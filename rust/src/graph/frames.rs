@@ -578,6 +578,22 @@ impl EdgeItems {
     }
 }
 
+/// A result frame's `metadata`: the sampled token's log-prob as
+/// `logprobs = [lp]` and the weights as `weight_version`, each only when set.
+/// Neither set writes the empty map, the same bytes as before either existed.
+fn result_metadata(out: &mut Vec<u8>, logprob: Option<f64>, weight_version: Option<&str>) {
+    w_map(out, u32::from(logprob.is_some()) + u32::from(weight_version.is_some()));
+    if let Some(lp) = logprob {
+        w_str(out, "logprobs");
+        w_arr(out, 1);
+        w_f64(out, lp);
+    }
+    if let Some(v) = weight_version {
+        w_str(out, "weight_version");
+        w_str(out, v);
+    }
+}
+
 /// One emitted output to the api server.
 pub struct ResultTensors<'a> {
     pub request_id: &'a str,
@@ -587,6 +603,8 @@ pub struct ResultTensors<'a> {
     pub loop_indices: Option<(Vec<Sym>, Vec<(Sym, u32)>, u32)>,
     /// The sampled token's log-prob, sent as `metadata["logprobs"] = [lp]`.
     pub logprob: Option<f64>,
+    /// The weights that produced it; None until a reload names a version.
+    pub weight_version: Option<&'a str>,
 }
 
 impl ResultTensors<'_> {
@@ -609,15 +627,7 @@ impl ResultTensors<'_> {
                 }
                 None => w_nil(m.key("loop_indices")),
             }
-            match self.logprob {
-                Some(lp) => {
-                    w_map(m.key("metadata"), 1);
-                    w_str(m.buf(), "logprobs");
-                    w_arr(m.buf(), 1);
-                    w_f64(m.buf(), lp);
-                }
-                None => w_map(m.key("metadata"), 0),
-            }
+            result_metadata(m.key("metadata"), self.logprob, self.weight_version);
         });
         out
     }
@@ -634,6 +644,8 @@ pub struct ResultTokens<'a> {
     /// Per request, its log-prob or None; empty when no request of the
     /// step has one.
     pub logprobs: &'a [Option<f64>],
+    /// As on ResultTensors: one version for the whole frame.
+    pub weight_version: Option<&'a str>,
 }
 
 impl ResultTokens<'_> {
@@ -661,7 +673,8 @@ impl ResultTokens<'_> {
             }
             w_str(m.key("signal"), self.signal);
             w_str(m.key("modality"), self.modality);
-            w_map(m.key("metadata"), 0);
+            // log-probs ride as their own column here, not in metadata
+            result_metadata(m.key("metadata"), None, self.weight_version);
             // left out, so a frame without log-probs is as it was
             if !self.logprobs.is_empty() {
                 w_arr(m.key("logprobs"), self.logprobs.len() as u32);
