@@ -635,6 +635,9 @@ class VAEDecoderSubmodule(ARNodeSubmodule):
 
     disable_torch_compile = True
     disable_autocast = True
+    # Nothing in the Talker reads the audio, and the decoder holds no resources, so a
+    # deployment can run its windows beside the Talker's steps (``side_stream: true``)
+    side_stream_walks = frozenset({"vae_chunk"})
     MAX_BATCH_SIZE = 32
     # wider batches are GPU-bound, so a replay saves under 1 ms of their 6 to
     # 90 ms, and capturing up to 32 rows would hold about 4 GB more graph memory
