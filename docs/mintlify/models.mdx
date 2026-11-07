@@ -210,6 +210,7 @@ On CUDA, decode runs in CUDA graphs over a fused layer: two concatenated GEMMs, 
 - Japanese written in kana alone, with spaces between words, is read poorly, as it is by the official model: in tests both garbled common words such as ゆっくり and ありがとうございました on every seed.
 - The flow's DiT estimator runs in bfloat16 by default; the Euler state, the rest of the flow and the HiFT vocoder stay float32 (HiFT's F0 predictor float64). `model_kwargs: {flow_estimator_dtype: float32}` in the deployment YAML runs the estimator at the reference's precision instead, at lower throughput.
 - The flow's Euler solve is captured at startup as CUDA graphs, one per frame bucket and batch size (`flow_capture_frame_buckets`, `flow_capture_batch_sizes`, `flow_capture_batch_frames`), which takes GPU memory and startup time. `model_kwargs: {flow_capture_frame_buckets: []}` captures none, and every solve runs eagerly.
+- The streaming vocoder is captured the same way, one graph per window bucket and batch size (`hift_capture_frame_buckets`, `hift_capture_batch_sizes`, about 3.3 GB at the defaults); each stream's mel tail and phase carry live in the `hift_state` pool, a slot per request (`resources: hift_state: {max_slots: N}`, one more than the requests). A chunk past the largest bucket runs as several steps. `hift_capture_frame_buckets: []` runs the vocoder eagerly.
 
 ## Qwen3-TTS notes {#qwen3-tts-notes}
 

@@ -34,6 +34,10 @@ LM_ATTN = "lm_attn"
 LM_POS = "lm_pos"
 LM_LABEL = "main"
 
+# Resource keys (vocoder node)
+HIFT_STATE = "hift_state"
+HIFT_STATE_LABEL = "main"
+
 # Node names
 SPEAKER_ENCODER_NODE = "speaker_encoder"
 LM_NODE = "llm"
@@ -162,6 +166,12 @@ class CausalHiFTConfig(S3GenHiFTConfig):
     noise_seconds: float = 300.0
 
     @property
+    def f0_left_history(self) -> int:
+        """Frames the F0 predictor reads before the first it predicts: its four causal
+        convolutions of kernel 3."""
+        return 8
+
+    @property
     def stream_holdback_frames(self) -> int:
         """Mel frames at the end of a non-final call whose audio is not final yet:
         the F0 predictor's and the pre-convolution's look-ahead, plus the frame
@@ -232,3 +242,19 @@ class CosyVoice3Config:
     )
     flow_capture_batch_sizes: tuple[int, ...] = (1, 2, 3, 4, 6, 8)
     flow_capture_batch_frames: int = 8192
+    # Streaming vocoder steps replayed as CUDA graphs: one per frame bucket (a window's
+    # frames) and batch size, a stream's tail and phase in ``HIFT_STATE``. A longer chunk
+    # runs as several steps. No buckets, or a whole-history vocoder
+    # (``hift_context_frames = 0``), runs ``stream_vocode`` eagerly instead.
+    hift_capture_frame_buckets: tuple[int, ...] = (128, 192, 256, 320, 400)
+    hift_capture_batch_sizes: tuple[int, ...] = (1, 2, 4, 8)
+
+    @property
+    def hift_captured(self) -> bool:
+        return self.hift_context_frames > 0 and bool(self.hift_capture_frame_buckets)
+
+    @property
+    def hift_tail_frames(self) -> int:
+        """Frames a stream keeps: a window's context and F0 history, and the frames
+        still held back from emitting."""
+        return self.hift_context_frames + self.hift.f0_left_history + self.hift.stream_holdback_frames

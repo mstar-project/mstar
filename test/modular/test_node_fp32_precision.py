@@ -209,6 +209,7 @@ def test_capture_runs_under_the_node_precision(monkeypatch):
     class _Region:
         any_graphs = False
         dropped_shapes = ()
+        required = False
 
         def __init__(self, node):
             self.node = node

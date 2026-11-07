@@ -2209,6 +2209,10 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   naming the buffer.
 - ``forward_kwargs`` holds static keyword arguments that are passed to ``capture_fn`` on
   every call, for example a layer count or an ``is_causal`` flag.
+- ``required`` refuses to start the worker when any of the region's shapes is left out of
+  capture, for memory or by a failure, rather than serving those shapes eagerly. Set it on a
+  region with no eager path, such as one whose per-stream state only its captures read and
+  write. The default is ``False``.
 - ``declare_step`` has signature
   ``(request_ids, seq_lens) -> SubmoduleStep | None``. It declares the region's own
   resource work over the padded batch. It is separate from the submodule's

@@ -779,6 +779,13 @@ CosyVoice3 notes
   ``flow_capture_batch_sizes``, ``flow_capture_batch_frames``), which takes GPU
   memory and startup time. ``model_kwargs: {flow_capture_frame_buckets: []}``
   captures none, and every solve runs eagerly.
+- The streaming vocoder is captured the same way, one graph per window bucket
+  and batch size (``hift_capture_frame_buckets``, ``hift_capture_batch_sizes``,
+  about 3.3 GB at the defaults); each stream's mel tail and phase carry live in
+  the ``hift_state`` pool, a slot per request (``resources: hift_state:
+  {max_slots: N}``, one more than the requests). A chunk past the largest bucket
+  runs as several steps. ``hift_capture_frame_buckets: []`` runs the vocoder
+  eagerly.
 
 Qwen3-TTS notes
 ---------------

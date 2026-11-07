@@ -59,13 +59,24 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.chatterbox.components.audio import kaldi_fbank_80
 from mstar.model.chatterbox.components.audio_frontend import resample
 from mstar.model.chatterbox.submodules import VoiceCache
 from mstar.model.cosyvoice3.components.flow import CosyVoice3FlowRow, ReferenceVoice, SolveInputs
-from mstar.model.cosyvoice3.components.hift import HiftStreamState, stream_vocode
+from mstar.model.cosyvoice3.components.hift import (
+    CapturedStream,
+    HiftStreamState,
+    StreamRow,
+    VocodeInputs,
+    finish_stream_row,
+    plan_stream_row,
+    stream_vocode,
+)
 from mstar.model.cosyvoice3.components.sampling import ras_sample
 from mstar.model.cosyvoice3.config import (
+    HIFT_STATE,
+    HIFT_STATE_LABEL,
     LM_ATTN,
     LM_KV,
     LM_LABEL,
@@ -806,11 +817,24 @@ class FlowSubmodule(NodeSubmodule):
 # ===========================================================================
 
 
+def vocode_region(frames: int) -> str:
+    return f"vocode_F{frames}"
+
+
+MEL_TAIL_BLOCK = "mel_tail"
+PHASE_CARRY_BLOCK = "phase_carry"
+_VOCODE_COUNTS = ("new_frames", "skip", "history", "frames", "start", "carry_at", "advance")
+
+
 class HiFTSubmodule(NodeSubmodule):
     """Vocodes each request's new mel frames behind a bounded window of its
     history (``hift_context_frames``) and emits only samples no later frame can
     change; the final call flushes the rest, so a stream has exactly the length
-    of a whole-utterance call."""
+    of a whole-utterance call.
+
+    Captured (``hift_captured``), a step's rows run as one padded batch, a piecewise
+    CUDA graph per frame bucket and batch size, with each stream's mel tail and phase
+    carry in the ``HIFT_STATE`` pool. Otherwise each row runs ``stream_vocode`` eagerly."""
 
     disable_torch_compile = True
     disable_autocast = True
@@ -819,6 +843,8 @@ class HiFTSubmodule(NodeSubmodule):
         super().__init__()
         self.hift = hift
         self.config = config
+        batch = config.hift_max_batch_size
+        self._counts = PinnedStager(torch.long, numel=len(_VOCODE_COUNTS) * batch)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         del graph_walk, kwargs
@@ -828,6 +854,10 @@ class HiFTSubmodule(NodeSubmodule):
         # only when the two are placed apart
         final = bool(inputs[MEL_FINAL][0].reshape(-1)[0])
         return NodeInputs(tensor_inputs={MEL: mel}, kwargs={"rid": _rid(fwd_info), "final": final})
+
+    @staticmethod
+    def _pcm(wav: torch.Tensor) -> torch.Tensor:
+        return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
 
     def _vocode(self, rid: int, mel: torch.Tensor, final: bool) -> torch.Tensor:
         state = self.request_state(rid)
@@ -839,7 +869,84 @@ class HiFTSubmodule(NodeSubmodule):
             wav = mel.new_zeros(0)
         else:
             wav = stream_vocode(self.hift, stream, mel, final, self.config.hift_context_frames)
-        return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
+        return self._pcm(wav)
+
+    # -- captured steps ---------------------------------------------------------
+
+    def _pieces(self, rid: int, mel: torch.Tensor, final: bool) -> list[tuple[int, torch.Tensor, bool]]:
+        """``mel`` in chunks a window of the largest bucket holds beside a stream's tail."""
+        cfg = self.config
+        # the holdback again for frames still pending from a chunk too short to emit
+        room = max(cfg.hift_capture_frame_buckets) - cfg.hift_tail_frames - cfg.hift.stream_holdback_frames
+        chunks = list(mel.split(room, dim=-1)) if mel.shape[-1] else [mel]
+        return [(rid, c, final and i == len(chunks) - 1) for i, c in enumerate(chunks)]
+
+    def _plan_row(self, rid: int, mel: torch.Tensor, final: bool) -> StreamRow | None:
+        state = self.request_state(rid)
+        stream = state.get("stream")
+        if stream is None:
+            stream = CapturedStream()
+            state.add("stream", stream)
+        if mel.shape[-1] == 0 and not final:
+            return None
+        cfg = self.config
+        return plan_stream_row(cfg.hift, stream, mel, final, cfg.hift_context_frames, cfg.hift_tail_frames)
+
+    def _replay(self, rows: list[tuple[int, StreamRow]], runners: Mapping[str, Any]) -> torch.Tensor:
+        """The rows' PCM16 from the smallest captured window that holds them."""
+        cfg = self.config
+        longest = max(row.new_mel.shape[-1] + cfg.hift_tail_frames - row.skip for _, row in rows)
+        for bucket in cfg.hift_capture_frame_buckets:
+            runner = runners.get(vocode_region(bucket))
+            if bucket >= longest and runner is not None and runner.can_run(len(rows)):
+                break
+        else:
+            raise RuntimeError(
+                f"no captured vocoder step holds {len(rows)} rows of {longest} frames: captures were left out for "
+                "memory; free some, or set hift_capture_frame_buckets to [] to run the vocoder eagerly"
+            )
+        device = self.get_device()
+        first = rows[0][1].new_mel
+        new_mel = torch.zeros(len(rows), first.shape[0], bucket, device=device, dtype=first.dtype)
+        for i, (_, row) in enumerate(rows):
+            new_mel[i, :, : row.new_mel.shape[-1]] = row.new_mel
+        counts = torch.empty(len(_VOCODE_COUNTS), len(rows), dtype=torch.long, device=device)
+        self._counts.copy_(
+            counts,
+            [row.new_mel.shape[-1] for _, row in rows]
+            + [row.skip for _, row in rows]
+            + [row.history for _, row in rows]
+            + [row.frames for _, row in rows]
+            + [row.start for _, row in rows]
+            + [row.carry_at for _, row in rows]
+            + [int(row.advance) for _, row in rows],
+        )
+        statics = {"new_mel": new_mel, **dict(zip(_VOCODE_COUNTS, counts, strict=True))}
+        return runner.run(static_inputs=statics, request_ids=[rid for rid, _ in rows], real_bs=len(rows))["pcm"]
+
+    @torch.no_grad()
+    def _run_captured(self, rids, mels, finals, runners: Mapping[str, Any]) -> list[torch.Tensor]:
+        """Each row's new PCM16, a round of replays per chunk of its longest row."""
+        pieces = [self._pieces(r, m, f) for r, m, f in zip(rids, mels, finals, strict=True)]
+        out: list[list[torch.Tensor]] = [[] for _ in rids]
+        for piece in range(max(len(p) for p in pieces)):
+            planned = [
+                (i, self._plan_row(*p[piece])) for i, p in enumerate(pieces) if piece < len(p)
+            ]
+            rows = [(i, row) for i, row in planned if row is not None]
+            if not rows:
+                continue
+            pcm = self._replay([(rids[i], row) for i, row in rows], runners)
+            for k, (i, row) in enumerate(rows):
+                out[i].append(finish_stream_row(self.config.hift, row, pcm[k]))
+        empty = mels[0].new_zeros(0, dtype=torch.int16)
+        return [torch.cat(o) if len(o) > 1 else (o[0] if o else empty) for o in out]
+
+    def _run(self, rids, mels, finals, runners: Mapping[str, Any]) -> list[torch.Tensor]:
+        # no regions: a device with no captures, or none fit in memory
+        if self.config.hift_captured and runners:
+            return self._run_captured(rids, mels, finals, runners)
+        return [self._vocode(r, m, f) for r, m, f in zip(rids, mels, finals, strict=True)]
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
         del batch
@@ -851,20 +958,77 @@ class HiFTSubmodule(NodeSubmodule):
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]):
         del graph_walk, engine_inputs
-        if len(inputs) == 1:
-            return {**inputs[0].tensor_inputs, **inputs[0].kwargs}
         return {
             MEL: [inp.tensor_inputs[MEL] for inp in inputs],
             "rid": [inp.kwargs["rid"] for inp in inputs],
             "final": [inp.kwargs["final"] for inp in inputs],
         }
 
+    @staticmethod
+    def _runners(engine_inputs) -> Mapping[str, Any]:
+        return engine_inputs.piecewise_runners if engine_inputs is not None else {}
+
     @torch.no_grad()
     def forward(self, graph_walk, engine_inputs, mel, rid, final, **kwargs) -> NameToTensorList:
-        del graph_walk, engine_inputs, kwargs
-        return {AUDIO_CHUNK: [self._vocode(rid, mel, final)]}
+        del graph_walk, kwargs
+        return {AUDIO_CHUNK: [self._run(rid, mel, final, self._runners(engine_inputs))[0]]}
 
     @torch.no_grad()
     def forward_batched(self, graph_walk, engine_inputs, mel, rid, final, **kwargs) -> dict[int, NameToTensorList]:
-        del graph_walk, engine_inputs, kwargs
-        return {r: {AUDIO_CHUNK: [self._vocode(r, m, f)]} for r, m, f in zip(rid, mel, final, strict=True)}
+        del graph_walk, kwargs
+        pcm = self._run(rid, mel, final, self._runners(engine_inputs))
+        return {r: {AUDIO_CHUNK: [p]} for r, p in zip(rid, pcm, strict=True)}
+
+    # -- captured vocode --------------------------------------------------------
+
+    def _vocode_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        pool = inp.resources[HIFT_STATE]
+        tail = pool.gather(MEL_TAIL_BLOCK, None, label=HIFT_STATE_LABEL)
+        carry = pool.gather(PHASE_CARRY_BLOCK, None, label=HIFT_STATE_LABEL)
+        output = self.hift.vocode_stream(VocodeInputs(**inp.static_inputs), tail, carry)
+        pool.scatter_(MEL_TAIL_BLOCK, output.tail, None, label=HIFT_STATE_LABEL)
+        pool.scatter_(PHASE_CARRY_BLOCK, output.phase_carry, None, label=HIFT_STATE_LABEL)
+        return {"pcm": self._pcm(output.wav)}
+
+    def _vocode_static_inputs(self, shape: PiecewiseCaptureShape, frames: int, device) -> dict[str, torch.Tensor]:
+        dtype = self.hift.conv_pre.weight.dtype
+        counts = {name: torch.zeros(shape.bs, dtype=torch.long, device=device) for name in _VOCODE_COUNTS}
+        return {
+            "new_mel": torch.zeros(shape.bs, self.config.hift.in_channels, frames, dtype=dtype, device=device),
+            **counts,
+        }
+
+    @staticmethod
+    def _vocode_step(request_ids, seq_lens) -> SubmoduleStep:
+        """A row addresses its stream's slot; a padding row the sink."""
+        del seq_lens
+        return SubmoduleStep(
+            steps={
+                HIFT_STATE: RecurrentStep(
+                    segments=tuple(Segment(rid, HIFT_STATE_LABEL, 1) for rid in request_ids)
+                )
+            },
+        )
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """One region per frame bucket, largest first, as the flow's: regions
+        share a pool, and a smaller capture reuses the blocks a larger one freed."""
+        del autocast_dtype, tp_world_size, kwargs
+        cfg = self.config
+        sizes = [bs for bs in cfg.hift_capture_batch_sizes if bs <= cfg.hift_max_batch_size]
+        if not cfg.hift_captured or not sizes:
+            return {}
+        return {
+            vocode_region(frames): PiecewiseBatchedConfig(
+                capture_fn=self._vocode_capture,
+                make_static_inputs=functools.partial(self._vocode_static_inputs, frames=frames, device=device),
+                declare_step=self._vocode_step,
+                seq_len=frames,
+                capture_batch_sizes=sizes,
+                # a stream's state lives in the pool only the captured windows read and write
+                required=True,
+            )
+            for frames in sorted(cfg.hift_capture_frame_buckets, reverse=True)
+        }
