@@ -18,6 +18,8 @@ NOT_IN_ALL = {
     # not in [all] yet: resemble-perth needs setuptools<82 next to it (#537)
     "chatterbox": {"librosa", "pyloudnorm", "resemble-perth", "setuptools", "tokenizers"},
     "chatterbox_multilingual": {"pykakasi", "spacy-pkuseg"},
+    # opt-in: it fetches its grammars from ModelScope on first start
+    "cosyvoice3_wetext": {"wetext"},
 }
 
 
