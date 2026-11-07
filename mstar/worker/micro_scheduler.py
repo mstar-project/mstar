@@ -434,6 +434,9 @@ class MicroScheduler:
         # schedules only its own nodes' keys (``get_next_batch``), so the chain
         # neither runs nor yields to another lane's
         self.lane_of: dict[tuple[str, str], int] = {}
+        # Opted-in graph sections, derived by the Rust runtime. The existing
+        # builder takes their common capture key and tightest member cap.
+        self.execution_units = {}
         # (node, walk) -> whether its speculation chain merges the other walks
         # of its combined walk: the config's settings, then each default as
         # `speculation_mixes` first decides it
@@ -1487,6 +1490,10 @@ class MicroScheduler:
         capture_group = None
         if engine.splits_by_capture_key(node, walk):
             capture_group = self._chain_capture_group(request_state, node, walk, continuing, next_iter_of)
+        unit = self.execution_units.get(key)
+        if unit is not None:
+            def capture_group(rid):
+                return tuple(self._capture_group(request_state, member, walk, rid) for member in unit.nodes)
         return StepCandidates(
             graph_walk=walk,
             continuing=continuing, own_walk=own_walk,
@@ -1921,9 +1928,11 @@ class MicroScheduler:
         Fixed once the graphs are captured, so asked once."""
         key = (node_name, graph_walk)
         if key not in self._max_bs:
-            self._max_bs[key] = self.engine_manager.get_engine(node_name).get_max_batch_size(
-                node_name, graph_walk
-            )
+            unit = self.execution_units.get(key)
+            nodes = unit.nodes if unit is not None else (node_name,)
+            caps = [self.engine_manager.get_engine(node).get_max_batch_size(node, graph_walk) for node in nodes]
+            capped = [cap for cap in caps if cap is not None]
+            self._max_bs[key] = min(capped) if capped else None
         return self._max_bs[key]
 
     def _limited(self, node_name: str, graph_walk: str, cap: int | None) -> int | None:

@@ -1,5 +1,6 @@
-//! A run of a captured graph, launched from one call with the GIL released:
-//! N graph launches and the device-to-device copies between them, in order.
+//! A run of captured graphs, launched from one call with the GIL released:
+//! the graph launches of N iterations (one graph a node of the run) and the
+//! device-to-device copies between them, in order.
 //! Every CUDA entry point arrives as an address, so the crate links no CUDA.
 
 use pyo3::exceptions::PyRuntimeError;
@@ -13,21 +14,26 @@ type Memcpy2D = unsafe extern "C" fn(
 
 const OP_LAUNCH: u64 = 0;
 const OP_COPY: u64 = 1;
+const LAUNCH_WORDS: usize = 1;
 const COPY_WORDS: usize = 6;
 // cudaMemcpyDefault: a copy may land in pinned host memory (`stream_tokens`)
 const COPY_DEFAULT: i32 = 4;
 
-/// `ops`, flat: a launch is `[0]`, a copy
+/// `ops`, flat: a launch is `[0, exec]`, a copy
 /// `[1, dst, dst_pitch, src, src_pitch, width, height]`, in bytes.
-fn run(launch: GraphLaunch, copy: Memcpy2D, exec: usize, stream: usize, ops: &[u64]) -> Result<(), String> {
+fn run(launch: GraphLaunch, copy: Memcpy2D, stream: usize, ops: &[u64]) -> Result<(), String> {
     let stream = stream as *mut c_void;
     let mut at = 0;
     while at < ops.len() {
         let op = ops[at];
         at += 1;
         let status = match op {
-            // SAFETY: the caller passes a live graph exec and stream, and CUDA's own entry points
-            OP_LAUNCH => unsafe { launch(exec as *mut c_void, stream) },
+            OP_LAUNCH => {
+                let exec = *ops.get(at).ok_or("a launch op is cut short")? as usize;
+                at += LAUNCH_WORDS;
+                // SAFETY: the caller passes live graph execs and stream, and CUDA's own entry points
+                unsafe { launch(exec as *mut c_void, stream) }
+            }
             OP_COPY => {
                 let args = ops.get(at..at + COPY_WORDS).ok_or("a copy op is cut short")?;
                 at += COPY_WORDS;
@@ -52,7 +58,7 @@ fn run(launch: GraphLaunch, copy: Memcpy2D, exec: usize, stream: usize, ops: &[u
 /// address and `memcpy_2d` `cudaMemcpy2DAsync`'s.
 #[pyfunction]
 pub fn launch_run(
-    py: Python<'_>, graph_launch: usize, memcpy_2d: usize, exec: usize, stream: usize, ops: Vec<u64>,
+    py: Python<'_>, graph_launch: usize, memcpy_2d: usize, stream: usize, ops: Vec<u64>,
 ) -> PyResult<()> {
     if graph_launch == 0 || memcpy_2d == 0 {
         return Err(PyRuntimeError::new_err("launch_run needs both CUDA entry points"));
@@ -64,5 +70,5 @@ pub fn launch_run(
             std::mem::transmute::<usize, Memcpy2D>(memcpy_2d),
         )
     };
-    py.detach(|| run(launch, copy, exec, stream, &ops)).map_err(PyRuntimeError::new_err)
+    py.detach(|| run(launch, copy, stream, &ops)).map_err(PyRuntimeError::new_err)
 }

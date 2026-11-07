@@ -11,7 +11,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from functools import cache, cached_property, partial
 from time import sleep
@@ -37,7 +37,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.device_run import RUN_REPLAYS, RUN_SKIPPED, run_item
-from mstar.engine.engine import ExecutingBatch
+from mstar.engine.engine import ExecutingBatch, ExecutionGroup
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
@@ -315,6 +315,7 @@ class PendingBatch:
     submitted_at: float = 0.0
     # the chain's step, or another lane's (``mstar.worker.lanes``)
     lane: int = CHAIN_LANE
+    group: ExecutionGroup | None = None
 
 
 class EvictionPolicy(Enum):
@@ -929,6 +930,17 @@ class Worker(RepeatingSteps):
                 walk_graphs, [(node, walk) for walk, node in self._innermost_loop_by_node if (node, walk) in my_walks],
             ),
         )
+        walk_runs = (model_config or {}).get("walk_runs", [])
+        if not isinstance(walk_runs, list) or any(not isinstance(walk, str) for walk in walk_runs):
+            raise ValueError("walk_runs must be a list of graph walk names")
+        if unknown := set(walk_runs) - walk_graphs.keys():
+            raise ValueError(f"walk_runs names unknown walks: {sorted(unknown)}")
+        self.scheduler.execution_units = {
+            (unit.nodes[0], walk): unit
+            for walk in walk_runs for unit in self._graph_runtime.execution_units(walk)
+            if not (set(unit.nodes) & self.parallel_nodes)
+            and all(self.scheduler.lane_of.get((node, walk), CHAIN_LANE) == CHAIN_LANE for node in unit.nodes)
+        }
 
         if status_interval_s is not None:
             self._metrics = self._start_metrics(status_interval_s)
@@ -2517,6 +2529,7 @@ class Worker(RepeatingSteps):
         batch: ScheduledBatch,
         node_batch: ExecutingBatch,
         plan_future: Future | None = None,
+        *, group: ExecutionGroup | None = None,
     ) -> dict[int, NameToTensorList]:
         """Run the engine on the GPU executor thread.
 
@@ -2537,6 +2550,15 @@ class Worker(RepeatingSteps):
             set_step_key(_step_key(batch.node_name, batch.graph_walk))
         laps = PhaseLaps("worker.gpu_thread.")
         engine = self.engine_manager.get_engine(batch.node_name)
+        group_outputs = None
+        original = None
+        if group is not None:
+            original = replace(
+                node_batch, step_context=replace(node_batch.step_context),
+                skipped_rids=set(node_batch.skipped_rids), cached_rids=set(node_batch.cached_rids),
+                failed_requests=dict(node_batch.failed_requests), first_chunk_rids=set(node_batch.first_chunk_rids),
+                outputs_ready=threading.Event(), commit_done=threading.Event(),
+            )
         if self.enable_nvtx:
             range_push("worker.gpu_thread_start", synchronize=False)
             range_pop(synchronize=False)
@@ -2580,7 +2602,8 @@ class Worker(RepeatingSteps):
                     "worker.gpu_thread.prepare_inputs",
                     cpu="worker.gpu_thread.prepare_inputs.cpu",
                 ):
-                    engine.prepare_inputs(node_batch)
+                    if group is None:
+                        engine.prepare_inputs(node_batch)
             except Exception:
                 if plan_future is not None and node_batch.preplanned_rids is not None:
                     # The stage was for this batch, which now never runs.
@@ -2611,15 +2634,31 @@ class Worker(RepeatingSteps):
             with self._span(
                 "worker.gpu_thread.exec", cpu="worker.gpu_thread.exec.cpu",
             ):
-                outputs = engine.exec_and_postprocess(node_batch)
+                if group is not None:
+                    group_outputs = engine.exec_group(group)
+                    if group_outputs is None:
+                        node_batch.__dict__.update(original.__dict__)
+                        engine.prepare_inputs(node_batch)
+                    elif self._phase_period:
+                        self._phase_record("connected.members#", len(group.members))
+                        for scheduled, member in group.members:
+                            self._phase_record(
+                                f"connected.rows.{scheduled.node_name}.{scheduled.graph_walk}#",
+                                len(member.request_ids),
+                            )
+                outputs = engine.exec_and_postprocess(node_batch) if group_outputs is None else group_outputs[0]
             laps.skip()
             if execution_stream is not None:
                 lane = self.scheduler.lane_of.get((batch.node_name, batch.graph_walk), CHAIN_LANE)
-                self._stage_host_rows(outputs, lane)
+                for output in group_outputs or (outputs,):
+                    self._stage_host_rows(output, lane)
                 laps.lap("stage_host_rows")
                 event = torch.Event(device=self.device)
                 event.record(execution_stream)
                 node_batch.completion_event = event
+                if group_outputs is not None:
+                    for _, member in group.members[1:]:
+                        member.completion_event = event
                 laps.lap("completion_event")
                 if gpu_start is not None:
                     gpu_end = torch.Event(device=self.device, enable_timing=True)
@@ -2650,6 +2689,12 @@ class Worker(RepeatingSteps):
             node_batch.resource_publish_info = engine.finalize_batch(
                 node_batch, publish_request_ids=publish_rids,
             )
+            if group is not None and group.submitted:
+                for _, member in group.members[1:]:
+                    member.release_waiters()
+                    member.resource_publish_info = engine.finalize_batch(
+                        member, publish_request_ids=self._publishable_request_ids(member),
+                    )
             laps.lap("finalize_batch")
             if timed:
                 self._phase_record(
@@ -2757,7 +2802,12 @@ class Worker(RepeatingSteps):
         ``PendingBatch.submitted_at``). Which rows the lane holds is the
         caller's to record (``_hold_rows``): the chain's step N+1 takes over
         only once N is postprocessed."""
-        if not speculated:
+        group = None
+        if not speculated and lane == CHAIN_LANE and plan_future is None and execute is None:
+            group = self._claim_group(batch, node_batch)
+            if group is not None:
+                execute = partial(self._execute_on_gpu_thread, group=group)
+        if not speculated and group is None:
             self._set_in_flight_flag(batch, True)
         submitted_at = _time.perf_counter() if self._metrics is not None and not speculated else 0.0
         future = self._submit_gpu_step(gpu_executor, batch, node_batch, plan_future, execute=execute)
@@ -2766,8 +2816,53 @@ class Worker(RepeatingSteps):
         return PendingBatch(
             batch=batch, node_batch=node_batch, node_name=batch.node_name,
             graph_walk=batch.graph_walk, future=future, submitted_at=submitted_at,
-            lane=lane, **step,
+            lane=lane, group=group, **step,
         )
+
+    def _claim_group(self, batch: ScheduledBatch, node_batch: ExecutingBatch) -> ExecutionGroup | None:
+        """Claim one common row set before any member is prepared or launched."""
+        unit = getattr(self.scheduler, "execution_units", {}).get((batch.node_name, batch.graph_walk))
+        if unit is None or batch.request_walks or batch.chunk_ranges or node_batch.failed_requests:
+            return None
+        engine = self.engine_manager.get_engine(batch.node_name)
+        for node in unit.nodes:
+            if self.engine_manager.get_engine(node) is not engine:
+                return None
+            runner = engine._submodules[node].accelerator_graph_runner
+            if runner is None or runner.launch_refusal(batch.graph_walk) is not None:
+                return None
+        claimed = self._graph_runtime.claim_execution_unit(
+            batch.node_name, batch.graph_walk, list(node_batch.request_ids),
+        )
+        if claimed is None:
+            return None
+        claim, popped = claimed
+        members = []
+        try:
+            for i, (node, part) in enumerate(zip(unit.nodes, popped, strict=True)):
+                scheduled = replace(batch, output_signals=list(part.output_signals)) if i == 0 else ScheduledBatch(
+                    node_name=node, graph_walk=batch.graph_walk,
+                    request_to_worker_graph=dict(zip(part.wg_ids.keys, part.wg_ids.values, strict=True)),
+                    input_edges=part.input_edges, output_signals=list(part.output_signals),
+                )
+                executing = node_batch if i == 0 else self._build_executing_batch(scheduled)
+                if tuple(executing.request_ids) != tuple(node_batch.request_ids):
+                    self._graph_runtime.cancel_execution_unit(claim)
+                    return None
+                members.append((scheduled, executing))
+        except Exception:
+            self._graph_runtime.cancel_execution_unit(claim)
+            raise
+        return ExecutionGroup(unit, claim, tuple(members))
+
+    def _settle_group_claim(self, group: ExecutionGroup) -> None:
+        """Publish the GPU thread's irreversible boundary on the main thread."""
+        if group.claim:
+            if group.submitted:
+                self._graph_runtime.submit_execution_unit(group.claim)
+            else:
+                self._graph_runtime.cancel_execution_unit(group.claim)
+            group.claim = 0
 
     def _hold_rows(self, lane: int, rids: Iterable[int]) -> None:
         """The rows ``lane``'s step in flight holds are now ``rids``. Teardown
@@ -2796,6 +2891,10 @@ class Worker(RepeatingSteps):
         (``_handle_admit_failure``, which leaves the rows the chain's
         ``speculation`` will run alone), and the rows a per-rid stage blamed
         fail. True when the step was refused."""
+        if step.group is not None:
+            self._settle_group_claim(step.group)
+            if step.group.submitted:
+                step.batch = step.group.members[0][0]
         refused = step.node_batch.admit_error is not None
         if refused:
             self._handle_admit_failure(
@@ -2816,6 +2915,16 @@ class Worker(RepeatingSteps):
     def _finish_step(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
+        if step.group is not None and step.group.submitted:
+            for i, (scheduled, executing) in enumerate(step.group.members):
+                member = replace(step, batch=scheduled, node_batch=executing, node_name=scheduled.node_name,
+                                 partition=self.request_state.get_partition_for_node(scheduled.node_name), group=None)
+                if i:
+                    self._clear_in_flight_flag(scheduled)
+                    self._settle_step_rows(member, executing.outputs)
+                self._finish_step(member, executing.outputs)
+            step.group.parts.clear()
+            return
         self.scheduler.clear_batch_limit(
             step.node_name, step.graph_walk, len(step.batch.request_to_worker_graph),
             walks=step.batch.rids_by_walk(),
@@ -2839,7 +2948,11 @@ class Worker(RepeatingSteps):
         it took the step, the step's rows have had their turn at its node. A
         refused step is retried, and its rows keep their place in line."""
         if pending is not None and pending.node_batch.admit_error is None:
-            self.scheduler.note_ran(pending.batch)
+            members = pending.group.members if pending.group is not None and pending.group.submitted else (
+                (pending.batch, pending.node_batch),
+            )
+            for scheduled, _ in members:
+                self.scheduler.note_ran(scheduled)
 
     def _drop_rows_whose_loop_stopped(self, pending: PendingBatch) -> None:
         """Take the rows of a speculative step that ran nothing whose loop stopped
@@ -5095,6 +5208,8 @@ class Worker(RepeatingSteps):
                     "Worker %s discarding failed batch for node %s",
                     self.worker_id, stale.node_name,
                 )
+            if stale.group is not None:
+                self._settle_group_claim(stale.group)
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
             self._clear_in_flight_flag(batch)
@@ -5176,6 +5291,8 @@ class Worker(RepeatingSteps):
         """Speculate the step after ``pending`` (N+1 from N), or a
         yield-away batch when fairness says so. Returns the speculation
         and the (node, walk) to exclude on the non-speculative path."""
+        if pending is not None and pending.group is not None:
+            return None, None
         speculation = None
         yield_away_from_target = None
         batch = None

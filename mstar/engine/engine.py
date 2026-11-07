@@ -22,12 +22,14 @@ from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
     PiecewiseAcceleratorGraphRunner,
+    RunPart,
     autocast_scope,
     fail_if_graphs_required,
     output_named,
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
+from mstar.engine.connected_inputs import ConnectedInputs, active_guard
 from mstar.engine.device_run import IterationWindow, RunAsk, TokenStream, run_item
 from mstar.engine.fp32_precision import Fp32Precision, cudnn_benchmark, fp32_precision_scope, node_fp32_precision
 from mstar.engine.node_dtype import resolve_node_dtype
@@ -69,7 +71,7 @@ from mstar.engine.resources.step import (
     PerReqSetting,
 )
 from mstar.graph.loop_indices import LoopLayout
-from mstar.graph.runtime.base import GraphRuntime
+from mstar.graph.runtime.base import ExecutionUnit, GraphRuntime
 from mstar.model.base import keyed_labels
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
@@ -111,6 +113,7 @@ if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
+    from mstar.worker.micro_scheduler import ScheduledBatch
 
 logger = logging.getLogger(__name__)
 
@@ -648,6 +651,17 @@ class ExecutingBatch:
         self.step_context.slot_lease = slot_lease
         if self.slot is None:
             self.set_slot(slot_lease.slot)
+
+
+@dataclass
+class ExecutionGroup:
+    """One graph claim, its ordinary members, and their held launch bindings."""
+    unit: ExecutionUnit
+    claim: int
+    members: tuple[tuple["ScheduledBatch", ExecutingBatch], ...]
+    submitted: bool = False
+    refusal: str | None = None
+    parts: list[RunPart] = field(default_factory=list)
 
 
 class Engine:
@@ -1581,6 +1595,9 @@ class Engine:
                     # the submodule reads a mixed step's rows by their own walk
                     req_inputs.graph_walk = row_walk
             except Exception as error:
+                guard = active_guard()
+                if guard is not None and guard.reason is not None:
+                    raise
                 batch.register_failure(rid, error, walk=row_walk)
                 continue
             if req_inputs is None:
@@ -2209,12 +2226,7 @@ class Engine:
                 else:
                     batch.outputs = self._exec_single(batch)
             laps = PhaseLaps("engine.exec.")
-            if batch.admit_error is None:
-                self._record_loopback(batch)
-                batch.outputs.loopback_rids = batch.loopback_rids
-                if batch.step_context.repeats > 1:
-                    batch.outputs.run_columns = self.run_columns(batch.node_name, batch.step_context.graph_walk)
-            batch.outputs_ready.set()
+            self._finish_outputs(batch)
             laps.lap("record_loopback")
             return batch.outputs
         except Exception:
@@ -2231,6 +2243,33 @@ class Engine:
             if nvtx:
                 range_pop()
 
+    def _finish_outputs(self, batch: ExecutingBatch) -> None:
+        """Publish ordinary completion metadata before the outputs become ready."""
+        if batch.admit_error is None:
+            self._record_loopback(batch)
+            batch.outputs.loopback_rids = batch.loopback_rids
+            if batch.step_context.repeats > 1:
+                batch.outputs.run_columns = self.run_columns(batch.node_name, batch.step_context.graph_walk)
+        batch.outputs_ready.set()
+
+    @staticmethod
+    def _pad_batch(
+        batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement, lease: SlotLease | None,
+    ) -> tuple[list[NodeInputs], Mapping[int, CurrentForwardPassInfo]]:
+        """The admitted rows of an ordinary step, padded to its leased capture."""
+        cg_runner = submodule_mgmt.accelerator_graph_runner
+        inputs = batch.inputs
+        req_info = batch.per_request_info_wrapped
+        if lease is not None:
+            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
+            req_info = cg_runner.step_metadata(
+                lease, batch.request_ids, req_info
+            )
+            batch.step_context.set_padded_rids(
+                cg_runner.step_ids(lease, batch.request_ids)
+            )
+        return inputs, req_info
+
     def _exec_single(
         self, batch: ExecutingBatch
     ) -> BatchedModelOutput:
@@ -2245,16 +2284,7 @@ class Engine:
         lease = batch.step_context.slot_lease
         real_bs = len(batch.request_ids)
 
-        inputs = batch.inputs
-        req_info = batch.per_request_info_wrapped
-        if lease is not None:
-            inputs = cg_runner.pad_inputs(lease, inputs, uniform=batch.uniform_inputs)
-            req_info = cg_runner.step_metadata(
-                lease, batch.request_ids, req_info
-            )
-            batch.step_context.set_padded_rids(
-                cg_runner.step_ids(lease, batch.request_ids)
-            )
+        inputs, req_info = self._pad_batch(batch, submodule_mgmt, lease)
         laps.lap("pad")
 
         try:
@@ -2288,22 +2318,7 @@ class Engine:
             batch.commit_done.set()
             if submodule_mgmt.rings:
                 self._write_rings(submodule_mgmt, batch, raw)
-            if self._enable_nvtx:
-                range_push("engine.collect_outputs")
-            t0 = phase_start()
-            try:
-                out = self._collect_outputs(
-                    submodule_mgmt, lease, raw, inputs, req_info,
-                    request_ids=batch.request_ids,
-                    step_request_ids=batch.step_context.padded_request_ids,
-                    graph_walk=batch.step_context.graph_walk,
-                    rows_only=batch.rows_only,
-                )
-            finally:
-                phase_end("engine.collect_outputs", t0)
-                if self._enable_nvtx:
-                    range_pop()
-            self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
+            out = self._collect_step(batch, submodule_mgmt, lease, raw, inputs, req_info)
             # Optional 1-step launch throttle (see MSTAR_ENGINE_STEP_SYNC).
             # Not for correctness — downstream reads already gate on the
             # completion event, so the token exists before it is read. This just
@@ -2328,6 +2343,185 @@ class Engine:
             if lease is not None:
                 cg_runner.release(lease, real_bs)
             laps.lap("release")
+
+    def exec_group(self, group: ExecutionGroup) -> list[BatchedModelOutput] | None:
+        """Prepare all ordinary members, then submit their captures together.
+
+        None is an unsubmitted refusal: the worker runs the original head.
+        Once submission starts, errors use ordinary failure settlement instead
+        of replaying any member. No graph-runtime call runs on this thread.
+        """
+        bindings: dict[Any, torch.Tensor] = {}
+        guard = ConnectedInputs(bindings)
+        prepared = []
+        admitted = []
+        rows = tuple(group.members[0][1].request_ids)
+        leases = {}
+        owners = set()
+        try:
+            with torch.no_grad(), guard.preparing():
+                for _, batch in group.members:
+                    mgmt = self._submodules[batch.node_name]
+                    runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule
+                    if (runner is None or batch.chunk_ranges or batch.step_context.request_walks
+                            or batch.step_context.repeats != 1):
+                        guard.refuse("a member has no whole capture or has chunked/mixed rows")
+                    if batch.graph_walk in self._keyed_walks.get(batch.node_name, ()) or mgmt.rings:
+                        guard.refuse("a member prepares cached prefixes or stream windows")
+                    # Reachable owners include resource dependencies, even if
+                    # this declaration would not explicitly name them.
+                    member_owners = {id(resource) for resource in mgmt.resources.values()}
+                    if owners & member_owners:
+                        guard.refuse("members share a resource owner")
+                    owners.update(member_owners)
+                    incoming = [(a, signal) for a, b, signal in group.unit.edges if b == batch.node_name]
+                    tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
+                    for maker, signal in incoming:
+                        maker_mgmt = self._submodules[maker]
+                        maker_type = type(maker_mgmt.submodule)
+                        maker_slot = maker_mgmt.accelerator_graph_runner.slot_for(leases[maker])
+                        if (maker_type.postprocess is not NodeSubmodule.postprocess
+                                or maker_type.batch_postprocess is not NodeSubmodule.batch_postprocess
+                                or maker_type.filter_batched_output is not NodeSubmodule.filter_batched_output
+                                or maker_mgmt.submodule.spanned_outputs(batch.graph_walk)
+                                or maker_mgmt.submodule.get_stop_policies(batch.graph_walk) is None):
+                            guard.refuse("a producer changes its routed outputs outside capture")
+                        output = maker_mgmt.submodule.repeat_carry(batch.graph_walk, {signal})[signal].output
+                        source = (maker_slot.static_outputs.row_outputs or {}).get(output)
+                        if source is None or source.ndim == 0 or source.shape[0] < len(rows):
+                            guard.refuse(f"{maker}/{signal} has no captured row output")
+                        for i, rid in enumerate(rows):
+                            key = maker, signal, rid
+                            # Ordinary collect gives the consumer split(1)
+                            # views, retaining the row axis.
+                            bindings[key] = source[i:i + 1]
+                            tensors[rid][signal] = [guard.unknown(key)]
+                    batch.per_request_input_tensors = tensors
+                    with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
+                                        node_name=batch.node_name):
+                        self.prepare_inputs(batch)
+                    if tuple(batch.request_ids) != rows:
+                        guard.refuse("a member changed the common row set")
+                    for inp in batch.inputs:
+                        for f in dataclasses.fields(inp):
+                            if f.name != "tensor_inputs":
+                                guard.require_real(getattr(inp, f.name), f"NodeInputs.{f.name}")
+                    lease = self.reserve_replay_slot(batch)
+                    if lease is None:
+                        guard.refuse("a member has no capture for the common rows")
+                    leases[batch.node_name] = lease
+                    slot = runner.slot_for(lease)
+                    if slot.run is not None or batch.step_context.resident is not None:
+                        guard.refuse("connected resident runs need their shared run state staged before launch")
+                    if slot.row_heads:
+                        guard.refuse("connected inputs need their captured row owner's destination")
+                    inputs, info = self._pad_batch(batch, mgmt, lease)
+                    prepared.append((batch, mgmt, lease, inputs, info, incoming))
+                    batch.step = self._declare_step(batch, batch.step_context.padded_request_ids, inputs,
+                                                    submodule, batch.step_context, batch.step)
+                    if batch.step is not None:
+                        guard.require_real(batch.step.steps, "resource declarations")
+                        for resource_step in batch.step.steps.values():
+                            if getattr(resource_step, "pre_forks", ()) or getattr(resource_step, "post_forks", ()):
+                                guard.refuse("a member forks resource state during planning")
+                for batch, _, _, inputs, _, _ in prepared:
+                    admit = self._admit_step(batch, batch.step_context.padded_request_ids, inputs,
+                                             batch.step_context, batch.step)
+                    if not admit.ok:
+                        guard.refuse("a member refused admission")
+                    if batch.step is not None:
+                        admitted.append(batch.step)
+                for batch, mgmt, lease, inputs, info, incoming in prepared:
+                    with autocast_scope(self._autocast_dtype_for(batch.node_name), device_type=self._device.type,
+                                        node_name=batch.node_name):
+                        _, values = self._plan_step(batch, mgmt, batch.request_ids, inputs, info,
+                                                    batch.step_context, lease, batch.step)
+                    guard.require_real(batch.step_context.plan_results, "resource plans")
+                    runner = mgmt.accelerator_graph_runner
+                    slot = runner.slot_for(lease)
+                    carries = mgmt.submodule.repeat_carry(batch.graph_walk, {signal for _, signal in incoming})
+                    expected = {}
+                    for maker, signal in incoming:
+                        expected.setdefault(carries[signal].input, []).extend((maker, signal, rid) for rid in rows)
+                    copies, real = [], {}
+                    for name, value in values.items():
+                        if guard.contains(value):
+                            if name not in expected or not isinstance(value, torch.Tensor):
+                                guard.refuse(f"future values escaped into preprocess field {name}")
+                            target = slot.static_inputs.get(name)
+                            if not isinstance(target, torch.Tensor) or name not in slot.static_input_keys:
+                                guard.refuse(f"no captured destination for {name}")
+                            dim = runner._static_buffer_seq_dims.get((slot.config_idx, name), 0)
+                            if value.ndim != target.ndim or value.shape[dim] > target.shape[dim]:
+                                guard.refuse(f"future field {name} exceeds its captured destination")
+                            target = target.narrow(dim, 0, value.shape[dim])
+                            copies.extend(guard.copies(value, target, tuple(expected.pop(name))))
+                        else:
+                            real[name] = value
+                    if expected:
+                        guard.refuse("preprocess discarded a future input")
+                    runner._stage(lease, real)
+                    group.parts.append(RunPart(slot, copies, []))
+            # Every binding has been checked. This is the irreversible point;
+            # the main thread publishes it to Rust before landing members.
+            group.submitted = True
+            head = group.members[0][1]
+            if head.launch_started_event is not None:
+                head.launch_started_event.set()
+            prepared[0][1].accelerator_graph_runner.launch_parts(group.parts)
+            for batch, mgmt, _, _, _, _ in prepared:
+                self._commit_step(batch, mgmt, batch.step, batch.step_context)
+                batch.commit_done.set()
+            outputs = []
+            for batch, mgmt, lease, inputs, info, _ in prepared:
+                raw = mgmt.accelerator_graph_runner.slot_for(lease).static_outputs
+                output = self._collect_step(batch, mgmt, lease, raw, inputs, info)
+                batch.outputs = output
+                self._finish_outputs(batch)
+                outputs.append(self._postprocess_outputs(batch, output))
+            return outputs
+        except Exception:
+            if group.submitted or guard.reason is None:
+                raise
+            group.refusal = guard.reason
+            return None
+        finally:
+            if not group.submitted:
+                # Preparation may have queued plan/staging writes. Keep pages
+                # and their buffers owned until those writes have drained.
+                if self.device_capability.is_accelerator:
+                    torch.accelerator.current_stream(self._device).synchronize()
+                for step in reversed(admitted):
+                    self._runner.rollback_admit(step)
+            for _, batch in reversed(group.members):
+                lease = leases.get(batch.node_name)
+                if lease is not None:
+                    self._submodules[batch.node_name].accelerator_graph_runner.release(lease, len(rows))
+                batch.release_waiters()
+
+    def _collect_step(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        lease: SlotLease | None, raw: BatchedModelOutput,
+        inputs: list[NodeInputs], req_info: Mapping[int, CurrentForwardPassInfo],
+    ) -> BatchedModelOutput:
+        """Collect one ordinary member's outputs after its resource commit."""
+        if self._enable_nvtx:
+            range_push("engine.collect_outputs")
+        t0 = phase_start()
+        try:
+            out = self._collect_outputs(
+                submodule_mgmt, lease, raw, inputs, req_info,
+                request_ids=batch.request_ids,
+                step_request_ids=batch.step_context.padded_request_ids,
+                graph_walk=batch.step_context.graph_walk,
+                rows_only=batch.rows_only,
+            )
+        finally:
+            phase_end("engine.collect_outputs", t0)
+            if self._enable_nvtx:
+                range_pop()
+        self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
+        return out
 
     @staticmethod
     def _add_resource_host_rows(
@@ -2487,9 +2681,52 @@ class Engine:
         ctx: StepContext,
         step: SubmoduleStep | None=None,
     ) -> tuple[AdmitOutcome, SubmoduleStep]:
+        step = self._declare_step(batch, rids, inputs, submodule, ctx, step)
+        return self._admit_step(batch, rids, inputs, ctx, step), step
+
+    def _admit_step(
+        self, batch: ExecutingBatch, rids: Sequence[int], inputs: list[NodeInputs],
+        ctx: StepContext, step: SubmoduleStep | None,
+    ) -> AdmitOutcome:
+        if step is None:
+            return ADMIT_OK
+        nvtx = self._enable_nvtx
+        if batch.chunk_ranges:
+            ctx.chunk_tokens_after = {
+                rid: inp.chunk_total - inp.chunk_start - inp.input_seq_len
+                for rid, inp in zip(rids, inputs, strict=True)
+                if not inp.is_final_chunk
+            }
+            ctx.reserve_whole_prefill = PerReqSetting.over(
+                ctx.chunk_tokens_after,
+                lambda rid: self._chunking.policy(
+                    batch.node_name, batch.step_context.walk_of(rid),
+                ).reserve_whole_prefill,
+            )
+        step.set_ctx(ctx)
+        if nvtx:
+            range_push("engine.admit")
+        t0 = phase_start()
+        try:
+            admit_outcome = self._runner.admit(step)
+        finally:
+            phase_end("engine.admit", t0)
+            if nvtx:
+                range_pop()
+        if not admit_outcome.ok:
+            batch.register_admit_error(admit_outcome.reason, admit_outcome.failed_resource)
+            for rid in batch.first_chunk_rids:
+                self._chunking.release(rid, batch.node_name)
+        return admit_outcome
+
+    def _declare_step(
+        self, batch: ExecutingBatch, rids: Sequence[int], inputs: list[NodeInputs],
+        submodule: NodeSubmodule, ctx: StepContext, step: SubmoduleStep | None,
+    ) -> SubmoduleStep | None:
+        """Declare once, separately from admission so a unit can preflight it."""
         if step is None:
             self._maybe_lease_piecewise_regions(batch.node_name, ctx, inputs)
-            if nvtx:
+            if self._enable_nvtx:
                 range_push("engine.declare_step")
             t0 = phase_start()
             try:
@@ -2502,48 +2739,9 @@ class Engine:
                 )
             finally:
                 phase_end("engine.declare_step", t0)
-                if nvtx:
+                if self._enable_nvtx:
                     range_pop()
-        if step is None:
-            # the submodule declared no step (a node owning no resources);
-            # there is nothing to admit, and the forward still runs
-            return ADMIT_OK, None
-        if batch.chunk_ranges:
-            walk_of = batch.step_context.walk_of
-            ctx.chunk_tokens_after = {
-                rid: inp.chunk_total - inp.chunk_start - inp.input_seq_len
-                for rid, inp in zip(rids, inputs, strict=True)
-                if not inp.is_final_chunk
-            }
-            ctx.reserve_whole_prefill = PerReqSetting.over(
-                ctx.chunk_tokens_after,
-                lambda rid: self._chunking.policy(
-                    batch.node_name, walk_of(rid),
-                ).reserve_whole_prefill,
-            )
-        # admit reads the step's ctx, so bind it before the sweep rather than
-        # in `_drive_step`
-        step.set_ctx(ctx)
-
-        if nvtx:
-            range_push("engine.admit")
-        t0 = phase_start()
-        try:
-            admit_outcome = self._runner.admit(step)
-        finally:
-            phase_end("engine.admit", t0)
-            if nvtx:
-                range_pop()
-
-        if not admit_outcome.ok:
-            batch.register_admit_error(
-                admit_outcome.reason, admit_outcome.failed_resource,
-            )
-            # A retry prepares the row again, so its length and cached prefix
-            # are checked against the pages it then finds, not the ones before.
-            for rid in batch.first_chunk_rids:
-                self._chunking.release(rid, batch.node_name)
-        return admit_outcome, step
+        return step
 
     def _maybe_lease_piecewise_regions(
         self, node_name: str, ctx: StepContext, inputs: list[NodeInputs],
@@ -2576,25 +2774,18 @@ class Engine:
         if leases:
             ctx.set_piecewise_leases(leases)
 
-    def _drive_step(
+    def _plan_step(
         self,
         batch: ExecutingBatch,
         submodule_mgmt: SubmoduleManagement,
-        request_ids: list[str],
+        request_ids: list[int],
         inputs: list[NodeInputs],
-        req_info: Mapping[str, CurrentForwardPassInfo],
+        req_info: Mapping[int, CurrentForwardPassInfo],
         ctx: StepContext,
         lease: SlotLease | None,
-        running_batched: bool,
         step: SubmoduleStep | None,
-        set_launch: bool,
-    ) -> tuple[dict | None, SubmoduleStep | None]:
-        """declare → admit → plan → preprocess → forward → commit for one forward.
-
-        ``request_ids`` are the real rids (for admit-fail / collect); the model
-        runs over ``ctx.request_ids`` (padded under a lease). Returns
-        ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
-        """
+    ) -> tuple[ModelInputsFromEngine, dict[str, Any]]:
+        """Plan and preprocess an admitted ordinary step, without launching it."""
         nvtx = self._enable_nvtx
         cg_runner = submodule_mgmt.accelerator_graph_runner
         submodule = submodule_mgmt.submodule
@@ -2699,6 +2890,32 @@ class Engine:
             if nvtx:
                 range_pop()
 
+        return engine_inputs, preprocessed
+
+    def _drive_step(
+        self,
+        batch: ExecutingBatch,
+        submodule_mgmt: SubmoduleManagement,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        req_info: Mapping[str, CurrentForwardPassInfo],
+        ctx: StepContext,
+        lease: SlotLease | None,
+        running_batched: bool,
+        step: SubmoduleStep | None,
+        set_launch: bool,
+    ) -> tuple[dict | None, SubmoduleStep | None]:
+        """Plan, preprocess, forward and commit one admitted ordinary step.
+
+        ``request_ids`` are the real rids (for admit-fail / collect); the model
+        runs over ``ctx.request_ids`` (padded under a lease). Returns
+        ``(raw_outputs, step)``; ``raw_outputs`` is None when admit failed.
+        """
+        engine_inputs, preprocessed = self._plan_step(
+            batch, submodule_mgmt, request_ids, inputs, req_info, ctx, lease, step,
+        )
+        nvtx = self._enable_nvtx
+        cg_runner = submodule_mgmt.accelerator_graph_runner
         if self._enable_profile and batch.exec_timings.fwd_start is None:
             batch.exec_timings.fwd_start = time.perf_counter()
         # The waiter is released inside the forward, immediately before the
@@ -2730,6 +2947,15 @@ class Engine:
             actual.update(dict.fromkeys(request_ids, ctx.repeats))
             batch.step_context.run_counts = MappingProxyType(actual)
 
+        self._commit_step(batch, submodule_mgmt, step, ctx)
+        return raw, step
+
+    def _commit_step(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        step: SubmoduleStep | None, ctx: StepContext,
+    ) -> None:
+        """Settle one submitted step through the ordinary resource owners."""
+        nvtx = self._enable_nvtx
         if step is not None:
             if nvtx:
                 range_push("engine.commit")
@@ -2743,7 +2969,6 @@ class Engine:
                 phase_end("engine.commit", t0)
                 if nvtx:
                     range_pop()
-        return raw, step
 
     def _forward(
         self,
@@ -2805,9 +3030,11 @@ class Engine:
                 columns = submodule_mgmt.run_columns.get(graph_walk, frozenset())
                 # a signal in the rows moves through them, in the graph
                 carries = {s: pair for s, pair in submodule_mgmt.carries[graph_walk].items() if s not in slot.row_heads}
+                part = cg_runner.run_part(
+                    lease, carries, self._runner.replay_columns(step, ctx.repeats), batch.iteration_columns,
+                )
                 stops, rows, spans = cg_runner.repeat(
-                    lease, carries, ctx.repeats,
-                    self._runner.replay_columns(step, ctx.repeats), columns, batch.iteration_columns,
+                    [part], ctx.repeats, columns,
                     None if batch.token_stream is None else (batch.token_stream, streamed[0]),
                 )
                 out = dataclasses.replace(
@@ -2957,6 +3184,10 @@ class Engine:
         beside = self._stage_lock is not None and self._beside_chain(batch.node_name, batch.graph_walk)
         with self._stage_lock if beside else nullcontext():
             outputs = self.exec(batch)
+        return self._postprocess_outputs(batch, outputs)
+
+    def _postprocess_outputs(self, batch: ExecutingBatch, outputs: BatchedModelOutput) -> BatchedModelOutput:
+        """The ordinary host tail, shared by independent and grouped steps."""
         laps = PhaseLaps("engine.")
         # A failed admit means no forward ran and every rid's outputs are empty,
         # so the tail has nothing to consume; the worker re-drives the step.

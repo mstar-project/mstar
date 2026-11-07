@@ -18,6 +18,147 @@ from mstar.engine.resources.step import BucketKey, SlotLease  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 
 
+def _connected_engine(transform=None, *, head_state=False, mixed=False):
+    """Real ordinary preparation/plan/collect, with replay standing in for CUDA."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphSlot
+    from mstar.engine.engine import ExecutingBatch, ExecutionGroup, SubmoduleManagement
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.engine.resources.step import StepContext
+    from mstar.graph.runtime.base import ExecutionUnit
+    from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule
+    from mstar.worker.micro_scheduler import ScheduledBatch
+
+    events = []
+
+    class Node(NodeSubmodule):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def prepare_inputs(self, inputs, fwd_info, **kw):
+            if head_state and self.name == "a":
+                self.request_state(fwd_info.request_id).kwargs["count"] = 1
+            x = inputs["x"][0]
+            if self.name == "b" and transform is not None:
+                x = transform(x)
+                if x is None:
+                    return None
+            return NodeInputs(tensor_inputs={"x": x})
+
+        def can_batch(self, **kw):
+            return True
+
+        def preprocess(self, graph_walk, engine_inputs, inputs):
+            values = [inp.tensor_inputs["x"] for inp in inputs]
+            if mixed and self.name == "b":
+                # Real-only work must stay real; its values precede future rows.
+                values.insert(0, torch.ones(1, 2).mul(7))
+            return {"x": torch.cat(values)}
+
+        def forward(self, *a, **kw):
+            raise AssertionError("connected execution must replay the captures")
+
+    eng = Engine.__new__(Engine)
+    eng._enable_nvtx = eng._enable_profile = False
+    eng._device = torch.device("cpu")
+    eng._device_capability = SimpleNamespace(is_accelerator=False)
+    eng._keyed_walks = eng._loopback_steps = {}
+    eng._runner = StepRunner({})
+    eng._submodules = {}
+    members = []
+    leases = {}
+    for name in ("a", "b"):
+        # Three captured rows, two real rows: stale producer padding must
+        # never replace the consumer template's padding.
+        config = BatchedAcceleratorGraphConfig(
+            capture_graph_walk="prefill",
+            single_request_inputs=NodeInputs(tensor_inputs={"x": torch.ones(1, 2).mul(9)}),
+        )
+        runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+        bucket = BucketKey("prefill", 3, 0)
+        leases[name] = SlotLease(0, bucket)
+        inputs = torch.zeros(4 if name == "b" and mixed else 3, 2)
+        output = torch.full_like(inputs, -999)
+
+        def replay(name=name, inputs=inputs, output=output):
+            events.append(name)
+            output.copy_(inputs + (10 if name == "a" else 100))
+
+        slot = AcceleratorGraphSlot(
+            graph=SimpleNamespace(replay=replay), static_inputs={"x": inputs}, static_input_keys=("x",),
+            static_outputs=BatchedModelOutput(row_outputs={"x": output}),
+            dummy_rids=[-1, -2, -3], dummy_metadata={-3: SimpleNamespace()}, config_idx=0,
+        )
+        runner._buckets = {bucket: SimpleNamespace(config=config, slots=[slot])}
+        runner._static_buffer_seq_dims = {}
+        runner._submodule_name = name
+        runner.release = lambda lease, bs, name=name: events.append(f"release:{name}")
+        mgmt = SubmoduleManagement(Node(name), None, None, None, {}, accelerator_graph_runner=runner)
+        eng._submodules[name] = mgmt
+        batch = ExecutingBatch(
+            node_name=name, per_request_info={rid: SimpleNamespace(request_id=rid) for rid in (2, 1)},
+            step_context=StepContext((2, 1), "prefill", 0, False),
+            per_request_input_tensors=(
+                {rid: {"x": [torch.full((1, 2), rid * 1.)]} for rid in (2, 1)} if name == "a" else {}
+            ),
+        )
+        members.append((ScheduledBatch(name, "prefill", {2: 1, 1: 1}), batch))
+    eng._chunking = ChunkingManagement(eng._submodules)
+
+    def reserve(batch):
+        lease = leases[batch.node_name]
+        batch.lease_slot(lease)
+        return lease
+
+    eng.reserve_replay_slot = reserve
+    group = ExecutionGroup(ExecutionUnit(1, ("a", "b"), (("a", "b", "x"),), ((), ("x",))), 1, tuple(members))
+    return eng, group, events
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed):
+    eng, group, events = _connected_engine(mixed=mixed)
+    runner = eng._submodules["a"].accelerator_graph_runner
+    runs = []
+    run = runner._run
+    runner._run = lambda ops: (runs.append(list(ops)), run(ops))[-1]
+    outputs = eng.exec_group(group)
+    assert group.submitted and group.refusal is None and len(runs) == 1
+    assert events == ["a", "b", "release:b", "release:a"]
+    assert outputs[0].per_rid_outputs[2]["x"][0].tolist() == [[12., 12.]]
+    b_slot = group.parts[1].slot
+    expected = [[107., 107.], [112., 112.], [111., 111.], [109., 109.]] if mixed else [
+        [112., 112.], [111., 111.], [109., 109.],
+    ]
+    assert b_slot.static_outputs.row_outputs["x"].tolist() == expected
+    # Output collection made durable copies before either slot was released.
+    group.parts[0].slot.static_outputs.row_outputs["x"].fill_(-1)
+    assert outputs[0].per_rid_outputs[2]["x"][0].tolist() == [[12., 12.]]
+
+
+@pytest.mark.parametrize("transform", [
+    lambda x: x + 1,
+    lambda x: torch.empty(2).copy_(x),
+    lambda x: x[0].item(),
+    lambda x: x.tolist(),
+    lambda x: bool(x[0]),
+    lambda x: None,
+])
+def test_connected_actual_preparation_refuses_before_launch_without_failing_rows(transform):
+    eng, group, events = _connected_engine(transform)
+    assert eng.exec_group(group) is None
+    assert group.refusal and not group.submitted
+    assert not any(event in {"a", "b"} for event in events)
+    assert all(not batch.failed_requests for _, batch in group.members)
+
+
+def test_connected_head_cannot_mutate_request_state_before_a_later_refusal():
+    eng, group, events = _connected_engine(head_state=True)
+    assert eng.exec_group(group) is None
+    assert not eng._submodules["a"].submodule.request_states
+    assert events == []
+
+
 class _Batch:
     def __init__(self, rids, walk="decode"):
         self.node_name = "llm"
@@ -201,3 +342,44 @@ def test_a_row_the_node_kept_reads_its_kept_signal_off_its_row():
     (kept,), (routed,) = sub.row_inputs[0]["h"], sub.row_inputs[1]["h"]
     assert kept.tolist() == [1.0, 2.0] and routed.tolist() == [9.0, 9.0]
 
+
+
+def test_connected_capture_can_run_when_the_eager_forward_does_not_batch():
+    eng, group, events = _connected_engine()
+    for mgmt in eng._submodules.values():
+        mgmt.submodule.can_batch = lambda **kw: False
+    outputs = eng.exec_group(group)
+    assert group.submitted and len(outputs) == 2
+    assert outputs[1].per_rid_outputs[2]["x"][0].tolist() == [[112., 112.]]
+    assert events == ["a", "b", "release:b", "release:a"]
+
+
+@pytest.mark.parametrize("kept", [frozenset(), frozenset({1})])
+def test_connected_completion_keeps_ordinary_last_member_metadata(kept):
+    eng, group, _ = _connected_engine()
+    eng._loopback_steps = {1: ("a", "prefill"), 2: ("a", "prefill")}
+    group.members[0][1].rows_only = True
+    group.members[1][1].loopback_rids = kept
+    outputs = eng.exec_group(group)
+    assert group.submitted
+    assert outputs[1].loopback_rids == kept
+    assert eng._loopback_steps == {rid: ("b", "prefill") for rid in kept}
+    assert eng._loopback_rows(group.members[0][1]) == ([False, False] if kept else None)
+    assert eng._loopback_rows(group.members[1][1]) == ([False, True] if kept else None)
+
+
+@pytest.mark.parametrize("unsupported", ["run", "resident", "row_heads"])
+def test_connected_refuses_unstaged_captured_state_before_launch(unsupported):
+    eng, group, events = _connected_engine()
+    batch = group.members[0][1]
+    runner = eng._submodules["a"].accelerator_graph_runner
+    slot = next(iter(runner._buckets.values())).slots[0]
+    if unsupported == "resident":
+        batch.step_context.resident = object()
+    elif unsupported == "run":
+        slot.run = object()
+    else:
+        slot.row_heads = {"x": "x"}
+    assert eng.exec_group(group) is None
+    assert not group.submitted
+    assert events == ["release:a"]

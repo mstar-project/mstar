@@ -1413,6 +1413,22 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
 # ── engine capture-group gate ───────────────────────────────────────────
 
 
+@pytest.mark.parametrize(("groups", "expected"), [
+    ({"r0": "left", "r1": "right", "r2": "left"}, ["r0"]),
+    ({"r0": "left", "r1": "left", "r2": "left"}, ["r0", "r1"]),
+])
+def test_connected_members_share_the_existing_builder_capture_key_and_tightest_cap(groups, expected):
+    from mstar.graph.runtime.base import ExecutionUnit
+
+    a, b = _Engine(max_bs=8), _Engine(max_bs=2, groups=groups)
+    scheduler = _scheduler(a)
+    scheduler.engine_manager.get_engine = lambda name: a if name == NODE else b
+    scheduler.execution_units[NODE, WALK] = ExecutionUnit(0, (NODE, "b"), ((NODE, "b", "x"),), ((), ()))
+    manager = _Manager(["r0", "r1", "r2"])
+    batch = _next_batch(scheduler, manager)
+    assert list(batch.request_to_worker_graph) == expected
+
+
 class _Submodule:
     def __init__(self, split):
         self._split = split

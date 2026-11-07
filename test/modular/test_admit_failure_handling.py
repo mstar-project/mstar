@@ -61,10 +61,9 @@ def _offloading(rid: str = "r0") -> RequestOffloading:
 # --- engine: the tail must not run over a step that never ran --------------
 
 
-class _FakeEngine:
+class _FakeEngine(Engine):
     """Just enough engine to exercise the ``exec``/``postprocess`` branch."""
 
-    exec_and_postprocess = Engine.exec_and_postprocess
     _stage_lock = None  # no lanes
 
     def __init__(self, admit_error):
@@ -723,11 +722,8 @@ class _FakeMgmt:
             raise RuntimeError("slot setup failed")
 
 
-class _FakeExecEngine:
+class _FakeExecEngine(Engine):
     """Engine internals bound onto stubs, to drive `_exec_per_request` alone."""
-
-    _exec_per_request = Engine._exec_per_request
-    _declare_and_admit = Engine._declare_and_admit
 
     def __init__(
         self, fail_on: str | None = None, num_slots: int = 1, next_slot: int = 0,
@@ -745,7 +741,7 @@ class _FakeExecEngine:
         self.launch_signals: list[str] = []
         self._runner = self
         self._device = torch.device("cpu")
-        self.device_capability = DeviceCapability.of(self._device)
+        self._device_capability = DeviceCapability.of(self._device)
         # the per-request path's slots; no fence, so no CUDA event is recorded
         self.piecewise_slots: list[int] = []
         self.run_slots: list[int] = []
@@ -998,7 +994,7 @@ class _LoggedEvent(threading.Event):
 def _fenced(monkeypatch, **kwargs) -> _FakeExecEngine:
     engine = _FakeExecEngine(**kwargs)
     engine.mgmt.needs_slot_fence = True
-    engine.device_capability = SimpleNamespace(
+    engine._device_capability = SimpleNamespace(
         is_accelerator=True, is_capturing=lambda: False,
     )
     monkeypatch.setattr(torch, "Event", lambda device=None: _FakeEvent(engine))

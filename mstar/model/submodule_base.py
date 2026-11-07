@@ -1015,6 +1015,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
 
     def request_state(self, request_id: str) -> PerRequestState:
         """The request's state, created on first access."""
+        from mstar.engine.connected_inputs import active_guard
+
+        guard = active_guard()
+        if guard is not None:
+            guard.refuse("connected preparation accesses mutable model request state")
         state = self.request_states.get(request_id)
         if state is None:
             state = self.request_states[request_id] = PerRequestState()

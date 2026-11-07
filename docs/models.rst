@@ -229,6 +229,22 @@ Notes
   for each shape it serves untuned; see "Tuned kernel configs" in :doc:`adding_models`.
 - To add a new family, see :doc:`adding_models`.
 
+Connected captures
+~~~~~~~~~~~~~~~~~~
+
+``walk_runs: [prefill]`` in a serving config asks the worker to submit eligible
+connected nodes of that walk together. It is off by default. Models use their
+ordinary graph edges, captures, resource declarations and ``REPEAT_CARRIES``
+names; no additional model method is required.
+
+The worker selects common rows, prepares and admits all members, and submits
+their captures and internal copies in graph order. An unsubmitted refusal runs
+the ordinary head. Currently eligible sections are acyclic, on one GPU, and
+have disjoint resource owners. Preparation may structurally pack future inputs
+with real values; arithmetic on future values, mutable model request state,
+and uncaptured producer output transformations use ordinary execution. The
+phase trace records ``connected.members#`` and each member's real row count.
+
 OmniVoice notes
 ~~~~~~~~~~~~~~~
 

@@ -738,6 +738,52 @@ def test_unit_cancellation_does_not_attach_to_recycled_handles(submitted):
     assert rt.cancel_execution_unit(replacement)
 
 
+@pytest.mark.parametrize("refuse", [False, True])
+def test_worker_claim_runs_the_ordinary_engine_members_and_settles_rust_once(refuse):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from mstar.worker.worker import Worker
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "modular"))
+    from test_engine_uniform_inputs import _connected_engine
+
+    rt = _two_node_runtime()
+    # The engine fixture intentionally orders its real rows [2, 1].
+    _admit(rt, "unused")
+    a, b = _admit(rt, "ra"), _admit(rt, "rb")
+    assert (a, b) == (1, 2)
+    rt.ingest_inputs_batch(_ingest_block([a, b, a, b], [
+        _spec("in", "a"), _spec("in", "a"), _spec("y", "b"), _spec("y", "b"),
+    ]))
+    eng, fixture, events = _connected_engine((lambda x: x + 1) if refuse else None)
+    for scheduled, executing in fixture.members:
+        scheduled.graph_walk = executing.step_context.graph_walk = WALK
+        eng._submodules[scheduled.node_name].accelerator_graph_runner.launch_refusal = lambda walk: None
+    unit, = rt.execution_units(WALK)
+    worker = Worker.__new__(Worker)
+    worker._graph_runtime = rt
+    worker.scheduler = SimpleNamespace(execution_units={("a", WALK): unit})
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: eng)
+    worker._build_executing_batch = lambda batch: fixture.members[1][1]
+    head, executing = fixture.members[0]
+    rt.pop_rids("a", WALK, [b, a], check_ready=True)
+    group = worker._claim_group(head, executing)
+    assert group is not None and rt.get_ready_nodes(set()) == []
+    outputs = eng.exec_group(group)
+    worker._settle_group_claim(group)
+    worker._settle_group_claim(group)
+    if refuse:
+        assert outputs is None and not group.submitted
+        assert set(rt.get_ready_nodes(set())[0].rids) == {a, b}
+        assert events == ["release:a"]
+    else:
+        assert len(outputs) == 2 and group.submitted
+        for node in ("a", "b"):
+            _route(rt, [b, a], node, [], [[], []])
+        assert rt.get_ready_nodes(set()) == []
+        assert events == ["a", "b", "release:b", "release:a"]
+
+
 def test_unit_lands_in_graph_order_with_internal_readiness_and_external_outputs_once(tmp_path):
     from types import SimpleNamespace
 

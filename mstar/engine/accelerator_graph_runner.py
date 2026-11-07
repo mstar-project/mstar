@@ -676,13 +676,14 @@ def _copy_words(target: torch.Tensor, source: torch.Tensor) -> list[int] | None:
     ]
 
 
-def _launch_words(ops: Sequence[tuple[torch.Tensor, torch.Tensor] | None]) -> list[int] | None:
-    """``ops`` as ``mstar_rust.launch_run`` takes them, or None if one of them
-    can't be said (that run stays on the host's loop)."""
+def _launch_words(ops: Sequence[tuple[torch.Tensor, torch.Tensor] | int]) -> list[int] | None:
+    """``ops`` as ``mstar_rust.launch_run`` takes them: a launch is its graph
+    exec's address, a copy its target and source. None if a copy can't be
+    said (that run stays on the host's loop)."""
     words: list[int] = []
     for op in ops:
-        if op is None:
-            words.append(0)
+        if not isinstance(op, tuple):
+            words.extend((0, op))
             continue
         copy = _copy_words(*op)
         if copy is None:
@@ -743,6 +744,15 @@ class AcceleratorGraphSlot:
     # loop-back signal -> the static input this capture reads it into, off the
     # node's rows, at its head
     row_heads: Mapping[str, str] = MappingProxyType({})
+
+
+class RunPart(NamedTuple):
+    """One ordinary capture and the copies/columns it reads before replay."""
+    slot: AcceleratorGraphSlot
+    # (source, target): the same buffers every round, a carried signal each
+    copies: Sequence[tuple[torch.Tensor, torch.Tensor]]
+    # (column, target): a column a round, ``[rows, repeats, ...]``
+    columns: Sequence[tuple[torch.Tensor, torch.Tensor]]
 
 
 @dataclass
@@ -1969,60 +1979,78 @@ class AcceleratorGraphRunner:
             profiler.range_pop()
         return slot.static_outputs
 
-    def repeat(
-        self, lease: SlotLease, carries: Mapping[str, CarryPair], repeats: int,
+    def run_part(
+        self, lease: SlotLease, carries: Mapping[str, CarryPair],
         replay_columns: Collection[tuple[torch.Tensor, torch.Tensor]] = (),
-        columns: Collection[str] = (), iteration: Mapping[str, torch.Tensor] | None = None,
+        iteration: Mapping[str, torch.Tensor] | None = None,
+    ) -> RunPart:
+        """This step's part of a run: every loop-back signal's output copied
+        into the static input it feeds (``carries``) before each replay after
+        the first, each iteration input's column for that replay into its own
+        (``iteration``, ``[rows, repeats, ...]``), and the resources' into
+        theirs (``replay_columns``, column then target)."""
+        slot = self.slot_for(lease)
+        copies = [
+            (output_named(slot.static_outputs, pair.output), slot.static_inputs[pair.input])
+            for pair in carries.values()
+        ]
+        stage = [(column, slot.static_inputs[name]) for name, column in (iteration or {}).items()]
+        return RunPart(slot, copies, [*stage, *replay_columns])
+
+    def repeat(
+        self, parts: Sequence[RunPart], repeats: int, columns: Collection[str] = (),
         stream: tuple[TokenStream, str] | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """The rest of a step that repeats, after its first replay: before
-        each replay, every loop-back signal's output is copied into the static
-        input it feeds (``carries``), and each iteration input's column for
-        that replay into its own (``iteration``, ``[rows, repeats, ...]``), and
-        the resources' into theirs (``replay_columns``, column then target).
-        Returns the stop buffers, one value a row each, and the row outputs
-        named in ``columns``, ``[rows, ...]`` each, both with a column per
-        replay (``[rows, repeats, ...]``): a replay overwrites what the last
-        one left, so each is copied out on the stream before the next one.
-        Third, the spans of the spanned ones among ``columns``
-        (``[rows, repeats, 2]``). ``stream``: where each replay's tokens land
-        as it finishes, and the stop buffer that holds them."""
-        slot = self.slot_for(lease)
+        """The rest of a run, after the replay of its last part (this step's,
+        ``parts[-1]``): ``repeats - 1`` rounds, each part in order taking its
+        copies and its columns' entry for that round (``RunPart``) and
+        replaying. Returns the last part's stop buffers, one value a row each,
+        and its row outputs named in ``columns``, ``[rows, ...]`` each, both
+        with a column per replay (``[rows, repeats, ...]``): a replay
+        overwrites what the last one left, so each is copied out on the stream
+        before the next one. Third, the spans of the spanned ones among
+        ``columns`` (``[rows, repeats, 2]``). ``stream``: where each replay's
+        tokens land as it finishes, and the stop buffer that holds them."""
+        slot = parts[-1].slot
         # a count stop reads no buffer
         buffers = slot.static_outputs.check_stop_buffers or {}
         rows_out = {name: slot.static_outputs.row_outputs[name] for name in columns}
         # a spanned output's spans, a column a replay like the output itself
         spans = slot.static_outputs.output_spans or {}
         spans_out = {name: spans[name] for name in columns if name in spans}
-        copies = [
-            (output_named(slot.static_outputs, pair.output), slot.static_inputs[pair.input])
-            for pair in carries.values()
-        ]
-        stage = [(column, slot.static_inputs[name]) for name, column in (iteration or {}).items()]
         # two names can share a buffer
         unique = {id(t): t.reshape(t.shape[0], -1)[:, 0] for t in buffers.values()}
         unique.update((id(t), t) for t in (*rows_out.values(), *spans_out.values()))
         wide = {key: t.new_empty(t.shape[0], repeats, *t.shape[1:]) for key, t in unique.items()}
-        # the run, in order: a launch is None, a copy its target and source
-        ops: list[tuple[torch.Tensor, torch.Tensor] | None] = []
+        # the run, in order: a launch is its slot, a copy its target and source
+        ops: list[tuple[torch.Tensor, torch.Tensor] | AcceleratorGraphSlot] = []
         for i in range(repeats):
             if i:
-                ops.extend((target, source.reshape(target.shape)) for source, target in copies)
-                ops.extend((target, column[:, i].reshape(target.shape)) for column, target in stage)
-                ops.extend((target, column[:, i]) for column, target in replay_columns)
-                ops.append(None)
+                for part in parts:
+                    ops.extend((target, source.reshape(target.shape)) for source, target in part.copies)
+                    ops.extend((target, column[:, i].reshape(target.shape)) for column, target in part.columns)
+                    ops.append(part.slot)
             ops.extend((wide[key][:, i], tensor) for key, tensor in unique.items())
             if stream is not None:
                 landing, name = stream
                 token = buffers[name].reshape(buffers[name].shape[0], -1)[:, 0]
                 ops.append((landing.tokens[:token.shape[0], i], token))
                 ops.append((landing.landed, landing.counts[i:i + 1]))
-        self._run(slot, ops)
+        self._run(ops)
         return (
             {key: wide[id(t)] for key, t in buffers.items()},
             {key: wide[id(t)] for key, t in rows_out.items()},
             {key: wide[id(t)] for key, t in spans_out.items()},
         )
+
+    def launch_parts(self, parts: Sequence[RunPart]) -> None:
+        """Submit a prepared unit from its first member, in one ordered run."""
+        ops: list[AcceleratorGraphSlot | tuple[torch.Tensor, torch.Tensor]] = []
+        for part in parts:
+            ops.extend((target, source.reshape(target.shape)) for source, target in part.copies)
+            ops.extend((target, column[:, 0].reshape(target.shape)) for column, target in part.columns)
+            ops.append(part.slot)
+        self._run(ops)
 
     def captured_output(self, name: str) -> torch.Tensor | None:
         """A capture's static output ``name``, row i request i; None if no capture has one."""
@@ -2047,20 +2075,26 @@ class AcceleratorGraphRunner:
             slot.token_stream = TokenStream(rows, limit, self._device)
         return slot.token_stream
 
-    def _run(self, slot: AcceleratorGraphSlot, ops: Sequence[tuple[torch.Tensor, torch.Tensor] | None]) -> None:
-        """A run's launches and copies, in order: from one Rust call with the
-        GIL released where it can (``mstar_rust.launch_run``), else here."""
-        words = _launch_words(ops) if slot.raw_launch else None
-        if words is not None:
+    def _run(self, ops: Sequence[tuple[torch.Tensor, torch.Tensor] | AcceleratorGraphSlot]) -> None:
+        """A run's launches (a slot, its graph) and copies (target, source), in
+        order: from one Rust call with the GIL released where every slot it
+        launches can (``mstar_rust.launch_run``), else here."""
+        raw = all(op.raw_launch for op in ops if not isinstance(op, tuple))
+        launches = {
+            id(op): self._graph_backend.raw_launch(op.graph) for op in ops if raw and not isinstance(op, tuple)
+        }
+        words = _launch_words([op if isinstance(op, tuple) else launches[id(op)].exec for op in ops]) if raw else None
+        if words is not None and launches:
             import mstar_rust
 
-            mstar_rust.launch_run(*self._graph_backend.raw_launch(slot.graph), words)
+            first = next(iter(launches.values()))
+            mstar_rust.launch_run(first.graph_launch, first.memcpy_2d, first.stream, words)
             return
         for op in ops:
-            if op is None:
-                slot.graph.replay()
-            else:
+            if isinstance(op, tuple):
                 op[0].copy_(op[1], non_blocking=True)
+            else:
+                op.graph.replay()
 
     def launch_refusal(self, walk: str) -> str | None:
         """After capture: why a run of ``walk`` can't launch from one Rust call,
