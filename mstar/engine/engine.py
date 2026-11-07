@@ -671,7 +671,10 @@ class ExecutionGroup:
     unit: ExecutionUnit
     claim: int
     members: tuple[tuple["ScheduledBatch", ExecutingBatch], ...]
+    # Ordinary ready member that triggered this attempt; members stay in graph order.
+    trigger: int = 0
     submitted: bool = False
+    acknowledged: bool = False
     refusal: str | None = None
     parts: list[RunPart] = field(default_factory=list)
     initial_copies: list[tuple[torch.Tensor, torch.Tensor]] = field(default_factory=list)
@@ -2652,7 +2655,7 @@ class Engine:
             for scheduled, batch in group.members:
                 scheduled.repeats = batch.step_context.repeats
             group.submitted = True
-            head = group.members[0][1]
+            head = group.members[group.trigger][1]
             if head.launch_started_event is not None:
                 head.launch_started_event.set()
             retained = prepared[0][1].accelerator_graph_runner.launch_parts(

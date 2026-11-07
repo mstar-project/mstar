@@ -858,6 +858,13 @@ def test_stream_unit_lands_independent_counts_and_releases_zero_work_without_a_f
 
 
 def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_again():
+    from types import SimpleNamespace
+
+    from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.resources.step import StepContext
+    from mstar.worker.micro_scheduler import ScheduledBatch
+    from mstar.worker.worker import Worker
+
     rt, rid = _stream_unit_runtime()
     rt.ingest_inputs_batch(_ingest_block([rid, rid], [_spec("seed", "a"), _spec("y", "b")]))
     walks = ("produce", "consume")
@@ -878,9 +885,31 @@ def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_
     assert rt.graph_passes({rid: 9}) == [0]
     assert rt.claim_execution_unit("a", "produce", [rid], walks) is None  # no member ready
     rt.ingest_inputs_batch(_ingest_block([rid], [_spec("x", "b")]))
-    claim, _ = rt.claim_execution_unit("a", "produce", [rid], walks)
-    rt.submit_execution_unit(claim)
-    assert rt.release_execution_unit_member(claim, "a", 7, [rid])
+    unit, = rt.execution_units("produce")
+    worker = Worker.__new__(Worker)
+    worker._graph_runtime, worker._step_repeats = rt, None
+    worker.scheduler = SimpleNamespace(execution_units={("b", "consume"): unit})
+    checked = []
+    engine = SimpleNamespace(_submodules={node: SimpleNamespace(accelerator_graph_runner=SimpleNamespace(
+        launch_refusal=lambda walk, node=node: checked.append((node, walk)),
+    )) for node in unit.nodes})
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker._build_executing_batch = lambda batch: ExecutingBatch(
+        batch.node_name, {}, StepContext([rid], batch.graph_walk, 0, False),
+    )
+    popped = rt.pop_rids("b", "consume", [rid], check_ready=True)
+    scheduled = ScheduledBatch("b", "consume", {rid: 9}, popped.input_edges, list(popped.output_signals))
+    executing = worker._build_executing_batch(scheduled)
+    group = worker._claim_group(scheduled, executing)
+    assert group.trigger == 1 and group.members[1][1] is executing
+    assert [(b.node_name, b.graph_walk) for b, _ in group.members] == [("a", "produce"), ("b", "consume")]
+    assert checked == [("a", "produce"), ("b", "consume")]
+    claim = group.claim
+    group.submitted = True
+    worker._settle_group_claim(group)
+    worker._settle_group_claim(group)
+    assert group.claim == claim and group.acknowledged
+    assert rt.release_execution_unit_member(group.claim, "a", 7, [rid])
     assert rt.get_ready_nodes(set()) == []
     rt.complete_and_route_batch(RouteInput(
         partition="sink", graph_walk="consume", node_name="b", output_signals=[],

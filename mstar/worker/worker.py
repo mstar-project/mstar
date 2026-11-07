@@ -2672,7 +2672,8 @@ class Worker(RepeatingSteps):
                                 f"connected.rows.{scheduled.node_name}.{scheduled.graph_walk}#",
                                 len(member.request_ids),
                             )
-                outputs = engine.exec_and_postprocess(node_batch) if group_outputs is None else group_outputs[0]
+                outputs = (engine.exec_and_postprocess(node_batch) if group_outputs is None
+                           else group_outputs[group.trigger])
             laps.skip()
             if execution_stream is not None:
                 lane = self.scheduler.lane_of.get((batch.node_name, batch.graph_walk), CHAIN_LANE)
@@ -2683,7 +2684,7 @@ class Worker(RepeatingSteps):
                 event.record(execution_stream)
                 node_batch.completion_event = event
                 if group_outputs is not None:
-                    for _, member in group.members[1:]:
+                    for _, member in group.members:
                         member.completion_event = event
                 laps.lap("completion_event")
                 if gpu_start is not None:
@@ -2716,7 +2717,9 @@ class Worker(RepeatingSteps):
                 node_batch, publish_request_ids=publish_rids,
             )
             if group is not None and group.submitted:
-                for _, member in group.members[1:]:
+                for i, (_, member) in enumerate(group.members):
+                    if i == group.trigger:
+                        continue
                     member.release_waiters()
                     member.resource_publish_info = engine.finalize_batch(
                         member, publish_request_ids=self._publishable_request_ids(member),
@@ -2851,32 +2854,35 @@ class Worker(RepeatingSteps):
         if unit is None or batch.request_walks or batch.chunk_ranges or node_batch.failed_requests:
             return None
         engine = self.engine_manager.get_engine(batch.node_name)
-        for node in unit.nodes:
+        for node, walk in zip(unit.nodes, unit.graph_walks, strict=True):
             if self.engine_manager.get_engine(node) is not engine:
                 return None
             runner = engine._submodules[node].accelerator_graph_runner
-            if runner is None or runner.launch_refusal(batch.graph_walk) is not None:
+            if runner is None or runner.launch_refusal(walk) is not None:
                 return None
         claimed = self._graph_runtime.claim_execution_unit(
-            batch.node_name, batch.graph_walk, list(node_batch.request_ids),
+            unit.nodes[0], unit.graph_walks[0], list(node_batch.request_ids), unit.graph_walks,
         )
         if claimed is None:
             return None
         claim, popped = claimed
         members = []
         try:
-            for i, (node, part) in enumerate(zip(unit.nodes, popped, strict=True)):
-                scheduled = replace(batch, output_signals=list(part.output_signals)) if i == 0 else ScheduledBatch(
-                    node_name=node, graph_walk=batch.graph_walk,
+            trigger = tuple(zip(unit.nodes, unit.graph_walks, strict=True)).index((batch.node_name, batch.graph_walk))
+            for i, (node, walk, part) in enumerate(zip(unit.nodes, unit.graph_walks, popped, strict=True)):
+                scheduled = replace(
+                    batch, output_signals=list(part.output_signals),
+                ) if i == trigger else ScheduledBatch(
+                    node_name=node, graph_walk=walk,
                     request_to_worker_graph=dict(zip(part.wg_ids.keys, part.wg_ids.values, strict=True)),
                     input_edges=part.input_edges, output_signals=list(part.output_signals),
                 )
-                executing = node_batch if i == 0 else self._build_executing_batch(scheduled)
+                executing = node_batch if i == trigger else self._build_executing_batch(scheduled)
                 if tuple(executing.request_ids) != tuple(node_batch.request_ids):
                     self._graph_runtime.cancel_execution_unit(claim)
                     return None
                 members.append((scheduled, executing))
-            group = ExecutionGroup(unit, claim, tuple(members))
+            group = ExecutionGroup(unit, claim, tuple(members), trigger=trigger)
             self._stamp_group_repeats(group)
         except Exception:
             self._graph_runtime.cancel_execution_unit(claim)
@@ -2885,12 +2891,12 @@ class Worker(RepeatingSteps):
 
     def _settle_group_claim(self, group: ExecutionGroup) -> None:
         """Publish the GPU thread's irreversible boundary on the main thread."""
-        if group.claim:
+        if not group.acknowledged:
             if group.submitted:
                 self._graph_runtime.submit_execution_unit(group.claim)
             else:
                 self._graph_runtime.cancel_execution_unit(group.claim)
-            group.claim = 0
+            group.acknowledged = True
 
     def _hold_rows(self, lane: int, rids: Iterable[int]) -> None:
         """The rows ``lane``'s step in flight holds are now ``rids``. Teardown
@@ -2922,7 +2928,7 @@ class Worker(RepeatingSteps):
         if step.group is not None:
             self._settle_group_claim(step.group)
             if step.group.submitted:
-                step.batch = step.group.members[0][0]
+                step.batch = step.group.members[step.group.trigger][0]
         refused = step.node_batch.admit_error is not None
         if refused:
             self._handle_admit_failure(
@@ -2947,8 +2953,9 @@ class Worker(RepeatingSteps):
         if step.group is not None and step.group.submitted:
             for i, (scheduled, executing) in enumerate(step.group.members):
                 member = replace(step, batch=scheduled, node_batch=executing, node_name=scheduled.node_name,
+                                 graph_walk=scheduled.graph_walk,
                                  partition=self.request_state.get_partition_for_node(scheduled.node_name), group=None)
-                if i:
+                if i != step.group.trigger:
                     self._clear_in_flight_flag(scheduled)
                     self._settle_step_rows(member, executing.outputs)
                 self._finish_step(member, executing.outputs)

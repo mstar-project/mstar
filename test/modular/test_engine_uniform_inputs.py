@@ -140,8 +140,14 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False, device="
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed):
+@pytest.mark.parametrize("trigger", [0, 1])
+def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed, trigger):
+    import threading
+
     eng, group, events = _connected_engine(mixed=mixed)
+    group.trigger = trigger
+    for _, member in group.members:
+        member.launch_started_event = threading.Event()
     a, b = (eng._submodules[name] for name in ("a", "b"))
     b.slot_rotation = a.slot_rotation
     a.slot_rotation.count = 2
@@ -158,7 +164,12 @@ def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed):
     runner = eng._submodules["a"].accelerator_graph_runner
     runs = []
     run = runner._run
-    runner._run = lambda ops: (runs.append(list(ops)), run(ops))[-1]
+    def launch(ops):
+        assert group.members[trigger][1].launch_started_event.is_set()
+        assert not group.members[1 - trigger][1].launch_started_event.is_set()
+        runs.append(list(ops))
+        return run(ops)
+    runner._run = launch
     outputs = eng.exec_group(group)
     assert group.submitted and group.refusal is None and len(runs) == 1
     assert a.next_slot == 1  # one component lease, shared by both members
