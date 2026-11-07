@@ -1471,3 +1471,31 @@ def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_t
     assert not stopped_outputs[RUN_COUNTS].any()
     assert torch.equal(runner.test_resource[1:], before)
     assert run.state.stream.take(take) == ([], [])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA publication kernel loading")
+def test_publication_never_loads_a_new_cas_kernel_for_row_or_descriptor_values():
+    from triton import knobs
+
+    from mstar.engine.resources.run_rows import RunRows
+
+    membership = RunRows(torch.device("cuda", 0), rows=18, capacity=18, binding_width=1)
+    membership._generation[0] = 1 << 30  # descriptor words require the same 64-bit ABI at all ages
+    descriptors = [membership.reserve_row(row, 1, row, (row + 1,)) for row in (0, 1, 17)]
+
+    def no_late_load(*args):
+        raise AssertionError("publication loaded a CUDA module while runs could already be active")
+
+    knobs.runtime.kernel_load_start_hook.add(no_late_load)
+    try:
+        with torch.cuda.stream(membership.publication_stream):
+            for descriptor in descriptors:
+                membership.publish_row(descriptor)
+                membership.cancel(descriptor)
+        membership.publication_stream.synchronize()
+    finally:
+        knobs.runtime.kernel_load_start_hook.remove(no_late_load)
+    assert membership.control.cpu().tolist() == [
+        (next(descriptor.handle for descriptor in descriptors if descriptor.row == row) << 2) | 2
+        if row in (0, 1, 17) else 0 for row in range(18)
+    ]

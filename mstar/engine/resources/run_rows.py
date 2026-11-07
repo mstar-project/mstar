@@ -21,9 +21,10 @@ from mstar.utils.h2d import PinnedStager
 _OFFERED, _ACTIVE, _CANCELLED, _RETIRED = range(4)
 
 
-@triton.jit
-def _change(Control, row, expected, replacement):
-    tl.atomic_cas(Control + row, expected.to(tl.int64), replacement.to(tl.int64), sem="acq_rel", scope="gpu")
+@triton.jit(do_not_specialize=["row", "expected", "replacement"],
+            do_not_specialize_on_alignment=["row", "expected", "replacement"])
+def _change(Control, row: tl.int32, expected: tl.int64, replacement: tl.int64):
+    tl.atomic_cas(Control + row, expected, replacement, sem="acq_rel", scope="gpu")
 
 
 @triton.jit
@@ -119,6 +120,12 @@ class RunRows(Resource):
         self._observed = [0] * rows
         self._retired: set[int] = set()
         self._published: set[int] = set()
+        if self.publication_stream is not None:
+            # Compilation alone leaves CUDA module loading until first launch,
+            # which can wait for the active WHILE. Load the one scalar ABI now;
+            # -1 cannot match a fresh zero control word, so this changes no row.
+            with torch.cuda.stream(self.publication_stream):
+                self._change(0, -1, 0)
 
     @classmethod
     def build(cls, spec: RunRowsSpec, info: EngineResourceInfo) -> RunRows:
