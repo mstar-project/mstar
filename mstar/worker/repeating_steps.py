@@ -562,6 +562,11 @@ class RepeatingSteps:
             logical.group.members = tuple((scheduled, copy.copy(batch)) for scheduled, batch in active.group.members)
             for _, batch in logical.group.members:
                 batch.step_context = copy.copy(batch.step_context)
+                if batch.step is not None:
+                    batch.step = copy.copy(batch.step)
+                    batch.step.set_ctx(batch.step_context)
+                    if batch.committed is not None:
+                        batch.committed = batch.step
                 batch.request_ids = list(batch.request_ids)
             logical.node_batch = logical.group.members[logical.group.trigger][1]
             receipts = (logical, *active.joined)
@@ -659,9 +664,14 @@ class RepeatingSteps:
         stream = membership.publication_stream
         with torch.cuda.stream(stream) if stream is not None else nullcontext():
             for part in (active, *active.joined):
-                for rid, descriptor in part.node_batch.run_rows.items():
-                    if self._is_tearing_down(rid):
-                        membership.cancel(descriptor)
+                members = ([batch for _, batch in part.group.members] if part.group is not None
+                           else [part.node_batch])
+                for batch in members:
+                    for rid, descriptor in batch.run_rows.items():
+                        if self._is_tearing_down(rid):
+                            membership.cancel(descriptor)
+        if active.group is not None:
+            return False  # late offers must admit a complete unit before publication
         available = membership.available_rows(lease.bucket.bs)
         if not available or active.node_batch.completion_event.query():
             return False

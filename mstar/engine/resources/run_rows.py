@@ -181,6 +181,9 @@ class RunRows(Resource):
     def repeat_refusal(self, walk: str, host_step=None) -> str | None:
         return None  # only the captured boundary changes membership
 
+    def connected_refusal(self, step, ctx) -> str | None:
+        return None  # one accepting parent owns the boundary; member plans have no effect
+
     def resident_binding(self) -> ResidentBinding:
         return ResidentBinding(
             check_streams=no_resident_effect, bind=no_resident_effect, row=no_resident_effect,

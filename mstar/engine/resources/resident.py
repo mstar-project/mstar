@@ -38,7 +38,7 @@ import triton
 import triton.language as tl
 
 from mstar.engine.resources.base import Resource
-from mstar.engine.resources.resident_hooks import ResidentBinding, no_resident_effect
+from mstar.engine.resources.resident_hooks import ResidentBinding
 from mstar.engine.resources.step import BucketKey, SubmoduleStep
 from mstar.utils import knobs
 from mstar.utils.h2d import PinnedStager
@@ -896,10 +896,7 @@ def build_planner(
     for key, binding in bindings.items():
         # An auxiliary publication owner has no planner-local state to rebind.
         # Any actual table effect still requires one node to own its planner.
-        inert = isinstance(binding, ResidentBinding) and all(effect is no_resident_effect for effect in (
-            binding.bind, binding.row, binding.stage, binding.gather, binding.run_gather,
-            binding.commit_in_graph, binding.advance, binding.rewind_run,
-        ))
+        inert = isinstance(binding, ResidentBinding) and binding.inert
         if refusal is None and len(resource_nodes.get(key, ())) > 1 and not inert:
             refusal = f"resource {key!r}: it is shared by nodes {sorted(resource_nodes[key])}"
     if refusal is not None:

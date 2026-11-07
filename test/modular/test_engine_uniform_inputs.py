@@ -1074,7 +1074,7 @@ def test_streamed_batch_callbacks_cannot_recover_unresolved_metadata(read):
                                   "direct_error", "direct_missing", "direct_walk", "direct_alias",
                                   "direct_spans", "direct_absent", "direct_shared",
                                   "direct_repeat", "direct_short", "direct_one", "direct_skip", "direct_repeat_error",
-                                  "direct_owned",
+                                  "direct_owned", "direct_joining",
                                   "metadata", "declared_key"])
 def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
@@ -1091,12 +1091,13 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     if device_name == "cuda" and not torch.cuda.is_available():
         pytest.skip("real Engine streamed composition")
     device = torch.device(device_name)
+    joining = mode == "direct_joining"
     direct = mode.startswith("direct")
     repeated = mode in {"direct_repeat", "direct_short", "direct_one", "direct_skip", "direct_repeat_error",
-                        "direct_owned"}
+                        "direct_owned", "direct_joining"}
     producer_count = ({"direct_repeat": 4, "direct_short": 2, "direct_one": 1,
                        "direct_skip": 0, "direct_repeat_error": 4,
-                       "direct_owned": 4}.get(mode, 0 if mode == "direct_zero" else 1))
+                       "direct_owned": 4, "direct_joining": 4}.get(mode, 0 if mode == "direct_zero" else 1))
     producer_kept = producer_count - (mode in {"direct_eos", "direct_short", "direct_one"})
     full, yielded = mode == "full", mode in {"yield", "tail_zero", "direct_zero", "direct_skip"}
     packing = mode.startswith("packing")
@@ -1122,6 +1123,20 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     eng._submodules["a"].rings = {"x": {"prefill"}}
     eng._submodules["b"].submodule.iteration_tables = tables
     leases, slots, launches = {}, {}, []
+    membership = None
+    if joining:
+        from test_device_run import _Loop
+
+        from mstar.engine.engine import RunLayout
+        from mstar.engine.resources.resident import ResidentPlanner
+        from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
+        from mstar.engine.resources.runner import StepRunner
+        from mstar.engine.resources.step import SubmoduleStep
+
+        membership = RunRows(device, 1, 4, 6)
+        eng._run_layouts = dict.fromkeys(("a", "b"), RunLayout(("a", "b"), 4))
+        eng._runner = StepRunner({"membership": membership})
+        eng._runner.ingest_request(2)
 
     def cpu_compose(ops):
         def execute(ops):
@@ -1149,6 +1164,9 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
             launches.append(1)
             return launch(*args)
         monkeypatch.setattr(runtime, "launch", launch_counted)
+
+    if joining:
+        runtime = backend.while_runtime() if device_name == "cuda" else _Loop()
 
     def capture(fn):
         if device_name == "cpu":
@@ -1227,7 +1245,10 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         mgmt.refills["prefill"] = None
         resident_rows = torch.full((1,), 2, dtype=torch.long, device=device)
         state = RunState(1, "token", (99,), device,
-                         dropping=SimpleNamespace(rows=resident_rows, slots=resident_rows.clone()))
+                         dropping=SimpleNamespace(rows=resident_rows, slots=resident_rows.clone()),
+                         membership=RunRowsSnapshot(membership, 1) if joining else None,
+                         member=0 if name == "a" else 1, width=4 if joining else None,
+                         independent_rows=joining)
         run = slot.run = DeviceRun(state, {}, lambda: None, 4)
         run.rows["x"] = torch.zeros(1, 4, 2 if name == "a" else 1, device=device)
         run.stops["token"] = torch.zeros(1, 4, dtype=torch.long, device=device)
@@ -1253,15 +1274,26 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                     ])}
                 mgmt.submodule.preprocess = preprocess
 
-        mgmt.resident = _resident_owner(mgmt.loopback_rows, {2: 2})
+        mgmt.resident = _resident_owner(mgmt.loopback_rows, {2: 1 if joining else 2})
+        if joining:
+            mgmt.resources = {"membership": membership}
+            mgmt.resident = ResidentPlanner(name, {"prefill": {}}, mgmt.resources, device, 1)
+            mgmt.resident._streams[bucket] = {}
+            mgmt.submodule.declare_step = lambda **kw: SubmoduleStep(segments=[], steps={})
 
         def entry(state=state, name=name):
+            if joining:
+                runtime.start(state, None)
+                return
             state.index.zero_()
             state.counts.zero_()
             state.marks.zero_()
             state.continuation.fill_(0 if yielded and name == "a" else 1)
 
         def body(name=name, slot=slot, run=run, state=state, mgmt=mgmt, bucket=bucket):
+            if joining:
+                state.select_rows()
+                state.head()
             if name == "a":
                 slot.static_outputs.row_outputs["x"].copy_((state.index + (11 if direct else 10)).expand(1, 2))
                 slot.static_outputs.check_stop_buffers["token"].copy_(
@@ -1276,6 +1308,9 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                 slot.static_outputs.check_stop_buffers["token"].fill_(1)
             run.keep(slot.static_outputs.row_outputs, run.rows)
             run.keep(slot.static_outputs.check_stop_buffers, run.stops)
+            if joining:
+                runtime.stop(state, slot.static_outputs.check_stop_buffers["token"], None)
+                return
             state.index.add_(1)
             state.counts.add_(1)
             state.marks.copy_(slot.static_outputs.check_stop_buffers["token"] == 99)
@@ -1300,6 +1335,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     def reserve(batch, *, capture_step=None):
         lease = leases[batch.node_name]
         batch.lease_slot(lease)
+        if joining:
+            batch.step_context.resident = eng._submodules[batch.node_name].resident
         return lease
     eng.reserve_replay_slot = reserve
     a, b = (pair[1] for pair in group.members)
@@ -1486,7 +1523,15 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     pending = PendingBatch(trigger_schedule, trigger_batch, trigger_batch.node_name,
                            trigger_batch.node_name, "prefill", None, group=group)
     with ThreadPoolExecutor(max_workers=1) as executor:
-        worker._finish_step(pending, output[0], gpu_executor=executor)
+        if joining:
+            assert a.run_rows[2] is b.run_rows[2]
+            assert a.run_rows[2].bindings == (1, 0, 4, 1, 0, 3)
+            assert all(eng._submodules[node].resident._readers.sum() == 1 for node in ("a", "b"))
+            worker._finish_live_run(pending, executor)
+            assert membership.idle
+            assert all(not eng._submodules[node].resident._readers.any() for node in ("a", "b"))
+        else:
+            worker._finish_step(pending, output[0], gpu_executor=executor)
     if direct:
         expected = []
         if producer_count:
@@ -1502,7 +1547,7 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                 expected_view = expected_view[:, 0]
             torch.testing.assert_close(producer_views[0], expected_view.float())
         assert failed_members == (["a", "b"] if mode in {"direct_error", "direct_repeat_error"} else [])
-        assert not b.stream_windows and not source._reservations
+        assert (joining or not b.stream_windows) and not source._reservations
         assert launches == [1]
         assert a.step_context.slot_lease is None and b.step_context.slot_lease is None
         return
@@ -2047,7 +2092,7 @@ def test_live_unit_closes_all_claims_before_releasing_its_original_parent(tail_f
                 for index in slots:
                     held.remove((node, index))
             batch = SimpleNamespace(node_name=node, graph_walk="walk", request_ids=list(rows), run_rows=dict(rows),
-                                    stream_windows={}, step_context=SimpleNamespace(
+                                    step=None, committed=None, stream_windows={}, step_context=SimpleNamespace(
                                         run_counts=None, repeats=4 if node == "a" else 1,
                                         resident=SimpleNamespace(unpin=unpin)),
                                     outputs=BatchedModelOutput(

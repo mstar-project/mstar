@@ -65,6 +65,14 @@ class ResidentBinding:
     max_repeats: Callable[[ResourceStep, StepContext], int]
     rewind_run: Callable[[ResourceStep, StepContext, int, Collection], None]
 
+    @property
+    def inert(self) -> bool:
+        """No planner-local table or execution effect to share between members."""
+        return all(effect is no_resident_effect for effect in (
+            self.bind, self.row, self.stage, self.gather, self.run_gather,
+            self.commit_in_graph, self.advance, self.rewind_run,
+        ))
+
 
 class ResidentHooks:
     """A captured decode step reads per-request state off tables on the device;
