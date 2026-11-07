@@ -613,9 +613,15 @@ def test_connected_inputs_reach_captured_row_owners_only_after_submission(repeat
         slot.row_heads = {"x": "x"}
         replay = slot.graph.replay
 
-        def replay_rows(rows=rows, bucket=bucket, slot=slot, replay=replay):
+        def replay_rows(rows=rows, bucket=bucket, slot=slot, replay=replay, name=name):
             rows.head(bucket, 0, "x", slot.static_inputs["x"])
-            replay()
+            if device == "cuda":
+                # Capture the forward with its owner reads/writes. Replaying
+                # an already captured graph inside capture is unsupported.
+                torch.add(slot.static_inputs["x"], 10 if name == "a" else 100,
+                          out=slot.static_outputs.row_outputs["x"])
+            else:
+                replay()
             rows.tail(bucket, 0, "x", slot.static_outputs.row_outputs["x"])
 
         if device == "cuda":
