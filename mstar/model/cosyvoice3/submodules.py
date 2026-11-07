@@ -170,7 +170,10 @@ class ReferenceEncoder:
     @torch.no_grad()
     def tokens(self, wav24: torch.Tensor) -> torch.Tensor:
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
-        tokens, lens = self.tokenizer([wav16])
+        # Clips vary in length, and cuDNN plans anew per shape: native convolutions
+        # hold CAMPPlus to about 14 ms a clip, against 37 to 119 ms.
+        with torch.backends.cudnn.flags(enabled=False):
+            tokens, lens = self.tokenizer([wav16])
         tokens = tokens[0, : int(lens[0])]
         frames = self._mel_frames(wav24.numel())
         return tokens[: min(int(tokens.numel()), frames // 2)]
@@ -189,7 +192,8 @@ class ReferenceEncoder:
         feat = feat[: 2 * tokens.numel()]
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
         fbank = kaldi_fbank_80(wav16)
-        embedding = self.campplus(fbank[None])[0]
+        with torch.backends.cudnn.flags(enabled=False):
+            embedding = self.campplus(fbank[None])[0]
         return ReferenceVoice(prompt_tokens=tokens, prompt_feat=feat, embedding=embedding)
 
 
