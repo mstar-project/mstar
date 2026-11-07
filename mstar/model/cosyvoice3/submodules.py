@@ -45,6 +45,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
     PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
@@ -532,19 +533,42 @@ class LMSubmodule(ARNodeSubmodule):
         dtype = self.model.speech_embedding.weight.dtype
         width = max(self.window, 1)
         tensor_inputs = {HISTORY: torch.full((width,), -1, dtype=torch.long, device=device)}
-        return [
+        kwargs = {KNOBS: CAPTURE_KNOBS, STEP: 0, EOS_FLAG: None}
+        configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(1, self.lm.hidden_size, dtype=dtype, device=device),
                     input_seq_len=1,
                     tensor_inputs=tensor_inputs,
-                    kwargs={KNOBS: CAPTURE_KNOBS, STEP: 0, EOS_FLAG: None},
+                    kwargs=kwargs,
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=False,
             )
         ]
+        if self.config.lm_prefill_token_buckets:
+            configs.append(
+                PackedAcceleratorGraphConfig(
+                    capture_graph_walk="prefill_voice",
+                    replay_graph_walks=list(PREFILL_WALKS),
+                    capture_token_lengths=list(self.config.lm_prefill_token_buckets),
+                    make_node_input=lambda n: ARNodeInputs(
+                        input_embeds=torch.zeros(n, self.lm.hidden_size, dtype=dtype, device=device),
+                        input_seq_len=n,
+                        tensor_inputs=tensor_inputs,
+                        kwargs=kwargs,
+                    ),
+                    capture_batch_sizes=list(self.config.lm_prefill_batch_sizes),
+                    compile=False,
+                    # a longer or wider prefill runs eagerly
+                    caps_eager_batch_size=False,
+                )
+            )
+        return configs
+
+    def resident_walks(self) -> frozenset[str]:
+        return frozenset({"decode"})
 
     def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return self.can_batch(batch, model_inputs) and super().can_use_accelerator_graphs(batch, model_inputs)
