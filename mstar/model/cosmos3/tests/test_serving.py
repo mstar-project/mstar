@@ -872,3 +872,14 @@ def test_vae_decode_fast_must_be_a_bool() -> None:
 
     with pytest.raises(ValueError, match="vae_decode_fast must be true or false"):
         Cosmos3Config(vae_decode_fast="false").check_streaming_decode()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"size": "abc"}, {"size": "0x0"}, {"num_frames": 0},
+    {"fps": 0}, {"fps": -5}, {"fps": float("nan")},
+    {"guidance_interval": [1]},
+])
+def test_malformed_generation_parameters_fail_before_submission(kwargs):
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    with pytest.raises(ValueError):
+        model._resolve_gen_params(kwargs, ["text"], ["video"])

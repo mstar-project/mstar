@@ -54,6 +54,7 @@ Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -1256,12 +1257,12 @@ class Cosmos3Model(Model):
             default_size = self.config.video_size_default
         width, height = int(default_size[0]), int(default_size[1])
         size = mk.get("size")
-        if isinstance(size, str) and "x" in size.lower():
-            sw, sh = size.lower().split("x", 1)
+        if size is not None:
             try:
+                sw, sh = size.lower().split("x")
                 width, height = int(sw), int(sh)
-            except ValueError:
-                pass
+            except (AttributeError, TypeError, ValueError):
+                raise ValueError("Cosmos3 size must be WIDTHxHEIGHT") from None
 
         # Action requests resolve their mode up front: it switches the frame,
         # step, guidance and flow-shift defaulting below to the action recipe.
@@ -1366,6 +1367,10 @@ class Cosmos3Model(Model):
                 1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
             ),
         }
+        if params["width"] <= 0 or params["height"] <= 0 or num_frames <= 0:
+            raise ValueError("Cosmos3 width, height and num_frames must be positive")
+        if not math.isfinite(params["fps"]) or params["fps"] <= 0:
+            raise ValueError("Cosmos3 fps must be finite and positive")
         frames_per_latent = self.config.vae.scale_factor_temporal
         if params["has_image_condition"] and action_mode is None and num_frames <= frames_per_latent:
             # the image pins the first latent frame, so one latent frame leaves nothing to denoise
@@ -1425,7 +1430,15 @@ class Cosmos3Model(Model):
         if gi is None and action_mode is not None:
             gi = self.config.guidance_interval_action
         if gi is not None:
-            params["guidance_interval"] = (float(gi[0]), float(gi[1]))
+            if not isinstance(gi, (list, tuple)) or len(gi) != 2:
+                raise ValueError("Cosmos3 guidance_interval must contain two numbers")
+            try:
+                interval = (float(gi[0]), float(gi[1]))
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("Cosmos3 guidance_interval must contain two numbers") from None
+            if not all(math.isfinite(x) for x in interval) or interval[0] > interval[1]:
+                raise ValueError("Cosmos3 guidance_interval must be finite and ordered")
+            params["guidance_interval"] = interval
         # Action requests must name their embodiment explicitly — the domain
         # conditions the action pathway, and a silent default would predict
         # actions for the wrong robot — except a policy request to a policy
