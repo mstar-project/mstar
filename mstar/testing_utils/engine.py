@@ -8,7 +8,7 @@ it calls. One it forgot is an ``AttributeError`` rather than a stub answering fo
 """
 import torch
 
-from mstar.engine.engine import Engine
+from mstar.engine.engine import Engine, SubmoduleManagement
 
 
 def make_engine(**overrides) -> Engine:
@@ -30,3 +30,15 @@ def make_engine(**overrides) -> Engine:
             raise TypeError(f"Engine has no field {name!r}")
         setattr(engine, name, value)
     return engine
+
+
+def make_mgmt(submodule=None, **overrides) -> SubmoduleManagement:
+    """A node's entry in ``Engine._submodules``, as ``load_model`` builds it, for a
+    node with no resources or process group. ``overrides`` replace its fields."""
+    defaults = {
+        "forward": getattr(submodule, "forward", None),
+        "forward_batched": getattr(submodule, "forward_batched", None),
+        "joint_comm_group": None,
+        "resources": {},
+    }
+    return SubmoduleManagement(submodule=submodule, **(defaults | overrides))

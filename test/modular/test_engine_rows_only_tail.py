@@ -9,7 +9,7 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule  # noqa: E402
-from mstar.testing_utils.engine import make_engine  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
 
 class _Plain(NodeSubmodule):
@@ -29,7 +29,7 @@ RUNNERS = {"region": object()}
 
 
 def _engine(sub):
-    eng = make_engine(_submodules={"llm": SimpleNamespace(submodule=sub, piecewise_runners=RUNNERS)})
+    eng = make_engine(_submodules={"llm": make_mgmt(submodule=sub, piecewise_runners=RUNNERS)})
     eng.per_request_tails = []
     eng.postprocess_batch = lambda batch, outputs: eng.per_request_tails.append(batch)
     return eng

@@ -12,7 +12,7 @@ import pytest
 
 from mstar.engine.accelerator_graph_config import PiecewiseConfigType
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, PiecewiseGraphKey
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 
 class _Runner:
@@ -37,7 +37,7 @@ class _Ctx:
 
 
 def _lease(runners, inputs):
-    engine = make_engine(_submodules={"node": SimpleNamespace(piecewise_runners=runners)})
+    engine = make_engine(_submodules={"node": make_mgmt(piecewise_runners=runners)})
     ctx = _Ctx()
     engine._maybe_lease_piecewise_regions("node", ctx, inputs)
     return ctx.piecewise_leases

@@ -29,7 +29,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     NodeInputs,
 )
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 RID = "r0"
 NODE = "LLM"
@@ -77,7 +77,7 @@ def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]
         _resources=resources,
         _runner=StepRunner(resources, node_resources=node_resources),
         _submodules={
-            node: SimpleNamespace(submodule=_Submodule())
+            node: make_mgmt(submodule=_Submodule())
             for node in node_resources
         },
         # every node keys WALK, as a declaration would name it
@@ -332,7 +332,7 @@ class _Preparing(_Submodule):
 
 def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
     engine = _engine({"kv": _RaisingFor(96, RID)}, {NODE: ["kv"]})
-    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    engine._submodules[NODE] = make_mgmt(_Preparing())
     batch = ExecutingBatch(
         node_name=NODE, per_request_info={RID: None, "r1": None},
         step_context=StepContext(
@@ -357,7 +357,7 @@ def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
 @pytest.mark.parametrize("request_walks", [{}, {RID: WALK, "r1": "decode"}], ids=["one walk", "mixed"])
 def test_a_walk_the_cache_serves_whole_completes_without_failing_its_request(request_walks):
     engine = _engine({"kv": _Answering(PROMPT)}, {NODE: ["kv"]})
-    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    engine._submodules[NODE] = make_mgmt(_Preparing())
     batch = ExecutingBatch(
         node_name=NODE, per_request_info={RID: None, "r1": None},
         step_context=StepContext(

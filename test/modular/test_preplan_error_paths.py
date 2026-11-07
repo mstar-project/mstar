@@ -18,7 +18,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -184,7 +184,7 @@ def test_a_step_the_executor_never_runs_still_lifts_the_fence() -> None:
 
 def _exec_fake(runner, raise_with):
     return make_engine(
-        _submodules={"dit": SimpleNamespace(submodule=object())},
+        _submodules={"dit": make_mgmt(submodule=object())},
         _autocast_dtype_for=lambda submodule: None,
         reserve_replay_slot=lambda batch: None,
         _exec_single=_raiser(raise_with),
@@ -233,7 +233,7 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     # admit, so the reset clears it even though the batch still has inputs
     cleared = []
     fake = make_engine(
-        _submodules={"dit": SimpleNamespace(accelerator_graph_runner=None)},
+        _submodules={"dit": make_mgmt()},
         _runner=SimpleNamespace(clear_preplan=lambda: cleared.append(True)),
     )
     batch = SimpleNamespace(
@@ -281,7 +281,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
         ),
     )
     submodule.step_is_input_free = lambda walk: False
-    mgmt = SimpleNamespace(submodule=submodule, piecewise_runners={})
+    mgmt = make_mgmt(submodule)
     with pytest.raises(RuntimeError):
         fake._pre_plan_for_batch(batch, mgmt, cg_runner, object())
     event = fake._pre_plan_done["dit"]
@@ -318,7 +318,7 @@ def test_an_inline_plan_waits_on_pre_plans_before_the_resident_stage_copies() ->
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
     ctx.resident = SimpleNamespace(plan=lambda step, ctx: calls.append("resident"))
-    mgmt = SimpleNamespace(accelerator_graph_runner=None, submodule=None)
+    mgmt = make_mgmt()
     with pytest.raises(NotImplementedError, match="reached plan"):
         engine._drive_step(
             SimpleNamespace(node_name="LLM", preplan_event=None), mgmt, [1], [], {},

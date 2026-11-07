@@ -23,7 +23,7 @@ from mstar.model.cosmos3.submodules import (  # noqa: E402
     VIDEO_GEN_AR_WALK,
     Cosmos3DiTSubmodule,
 )
-from mstar.testing_utils.engine import make_engine  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
 # nvidia/Cosmos3-Edge scheduler/scheduler_config.json (the fields UniPC reads)
 EDGE_SCHEDULER = {
@@ -132,7 +132,7 @@ def test_finished_request_re_queued_fails_alone():
     batch.drop_rids = lambda rids: setattr(
         batch, "request_ids", [r for r in batch.request_ids if r not in rids])
     batch.register_failure = lambda rid, err, walk=None: batch.failed_requests.__setitem__(rid, str(err))
-    eng = make_engine(_submodules={"dit": SimpleNamespace(submodule=dit, resources={})})
+    eng = make_engine(_submodules={"dit": make_mgmt(dit)})
 
     eng.prepare_inputs(batch)
 

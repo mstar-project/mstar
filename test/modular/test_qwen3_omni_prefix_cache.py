@@ -19,7 +19,7 @@ from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
-from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 RID = "r0"
 NODE = "Thinker"
@@ -75,7 +75,7 @@ def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None,
             {THINKER_KV: _Holding(held.tokens, held.position), THINKER_POS: thinker.node_resources[THINKER_POS]},
             node_resources={NODE: [THINKER_KV, THINKER_POS]},
         ),
-        _submodules={NODE: SimpleNamespace(submodule=thinker)},
+        _submodules={NODE: make_mgmt(submodule=thinker)},
         _keyed_walks={NODE: {"prefill_text", "prefill_vision", "prefill_audio"}},
     )
     batch = SimpleNamespace(
@@ -423,7 +423,7 @@ def test_the_encoders_are_not_compiled_while_their_output_is_cached(monkeypatch,
     engine = make_engine(
         _device=torch.device("cuda"),
         _item_encoders={node},
-        _submodules={node: SimpleNamespace(submodule=object.__new__(cls), forward="eager")},
+        _submodules={node: make_mgmt(submodule=object.__new__(cls), forward="eager")},
     )
 
     engine._compile_submodules()
