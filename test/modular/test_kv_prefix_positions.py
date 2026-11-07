@@ -36,6 +36,7 @@ from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, PrefixKeys
+from mstar.testing_utils.model import StubModel
 from mstar.validation.resources import (
     _uncacheable_positions,
     _unknown_prefix_walks,
@@ -226,7 +227,7 @@ def _built_rope(specs: list) -> RopeManager:
     )
 
 
-class _Model:
+class _Model(StubModel):
     """Declares whichever resources the test wants keyed."""
 
     def __init__(self, *keyed: str):
@@ -324,7 +325,7 @@ def test_a_declared_node_of_caches_positions_attention_and_sampling_loads():
 # ── the walks a declaration names ───────────────────────────────────────
 
 
-class _Walking:
+class _Walking(StubModel):
     """Declares one stream on ``walk`` and runs the walks it is given."""
 
     def __init__(self, walk: str, runs: tuple[str, ...] = ("prefill", "decode")):

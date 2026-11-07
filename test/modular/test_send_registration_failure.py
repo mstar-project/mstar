@@ -34,6 +34,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import ConductorMessageType, RemoveRequest
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -194,6 +195,7 @@ def _postprocess_worker(refuse, follower=False):
     w.parallel_nodes = {"llm"} if follower else set()
     w.parallel_leader_nodes = set()
     w._innermost_loop_by_node = {}
+    w._rebuilds = Rebuilds({}, {})
     w.log = SimpleNamespace(stop_checked=[], routed=[], registered=[], sent=[], conductor=[])
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.scheduler.fail_rids = w.scheduler.failed_rids.update
@@ -277,7 +279,7 @@ def _postprocess_worker(refuse, follower=False):
 
 def _decode_step(rids, final_stream=()):
     node_batch = SimpleNamespace(
-        request_ids=list(rids), per_request_info=dict.fromkeys(rids),
+        node_name="llm", request_ids=list(rids), per_request_info=dict.fromkeys(rids),
         failed_requests={}, completion_event=None,
         final_stream_rids=set(final_stream), resource_publish_info={},
         partition_done_rids=set(), cached_rids=set(), withheld_outputs={},

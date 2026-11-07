@@ -254,7 +254,7 @@ def test_a_vision_block_with_no_handle_keeps_its_resource():
 
 def test_a_vision_attention_with_neither_says_what_is_missing():
     attn = VisionAttention(_ViTConfig, "vision")
-    with pytest.raises(RuntimeError, match="declare a RaggedAttentionSpec under 'vision'"):
+    with pytest.raises(ValueError, match="declare a RaggedAttentionSpec under 'vision'"):
         attn(*_vision_inputs())
 
 

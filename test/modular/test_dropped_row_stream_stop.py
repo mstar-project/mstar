@@ -26,14 +26,15 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.communication.tensors import StoredOutputs  # noqa: E402
-from mstar.engine.chunking import ChunkingManagement  # noqa: E402
-from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
+from mstar.engine.engine import ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess, RouteOutput  # noqa: E402
 from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, chunk_loop_name  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
 NODE, WALK, LOOP = "vocoder", "w", "stream_loop"
@@ -115,12 +116,7 @@ class _Runtime(PhasedPostprocess):
 
 
 def _engine(sub):
-    eng = Engine.__new__(Engine)
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub, resources={})}
-    eng._enable_nvtx = False
-    eng._loopback_steps = {}
-    eng._chunking = ChunkingManagement(eng._submodules)
-    eng._runner = StepRunner({})
+    eng = make_engine(_submodules={NODE: make_mgmt(sub)}, _runner=StepRunner({}))
     return eng
 
 
@@ -153,6 +149,7 @@ def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
     w.enable_nvtx = False
     w.enable_prof = False
     w.device = torch.device("cpu")
+    w._rebuilds = Rebuilds({}, {})
     w._graph_runtime = runtime
     w.scheduler = SimpleNamespace(failed_rids=set())
     w.tensor_manager = SimpleNamespace(

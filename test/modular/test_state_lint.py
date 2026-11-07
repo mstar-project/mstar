@@ -26,14 +26,7 @@ FORBIDDEN_ATTRIBUTES = {
 _CAPTURE = "a capture's buckets and compile mode, which the engine doesn't pick yet"
 ALLOWED = {
     ("mstar.engine.accelerator_graph_config", name): _CAPTURE
-    for name in (
-        "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
-        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseCallInputs",
-        "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
-    )
-} | {
-    ("mstar.engine.resources.spec", "CombinedSplit"): "a value of kernel_settings(), until the engine picks kernels",
-    ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
+    for name in ("AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE")
 }
 
 
