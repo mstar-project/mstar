@@ -1025,37 +1025,37 @@ class Worker:
             return
         logger.debug("Worker %s received request %s", self.worker_id, body.request_id)
         laps = PhaseLaps("worker.msg.new_request.")
-        # The one place a handle is minted; a request with several partitions
-        # on this worker gets the same one for each. Everything below keys on it.
-        request_id = self._graph_runtime.add_request(
-            request_id=body.request_id,
-            partition=body.request_info.partition_name,
-            graph_walk=body.request_info.graph_walk,
-            partition_worker_graph_ids=body.partition_worker_graph_ids,
-            worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
-            loop_caps=body.loop_caps,
-        )
-        body.request_info.rid_handle = request_id
-        if body.request_id in self._draining_rids:
-            # Drained before admission: take no new work, as ``_begin_drain``
-            # does for an admitted rid, while committed TP steps still run.
-            self.scheduler.fail_rids({request_id})
-        laps.lap("runtime_add")
-
-        # One NewRequest comes per partition this worker serves, and a later one
-        # can land after a step already ran. The tensor manager and the engine
-        # hold request-wide state, so only the first opens it. Opening it again
-        # would reset that state under the partition that is running.
-        first = request_id not in self.request_state.per_request_info
-        self.request_state.add_request(request_id, body.request_info)
-        self.scheduler.note_arrival(request_id)
-        self._graph_runtime.register_stop_limits(request_id, body.request_info)
-        if first:
-            self.tensor_manager.register_request(
-                request_id, self._graph_runtime.get_sharding_config(request_id),
-            )
-        laps.lap("worker_state")
         try:
+            # The one place a handle is minted; a request with several partitions
+            # on this worker gets the same one for each. Everything below keys on it.
+            request_id = self._graph_runtime.add_request(
+                request_id=body.request_id,
+                partition=body.request_info.partition_name,
+                graph_walk=body.request_info.graph_walk,
+                partition_worker_graph_ids=body.partition_worker_graph_ids,
+                worker_graph_to_workers=ParallelList.from_dict(body.worker_graph_to_workers),
+                loop_caps=body.loop_caps,
+            )
+            body.request_info.rid_handle = request_id
+            if body.request_id in self._draining_rids:
+                # Drained before admission: take no new work, as ``_begin_drain``
+                # does for an admitted rid, while committed TP steps still run.
+                self.scheduler.fail_rids({request_id})
+            laps.lap("runtime_add")
+
+            # One NewRequest comes per partition this worker serves, and a later one
+            # can land after a step already ran. The tensor manager and the engine
+            # hold request-wide state, so only the first opens it. Opening it again
+            # would reset that state under the partition that is running.
+            first = request_id not in self.request_state.per_request_info
+            self.request_state.add_request(request_id, body.request_info)
+            self.scheduler.note_arrival(request_id)
+            self._graph_runtime.register_stop_limits(request_id, body.request_info)
+            if first:
+                self.tensor_manager.register_request(
+                    request_id, self._graph_runtime.get_sharding_config(request_id),
+                )
+            laps.lap("worker_state")
             if first:
                 self.engine_manager.add_request(
                     request_id, body.request_info.resource_configs, body.request_info,
@@ -1086,9 +1086,22 @@ class Worker:
                 )
             laps.lap("ingest_signals")
         except Exception as err:
-            # a failed engine ingest rolled itself back; the conductor's REMOVE
-            # tears down what else the request has here
-            self._fail_intake([request_id], err, f"ingest of request {body.request_id} failed")
+            request_id = self._rid(body.request_id)
+            what = f"ingest of request {body.request_id} failed"
+            if request_id in self.request_state.per_request_info:
+                self._fail_intake([request_id], err, what)
+            else:
+                # Registration can fail before worker state exists. The conductor
+                # still owns this wire ID and will drain and remove partial state.
+                failure = RequestError.from_exception(err, what, log=logger)
+                if request_id is not None:
+                    self.scheduler.fail_rids({request_id})
+                self.communicator.send(
+                    "conductor", ConductorMessage(
+                        message_type=ConductorMessageType.FAIL_REQUESTS,
+                        body=FailRequests(errors={body.request_id: failure}),
+                    ),
+                )
         self._process_unprocessed(body.request_id)
 
     def _process_unprocessed(self, wire_rid: str) -> None:
