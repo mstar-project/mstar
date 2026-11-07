@@ -20,6 +20,7 @@ from mstar.engine.resources.kv.rolling import (
     RollingKVStep,
     RollingPosition,
 )
+from mstar.engine.resources.kv.rolling import manager as manager_module
 from mstar.engine.resources.kv.rolling.manager import RollingKVManager, row_layout
 from mstar.engine.resources.step import (
     ASKS,
@@ -185,6 +186,46 @@ def test_rearranging_joins_the_gaps_and_keeps_every_requests_tokens():
         assert keys == _expected(total, 2, 8, base=2000)
     for total, keys, _ in newcomer:
         assert keys == _expected(total, 2, 18, base=4000)
+
+
+@pytest.mark.parametrize("gap", [1, 2, 3, 4, 7, 20])
+def test_a_region_moved_left_keeps_every_token_however_short_the_gap(monkeypatch, gap):
+    """A gap under a quarter of the staging block is crossed through it, block by
+    block; a longer one in place. Either way every token lands where it should."""
+    monkeypatch.setattr(manager_module, "STAGE_TOKENS", 16)
+    store = _store(48)
+    pool = store._pool
+    pool.copy_(torch.arange(pool.numel(), dtype=pool.dtype).view_as(pool))
+    store._stage.fill_(-7)
+    expect = pool[:, :, gap:gap + 23].clone()
+    store._move_left(gap, 0, 23)
+    assert torch.equal(pool[:, :, :23], expect)
+    staged = bool((store._stage != -7).any())
+    assert staged == (4 * gap < 16)
+
+
+def test_regions_that_slide_across_a_one_token_gap_keep_their_streams(monkeypatch):
+    """A one-token request leaves a one-token gap; the regions after it cross it
+    through the staging block when a newcomer needs that gap and the tail together."""
+    monkeypatch.setattr(manager_module, "STAGE_TOKENS", 8)
+    store = _store(30)
+    store._stage.fill_(-7)
+    tiny = _run(store, 1, [1] * 3, 0, 1, base=1000)
+    next(tiny)
+    streams = {rid: _run(store, rid, [4] * 6, 2, 8, base=1000 * rid) for rid in (2, 3)}
+    for _ in range(3):
+        for stream in streams.values():
+            next(stream)
+    store.remove_request(1)
+    assert store._free == [(0, 1), (21, 9)]
+    newcomer = _run(store, 4, [4] * 3, 2, 8, base=4000)  # 10 tokens: neither gap holds it
+    total, keys, _ = next(newcomer)
+    assert [store._requests[r].offset for r in (2, 3, 4)] == [0, 10, 20] and store._free == []
+    assert (store._stage != -7).any()  # the 10-token regions crossed the 1-token gap staged
+    assert keys == _expected(total, 2, 8, base=4000)
+    for rid, stream in streams.items():
+        for total, keys, _ in stream:
+            assert keys == _expected(total, 2, 8, base=1000 * rid)
 
 
 def test_a_refused_step_gives_back_its_region_and_sets_the_room_aside_again():
