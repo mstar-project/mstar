@@ -3653,9 +3653,9 @@ class Worker:
     def _step_result(self, pending: PendingBatch) -> BatchedModelOutput:
         """N's outputs. A forward that raised becomes N's verdict instead: no
         outputs and every row failed (``failed_requests``), which voids a head
-        built on N and lets a step independent of N run, on every rank alike.
-        Dropping such a step on one rank only would leave the others in its
-        collectives."""
+        built on N and lets a step independent of N run. When the raise is on
+        every rank, every rank does so alike. A raise on one rank alone leaves
+        the others in a step it won't run, and the group wedges (#1235)."""
         try:
             return pending.future.result()
         except Exception as exc:
@@ -5464,7 +5464,7 @@ class Worker:
                             range_pop(synchronize=False)
 
                     if speculation is not None and not speculation.is_yield_away and self._step_voids_head(pending):
-                        committed = None  # every rank voids the head on this verdict
+                        committed = None  # when the raise is on every rank, every rank voids the head
                     laps.skip()
                     # set node._in_flight to false, since
                     # the node has just completed
