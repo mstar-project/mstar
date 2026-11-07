@@ -1409,7 +1409,7 @@ class AcceleratorGraphRunner:
             self._run_failures[walk] = "graph: a counted run has no token signal to stream"
             return None, None, None
         dropping = None
-        if ask.drop_rows or ask.loop is not None or ask.membership is not None:
+        if ask.drop_rows or ask.loop is not None or ask.membership is not None or ask.independent_rows:
             if self._resident is None or not self._resident.covers(spec.bucket):
                 self._run_failures[walk] = "planner: the walk isn't resident, which dropping rows needs"
                 return None, None, None
@@ -1436,6 +1436,9 @@ class AcceleratorGraphRunner:
             if ask.refill_at is not None:
                 self._run_failures[walk] = "graph: joining membership has no fixed refill row count"
                 return None, None, None
+        if ask.independent_rows and (ask.stream_tokens or ask.carries or (ask.iteration and ask.loop is None)):
+            self._run_failures[walk] = "resource: independent rows need owned carries/cursors and no live token stream"
+            return None, None, None
         if ask.loop is not None:
             self._rows.prepare_iteration(walk, ask.loop)
         cuda = backend.while_runtime()
@@ -1443,7 +1446,7 @@ class AcceleratorGraphRunner:
                   if ask.stream_tokens else None)
         state = RunState(
             spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, stream,
-            membership=ask.membership, width=ask.limit,
+            membership=ask.membership, width=ask.limit, independent_rows=ask.independent_rows,
         )
         shapes = {name: value for name, value in warmed.static_inputs.items() if name in ask.iteration}
         window = None
@@ -1465,11 +1468,13 @@ class AcceleratorGraphRunner:
         # last column. Sized off the last warm-up forward, or one more.
         with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
             sized = BatchedModelOutput.coerce(warmed.output if warmed.output is not None else warmed.run(False))
-        if ask.membership is not None and (sized.per_rid_outputs or sized.packed_outputs):
+        if (ask.membership is not None or ask.independent_rows) and (sized.per_rid_outputs or sized.packed_outputs):
             raise ValueError("joining runs require row-addressed outputs")
         # Every physical row may change owners, including outputs routed only
         # when a Loop ends. Keep its value until the logical receipt is collected.
-        columns = tuple(sized.row_outputs or {}) if ask.membership is not None else ask.columns
+        columns = tuple(sized.row_outputs or {}) if ask.membership is not None or ask.independent_rows else ask.columns
+        if ask.independent_rows and ask.membership is None:
+            run.last_outputs = frozenset(columns) - set(ask.columns)
         buffers, spans = sized.check_stop_buffers or {}, sized.output_spans or {}
         run.keep({name: t.reshape(t.shape[0], -1)[:, 0] for name, t in buffers.items()}, run.stops)
         run.keep({name: sized.row_outputs[name] for name in columns}, run.rows)
@@ -1480,7 +1485,8 @@ class AcceleratorGraphRunner:
 
         def body() -> Any:
             state.acquire_rows()
-            position = active = None
+            position = None
+            active = state.select_rows() if window is not None or state.active is not None else None
             if window is not None:
                 indices = self._rows.iteration_rows(warmed.resident)
                 # Resident slots select the input bank; LoopbackRows indices
@@ -1488,8 +1494,14 @@ class AcceleratorGraphRunner:
                 resident_slots = warmed.resident.buffers.rows
                 entries = window.entries.index_select(0, resident_slots)
                 origins = window.origins.index_select(0, resident_slots)
-                position, active = self._rows.iteration_head(walk, ask.loop, indices, entries, ~state.marks)
-                state.marks.logical_or_(~active)
+                position, live = self._rows.iteration_head(walk, ask.loop, indices, entries, active)
+                if state.active is not None:
+                    state.marks.logical_or_(active & ~live)
+                    state.active.logical_and_(live)
+                    active = state.active
+                else:
+                    state.marks.logical_or_(~live)
+                    active = live
             state.head()
 
             def select_inputs():

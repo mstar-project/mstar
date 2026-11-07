@@ -46,7 +46,8 @@ extern "C" __device__ __cudart_builtin__ void cudaGraphSetConditional(cudaGraphC
 
 extern "C" __global__ void run_stop(
     const long long* tokens, int stride, int rows, const long long* stop_ids, int num_ids,
-    const unsigned char* immune, unsigned char* marks, long long* index, const long long* limit,
+    const unsigned char* immune, unsigned char* marks, const unsigned char* active,
+    long long* index, const long long* limit,
     const long long* refill, const long long* generation, const volatile long long* yield_until,
     long long* continuation,
     long long* host_tokens, volatile int* landed, int host_width, long long* counts,
@@ -55,12 +56,13 @@ extern "C" __global__ void run_stop(
     int done = 0;
     long long at = *index;
     for (int row = 0; row < rows; ++row) {
-        long long identity = identities && !marks[row] ? identities[row] : 0;
+        bool executed = active ? active[row] : !marks[row];
+        long long identity = identities && executed ? identities[row] : 0;
         if (descriptors) descriptors[row * width + at] = identity;
         if (host_descriptors) host_descriptors[row * host_width + at] = identity;
-        if (!marks[row]) counts[row] += 1;
+        if (executed) counts[row] += 1;
         if (host_tokens) host_tokens[row * host_width + at] = tokens[row * stride];
-        if (tokens && !marks[row] && !immune[row]) {
+        if (tokens && executed && !immune[row]) {
             for (int i = 0; i < num_ids; ++i) {
                 if (tokens[row * stride] == stop_ids[i]) marks[row] = 1;
             }
@@ -79,8 +81,13 @@ extern "C" __global__ void run_stop(
 
 extern "C" __global__ void run_start(
     const long long* limit, const long long* generation, const volatile long long* yield_until,
-    long long* continuation, volatile int* started
+    long long* continuation, volatile int* started,
+    unsigned char* eligible, unsigned char* active, int rows
 ) {
+    for (int row = 0; eligible && row < rows; ++row) {
+        eligible[row] = 1;
+        active[row] = 0;
+    }
     bool skip = *limit > 1 && *generation <= *yield_until;
     *continuation = skip ? 0 : 1;
     *started = skip ? RUN_SKIPPED : RUN_RAN;
@@ -119,6 +126,9 @@ class RunAsk(NamedTuple):
     loop: LoopLayout | None = None
     # Declared membership owner shared by the bounded pair of captures.
     membership: RunRows | None = None
+    # Internal capture requirement, derived from independently ready graph rows.
+    # No serving option: the Engine must prove the resource/output coverage.
+    independent_rows: bool = False
 
 
 class IterationWindow(NamedTuple):
@@ -200,7 +210,7 @@ class RunState:
     def __init__(
         self, bs: int, token_signal: str | None, stop_ids: Collection[int], device: torch.device,
         dropping: Any = None, stream: TokenStream | None = None,
-        *, membership: RunRows | None = None, width: int = 1,
+        *, membership: RunRows | None = None, width: int = 1, independent_rows: bool = False,
     ):
         self.token_signal = token_signal
         # where its tokens land as it goes, for a walk that streams them
@@ -224,6 +234,10 @@ class RunState:
         self.immune = torch.zeros(bs, dtype=torch.bool, device=device)
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
+        if independent_rows and (dropping is None or stream is not None):
+            raise ValueError("independently ready rows need resident writes and no live token stream")
+        self.eligible = torch.ones_like(self.marks) if independent_rows else None
+        self.active = torch.zeros_like(self.marks) if independent_rows else None
         self.counts = torch.zeros(bs, dtype=torch.long, device=device)
         # Fixed-row successors can stage before the previous step is collected.
         self.replays = (torch.zeros_like(self.counts) if membership is None else None)
@@ -276,11 +290,19 @@ class RunState:
         if self.membership is not None:
             self.membership.stop(self.identities, self.marks)
 
+    def select_rows(self) -> torch.Tensor:
+        """Snapshot this body's executions before entry or owner state changes."""
+        if self.active is None:
+            return ~self.marks
+        torch.logical_and(self.eligible, ~self.marks, out=self.active)
+        return self.active
+
     def head(self) -> None:
         """Before a replay's forward: a stopped row reads and writes the trash slot."""
         if self.dropping is not None:
             rows = self.dropping.rows
-            torch.where(self.marks, torch.full_like(rows, TRASH_SLOT), rows, out=self.dropping.slots)
+            inactive = self.marks if self.active is None else ~self.active
+            torch.where(inactive, torch.full_like(rows, TRASH_SLOT), rows, out=self.dropping.slots)
 
 
 class CudaWhile:
@@ -357,6 +379,8 @@ class CudaWhile:
             ctypes.c_void_p(state.limit.data_ptr()), ctypes.c_void_p(state.generation.data_ptr()),
             ctypes.c_void_p(state.yield_until.data_ptr()), ctypes.c_void_p(state.continuation.data_ptr()),
             ctypes.c_void_p(state.started.data_ptr()),
+            ctypes.c_void_p(None if state.eligible is None else state.eligible.data_ptr()),
+            ctypes.c_void_p(None if state.active is None else state.active.data_ptr()), ctypes.c_int(len(state.marks)),
         ]
         args = (ctypes.c_void_p * len(values))(*(ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in values))
         self._driver_call(
@@ -371,6 +395,7 @@ class CudaWhile:
             ctypes.c_int(0 if row is None else row.stride(0)), ctypes.c_int(len(state.marks)),
             ctypes.c_void_p(state.stop_ids.data_ptr()), ctypes.c_int(len(state.stop_ids)),
             ctypes.c_void_p(state.immune.data_ptr()), ctypes.c_void_p(state.marks.data_ptr()),
+            ctypes.c_void_p(None if state.active is None else state.active.data_ptr()),
             ctypes.c_void_p(state.index.data_ptr()), ctypes.c_void_p(state.limit.data_ptr()),
             ctypes.c_void_p(state.refill.data_ptr()), ctypes.c_void_p(state.generation.data_ptr()),
             ctypes.c_void_p(state.yield_until.data_ptr()),
@@ -464,6 +489,7 @@ class DeviceRun:
         self.stops: dict[str, torch.Tensor] = {}
         self.rows: dict[str, torch.Tensor] = {}
         self.spans: dict[str, torch.Tensor] = {}
+        self.last_outputs: frozenset[str] = frozenset()
 
     def stage_inputs(self, iteration: Mapping[str, torch.Tensor] | None) -> None:
         if self.window is not None or isinstance(iteration, IterationWindow):
@@ -480,7 +506,8 @@ class DeviceRun:
             if name not in kept:
                 if self.sealed:
                     raise RuntimeError(f"a run's column {name!r} was not sized before its capture")
-                kept[name] = tensor.new_empty(tensor.shape[0], int(self.limit), *tensor.shape[1:])
+                allocate = tensor.new_zeros if self.state.active is not None else tensor.new_empty
+                kept[name] = allocate(tensor.shape[0], int(self.limit), *tensor.shape[1:])
             column_out(self.state, tensor, kept[name])
 
     def execution_counts(self) -> dict[str, torch.Tensor]:
@@ -507,17 +534,29 @@ class DeviceRun:
         # their views without launching kernels or allocating after the WHILE
         # launch: first-use CUDA work here can block publication until it ends.
         if state.descriptors is None:
-            # A skipped run wrote nothing, and nothing reads its columns.
-            ran = torch.minimum(self._columns[:repeats], (state.index - 1).clamp(min=0))
-            for column in (*self.rows.values(), *self.stops.values()):
-                column[:, :repeats] = column.index_select(1, ran)
+            if state.active is None:
+                # Ordinary rows execute every physical iteration until stop.
+                ran = torch.minimum(self._columns[:repeats], (state.index - 1).clamp(min=0))
+                for column in (*self.rows.values(), *self.stops.values()):
+                    column[:, :repeats] = column.index_select(1, ran)
+            else:
+                # Waiting rows leave no holes in their logical output columns.
+                ran = torch.minimum(self._columns[None, :repeats], (state.counts[:, None] - 1).clamp(min=0))
+                for column in (*self.rows.values(), *self.stops.values(), *self.spans.values()):
+                    index = ran.reshape(*ran.shape, *((1,) * (column.ndim - 2))).expand(
+                        column.shape[0], repeats, *column.shape[2:],
+                    )
+                    valid = (state.counts > 0).reshape(-1, *((1,) * (column.ndim - 1)))
+                    column[:, :repeats] = torch.where(valid, column.gather(1, index), 0)
         stops = {name: column[:, :repeats] for name, column in self.stops.items()}
         stops.update(self.execution_counts())
         if state.descriptors is not None:
             stops[RUN_DESCRIPTORS] = state.descriptors[:, :repeats]
         return (
-            stops, {name: column[:, :repeats] for name, column in self.rows.items()},
-            {name: column[:, :repeats] for name, column in self.spans.items()},
+            stops, {name: column[:, repeats - 1] if name in self.last_outputs else column[:, :repeats]
+                    for name, column in self.rows.items()},
+            {name: column[:, repeats - 1] if name in self.last_outputs else column[:, :repeats]
+             for name, column in self.spans.items()},
         )
 
 
@@ -530,7 +569,13 @@ def column_in(indices: torch.Tensor, column: torch.Tensor, target: torch.Tensor)
 
 def column_out(state: RunState, tensor: torch.Tensor, column: torch.Tensor) -> None:
     """Inside a body: ``tensor`` into this replay's column of ``column``."""
-    column.index_copy_(1, state.index, tensor.unsqueeze(1).to(column.dtype))
+    if state.active is None or state.membership is not None:
+        column.index_copy_(1, state.index, tensor.unsqueeze(1).to(column.dtype))
+        return
+    index = state.counts.clamp(max=column.shape[1] - 1).reshape(-1, 1, *((1,) * (column.ndim - 2)))
+    index = index.expand(column.shape[0], 1, *column.shape[2:])
+    active = state.active.reshape(-1, 1, *((1,) * (column.ndim - 2)))
+    column.scatter_(1, index, torch.where(active, tensor.unsqueeze(1).to(column.dtype), column.gather(1, index)))
 
 
 def run_item(column: torch.Tensor, iteration: int, copies: "torch.cuda.Stream | None" = None) -> torch.Tensor:

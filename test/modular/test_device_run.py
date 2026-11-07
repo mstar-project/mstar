@@ -45,6 +45,9 @@ class _Loop:
         pass
 
     def start(self, state, stream):
+        if state.eligible is not None:
+            state.eligible.fill_(True)
+            state.active.zero_()
         skip = int(state.limit) > 1 and int(state.generation[0]) <= int(state.yield_until[0])
         state.started[0] = RUN_SKIPPED if skip else RUN_RAN
         state.continuation[0] = not skip
@@ -57,10 +60,11 @@ class _Loop:
             state.descriptors[:, int(state.index)] = identities
             if state.stream is not None:
                 state.stream.identities[:, int(state.index)] = identities
-        state.counts += ~state.marks
+        active = ~state.marks if state.active is None else state.active
+        state.counts += active
         token = None if tokens is None else tokens.reshape(len(state.marks), -1)[:, 0]
         if token is not None:
-            state.marks |= (token.unsqueeze(-1) == state.stop_ids).any(-1) & ~state.immune
+            state.marks |= (token.unsqueeze(-1) == state.stop_ids).any(-1) & ~state.immune & active
         if state.stream is not None:
             state.stream.tokens[:, int(state.index)] = token
             state.stream.landed[0] = int(state.index) + 1
@@ -93,7 +97,7 @@ class _Loop:
 
 def _runner(
     monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False,
-    progress=False, membership=None, unmanaged=False, ask=None,
+    progress=False, membership=None, unmanaged=False, ask=None, independent=False,
 ):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
@@ -130,7 +134,7 @@ def _runner(
         runner.test_resource = torch.zeros(capacity + 1)
     runner.ask_run(WALK, ask or RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
                                        False, limit, carries or {}, ("frame",), ("cond",),
-                                       refill_at, stream_tokens, layout, membership))
+                                       refill_at, stream_tokens, layout, membership, independent))
     static = {"cond": torch.zeros(bs)}
     if membership is None or unmanaged:
         static["h"] = torch.zeros(bs)
@@ -145,11 +149,14 @@ def _runner(
         i = min(len(calls), len(tokens) - 1)
         calls.append(static["cond"].clone())
         token = static["cond"].long() if progress else torch.tensor(tokens[i])
+        if independent:
+            token = torch.where(token == 0, EOS, token)  # padding must never stop a waiting row
         if resident is not None:
             runner.test_resource.index_add_(0, resident.slots, static["cond"])
         return BatchedModelOutput(
             check_stop_buffers={} if counted else {"new_token": token},
-            row_outputs={"frame": token.float() * 2, "h": static.get("h", torch.zeros(bs)) + 1},
+            row_outputs={"frame": token.float() * 2,
+                         "h": token.float() + 100 if independent else static.get("h", torch.zeros(bs)) + 1},
         )
 
     def capture(body, *args, **kwargs):
@@ -1879,3 +1886,105 @@ def test_a_streamed_unit_waits_and_yields_for_its_nontrigger_members(monkeypatch
     assert worker._is_device_run(pending)
     assert not worker._await_run(pending, None, [], None)
     assert log.count("a") == 1 and "n" not in log
+
+
+def test_independently_ready_rows_keep_actual_progress_and_last_values(monkeypatch):
+    loop = _Loop()
+    runner, run, _, _ = _runner(monkeypatch, loop, [[1, 1, 1]], bs=3, limit=4,
+                                progress=True, independent=True)
+    assert run is not None
+    runner.test_resource.zero_()
+    table = runner._rows.prepare_iteration(WALK, runner._run_asks[WALK].loop)
+    table[runner._rows._row_of[3]] = torch.tensor([17, 1, 5, 3])
+    patterns = torch.tensor([[1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 1, 0]], dtype=torch.bool)
+    loop.on_iteration = lambda i: run.state.eligible.copy_(patterns[i])
+    window = IterationWindow(
+        {"cond": torch.tensor([[1., 9., 5., 6., 7., 8., 9., 10.],
+                                [2., 3., 9., 5., 6., 7., 8., 9.],
+                                [9., 9., 9., 9., 9., 9., 9., 9.]])},
+        torch.zeros(3, dtype=torch.long), torch.tensor([[1, 1], [1, 1], [1, 1]]),
+    )
+    stops, values, _ = _run(run, 3, 4, columns=window)
+    assert stops[RUN_COUNTS].tolist() == [2, 3, 0]
+    assert values["frame"].tolist() == [[2, 18, 18, 18], [4, 6, 18, 18], [0, 0, 0, 0]]
+    assert values["h"].tolist() == [109, 109, 0]  # no synthetic stream axis on a last-value output
+    assert run.state.marks.tolist() == [True, True, False]
+    assert runner.test_resource[1:].tolist() == [10, 14, 0]
+    assert table[runner._rows._row_of[3]].tolist() == [17, 1, 5, 3]  # waiting never writes entry
+    # A preplanned new entry can use this same capture with ordinary all-ready
+    # execution. The entry itself resets the previous eligibility snapshot.
+    loop.on_iteration = lambda i: None
+    successor = IterationWindow(window.columns, window.origins, window.entries + torch.tensor([0, 1]))
+    stops, values, _ = _run(run, 3, 1, columns=successor)
+    assert stops[RUN_COUNTS].tolist() == [1, 1, 1]
+    assert values["frame"].flatten().tolist() == [2, 4, 18]
+
+
+@pytest.mark.parametrize("unsupported", ["owners", "stream", "carry"])
+def test_independent_row_capture_refuses_uncovered_effects(monkeypatch, unsupported):
+    runner, run, _, _ = _runner(
+        monkeypatch, _Loop(), [[1, 1]], independent=True, progress=unsupported != "owners",
+        stream_tokens=unsupported == "stream", carries={"h": CarryPair("h", "h")} if unsupported == "carry" else {},
+    )
+    assert run is None and WALK in runner._run_failures
+
+
+def test_independent_row_masks_execute_in_a_real_conditional_capture():
+    from mstar.engine.accelerator_graph_backend import CUDAGraphBackend
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA independent row execution")
+    device = torch.device("cuda", 0)
+    backend = CUDAGraphBackend(device)
+    cuda = backend.while_runtime()
+    buffers = SimpleNamespace(rows=torch.tensor([1, 2, 3], device=device),
+                              slots=torch.tensor([1, 2, 3], device=device))
+    state = RunState(3, "token", {9}, device, dropping=buffers, independent_rows=True)
+    run = DeviceRun(state, {}, lambda: None, 4)
+    run.last_outputs = frozenset({"last"})
+    masks = torch.tensor([[1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 1, 0]], dtype=torch.bool, device=device)
+    lengths = torch.tensor([2, 3, 1], device=device)
+    owner = torch.zeros(4, dtype=torch.long, device=device)
+    token = torch.zeros(3, dtype=torch.long, device=device)
+    last = torch.zeros(3, dtype=torch.long, device=device)
+    run.keep({"frame": token, "last": last}, run.rows)
+    run.keep({"token": token}, run.stops)
+    run.sealed = True
+
+    def body():
+        state.eligible.copy_(masks.index_select(0, state.index).reshape(3))
+        state.select_rows()
+        state.head()
+        owner.index_add_(0, buffers.slots, torch.ones_like(token))
+        token.copy_(torch.where(state.counts + 1 == lengths, 9, state.counts + 1))
+        last.copy_(state.index.expand_as(last) + 100)
+        run.keep({"frame": token, "last": last}, run.rows)
+        run.keep({"token": token}, run.stops)
+        cuda.stop(state, token, backend.raw_stream())
+
+    cuda._load_kernels()
+    pool = backend.graph_pool_handle()
+    graph, _ = capture_into_graph(body, pool, device, None, keep_graph=True)
+    entry, _ = capture_into_graph(lambda: cuda.start(state, backend.raw_stream()), pool, device, None, keep_graph=True)
+    composed = backend.compose((entry, GraphConditional("while", state.continuation, (graph,))))
+    owner.zero_()
+    state.stage(3, [False] * 3, 4)
+    composed.replay()
+    stops, values, _ = run.results(4)
+    backend.synchronize()
+    assert stops[RUN_COUNTS].tolist() == [2, 3, 0]
+    assert owner[1:].tolist() == [2, 3, 0]
+    assert values["frame"].tolist() == [[1, 9, 9, 9], [1, 2, 9, 9], [0, 0, 0, 0]]
+    assert values["last"].tolist() == [102, 103, 0]
+    assert state.marks.tolist() == [True, True, False]
+    # Entry resets must be captured operations even when the body never runs.
+    state.eligible.zero_()
+    state.stage(3, [False] * 3, 4)
+    state.request_yield()
+    composed.replay()
+    stops, values, _ = run.results(4)
+    backend.synchronize()
+    assert state.eligible.tolist() == [True, True, True]
+    assert stops[RUN_COUNTS].tolist() == [0, 0, 0]
+    assert not values["frame"].any() and not values["last"].any()

@@ -340,7 +340,8 @@ def test_a_resident_step_resumes_the_state_its_last_step_left():
     assert b.replays[0].has_state == [True, True, False, False]
 
 
-def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_them():
+@pytest.mark.parametrize("waiting", [False, True])
+def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_them(waiting):
     """``device_stop: drop_rows``: from the replay after its stop column a row
     reads and writes the trash slot, so its stream length, page and recurrent
     slot stay where the stop left them, while the others advance; the next
@@ -348,17 +349,20 @@ def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_the
     live, _, planner = _setup({1: 3, 2: 5})
     s = _captured_step(live, planner, [1, 2], slot=0, bs=2, run=False, repeats=3)
     bucket = s.ctx.slot_lease.bucket
-    state = RunState(2, "t", {9}, CPU, planner.drop_rows(bucket, 0))
+    state = RunState(2, "t", {9}, CPU, planner.drop_rows(bucket, 0), independent_rows=waiting)
     state.stage(2, [False, False], 3)
     tokens = [[9, 1], [1, 1], [1, 1]]  # row 0 stops in the first column
 
     def head(replay):
-        if replay:  # the stop kernel's mark
+        if waiting:
+            state.eligible.copy_(torch.tensor([replay != 1, True]))
+            state.select_rows()
+        elif replay:  # the stop kernel's mark
             state.marks |= (torch.tensor(tokens[replay - 1]).unsqueeze(-1) == state.stop_ids).any(-1)
         state.head()
 
     _replay(live, planner, s, head=head)
-    assert [replay.pool_slots[0] == s.replays[0].pool_slots[0] for replay in s.replays] == [True, False, False]
+    assert [replay.pool_slots[0] == s.replays[0].pool_slots[0] for replay in s.replays] == [True, False, waiting]
     assert s.replays[0].pool_slots[1] == s.replays[2].pool_slots[1], "the other row keeps its slot"
     lengths = live["kv"]._resident.kv_len
     row, other = planner.slot_of(1), planner.slot_of(2)
@@ -366,10 +370,13 @@ def test_a_stopped_row_leaves_its_kv_and_recurrent_state_where_its_stop_left_the
     def stored(slot):
         return planner.store[slot * lengths.stride + lengths.col].item()
 
-    assert stored(row) == 3 + 1, "the row stopped in the first replay"
+    assert stored(row) == 3 + (2 if waiting else 1), "waiting pauses state; a stop ends it"
     assert stored(other) == 5 + 3
     # the next run's first replay reads every row again
     state.stage(2, [False, False], 3)
+    if waiting:
+        state.eligible.fill_(True)
+        state.select_rows()
     state.head()
     assert planner.buffers(bucket, 0).slots.tolist() == [row, other]
 

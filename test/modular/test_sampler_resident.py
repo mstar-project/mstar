@@ -18,6 +18,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.engine.device_run import RunState  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
@@ -418,16 +419,25 @@ def test_each_replay_reads_sampler_identity_and_contents_from_resident_cells(dra
     monkeypatch.setattr(sampler_utils, "sample_accelerator_graphable_gpu", inspect)
     # Only device-side resident membership changes between these reads. The
     # same prepared sampler/gather must stop reading and writing the old owner.
-    for rids in ((1, 2), (3,)):
+    state = RunState(3, None, (), CPU, node.planner.drop_rows(BucketKey(WALK, 3, 3), 0),
+                     independent_rows=True)
+    state.stage(2, [False, False], 4)
+    for owners, ready in (((1, 2), (True, True)), ((1, 2), (False, True)),
+                          ((1, 2), (True, True)), ((3,), (True,))):
+        rids = tuple(rid for rid, enabled in zip(owners, ready, strict=True) if enabled)
         rows = owner.indices((1, 2, 3))
         before_offsets = owner.offset.index_select(0, rows).clone()
         before_tokens, before_counts = owner.history.read(rows)
         before_masks = owner.read_seen(rows)
-        slots = [node.planner.slot_of(rid) for rid in rids]
-        rec.slots.copy_(torch.tensor([*slots, *([TRASH_SLOT] * (3 - len(slots)))]))
+        slots = [node.planner.slot_of(rid) for rid in owners]
+        state.dropping.rows.copy_(torch.tensor([*slots, *([TRASH_SLOT] * (3 - len(slots)))]))
+        state.eligible.copy_(torch.tensor([*ready, *([False] * (3 - len(ready)))]))
+        state.select_rows()
+        state.head()
         node.planner.gather(rec)
         out = sampler.sample([1, 2, -1], torch.zeros(3, V), apply_penalty=True)
-        for i, rid in enumerate(rids):
+        for rid in rids:
+            i = owners.index(rid)
             assert drawn[-1][i][3:5] == (rid, before_offsets[rid - 1].item())
             torch.testing.assert_close(masks[-1][i], before_masks[rid - 1])
             assert owner.offset[owner.slot_of(rid)].item() == before_offsets[rid - 1].item() + STRIDE
