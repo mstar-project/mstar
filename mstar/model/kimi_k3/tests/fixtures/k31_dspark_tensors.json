@@ -1,0 +1,451 @@
+{
+"source": "Inferact/Kimi-K3.1-Pro-DSpark-preview@6a2ef20a05efe88aabbf9ecaa12d020c3b0edf94 model.safetensors header",
+"tensors": {
+"confidence_head.proj.bias": [
+"BF16",
+[
+1
+]
+],
+"confidence_head.proj.weight": [
+"BF16",
+[
+1,
+7680
+]
+],
+"context_norm.weight": [
+"BF16",
+[
+7168
+]
+],
+"context_proj.weight": [
+"BF16",
+[
+7168,
+35840
+]
+],
+"final_norm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.0.input_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.0.mlp.down_proj.weight": [
+"BF16",
+[
+7168,
+14336
+]
+],
+"layers.0.mlp.gate_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.0.mlp.up_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.0.post_attention_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.0.self_attn.kv_a_layernorm.weight": [
+"BF16",
+[
+512
+]
+],
+"layers.0.self_attn.kv_a_proj_with_mqa.weight": [
+"BF16",
+[
+576,
+7168
+]
+],
+"layers.0.self_attn.kv_b_proj.weight": [
+"BF16",
+[
+24576,
+512
+]
+],
+"layers.0.self_attn.o_proj.weight": [
+"BF16",
+[
+7168,
+12288
+]
+],
+"layers.0.self_attn.q_a_layernorm.weight": [
+"BF16",
+[
+1536
+]
+],
+"layers.0.self_attn.q_a_proj.weight": [
+"BF16",
+[
+1536,
+7168
+]
+],
+"layers.0.self_attn.q_b_proj.weight": [
+"BF16",
+[
+18432,
+1536
+]
+],
+"layers.1.input_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.1.mlp.down_proj.weight": [
+"BF16",
+[
+7168,
+14336
+]
+],
+"layers.1.mlp.gate_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.1.mlp.up_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.1.post_attention_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.1.self_attn.kv_a_layernorm.weight": [
+"BF16",
+[
+512
+]
+],
+"layers.1.self_attn.kv_a_proj_with_mqa.weight": [
+"BF16",
+[
+576,
+7168
+]
+],
+"layers.1.self_attn.kv_b_proj.weight": [
+"BF16",
+[
+24576,
+512
+]
+],
+"layers.1.self_attn.o_proj.weight": [
+"BF16",
+[
+7168,
+12288
+]
+],
+"layers.1.self_attn.q_a_layernorm.weight": [
+"BF16",
+[
+1536
+]
+],
+"layers.1.self_attn.q_a_proj.weight": [
+"BF16",
+[
+1536,
+7168
+]
+],
+"layers.1.self_attn.q_b_proj.weight": [
+"BF16",
+[
+18432,
+1536
+]
+],
+"layers.2.input_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.2.mlp.down_proj.weight": [
+"BF16",
+[
+7168,
+14336
+]
+],
+"layers.2.mlp.gate_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.2.mlp.up_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.2.post_attention_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.2.self_attn.kv_a_layernorm.weight": [
+"BF16",
+[
+512
+]
+],
+"layers.2.self_attn.kv_a_proj_with_mqa.weight": [
+"BF16",
+[
+576,
+7168
+]
+],
+"layers.2.self_attn.kv_b_proj.weight": [
+"BF16",
+[
+24576,
+512
+]
+],
+"layers.2.self_attn.o_proj.weight": [
+"BF16",
+[
+7168,
+12288
+]
+],
+"layers.2.self_attn.q_a_layernorm.weight": [
+"BF16",
+[
+1536
+]
+],
+"layers.2.self_attn.q_a_proj.weight": [
+"BF16",
+[
+1536,
+7168
+]
+],
+"layers.2.self_attn.q_b_proj.weight": [
+"BF16",
+[
+18432,
+1536
+]
+],
+"layers.3.input_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.3.mlp.down_proj.weight": [
+"BF16",
+[
+7168,
+14336
+]
+],
+"layers.3.mlp.gate_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.3.mlp.up_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.3.post_attention_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.3.self_attn.kv_a_layernorm.weight": [
+"BF16",
+[
+512
+]
+],
+"layers.3.self_attn.kv_a_proj_with_mqa.weight": [
+"BF16",
+[
+576,
+7168
+]
+],
+"layers.3.self_attn.kv_b_proj.weight": [
+"BF16",
+[
+24576,
+512
+]
+],
+"layers.3.self_attn.o_proj.weight": [
+"BF16",
+[
+7168,
+12288
+]
+],
+"layers.3.self_attn.q_a_layernorm.weight": [
+"BF16",
+[
+1536
+]
+],
+"layers.3.self_attn.q_a_proj.weight": [
+"BF16",
+[
+1536,
+7168
+]
+],
+"layers.3.self_attn.q_b_proj.weight": [
+"BF16",
+[
+18432,
+1536
+]
+],
+"layers.4.input_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.4.mlp.down_proj.weight": [
+"BF16",
+[
+7168,
+14336
+]
+],
+"layers.4.mlp.gate_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.4.mlp.up_proj.weight": [
+"BF16",
+[
+14336,
+7168
+]
+],
+"layers.4.post_attention_layernorm.weight": [
+"BF16",
+[
+7168
+]
+],
+"layers.4.self_attn.kv_a_layernorm.weight": [
+"BF16",
+[
+512
+]
+],
+"layers.4.self_attn.kv_a_proj_with_mqa.weight": [
+"BF16",
+[
+576,
+7168
+]
+],
+"layers.4.self_attn.kv_b_proj.weight": [
+"BF16",
+[
+24576,
+512
+]
+],
+"layers.4.self_attn.o_proj.weight": [
+"BF16",
+[
+7168,
+12288
+]
+],
+"layers.4.self_attn.q_a_layernorm.weight": [
+"BF16",
+[
+1536
+]
+],
+"layers.4.self_attn.q_a_proj.weight": [
+"BF16",
+[
+1536,
+7168
+]
+],
+"layers.4.self_attn.q_b_proj.weight": [
+"BF16",
+[
+18432,
+1536
+]
+],
+"markov_head.markov_w1.weight": [
+"BF16",
+[
+163840,
+512
+]
+],
+"markov_head.markov_w2.weight": [
+"BF16",
+[
+163840,
+512
+]
+]
+}
+}

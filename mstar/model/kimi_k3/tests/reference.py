@@ -162,10 +162,11 @@ def latent_moe(sd: dict, p: str, x: torch.Tensor, cfg: KimiK3ModelConfig) -> tor
 @torch.no_grad()
 def reference_logits(sd: dict, input_ids: torch.Tensor, cfg: KimiK3ModelConfig, use_dsa: bool = False,
                      forced: dict[int, dict[int, torch.Tensor]] | None = None,
-                     trace: dict | None = None, logits_from: int = 0) -> torch.Tensor:
+                     trace: dict | None = None, taps: dict | None = None, logits_from: int = 0) -> torch.Tensor:
     """``(T, vocab)`` logits of one sequence; ``use_dsa`` applies K3.1's top-k selection.
     ``forced`` (layer -> query position -> key positions) replays another run's DSA picks;
-    ``trace`` collects each DSA layer's fp32 index scores under its layer index. ``logits_from``: only
+    ``trace`` collects each DSA layer's fp32 index scores under its layer index; ``taps`` each
+    layer's output stream (the block's running sum) under its layer index. ``logits_from``: only
     positions from it on get logits (an 8K-token sequence's would be 5 GB in fp32)."""
     eps = cfg.rms_norm_eps
     prefix = sd["model.embed_tokens.weight"][input_ids]
@@ -195,6 +196,8 @@ def reference_logits(sd: dict, input_ids: torch.Tensor, cfg: KimiK3ModelConfig, 
             f = gated_mlp(h, sd[f"{p}mlp.gate_proj.weight"], sd[f"{p}mlp.up_proj.weight"],
                           sd[f"{p}mlp.down_proj.weight"], cfg)
         prefix = cur + f
+        if taps is not None:
+            taps[i] = prefix
     prefix, blocks = prefix[logits_from:], [b[logits_from:] for b in blocks]
     out = attn_res(prefix, blocks, sd["model.output_attn_res_norm.weight"],
                    sd["model.output_attn_res_proj.weight"], eps)

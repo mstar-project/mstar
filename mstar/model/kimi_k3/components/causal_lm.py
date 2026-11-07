@@ -2,6 +2,8 @@
 output read, final norm and LM head."""
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 from torch import nn
 
@@ -28,14 +30,26 @@ class KimiK3LanguageModel(nn.Module):
         self.output_attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.output_attn_res_proj = nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, input_ids: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, rows: torch.Tensor | None = None,
+                aux_layers: tuple[int, ...] | None = None,
+                aux_sink: Callable[[int, torch.Tensor], None] | None = None):
         """``input_ids (T,)`` flat batch -> final normed hidden ``(T, hidden)``, or only its
-        ``rows``."""
+        ``rows``. With ``aux_layers`` (0-based, ascending, before the last layer) each of those
+        layers' output stream goes to ``aux_sink(j, state)`` (``j`` its index in ``aux_layers``),
+        for the DSpark drafter's context: under block attention residuals, the running partial sum
+        of the block (the layer's input to the next one's reads, residual and MLP added), as PR #257
+        reads it for K3's drafter (vLLM captures a DSpark drafter's ``target_layer_ids`` + 1;
+        which stream it takes under attention residuals is a hypothesis)."""
         prefix = self.embed_tokens(input_ids)
         blocks = None
         last = len(self.layers) - 1
+        taps = {layer: j for j, layer in enumerate(aux_layers or ())}
+        if taps and (list(taps) != sorted(taps) or max(taps) >= last or aux_sink is None):
+            raise ValueError(f"aux_layers {aux_layers}: ascending, before layer {last}, with a sink")
         for idx, layer in enumerate(self.layers):
             prefix, blocks = layer(prefix, blocks, rows=rows if idx == last else None)
+            if idx in taps:
+                aux_sink(taps[idx], prefix)
         out = attn_res_read(prefix, blocks, score_weight(
             self.output_attn_res_norm.weight, self.output_attn_res_proj.weight), self.eps)
         return self.norm(out)
