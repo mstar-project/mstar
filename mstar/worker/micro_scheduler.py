@@ -1493,7 +1493,8 @@ class MicroScheduler:
         unit = self.execution_units.get(key)
         if unit is not None:
             def capture_group(rid):
-                return tuple(self._capture_group(request_state, member, walk, rid) for member in unit.nodes)
+                return tuple(self._capture_group(request_state, member, member_walk, rid)
+                             for member, member_walk in zip(unit.nodes, unit.graph_walks, strict=True))
         return StepCandidates(
             graph_walk=walk,
             continuing=continuing, own_walk=own_walk,
@@ -1929,8 +1930,8 @@ class MicroScheduler:
         key = (node_name, graph_walk)
         if key not in self._max_bs:
             unit = self.execution_units.get(key)
-            nodes = unit.nodes if unit is not None else (node_name,)
-            caps = [self.engine_manager.get_engine(node).get_max_batch_size(node, graph_walk) for node in nodes]
+            members = zip(unit.nodes, unit.graph_walks, strict=True) if unit is not None else ((node_name, graph_walk),)
+            caps = [self.engine_manager.get_engine(node).get_max_batch_size(node, walk) for node, walk in members]
             capped = [cap for cap in caps if cap is not None]
             self._max_bs[key] = min(capped) if capped else None
         return self._max_bs[key]

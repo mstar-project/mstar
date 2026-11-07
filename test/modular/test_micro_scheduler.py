@@ -1417,14 +1417,23 @@ def test_clearing_a_rid_forgets_its_undelivered_admit_error():
     ({"r0": "left", "r1": "right", "r2": "left"}, ["r0"]),
     ({"r0": "left", "r1": "left", "r2": "left"}, ["r0", "r1"]),
 ])
-def test_connected_members_share_the_existing_builder_capture_key_and_tightest_cap(groups, expected):
+@pytest.mark.parametrize("consumer_walk", [WALK, "consume"])
+def test_connected_members_share_the_existing_builder_capture_key_and_tightest_cap(groups, expected, consumer_walk):
     from mstar.graph.runtime.base import ExecutionUnit
 
     a, b = _Engine(max_bs=8), _Engine(max_bs=2, groups=groups)
+    original_group, original_cap = b.capture_group, b.get_max_batch_size
+    def capture_group(node, walk, *args, **kwargs):
+        assert walk == consumer_walk
+        return original_group(node, walk, *args, **kwargs)
+    def max_batch_size(node, walk):
+        assert walk == consumer_walk
+        return original_cap(node, walk)
+    b.capture_group, b.get_max_batch_size = capture_group, max_batch_size
     scheduler = _scheduler(a)
     scheduler.engine_manager.get_engine = lambda name: a if name == NODE else b
     scheduler.execution_units[NODE, WALK] = ExecutionUnit(
-        (0, 0), (WALK, WALK), (NODE, "b"), ((NODE, "b", "x"),), ((), ()),
+        (0, 0), (WALK, consumer_walk), (NODE, "b"), ((NODE, "b", "x"),), ((), ()),
     )
     manager = _Manager(["r0", "r1", "r2"])
     batch = _next_batch(scheduler, manager)
