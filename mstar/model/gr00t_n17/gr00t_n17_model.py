@@ -56,6 +56,7 @@ from mstar.model.gr00t_n17.submodules import (
 from mstar.model.gr00t_n17.weight_loader import load_gr00t_n17_weights
 from mstar.model.qwen3_5.config import VISION_ATTN
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -132,12 +133,13 @@ class Gr00tN17Model(Model):
         # dims come from `nvidia/Cosmos-Reason2-2B`, which is gated.
         self.backbone_path_hf = backbone_path_hf or self.config_backbone_default
         self.cache_dir = cache_dir
-        self._repo_dir: Path | None = None
+        # NVIDIA's fine-tunes also ship their optimizer state: 29 GB of Bridge's 36
+        self._repo_dir = resolve_snapshot_dir(model_path_hf, cache_dir, allow_patterns=["*.json", "*.safetensors"])
         self.config: Gr00tN17Config = Gr00tN17Config.from_hf(
-            self._model_dir(), self._backbone_config(),
+            self._repo_dir, self._backbone_config(),
         )
         self.processor = Gr00tN17Preprocessor.from_pretrained(
-            self._model_dir(),
+            self._repo_dir,
             max_state_dim=self.config.max_state_dim,
             max_action_horizon=self.config.action_horizon,
             # the hub id, not a local path: `AutoProcessor.from_pretrained`
@@ -157,22 +159,6 @@ class Gr00tN17Model(Model):
         self._submodules: dict[str, NodeSubmodule] = {}
 
     config_backbone_default = "nvidia/Cosmos-Reason2-2B"
-
-    def _model_dir(self) -> Path:
-        """`model_path_hf` (a hub id or a path) as a local directory. A hub id is
-        snapshotted whole, as `Pi05Model._ensure_repo` does: the config, the
-        processor's json files and the weight shards are all read from it.
-        """
-        if self._repo_dir is None:
-            if Path(self.model_path_hf).is_dir():
-                self._repo_dir = Path(self.model_path_hf)
-            else:
-                from huggingface_hub import snapshot_download
-
-                self._repo_dir = Path(snapshot_download(
-                    repo_id=self.model_path_hf, cache_dir=self.cache_dir,
-                ))
-        return self._repo_dir
 
     def _backbone_config(self) -> Path:
         """Cosmos-Reason2-2B's `config.json` alone: only the backbone's dims are
@@ -377,7 +363,7 @@ class Gr00tN17Model(Model):
         config = self.config
 
         def loaded(module: torch.nn.Module) -> torch.nn.Module:
-            load_gr00t_n17_weights(module, node_name, self._model_dir())
+            load_gr00t_n17_weights(module, node_name, self._repo_dir)
             return module
 
         if node_name == VISION_ENCODER:
