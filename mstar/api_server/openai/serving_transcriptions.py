@@ -64,7 +64,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, read_stream_head
 from mstar.utils.utf8_stream import Utf8Stream
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
@@ -532,7 +532,9 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
             words.append({
                 **word,
                 "start": min(max(word["start"], 0.0), end) + window.offset,
-                "end": min(max(word["end"] if word["end"] is not None else end, word["start"], 0.0), end) + window.offset,
+                "end": min(max(
+                    word["end"] if word["end"] is not None else end, word["start"], 0.0,
+                ), end) + window.offset,
             })
         language = language or t.language
     for idx, seg in enumerate(segments):
@@ -585,10 +587,27 @@ async def create_transcription(
         raise
 
     if req.stream:
-        # the stream owns the files and windows from here
+        stream = _stream(api, adapter, req, planner, mode, raw_request)
+        try:
+            first = await read_stream_head(stream, raw_request)
+        except BaseException:
+            planner.cleanup()
+            raise
+        if first is None:
+            planner.cleanup()
+
+        async def replay():
+            try:
+                if first is not None:
+                    yield first
+                async for item in stream:
+                    yield item
+            finally:
+                await stream.aclose()
+
         return ReleasingStreamingResponse(
-            _stream(api, adapter, req, planner, mode, raw_request),
-            release=planner.cleanup,
+            replay(),
+            release=stream.aclose,
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
@@ -727,27 +746,30 @@ def _error_event(message: str, status: int | None) -> str:
     })
 
 
-def _cutting_error_event(exc: Exception) -> str:
-    """In band, since the stream has sent its 200: cutting the upload failed
-    for the upload's reason (an HTTPException) or the server's (no FFmpeg, no
-    memory)."""
-    if isinstance(exc, HTTPException):
-        return _error_event(str(exc.detail), exc.status_code)
-    return _error_event(f"the server could not decode the upload ({type(exc).__name__})", 500)
-
-
 async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_request=None):
     """Deltas as they come for one window or parallel windows (in window
     order); sequential long form emits each window's text once the window
     is accepted, since only then is it known to stand."""
     windows: list[Window] = []
     inflight: set[str] = set()
+    started = False
+
+    def error(message, status):
+        if not started:
+            raise HTTPException(status_code=status or 500, detail=message)
+        return _error_event(message, status)
+
+    def cutting_error(exc):
+        if isinstance(exc, HTTPException):
+            return error(str(exc.detail), exc.status_code)
+        return error(f"the server could not decode the upload ({type(exc).__name__})", 500)
+
     try:
         if mode == "parallel" or planner.single:
             try:
                 windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
             except (HTTPException, ImportError, MemoryError) as exc:
-                yield _cutting_error_event(exc)
+                yield cutting_error(exc)
                 yield SSE_DONE
                 return
             # The stream carries text only, and a window decoded with timestamps
@@ -768,7 +790,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                 decoder = Utf8Stream()
                 async for c in api.iter_result_chunks(window.request_id):
                     if c.modality == "error":
-                        yield _error_event(c.data.decode("utf-8", "replace"), (c.metadata or {}).get("status"))
+                        yield error(c.data.decode("utf-8", "replace"), (c.metadata or {}).get("status"))
                         yield SSE_DONE
                         return
                     if c.modality != "text" or not c.data:
@@ -777,8 +799,10 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                     delta, emitted = _stream_delta(adapter.stream_text(raw), emitted)
                     if delta:
                         if gap:
+                            started = True
                             yield sse({"type": "transcript.text.delta", "delta": " "})
                             gap = False
+                        started = True
                         yield sse({"type": "transcript.text.delta", "delta": delta})
                 raw += decoder.flush()
                 # A language/control prefix may have held all the text back.
@@ -786,7 +810,9 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                 delta, emitted = _stream_delta(adapter.parse_transcript(raw, window_req).text, emitted)
                 if delta:
                     if gap:
+                        started = True
                         yield sse({"type": "transcript.text.delta", "delta": " "})
+                    started = True
                     yield sse({"type": "transcript.text.delta", "delta": delta})
                 inflight.discard(window.request_id)
                 window.raw_text = raw
@@ -800,15 +826,18 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                     windows.append(window)
                     if window.transcript.text:
                         if spoken:
+                            started = True
                             yield sse({"type": "transcript.text.delta", "delta": " "})
+                        started = True
                         yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
                         spoken = True
                     await asyncio.sleep(0)
             except (HTTPException, ImportError, MemoryError) as exc:
-                yield _cutting_error_event(exc)
+                yield cutting_error(exc)
                 yield SSE_DONE
                 return
         transcript = merge_windows(windows, adapter, req)
+        started = True
         yield sse({
             "type": "transcript.text.done",
             "text": transcript.text,

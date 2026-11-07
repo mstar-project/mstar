@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import collections
-import contextlib
 import itertools
 import json
 import logging
@@ -52,7 +51,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.api_server.served_models import ServedModels
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, read_stream_head
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -373,18 +372,6 @@ def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
         "data": base64.b64encode(chunk.data).decode("ascii"),
         "metadata": chunk.metadata,
     }) + "\n"
-
-
-async def _disconnected(raw_request: Request) -> None:
-    """Return once the client has gone; the body is already read."""
-    while (await raw_request.receive())["type"] != "http.disconnect":
-        pass
-
-
-async def _empty_stream():
-    """The body for a client that left before its first chunk."""
-    return
-    yield
 
 
 def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
@@ -1598,21 +1585,7 @@ class APIServer:
         client that disconnects first is aborted and gets an empty iterator.
         """
         items = (self.iter_result_chunk_batches if batches else self.iter_result_chunks)(request_id)
-        first_read = asyncio.ensure_future(anext(items, None))
-        gone = asyncio.ensure_future(_disconnected(raw_request)) if raw_request is not None else None
-        try:
-            await asyncio.wait({first_read, gone} - {None}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            # a pending receive() would take the disconnect StreamingResponse listens for
-            for task in (gone, first_read):
-                if task is not None and not task.done():
-                    # cancelling the read unwinds the iterator, which aborts the request
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-        if first_read.cancelled():
-            return _empty_stream()
-        first = first_read.result()
+        first = await read_stream_head(items, raw_request)
         head = first[0] if batches and first else first
         if head is not None and head.modality == "error":
             # read to the end, so the finished request is not aborted

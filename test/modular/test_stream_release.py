@@ -287,16 +287,18 @@ def test_speech_stream_schedules_its_reference_clip_cleanup(monkeypatch):
 
 
 def test_transcription_stream_deletes_its_upload(monkeypatch):
-    from test_openai_transcriptions import _StubAPI, _wav_bytes
+    from test_openai_transcriptions import _Chunk, _StubAPI, _wav_bytes
 
     stub = _StubAPI()
+    stub.next_chunks = [_Chunk("text", b"hello")]
     client = _client(monkeypatch, stub)
     client.post(
         "/v1/audio/transcriptions",
-        data={"model": "whisper_large", "stream": "true"},
+        data={"model": "whisper_large", "stream": "true", "long_form": "parallel"},
         files={"file": ("long.wav", _wav_bytes(45), "audio/wav")},
     )
-    assert stub.submits == []
+    assert stub.submits
+    assert sorted(stub.released) == sorted(s["request_id"] for s in stub.submits)
     assert not list(Path(stub.upload_dir).iterdir())
 
 

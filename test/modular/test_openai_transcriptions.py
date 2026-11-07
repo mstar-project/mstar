@@ -312,7 +312,7 @@ def test_transcription_stream_events(client_and_stub):
 
 
 @pytest.mark.parametrize("status,error_type", [(500, "server_error"), (400, "invalid_request_error")])
-def test_transcription_stream_reports_in_band_error(client_and_stub, status, error_type):
+def test_transcription_stream_refusal_keeps_http_status(client_and_stub, status, error_type):
     client, stub = client_and_stub
     stub.next_chunks = [_Chunk("error", b"boom", {"status": status})]
     with client.stream(
@@ -320,11 +320,10 @@ def test_transcription_stream_reports_in_band_error(client_and_stub, status, err
         data={"model": "whisper_large", "stream": "true"},
         files={"file": ("a.wav", b"RIFF", "audio/wav")},
     ) as r:
-        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
-    event = json.loads(lines[0][len("data: "):])
-    assert event["type"] == "error"
-    assert event["error"] == {"message": "boom", "type": error_type, "code": status}, "the type ignores the status"
-    assert lines[-1] == "data: [DONE]"
+        r.read()
+        assert r.status_code == status
+        assert r.json()["error"] == {"message": "boom", "type": error_type, "code": status}
+    assert not list(stub.upload_dir.iterdir())
 
 
 def test_transcription_requires_a_file(client_and_stub):
@@ -860,8 +859,8 @@ def test_streaming_parallel_error_releases_the_other_windows(client_and_stub):
         data={"model": "whisper_large", "stream": "true", "long_form": "parallel"},
         files={"file": ("long.wav", _wav_bytes(61), "audio/wav")},
     ) as r:
-        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
-    assert json.loads(lines[0][len("data: "):])["type"] == "error"
+        r.read()
+        assert r.status_code == 400
     # the failed window is released too: its iterator was left mid-stream
     assert sorted(stub.released) == sorted(s["request_id"] for s in stub.submits)
 
@@ -971,3 +970,18 @@ def test_qwen_repetition_is_removed_before_captions_and_realtime(prefix):
         [serving_transcriptions.Window(path="a", offset=0.0, duration=2.0, raw_text=raw)], adapter, req,
     )
     assert merged.segments[0]["text"] == merged.text
+
+
+def test_transcription_error_after_text_stays_in_band(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("text", b"hello"), _Chunk("error", b"later failure", {"status": 500})]
+    response = client.post("/v1/audio/transcriptions",
+        data={"model": "whisper_large", "stream": "true"},
+        files={"file": ("a.wav", b"RIFF", "audio/wav")},
+    )
+    assert response.status_code == 200
+    events = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ") and "[DONE]" not in line]
+    assert events[0]["type"] == "transcript.text.delta"
+    assert events[-1]["error"]["message"] == "later failure"
+    assert not list(stub.upload_dir.iterdir())
