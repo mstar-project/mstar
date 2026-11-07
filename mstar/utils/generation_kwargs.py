@@ -105,4 +105,13 @@ def normalize_generation_kwargs(model_kwargs: dict | None) -> dict:
             check_int_knob(key, value, *_INT_RULES[name])
         elif _knob(key, _BOOL_KNOBS) is not None:
             check_bool_knob(key, value)
+    pending = list(kwargs.values())
+    while pending:
+        value = pending.pop()
+        if isinstance(value, int) and not -(2**63) <= value < 2**64:
+            raise ValueError("request integers must fit the 64-bit wire format")
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
     return kwargs
