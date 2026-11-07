@@ -591,7 +591,7 @@ def warm_up_model(model) -> None:
 
 @dataclass
 class RequestOutputState:
-    """One request's output ordering, held by the data worker.
+    """One request's output ordering and prompt count, held by the data worker.
 
     Transport reads may complete out of order. Each output takes a sequence
     when the worker notification arrives, and completed chunks are held until
@@ -607,6 +607,7 @@ class RequestOutputState:
     # A video_frame chunk can carry several frames, so this advances by
     # frame_count rather than chunks.
     frame_index: int = 0
+    prompt_tokens: int | None = None
 
 
 class EncodedOutput(NamedTuple):
@@ -985,7 +986,14 @@ class PreprocessWorkerThread:
             call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        prompt_tokens = None
+        usage_layout = getattr(self.model, "TOKEN_USAGE_LAYOUT", None)
+        if usage_layout is not None:
+            resource, label = usage_layout
+            row = model_kwargs.get("kv_layout", {}).get(resource, {}).get(label)
+            if row is not None:
+                prompt_tokens = sum(span[0] for span in row[0])
+        self.request_output_state[input.request_id] = RequestOutputState(prompt_tokens=prompt_tokens)
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -1557,6 +1565,8 @@ class PreprocessWorkerThread:
                 else:
                     data = datas[i]
                 metadata = {} if not logprobs or logprobs[i] is None else {"logprobs": [logprobs[i]]}
+                if item.modality == "text" and state.prompt_tokens is not None:
+                    metadata["completion_tokens"] = 1
                 if self._wants_token_ids(request_id, item.modality):
                     metadata["token_ids"] = [values[i]]
                 self._queue_completed_output(
@@ -1577,9 +1587,15 @@ class PreprocessWorkerThread:
         """A text chunk of a request that set ``return_token_ids``."""
         return modality == "text" and bool((self.request_model_kwargs.get(request_id) or {}).get("return_token_ids"))
 
-    def _with_token_ids(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
-        """``metadata`` plus the chunk's sampled ids, stop tokens included. A
-        float text tensor (Whisper's word alignment) carries no ids."""
+    def _with_token_metadata(self, request_id: str, modality: str, tensor: torch.Tensor, metadata: dict) -> dict:
+        """Count sampled text tokens and optionally expose their IDs, including
+        stop tokens. Float text tensors (Whisper alignment) carry no token IDs."""
+        state = self.request_output_state.get(request_id)
+        if (
+            modality == "text" and not tensor.is_floating_point()
+            and state is not None and state.prompt_tokens is not None
+        ):
+            metadata = {**metadata, "completion_tokens": tensor.numel()}
         if tensor.is_floating_point() or not self._wants_token_ids(request_id, modality):
             return metadata
         return {**metadata, "token_ids": tensor.reshape(-1).tolist()}
@@ -1599,6 +1615,8 @@ class PreprocessWorkerThread:
 
         while state.next_emit in state.pending:
             ready = state.pending.pop(state.next_emit)
+            if state.next_emit == 0 and state.prompt_tokens is not None:
+                ready.metadata = {**ready.metadata, "prompt_tokens": state.prompt_tokens}
             if ready.modality == "video_frame":
                 ready.metadata["frame_index"] = state.frame_index
                 state.frame_index += ready.metadata["frame_count"]
@@ -1648,7 +1666,7 @@ class PreprocessWorkerThread:
             )
 
         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
-        chunk_metadata = self._with_token_ids(request_id, modality, tensor, chunk_metadata)
+        chunk_metadata = self._with_token_metadata(request_id, modality, tensor, chunk_metadata)
         # Audio is emitted as headerless 16-bit PCM; surface the
         # model's output sample rate + channel count so clients can
         # wrap it.

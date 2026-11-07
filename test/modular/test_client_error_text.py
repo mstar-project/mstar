@@ -130,9 +130,9 @@ def test_a_worker_exception_reaches_the_client_as_an_error_id(tmp_path, caplog):
     w._handle_main_loop_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
 
     (message,) = w.sent
-    text = message.body.errors["r1"]
+    text = message.body.errors["r1"].message
     _assert_clean(text)
-    assert text.startswith("Error in worker: internal error (error id ")
+    assert text.startswith("internal error (error id ")
     assert tensor_file in _logged(caplog, _error_id(text)).getMessage()
 
 
@@ -141,9 +141,9 @@ def test_a_per_request_stage_failure_reaches_the_client_as_an_error_id(tmp_path,
     ExecutingBatch.register_failure(batch, 7, RuntimeError(f"bad weights at {tmp_path}"))
     ExecutingBatch.register_failure(batch, 8, ValueError(f"no frames in {tmp_path}/a_b.wav"))
 
-    _assert_clean(batch.failed_requests[7])
-    assert str(tmp_path) in _logged(caplog, _error_id(batch.failed_requests[7])).getMessage()
-    assert batch.failed_requests[8] == "ValueError: no frames in a_b.wav"
+    _assert_clean(batch.failed_requests[7].message)
+    assert str(tmp_path) in _logged(caplog, _error_id(batch.failed_requests[7].message)).getMessage()
+    assert batch.failed_requests[8].message == "ValueError: no frames in a_b.wav"
 
 
 class _FailingServer:
@@ -370,14 +370,18 @@ def _rss_mib() -> float:
         return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
 
 
-def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_error_id(
-    monkeypatch, tmp_path, caplog,
+@pytest.mark.parametrize("decoder_available", [True, False])
+def test_transcription_decode_failure_distinguishes_bad_file_from_missing_decoder(
+    monkeypatch, tmp_path, caplog, decoder_available,
 ):
     """A header longer than the model's window makes the frontend decode the
-    upload (``WindowPlanner.prepare``). When that decode fails with an
-    unexpected error, here the FFmpeg fallback naming the saved upload as
-    torchcodec does, the client gets an error id and the upload is deleted."""
+    upload (``WindowPlanner.prepare``). Invalid audio is a client error; a
+    missing decoder is a server error. Neither exposes the saved upload path,
+    and both delete the upload."""
     from mstar.api_server import media_io
+    from mstar.model.components import audio_features
+
+    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: decoder_available)
 
     seen = []
 
@@ -391,11 +395,14 @@ def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_erro
     )
 
     assert len(seen) == 1, "the frontend decode did not run"
-    assert response.status_code == 500
+    assert response.status_code == (400 if decoder_available else 500)
     _assert_clean(response.text)
     assert SECRET not in response.text and "lecture" not in response.text
     message = response.json()["error"]["message"]
-    assert seen[0] in _logged(caplog, _error_id(message)).getMessage()
+    if decoder_available:
+        assert message == "could not decode the audio upload"
+    else:
+        assert seen[0] in _logged(caplog, _error_id(message)).getMessage()
     assert os.listdir(tmp_path) == []
 
 
@@ -445,3 +452,15 @@ def test_an_openai_route_keeps_the_status_an_exception_names(monkeypatch, tmp_pa
     )
     assert response.status_code == 413
     assert response.json()["error"]["message"] == str(media_io.AudioTooLongError(1800))
+
+
+@pytest.mark.parametrize("detail", [
+    "CUDA error: an illegal memory access was encountered",
+    "CUDA error: device-side assert triggered",
+    "CUDA error: unspecified launch failure",
+])
+def test_external_kernel_sticky_errors_stop_the_worker(detail):
+    from mstar.utils.client_errors import RequestError
+
+    with pytest.raises(SystemExit, match="fatal device error"):
+        RequestError.from_exception(RuntimeError(detail), "forward failed")

@@ -291,6 +291,7 @@ def _load_into(
 # ---------------------------------------------------------------------------
 
 class BagelModel(Model):
+
     """
     BAGEL unified multimodal model (ByteDance).
 
@@ -307,6 +308,8 @@ class BagelModel(Model):
     Prefill steps are constructed as a sequential schedule that walks
     through interleaved text and image inputs.
     """
+
+    TOKEN_USAGE_LAYOUT = ("kv", "main")
 
 
     INTERNAL_KWARGS = (CFG_WINDOW, ROLE_TURNS)
@@ -681,6 +684,11 @@ class BagelModel(Model):
 
         Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
         """
+        unsupported = set(input_modalities) - {TEXT, "image"}
+        if unsupported:
+            raise ValueError(f"BAGEL has no encoder for {', '.join(sorted(unsupported))}")
+        if (output_modalities or ["text"])[0] == "text" and not prompt and "image" not in input_modalities:
+            raise ValueError("BAGEL chat requires text or image input")
         params = self._request_params(input_modalities, output_modalities, kwargs)
         if "image" in output_modalities:
             image_output_format(kwargs)  # fail a bad output knob now, not after the denoise
@@ -761,6 +769,12 @@ class BagelModel(Model):
             # under 16 pixels a side (the VAE's 8x times the 2x2 patch) it has no latent patch,
             # and the loop would fail mid-request
             sides = images[0].shape[-2:] if images else (params["height"], params["width"])
+            max_side = self.config.max_latent_size * self.config.latent_downsample
+            if any(side > max_side for side in sides):
+                raise ValueError(
+                    f"BAGEL's position table supports at most {max_side} pixels a side, "
+                    f"got {list(sides)} (h, w)"
+                )
             if any(side < 16 for side in sides):
                 raise ValueError(f"BAGEL's output image must be at least 16 pixels a side, got {list(sides)} (h, w)")
         if tensors is None:

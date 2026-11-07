@@ -159,6 +159,12 @@ def test_requests_above_max_image_area_are_rejected():
     small.set_config(ZImageConfig())
     with pytest.raises(ValueError, match="max_image_area"):
         small._resolve_size(dict(height=1024, width=1040))
+    with pytest.raises(ValueError, match="dimensions"):
+        model._resolve_size(dict(width=float("inf")))
+    # a side past the rotary table (512 tokens of 16 px) indexed past its end, inside the area cap
+    assert model._resolve_size(dict(height=16, width=8192)) == (16, 8192)
+    with pytest.raises(ValueError, match="8192"):
+        model._resolve_size(dict(height=16, width=8208))
 
 
 def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
@@ -239,3 +245,9 @@ def test_fused_qk_norm_rope_matches_the_eager_modules():
             diff = (apply_rotary_complex(norm(x), freqs).float() - out.float()).abs()
             assert out.is_contiguous() and (diff > 0).float().mean() < 1e-4
             assert diff.max() <= 2 ** -6 * apply_rotary_complex(norm(x), freqs).float().abs().max()
+
+
+@pytest.mark.parametrize("modality", ["audio", "video"])
+def test_unsupported_upload_is_not_silently_dropped(modality):
+    with pytest.raises(ValueError, match="input"):
+        _make_model().process_prompt("a cat", ["text", modality], ["image"])

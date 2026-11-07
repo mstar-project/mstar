@@ -346,3 +346,35 @@ def test_the_scheduler_sees_the_rows_every_lane_holds():
     assert w._in_flight_rids is shared and held == {R, A} and shared == {A}, (
         "the scheduler shares the set, and would start a rebuild for a row a step in flight holds"
     )
+
+
+@pytest.mark.parametrize("handler", ["main_loop", "step_result"])
+def test_failed_forward_releases_traceback_tensors_without_gc(handler):
+    import gc
+    import weakref
+    refs = []
+    def forward():
+        tensor = torch.zeros(10)
+        refs.append(weakref.ref(tensor))
+        raise torch.OutOfMemoryError("out of memory")
+    w, _ = _worker()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        try:
+            forward()
+        except torch.OutOfMemoryError as exc:
+            if handler == "main_loop":
+                w._handle_main_loop_error(exc, (), None)
+            else:
+                from concurrent.futures import Future
+                future = Future()
+                future.set_exception(exc)
+                pending = SimpleNamespace(future=future, node_name=NODE, graph_walk=DECODE,
+                    node_batch=SimpleNamespace(failed_requests={}),
+                    batch=SimpleNamespace(request_to_worker_graph={}))
+                w._step_result(pending)
+            assert refs[0]() is None
+    finally:
+        if was_enabled:
+            gc.enable()

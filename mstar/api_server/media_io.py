@@ -18,20 +18,18 @@ the base install stays slim.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import math
 import os
 import threading
-import time
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import numpy as np
-
-from mstar.utils.threads import Thread
 
 # MIME (top-level type or full type) -> file extension used when persisting.
 _MIME_TO_EXT: dict[str, str] = {
@@ -131,46 +129,75 @@ def _ext_for(mime: str, fallback: str = ".bin") -> str:
 # Inbound: persist request media into upload_dir, return (modality, path)
 # ---------------------------------------------------------------------------
 
-def _save_bytes(raw: bytes, mime: str, upload_dir: Path) -> tuple[str, str]:
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    path = upload_dir / f"{uuid4()}{_ext_for(mime)}"
-    path.write_bytes(raw)
-    return modality_from_mime(mime), str(path)
+def save_upload(raw: bytes | bytearray, filename: str, upload_dir: Path) -> str:
+    """Save a client upload with a bounded basename; remove a partial write on failure.
+
+    Use string paths for request-specific names: Python 3.12's pathlib interns
+    their components for the lifetime of the process.
+    """
+    os.makedirs(upload_dir, exist_ok=True)
+    base = os.path.basename(filename) or "upload.bin"
+    if len(base.encode("utf-8")) > 180:
+        ext = os.path.splitext(base)[1]
+        base = "upload" + (ext if len(ext.encode("utf-8")) <= 16 else ".bin")
+    path = os.path.join(upload_dir, f"{uuid4()}_{base}")
+    try:
+        with open(path, "wb") as output:
+            output.write(raw)
+    except BaseException:
+        remove_uploads({"upload": [path]}, upload_dir)
+        raise
+    return path
 
 
-def _decode_base64_payload(payload: str) -> bytes:
-    """Decode client-provided base64 after normalizing common wire variants."""
-    # OpenAI-compatible clients may omit padding or wrap the payload at a
-    # fixed column width. Normalize both forms before asking the decoder to
-    # validate the alphabet, so malformed requests fail as client errors.
-    cleaned = "".join(payload.split())
-    padded = cleaned + "=" * (-len(cleaned) % 4)
-    return base64.b64decode(padded, validate=True)
+def _save_bytes(raw: bytes | bytearray, mime: str, upload_dir: Path) -> tuple[str, str]:
+    return modality_from_mime(mime), save_upload(raw, "upload" + _ext_for(mime), upload_dir)
+
+
+def _decode_base64_payload(payload: str, start: int = 0) -> bytearray:
+    """Decode wrapped/unpadded base64 in bounded calls that release the GIL
+    between chunks when intake runs in a worker thread."""
+    decoded = bytearray()
+    pending = ""
+    padded = False
+    for offset in range(start, len(payload), 65536):
+        pending += "".join(payload[offset:offset + 65536].split())
+        if padded:
+            if len(pending) > 4:
+                raise ValueError("Excess data after base64 padding")
+            continue
+        pad = pending.find("=")
+        end = (pad if pad >= 0 else len(pending)) // 4 * 4
+        if end:
+            decoded.extend(base64.b64decode(pending[:end], validate=True))
+        pending = pending[end:]
+        padded = pad >= 0
+        if padded and len(pending) > 4:
+            raise ValueError("Excess data after base64 padding")
+    if pending:
+        decoded.extend(base64.b64decode(pending + "=" * (-len(pending) % 4), validate=True))
+    return decoded
 
 
 def save_data_url(data_url: str, upload_dir: Path) -> tuple[str, str]:
     """Persist a ``data:<mime>;base64,<payload>`` URL. Returns (modality, path)."""
-    header, _, payload = data_url.partition(",")
-    if not payload:
+    comma = data_url.find(",")
+    if comma < 0 or comma + 1 == len(data_url):
         raise ValueError("Malformed data URL: missing payload")
+    header = data_url[:comma]
     mime = header[len("data:"):].split(";", 1)[0] or "application/octet-stream"
-    raw = _decode_base64_payload(payload)
+    if modality_from_mime(mime) == "unknown":
+        raise ValueError("data URL must contain image, audio or video media")
+    raw = _decode_base64_payload(data_url, start=comma + 1)
     return _save_bytes(raw, mime, upload_dir)
 
 
 def save_base64(b64: str, fmt: str, modality_hint: str, upload_dir: Path) -> tuple[str, str]:
     """Persist a bare base64 blob with a known ``fmt`` (e.g. ``"wav"``)."""
-    upload_dir = Path(upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
     raw = _decode_base64_payload(b64)
-    # Sanitize the client-controlled fmt: alphanumerics only, so it cannot
-    # inject path separators into the upload path.
     clean = "".join(c for c in fmt.lstrip(".") if c.isalnum())
     ext = "." + clean if clean else ".bin"
-    path = upload_dir / f"{uuid4()}{ext}"
-    path.write_bytes(raw)
-    return modality_hint, str(path)
+    return modality_hint, save_upload(raw, "upload" + ext, upload_dir)
 
 
 # Telephone band, the lowest rate speech is recorded or coded at. A clip below it
@@ -243,10 +270,10 @@ def check_ref_audio(path: str, decoder: str) -> None:
             except Exception:  # noqa: BLE001 — not a libsndfile container; the loader tries FFmpeg
                 _check_ref_audio_torchcodec(path)
     except RefAudioTooLongError:
-        Path(path).unlink(missing_ok=True)
+        remove_uploads({"audio": [path]}, os.path.dirname(path))
         raise
     except Exception as exc:  # noqa: BLE001 — not loadable here, so the model cannot load it either
-        Path(path).unlink(missing_ok=True)
+        remove_uploads({"audio": [path]}, os.path.dirname(path))
         raise ValueError(
             f"ref_audio must be audio the model can decode, at {MIN_REF_AUDIO_SAMPLE_RATE} Hz or more"
         ) from exc
@@ -311,7 +338,7 @@ def save_remote_url(url: str, upload_dir: Path, timeout: float = 30.0) -> tuple[
         mime = resp.headers.get_content_type() if resp.headers else ""
     if not mime:
         # Infer from the URL path extension.
-        suffix = Path(urlparse(url).path).suffix.lower()
+        suffix = os.path.splitext(urlparse(url).path)[1].lower()
         rev = {v: k for k, v in _MIME_TO_EXT.items()}
         mime = rev.get(suffix, "application/octet-stream")
     return _save_bytes(raw, mime, upload_dir)
@@ -345,14 +372,13 @@ def remove_uploads(file_paths: dict[str, list[str]] | None, upload_dir: Path) ->
     """Delete a request's files under ``upload_dir`` now. A path elsewhere is
     left alone: no route puts one in ``file_paths`` today, and a file the
     server did not save is never the request's to delete."""
-    root = Path(upload_dir).resolve()
+    root = os.path.realpath(upload_dir)
     for paths in (file_paths or {}).values():
         for path in paths:
-            p = Path(path)
-            if not p.resolve().is_relative_to(root):
+            if os.path.commonpath((root, os.path.realpath(path))) != root:
                 continue
             try:
-                p.unlink(missing_ok=True)
+                os.unlink(path)
             except OSError:
                 pass
 
@@ -363,11 +389,9 @@ def schedule_upload_cleanup(file_paths: dict[str, list[str]] | None, upload_dir:
     if not file_paths:
         return
 
-    def _cleanup() -> None:
-        time.sleep(UPLOAD_CLEANUP_DELAY_S)
-        remove_uploads(file_paths, upload_dir)
-
-    Thread(target=_cleanup, daemon=True).start()
+    asyncio.get_running_loop().call_later(
+        UPLOAD_CLEANUP_DELAY_S, remove_uploads, file_paths, upload_dir,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,9 +426,6 @@ def check_resample_rate(rate: int, target: int) -> None:
 # and /generate audio, reference clips): the transcription route's limit.
 MAX_AUDIO_SECONDS = 30 * 60
 _SOUNDFILE_BLOCK_SECONDS = 10
-# libsndfile's MP3 decoder is seamless across reads only at whole 1152-sample
-# MPEG frames; a read that splits a frame glitches the samples after it
-_SOUNDFILE_BLOCK_ALIGN = 1152
 
 
 class AudioRefusedError(ValueError):
@@ -422,8 +443,11 @@ class AudioTooLongError(AudioRefusedError):
         super().__init__(f"audio is longer than the {max_seconds:g} s limit")
 
 
-def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> tuple[np.ndarray, int]:
-    """libsndfile decode of ``path``: float32 mono at the file's own rate.
+def read_audio_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> tuple[np.ndarray, int]:
+    """Decode ``path`` to float32 mono at the file's own rate.
+
+    PyAV reads MP3 and zero-length WAV headers through EOF; soundfile reads
+    other supported containers.
 
     Reads in blocks and counts the frames it decodes, so a header that hides
     or understates the length cannot make the read unbounded; past
@@ -434,6 +458,12 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
     import soundfile as sf
 
     with sf.SoundFile(path) as f:
+        # libsndfile stops at MPEG's first/estimated frame count, and at a
+        # streaming WAV's zero-length data header, even when bytes remain.
+        if getattr(f, "format", None) == "MP3" or (
+            getattr(f, "format", None) in ("WAV", "WAVEX", "RF64") and f.frames == 0
+        ):
+            return _read_av_capped(path, max_seconds)
         rate = f.samplerate
         # the frame cap scales with the rate; the range alone here, the
         # kernel to the caller's target is checked after the decode
@@ -442,7 +472,7 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
         except ValueError as exc:
             raise AudioRefusedError(str(exc)) from None
         limit = int(max_seconds * rate)
-        block = max(1, _SOUNDFILE_BLOCK_SECONDS * rate // _SOUNDFILE_BLOCK_ALIGN) * _SOUNDFILE_BLOCK_ALIGN
+        block = max(1, _SOUNDFILE_BLOCK_SECONDS * rate)
         parts, frames = [], 0
         while True:
             data = f.read(min(block, limit + 1 - frames), dtype="float32", always_2d=True)
@@ -454,6 +484,47 @@ def read_soundfile_capped(path: str, max_seconds: float = MAX_AUDIO_SECONDS) -> 
             # a mono block is its own mean, and numpy's reduction over the
             # length-1 axis costs ~10x the copy
             parts.append(data[:, 0] if data.shape[1] == 1 else data.mean(axis=1))
+    return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
+
+
+def _read_av_capped(path: str, max_seconds: float) -> tuple[np.ndarray, int]:
+    """Decode through EOF, counting samples rather than trusting duration tags."""
+    import av
+
+    parts, frames = [], 0
+    with av.open(path) as container:
+        stream = container.streams.audio[0]
+        rate = stream.codec_context.sample_rate
+        try:
+            check_resample_rate(rate, rate)
+        except ValueError as exc:
+            raise AudioRefusedError(str(exc)) from None
+        limit = int(max_seconds * rate)
+        resampler = av.AudioResampler(format="fltp", rate=rate)
+
+        def append(frame):
+            nonlocal frames
+            frames += frame.samples
+            if frames > limit:
+                raise AudioTooLongError(max_seconds)
+            data = frame.to_ndarray()
+            parts.append(data[0] if data.shape[0] == 1 else data.mean(axis=0))
+
+        for packet in container.demux(stream):
+            try:
+                decoded = packet.decode()
+            except av.error.InvalidDataError:
+                # A concatenated MP3 can put an ID3 tag between audio segments.
+                # The demuxer emits that metadata as a packet; it is not audio.
+                if stream.codec_context.name == "mp3float" and bytes(packet).startswith(b"ID3"):
+                    continue
+                raise
+            for frame in decoded:
+                frame.pts = None  # concatenated segments may restart timestamps
+                for converted in resampler.resample(frame):
+                    append(converted)
+        for converted in resampler.resample(None):
+            append(converted)
     return (np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)), rate
 
 
@@ -618,7 +689,8 @@ def write_wav(audio, path: str, sample_rate: int = 16000) -> str:
     sample."""
     scaled = np.rint(np.asarray(audio, dtype=np.float64) * 32768.0)
     pcm = np.clip(scaled, -32768, 32767).astype("<i2").tobytes()
-    Path(path).write_bytes(pcm16_to_wav_bytes(pcm, sample_rate))
+    with open(path, "wb") as output:
+        output.write(pcm16_to_wav_bytes(pcm, sample_rate))
     return path
 
 

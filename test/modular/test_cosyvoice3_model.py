@@ -680,7 +680,7 @@ def test_an_upload_the_server_cannot_write_is_not_a_bad_request(tmp_path, monkey
     def fail(*args, **kwargs):
         raise error
 
-    monkeypatch.setattr(Path, "write_bytes", fail)
+    monkeypatch.setattr(adapters.media_io, "save_upload", fail)
     with pytest.raises(RuntimeError) as raised:
         adapters.CosyVoice3Adapter().speech_to_request(_speech(ref_audio=ref, ref_text="w"), tmp_path)
     assert not isinstance(raised.value, ValueError)
@@ -710,10 +710,10 @@ def test_an_upload_write_failure_is_a_500_with_no_path(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
     monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
 
-    def fail(path, data):
-        raise OSError(28, "No space left on device", str(path))
+    def fail(raw, filename, upload_dir):
+        raise OSError(28, "No space left on device", str(upload_dir))
 
-    monkeypatch.setattr(Path, "write_bytes", fail)
+    monkeypatch.setattr(adapters.media_io, "save_upload", fail)
     app = FastAPI()
     app.include_router(router)
     r = TestClient(app, raise_server_exceptions=False).post(

@@ -64,14 +64,16 @@ class KVConfig(ABC):
         ``num_shards`` is the instance session size (tp * sp): Ulysses SP
         all-to-alls heads, so attention runs at head-degree tp*sp.
         """
-        from mstar.distributed.utils import divide
-
-        if num_shards >= self._unsharded_kv_heads:
-            # fewer KV heads than ranks — every rank holds a replicated head
-            self.num_kv_heads = 1
-        else:
-            self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
-        self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
+        qo_heads, kv_heads = self._unsharded_qo_heads, self._unsharded_kv_heads
+        if (num_shards < 1 or qo_heads % num_shards
+                or max(kv_heads, num_shards) % min(kv_heads, num_shards)):
+            raise ValueError(
+                f"KV attention heads (query={qo_heads}, key/value={kv_heads}) cannot be split "
+                f"over {num_shards} head shards; query heads must divide evenly and KV heads "
+                "must divide evenly or be replicated equally across ranks"
+            )
+        self.num_kv_heads = max(1, kv_heads // num_shards)
+        self.num_qo_heads = qo_heads // num_shards
 
     @abstractmethod
     def apply_yaml_overrides(self, **kwargs) -> None:

@@ -23,6 +23,12 @@ EXPECTED_MSTAR_RUST_VERSION = "0.1.1"
 #: notably the tensor-file namespace in ``mstar.communication.tensors``.
 DEPLOYMENT_ANCHOR_ENTITY = "conductor"
 
+#: The entities that lock the deployment's IPC prefix when they bind: the
+#: anchor, and the first one the API-server process binds, so a second
+#: ``mstar serve`` on the prefix is refused before it takes over the first
+#: deployment's API-server sockets (its conductor starts later).
+DEPLOYMENT_LOCK_ENTITIES = (DEPLOYMENT_ANCHOR_ENTITY, "api_server_preprocess_worker")
+
 
 class CommProtocol(Enum):
     IPC = "IPC"
@@ -76,8 +82,9 @@ class BaseCommunicator(ABC):
         """Claim this deployment, so a second one on the same IPC prefix fails
         here instead of corrupting the first.
 
-        Only the anchor entity locks, and only over IPC. TCP needs no lock: two
-        deployments sharing a base port collide on ``bind`` already. IPC does
+        Only ``DEPLOYMENT_LOCK_ENTITIES`` lock, each on its own file, and only
+        over IPC. TCP needs no lock: two deployments sharing a base port
+        collide on ``bind`` already. IPC does
         not -- libzmq UNLINKS an existing socket file and binds a fresh one, so
         the second conductor comes up, silently steals every connection aimed
         at the first, and derives the same tensor-file namespace (uuids are
@@ -89,7 +96,7 @@ class BaseCommunicator(ABC):
         exits, so a crashed deployment leaves nothing to clean up; the fd is
         kept on the instance purely so it outlives this call.
         """
-        if self.protocol != CommProtocol.IPC or my_id != DEPLOYMENT_ANCHOR_ENTITY:
+        if self.protocol != CommProtocol.IPC or my_id not in DEPLOYMENT_LOCK_ENTITIES:
             return
         path = self._endpoint(my_id).removeprefix("ipc://") + ".lock"
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)

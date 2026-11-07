@@ -80,7 +80,7 @@ from mstar.model.submodule_base import (
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.profile.worker import ExecTimings
 from mstar.utils import knobs
-from mstar.utils.client_errors import client_error_text
+from mstar.utils.client_errors import RequestError
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.utils.profiler import (
@@ -393,7 +393,7 @@ class ExecutingBatch:
     cached_rids: set[str] = field(default_factory=set)
     # rid -> error, for per-rid stages that raised. The rid leaves the batch;
     # the rest of it runs.
-    failed_requests: dict[int, str] = field(default_factory=dict)
+    failed_requests: dict[int, RequestError] = field(default_factory=dict)
     # rid -> outputs the stop check found are not data this step
     # (``StopCheck.withheld``); the worker does not route them
     withheld_outputs: dict[int, tuple[str, ...]] = field(default_factory=dict)
@@ -503,7 +503,7 @@ class ExecutingBatch:
         self.commit_done.set()
 
     def register_failure(self, rid: int, error: Exception, walk: str | None = None):
-        self.failed_requests[rid], _ = client_error_text(
+        self.failed_requests[rid] = RequestError.from_exception(
             error,
             f"request {rid} failed (node={self.node_name}, walk={walk or self.graph_walk})",
             log=logger,

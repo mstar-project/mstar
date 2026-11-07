@@ -4,6 +4,9 @@ import logging
 import os
 import re
 import secrets
+from dataclasses import dataclass
+
+from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +35,8 @@ def client_error_text(
 ) -> tuple[str, str]:
     """Return ``(text, error_id)``: what a client may see for ``exc``.
 
-    A ``ValueError`` or ``TypeError`` is a refusal raised on purpose, so it
+    An ``HTTPException`` keeps its detail. A ``ValueError`` or ``TypeError``
+    is a refusal raised on purpose, so it
     keeps its message (prefixed with the type name when ``type_name``), with
     absolute paths cut to their base names. Anything else becomes
     ``internal error (error id <id>)``. Either way the full error and its
@@ -44,9 +48,41 @@ def client_error_text(
         "%s [error id %s]: %s: %s", what, error_id, type(exc).__name__, exc,
         exc_info=exc if traceback else None,
     )
+    if isinstance(exc, HTTPException):
+        return scrub_paths(str(exc.detail)), error_id
     if isinstance(exc, (ValueError, TypeError)):
         text = scrub_paths(str(exc))
         if type_name:
             text = f"{type(exc).__name__}: {text}"
         return text, error_id
     return f"internal error (error id {error_id})", error_id
+
+
+@dataclass(frozen=True)
+class RequestError:
+    """A request failure carried from its owning worker to the API."""
+
+    message: str
+    status: int = 500
+
+    @classmethod
+    def from_exception(cls, exc: BaseException, what: str, *, log=logger, traceback=True):
+        from torch import AcceleratorError
+
+        # Device-runtime faults poison subsequent work. Ordinary OOM is a
+        # separate torch.OutOfMemoryError and remains request-local.
+        fatal = isinstance(exc, AcceleratorError) or (
+            isinstance(exc, RuntimeError) and any(text in str(exc).lower() for text in (
+                "cuda error: an illegal memory access",
+                "cuda error: device-side assert triggered",
+                "cuda error: unspecified launch failure",
+            ))
+        )
+        if fatal:
+            log.error("%s: fatal device error", what, exc_info=exc)
+            raise SystemExit(f"{what}: fatal device error ({exc})") from exc
+        message, _ = client_error_text(exc, what, log=log, traceback=traceback)
+        status = exc.status_code if isinstance(exc, HTTPException) else (
+            400 if isinstance(exc, (ValueError, TypeError)) else 500
+        )
+        return cls(message, status)

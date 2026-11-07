@@ -42,7 +42,7 @@ def _wave_soundfile() -> types.ModuleType:
     def info(path):
         with wave.open(str(path), "rb") as w:
             return types.SimpleNamespace(
-                samplerate=w.getframerate(), frames=w.getnframes(), channels=w.getnchannels(),
+                format="WAV", samplerate=w.getframerate(), frames=w.getnframes(), channels=w.getnchannels(),
             )
 
     def _frames(w, frames, always_2d):

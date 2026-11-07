@@ -269,9 +269,8 @@ class SlidingWindowTests(unittest.TestCase):
         self.assertLessEqual(named, captured_page_capacity(len(step.segments), num_tokens, cfg, cfg.groups[0]))
 
     def test_a_window_pool_allots_every_group(self):
-        """A request is allotted its prompt's pages in every group, so one that fits only if the
-        window's pages went uncounted waits; once the prompt is written, the window's share drops
-        to the pages it holds, and the waiting request fits."""
+        """Admission covers every group's peak, including growth after the prompt.
+        A waiting request starts once the admitted request releases its allotment."""
         from mstar.communication.tensors import LocalTransferEngine
         from mstar.engine.resources.kv import manager as manager_mod
         from mstar.engine.resources.kv.manager import KVManager, RoomMark
@@ -302,9 +301,10 @@ class SlidingWindowTests(unittest.TestCase):
                 # the prompt's second chunk still needs the pages the window released
                 self.assertIsInstance(kv.reserve("b", "LLM", "walk", None), RoomMark)
             elif span == 16:
-                # a holds 3 pages of the full layer and 1 of the window
-                self.assertIsNone(kv.reserve("b", "LLM", "walk", None))
+                # Decode growth still holds part of a's allotment.
+                self.assertIsInstance(kv.reserve("b", "LLM", "walk", None), RoomMark)
         kv.remove_request("a")
+        self.assertIsNone(kv.reserve("b", "LLM", "walk", None))
         # an admit unwound gives back the pages it took in each group
         free = kv._arena.num_free
         step, ctx = KVStep(segments=(Segment("b", "main", 48),)), StepContext(("b",), "walk", 0, False)
@@ -315,15 +315,15 @@ class SlidingWindowTests(unittest.TestCase):
 
     def test_capacity_benchmark_counts_what_admission_lets_in(self):
         """At one rank `benchmark/kv_capacity.py` stops at the request admission makes wait. A
-        request's window gives its pages back once its prompt is written, so one rank lets in
-        what the pages hold, as above one rank, where nothing allots."""
+        request reserves decode growth too, on rank zero of a multi-rank pool
+        as well as on a single rank."""
         from benchmark import kv_capacity
 
         def requests(shards):
             cfg = window_pool(num_qo_heads=1, num_kv_heads=1, head_dim=4)
             return kv_capacity.fill(cfg, 64, shards=shards, decode=16, device="cpu")["requests"]
 
-        self.assertEqual([requests(1), requests(2)], [2, 2])
+        self.assertEqual([requests(1), requests(2)], [1, 1])
 
     def test_window_pool_refusals(self):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only

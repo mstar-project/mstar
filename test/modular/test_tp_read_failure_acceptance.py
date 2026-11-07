@@ -947,7 +947,7 @@ def _run(tmp_path, scenario: Scenario) -> Run:
                 for rid, error in msg.body.errors.items():
                     if rid in run.failed:
                         continue
-                    run.failed[rid] = f"rank {rank}: {error}"
+                    run.failed[rid] = error
                     to_both(WorkerMessage(
                         message_type=WorkerMessageType.DRAIN_REQUEST,
                         body=DrainRequest(request_id=rid, source=MessageSource.CONDUCTOR),
@@ -1018,7 +1018,7 @@ def test_a_followers_failed_read_fails_only_its_request_and_nothing_hangs(tmp_pa
     run = _run(tmp_path, Scenario(kind=kind))
     _healthy_ok(run)
     assert set(run.failed) == {"r1"}, run.summary()
-    assert "input tensor read failed" in run.failed["r1"], run.summary()
+    assert run.failed["r1"].status == 500, run.summary()
     assert run.torn_down("r1"), "r1's drain never finished on both ranks: " + run.summary()
 
 

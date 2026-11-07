@@ -70,6 +70,8 @@ def read_video_whole_budgeted(ele: dict) -> tuple[torch.Tensor, dict, float]:
     budget = VideoBudget()
     frames = []
     with av.open(path) as container:
+        if not container.streams.video:
+            raise ValueError("upload contains no video stream")
         stream = container.streams.video[0]
         fps = float(stream.average_rate) if stream.average_rate else 0.0
         for frame in container.decode(stream):

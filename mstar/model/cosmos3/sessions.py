@@ -18,6 +18,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
+from fastapi import HTTPException
+
 
 @dataclass
 class _Entry:
@@ -67,9 +69,9 @@ class SessionStore:
         if entry is None:
             entry = self._entries[session_id] = _Entry(value=None, expires_at=math.inf)
         elif entry.live not in (None, request_id):
-            raise ValueError(
-                f"session {session_id!r} is in use by request {entry.live!r}; "
-                "wait for it to finish or pick another session_id"
+            raise HTTPException(
+                status_code=409,
+                detail="session is in use; wait for it to finish or pick another session_id",
             )
         entry.live = request_id
         self._entries.move_to_end(session_id)

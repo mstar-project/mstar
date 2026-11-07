@@ -180,9 +180,9 @@ def test_a_request_that_asks_gets_each_text_chunks_token_ids():
     assert chunks["other"].metadata == {}
     # a tensor chunk's ids too, and nothing on another modality or a float text tensor (Whisper's alignment)
     ids = torch.tensor([[5, 151645]])
-    assert worker._with_token_ids("req", "text", ids, {}) == {"token_ids": [5, 151645]}
-    assert worker._with_token_ids("req", "audio", ids, {"sample_rate": 1}) == {"sample_rate": 1}
-    assert worker._with_token_ids("req", "text", torch.rand(2, 3), {}) == {}
+    assert worker._with_token_metadata("req", "text", ids, {}) == {"token_ids": [5, 151645]}
+    assert worker._with_token_metadata("req", "audio", ids, {"sample_rate": 1}) == {"sample_rate": 1}
+    assert worker._with_token_metadata("req", "text", torch.rand(2, 3), {}) == {}
 
 
 def test_the_facade_accounts_an_inline_token_like_a_tensor():
@@ -360,3 +360,30 @@ def test_a_withheld_output_routes_through_the_store():
     rows = HostRows((7,), {"new_token": torch.tensor([70])})
     w, engine, batch = _inline_step(withheld={7: ("text_inputs",)})
     assert w._get_postprocess_request(batch, rows, engine, False, None, None).inline is None
+
+
+def test_chat_usage_counts_the_prepared_prompt_and_sampled_ids_not_text_bytes():
+    from mstar.api_server.data_worker import PreparedInput
+    from mstar.api_server.openai.serving_chat import _build_response
+    from mstar.api_server.request_types import PreprocessInput
+    from mstar.model.base import LabelLayout, Span
+
+    worker, _ = _thread()
+    worker.model.TOKEN_USAGE_LAYOUT = ("chat", "main")
+    worker._store_persisted = lambda rid, tensors: {}
+    layout = LabelLayout(spans=(
+        Span("ids", "prefill", 7, 7, "text_inputs"),
+        Span("rows", "prefill", 30, 30, "image_inputs", opens_step=False),
+    ))
+    worker._finish_input(
+        PreprocessInput("req", "hello", {}, ["text"], ["text"], {}),
+        PreparedInput({}, {}, {"kv_layout": {"chat": {"main": layout.row()}}}), None,
+    )
+    worker._emit_inline_tokens(InlineTokens(["req"], [11], "text"))
+    first = worker.out_queue.get(timeout=1)
+    # A multi-token tensor can include a stop ID whose rendered bytes are empty.
+    metadata = worker._with_token_metadata("req", "text", torch.tensor([12, 13]), {})
+    worker._queue_completed_output("req", 1, ResultChunk("req", "text", b"", metadata))
+    second = worker.out_queue.get(timeout=1)
+    response = _build_response("model", "req", [first, second], 24000)
+    assert response["usage"] == {"prompt_tokens": 37, "completion_tokens": 3, "total_tokens": 40}

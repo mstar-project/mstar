@@ -327,7 +327,16 @@ def _worker_process_target(
         logger.exception("Worker %s failed to initialize: %s", worker_id, str(e))
         raise e
     built.append(worker)
-    _run_worker(worker)
+    try:
+        _run_worker(worker)
+    except SystemExit as exc:
+        if exc.code is None or exc.code == 0:
+            raise
+        # _run_worker has unlinked our owned SHM. A peer may still be in a
+        # collective on a non-daemon executor thread: Python shutdown would
+        # join it forever, hiding this fatal failure from conductor liveness.
+        logger.error("Worker %s stopped: %s", worker_id, exc)
+        os._exit(exc.code if isinstance(exc.code, int) else 1)
 
 
 @dataclass
@@ -1399,7 +1408,10 @@ class Conductor:
         groups_run = self._router.groups_run(
             name for name, fwd_args in partition_fwd_args.items() if not fwd_args.request_done
         )
-        placement = self._router.pick(resource_configs, groups_run)
+        affinity = model_kwargs.get(self.model.REPLICA_AFFINITY_KWARG)
+        placement = self._router.pick(
+            resource_configs, groups_run, affinity=None if affinity is None else str(affinity),
+        )
         worker_graph_to_workers = self._assign_worker_graphs_to_workers(placement.replicas)
 
         # Build per-connection streaming state. None for a client stream: the
@@ -1696,7 +1708,8 @@ class Conductor:
         """Tear down requests a worker reported as unservable. Routes through the
         drain barrier; the client is notified (request_failed) only once every
         reader has drained, so no output is unlinked under an in-flight read."""
-        for rid, error_message in body.errors.items():
+        for rid, failure in body.errors.items():
+            error_message = failure.message
             request_data = self.requests.get(rid)
             if request_data is None or rid in self.draining:
                 # Expected under TP: every rank raises symmetrically and each
@@ -1709,7 +1722,7 @@ class Conductor:
                 continue
             logger.error("Request %s failed on a worker: %s", rid, error_message)
             try:
-                self._remove_request(rid, request_data, failure_error=error_message)
+                self._remove_request(rid, request_data, failure_error=error_message, failure_status=failure.status)
             except Exception as exc:
                 # the other requests in the batch keep their own error
                 self._fail_after_error(rid, "failing it", exc)
@@ -1751,7 +1764,7 @@ class Conductor:
 
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1771,6 +1784,7 @@ class Conductor:
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(
@@ -2355,7 +2369,17 @@ class Conductor:
                     except Exception as exc:
                         step = f"handling {_message_name(message)}"
                         for request_id in _message_request_ids(message):
-                            self._fail_after_error(request_id, step, exc)
+                            if (message.message_type == ConductorMessageType.NEW_REQUEST
+                                    and request_id not in self.requests):
+                                self.waiting_queue[:] = [
+                                    body for body in self.waiting_queue if body.request_id != request_id
+                                ]
+                                if self._status_interval_s is not None:
+                                    self._queued_since.pop(request_id, None)
+                                text, _ = client_error_text(exc, f"Conductor error {step}", log=logger)
+                                self._reject_request(request_id, text, status=500)
+                            else:
+                                self._fail_after_error(request_id, step, exc)
 
                 completed_requests = []
 

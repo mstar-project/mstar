@@ -736,3 +736,36 @@ def test_a_16_bit_png_reads_as_uint8(tmp_path, color_type, channels):
         assert torch.equal(image, torch.from_numpy(np.asarray(Image.open(path).convert("RGB"))).permute(2, 0, 1))
     loaded = Model.load_image(None, path, "cpu").data
     assert 0.0 <= loaded.min() and loaded.max() <= 1.0
+
+
+def test_omni_audio_only_container_is_not_a_video(tmp_path, monkeypatch):
+    pytest.importorskip("av")
+    vision = types.ModuleType("qwen_omni_utils.v2_5.vision_process")
+    vision.smart_nframes = lambda *args, **kwargs: 4
+    for name in ("qwen_omni_utils", "qwen_omni_utils.v2_5"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "qwen_omni_utils.v2_5.vision_process", vision)
+    import wave
+    path = tmp_path / "audio.wav"
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(16000)
+        f.writeframes(bytes(3200))
+    with pytest.raises(ValueError, match="video"):
+        read_video_whole_budgeted({"video": str(path)})
+
+
+@pytest.mark.parametrize("failure", ["open", "frames", "empty"])
+def test_base_video_decode_failure_is_a_client_error(monkeypatch, failure):
+    def decode(*args, **kwargs):
+        if failure == "open":
+            raise RuntimeError("invalid container")
+        def frames():
+            if failure == "frames":
+                yield torch.zeros(3, 8, 8, dtype=torch.uint8)
+                raise RuntimeError("truncated frame")
+        return frames()
+    monkeypatch.setitem(sys.modules, "torchcodec.decoders", types.SimpleNamespace(VideoDecoder=decode))
+    with pytest.raises(ValueError, match="video"):
+        Model.load_video(None, "bad.mp4", "cpu")

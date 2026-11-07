@@ -86,7 +86,7 @@ def _worker(is_tp_follower=False) -> Worker:
     )
     w.request_state = RequestStateManager(node_to_partition={NODE: "default"})
     w.engine_manager = SimpleNamespace(
-        add_request=lambda rid, cfgs: None,
+        add_request=lambda rid, cfgs, info: None,
         remove_request=lambda rid: None,
     )
     w.wire_rids_cleared = []
@@ -94,6 +94,7 @@ def _worker(is_tp_follower=False) -> Worker:
         clear_rid=lambda rid, rid_str: None,
         clear_wire_rid=w.wire_rids_cleared.append,
         fail_rids=lambda rids: None,
+        failed_rids=set(), read_failed_rids=set(),
         note_arrival=lambda rid: None,
         pending_tp_follow_count={},
         last_consumed_tp_seq=-1,
@@ -237,3 +238,11 @@ def test_messages_that_outrun_their_new_request_are_still_replayed():
     assert w.tensor_manager.reads == [("prompt", 4)]
     assert w._rid("E#1") is None
     assert w.tensor_manager.acked == []
+
+
+def test_conductor_remove_reaches_a_non_tp_request_on_a_follower_worker():
+    # This worker also follows a TP node, but this request uses only its
+    # non-TP node (the runtime's request sharding has no TP group here).
+    w = _worker(is_tp_follower=True)
+    w._process_message_list([_new("side#1"), _remove("side#1", source=MessageSource.CONDUCTOR)])
+    assert w._rid("side#1") is None

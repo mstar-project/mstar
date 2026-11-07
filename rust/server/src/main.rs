@@ -284,6 +284,11 @@ async fn admission(
     // free the slot while the stream is still being served — the cap would
     // not bound concurrent streams at all. Moving it into the body drops it
     // at end-of-body, uniformly for streaming and non-streaming handlers.
+    // A partial upload must not hold an admission slot forever. This is a
+    // body inactivity timeout, so it does not limit model execution time.
+    let (parts, body) = req.into_parts();
+    let body = tower_http::timeout::TimeoutBody::new(std::time::Duration::from_secs(30), body);
+    let req = axum::http::Request::from_parts(parts, Body::new(body));
     let resp = next.run(req).await;
     let (parts, body) = resp.into_parts();
     let guarded = body.into_data_stream().map(move |chunk| {
@@ -663,7 +668,13 @@ fn build_chat_response(
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut audio_pcm: Vec<u8> = Vec::new();
     let mut images: Vec<Vec<u8>> = Vec::new();
+    let mut prompt_tokens = None;
+    let mut completion_tokens = 0u64;
     for c in &chunks {
+        if prompt_tokens.is_none() {
+            prompt_tokens = c.metadata.get("prompt_tokens").and_then(Value::as_u64);
+        }
+        completion_tokens += c.metadata.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
         match c.modality.as_str() {
             "text" => text_bytes.extend_from_slice(&c.data),
             "audio" => audio_pcm.extend_from_slice(&c.data),
@@ -695,13 +706,18 @@ fn build_chat_response(
         message["content"] = Value::Array(parts);
     }
 
+    let usage = prompt_tokens.map(|prompt| json!({
+        "prompt_tokens": prompt,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt + completion_tokens,
+    }));
     json!({
         "id": request_id,
         "object": "chat.completion",
         "created": now(),
         "model": model,
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage,
     })
 }
 
@@ -935,10 +951,6 @@ async fn videos_generations(
 }
 
 async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response {
-    let adapter = match resolve(&st, Surface::Images) {
-        Ok(a) => a,
-        Err(r) => return r,
-    };
     // Multipart (image file + prompt + passthrough fields), parsed manually so
     // arbitrary model knobs (e.g. cfg_*_scale) flow through as model_kwargs.
     // `size` is kept: the adapter maps "WxH" onto the model's width / height
@@ -997,6 +1009,13 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         }
     }
 
+    // Read the multipart body before an early model refusal; leaving it
+    // unread can reset the TCP connection while the client is still uploading.
+    let adapter = match resolve(&st, Surface::Images) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
     let image_bytes = match image_bytes {
         Some(b) if !b.is_empty() => b,
         _ => return error(400, "images/edits requires an 'image' file upload", "invalid_request_error"),
@@ -1005,14 +1024,12 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
     if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
         return error(500, &e.to_string(), "server_error");
     }
-    let ext = image_filename
-        .as_deref()
-        .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
-        .unwrap_or_else(|| ".png".to_string());
-    let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
-    if let Err(e) = std::fs::write(&image_path, &image_bytes) {
-        return error(500, &e.to_string(), "server_error");
-    }
+    let image_path = match media::save_upload(
+        &image_bytes, image_filename.as_deref().unwrap_or("image.png"), &st.upload_dir,
+    ) {
+        Ok(path) => path,
+        Err(e) => return error(500, &e.to_string(), "server_error"),
+    };
 
     let args = match adapter.image_edit_to_request(&prompt, &image_path.to_string_lossy(), extra) {
         Ok(a) => a,
@@ -1159,20 +1176,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             if let Err(e) = std::fs::create_dir_all(&st.upload_dir) {
                 return detail_error(500, &e.to_string());
             }
-            // Sanitize: take ONLY the final path component of the
-            // client-supplied name. `join` treats embedded separators as
-            // separators, so `../../x` would escape upload_dir (arbitrary
-            // write — and the cleanup filter is component-based, so it would
-            // then arbitrary-delete). file_name() strips any directory parts.
-            let safe = std::path::Path::new(&filename)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("upload");
-            let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
-            if let Err(e) = std::fs::write(&save_path, &bytes) {
-                return detail_error(500, &e.to_string());
-            }
+            let save_path = match media::save_upload(&bytes, &filename, &st.upload_dir) {
+                Ok(path) => path,
+                Err(e) => return detail_error(500, &e.to_string()),
+            };
             uploads
                 .paths
                 .entry(modality.to_string())
@@ -1189,6 +1196,10 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                     return detail_error(status, &msg);
                 }
             };
+            // Starlette's multipart parser caps non-file parts at 1 MiB.
+            if val.len() > 1 << 20 {
+                return detail_error(400, "Part exceeded maximum size of 1024KB.");
+            }
             match name.as_str() {
                 "text" => text = Some(val),
                 "input_modalities" => in_mods_raw = Some(val),
@@ -1287,6 +1298,7 @@ async fn generate_finish(
     let model_kwargs: Map<String, Value> = match mk_raw {
         Some(raw) if !raw.is_empty() => match serde_json::from_str::<Value>(&raw) {
             Ok(Value::Object(m)) => m,
+            Ok(Value::Null) => Map::new(),
             Ok(_) => return detail_error(400, "model_kwargs must be a JSON object"),
             Err(e) => return detail_error(400, &format!("model_kwargs JSON: {e}")),
         },
@@ -1715,8 +1727,10 @@ mod tests {
     async fn a_file_refused_mid_form_takes_the_saved_ones_with_it() {
         let mut st = state(None);
         st.upload_dir = socket_dir();
+        let long_name = format!("{}.wav", "é".repeat(2500));
         let req = multipart_request("/generate", &[
             ("files", Some("clip.wav"), b"RIFF"),
+            ("files", Some(&long_name), b"RIFF"),
             ("files", Some("notes.xyz"), b"?"),
         ]);
 
@@ -1849,8 +1863,12 @@ mod tests {
 
     #[test]
     fn chat_response_joins_text_before_decoding() {
-        let resp = build_chat_response("m", "r", split_text_chunks(), 24000);
+        let mut chunks = split_text_chunks();
+        chunks[0].metadata = json!({"prompt_tokens": 17, "completion_tokens": 2});
+        chunks[1].metadata = json!({"completion_tokens": 3});
+        let resp = build_chat_response("m", "r", chunks, 24000);
         assert_eq!(resp["choices"][0]["message"]["content"], "中文 😀");
+        assert_eq!(resp["usage"], json!({"prompt_tokens": 17, "completion_tokens": 5, "total_tokens": 22}));
     }
 
     #[test]
@@ -1884,4 +1902,60 @@ mod tests {
         assert_eq!(events[n - 2]["choices"][0]["delta"]["content"], "\u{FFFD}");
         assert_eq!(events[n - 1]["choices"][0]["finish_reason"], "stop");
     }
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_request_body_releases_admission() {
+        use tower::ServiceExt;
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let app = Router::new().route("/generate", post(generate))
+            .route_layer(axum::middleware::from_fn_with_state(permits.clone(), admission))
+            .with_state(state(None));
+        let request = axum::http::Request::builder().method("POST").uri("/generate")
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from_stream(futures::stream::pending::<Result<axum::body::Bytes, std::io::Error>>()))
+            .unwrap();
+        let pending = tokio::spawn(app.oneshot(request));
+        tokio::task::yield_now().await;
+        assert_eq!(permits.available_permits(), 0);
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(pending.is_finished(), "an idle upload must not hold admission indefinitely");
+        let (status, _, _) = body(pending.await.unwrap().unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_edit_consumes_its_body_before_refusing() {
+        use std::sync::atomic::AtomicUsize;
+        let st = state(None);
+        let req = multipart_request("/v1/images/edits", &[
+            ("image", Some("input.png"), &[1; 4096]), ("prompt", None, b"edit"),
+        ]);
+        let (parts, raw) = req.into_parts();
+        let data = axum::body::to_bytes(raw, usize::MAX).await.unwrap();
+        let expected = data.len();
+        let read = Arc::new(AtomicUsize::new(0));
+        let count = read.clone();
+        let chunks: Vec<_> = data.chunks(64).map(axum::body::Bytes::copy_from_slice).collect();
+        let streamed = futures::stream::iter(chunks).map(move |chunk| {
+            count.fetch_add(chunk.len(), Ordering::SeqCst);
+            Ok::<_, std::io::Error>(chunk)
+        });
+        let req = axum::http::Request::from_parts(parts, Body::from_stream(streamed));
+        let mp = Multipart::from_request(req, &st).await.unwrap();
+        let (status, _, _) = body(images_edits(State(st), mp).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(read.load(Ordering::SeqCst), expected);
+    }
+
+    #[tokio::test]
+    async fn generate_form_limits_match_python() {
+        let st = state(None);
+        let req = multipart_request("/generate", &[("model_kwargs", None, b"null")]);
+        assert_eq!(body(generate(State(st.clone()), req).await).await.0, StatusCode::OK);
+        let large = vec![b'x'; (1 << 20) + 1];
+        let req = multipart_request("/generate", &[("text", None, &large)]);
+        assert_eq!(body(generate(State(st), req).await).await.0, StatusCode::BAD_REQUEST);
+    }
+
 }

@@ -19,9 +19,11 @@ one picked longest ago, so requests that never overlap still take turns over
 the replicas. Groups whose replicas sit on the same ranks, replica for
 replica, pick one index together, so a request's walks stay on one set of
 workers. A prediction never changes outputs: a wrong one makes a request
-slower.
+slower. A model may instead declare a session affinity kwarg: its stable hash
+fixes each unit's replica, so a session resumes where its state is held.
 """
 
+import hashlib
 import logging
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -173,9 +175,15 @@ class ReplicaRouter:
         """The node groups of these partitions: what a request whose other partitions are done runs."""
         return frozenset().union(*(self._partition_groups[p] for p in partitions))
 
-    def pick(self, configs: Mapping[str, ResourceReqConfig], groups_run: frozenset[int]) -> Placement:
+    def pick(
+        self, configs: Mapping[str, ResourceReqConfig], groups_run: frozenset[int], *, affinity: str | None = None,
+    ) -> Placement:
         """Each node group's replica for a new request that runs ``groups_run``
-        and opens its resources with ``configs``. Records nothing."""
+        and opens its resources with ``configs``. ``affinity`` fixes placement
+        for stateful sessions regardless of replica load. Records nothing."""
+        affinity_hash = None if affinity is None else int.from_bytes(
+            hashlib.blake2b(affinity.encode("utf-8"), digest_size=8).digest(), "big",
+        )
         replicas: dict[int, int] = {}
         picked: dict[int, RoutingFacts] = {}
         for u, unit in enumerate(self._units):
@@ -196,6 +204,8 @@ class ReplicaRouter:
                 choice = min(
                     (i for i, c in enumerate(cost) if c == least), key=lambda i: self._last_pick[(u, i)],
                 )
+                if affinity_hash is not None:
+                    choice = affinity_hash % len(unit.instances)
                 if row is not None:
                     picked[u] = row[choice]
             for group in unit.groups:

@@ -329,14 +329,15 @@ def test_images(client_and_stub):
     assert base64.b64decode(body["data"][0]["b64_json"]) == png
 
 
-def test_images_edits(client_and_stub):
+@pytest.mark.parametrize("filename", ["in.png", "in." + "x" * 400])
+def test_images_edits(client_and_stub, filename):
     client, stub = client_and_stub
     stub.model_name = "bagel"
     edited = b"\x89PNGedited"
     stub.next_chunks = [_Chunk("image", edited)]
     resp = client.post(
         "/v1/images/edits",
-        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        files={"image": (filename, b"\x89PNGinput", "image/png")},
         data={"prompt": "make it neon", "cfg_img_scale": "2.0", "cfg_interval": "[0.0, 1.0]"},
     )
     body = resp.json()
@@ -955,3 +956,44 @@ def test_a_chunked_speech_stream_keeps_its_clip_until_the_last_chunk_is_submitte
     assert r.status_code == 200 and r.content == _pcm([1, 2, 3]) * len(on_disk_at_submit)
     assert len(on_disk_at_submit) > 2 and all(on_disk_at_submit)
     assert _left_after_cleanup(stub.upload_dir) == []
+
+
+def test_video_stream_refusal_keeps_http_error_status(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "cosmos3"
+    stub.next_chunks = [_Chunk("error", b"stream_video requires multiple frames", {"status": 400})]
+    response = client.post("/v1/videos/generations", json={
+        "model": "cosmos3", "prompt": "a road", "num_frames": 1, "stream_video": True,
+    })
+    assert response.status_code == 400
+    assert "multiple frames" in response.json()["error"]["message"]
+
+
+def test_chat_attachment_write_does_not_block_other_loop_work(monkeypatch):
+    import threading
+
+    from mstar.api_server import media_io
+    from mstar.api_server.openai.adapters import BagelAdapter
+    from mstar.api_server.openai.protocol import ChatCompletionRequest
+    from mstar.api_server.openai.serving_chat import create_chat_completion
+
+    async def serve():
+        loop = asyncio.get_running_loop()
+        progressed = threading.Event()
+        save = media_io.save_upload
+
+        def write(*args, **kwargs):
+            loop.call_soon_threadsafe(progressed.set)
+            assert progressed.wait(1), "attachment write blocked the event loop"
+            return save(*args, **kwargs)
+
+        monkeypatch.setattr(media_io, "save_upload", write)
+        api = _StubAPI()
+        req = ChatCompletionRequest(messages=[{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,YQ=="}},
+        ]}])
+        response = await create_chat_completion(api, "bagel", BagelAdapter(), req)
+        assert response["choices"][0]["finish_reason"] == "stop"
+        assert api.last_submit["input_modalities"] == ["image"]
+
+    asyncio.run(serve())

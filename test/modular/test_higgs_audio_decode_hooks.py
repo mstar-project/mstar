@@ -3,6 +3,7 @@ client inline, and a batched stop check that agrees with the per-request one."""
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -74,3 +75,11 @@ def test_batched_stop_check_agrees_with_the_per_request_one():
     prefill = {rid: SimpleNamespace(**{**vars(info), "graph_walk": "prefill_audio"}) for rid, info in infos.items()}
     assert sub.check_stop("b", prefill["b"], {"new_token": [tokens[1]]}) == {END_PARTITION}
     assert sub.check_stop_batched(list(prefill), prefill, rows) == {"b": {END_PARTITION}}
+
+
+@pytest.mark.parametrize("samples", [0, 1, 159, 319])
+def test_short_audio_is_refused_before_feature_extraction(samples):
+    model = object.__new__(HiggsAudioModel)
+    model.config = HiggsAudioModelConfig()
+    with pytest.raises(ValueError, match="audio"):
+        model.process_prompt(None, ["audio"], ["text"], {"audio_inputs": [torch.zeros(samples)]})

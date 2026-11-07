@@ -65,7 +65,9 @@ class _FakeSoundfile(types.ModuleType):
         self.SoundFile = SoundFile
 
     def info(self, path):
-        return types.SimpleNamespace(frames=self.header_frames, samplerate=self.rate, channels=self.channels)
+        return types.SimpleNamespace(
+            format="WAV", frames=self.header_frames, samplerate=self.rate, channels=self.channels,
+        )
 
     def read(self, path, dtype="float64", always_2d=False, **k):
         # the whole-file read main used: hands out every frame
@@ -158,7 +160,7 @@ def test_a_soundfile_rate_past_the_range_is_refused_before_any_read(monkeypatch,
     from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 
     for load in (
-        lambda: media_io.read_soundfile_capped(clip),
+        lambda: media_io.read_audio_capped(clip),
         lambda: media_io.decode_audio(clip, 16000),
         lambda: load_audio_file(clip),
         lambda: ChatterboxModel._decode_audio(clip),
@@ -457,28 +459,26 @@ def test_real_soundfile_decode_stops_at_the_limit(tmp_path):
     stereo = (0.1 * rng.standard_normal((8000 * 3, 2))).astype(np.float32)
     sf.write(path, stereo, 8000)
     with pytest.raises(AudioTooLongError):
-        media_io.read_soundfile_capped(str(path), max_seconds=2)
-    audio, rate = media_io.read_soundfile_capped(str(path), max_seconds=3)
+        media_io.read_audio_capped(str(path), max_seconds=2)
+    audio, rate = media_io.read_audio_capped(str(path), max_seconds=3)
     whole, _ = sf.read(path, dtype="float32", always_2d=True)
     assert rate == 8000 and np.array_equal(audio, whole.mean(axis=1))
 
 
-def test_blockwise_mp3_decode_equals_one_read(tmp_path, monkeypatch):
-    """A read that splits an MPEG frame glitches the samples after it (0.027
-    on a 45 s, 44.1 kHz speech upload with 10 s blocks), so blocks are whole frames."""
+def test_mp3_decode_matches_the_soundfile_reference(tmp_path):
+    """The decoder change preserves valid MP3 samples within float precision."""
     sf = pytest.importorskip("soundfile")
     if "MPEG_LAYER_III" not in sf.available_subtypes("MP3"):
         pytest.skip("this libsndfile cannot write MP3")
-    monkeypatch.setattr(media_io, "_SOUNDFILE_BLOCK_SECONDS", 1)
     rate = 22_050
     t = np.arange(8 * rate) / rate
     signal = 0.3 * np.sin(2 * np.pi * 440 * t) + 0.05 * np.random.default_rng(0).standard_normal(t.size)
     path = tmp_path / "clip.mp3"
     sf.write(path, signal.astype(np.float32), rate, format="MP3", subtype="MPEG_LAYER_III")
     whole, _ = sf.read(path, dtype="float32", always_2d=True)
-    audio, got = media_io.read_soundfile_capped(str(path))
+    audio, got = media_io.read_audio_capped(str(path))
     assert got == rate and audio.shape == (whole.shape[0],)
-    np.testing.assert_allclose(audio, whole.mean(axis=1), atol=1e-6, rtol=0)
+    np.testing.assert_allclose(audio, whole.mean(axis=1), atol=2e-6, rtol=0)
 
 
 def _flac_without_length(path: Path, seconds: float, rate: int = 16000) -> None:
@@ -510,3 +510,44 @@ def test_flac_without_a_length_is_measured_by_decoding_it(client, tmp_path):
     r = _transcribe(http, content=path.read_bytes(), filename="speech.flac")
     assert r.status_code == 200, r.text
     assert api.submits
+
+
+@pytest.mark.parametrize("container", ["concatenated_mp3", "vbr_without_xing", "streamed_wav"])
+def test_audio_with_an_unreliable_length_header_is_fully_decoded(tmp_path, container):
+    import struct
+
+    av = pytest.importorskip("av")
+    sf = pytest.importorskip("soundfile")
+    from mstar.api_server.openai.serving_transcriptions import audio_duration_seconds
+
+    rate, seconds = 16000, 12
+    tone = (0.2 * np.sin(np.arange(rate * seconds) * 2 * np.pi * 440 / rate)).astype(np.float32)
+    if container == "streamed_wav":
+        path = tmp_path / "stream.wav"
+        sf.write(path, tone, rate)
+        raw = bytearray(path.read_bytes())
+        struct.pack_into("<I", raw, raw.index(b"data") + 4, 0)
+        path.write_bytes(raw)
+    else:
+        path = tmp_path / "clip.mp3"
+        options = {"write_xing": "0"} if container == "vbr_without_xing" else {}
+        with av.open(str(path), "w", format="mp3", options=options) as output:
+            stream = output.add_stream("libmp3lame", rate=rate)
+            stream.layout = "mono"
+            stream.codec_context.flags |= av.codec.context.Flags.qscale
+            stream.codec_context.global_quality = 4 * 118
+            frame = av.AudioFrame.from_ndarray(tone[None], format="fltp", layout="mono")
+            frame.sample_rate = rate
+            for packet in stream.encode(frame):
+                output.mux(packet)
+            for packet in stream.encode(None):
+                output.mux(packet)
+        if container == "concatenated_mp3":
+            path.write_bytes(path.read_bytes() * 3)
+            seconds *= 3
+    audio, got_rate = media_io.read_audio_capped(str(path), max_seconds=seconds + 1)
+    assert got_rate == rate
+    assert abs(len(audio) / rate - seconds) < .3
+    assert audio_duration_seconds(str(path)) is None
+    with pytest.raises(AudioTooLongError):
+        media_io.read_audio_capped(str(path), max_seconds=seconds - 1)

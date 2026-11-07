@@ -100,7 +100,7 @@ def test_save_base64_audio_accepts_unpadded(raw, tmp_path):
         assert f.read() == raw
 
 
-@pytest.mark.parametrize("raw", [b"R", b"RI", b"RIFFfake"])
+@pytest.mark.parametrize("raw", [b"R", b"RI", b"RIFFfake", b"R" * 49153])
 @pytest.mark.parametrize("padded", [True, False])
 @pytest.mark.parametrize("wrap", [0, 4, 76])
 @pytest.mark.parametrize("trailing", ["", "\n", "\r\n"])
@@ -147,3 +147,36 @@ def test_remove_uploads_leaves_a_file_outside_the_upload_dir(tmp_path):
     media_io.remove_uploads({"audio": [str(saved), str(preset)]}, upload_dir)
 
     assert not saved.exists() and preset.exists()
+
+
+def test_upload_cleanup_uses_the_loop_without_threads(tmp_path, monkeypatch):
+    import asyncio
+    import os
+    import threading
+
+    def no_thread(*args, **kwargs):
+        raise AssertionError("cleanup must not start a thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_thread)
+    monkeypatch.setattr(media_io, "UPLOAD_CLEANUP_DELAY_S", 0)
+    async def run():
+        path = media_io.save_upload(b"audio", "clip.wav", tmp_path)
+        media_io.schedule_upload_cleanup({"audio": [path]}, tmp_path)
+        assert os.path.exists(path)
+        await asyncio.sleep(0.01)
+        assert not os.path.exists(path)
+
+    asyncio.run(run())
+
+
+def test_non_media_data_url_is_refused_without_saving(tmp_path):
+    with pytest.raises(ValueError, match="media"):
+        media_io.save_data_url("data:text/plain;base64,YQ==", tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("payload", ["A" * 65535 + "?", "A" * 65534 + "==AAAA", "A" * 65533 + "==="])
+def test_base64_refuses_invalid_data_across_decode_chunks(payload, tmp_path):
+    with pytest.raises(ValueError):
+        media_io.save_base64(payload, "wav", "audio", tmp_path)
+    assert not list(tmp_path.iterdir())

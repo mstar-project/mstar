@@ -90,7 +90,7 @@ def test_a_crafted_header_rate_is_refused_before_resampling(tmp_path, video_only
 def test_other_containers_still_go_to_torchcodec(tmp_path, video_only_ffmpeg):
     path = tmp_path / "clip.m4a"
     path.write_bytes(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64)
-    with pytest.raises(RuntimeError, match="Invalid data"):
+    with pytest.raises(ValueError, match="decode"):
         Model.load_audio(None, str(path), "cpu")
     assert video_only_ffmpeg.calls == [str(path)]
 
@@ -117,3 +117,38 @@ def test_omnivoice_reads_a_wav_reference_without_ffmpeg(tmp_path, video_only_ffm
     assert video_only_ffmpeg.calls == []
     assert out.metadata == {"sample_rate": 24_000, "num_channels": 1}
     assert out.data.numel() == 24_000
+
+
+def test_empty_audio_upload_is_refused(tmp_path):
+    sf = pytest.importorskip("soundfile")
+    path = tmp_path / "empty.wav"
+    sf.write(path, np.zeros(0, dtype=np.float32), 16000)
+    with pytest.raises(ValueError, match="empty"):
+        Model.load_audio(None, str(path), "cpu")
+
+
+@pytest.mark.parametrize("model_name,class_name", [
+    ("fish_s2_pro", "FishS2ProModel"),
+    ("qwen3_tts", "Qwen3TTSModel"),
+    ("omnivoice", "OmniVoiceModel"),
+])
+@pytest.mark.parametrize("bad", ["garbage", "truncated", "empty"])
+def test_reference_loaders_refuse_bad_uploads(tmp_path, video_only_ffmpeg, model_name, class_name, bad):
+    import importlib
+
+    sf = pytest.importorskip("soundfile")
+    cls = getattr(importlib.import_module(f"mstar.model.{model_name}.{model_name}_model"), class_name)
+    model = object.__new__(cls)
+    model.config = types.SimpleNamespace(
+        sample_rate=24000,
+        codec=types.SimpleNamespace(sample_rate=44100, input_sample_rate=24000),
+        reference_min_seconds=1, reference_max_seconds=30,
+    )
+    path = tmp_path / "bad.wav"
+    sf.write(path, np.zeros(0 if bad == "empty" else 24000, dtype=np.float32), 24000)
+    if bad == "garbage":
+        path.write_bytes(b"not audio")
+    elif bad == "truncated":
+        path.write_bytes(path.read_bytes()[:20])
+    with pytest.raises(ValueError):
+        model.load_audio(str(path), "cpu")

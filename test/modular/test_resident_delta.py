@@ -909,13 +909,8 @@ def test_held_removals_land_in_step_order():
     assert rank.applied == ["first", "second"]
 
 
-class _ForwardingLeader:
+class _ForwardingLeader(Worker):
     """Rank 0's ``_remove_request``, over stubs, to pin what it forwards."""
-
-    _remove_request = Worker._remove_request
-    _removal_step_reached = Worker._removal_step_reached
-    _rid = Worker._rid
-    _mark_removed = Worker._mark_removed
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False

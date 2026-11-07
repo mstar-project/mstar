@@ -213,7 +213,10 @@ def image_span(grid_thw: torch.Tensor, merge_size: int) -> ImageSpan:
 # ---------------------------------------------------------------------------
 
 class Qwen3OmniModel(Model):
+
     """Qwen3-Omni: Thinker + Talker + Code2Wav 3-partition streaming model."""
+
+    TOKEN_USAGE_LAYOUT = (THINKER_KV, "main")
 
     LENGTH_KWARGS = ("max_output_tokens", "talker_max_output_tokens")
     PREPROCESS_PARALLEL = True
@@ -1260,6 +1263,11 @@ class Qwen3OmniModel(Model):
         expanded token IDs, plus the per-modality tensor outputs needed by
         the Thinker's prefill walks.
         """
+        if "audio" in output_modalities and kwargs.get("voice") is not None:
+            voice = kwargs["voice"]
+            speakers = self.config.talker.speaker_id or {}
+            if not isinstance(voice, str) or voice.lower() not in speakers:
+                raise ValueError(f"voice must be one of {sorted(speakers)}")
         result: NameToTensorList = {}
 
         attached = tensors is not None

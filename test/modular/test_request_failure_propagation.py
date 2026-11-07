@@ -36,6 +36,7 @@ from mstar.api_server.request_types import (
 from mstar.communication.event import EventWakeup
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.testing_utils.model import StubModel
+from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler, ScheduledBatch
 from mstar.worker.worker import PendingBatch, Worker
@@ -86,12 +87,12 @@ def _worker(known_rids=("r1", "r2")):
 
 def test_fail_requests_reports_per_rid_errors_once():
     w = _worker()
-    w._fail_requests({"r1": "boom", "r2": "bang"})
+    w._fail_requests({"r1": RequestError("boom"), "r2": RequestError("bang")})
     assert len(w.sent) == 1
     entity, msg = w.sent[0]
     assert entity == "conductor"
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
-    assert msg.body == FailRequests(errors={"r1": "boom", "r2": "bang"})
+    assert msg.body == FailRequests(errors={"r1": RequestError("boom"), "r2": RequestError("bang")})
     assert w.scheduler.failed_rids == {"r1", "r2"}
 
 
@@ -100,7 +101,7 @@ def test_fail_requests_ignores_rids_the_worker_already_dropped():
     start one for a request it no longer tracks, so reporting an unknown rid
     would pin it in failed_rids forever."""
     w = _worker(known_rids=("r1",))
-    w._fail_requests({"gone": "boom"})
+    w._fail_requests({"gone": RequestError("boom")})
     assert w.sent == []
     assert w.scheduler.failed_rids == set()
 
@@ -134,7 +135,7 @@ def test_crashed_forward_fails_the_whole_batch():
         assert len(w.sent) == 1
         errors = w.sent[0][1].body.errors
         assert set(errors) == {"r1"}
-        assert errors["r1"].startswith("Error in worker: internal error (error id ")
+        assert errors["r1"].message.startswith("internal error (error id ")
         # The node must not stay flagged as speculatively scheduled, or it can
         # never be re-queued. The runtime owns that flag now.
         assert w._graph_runtime.cleared == [("node", ["r1"])]

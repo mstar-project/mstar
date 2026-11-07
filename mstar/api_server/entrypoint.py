@@ -3,7 +3,6 @@
 import asyncio
 import base64
 import collections
-import contextlib
 import itertools
 import json
 import logging
@@ -13,6 +12,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -51,7 +51,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.api_server.served_models import ServedModels
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, read_stream_head
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -374,18 +374,6 @@ def _chunk_to_ndjson_payload(chunk: ResultChunk) -> str:
     }) + "\n"
 
 
-async def _disconnected(raw_request: Request) -> None:
-    """Return once the client has gone; the body is already read."""
-    while (await raw_request.receive())["type"] != "http.disconnect":
-        pass
-
-
-async def _empty_stream():
-    """The body for a client that left before its first chunk."""
-    return
-    yield
-
-
 def _chunk_to_binary_frame(chunk: ResultChunk) -> tuple[bytes, bytes]:
     """Serialize one result chunk as a header line plus its untouched payload.
 
@@ -461,8 +449,9 @@ class APIServer:
         enable_nvtx: bool = False,
         model_config: dict | None = None,
     ):
-        self.upload_dir = Path(upload_dir)
-        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(upload_dir, exist_ok=True)
+        self._upload_dir_owner = tempfile.TemporaryDirectory(prefix="deployment-", dir=upload_dir)
+        self.upload_dir = Path(self._upload_dir_owner.name)
         self.timeout_seconds = timeout_seconds
 
         # The result-delivery path runs on this process, not the worker's, so its
@@ -1596,21 +1585,7 @@ class APIServer:
         client that disconnects first is aborted and gets an empty iterator.
         """
         items = (self.iter_result_chunk_batches if batches else self.iter_result_chunks)(request_id)
-        first_read = asyncio.ensure_future(anext(items, None))
-        gone = asyncio.ensure_future(_disconnected(raw_request)) if raw_request is not None else None
-        try:
-            await asyncio.wait({first_read, gone} - {None}, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            # a pending receive() would take the disconnect StreamingResponse listens for
-            for task in (gone, first_read):
-                if task is not None and not task.done():
-                    # cancelling the read unwinds the iterator, which aborts the request
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-        if first_read.cancelled():
-            return _empty_stream()
-        first = first_read.result()
+        first = await read_stream_head(items, raw_request)
         head = first[0] if batches and first else first
         if head is not None and head.modality == "error":
             # read to the end, so the finished request is not aborted
@@ -1844,8 +1819,10 @@ class APIServer:
         self.preprocess_worker.shutdown()
         self.running = False
         self._wake_message_loop()
-        if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
+        if self._msg_thread is not None and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
+        if self._upload_dir_owner is not None:
+            self._upload_dir_owner.cleanup()
 
 
 def _resolve_warmup_path(path: str) -> str:
@@ -2125,7 +2102,7 @@ def _decode_ws_files(
         raise ValueError("files must be a list of {name, data} objects")
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
-    saved: list[Path] = []
+    saved: list[str] = []
     try:
         for entry in files or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
@@ -2141,16 +2118,13 @@ def _decode_ws_files(
                 data = media_io._decode_base64_payload(data)
             if not isinstance(data, (bytes, bytearray)):
                 raise ValueError(f"file {name!r} carries no data")
-            base = os.path.basename(name) or "upload"
-            save_path = upload_dir / f"{uuid.uuid4()}_{base}"
-            save_path.write_bytes(bytes(data))
+            save_path = media_io.save_upload(data, name, upload_dir)
             saved.append(save_path)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
             paths.append(str(save_path))
     except Exception:
-        for path in saved:
-            path.unlink(missing_ok=True)
+        media_io.remove_uploads({"upload": saved}, upload_dir)
         raise
     return file_paths, parts
 
@@ -2677,27 +2651,24 @@ async def generate(
     # --- save uploaded files, grouped by modality ----------------
     file_paths: dict[str, list[str]] = {}
     parts: list[PromptPart] = []
-    if files:
-        for f in files:
+    try:
+        for f in files or []:
             modality = _detect_modality(f.filename or "")
             if modality == "unknown":
-                # a refused request is never submitted, so the deferred cleanup
-                # below never sees what it saved
-                _remove_uploads(file_paths)
                 raise HTTPException(
                     status_code=400,
                     detail=f"Cannot determine modality for file: {f.filename}",
                 )
-            # Sanitize: only the final path component of the client name;
-            # embedded separators (../) would escape upload_dir.
-            base = os.path.basename(f.filename or "") or "upload"
-            save_name = f"{uuid.uuid4()}_{base}"
-            save_path = api_server.upload_dir / save_name
             content = await f.read()
-            await run_in_threadpool(save_path.write_bytes, content)
+            save_path = await run_in_threadpool(
+                media_io.save_upload, content, f.filename or "upload", api_server.upload_dir,
+            )
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
-            paths.append(str(save_path))
+            paths.append(save_path)
+    except BaseException:
+        _remove_uploads(file_paths)
+        raise
     if text:
         parts.append(PromptPart(modality="text", text=text))
 
@@ -2728,7 +2699,7 @@ async def generate(
 
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError) as e:
         _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,
@@ -2900,6 +2871,7 @@ def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # own, uvicorn's records reach the root logger and its writer thread.
     return uvicorn.Config(
         app, host=host, port=port, access_log=False, log_config=None,
+        timeout_graceful_shutdown=5,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
         ws_max_size=_ws_max_size(config),
     )
@@ -3130,8 +3102,6 @@ def main(argv: list[str] | None = None):
         if args.enable_metrics:
             api_server.enable_metrics()
         if args.rust_frontend:
-            import tempfile
-
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
                 launch_rust_server,
@@ -3143,7 +3113,7 @@ def main(argv: list[str] | None = None):
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
                 rust_frontend_bin, model_name,
-                args.port, bridge_dir, args.upload_dir, api_key=api_key)
+                args.port, bridge_dir, str(api_server.upload_dir), api_key=api_key)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

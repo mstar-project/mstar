@@ -28,6 +28,7 @@ from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, R
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.communication.event import EventWakeup
 from mstar.testing_utils.model import StubModel
+from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests, ReadsDone
 
 # ── the data worker ─────────────────────────────────────────────────────────
@@ -219,7 +220,7 @@ def test_the_conductor_tears_the_failed_request_down_once_and_answers_nothing():
         elif msg.message_type == ConductorMessageType.READS_DONE:
             c._handle_reads_done(msg.body)
     c._abort_request("r1")
-    c._fail_requests(FailRequests(errors={"r1": "failed on a worker"}))
+    c._fail_requests(FailRequests(errors={"r1": RequestError("failed on a worker")}))
     c._handle_reads_done(ReadsDone(request_id="r1", entity_id="w0"))
 
     assert _remove_targets(c, "r1") == {"w0", PREPROCESS}

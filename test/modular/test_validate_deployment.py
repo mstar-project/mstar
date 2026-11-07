@@ -356,7 +356,7 @@ _TP2 = {"ranks": [0, 1], "tp_size": 2}
 
 def _kv(key, nodes):
     return KVSpec(resource_key=key, nodes=set(nodes), config=PagedKVConfig(
-        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64,
+        num_layers=1, num_qo_heads=12, num_kv_heads=2, head_dim=8, max_seq_len=64,
     ))
 
 
@@ -661,3 +661,31 @@ def test_worker_graph_problems_are_reported_together(tmp_path):
     assert problems[2] == (
         "Resource spec kv nodes ['llm', 'post'] must use the same TP x SP shape across replicas"
     )
+
+
+@pytest.mark.parametrize("value", [0, -1, "64", True])
+def test_concurrency_limit_must_be_a_positive_integer(tmp_path, value):
+    problems = _problems(_Model(), _cfg(tmp_path, max_concurrent_requests=value))
+    assert any("max_concurrent_requests" in p for p in problems)
+
+
+def test_node_group_typo_is_not_silently_ignored(tmp_path):
+    config = _cfg(tmp_path, node_groups=[{"node_names": ["llm", "typo"], "ranks": [0]}])
+    assert any("typo" in p for p in _problems(_Model(), config))
+
+
+@pytest.mark.parametrize("qo_heads,kv_heads,degree,valid", [
+    (8, 2, 3, False), (6, 3, 3, True), (12, 3, 4, False), (8, 2, 4, True),
+])
+def test_attention_head_geometry_is_checked_before_workers_start(tmp_path, qo_heads, kv_heads, degree, valid):
+    spec = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+        num_layers=1, num_qo_heads=qo_heads, num_kv_heads=kv_heads, head_dim=8, max_seq_len=64,
+    ))
+    model = _Model(specs=[spec], kv_labels={"kv": {"main": KVLabel()}}, tp_enabled_nodes=["llm"])
+    cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(degree)), "tp_size": degree}])
+    if valid:
+        _validate(model, cfg)
+    else:
+        problems = _problems(model, cfg)
+        assert any("head" in problem and "kv" in problem for problem in problems), problems
+    assert spec.config.num_qo_heads == qo_heads and spec.config.num_kv_heads == kv_heads

@@ -115,6 +115,8 @@ class MediaPrompt(NamedTuple):
 
 
 class MultimodalDecoderModel(Model):
+    TOKEN_USAGE_LAYOUT = (KV_CACHE, "main")
+
     # Image preprocessing is a few small ops per request, and a thread per
     # core only slows them: each op waits on whichever thread a co-tenant
     # descheduled. At 64 threads c=1 TTFT p95 was 152 ms (some preprocesses

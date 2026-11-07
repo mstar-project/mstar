@@ -32,7 +32,7 @@ def checked_request_kwargs(kwargs: dict | None) -> dict:
             continue
         value = out[key]
         try:
-            if isinstance(value, bool) or int(value) != float(value):
+            if isinstance(value, bool) or (not isinstance(value, (int, str)) and int(value) != value):
                 raise ValueError
             out[key] = int(value)
         except (TypeError, ValueError, OverflowError):

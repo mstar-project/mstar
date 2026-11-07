@@ -1384,7 +1384,7 @@ def test_an_unservable_rid_is_parked_for_the_worker_to_fail():
     assert sched.failed_rids == {"r0"}
     errors = sched.take_admit_errors()
     assert set(errors) == {"r0"}
-    assert "r0 is doomed" in errors["r0"]
+    assert "r0 is doomed" in errors["r0"].message
     # drained exactly once, so the worker does not re-report it every iteration
     assert sched.take_admit_errors() == {}
 

@@ -41,7 +41,19 @@ mod flex {
     }
 
     pub fn opt_i64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
-        match Option::<Value>::deserialize(d)? {
+        // Preserve the literal until its integer range has been checked. Value
+        // rounds an overflowing negative integer to f64, hiding a one-unit overflow.
+        let raw = Option::<Box<serde_json::value::RawValue>>::deserialize(d)?;
+        let Some(raw) = raw else { return Ok(None) };
+        let literal = raw.get();
+        if literal.starts_with('-') || literal.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+            if !literal.contains(['.', 'e', 'E']) {
+                return literal.parse::<i64>().map(Some)
+                    .map_err(|_| Error::custom(format!("expected an integer, got {literal}")));
+            }
+        }
+        let value: Value = serde_json::from_str(literal).map_err(Error::custom)?;
+        match Some(value) {
             None | Some(Value::Null) => Ok(None),
             Some(Value::Number(n)) => n
                 .as_i64()
@@ -361,6 +373,10 @@ mod tests {
         assert!(max_tokens("-1e20").is_err());
         assert!(max_tokens("9223372036854775808.0").is_err());
         assert_eq!(max_tokens("-9223372036854775808.0").unwrap(), Some(i64::MIN));
+        assert_eq!(max_tokens("-9223372036854775808").unwrap(), Some(i64::MIN));
+        assert_eq!(max_tokens("9223372036854775807").unwrap(), Some(i64::MAX));
+        assert!(max_tokens("-9223372036854775809").is_err());
+        assert!(max_tokens("9223372036854775808").is_err());
         let seed = r#"{"messages":[],"seed":1e20}"#;
         assert!(serde_json::from_str::<ChatCompletionRequest>(seed).is_err());
     }

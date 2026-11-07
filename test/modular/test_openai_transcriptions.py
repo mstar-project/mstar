@@ -182,7 +182,14 @@ def test_whisper_parse_plain_text_and_forced_language():
 def test_whisper_parse_keeps_text_of_an_unterminated_segment():
     req = TranscriptionRequest()
     t = adapters.WhisperAdapter().parse_transcript("<|en|><|0.00|> cut off", req)
-    assert t.text == "cut off" and t.segments == []
+    assert t.text == "cut off"
+    assert t.segments == [{"start": 0.0, "end": None, "text": "cut off", "id": 0}]
+    merged = serving_transcriptions.merge_windows(
+        [serving_transcriptions.Window(path="a", offset=0.0, duration=2.0, raw_text="<|0.00|> cut off")],
+        adapters.WhisperAdapter(), req,
+    )
+    assert merged.segments[0]["text"] == "cut off"
+    assert merged.segments[0]["end"] == 2.0
 
 
 def test_whisper_stream_text_hides_control_tokens():
@@ -221,9 +228,10 @@ def test_srt_and_vtt_rendering():
     assert vtt.startswith("WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nHi")
 
 
-def test_save_upload_keeps_extension_and_drops_directories(tmp_path):
-    path = serving_transcriptions.save_upload(b"x", "../../evil.flac", tmp_path)
-    assert Path(path).parent == tmp_path and path.endswith("_evil.flac")
+@pytest.mark.parametrize("filename", ["../../evil.flac", "x" * 300 + ".flac", "é" * 200 + ".flac"])
+def test_save_upload_keeps_extension_and_drops_directories(tmp_path, filename):
+    path = serving_transcriptions.save_upload(b"x", filename, tmp_path)
+    assert Path(path).parent == tmp_path and path.endswith(".flac")
     assert Path(path).read_bytes() == b"x"
 
 
@@ -304,7 +312,7 @@ def test_transcription_stream_events(client_and_stub):
 
 
 @pytest.mark.parametrize("status,error_type", [(500, "server_error"), (400, "invalid_request_error")])
-def test_transcription_stream_reports_in_band_error(client_and_stub, status, error_type):
+def test_transcription_stream_refusal_keeps_http_status(client_and_stub, status, error_type):
     client, stub = client_and_stub
     stub.next_chunks = [_Chunk("error", b"boom", {"status": status})]
     with client.stream(
@@ -312,11 +320,10 @@ def test_transcription_stream_reports_in_band_error(client_and_stub, status, err
         data={"model": "whisper_large", "stream": "true"},
         files={"file": ("a.wav", b"RIFF", "audio/wav")},
     ) as r:
-        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
-    event = json.loads(lines[0][len("data: "):])
-    assert event["type"] == "error"
-    assert event["error"] == {"message": "boom", "type": error_type, "code": status}, "the type ignores the status"
-    assert lines[-1] == "data: [DONE]"
+        r.read()
+        assert r.status_code == status
+        assert r.json()["error"] == {"message": "boom", "type": error_type, "code": status}
+    assert not list(stub.upload_dir.iterdir())
 
 
 def test_transcription_requires_a_file(client_and_stub):
@@ -852,8 +859,8 @@ def test_streaming_parallel_error_releases_the_other_windows(client_and_stub):
         data={"model": "whisper_large", "stream": "true", "long_form": "parallel"},
         files={"file": ("long.wav", _wav_bytes(61), "audio/wav")},
     ) as r:
-        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
-    assert json.loads(lines[0][len("data: "):])["type"] == "error"
+        r.read()
+        assert r.status_code == 400
     # the failed window is released too: its iterator was left mid-stream
     assert sorted(stub.released) == sorted(s["request_id"] for s in stub.submits)
 
@@ -870,7 +877,7 @@ def test_undecodable_upload_is_a_400(client_and_stub, monkeypatch):
             raise RuntimeError("decode_av_frame: /src/torchcodec/_core/SingleStreamDecoder.cpp")
 
     # the header reads fine, the payload does not: libsndfile and FFmpeg both refuse it
-    monkeypatch.setattr(serving_transcriptions.media_io, "read_soundfile_capped", refuse)
+    monkeypatch.setattr(serving_transcriptions.media_io, "read_audio_capped", refuse)
     decoders = types.SimpleNamespace(AudioDecoder=_Decoder)
     monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
@@ -929,3 +936,60 @@ def test_client_gone_mid_long_form_stops_submitting(client_and_stub, monkeypatch
     assert len(stub.submits) == submitted
     assert set(stub.released) == {s["request_id"] for s in stub.submits[2:]}
     assert not list(stub.upload_dir.iterdir())
+
+
+def test_window_timestamps_cannot_overlap_the_next_window():
+    adapter = adapters.WhisperAdapter()
+    req = TranscriptionRequest(model="whisper", response_format="verbose_json")
+    window = serving_transcriptions.Window(path="", offset=7.0, duration=7.0,
+        raw_text="<|0.00|>hello<|7.22|>")
+    t = serving_transcriptions.merge_windows([window], adapter, req)
+    assert t.segments[0]["start"] == 7.0
+    assert t.segments[0]["end"] == 14.0
+
+
+def test_qwen_short_language_prefix_is_flushed_in_stream(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "qwen3_asr"
+    stub.queued_chunks = [_text("language", " is interesting")]
+    response = _post(client, {"model": "qwen3_asr", "stream": "true", "long_form": "parallel"})
+    events = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ") and line != "data: [DONE]"]
+    assert "".join(e["delta"] for e in events if e["type"] == "transcript.text.delta") == "language is interesting"
+    assert events[-1]["text"] == "language is interesting"
+
+
+@pytest.mark.parametrize("prefix", ["", "language English<asr_text>"])
+def test_qwen_repetition_is_removed_before_captions_and_realtime(prefix):
+    req = TranscriptionRequest()
+    adapter = adapters.Qwen3ASRAdapter()
+    raw = prefix + "hello " * 30
+    parsed = adapter.parse_transcript(raw, req)
+    assert parsed.text == adapter.final_text(("hello " * 30).strip())
+    merged = serving_transcriptions.merge_windows(
+        [serving_transcriptions.Window(path="a", offset=0.0, duration=2.0, raw_text=raw)], adapter, req,
+    )
+    assert merged.segments[0]["text"] == merged.text
+
+
+def test_transcription_error_after_text_stays_in_band(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("text", b"hello"), _Chunk("error", b"later failure", {"status": 500})]
+    response = client.post("/v1/audio/transcriptions",
+        data={"model": "whisper_large", "stream": "true"},
+        files={"file": ("a.wav", b"RIFF", "audio/wav")},
+    )
+    assert response.status_code == 200
+    events = [json.loads(line[6:]) for line in response.text.splitlines()
+              if line.startswith("data: ") and "[DONE]" not in line]
+    assert events[0]["type"] == "transcript.text.delta"
+    assert events[-1]["error"]["message"] == "later failure"
+    assert not list(stub.upload_dir.iterdir())
+
+
+def test_open_timestamp_without_known_duration_stays_finite():
+    window = serving_transcriptions.Window(path="", offset=0, duration=0,
+        raw_text="<|2.00|>unfinished")
+    transcript = serving_transcriptions.merge_windows([window], adapters.WhisperAdapter(), TranscriptionRequest())
+    assert transcript.segments[0]["start"] == transcript.segments[0]["end"] == 2.0
+    json.dumps(transcript.segments, allow_nan=False)

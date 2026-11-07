@@ -32,6 +32,7 @@ The distilled checkpoint runs a fixed 8-sigma schedule with no guidance;
 from __future__ import annotations
 
 import logging
+import math
 
 import torch
 
@@ -360,8 +361,15 @@ class LTX25Model(Model):
             fps = float(cfg.default_fps if raw_fps is None else raw_fps)
         except (TypeError, ValueError):
             raise ValueError(f"LTX-2.5 fps must be a number; got {raw_fps!r}") from None
-        if fps <= 0:
-            raise ValueError(f"LTX-2.5 fps must be positive; got {raw_fps!r}")
+        if not math.isfinite(fps) or fps <= 0:
+            raise ValueError(f"LTX-2.5 fps must be positive and finite; got {raw_fps!r}")
+        # Both streams attend jointly. A tiny fps must not bypass the latent
+        # budget by keeping video geometry small while making audio enormous.
+        audio_frames = num_frames / fps * geo.audio_latents_per_second
+        if audio_frames > self.max_video_tokens:
+            raise ValueError(
+                f"LTX-2.5 audio length exceeds this server's max_video_tokens budget of {self.max_video_tokens}"
+            )
         if geo.audio_frames(num_frames, fps) < 1:
             raise ValueError(
                 f"LTX-2.5 num_frames={num_frames} at fps={fps:g} is {num_frames / fps:.3f} s of video, which rounds "

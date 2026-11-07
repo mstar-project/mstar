@@ -54,7 +54,10 @@ _RETIRED_KWARGS = (
 
 
 class Glm52Model(Model):
+
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
+
+    TOKEN_USAGE_LAYOUT = (KV_RESOURCE, "main")
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True

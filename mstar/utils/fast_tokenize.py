@@ -16,12 +16,15 @@ against the real tokenizer over the benchmark prompts.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 
 # Below this many characters a single encode is as fast; above it chunking
 # pays. ~4 KB of text is roughly 1k tokens.
 DEFAULT_CHUNK_CHARS = int(os.environ.get("MSTAR_TOKENIZE_CHUNK_CHARS", "4096"))
 DEFAULT_MAX_CHUNKS = int(os.environ.get("MSTAR_TOKENIZE_MAX_CHUNKS", "8"))
+_SPACE_BOUNDARY = re.compile(r"\S ")
 
 
 def cut_points(
@@ -41,10 +44,11 @@ def cut_points(
         target = at + size
         if target >= n:
             break
-        i = text.find(" ", target)
-        while i > 0 and text[i - 1].isspace():
-            i = text.find(" ", i + 1)
-        if i <= 0 or i >= n - 1:
+        match = _SPACE_BOUNDARY.search(text, max(0, target - 1))
+        if match is None:
+            break
+        i = match.start() + 1
+        if i >= n - 1:
             break
         cuts.append(i)
         at = i
@@ -73,21 +77,73 @@ def _parallelism_on() -> None:
         os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
+def _byte_bpe_token_bound(backend, text: str) -> int | None:
+    """Maximum input characters per token, only when preprocessing preserves bytes."""
+    state = json.loads(backend.to_str())
+    normalizer = state.get("normalizer")
+    if normalizer is not None and not (
+        normalizer.get("type") in ("NFC", "NFKC", "NFD", "NFKD") and text.isascii()
+    ):
+        return None
+    model = state.get("model", {})
+    if model.get("type") != "BPE" or model.get("fuse_unk"):
+        return None
+    pending = [state.get("pre_tokenizer")]
+    byte_level = False
+    while pending:
+        part = pending.pop()
+        if not part:
+            return None
+        kind = part.get("type")
+        if kind == "Sequence":
+            pending.extend(part["pretokenizers"])
+        elif kind == "ByteLevel":
+            byte_level = True
+        elif kind != "Split" or part.get("behavior") == "Removed":
+            return None
+    added = state.get("added_tokens", [])
+    if not byte_level or any(t.get("lstrip") or t.get("rstrip") for t in added):
+        return None
+    # ByteLevel represents each source byte with one vocabulary character.
+    # Special tokens instead match their literal content; both give upper bounds.
+    return max([0, *(len(t) for t in model["vocab"]), *(len(t["content"]) for t in added)]) or None
+
+
 def encode_ids(
     tokenizer, text: str, chunk_chars: int = DEFAULT_CHUNK_CHARS,
-    max_chunks: int = DEFAULT_MAX_CHUNKS,
+    max_chunks: int = DEFAULT_MAX_CHUNKS, *, max_tokens: int | None = None,
 ) -> list[int]:
     """Token ids of ``text`` with the tokenizer's defaults for special
     tokens: a long text goes through the Rust backend as a batch of chunks,
     a short one (or a tokenizer without a Rust backend) through ``tokenizer``
-    itself."""
+    itself. With ``max_tokens``, stop once the context is exceeded instead of
+    encoding and retaining the rest of an oversized prompt."""
     backend = getattr(tokenizer, "backend_tokenizer", None)
-    cuts = cut_points(text, chunk_chars, max_chunks) if backend is not None else []
+
+    def check(count):
+        if max_tokens is not None and count > max_tokens:
+            raise ValueError(f"prompt exceeds the model context of {max_tokens} tokens")
+
+    if max_tokens is not None and backend is not None and len(text) > max_tokens * 8:
+        bound = _byte_bpe_token_bound(backend, text)
+        if bound is not None and len(text) > max_tokens * bound:
+            check(max_tokens + 1)
+    # Fixed-size chunks let an oversized request stop after a bounded batch,
+    # instead of making eight equally huge encodings before checking the limit.
+    chunks = max_chunks
+    if max_tokens is not None and chunk_chars > 0:
+        chunks = max(2, len(text) // chunk_chars)
+    cuts = cut_points(text, chunk_chars, chunks) if backend is not None else []
     if not cuts:
-        return list(tokenizer(text).input_ids)
+        ids = list(tokenizer(text).input_ids)
+        check(len(ids))
+        return ids
     _parallelism_on()
-    encodings = backend.encode_batch(split_at(text, cuts), add_special_tokens=False)
     ids: list[int] = []
-    for enc in encodings:
-        ids.extend(enc.ids)
+    ends = [0, *cuts, len(text)]
+    for at in range(0, len(ends) - 1, max(1, max_chunks)):
+        parts = [text[ends[i]:ends[i + 1]] for i in range(at, min(at + max(1, max_chunks), len(ends) - 1))]
+        for enc in backend.encode_batch(parts, add_special_tokens=False):
+            check(len(ids) + len(enc.ids))
+            ids.extend(enc.ids)
     return ids

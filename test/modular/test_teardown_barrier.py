@@ -11,9 +11,11 @@ from collections import deque
 
 import pytest
 import torch
+from fastapi import HTTPException
 
 from mstar.conductor.conductor import Conductor, RequestData, _req_id_to_seed, _request_seed
 from mstar.graph.base import TensorPointerInfo
+from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import (
     FailRequests,
     NewRequestConductor,
@@ -146,9 +148,19 @@ def test_second_abort_while_draining_is_ignored():
     assert c.sent == []
 
 
-def test_fail_defers_client_notification_until_barrier_completes():
+@pytest.mark.parametrize("error,status", [(ValueError("bad request"), 400), (RuntimeError("broken forward"), 500),
+     (torch.OutOfMemoryError("CUDA out of memory"), 500),
+     (HTTPException(409, "session is in use"), 409)])
+def test_fail_defers_client_notification_until_barrier_completes(error, status):
     c = _conductor({"r1": _request_data()})
-    c._fail_requests(FailRequests(errors={"r1": "boom"}))
+    from mstar.communication import wire, wire_types  # noqa: F401
+    from mstar.engine.engine import ExecutingBatch
+    from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType
+
+    batch = types.SimpleNamespace(failed_requests={}, node_name="node", graph_walk="walk")
+    ExecutingBatch.register_failure(batch, "r1", error)
+    report = ConductorMessage(ConductorMessageType.FAIL_REQUESTS, FailRequests(errors=batch.failed_requests))
+    c._fail_requests(wire.decode(wire.encode(report)).body)
 
     # Draining, but the client is not told yet.
     assert _drain_targets(c, "r1") == {"w0", PREPROCESS}
@@ -162,7 +174,7 @@ def test_fail_defers_client_notification_until_barrier_completes():
         if e == "api_server" and m.message_type == "request_failed"
     ]
     assert len(failures) == 1
-    assert failures[0].body.error_message == "boom"
+    assert failures[0].body.status == status
     assert _remove_targets(c, "r1") == {"w0", PREPROCESS}
 
 
@@ -354,7 +366,7 @@ def test_drain_barrier_times_out_and_force_finalizes():
     """A participant that never ACKs (crashed/hung) must not hold the request —
     or, on the fail path, the client's notification — forever."""
     c = _conductor({"r1": _request_data()}, drain_ttl_s=0.0)
-    c._fail_requests(FailRequests(errors={"r1": "boom"}))
+    c._fail_requests(FailRequests(errors={"r1": RequestError("boom")}))
     assert "r1" in c.draining  # w0 and the preprocess worker never ACK
 
     c._sweep_expiry()

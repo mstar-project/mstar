@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 
+import anyio
 from fastapi import HTTPException
 
 from mstar.api_server import media_io
@@ -21,7 +22,9 @@ from mstar.utils.utf8_stream import Utf8Stream
 
 async def create_chat_completion(api, model_name, adapter, req, raw_request=None):
     """The response dict, or for ``req.stream`` the SSE response itself."""
-    args = adapter.chat_to_request(req, api.upload_dir)
+    # Adapters decode and write attachments. Keep that work off the loop
+    # serving other requests' token streams; do not abandon the worker on cancellation.
+    args = await anyio.to_thread.run_sync(adapter.chat_to_request, req, api.upload_dir)
     request_id = rid("chatcmpl")
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
 
@@ -89,13 +92,19 @@ def _build_response(model_name, request_id, chunks, sample_rate) -> dict:
             parts.append({"type": "image_url", "image_url": {"url": media_io.png_to_data_url(img)}})
         message["content"] = parts
 
+    prompt_tokens = next((c.metadata["prompt_tokens"] for c in chunks if "prompt_tokens" in c.metadata), None)
+    completion_tokens = sum(c.metadata.get("completion_tokens", 0) for c in chunks)
+    usage = None if prompt_tokens is None else {
+        "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
     return {
         "id": request_id,
         "object": "chat.completion",
         "created": now(),
         "model": model_name,
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage,
     }
 
 

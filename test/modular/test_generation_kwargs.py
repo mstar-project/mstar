@@ -339,3 +339,13 @@ def test_a_client_still_waiting_keeps_its_stream():
         return [c async for c in chunks], client.receives
 
     assert asyncio.run(asyncio.wait_for(run(), timeout=5)) == ([ok], 1)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"max_tokens": 2**64}, {"max_tokens": 1e308},
+    {"extra": {"nested": [2**64]}}, {"extra": -2**63 - 1},
+])
+def test_unrepresentable_request_integers_fail_before_wire_encoding(kwargs):
+    from mstar.utils.generation_kwargs import normalize_generation_kwargs
+    with pytest.raises(ValueError, match="64-bit"):
+        normalize_generation_kwargs(kwargs)

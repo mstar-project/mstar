@@ -190,12 +190,19 @@ class ZImageModel(Model):
         return enc["input_ids"][0].to(torch.long)
 
     def _resolve_size(self, model_kwargs: dict) -> tuple[int, int]:
-        height = int(model_kwargs.get("height", self.config.default_height))
-        width = int(model_kwargs.get("width", self.config.default_width))
+        try:
+            height = int(model_kwargs.get("height", self.config.default_height))
+            width = int(model_kwargs.get("width", self.config.default_width))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("Z-Image dimensions must be finite integers") from None
         align = self.config.spatial_alignment
-        for name, value in (("height", height), ("width", width)):
+        # the rotary table has one row per token along each image axis (axes 1 and 2)
+        axes = self.config.transformer.axes_lens
+        for name, value, axis_len in (("height", height, axes[1]), ("width", width, axes[2])):
             if value <= 0 or value % align:
                 raise ValueError(f"Z-Image {name}={value} must be a positive multiple of {align}")
+            if value > axis_len * align:
+                raise ValueError(f"Z-Image {name}={value} exceeds the model's {axis_len * align} px")
         if height * width > self.max_image_area:
             raise ValueError(
                 f"Z-Image {width}x{height} exceeds this server's max_image_area of {self.max_image_area} pixels "
@@ -219,6 +226,8 @@ class ZImageModel(Model):
             raise ValueError("Z-Image requires a non-empty text prompt")
         if "image" in input_modalities:
             raise ValueError("Z-Image-Turbo is text-to-image only; reference images are not supported")
+        if set(input_modalities) - {"text"}:
+            raise ValueError("Z-Image-Turbo supports only text inputs")
         self._resolve_size(kwargs)
         self._resolve_steps(kwargs)
         image_output_format(kwargs)  # fail a bad output knob now, not after the denoise

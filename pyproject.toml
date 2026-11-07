@@ -91,6 +91,7 @@ dev = [
 # and SDK. WAV/PCM work without this.
 audio = [
     "soundfile",
+    "av>=19",  # bounded decoding without trusting MP3/streamed WAV length headers
 ]
 
 # Optional: Prometheus metrics at /metrics (``mstar serve --enable-metrics``).
@@ -222,6 +223,7 @@ qwen3_tts = [
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "soundfile",  # reference-audio decoding for Base voice cloning
+    "av>=19",  # bounded decoding without trusting MP3/streamed WAV length headers
     "transformers>=4.57.3",
 ]
 
@@ -231,6 +233,7 @@ fish_s2_pro = [
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "soundfile",  # reference-audio decoding for voice cloning
+    "av>=19",  # bounded decoding without trusting MP3/streamed WAV length headers
     "transformers",
 ]
 
@@ -278,6 +281,7 @@ cosyvoice3 = [
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "soundfile",
+    "av>=19",  # bounded decoding without trusting MP3/streamed WAV length headers
     "torchcodec",
     "transformers",
 ]
@@ -290,6 +294,7 @@ voxcpm2 = [
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "soundfile",
+    "av>=19",  # bounded decoding without trusting MP3/streamed WAV length headers
     "soxr",
     "transformers",
 ]
@@ -400,6 +405,7 @@ asr = [
     "safetensors",
     # decodes WAV / FLAC / OGG / MP3 uploads without FFmpeg (torchcodec takes the rest)
     "soundfile",
+    "av>=19",  # bounded decoding without trusting MP3/streamed WAV length headers
     # torchcodec doesn't declare its torch requirement and loads only next to the torch
     # it was built for, so the extra pins the pair the Dockerfiles ship (torch 2.10 with 0.10)
     "torch>=2.10.0,<2.11",
@@ -425,9 +431,9 @@ all = [
     "ruff",
     "pytest>=9.0.3",
     "soundfile",
+    "av>=19",  # bounded decoding without trusting MP3/streamed WAV length headers
     "silero-vad>=5.1",
     "onnxruntime>=1.17",
-    "av>=19",
     "diffusers>=0.39",
     "fa3-fwd",
     "einops",

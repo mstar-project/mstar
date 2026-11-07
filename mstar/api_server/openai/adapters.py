@@ -134,10 +134,27 @@ def flatten_messages(
                 if content:
                     add_text(content, role)
                 continue
+            if not isinstance(content, list):
+                raise ValueError("message content must be text or a list of parts")
             for part in content:
                 if not isinstance(part, dict):
-                    continue
+                    raise ValueError("message content parts must be objects")
                 ptype = part.get("type")
+                if ptype == "text" and not isinstance(part.get("text"), str):
+                    raise ValueError("text content must be a string")
+                if ptype in ("image_url", "video_url", "audio_url"):
+                    media = part.get(ptype)
+                    if not isinstance(media, dict) or not isinstance(media.get("url"), str) or not media["url"]:
+                        raise ValueError(f"{ptype} must contain a non-empty url string")
+                elif ptype == "input_audio":
+                    media = part.get(ptype)
+                    if (not isinstance(media, dict) or not isinstance(media.get("data"), str)
+                            or not media["data"] or not isinstance(media.get("format", "wav"), str)):
+                        raise ValueError("input_audio must contain base64 data and a format string")
+                elif ptype != "text":
+                    raise ValueError(f"unsupported message content type {ptype!r}")
+                if role == "system" and ptype != "text":
+                    raise ValueError("system messages support text content only")
                 if ptype == "text":
                     if part.get("text"):
                         add_text(part["text"], role)
@@ -474,6 +491,8 @@ class Qwen3OmniAdapter(OpenAIAdapter):
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Qwen3-Omni is a chat model; /v1/audio/speech returns the audio of its
         # spoken response to ``input`` (the handler keeps only the audio).
+        if not req.input.strip():
+            raise ValueError("input must be non-empty")
         mk = _passthrough(req)
         if getattr(req, "voice", None) is not None:
             mk["voice"] = req.voice
@@ -1323,8 +1342,10 @@ def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bo
     tail = text[cursor:]
     (buffer if start is not None else parts).append(tail)
     if start is not None and "".join(buffer).strip():
-        # an open segment at the end of the stream: keep its text, no end
-        parts.append("".join(buffer).strip())
+        # The window owner supplies the end if no later decode replaces this tail.
+        tail_text = "".join(buffer).strip()
+        parts.append(tail_text)
+        segments.append({"start": start, "end": None, "text": tail_text})
     return language, segments, parts, start is not None
 
 
@@ -1380,7 +1401,7 @@ class Qwen3ASRAdapter(OpenAIAdapter):
     def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
         raw = text.strip()
         if ASR_TEXT_TAG not in raw:
-            return Transcript(text=raw, language=req.language)
+            return Transcript(text=self.final_text(raw), language=req.language)
         meta, body = raw.split(ASR_TEXT_TAG, 1)
         language = None
         for line in meta.splitlines():
@@ -1390,7 +1411,7 @@ class Qwen3ASRAdapter(OpenAIAdapter):
                 break
         if language and language.lower() == "none":
             language = None
-        return Transcript(text=body.strip(), language=req.language or _qwen3_language_code(language))
+        return Transcript(text=self.final_text(body.strip()), language=req.language or _qwen3_language_code(language))
 
 
 def _qwen3_language_code(name: str | None) -> str | None:

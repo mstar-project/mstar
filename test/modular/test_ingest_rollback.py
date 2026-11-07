@@ -41,7 +41,14 @@ def test_a_raising_ingest_rolls_back_every_resource_it_reached():
     ]
 
 
-def test_the_worker_fails_only_the_request_whose_ingest_raised():
+def _raise(err):
+    raise err
+
+
+@pytest.mark.parametrize("raises_in", [
+    "runtime_add", "worker_state", "stop_limits", "tensor_register", "engine_add", "input_read",
+])
+def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
     w._draining_rids = set()
@@ -49,29 +56,60 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     w._unprocessed_messages = {"wire": ["parked"]}
     processed, failed, registered = [], [], []
     w._graph_runtime = SimpleNamespace(
-        add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
-        register_stop_limits=lambda rid, info: None,
+        add_request=lambda **kw: (_raise(RuntimeError("registration failed")) if raises_in == "runtime_add" else 5),
+        get_sharding_config=lambda rid: None,
+        register_stop_limits=lambda rid, info: (
+            _raise(RuntimeError("registration failed")) if raises_in == "stop_limits" else None
+        ),
     )
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
+        add_request=lambda rid, cfg, info: (
+            _raise(RuntimeError("over capacity")) if raises_in == "engine_add" else None
+        ),
     )
-    w.request_state = SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None)
-    w.scheduler = SimpleNamespace(note_arrival=lambda rid: None)
+    w.request_state = SimpleNamespace(per_request_info={})
+    def add_info(rid, info):
+        if raises_in == "worker_state":
+            raise RuntimeError("registration failed")
+        w.request_state.per_request_info[rid] = info
+    w.request_state.add_request = add_info
+    w._rid = lambda rid: None if raises_in == "runtime_add" else 5
+    sent = []
+    w.communicator = SimpleNamespace(send=lambda destination, msg: sent.append(msg))
+    w.scheduler = SimpleNamespace(
+        note_arrival=lambda rid: None, read_failed_rids=set(),
+        failed_rids=set(), fail_rids=lambda rids: None,
+    )
+    w.streams = SimpleNamespace(add_request=lambda rid, info: None)
     w.tensor_manager = SimpleNamespace(
-        register_request=lambda rid, sharding: registered.append(rid),
-        start_read_tensors=lambda *a, **kw: pytest.fail("no reads for a failed request"),
+        register_request=lambda rid, sharding: (
+            _raise(RuntimeError("registration failed")) if raises_in == "tensor_register"
+            else registered.append(rid)
+        ),
+        start_read_tensors=lambda *a, **kw: (
+            _raise(RuntimeError("CUDA out of memory")) if raises_in == "input_read"
+            else pytest.fail("no reads for a failed request")
+        ),
     )
     w._fail_requests = failed.append
     w._process_message_list = processed.extend
     body = SimpleNamespace(
         request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
+        initial_inputs=[],
         request_info=SimpleNamespace(
-            partition_name="p", graph_walk="g", resource_configs=None, rid_handle=None,
+            partition_name="p", graph_walk="g", resource_configs={}, rid_handle=None,
         ),
     )
     Worker._add_new_request(w, body)
-    assert registered == [5] and len(failed) == 1 and list(failed[0]) == [5]
-    assert failed[0][5].startswith("Error in worker: internal error (error id ")
+    if raises_in in ("runtime_add", "worker_state"):
+        assert not failed and len(sent) == 1
+        assert list(sent[0].body.errors) == ["wire"]
+        failure = sent[0].body.errors["wire"]
+    else:
+        assert len(failed) == 1 and list(failed[0]) == [5]
+        failure = failed[0][5]
+    assert registered == ([5] if raises_in in ("engine_add", "input_read") else [])
+    assert failure.message.startswith("internal error (error id ")
     # messages parked before the NEW still go through (a parked REMOVE among them)
     assert processed == ["parked"] and "wire" not in w._unprocessed_messages

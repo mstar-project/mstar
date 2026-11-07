@@ -5,6 +5,7 @@ second writer, a timeout on idle sessions, and explicit ending."""
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 
 from mstar.model.cosmos3.sessions import SessionStore
 
@@ -35,8 +36,10 @@ def test_lru_promotes_on_read_and_evicts_the_oldest_idle():
 def test_live_sessions_are_never_evicted_and_refuse_a_second_writer():
     store, _ = _store(capacity=1)
     store.begin("w", "r1")                    # a rollout in flight, nothing stored yet
-    with pytest.raises(ValueError, match="in use by request 'r1'"):
+    with pytest.raises(HTTPException) as conflict:
         store.begin("w", "r2")
+    assert conflict.value.status_code == 409
+    assert "r1" not in conflict.value.detail
     store.begin("w", "r1")                    # the same request may re-pin
     for sid in ("x", "y", "z"):               # idle sessions churn around it
         store.put(sid, 0)

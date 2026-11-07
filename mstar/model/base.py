@@ -627,6 +627,13 @@ class Model(ABC):
     # values to the conductor alongside their tensor descriptors.
     PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
 
+    # KV resource and label whose prepared spans count the logical chat prompt.
+    TOKEN_USAGE_LAYOUT: tuple[str, str] | None = None
+
+    # Requests sharing this kwarg must reach the same copy of every node,
+    # because their session state lives on that replica.
+    REPLICA_AFFINITY_KWARG: str | None = None
+
     # Keys only this model's process_prompt sets (prompt layouts, stream
     # leads) for the conductor to read back from model_kwargs. The data
     # worker drops a client's values for them before process_prompt.
@@ -1062,20 +1069,28 @@ class Model(ABC):
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
         # video-only one); torchcodec for the other containers.
-        from mstar.model.components.audio_features import load_audio_file
+        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+        from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_audio_file(filepath, sample_rate=16000)
+        audio = load_speech_file(filepath, sample_rate=16000, max_seconds=MAX_AUDIO_SECONDS)
+        if audio.numel() == 0:
+            raise ValueError("audio upload is empty")
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
         budget = VideoBudget()
         frames = []
-        for frame in decoder:
-            budget.add(*frame.shape[-2:])
-            frames.append(frame)
+        try:
+            decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
+            for frame in decoder:
+                budget.add(*frame.shape[-2:])
+                frames.append(frame)
+        except (RuntimeError, OSError) as exc:
+            raise ValueError("Unable to decode video upload") from exc
+        if not frames:
+            raise ValueError("video upload has no frames")
         video = torch.stack(frames)
         del frames
         video = video.float().div_(255.0)

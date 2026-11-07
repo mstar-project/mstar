@@ -1,8 +1,10 @@
 """A streaming response that cleans up after a body Starlette never started."""
 
+import asyncio
+import contextlib
 import inspect
 import logging
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
 from fastapi.responses import StreamingResponse
 
@@ -23,7 +25,7 @@ class ReleasingStreamingResponse(StreamingResponse):
     process restarts.
     """
 
-    def __init__(self, content: AsyncGenerator, *, release: Callable[[], None], **kwargs):
+    def __init__(self, content: AsyncGenerator, *, release: Callable[[], None | Awaitable[None]], **kwargs):
         super().__init__(content, **kwargs)
         self._release = release
 
@@ -33,8 +35,30 @@ class ReleasingStreamingResponse(StreamingResponse):
         finally:
             if inspect.getasyncgenstate(self.body_iterator) == inspect.AGEN_CREATED:
                 try:
-                    self._release()
+                    result = self._release()
+                    if inspect.isawaitable(result):
+                        await result
                 except Exception:
                     # logged, not raised: raising here would replace the send
                     # error the server needs to see with this one
                     logger.exception("releasing a streaming response whose body never started failed")
+
+
+async def read_stream_head(items, raw_request=None):
+    """Read the first item before headers, aborting the iterator on disconnect."""
+    async def disconnected():
+        while (await raw_request.receive())["type"] != "http.disconnect":
+            pass
+
+    first = asyncio.ensure_future(anext(items, None))
+    gone = asyncio.ensure_future(disconnected()) if raw_request is not None else None
+    try:
+        await asyncio.wait({first, gone} - {None}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        # A pending receive would consume StreamingResponse's disconnect.
+        for task in (gone, first):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+    return None if first.cancelled() else first.result()

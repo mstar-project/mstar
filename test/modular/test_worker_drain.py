@@ -27,6 +27,8 @@ from mstar.utils.ipc_format import (
     InputSignals,
     MessageSource,
     RemoveRequest,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import Rebuilds
@@ -72,10 +74,9 @@ def _worker(
         register_stop_limits=lambda rid, info: None,
         get_rid_string=lambda h: h,
         remove_request=lambda h: None,
-        # The TP fan-out reads the sharding config off the runtime now; no
-        # groups means no followers, which is what these tests assume.
         get_sharding_config=lambda r: (
-            SimpleNamespace(groups=[]) if r in known_rids else None
+            SimpleNamespace(groups=[SimpleNamespace(tp_size=2, _tp_rank=1, _workers=["lead", "w0"])])
+            if is_follower and r in known_rids else SimpleNamespace(groups=[])
         ),
     )
     w._rebuilds = Rebuilds({}, {})
@@ -379,6 +380,14 @@ def test_follower_ignores_conductor_drain():
     assert "X" in w._draining_rids and len(_reads_done(w)) == 1
 
 
+def test_follower_honors_conductor_drain_of_a_request_it_never_admitted():
+    """The leader has no handle either, so it forwards nothing: without this the
+    teardown barrier waits out the drain TTL for this rank's READS_DONE."""
+    w = _worker(is_follower=True, known_rids=())
+    Worker._drain_request(w, DrainRequest(request_id="X"))  # source=CONDUCTOR
+    assert "X" in w._draining_rids and len(_reads_done(w)) == 1
+
+
 def test_drain_acks_only_once():
     w = _worker(inflight_reads=False)
     Worker._drain_request(w, DrainRequest(request_id="X"))
@@ -638,3 +647,61 @@ def test_preprocess_hard_cleanup_force_drops_and_clears():
     assert "X" not in wt.request_model_kwargs
     assert "X" not in wt.in_flight_requests
     assert "X" not in wt.request_output_state
+
+
+@pytest.mark.parametrize("follows", [False, True])
+def test_drain_follows_the_requests_replica_not_the_workers_role(follows):
+    w = _worker(is_follower=True)
+    group = SimpleNamespace(tp_size=2, _tp_rank=1 if follows else -1,
+                            _workers=["leader", "w0" if follows else "other-follower"])
+    w._graph_runtime.get_sharding_config = lambda rid: SimpleNamespace(groups=[group])
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert bool(_reads_done(w)) is (not follows)
+    if follows:
+        Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
+        assert len(_reads_done(w)) == 1
+
+
+def test_inflight_follower_removal_does_not_block_an_unrelated_request():
+    w = _worker(known_rids=("X", "Y", "Z"), is_follower=True)
+    follower = SimpleNamespace(tp_size=2, _tp_rank=1, _workers=["lead", "w0"])
+    w._graph_runtime.get_sharding_config = lambda rid: SimpleNamespace(groups=[] if rid == "Z" else [follower])
+    w._pending_removes = dict.fromkeys(("X", "Y", "Z"))
+    removed = []
+    w._remove_request = lambda body: removed.append(body.request_id)
+    w._apply_pending_removes_safe_to_drop({"X"})
+    assert removed == ["Z"]
+    assert list(w._pending_removes) == ["X", "Y"]
+    w._apply_pending_removes_safe_to_drop(set())
+    assert removed == ["Z", "X", "Y"]
+
+
+def test_cancelled_producers_missing_file_does_not_drop_an_innocent_message(tmp_path):
+    from dataclasses import replace
+
+    w, _, _ = _input_worker(known_rids=("X", "innocent"), in_flight=("innocent",))
+    w.scheduler.read_failed_rids = set()
+    w.request_state.per_request_info["innocent"].stream_buffers = {}
+    missing = tmp_path / "cancelled-producer"
+    missing.write_bytes(b"tensor")
+    missing.unlink()  # producer removed before its queued peer message arrived
+    reads = []
+
+    def read(rid, edges, graph_walk=None):
+        if rid == "X":
+            missing.read_bytes()
+        reads.append(rid)
+        return []
+
+    w.tensor_manager.start_read_tensors = read
+    healthy = _input(2, False)
+    healthy = replace(healthy, request_id="innocent", request_info=replace(
+        healthy.request_info, request_id="innocent",
+    ))
+    w._process_message_list([
+        WorkerMessage(WorkerMessageType.INPUT_SIGNALS, _input(1, True)),
+        WorkerMessage(WorkerMessageType.INPUT_SIGNALS, healthy),
+    ])
+    assert reads == ["innocent"]
+    assert w.failed == {"X"} and w._in_flight_rids == {"innocent"}
+    assert set(w.sent[0][1].body.errors) == {"X"}

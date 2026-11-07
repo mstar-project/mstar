@@ -33,6 +33,7 @@ from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
 from mstar.testing_utils.engine import make_engine
+from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import RemoveRequest
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
@@ -196,8 +197,8 @@ class _FailingWorker(_EvictingWorker):
         self.failed.update(errors)
 
 
-_POOL_FILLER_ERROR = (
-    "Error in worker: The request needs 64 pages of kv for this step, more than "
+_POOL_FILLER_ERROR = RequestError(
+    "The request needs 64 pages of kv for this step, more than "
     "the 63 the pool holds; raise max_num_pages or shorten the request."
 )
 
