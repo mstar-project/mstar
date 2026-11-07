@@ -902,6 +902,15 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # the signal: signal -> the pair (``repeat_carry``).
     REPEAT_CARRIES: Mapping[str, CarryPair] = MappingProxyType({})
 
+    # Walk -> signals whose ordinary split(1) rows equal the same-named
+    # captured row_outputs, before stop withholding. A consumer may prepare,
+    # plan, compute and collect without producer-tail effects; the producer
+    # tail must not need the consumer's pre-compute state. This is an author
+    # contract, not a Python-purity inference. Initially checked only for a
+    # streamed producer requesting one compute, with disjoint resource owners
+    # and no custom filter, unpack or batch tail.
+    DIRECT_OUTPUTS: Mapping[str, frozenset[str]] = MappingProxyType({})
+
     # Set True where this node's looping walks run on resident tables when the
     # config leaves ``knobs: resident_planning`` at its default (``auto``); which
     # walks still comes from every owner agreeing at load. ``on`` asks every

@@ -910,7 +910,9 @@ def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_valu
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
 @pytest.mark.parametrize("mode", ["live", "full", "yield", "unsupported", "bank_small",
                                   "tail", "tail_error", "tail_zero", "tail_wide", "producer_tail",
-                                  "packing", "packing_refuse"])
+                                  "packing", "packing_refuse", "direct", "direct_zero", "direct_eos",
+                                  "direct_error", "direct_missing", "direct_walk", "direct_alias",
+                                  "direct_spans", "direct_absent", "direct_wide", "direct_shared"])
 def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
 
@@ -926,10 +928,11 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     if device_name == "cuda" and not torch.cuda.is_available():
         pytest.skip("real Engine streamed composition")
     device = torch.device(device_name)
-    full, yielded = mode == "full", mode in {"yield", "tail_zero"}
+    direct = mode.startswith("direct")
+    full, yielded = mode == "full", mode in {"yield", "tail_zero", "direct_zero"}
     packing = mode.startswith("packing")
     custom = mode.startswith("tail") or mode == "producer_tail" or packing
-    tails, batch_tails = [], []
+    tails, batch_tails, producer_tails = [], [], []
     eng, group, events = _connected_engine(device=device)
     group.unit = replace(group.unit, streaming_edges=group.unit.edges)
     source = StreamBuffer(2, "x", "a", FixedChunkPolicy(2))
@@ -999,6 +1002,25 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                     batch_tails.append(tuple(request_infos))
                     assert outputs.get(2)["x"][0].tolist() == [10, 11]
             mgmt.submodule.__class__ = Tail
+        if direct and name == "a":
+            class Direct(type(mgmt.submodule)):
+                DIRECT_OUTPUTS = {"wrong" if mode == "direct_walk" else "prefill": frozenset({"x"})}
+
+                def postprocess(self, request_id, request_info, outputs, inputs, **kwargs):
+                    producer_tails.append(request_id)
+                    if mode == "direct_error":
+                        raise ValueError("producer tail failed")
+            mgmt.submodule.__class__ = Direct
+            if mode == "direct_missing":
+                mgmt.submodule.DIRECT_OUTPUTS = {}
+            if mode == "direct_alias":
+                from mstar.model.submodule_base import CarryPair
+                mgmt.submodule.REPEAT_CARRIES = {"x": CarryPair("other", "x")}
+        if mode == "direct_error" and name == "b":
+            class DependentTail(type(mgmt.submodule)):
+                def postprocess(self, *args, **kwargs):
+                    pytest.fail("failed predecessor cannot run a successful dependent tail")
+            mgmt.submodule.__class__ = DependentTail
         runner = mgmt.accelerator_graph_runner
         runner._graph_backend = backend
         old_bucket = next(iter(runner._buckets.values()))
@@ -1009,6 +1031,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
             row_outputs={"x": torch.zeros(1, 2 if name == "a" else 1, device=device)},
             check_stop_buffers={"token": torch.zeros(1, dtype=torch.long, device=device)},
         )
+        if direct and name == "a" and mode == "direct_spans":
+            slot.static_outputs.output_spans = {"x": torch.ones(1, dtype=torch.long, device=device)}
         slot.dummy_rids, slot.dummy_metadata = [-1], {}
         config = BatchedAcceleratorGraphConfig(
             capture_graph_walk="prefill", single_request_inputs=NodeInputs(
@@ -1057,8 +1081,10 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
 
         def body(name=name, slot=slot, run=run, state=state, mgmt=mgmt, bucket=bucket):
             if name == "a":
-                slot.static_outputs.row_outputs["x"].copy_((state.index + 10).expand(1, 2))
-                slot.static_outputs.check_stop_buffers["token"].copy_(torch.where(state.index == 2, 99, 1))
+                slot.static_outputs.row_outputs["x"].copy_((state.index + (11 if direct else 10)).expand(1, 2))
+                slot.static_outputs.check_stop_buffers["token"].copy_(
+                    torch.where(state.index == (0 if mode == "direct_eos" else 2), 99, 1),
+                )
             else:
                 mgmt.loopback_rows.head(bucket, 0, "x", slot.static_inputs["x"])
                 slot.static_outputs.row_outputs["x"].copy_(slot.static_inputs["x"].sum().reshape(1, 1))
@@ -1072,6 +1098,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
 
         run.entry, slot.graph = capture(entry), capture(body)
         slots[name] = slot
+        if name == "a" and mode == "direct_absent":
+            slot.static_outputs.row_outputs.pop("x")
         scheduled, batch = next(pair for pair in group.members if pair[1].node_name == name)
         batch.request_ids = [2]
         batch.per_request_info = {2: batch.per_request_info[2]}
@@ -1079,6 +1107,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         batch.step_context.repeats = scheduled.repeats = (4 if name == "a" else
                                                         1 if custom and mode != "tail_wide" else 3)
         scheduled.request_to_worker_graph = {2: 1}
+        if (direct and name == "a") or mode == "direct_error":
+            batch.step_context.repeats = scheduled.repeats = 2 if mode == "direct_wide" else 1
 
     def reserve(batch):
         lease = leases[batch.node_name]
@@ -1100,6 +1130,16 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         ring.ring_reserve("x", [2], 8)
         ring.ring_write("x", [2], torch.arange(10, 18, device=device).reshape(1, 8, 1).expand(1, 8, 2), [0])
         source.put_positions(list(range(8)))
+    if direct:
+        n = 2 if mode == "direct_zero" else 1
+        ring.ring_reserve("x", [2], n)
+        ring.ring_write("x", [2], torch.arange(10, 10 + n, device=device).reshape(1, n, 1).expand(1, n, 2), [0])
+        source.put_positions(list(range(n)))
+        if mode == "direct_shared":
+            from mstar.engine.resources.runner import StepRunner
+            eng._runner = StepRunner({"shared": ring})
+            eng._submodules["a"].resources = {"shared": ring}
+            eng._submodules["b"].resources = {"shared": ring}
     assert worker._reserve_group_stream(group)
     if mode == "unsupported":
         from mstar.engine.resources.base import Resource
@@ -1115,13 +1155,16 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     if mode in {"bank_small", "packing_refuse"}:
         tables.prepare_stream_window(leases["b"], 1, 1, 1)
     output = eng.exec_group(group)
-    if mode in {"unsupported", "bank_small", "tail_wide", "producer_tail", "packing_refuse"}:
+    if mode in {"unsupported", "bank_small", "tail_wide", "producer_tail", "packing_refuse",
+                "direct_missing", "direct_walk", "direct_alias", "direct_spans", "direct_absent",
+                "direct_wide", "direct_shared"}:
         assert output is None and group.refusal is not None
         assert not group.submitted and not launches
         if packing:
             assert owner.row("x", 2).eq(-100).all(), "unsubmitted padding cannot alter its owning row"
         worker._restore_group_stream(group)
-        assert not source._reservations and ring.ring_room("x", 2) == 8
+        assert not source._reservations
+        assert ring.ring_room("x", 2) == (5 if mode == "direct_wide" else 6 if direct else 8)
         return
     assert output is not None, group.refusal
     if device_name == "cuda":
@@ -1130,13 +1173,13 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     if packing:
         assert owner.row("x", 2).tolist() == [[10, 11, 0], [10, 11, 0]]
     if not full:
-        assert output[0].check_stop_buffers[RUN_COUNTS].tolist() == [0 if yielded else 3]
+        assert output[0].check_stop_buffers[RUN_COUNTS].tolist() == [0 if yielded else 1 if direct else 3]
     else:
         assert not output[0].check_stop_buffers and not a.step
-    b_count = 0 if yielded else 3 if full else 1
+    b_count = (0 if mode == "direct_eos" else 1) if direct else (0 if yielded else 3 if full else 1)
     assert output[1].check_stop_buffers[RUN_COUNTS].tolist() == [b_count]
     assert output[1].check_stop_buffers[STREAM_COUNTS].tolist() == [b_count]
-    if not yielded:
+    if b_count:
         assert output[1].row_outputs["x"][0, 0].item() == 42
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import nullcontext
@@ -1150,19 +1193,36 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     worker._wait_for_step = lambda step: None  # synchronized above on the accelerator
     worker._stage_host_rows = lambda outputs, lane: None
     worker._clear_in_flight_flag = lambda batch: None
-    worker._settle_step_rows = lambda *a: False
+    failed_members = []
+    def settle_member(step, outputs):
+        if mode == "direct_error" and step.node_batch.failed_requests:
+            failed_members.append(step.node_name)
+            worker._drop_failed_rids(step, outputs, dict(step.node_batch.failed_requests))
+        return False
+    worker._settle_step_rows = settle_member
     worker._publishable_request_ids = lambda batch: batch.request_ids
     worker.device_capability = SimpleNamespace(is_accelerator=False)
 
     def close_member(step, outputs, **kwargs):
         completed.append((step.node_name, step.batch.repeats, dict(step.node_batch.step_context.run_counts)))
+        if mode == "direct_error":
+            assert not outputs.per_rid_outputs
+            assert not step.batch.request_to_worker_graph
+            return
         if step.node_name == "a":
-            assert outputs.per_rid_outputs[2]["x"][0].shape[1] == 3
             base = a.ring_bases["x"][2]
-            source.put_positions([base, base + 1])  # ordinary routing publishes only kept items
-            ring.ring_skip("x", 2, [base + 2, base + 3])
+            if direct:
+                assert producer_tails == [2]
+                if mode in {"direct_eos", "direct_error"}:
+                    ring.ring_skip("x", 2, [base])
+                else:
+                    source.put_positions([base])
+            else:
+                assert outputs.per_rid_outputs[2]["x"][0].shape[1] == 3
+                source.put_positions([base, base + 1])  # ordinary routing publishes only kept items
+                ring.ring_skip("x", 2, [base + 2, base + 3])
         else:
-            assert source._consumed == (6 if full else 2) and not source._reservations
+            assert source._consumed == (0 if mode == "direct_error" else 6 if full else 2) and not source._reservations
             if custom:
                 assert tails == [[10, 10, 11, 11]]
                 assert not outputs.run_columns
@@ -1175,11 +1235,22 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                     worker._cut_run_items(step, outputs, SimpleNamespace(), None, {}, eng)
                     assert outputs.per_rid_outputs[2]["x"][0].tolist() == [10, 11]
             else:
+                if mode == "direct_error":
+                    assert 2 in step.node_batch.failed_requests
                 assert outputs.per_rid_outputs[2]["x"][0].flatten().tolist() == ([42, 50, 58] if full else [42])
     worker._postprocess_batch = close_member
     pending = PendingBatch(group.members[0][0], a, "a", "a", "prefill", None, group=group)
     with ThreadPoolExecutor(max_workers=1) as executor:
         worker._finish_step(pending, output[0], gpu_executor=executor)
+    if direct:
+        assert completed == ([('b', 1, {2: 1})] if mode == "direct_zero" else
+                             [('a', 1, {2: 1})] if mode == "direct_eos" else
+                             [('a', 1, {2: 1}), ('b', 1, {2: 1})])
+        assert producer_tails == ([] if mode == "direct_zero" else [2])
+        assert failed_members == (["a", "b"] if mode == "direct_error" else [])
+        assert not b.stream_windows and not source._reservations
+        assert launches == [1]
+        return
     assert completed == ([] if yielded else [("b", 3, {2: 3})] if full else
                          [("a", 3, {2: 3}), ("b", 1, {2: 1})])
     assert len(released) == (2 if yielded else 1 if full else 0)

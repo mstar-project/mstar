@@ -3067,8 +3067,15 @@ class Worker(RepeatingSteps):
         """A step that ran, on any lane: its batch limit lifts, its outputs
         are postprocessed and routed, and metrics count it."""
         if step.group is not None and step.group.submitted:
+            failed = {}
             try:
                 for i, (scheduled, executing) in enumerate(step.group.members):
+                    upstream_failed = frozenset(failed)
+                    # Every body may already have run. A predecessor's failed
+                    # tail still settles later owners, but cannot publish a
+                    # successful dependent result or run its ordinary tail.
+                    executing.failed_requests.update({rid: error for rid, error in failed.items()
+                                                      if rid in executing.request_ids})
                     finished = step.group.finished_rids[i] if step.group.finished_rids else frozenset()
                     if finished:
                         self._graph_runtime.release_execution_unit_member(
@@ -3120,7 +3127,7 @@ class Worker(RepeatingSteps):
 
                         def collect(executing=executing, width=width, counts=counts, pops=pops, selected=selected):
                             engine = self.engine_manager.get_engine(executing.node_name)
-                            if pops:
+                            if pops and not executing.failed_requests:
                                 producer, _, signal = step.group.unit.streaming_edges[0]
                                 engine.materialize_group_inputs(executing, producer, signal, selected, width)
                             result = engine.collect_group_outputs(executing, width, counts)
@@ -3136,15 +3143,26 @@ class Worker(RepeatingSteps):
 
                         try:
                             executing.outputs = gpu_executor.submit(collect).result()
+                            failed.update(executing.failed_requests)
                         finally:
                             # The forward already consumed these chunks, even
                             # if its ordinary tail failed. Keep their reader
                             # until that tail and its input copies have landed.
                             if pops:
-                                self._settle_stream_windows(
-                                    executing, counts, transitions={(rid, edge.name): (pops, selected)},
-                                )
-                                if final.is_final:
+                                if rid in upstream_failed:
+                                    # No producer arrival was published after
+                                    # its failure. Cancel the future semantic
+                                    # reservation after its GPU reader lands;
+                                    # any original reader still closes normally.
+                                    restored = self.streams.restore_edge(rid, edge)
+                                    if restored is not None:
+                                        self.streams.settle_window(rid, restored, 0)
+                                    executing.stream_windows = {}
+                                else:
+                                    self._settle_stream_windows(
+                                        executing, counts, transitions={(rid, edge.name): (pops, selected)},
+                                    )
+                                if final.is_final and rid not in upstream_failed:
                                     done, partition = self.streams.settle_final(scheduled.node_name, {rid: {edge.name}})
                                     executing.final_stream_rids.update(done)
                                     executing.partition_done_rids.update(partition)
@@ -3169,6 +3187,7 @@ class Worker(RepeatingSteps):
                         self.scheduler.note_ran(scheduled)
                     if i != step.group.trigger:
                         self._clear_in_flight_flag(scheduled)
+                    if i != step.group.trigger or step.group.unit.streaming_edges:
                         self._settle_step_rows(member, executing.outputs)
                     self._finish_step(member, executing.outputs)
             finally:

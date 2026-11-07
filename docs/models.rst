@@ -268,8 +268,21 @@ boundaries.
 A custom consumer tail is eligible only for a requested single compute. Its
 selected real input is reconstructed from retained owner storage before the
 ordinary tail runs, and its reader is released afterward, including on failure.
-A zero-compute consumer runs no tail. Custom producer output transformations
-remain a boundary. These eligibility rules do not by themselves establish that
+A zero-compute consumer runs no tail. A producer with an ordinary per-row tail
+can declare ``DIRECT_OUTPUTS = {walk: frozenset({signal})}``: the signal's
+ordinary ``split(1)`` row must equal the same-named captured ``row_outputs``
+tensor before stop withholding. Consumer preparation, planning, computation and
+its tail must not need producer-tail effects; the producer tail must not need
+the consumer's state from before its computation. This is an author contract,
+not a runtime inference about Python purity. Qwen3-TTS declares only decode's
+``codec_tokens``; clone-prefill prepends reference frames and is not declared.
+
+This bounded custom-producer path requires a requested single compute, disjoint
+resource owners, and no custom filter, unpack or batch tail. Aliases, packed or
+per-request overrides and output spans refuse before launch. The producer tail
+runs once iff its body computed; failure still settles dependent work without
+publishing a successful result or retrying either body. These eligibility rules
+do not by themselves establish that
 every served model's preparation and resources qualify. The phase trace records
 ``connected.members#`` and each member's real row count.
 

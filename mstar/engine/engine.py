@@ -2532,7 +2532,14 @@ class Engine:
         ).ignore_eos:
             guard.refuse("withheld items inside an EOS-immune run need explicit item identities")
         token = None if not withheld or source is None else output_named(source.static_outputs, policy.token_signal)
-        produced = None if source is None else output_named(source.static_outputs, signal)
+        direct = signal in source_mgmt.submodule.DIRECT_OUTPUTS.get(source_batch.graph_walk, ())
+        if source is not None and direct:
+            raw = source.static_outputs
+            if (raw.per_rid_outputs or raw.packed_outputs or raw.output_spans
+                    or source_mgmt.submodule.repeat_carry(source_batch.graph_walk, {signal})[signal].output != signal):
+                guard.refuse("a direct output needs its same-named unspanned captured row tensor")
+        produced = (None if source is None else (source.static_outputs.row_outputs or {}).get(signal) if direct
+                    else output_named(source.static_outputs, signal))
         if source is not None and (produced is None or produced.shape != (1, *item.shape[1:])):
             guard.refuse("a streamed producer must emit one captured item per iteration")
         key = ("stream", id(slot.graph), None if source is None else id(source.graph), id(window),
@@ -2645,18 +2652,26 @@ class Engine:
                     for _, batch in group.members:
                         batch.step_context.repeats = 1
                 loop_back = group.unit.loop_back if repeats > 1 else ()
+                direct_producers = set()
                 for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
                     if finished[maker]:
                         continue
                     producer = self._submodules[maker].submodule
                     kind = type(producer)
                     walk = member_walks[maker]
-                    if (kind.postprocess is not NodeSubmodule.postprocess
-                            or kind.batch_postprocess is not NodeSubmodule.batch_postprocess
+                    if (kind.batch_postprocess is not NodeSubmodule.batch_postprocess
                             or kind.filter_batched_output is not NodeSubmodule.filter_batched_output
                             or kind.unpack_packed_outputs is not NodeSubmodule.unpack_packed_outputs
                             or producer.spanned_outputs(walk) or producer.get_stop_policies(walk) is None):
                         guard.refuse("a producer changes its routed outputs outside capture")
+                    if kind.postprocess is not NodeSubmodule.postprocess:
+                        signals = {signal for a, _, signal in group.unit.edges if a == maker}
+                        requested = next(batch.step_context.repeats for _, batch in group.members
+                                         if batch.node_name == maker)
+                        if (not streamed or requested != 1
+                                or not signals <= producer.DIRECT_OUTPUTS.get(walk, frozenset())):
+                            guard.refuse("a custom producer needs declared direct outputs and one compute")
+                        direct_producers.add(maker)
                 for member, (_, batch) in enumerate(group.members):
                     if finished[batch.node_name] or batch.node_name in idle_sources:
                         continue
@@ -2757,7 +2772,8 @@ class Engine:
                         if (slot.run is None or slot.run.state.membership is not None or lease.bucket.bs != 1):
                             guard.refuse("streamed composition needs captured fixed-membership one-row bodies")
                         if self._custom_output_tail(submodule) and (
-                            not stream_incoming or batch.step_context.repeats != 1
+                            (not stream_incoming and batch.node_name not in direct_producers)
+                            or batch.step_context.repeats != 1
                         ):
                             guard.refuse("a custom streamed tail needs one consumer compute and no producer transform")
                     elif slot.run is not None or batch.step_context.resident is not None:
@@ -2784,6 +2800,8 @@ class Engine:
                 for occurrences in owners.values():
                     if len({batch.node_name for _, _, batch in occurrences}) < 2:
                         continue
+                    if any(batch.node_name in direct_producers for _, _, batch in occurrences):
+                        guard.refuse("a custom direct producer cannot share resource owners")
                     for key, resource, batch in occurrences:
                         if self._submodules[batch.node_name].piecewise_runners:
                             guard.refuse("a shared owner also has nested piecewise capture buffers")

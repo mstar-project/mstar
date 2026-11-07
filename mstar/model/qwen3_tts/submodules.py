@@ -138,6 +138,8 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     # the frame's summed codec embedding goes back in as the next input_embeds
     REPEAT_CARRIES = MappingProxyType({"talker_input_embeds": CarryPair("talker_input_embeds", "input_embeds")})
+    # Clone-prefill prepends reference frames in its tail; decode does not.
+    DIRECT_OUTPUTS = MappingProxyType({"talker_decode": frozenset({"codec_tokens"})})
     # Compiling the entire engine-facing forward traces request sampling,
     # residual-code control flow, and recurrent routing in addition to the
     # transformer. It introduces graph breaks and showed no steady-state win
