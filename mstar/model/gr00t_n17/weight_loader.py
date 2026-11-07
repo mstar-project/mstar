@@ -47,16 +47,6 @@ SKIPPED = frozenset({
 })
 
 
-def node_of(name: str) -> str | None:
-    """The node a checkpoint tensor loads into; None for a named skip."""
-    if name in SKIPPED:
-        return None
-    for node, (_, prefixes) in NODE_PREFIXES.items():
-        if name.startswith(prefixes):
-            return node
-    raise ValueError(f"checkpoint tensor {name!r} belongs to no GR00T node")
-
-
 def _remapper(node: str):
     root, prefixes = NODE_PREFIXES[node]
 
