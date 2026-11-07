@@ -232,7 +232,9 @@ def test_the_cuda_kernels_match_the_reference(name):
         x = torch.randn(m, 1024, device="cuda", dtype=torch.bfloat16)
         gpu = fmt.linear(x, *(buffers[b] for b in fmt.buffers))
         cpu = fmt.linear(x.cpu(), *(buffers[b].cpu() for b in fmt.buffers))
-        assert rel(gpu.cpu(), cpu) < 0.02, (name, m)
+        # the CPU reference keeps x in bf16 (W8A16); the W8A8 kernels round it to e4m3 (3 mantissa bits), which
+        # measured 0.026 for fp8_block at 64 tokens on an H200
+        assert rel(gpu.cpu(), cpu) < 0.04, (name, m)
         if fmt.has_glu:
             gpu = fmt.glu_linear(x, *(buffers[b] for b in fmt.buffers))
             cpu = fmt.glu_linear(x.cpu(), *(buffers[b].cpu() for b in fmt.buffers))
