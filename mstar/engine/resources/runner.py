@@ -684,6 +684,7 @@ class StepRunner:
         from mstar.engine.resources.loopback_rows import LoopbackRows
         from mstar.engine.resources.position.config import PosScheme
         from mstar.engine.resources.position.manager import RopeManager
+        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
         from mstar.engine.resources.sampler.resource import SamplerResource
 
         ctx = step.ctx
@@ -711,6 +712,12 @@ class StepRunner:
             elif type(owner) is RopeManager:
                 if owner._config.scheme != PosScheme.SEQUENTIAL or item.pos_ids is not None:
                     raise ValueError(f"joining resource {key!r} needs sequential positions")
+            elif type(owner) is RecurrentStatePool:
+                if (owner.config.prefix_slots or owner._kv is not None or item.pre_forks or item.post_forks
+                        or any(not owner._slots.get(seg.request_id, {}).get(seg.label)
+                               or not owner._slots[seg.request_id][seg.label].has_state
+                               for seg in item.segments or ())):
+                    raise ValueError(f"joining resource {key!r} needs existing state without prefix snapshots or forks")
             elif type(owner) is SamplerResource:
                 if (owner.repeat_refusal(ctx.graph_walk) is not None or owner._cg_buffers is None
                         or not owner._cg_buffers.ingraph_scatter):

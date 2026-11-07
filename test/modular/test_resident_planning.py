@@ -106,7 +106,10 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9, prefix_cache=True):
+def _resources(
+    cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9,
+    prefix_cache=True, recurrent_prefix_slots=0,
+):
     kv = KVManager(
         cfg=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
@@ -118,7 +121,9 @@ def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: 
     kv._cg_max_seq_len = 64
     pool = RecurrentStatePool(device=CPU, config=RecurrentStateConfig(
         num_layers=1, max_slots=pool_slots, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
+        prefix_slots=recurrent_prefix_slots,
     ))
+    pool.bind_kv(kv)
     rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
     # page-locked memory needs a GPU, and nothing here copies out of it asynchronously
     rope._pinned_pos_ids_buffer = lambda key, n: torch.empty(n, dtype=torch.long)
@@ -1881,11 +1886,10 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
 
     live = _resources(prefix_cache=False)
     kv, rope = live["kv"], live["rope"]
-    planner = _planner(live, max_bs=4, keys=("kv", "rope"))
-    runner = StepRunner({"kv": kv, "rope": rope})
+    planner = _planner(live, max_bs=4)
+    runner = StepRunner(live)
     for rid in (1, 2):
         runner.ingest_request(rid, {"kv": KVReqConfig()})
-        live["pool"].ingest_request(rid, None)
         _host_step(live, [rid], [3])
     _captured_step(live, planner, [1], slot=0, bs=4)
     bucket = BucketKey(WALK, 4, 4)
@@ -1893,7 +1897,8 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
                       slot_lease=SlotLease(0, bucket))
     ctx.set_padded_rids((1, -1, -2, -3))
     segments = tuple(Segment(rid, "main", 1) for rid in ctx.padded_request_ids)
-    queued = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments)})
+    queued = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
+                            "pool": RecurrentStep(segments=segments)})
     queued.set_ctx(ctx)
     assert runner.pre_admit(queued).ok
     planner.plan(queued, ctx)
@@ -1903,7 +1908,8 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
     marked = list(kv._preplan_marked)
     before_pages = kv._arena.num_free
     items = (Segment(2, "main", 1),)
-    joining = SubmoduleStep({"kv": KVStep(segments=items), "rope": PositionStep(segments=items)})
+    joining = SubmoduleStep({"kv": KVStep(segments=items), "rope": PositionStep(segments=items),
+                             "pool": RecurrentStep(segments=items)})
     joining.set_ctx(StepContext((2,), WALK, 0, False, resident=planner, repeats=4))
 
     # Full horizon sizing refuses before reserving; it never changes receipts.
@@ -1934,6 +1940,8 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
     expected = 5 + first_count
     assert kv._streams[2]["main"].stored_len == rope.position(2, "main") == expected
     assert kv._resident.host_len[planner.slot_of(2)] == expected
+    assert live["pool"]._slots[2]["main"].tokens == expected
+    assert live["pool"]._slots[2]["main"].has_state
     assert (runner._staged, runner._pre_admitted, kv._preplan_key, kv._cached_plan_output, planner._staged) == original
     # The ordinary successor still promotes the plan it reserved before the join.
     assert runner.admit(queued).ok
@@ -1949,7 +1957,7 @@ def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monk
 
 @pytest.mark.parametrize("unsupported", ["recurrent", "host_writes", "foreign_segment"])
 def test_joining_rejects_unaudited_owner_effects_before_reserving(unsupported):
-    live = _resources(prefix_cache=False)
+    live = _resources(prefix_cache=False, recurrent_prefix_slots=1 if unsupported == "recurrent" else 0)
     planner = _planner(live, max_bs=4)
     runner = StepRunner(live)
     runner.ingest_request(1, {"kv": KVReqConfig()})
