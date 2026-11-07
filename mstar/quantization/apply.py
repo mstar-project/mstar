@@ -81,23 +81,31 @@ def _unloaded(tensor: torch.Tensor, stands_for: torch.dtype | None) -> bool:
 
 
 def prepare(root: nn.Module, plan: QuantPlan) -> None:
-    """Give every ``DIRECT`` layer the stored format's empty storage (its scales NaN until loaded)."""
+    """Give every ``DIRECT`` layer the stored format's empty storage (its scales NaN until loaded). On a root
+    still on the meta device the storage is meta too, so the root's ``to_empty`` allocates the stored format
+    and never the bf16 weights it replaces; ``mark_unloaded`` then marks the scales once they exist."""
     for layer in plan.by_action(Action.DIRECT):
         if layer.kind == EXPERTS:
-            block = _block_of(root, layer.path)
-            block.experts_prepare(layer.runtime, layer.block or (128, 128), layer.source)
-            experts = root.get_submodule(layer.path)
-            for name, dtype in block.experts_scales().items():
-                if _is_scale(name, dtype):
-                    _fill_unloaded(getattr(experts, name), dtype)
-            continue
-        module = root.get_submodule(layer.path)
-        module.quant_prepare(format_of(layer))
-        for name, dtype in module._quant_views.items():
-            if _is_scale(name, dtype):
-                _fill_unloaded(getattr(module, name), dtype)
+            _block_of(root, layer.path).experts_prepare(layer.runtime, layer.block or (128, 128), layer.source)
+        else:
+            root.get_submodule(layer.path).quant_prepare(format_of(layer))
+    mark_unloaded(root, plan)
     if plan.by_action(Action.DIRECT):
         logger.info("%s: %d layers load as stored", plan.node, len(plan.by_action(Action.DIRECT)))
+
+
+def mark_unloaded(root: nn.Module, plan: QuantPlan) -> None:
+    """Mark every ``DIRECT`` layer's scales not loaded (``finalize`` refuses a layer whose marks survive the
+    load). Nothing to mark on the meta device: call it again once the storage exists."""
+    for layer in plan.by_action(Action.DIRECT):
+        if layer.kind == EXPERTS:
+            views, owner = _block_of(root, layer.path).experts_scales(), root.get_submodule(layer.path)
+        else:
+            owner = root.get_submodule(layer.path)
+            views = owner._quant_views
+        for name, dtype in views.items():
+            if _is_scale(name, dtype) and not getattr(owner, name).is_meta:
+                _fill_unloaded(getattr(owner, name), dtype)
 
 
 def intercept(
@@ -255,4 +263,4 @@ def finalize(root: nn.Module, plan: QuantPlan, device: torch.device | str | None
         logger.info("%s: quantization %s", plan.node, plan.summary())
 
 
-__all__ = ["finalize", "format_of", "intercept", "prepare", "stored_format", "LINEAR", "EXPERTS"]
+__all__ = ["finalize", "format_of", "intercept", "mark_unloaded", "prepare", "stored_format", "LINEAR", "EXPERTS"]

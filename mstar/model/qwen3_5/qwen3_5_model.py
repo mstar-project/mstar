@@ -1024,9 +1024,17 @@ class Qwen3_5DenseModel(Model):
         """Construct under `dtype` so no fp32 copy of the weights is
         allocated, then apply the node's policy before the weights load, so its
         fp32 islands receive the checkpoint's values unrounded."""
+        from mstar.quantization.scope import active_scope
+
         torch.set_default_dtype(dtype)
         try:
-            return apply_precision(make().to(device), precision)
+            model = make()
+            # layers that load as stored take their stored format's storage on the host first (torch.empty: the bf16
+            # stacks they replace are never touched), so a MoE's NVFP4 experts reach the device packed
+            scope = active_scope()
+            if scope is not None:
+                scope.prepare_meta(model)
+            return apply_precision(model.to(device), precision)
         finally:
             torch.set_default_dtype(torch.float32)
 

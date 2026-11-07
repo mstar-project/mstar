@@ -584,7 +584,11 @@ class Glm52Model(Model):
         # the node keeps its build dtypes (get_node_precision): bf16, and the
         # loader restores what the checkpoint stores fp32
         language_model = language_model.to(autocast_dtype or torch.bfloat16)
-        language_model.to_empty(device=device)
+        # the layers that load as stored get their stored format's storage before any bytes exist: NVFP4 experts
+        # allocate packed codes and scales, never the bf16 stacks they replace (3.6x the bytes)
+        from mstar.quantization.scope import materialize
+
+        materialize(language_model, device)
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
