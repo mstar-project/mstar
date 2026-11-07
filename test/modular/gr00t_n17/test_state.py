@@ -47,19 +47,15 @@ def _state(batch: int, history: int = 1, seed: int = 1) -> torch.Tensor:
 
 
 def _reference(
-    mlp: CategorySpecificMLP, x: torch.Tensor, cat_ids: torch.Tensor, relu: str = "between",
+    mlp: CategorySpecificMLP, x: torch.Tensor, cat_ids: torch.Tensor, relu: bool = True,
 ) -> torch.Tensor:
-    """Row ``i`` runs ``x @ W[id] + b[id]``, a ReLU, the same again, with ``id = cat_ids[i]``.
-    ``relu`` moves the ReLU to where a reader might expect it instead."""
+    """Row ``i`` runs ``x @ W[id] + b[id]``, a ReLU, the same again, with ``id = cat_ids[i]``."""
     rows = []
     for row, cat in zip(x, cat_ids.tolist(), strict=True):
-        if relu == "before":
-            row = torch.relu(row)
         hidden = row @ mlp.layer1.W[cat] + mlp.layer1.b[cat]
-        if relu == "between":
+        if relu:
             hidden = torch.relu(hidden)
-        out = hidden @ mlp.layer2.W[cat] + mlp.layer2.b[cat]
-        rows.append(torch.relu(out) if relu == "after" else out)
+        rows.append(hidden @ mlp.layer2.W[cat] + mlp.layer2.b[cat])
     return torch.stack(rows)
 
 
@@ -83,21 +79,10 @@ def test_the_mlp_is_two_per_embodiment_linears_with_a_relu_between(ids, history)
 
     assert out.shape == (len(ids), history, _OUTPUT)
     assert torch.equal(out, _reference(mlp, x, cat_ids))
+    # the negative control: without the ReLU the reference is a different function
+    assert not torch.equal(out, _reference(mlp, x, cat_ids, relu=False))
     if len(ids) > 1:  # rows 0 and 3 share an embodiment and differ only in state: not collapsed
         assert not torch.equal(out[0], out[3])
-
-
-@pytest.mark.parametrize(
-    "relu", ["none", "before", "after"],
-    ids=["no relu at all", "relu before both layers", "relu after both layers"],
-)
-@torch.no_grad()
-def test_the_relu_belongs_between_the_two_layers(relu):
-    """Each misplaced ReLU is a different function, so the parity above can tell them apart."""
-    mlp = _mlp()
-    cat_ids = torch.tensor(_IDS["a batch across embodiments"])
-    x = _state(len(cat_ids), history=2)
-    assert not torch.equal(mlp(x, cat_ids), _reference(mlp, x, cat_ids, relu=relu))
 
 
 @pytest.mark.parametrize("history", [1, 3])

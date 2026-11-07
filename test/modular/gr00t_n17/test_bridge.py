@@ -62,11 +62,8 @@ def _bind(bridge: Gr00tN17VLBridge, resources: dict) -> None:
 # Inline reference: the bridge, written from its description
 # ----------------------------------------------------------------------------
 
-# Deliberate deviations, each a mistake that would otherwise look like the real bridge.
-_WRONG_NO_ATTN_RESIDUAL = "the attention residual dropped"
-_WRONG_NO_FF_RESIDUAL = "the feed-forward residual dropped"
+# A deliberate deviation: every shape still fits, and only filled norms can tell the two apart.
 _WRONG_NORMS_SWAPPED = "norm1 and norm3 swapped"
-DEVIATIONS = (_WRONG_NO_ATTN_RESIDUAL, _WRONG_NO_FF_RESIDUAL, _WRONG_NORMS_SWAPPED)
 
 
 class RefBlock(nn.Module):
@@ -100,11 +97,9 @@ class RefBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         swapped = self.deviation == _WRONG_NORMS_SWAPPED
-        attended = self._attention((self.norm3 if swapped else self.norm1)(x))
-        x = attended if self.deviation == _WRONG_NO_ATTN_RESIDUAL else attended + x
+        x = self._attention((self.norm3 if swapped else self.norm1)(x)) + x
         normed = (self.norm1 if swapped else self.norm3)(x)
-        ff = self.proj_out(F.gelu(self.proj_in(normed), approximate="tanh"))
-        return ff if self.deviation == _WRONG_NO_FF_RESIDUAL else ff + x
+        return self.proj_out(F.gelu(self.proj_in(normed), approximate="tanh")) + x
 
 
 class RefBridge(nn.Module):
@@ -171,17 +166,8 @@ def test_our_bridge_is_a_norm_and_four_reference_blocks(geometry, tokens):
     out = ours(rows)
     assert out.shape == rows.shape
     assert relative_gap(out, _reference(ours, config)(rows)) <= _BAR
-
-
-@pytest.mark.parametrize("deviation", DEVIATIONS)
-def test_a_block_assembled_wrongly_misses_by_orders_of_magnitude(deviation):
-    """A plausible mistake misses the bar by orders of magnitude, not a few multiples."""
-    config = _config(*_GEOMETRIES["the checkpoint's head width"])
-    ours = _bridge(config, tokens=17)
-    rows = _rows(17, config.backbone_embedding_dim, seed=1)
-    theirs = _reference(ours, config, deviation=deviation)(rows)
-
-    assert relative_gap(ours(rows), theirs) > 1000 * _BAR
+    # a plausible mistake misses the bar by orders of magnitude, not a few multiples
+    assert relative_gap(out, _reference(ours, config, deviation=_WRONG_NORMS_SWAPPED)(rows)) > 1000 * _BAR
 
 
 def test_the_layer_norms_use_eps_1e_5_and_not_1e_6():

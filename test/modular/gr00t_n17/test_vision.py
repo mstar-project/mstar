@@ -3,6 +3,7 @@ import dataclasses
 import pytest
 import torch
 from torch import nn
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchMerger
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.step import Segment
@@ -31,32 +32,13 @@ def _config(taps: tuple[int, ...], depth: int = _DEPTH) -> Gr00tN17Config:
     )
 
 
-# ----------------------------------------------------------------------------
-# Inline reference: transformers' `Qwen3VLVisionPatchMerger`
-# (`models/qwen3_vl/modeling_qwen3_vl.py`) with `use_postshuffle_norm=True`, the
-# variant GR00T's DeepStack mergers are; the tower's own merger is the other one.
-# ----------------------------------------------------------------------------
-
-
-class RefPatchMerger(nn.Module):
-    def __init__(self, config: Qwen3_5VisionConfig):
-        super().__init__()
-        self.merged_size = config.hidden_size * config.merge_unit
-        self.norm = nn.LayerNorm(self.merged_size, eps=1e-6)
-        self.linear_fc1 = nn.Linear(self.merged_size, self.merged_size)
-        self.act_fn = nn.GELU()
-        self.linear_fc2 = nn.Linear(self.merged_size, config.out_hidden_size)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.norm(x.view(-1, self.merged_size))
-        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-
-
 def test_the_deepstack_merger_normalises_after_the_shuffle():
+    """GR00T's DeepStack mergers are the ``use_postshuffle_norm=True`` variant; the tower's
+    own merger is the other one."""
     vision = _config(()).vision
     merger = DeepStackMerger(vision)
     randomize(merger, 0, 1.0)
-    reference = RefPatchMerger(vision)
+    reference = Qwen3VLVisionPatchMerger(vision, use_postshuffle_norm=True)
     reference.load_state_dict(merger.state_dict())
     x = torch.randn(8, vision.hidden_size, generator=torch.Generator().manual_seed(1))
     assert torch.equal(merger(x), reference(x))
@@ -234,16 +216,6 @@ def test_driving_the_node_runs_the_encoders_own_forward():
 # ----------------------------------------------------------------------------
 
 
-def _rope_into_blocks(encoder: Gr00tN17VisionEncoder, args: tuple[torch.Tensor, ...]):
-    """The encoder's output, and the (cos, sin) each block was called with."""
-    seen = []
-    hooks = [b.register_forward_pre_hook(lambda _, a: seen.append(a[1:])) for b in encoder.tower.blocks]
-    embeds, _ = encoder(*args)
-    for hook in hooks:
-        hook.remove()
-    return embeds, seen
-
-
 @torch.no_grad()
 def test_a_bf16_encoder_feeds_its_blocks_the_fp32_rope(monkeypatch):
     """transformers' Qwen3-VL keeps the vision rope fp32 into the blocks, where ``embed``
@@ -251,22 +223,18 @@ def test_a_bf16_encoder_feeds_its_blocks_the_fp32_rope(monkeypatch):
     encoder = Gr00tN17VisionEncoder(_config((0,), depth=2)).to(torch.bfloat16)
     args = _inputs(encoder.tower.config, [(1, 4, 4)])
     args = (args[0].to(torch.bfloat16), *args[1:])
+    seen = []
     for block in encoder.tower.blocks:
         block.attn.bind_resources({VISION_ATTN: SegmentAttention((16,))})
+        block.register_forward_pre_hook(lambda _, a: seen.append(a[1:]))
     rope = encoder.tower.rotary_pos_emb
     table = rope(args[3])
+    embeds, _ = encoder(*args)
 
-    def fp32_table(seen):
-        pairs = [(r, t) for got in seen for r, t in zip(got, table, strict=True)]
-        return all(r.dtype == torch.float32 and torch.equal(r, t) for r, t in pairs)
-
-    embeds, seen = _rope_into_blocks(encoder, args)
-    assert len(seen) == 2 and fp32_table(seen)
-
-    # the negative control: every block gets `embed`'s rounded copy
+    assert len(seen) == 2
+    pairs = [(r, t) for got in seen for r, t in zip(got, table, strict=True)]
+    assert all(r.dtype == torch.float32 and torch.equal(r, t) for r, t in pairs)
+    # the control: `embed`'s rounded copy reaches the output at this size
     fp32 = rope.forward
     monkeypatch.setattr(rope, "forward", lambda p: [t.to(torch.bfloat16) for t in fp32(p)])
-    rounded_embeds, seen = _rope_into_blocks(encoder, args)
-    assert not fp32_table(seen)
-    # and the rounding reaches the output at this size
-    assert not torch.equal(embeds, rounded_embeds)
+    assert not torch.equal(embeds, encoder(*args)[0])

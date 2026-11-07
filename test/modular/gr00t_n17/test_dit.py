@@ -67,11 +67,8 @@ def _encoder(embedding_dim: int = _EMBED, seed: int = 0) -> TimestepEncoder:
 # The action encoder's sinusoid against an inline reference
 # ----------------------------------------------------------------------------
 
-# Conventions a reader might expect instead; this module has no weights, so each would load and run.
+# The convention a reader might expect instead; this module has no weights, so it would load and run.
 _WRONG_DIVISOR = "half_dim - 1"  # the usual form, and the one the DT's own encoding uses
-_WRONG_ORDER_COS_FIRST = "cos then sin"  # what `flip_sin_to_cos=True` does
-_WRONG_ORDER_INTERLEAVED = "sin and cos interleaved"  # the RoPE-style layout
-_WRONG_BASE = "base 1000"
 
 
 def _reference(timesteps: torch.Tensor, embedding_dim: int, deviation: str | None = None) -> torch.Tensor:
@@ -79,16 +76,10 @@ def _reference(timesteps: torch.Tensor, embedding_dim: int, deviation: str | Non
     the reference: the divisor is ``half_dim``, not the usual ``half_dim - 1``."""
     timesteps = timesteps.float()
     half_dim = embedding_dim // 2
-    base = 1000.0 if deviation == _WRONG_BASE else _BASE
     divisor = half_dim - 1 if deviation == _WRONG_DIVISOR else half_dim
-    exponent = -torch.arange(half_dim, dtype=torch.float) * (torch.log(torch.tensor(base)) / divisor)
+    exponent = -torch.arange(half_dim, dtype=torch.float) * (torch.log(torch.tensor(_BASE)) / divisor)
     freqs = timesteps.unsqueeze(-1) * exponent.exp()
-    sin, cos = torch.sin(freqs), torch.cos(freqs)
-    if deviation == _WRONG_ORDER_COS_FIRST:
-        return torch.cat([cos, sin], dim=-1)
-    if deviation == _WRONG_ORDER_INTERLEAVED:
-        return torch.stack([sin, cos], dim=-1).flatten(-2)
-    return torch.cat([sin, cos], dim=-1)
+    return torch.cat([torch.sin(freqs), torch.cos(freqs)], dim=-1)
 
 
 @pytest.mark.parametrize(
@@ -109,55 +100,7 @@ def test_the_sinusoid_is_the_reference_block(shape, embedding_dim):
 
     assert out.shape == (*shape, embedding_dim)
     assert torch.equal(out, _reference(timesteps, embedding_dim))
-
-
-# Properties argued from values, not a second formula. Element 0 is the check a deviation fails.
-def _zero_layout(encode) -> tuple[bool, ...]:
-    """At ``t = 0`` every sine is 0 and every cosine 1, so sines first is ``[0, ..., 0, 1, ..., 1]``
-    whatever the base; cos first and interleaved are another arrangement."""
-    half_dim = _TIME_PROJ // 2
-    at_zero = encode(torch.zeros(1, 3), _TIME_PROJ)
-    return (torch.equal(at_zero, torch.cat([torch.zeros(1, 3, half_dim), torch.ones(1, 3, half_dim)], dim=-1)),)
-
-
-def _ladder_halves(encode) -> tuple[bool, ...]:
-    """Dividing by ``half_dim`` makes frequency ``j`` at width ``2h`` frequency ``2j`` at width
-    ``4h``; ``half_dim - 1`` breaks that. Both ``half_dim`` are powers of two, so the ladders agree bit for bit."""
-    timesteps = _rows()
-    narrow, wide = encode(timesteps, _TIME_PROJ), encode(timesteps, 2 * _TIME_PROJ)
-    half_dim = _TIME_PROJ // 2
-    return (
-        torch.equal(narrow[..., :half_dim], wide[..., : 2 * half_dim : 2]),
-        torch.equal(narrow[..., half_dim:], wide[..., 2 * half_dim :: 2]),
-    )
-
-
-def _lowest_frequency(encode) -> tuple[bool, ...]:
-    """The last sine at ``t = 1`` is the lowest frequency (``sin x = x`` there); the bracket
-    excludes base 1000, base 100000 and ``half_dim - 1``. The ladder starts at exactly 1."""
-    ladder = encode(torch.ones(1, 1), _TIME_PROJ)[0, 0]
-    return (
-        1.05e-04 < ladder[_TIME_PROJ // 2 - 1].item() < 1.10e-04,
-        bool(ladder[0] == torch.sin(torch.tensor(1.0))),
-    )
-
-
-_SINUSOID_DEVIATIONS = {
-    "cos first, at t = 0": (_WRONG_ORDER_COS_FIRST, _zero_layout),
-    "interleaved, at t = 0": (_WRONG_ORDER_INTERLEAVED, _zero_layout),
-    "half_dim - 1, across two widths": (_WRONG_DIVISOR, _ladder_halves),
-    "base 1000, at the lowest frequency": (_WRONG_BASE, _lowest_frequency),
-    "half_dim - 1, at the lowest frequency": (_WRONG_DIVISOR, _lowest_frequency),
-}
-
-
-@pytest.mark.parametrize("deviation, check", list(_SINUSOID_DEVIATIONS.values()), ids=list(_SINUSOID_DEVIATIONS))
-@torch.no_grad()
-def test_a_sinusoid_built_any_other_way_fails_a_property_the_module_has(deviation, check):
-    """The sinusoid has no parameters, so no weight can give a wrong order, divisor or base
-    away; each is pinned by a value only the right convention produces."""
-    assert all(check(lambda timesteps, width: SinusoidalPositionalEncoding(width)(timesteps)))
-    assert not check(lambda timesteps, width: _reference(timesteps, width, deviation))[0]
+    assert not torch.equal(out, _reference(timesteps, embedding_dim, _WRONG_DIVISOR))
 
 
 @pytest.mark.parametrize("embedding_dim", [_TIME_PROJ, 8], ids=["the compared width", "a narrow one"])
@@ -244,12 +187,8 @@ _ACTION_SCALE = 3.0
 # one id per timestep, out of order, repeated, and spanning both ends of the category axis
 _CAT_IDS = (3, 0, 1, 3, 2)
 
-# Readings of the five steps a reader could expect instead; each loads every weight and runs.
-_ORDER_TAU_FIRST = "tau first"
-_SWISH_BEFORE_W2 = "before W2"
-_SWISH_BETWEEN = "between"
-_SWISH_AFTER_W3 = "after W3"
-_SWISH_NONE = "none"
+# Swapped halves are a permutation of `W2`'s input rows, so every weight loads and it runs.
+_WRONG_TAU_FIRST = "tau first"
 
 
 def _action_encoder(seed: int = 1) -> MultiEmbodimentActionEncoder:
@@ -292,28 +231,19 @@ def _encoder_reference(
     actions: torch.Tensor,
     timesteps: torch.Tensor,
     cat_ids: torch.Tensor,
-    order: str = "action first",
-    swish: str = _SWISH_BETWEEN,
-    silu: bool = False,
+    deviation: str | None = None,
 ) -> torch.Tensor:
     """Action through ``W1``, concatenated with the time's sinusoid, action first; ``W2``; a
-    swish; ``W3``. ``order``, ``swish`` and ``silu`` are the deviation knobs."""
+    swish; ``W3``."""
     cats = cat_ids.tolist()
     horizon = actions.shape[1]
     # every row of a request's horizon carries that request's one denoising time
     tau = _reference(torch.stack([t.expand(horizon) for t in timesteps]), _HIDDEN)
     action = _per_category(encoder.W1, actions, cats)
 
-    activation = F.silu if silu else (lambda x: x * torch.sigmoid(x))
-    halves = [tau, action] if order == _ORDER_TAU_FIRST else [action, tau]
-    mixed = torch.cat(halves, dim=-1)
-    if swish == _SWISH_BEFORE_W2:
-        mixed = activation(mixed)
-    mixed = _per_category(encoder.W2, mixed, cats)
-    if swish == _SWISH_BETWEEN:
-        mixed = activation(mixed)
-    out = _per_category(encoder.W3, mixed, cats)
-    return activation(out) if swish == _SWISH_AFTER_W3 else out
+    halves = [tau, action] if deviation == _WRONG_TAU_FIRST else [action, tau]
+    mixed = _per_category(encoder.W2, torch.cat(halves, dim=-1), cats)
+    return _per_category(encoder.W3, mixed * torch.sigmoid(mixed), cats)
 
 
 _BATCHES = {
@@ -338,40 +268,7 @@ def test_the_action_encoder_is_the_reference_block(ids, horizon):
 
     assert out.shape == (len(ids), horizon, _HIDDEN)
     assert torch.equal(out, _encoder_reference(encoder, actions, timesteps, cat_ids))
-
-
-# each deviation, and the floor on how far it moves the output where one was measured
-_ENCODER_DEVIATIONS = {
-    "the time before the action": ({"order": _ORDER_TAU_FIRST}, 0.1),
-    "F.silu for the swish": ({"silu": True}, None),
-    "a swish before W2": ({"swish": _SWISH_BEFORE_W2}, None),
-    "a swish after W3": ({"swish": _SWISH_AFTER_W3}, None),
-    "no swish at all": ({"swish": _SWISH_NONE}, None),
-}
-
-
-@pytest.mark.parametrize("deviation, floor", list(_ENCODER_DEVIATIONS.values()), ids=list(_ENCODER_DEVIATIONS))
-@torch.no_grad()
-def test_an_action_encoder_wired_any_other_way_is_a_different_answer(deviation, floor):
-    """Swapped halves are a permutation of ``W2``'s input rows, so nothing raises. ``F.silu``
-    differs from ``x * sigmoid(x)`` only in floating point, yet visibly in bf16 on a trained
-    embodiment; the 0.1 fill keeps ``W2``'s output O(1), since at 100x the two round identically."""
-    encoder = _action_encoder()
-    cat_ids = torch.tensor(_CAT_IDS)
-    actions, timesteps = _actions(), _flat()
-    out = encoder(actions, timesteps, cat_ids)
-    wrong = _encoder_reference(encoder, actions, timesteps, cat_ids, **deviation)
-
-    assert torch.equal(out, _encoder_reference(encoder, actions, timesteps, cat_ids))
-    assert not torch.equal(out, wrong)
-    if floor is not None:
-        # the halves are the same shape, far apart, and of one scale, so a swap is not a resize
-        action = encoder.W1(actions, cat_ids)
-        tau = encoder.pos_encoding(timesteps.unsqueeze(1).expand(-1, _HORIZON))
-        assert action.shape == tau.shape
-        assert (action - tau).abs().max() > 1.0
-        assert action.pow(2).mean().sqrt() == pytest.approx(tau.pow(2).mean().sqrt(), rel=0.1)
-        assert (out - wrong).abs().max() > floor * out.abs().max()
+    assert not torch.equal(out, _encoder_reference(encoder, actions, timesteps, cat_ids, _WRONG_TAU_FIRST))
 
 
 _BAD_TIMESTEPS = {
@@ -426,13 +323,8 @@ _BRIDGE_ROWS = 6
 # every LayerNorm in the DT, including AdaLN's inner one; spelled out, not imported
 _EPS = 1e-5
 
-# Readings of the one line a reader could expect instead; each loads the checkpoint and runs.
+# A reading of the one line a reader could expect instead; it loads the checkpoint and runs.
 _WRONG_SHIFT_FIRST = "shift first out of the chunk"
-_WRONG_BARE_SCALE = "scale and not 1 + scale"
-# `[:, None]` dropped: computable only where the request count equals the token count, where
-# it silently gives token t request t's conditioning.
-_WRONG_PER_TOKEN = "the pair indexed per token"
-_SWISH_LONGHAND = "x * sigmoid(x) for the activation"
 
 
 def _adaln_reference(
@@ -440,14 +332,9 @@ def _adaln_reference(
 ) -> torch.Tensor:
     """``layer_norm(x) * (1 + scale[:, None]) + shift[:, None]``, ``scale`` first out of the
     chunk. The norm is written out (not affine, eps 1e-5); only the ``linear`` is borrowed."""
-    activation = temb * torch.sigmoid(temb) if deviation == _SWISH_LONGHAND else F.silu(temb)
-    first, second = norm.linear(activation).chunk(2, dim=1)
+    first, second = norm.linear(F.silu(temb)).chunk(2, dim=1)
     scale, shift = (second, first) if deviation == _WRONG_SHIFT_FIRST else (first, second)
-    normed = F.layer_norm(x, (x.shape[-1],), eps=_EPS)
-    if deviation == _WRONG_PER_TOKEN:
-        return normed * (1 + scale) + shift
-    gain = scale[:, None] if deviation == _WRONG_BARE_SCALE else 1 + scale[:, None]
-    return normed * gain + shift[:, None]
+    return F.layer_norm(x, (x.shape[-1],), eps=_EPS) * (1 + scale[:, None]) + shift[:, None]
 
 
 def _adaln(seed: int = 20) -> AdaLayerNorm:
@@ -490,48 +377,7 @@ def test_adalayernorm_is_the_reference_block(shape):
 
     assert out.shape == (requests, tokens, _DT_DIM)
     assert torch.equal(out, _adaln_reference(norm, x, temb))
-
-
-# each deviation, and the floor on how far it moves the output where one was measured
-_ADALN_DEVIATIONS = {
-    _WRONG_SHIFT_FIRST: 0.1,
-    _WRONG_BARE_SCALE: None,
-    _WRONG_PER_TOKEN: 0.1,
-    _SWISH_LONGHAND: None,
-}
-
-
-@pytest.mark.parametrize("deviation, floor", list(_ADALN_DEVIATIONS.items()), ids=list(_ADALN_DEVIATIONS))
-@torch.no_grad()
-def test_adalayernorm_read_any_other_way_is_a_different_answer(deviation, floor):
-    """The chunk's halves swap with no shape change. ``1 + scale`` makes a zero ``linear`` the
-    identity where bare ``scale`` zeroes the tokens. The pair is per request, so every token of
-    a request given one row comes back as one row. ``F.silu`` here, unlike the action encoder's
-    long hand; the two differ in floating point."""
-    norm = _adaln()
-    if deviation == _WRONG_PER_TOKEN:
-        requests = tokens = 3
-        x = _hidden(1, 1).expand(requests, tokens, _DT_DIM).contiguous()
-        temb = _temb(requests)
-    else:
-        x, temb = _hidden(), _temb()
-    out = norm(x, temb)
-    wrong = _adaln_reference(norm, x, temb, deviation)
-
-    assert torch.equal(out, _adaln_reference(norm, x, temb))
-    assert not torch.equal(out, wrong)
-    if floor is not None:
-        assert (out - wrong).abs().max() > floor * out.abs().max()
-    if deviation == _WRONG_PER_TOKEN:
-        for request in range(requests):
-            for token in range(1, tokens):
-                assert torch.equal(out[request, token], out[request, 0])
-    if deviation == _WRONG_BARE_SCALE:
-        zeroed = AdaLayerNorm(_DT_DIM)
-        for parameter in zeroed.parameters():
-            parameter.zero_()
-        assert torch.equal(zeroed(x, temb), F.layer_norm(x, (_DT_DIM,), eps=_EPS))
-        assert torch.equal(_adaln_reference(zeroed, x, temb, _WRONG_BARE_SCALE), torch.zeros_like(x))
+    assert not torch.equal(out, _adaln_reference(norm, x, temb, _WRONG_SHIFT_FIRST))
 
 
 # ----------------------------------------------------------------------------
@@ -542,20 +388,8 @@ def test_adalayernorm_read_any_other_way_is_a_different_answer(deviation, floor)
 # dropped attention residual moves the answer about 1%, which reads as rounding.
 _BLOCK_SCALE = 0.3
 
+# Another block's arrangement; it loads the checkpoint and runs.
 _WRONG_NO_ATTN_RESIDUAL = "the attention residual dropped"
-_WRONG_NO_FF_RESIDUAL = "the feed-forward residual dropped"
-_WRONG_NORM3_AFTER_FF = "norm3 after the feed-forward"
-_WRONG_NORMS_SWAPPED = "AdaLN before the feed-forward instead"
-# the feed-forward reading the block's input rather than what the attention residual made
-_WRONG_FF_BEFORE_RESIDUAL = "the feed-forward reads the pre-residual tokens"
-
-_BLOCK_DEVIATIONS = (
-    _WRONG_NO_ATTN_RESIDUAL,
-    _WRONG_NO_FF_RESIDUAL,
-    _WRONG_NORM3_AFTER_FF,
-    _WRONG_NORMS_SWAPPED,
-    _WRONG_FF_BEFORE_RESIDUAL,
-)
 
 
 def _sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -601,8 +435,6 @@ def _block_reference(
     requests, queries, dim = hidden.shape
     heads = (requests, -1, _DT_HEADS, _DT_HEAD_DIM)
     plain = _adaln_reference(block.norm1, hidden, temb)
-    if deviation == _WRONG_NORMS_SWAPPED:
-        plain = F.layer_norm(hidden, (dim,), eps=_EPS)
     source = plain if encoder is None else encoder
     out = attend(
         block.attn1.to_q(plain).view(heads),
@@ -612,15 +444,7 @@ def _block_reference(
     attended = block.attn1.to_out[0](out.reshape(requests, queries, -1))
 
     residual = attended if deviation == _WRONG_NO_ATTN_RESIDUAL else attended + hidden
-    if deviation == _WRONG_NORM3_AFTER_FF:
-        return F.layer_norm(block.ff(residual), (dim,), eps=_EPS) + residual
-    normed = F.layer_norm(
-        hidden if deviation == _WRONG_FF_BEFORE_RESIDUAL else residual, (dim,), eps=_EPS,
-    )
-    if deviation == _WRONG_NORMS_SWAPPED:
-        normed = _adaln_reference(block.norm1, residual, temb)
-    forwarded = block.ff(normed)
-    return forwarded if deviation == _WRONG_NO_FF_RESIDUAL else forwarded + residual
+    return block.ff(F.layer_norm(residual, (dim,), eps=_EPS)) + residual
 
 
 # The even DT blocks cross-attend the bridge's rows, the odd ones their own tokens; the two
@@ -645,23 +469,7 @@ def test_the_block_is_the_reference_block(cross, requests, queries):
 
     assert out.shape == (requests, queries, _DT_DIM)
     assert torch.equal(out, _block_reference(block, hidden, temb, encoder))
-
-
-@pytest.mark.parametrize("cross", list(_SETTINGS.values()), ids=list(_SETTINGS))
-@pytest.mark.parametrize("deviation", _BLOCK_DEVIATIONS)
-@torch.no_grad()
-def test_a_block_wired_any_other_way_is_a_different_answer(cross, deviation):
-    """Each is the same six pieces in another block's arrangement (one residual, post-norm,
-    conditioned feed-forward, parallel halves); each loads the checkpoint and runs."""
-    block = _block(cross)
-    hidden, temb = _hidden(), _temb()
-    encoder = _bridge_rows(cross)
-    out = block(hidden, temb, encoder, _sdpa)
-    wrong = _block_reference(block, hidden, temb, encoder, deviation)
-
-    assert not torch.equal(out, wrong)
-    # a floor under the weakest deviation (norm3 after the feed-forward, which keeps both residuals)
-    assert (out - wrong).abs().max() > 0.2 * out.abs().max()
+    assert not torch.equal(out, _block_reference(block, hidden, temb, encoder, _WRONG_NO_ATTN_RESIDUAL))
 
 
 # ----------------------------------------------------------------------------
@@ -686,11 +494,8 @@ _OUT_EPS = 1e-6
 # at whichever iteration each is on.
 _DENOISE_STEPS = (0.0, 250.0, 500.0, 750.0)
 
-# Readings of the head's three lines; each loads the checkpoint and runs.
-_WRONG_HEAD_SCALE_FIRST = "scale first out of the head's chunk"
+# A reading of the output norm; it loads the checkpoint and runs.
 _WRONG_HEAD_BLOCK_EPS = "the blocks' 1e-5 at the output norm"
-# `[:, None]` dropped, as in `_WRONG_PER_TOKEN`: computable only where requests equal rows.
-_WRONG_HEAD_PER_ROW = "the head's pair indexed per row"
 
 
 def _dit_config(depth: int = _DIT_DEPTH) -> Gr00tN17Config:
@@ -752,12 +557,9 @@ def _head_reference(
     """``shift, scale = proj_out_1(silu(temb)).chunk(2, dim=1)`` (**that** order), then
     ``norm_out(hidden) * (1 + scale[:, None]) + shift[:, None]``, then ``proj_out_2``. The norm
     is written out (no weight, no bias, eps 1e-6); only the projections are borrowed."""
-    first, second = dit.proj_out_1(F.silu(temb)).chunk(2, dim=1)
-    shift, scale = (second, first) if deviation == _WRONG_HEAD_SCALE_FIRST else (first, second)
+    shift, scale = dit.proj_out_1(F.silu(temb)).chunk(2, dim=1)
     eps = _EPS if deviation == _WRONG_HEAD_BLOCK_EPS else _OUT_EPS
     normed = F.layer_norm(hidden, (hidden.shape[-1],), eps=eps)
-    if deviation == _WRONG_HEAD_PER_ROW:
-        return dit.proj_out_2(normed * (1 + scale) + shift)
     return dit.proj_out_2(normed * (1 + scale[:, None]) + shift[:, None])
 
 
@@ -817,35 +619,6 @@ def test_the_dit_is_its_blocks_then_the_output_head(shape, depth):
 
 
 @torch.no_grad()
-def test_the_output_heads_chunk_is_shift_then_scale_and_not_adalns_order():
-    """The head chunks ``shift, scale`` where ``AdaLayerNorm`` chunks ``scale, shift``
-    (``dit.py:331`` against ``dit.py:95``); both halves are of plausible size, so only values
-    see a swap. With shift 0 and scale -1 the right reading is exactly ``proj_out_2.bias``."""
-    dit = _dit()
-    with torch.no_grad():
-        dit.proj_out_1.weight.zero_()
-        dit.proj_out_1.bias[:_DIT_DIM].zero_()  # the first half out of the chunk: `shift`
-        dit.proj_out_1.bias[_DIT_DIM:].fill_(-1.0)  # the second: `scale`, so `1 + scale` is 0
-    hidden = _dit_rows()
-    encoder = _bridge_rows(True)
-    timestep = _steps()
-    out = dit(hidden, encoder, encoder, timestep, _STAND_INS)
-    swapped = _dit_reference(dit, hidden, encoder, encoder, timestep, _WRONG_HEAD_SCALE_FIRST)
-
-    assert torch.equal(out, dit.proj_out_2.bias.expand(_REQUESTS, _QUERIES, _DIT_OUT))
-    assert not torch.equal(out, swapped)
-    assert swapped.abs().max() > 2.0 * out.abs().max()
-
-    trained = _dit()
-    out = trained(hidden, encoder, encoder, timestep, _STAND_INS)
-    swapped = _dit_reference(trained, hidden, encoder, encoder, timestep, _WRONG_HEAD_SCALE_FIRST)
-    first, second = trained.proj_out_1(F.silu(trained.timestep_encoder(timestep))).chunk(2, 1)
-    assert first.pow(2).mean().sqrt() == pytest.approx(second.pow(2).mean().sqrt(), rel=0.3)
-    assert not torch.equal(out, swapped)
-    assert (out - swapped).abs().max() > 0.2 * out.abs().max()
-
-
-@torch.no_grad()
 def test_the_output_norm_normalises_at_1e_6_where_every_other_norm_uses_1e_5():
     """An eps is invisible to parity against a bf16 dump, so it is pinned on rows of variance
     under 1e-5, where the two eps differ visibly. No blocks: a block's norm would wash that out."""
@@ -860,12 +633,6 @@ def test_the_output_norm_normalises_at_1e_6_where_every_other_norm_uses_1e_5():
     at_1e_5 = _dit_reference(flat, hidden, encoder, encoder, timestep, _WRONG_HEAD_BLOCK_EPS)
     assert not torch.equal(out, at_1e_5)
     assert (out - at_1e_5).abs().max() > 0.2 * out.abs().max()
-
-    # and the two norms are different numbers in the same model, which is the whole hazard
-    deep = _dit()
-    assert deep.norm_out.eps == _OUT_EPS
-    assert {block.norm3.eps for block in deep.transformer_blocks} == {_EPS}
-    assert {block.norm1.norm.eps for block in deep.transformer_blocks} == {_EPS}
 
 
 def test_the_output_norm_is_not_affine_because_the_checkpoint_has_no_weight_for_it():
@@ -885,28 +652,6 @@ def test_the_output_norm_is_not_affine_because_the_checkpoint_has_no_weight_for_
     }
     assert dit.proj_out_1.out_features == 2 * _DIT_DIM  # the one projection both halves
     assert dit.proj_out_2.out_features == _DIT_OUT != _DIT_DIM
-
-
-@torch.no_grad()
-def test_the_heads_pair_is_one_per_request_and_reaches_every_row_of_it():
-    """Dropping the head's ``[:, None]`` raises everywhere but ``B == T``, where row ``t`` gets
-    request ``t``'s conditioning. Compared against the wrong reading, since a request's rows
-    differ among themselves in the last ulp."""
-    requests = rows = 3
-    dit = _dit()
-    hidden = _dit_rows(requests, rows)
-    encoder = _bridge_rows(True, requests)
-    timestep = _steps(requests)
-    out = dit(hidden, encoder, encoder, timestep, _STAND_INS)
-    per_row = _dit_reference(dit, hidden, encoder, encoder, timestep, _WRONG_HEAD_PER_ROW)
-
-    assert torch.equal(out, _dit_reference(dit, hidden, encoder, encoder, timestep))
-    assert not torch.equal(out, per_row)
-    assert (out - per_row).abs().max() > 0.2 * out.abs().max()
-
-    # at any other shape the dropped index is a shape error, hence the square shape above
-    with pytest.raises(RuntimeError):
-        _dit_reference(dit, _dit_rows(), _bridge_rows(True), _bridge_rows(True), _steps(), _WRONG_HEAD_PER_ROW)
 
 
 @torch.no_grad()

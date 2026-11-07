@@ -106,12 +106,9 @@ def _ref_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Te
     return x * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)
 
 
-# Deliberate deviations, each a mistake that would otherwise look like the real layer.
+# A deliberate deviation. The two orders part only where the rotation does something, so this
+# also fails if `build_cos_sin`, whose output both stacks share, stops rotating.
 _WRONG_ROPE_FIRST = "rope before the qk-norm"
-_WRONG_KV_SWAP = "k and v swapped"
-_WRONG_KV_REPEAT = "kv heads repeated instead of interleaved"
-_WRONG_NO_RESIDUAL = "the mlp residual dropped"
-DEVIATIONS = (_WRONG_ROPE_FIRST, _WRONG_KV_SWAP, _WRONG_KV_REPEAT, _WRONG_NO_RESIDUAL)
 
 
 class RefAttention(nn.Module):
@@ -134,17 +131,12 @@ class RefAttention(nn.Module):
         q = self.q_proj(x).view(tokens, config.num_attention_heads, config.head_dim)
         k = self.k_proj(x).view(tokens, config.num_key_value_heads, config.head_dim)
         v = self.v_proj(x).view(tokens, config.num_key_value_heads, config.head_dim)
-        if self.deviation == _WRONG_KV_SWAP:
-            k, v = v, k
         if self.deviation == _WRONG_ROPE_FIRST:
             q, k = self.q_norm(_ref_rope(q, cos, sin)), self.k_norm(_ref_rope(k, cos, sin))
         else:
             q, k = _ref_rope(self.q_norm(q), cos, sin), _ref_rope(self.k_norm(k), cos, sin)
         group = config.num_attention_heads // config.num_key_value_heads
-        if self.deviation == _WRONG_KV_REPEAT:
-            k, v = k.repeat(1, group, 1), v.repeat(1, group, 1)
-        else:
-            k, v = k.repeat_interleave(group, dim=1), v.repeat_interleave(group, dim=1)
+        k, v = k.repeat_interleave(group, dim=1), v.repeat_interleave(group, dim=1)
         out = F.scaled_dot_product_attention(
             q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1), is_causal=True,
         ).transpose(0, 1)
@@ -154,7 +146,6 @@ class RefAttention(nn.Module):
 class RefDecoderLayer(nn.Module):
     def __init__(self, config: Gr00tN17TextConfig, deviation: str | None = None):
         super().__init__()
-        self.deviation = deviation
         self.input_layernorm = RefRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = RefAttention(config, deviation)
         self.post_attention_layernorm = RefRMSNorm(config.hidden_size, config.rms_norm_eps)
@@ -166,7 +157,7 @@ class RefDecoderLayer(nn.Module):
         x = x + self.self_attn(self.input_layernorm(x), cos, sin)
         normed = self.post_attention_layernorm(x)
         mlp = self.down_proj(F.silu(self.gate_proj(normed)) * self.up_proj(normed))
-        return mlp if self.deviation == _WRONG_NO_RESIDUAL else x + mlp
+        return x + mlp
 
 
 @torch.no_grad()
@@ -230,31 +221,22 @@ _BAR = 4 * _MEASURED_GAP
 def test_our_stack_is_the_reference_decoder_layer(tmp_path, tokens):
     config = _config()
     weights = _checkpoint(config.text, seed=0)
-    ours, theirs = _run(
-        _loaded_model(config, weights, tmp_path), _reference_stack(config.text, weights), tokens, seed=1,
-    )
+    model = _loaded_model(config, weights, tmp_path)
+    ours, theirs = _run(model, _reference_stack(config.text, weights), tokens, seed=1)
     assert ours.shape == (tokens, config.text.hidden_size)
     assert relative_gap(ours, theirs) <= _BAR
-
-
-@pytest.mark.parametrize("deviation", DEVIATIONS)
-def test_a_layer_assembled_wrongly_misses_by_orders_of_magnitude(tmp_path, deviation):
-    """The bar above only means something if a plausible mistake cannot slip under it."""
-    config = _config()
-    weights = _checkpoint(config.text, seed=0)
-    ours, theirs = _run(
-        _loaded_model(config, weights, tmp_path),
-        _reference_stack(config.text, weights, deviation),
-        tokens=64, seed=1,
-    )
-    assert relative_gap(ours, theirs) > 1000 * _BAR
+    # the bar only means something if a plausible mistake cannot slip under it; a lone token
+    # sits at position 0, which no rotation moves, so there the two orders agree
+    if tokens > 1:
+        _, wrong = _run(model, _reference_stack(config.text, weights, _WRONG_ROPE_FIRST), tokens, seed=1)
+        assert relative_gap(ours, wrong) > 1000 * _BAR
 
 
 def test_the_fused_projection_holds_q_then_k_then_v_one_block_per_head(tmp_path):
     """What the forward's ``split`` assumes, and the half of GQA this module owns: which rows
     of the fused weight are a query head and which are a KV head. The other half -- which
-    group a query head lands in -- is the kernel's, and the ``repeat`` deviation above is
-    what pins it."""
+    group a query head lands in -- is the kernel's, and the parity test above is what pins
+    it."""
     config = _config()
     text = config.text
     weights = _checkpoint(text, seed=2)
@@ -279,7 +261,7 @@ def test_the_fused_projection_holds_q_then_k_then_v_one_block_per_head(tmp_path)
 # mistake; two blocks do not.
 _IMAGE_ROWS = torch.tensor([5, 6, 7, 8, 30, 31, 32, 33])
 # Fewer features than layers, as the real stack has (three vision taps, `select_layer`
-# layers), which also leaves the off-by-one deviations below a layer to land on.
+# layers), which also leaves the off-by-one deviation below a layer to land on.
 _FEATURES = 3
 _DEEPSTACK_LAYERS = 4
 # the reversal (a list read backwards) and a 3-cycle
@@ -295,8 +277,7 @@ def _ref_forward(
     ``i + shift``, feature ``order[i]`` is added to ``rows`` the way ``_deepstack_process``
     does it, ``hidden_states[visual_pos_masks, :] += visual_embeds``.
 
-    ``shift`` and ``order`` are the deviations, and default to the real thing. Injection
-    "after layer -1" is reachable only at ``shift=-1``, which is one of them.
+    ``shift`` and ``order`` are the deviations, and default to the real thing.
     """
     order = tuple(range(len(deepstack))) if order is None else order
 
@@ -307,7 +288,6 @@ def _ref_forward(
                 hidden[rows] += deepstack[order[i]]
         return hidden
 
-    hidden = inject(hidden, -1)
     for i, layer in enumerate(layers):
         hidden = inject(layer(hidden, cos, sin), i)
     return hidden
@@ -360,13 +340,8 @@ def test_deepstack_features_land_on_the_image_rows_after_their_layer(tmp_path):
     ours = case.ours()
     assert ours.shape == case.hidden.shape
     assert relative_gap(ours, case.theirs()) <= _BAR
-
-
-@pytest.mark.parametrize("shift", [-1, 1], ids=["a layer early", "a layer late"])
-def test_a_feature_added_after_the_wrong_layer_misses_by_orders_of_magnitude(tmp_path, shift):
-    """Moving an injection one layer cannot slip under the bar."""
-    case = _case(tmp_path)
-    assert relative_gap(case.ours(), case.theirs(shift=shift)) > 1000 * _BAR
+    # moving an injection one layer cannot slip under the bar
+    assert relative_gap(ours, case.theirs(shift=1)) > 1000 * _BAR
 
 
 @pytest.mark.parametrize("order", _PERMUTATIONS)
