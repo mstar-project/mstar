@@ -360,6 +360,8 @@ class HiggsAudioModel(Model):
             )
 
         waveform = raw_audio_inputs[0].reshape(-1).cpu().numpy()
+        if len(waveform) < self.config.sampling_rate // 50:
+            raise ValueError("Higgs-Audio requires at least 20 ms of audio")
         chunk_samples = self.config.chunk_size_samples
         chunks = [
             waveform[i:i + chunk_samples]
