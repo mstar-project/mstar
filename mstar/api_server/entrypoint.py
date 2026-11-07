@@ -2728,7 +2728,7 @@ async def generate(
 
     try:
         parsed_kwargs = json.loads(model_kwargs) if model_kwargs else None
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, RecursionError) as e:
         _remove_uploads(file_paths)
         raise HTTPException(
             status_code=400,

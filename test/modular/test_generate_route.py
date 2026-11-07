@@ -81,12 +81,13 @@ def test_generate_accepts_streaming_only_output_without_streaming_field(monkeypa
     assert server.streaming is True
 
 
-def test_generate_rejects_malformed_model_kwargs(monkeypatch):
+@pytest.mark.parametrize("payload", ["{", "[" * 100_000])
+def test_generate_rejects_malformed_model_kwargs(monkeypatch, payload):
     monkeypatch.setattr(entrypoint, "api_server", object())
 
     response = TestClient(entrypoint.app).post(
         "/generate",
-        data={"model_kwargs": "{"},
+        data={"model_kwargs": payload},
     )
 
     assert response.status_code == 400
