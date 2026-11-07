@@ -956,3 +956,14 @@ def test_a_chunked_speech_stream_keeps_its_clip_until_the_last_chunk_is_submitte
     assert r.status_code == 200 and r.content == _pcm([1, 2, 3]) * len(on_disk_at_submit)
     assert len(on_disk_at_submit) > 2 and all(on_disk_at_submit)
     assert _left_after_cleanup(stub.upload_dir) == []
+
+
+def test_video_stream_refusal_keeps_http_error_status(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "cosmos3"
+    stub.next_chunks = [_Chunk("error", b"stream_video requires multiple frames", {"status": 400})]
+    response = client.post("/v1/videos/generations", json={
+        "model": "cosmos3", "prompt": "a road", "num_frames": 1, "stream_video": True,
+    })
+    assert response.status_code == 400
+    assert "multiple frames" in response.json()["error"]["message"]

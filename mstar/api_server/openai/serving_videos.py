@@ -32,10 +32,9 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
             model=req.model,
         )
         if stream:
-            # A windowed request delivering each window as it lands: NDJSON
-            # lines (see _stream_ndjson) instead of one JSON body.
+            chunks = await api.open_result_stream(request_id, raw_request)
             return ReleasingStreamingResponse(
-                _stream_ndjson(api, request_id),
+                _ndjson_lines(chunks),
                 release=lambda: api.release_request(request_id),
                 media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"},
             )
@@ -69,11 +68,6 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
                 logger.exception("Muxing generated audio into the mp4 failed; returning video only")
         data.append({"b64_json": base64.b64encode(video), "url": None})
     return {"created": now(), "data": data}
-
-
-def _stream_ndjson(api, request_id):
-    # Bound to the submission now: the body is iterated later, by Starlette.
-    return _ndjson_lines(api.iter_result_chunks(request_id))
 
 
 async def _ndjson_lines(chunks):
