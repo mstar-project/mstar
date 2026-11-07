@@ -795,9 +795,11 @@ def test_future_stream_empty_final_and_continuing_tail_use_distinct_semantic_rec
     from mstar.engine.resources.iteration_tables import IterationTables
     from mstar.engine.resources.step import BucketKey, SlotLease
 
-    source = StreamBuffer(RID, EDGE, "LLM", FixedChunkPolicy(1, continue_after_done=continues))
+    streams, _, source = _window_consumer()
+    source.policy = FixedChunkPolicy(1, continue_after_done=continues)
     source.signal_done(0)
-    reservation = source.reserve_future_window([], 3).reservation
+    snapshot = source.reserve_future_window([], 3)
+    reservation = snapshot.reservation
     choices = {(parent, end, done): selected for parent, end, done, selected in reservation.decisions}
     owner = IterationTables(torch.device("cpu"))
     lease = SlotLease(0, BucketKey("consume", 1, 1))
@@ -821,8 +823,28 @@ def test_future_stream_empty_final_and_continuing_tail_use_distinct_semantic_rec
             break
     window.select(torch.tensor([0]), torch.tensor([True]), torch.tensor([True]))
     assert window.selected.item() == -1 and window.ready.item() == window.compute_ready.item() == 0
-    result = source.settle_window(reservation, count, final_transition=parent)
-    assert result.released == [] and result.is_final is not continues
+    # The worker's admit fence must preserve a semantic budget when the
+    # model computes fewer iterations (a final empty flush computes none).
+    from mstar.streaming.stream_buffer import StreamingEdge
+    from mstar.worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker.streams = streams
+    worker._step_repeats = SimpleNamespace(asked=True)
+    edge = StreamingEdge(EDGE, NODE, [], snapshot.info)
+    batch = SimpleNamespace(
+        stream_windows={RID: [edge]}, step_context=SimpleNamespace(repeats=1),
+        launch_started_event=None,
+    )
+    worker._await_admit_settled(SimpleNamespace(node_batch=batch, batch=SimpleNamespace(repeats=3)))
+    assert streams.window_bound(RID, edge) == 3
+    actual = {RID: count if continues else 0}
+    with pytest.raises(ValueError, match="actual semantic receipt"):
+        worker._settle_stream_windows(batch, actual)
+    assert source.owns_window(reservation)
+    worker._settle_stream_windows(batch, actual, transitions={(RID, EDGE): (count, parent)})
+    assert batch.stream_windows == {} and not source.owns_window(reservation)
+    assert source._final_chunk_emitted is not continues
     assert source._executed_chunks == (3 if continues else 1)
     assert source._tail_consumed == (3 if continues else 0)
 

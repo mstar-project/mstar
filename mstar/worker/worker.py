@@ -2777,7 +2777,8 @@ class Worker(RepeatingSteps):
             for rid, edges in pending.node_batch.stream_windows.items():
                 for edge in edges:
                     if edge.chunk.reservation is not None:
-                        if self.streams.window_bound(rid, edge) != repeats:
+                        if (not edge.chunk.reservation.decisions
+                                and self.streams.window_bound(rid, edge) != repeats):
                             self.streams.return_unread(rid, edge, repeats)
                         retained.setdefault(rid, []).append(edge)
                     elif edge.chunk.num_items > repeats and self.streams.return_unread(rid, edge, repeats):

@@ -787,7 +787,10 @@ class RepeatingSteps:
         self._settle_stream_windows(batch_N.node_batch, counts)
         batch_N.batch.repeats = ran
 
-    def _settle_stream_windows(self, node_batch, counts: Mapping[int, int], keep=frozenset()) -> None:
+    def _settle_stream_windows(
+        self, node_batch, counts: Mapping[int, int], keep=frozenset(), *,
+        transitions: Mapping[tuple[int, str], tuple[int, int]] | None = None,
+    ) -> None:
         """Retire source inputs only after their reader completed. A skipped
         or refused reader pushed back with its graph inputs keeps its snapshot.
         Graph cleanup independently releases the reader's tensor references.
@@ -795,8 +798,15 @@ class RepeatingSteps:
         for rid, edges in node_batch.stream_windows.items():
             if rid not in keep:
                 for edge in edges:
-                    if edge.chunk.reservation is not None:
-                        self.streams.settle_window(rid, edge, counts.get(rid, 0))
+                    reservation = edge.chunk.reservation
+                    if reservation is not None:
+                        if reservation.decisions:
+                            if transitions is None or (rid, edge.name) not in transitions:
+                                raise ValueError("a connected stream needs its actual semantic receipt")
+                            pops, final = transitions[rid, edge.name]
+                            self.streams.settle_window(rid, edge, pops, final_transition=final)
+                        else:
+                            self.streams.settle_window(rid, edge, counts.get(rid, 0))
         node_batch.stream_windows = {
             rid: edges for rid, edges in node_batch.stream_windows.items() if rid in keep
         }
