@@ -379,10 +379,7 @@ class LoopbackRows(Resource):
         row[self._resident_rows.col] = self._row_of.get(rid, TRASH_ROW)
 
     def _resident_gather(self, step: CapturedResidentStep) -> None:
-        # a padding row reads the trash slot's zero, which is the trash row
-        table = self._resident_rows
-        gather_column(self._resident.store, step.slots, table.stride, table.col,
-                      self.indices(step.bucket, step.buffer_slot))
+        self.gather_rows(step.bucket, step.buffer_slot, step.slots)
 
     def covers_head(self, name: str, target: torch.Tensor) -> bool:
         """Whether the existing row table can fill this captured input."""
@@ -398,6 +395,16 @@ class LoopbackRows(Resource):
         rows = table.index_select(0, self.indices(bucket, slot)[:target.shape[0]])
         target.copy_(rows.reshape(target.shape))
         return True
+
+    def input_view(self, name: str, value: torch.Tensor) -> torch.Tensor:
+        """The inverse geometry of head: a static input in its owner's shape.
+
+        No copy or owner lookup occurs here. The ordinary tail scatters this
+        view through the current captured indices after payload preparation.
+        """
+        if not self.covers_head(name, value) or not value.is_contiguous():
+            raise ValueError("a captured input cannot preserve its owning row shape")
+        return value.view(value.shape[0], *self._tables[name].shape[1:])
 
     def tail(self, bucket: BucketKey, slot: int | tuple[str, int], name: str, value: torch.Tensor) -> bool:
         """In a capture, after the forward: each row's ``name`` from ``value``.
@@ -420,15 +427,17 @@ class LoopbackRows(Resource):
             )
         return table
 
-    def iteration_rows(self, step: CapturedResidentStep) -> torch.Tensor:
-        """The entry's owner rows before stopped rows are sent to trash.
+    def gather_rows(
+        self, bucket: BucketKey, slot: int | tuple[str, int], resident_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Resolve this owner's rows through its own resident-slot mapping.
 
-        Only this column is gathered ahead of the active-row mask; the normal
-        resident gather still runs once for all resources afterwards.
+        Entry/payload work supplies unmasked bindings; ordinary body gathering
+        supplies the masked slots. Neither namespace is a table row number.
         """
         table = self._resident_rows
-        indices = self.indices(step.bucket, step.buffer_slot)
-        gather_column(self._resident.store, step.buffers.rows, table.stride, table.col, indices)
+        indices = self.indices(bucket, slot)
+        gather_column(self._resident.store, resident_slots, table.stride, table.col, indices)
         return indices
 
     def prepare_iteration(self, walk: str, loop: LoopLayout) -> torch.Tensor:

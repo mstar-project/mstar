@@ -267,6 +267,15 @@ refuse before submission. This bounds each bank, not total worker memory.
 Whole-unit live admission remains guarded until publication and collection
 bind every member through the same generation.
 
+Payload operations resolve each member's resident slots through its own
+``LoopbackRows`` mapping. The producer ring and consumer input have distinct
+row namespaces. Future copies retain static-input geometry, not initial
+request addresses: the consumer loads its complete owner input, overlays the
+selected ring payload, then scatters only computing rows back before its
+ordinary captured body. Real context and constant padding keep their ordinary
+admission writes. Finished producers retain their existing fixed ring reader
+binding until collection.
+
 Preparation may structurally pack future inputs with real values through
 reshape, transpose, stack, concatenation and constant padding. These operations
 lower to copies into the existing capture or resource-owned destination; an

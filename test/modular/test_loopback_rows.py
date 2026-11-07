@@ -140,7 +140,7 @@ def test_a_resident_step_gathers_its_rows_index_from_the_planners_slots():
         bucket=bucket, slot=0, buffer_slot=0, slots=torch.tensor([0, 0]),
         buffers=SimpleNamespace(rows=torch.tensor([3, 0])),
     )
-    assert rows.iteration_rows(step).tolist() == [rows._row_of[7], TRASH_ROW]
+    assert rows.gather_rows(step.bucket, step.buffer_slot, step.buffers.rows).tolist() == [rows._row_of[7], TRASH_ROW]
     rows.resident_binding().gather(step)
     assert rows.indices(bucket, 0).tolist() == [TRASH_ROW, TRASH_ROW]
 
@@ -340,10 +340,37 @@ def test_captured_ring_access_uses_owner_rows_and_reserved_positions_without_hos
     items = torch.tensor([[10], [21], [999]], device=device)
     read_positions = torch.tensor([[3, 4], [2, 3], [0, -1]], device=device)
     output = torch.empty(3, 2, 1, dtype=torch.long, device=device)
+    destination = LoopbackRows(device, capacity=3)
+    for rid in (2, 1):
+        destination.add(rid)
+    destination.write("input", [1, 2], torch.full((2, 2), -100, dtype=torch.long, device=device))
+    for resource, mapping in ((owner, {1: 1, 2: 4}), (destination, {1: 3, 2: 7})):
+        store = torch.zeros(16, dtype=torch.long, device=device)
+        planner = SimpleNamespace(store=store, table=lambda: SimpleNamespace(stride=2, col=1))
+        binding = resource.resident_binding()
+        binding.bind(planner, "rows")
+        for rid, slot in mapping.items():
+            row = [0, 0]
+            binding.row(rid, slot, row, None)
+            store[slot * 2 + 1] = row[1]
+    source_slots = torch.tensor([4, 1, 0], device=device)
+    destination_slots = torch.tensor([7, 3, 0], device=device)
+    static_input = torch.zeros_like(output)
+    inverse = destination.input_view("input", static_input)
 
     def step():
+        owner.gather_rows(bucket, 0, source_slots)
         owner.ring_scatter("frames", indices, positions, items, active)
         owner.ring_gather("frames", indices, read_positions, output)
+        target_rows = destination.gather_rows(bucket, 0, destination_slots)
+        destination.head(bucket, 0, "input", static_input)
+        owner.ring_gather("frames", indices, read_positions, static_input, active)
+        target_rows.masked_fill_(~active, 0)
+        assert destination.tail(bucket, 0, "input", inverse)
+        # A native body may replace these same buffers with masked rows.
+        # The next payload operation must refresh them, not inherit zeros.
+        indices.zero_()
+        target_rows.zero_()
 
     graph = None
     if device_name == "cuda":
@@ -359,6 +386,18 @@ def test_captured_ring_access_uses_owner_rows_and_reserved_positions_without_hos
     if graph is not None:
         backend.synchronize()
     assert output.tolist() == [[[10], [11]], [[21], [30]], [[0], [0]]]
+    assert destination.read("input", [1, 2]).tolist() == [[21, 30], [10, 11]]
+    # Reuse the same captured physical rows through independent owner spaces.
+    source_slots.copy_(torch.tensor([1, 4, 0], device=device))
+    destination_slots.copy_(torch.tensor([3, 7, 0], device=device))
+    positions.copy_(torch.tensor([2, -1, -1], device=device))
+    read_positions.copy_(torch.tensor([[2, 3], [3, 4], [0, -1]], device=device))
+    items[0] = 37
+    step() if graph is None else graph.replay()
+    if graph is not None:
+        backend.synchronize()
+    assert output.tolist()[:2] == [[[37], [30]], [[10], [11]]]
+    assert destination.read("input", [1, 2]).tolist() == [[37, 30], [10, 11]]
     assert owner.ring_room("frames", 1) == owner.ring_room("frames", 2) == 0
     # GPU reads do not release semantic ownership; unused slots and consumption
     # still close through the existing ordinary ring protocol.

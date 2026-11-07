@@ -2537,8 +2537,9 @@ class Engine:
         if not set(source_rows) <= set(target_rows):
             guard.refuse("every live producer needs a claimed consumer row")
         correspondence = tuple(target_rows.index(rid) for rid in source_rows)
-        for context in ([source_batch.step_context] if source is not None else []) + [batch.step_context]:
-            ring.plan(LoopbackRowsStep(), dataclasses.replace(context, resident=None))
+        # Retired producers have no live member slot. Their existing ring
+        # readers retain a fixed address; live entries are refreshed below.
+        ring.plan(LoopbackRowsStep(), dataclasses.replace(batch.step_context, resident=None))
         lease = batch.step_context.slot_lease
         indices = ring.indices(lease.bucket, lease.buffer_slot)
         source_lease = None if source is None else source_batch.step_context.slot_lease
@@ -2551,8 +2552,19 @@ class Engine:
         if ((capacity > 1 and slot.run.state.active is None)
                 or (source_capacity > 1 and source.run.state.active is None)):
             guard.refuse("independently ready streamed rows need captured owner masks")
+        if source is not None and source.run.state.dropping is None:
+            guard.refuse("a streamed producer needs resident ring-owner bindings")
+        input_name, owner_signal, payload = payload
         if len(payload) != len(batch.request_ids):
-            guard.refuse("each streamed row needs its own owner destination")
+            guard.refuse("each streamed row needs its own captured destination")
+        destination_owner = mgmt.loopback_rows if owner_signal is not None else None
+        destination_input = slot.static_inputs[input_name]
+        destination_view = None
+        if destination_owner is not None:
+            try:
+                destination_view = destination_owner.input_view(owner_signal, destination_input)
+            except ValueError as error:
+                guard.refuse(str(error))
         item = ring.row(signal, batch.request_ids[0])
         targets = []
         for prototype, target in payload:
@@ -2584,6 +2596,7 @@ class Engine:
         if source is not None and (produced is None or produced.shape != (source_capacity, *item.shape[1:])):
             guard.refuse("a streamed producer must emit one captured item per iteration")
         key = ("stream", id(slot.graph), None if source is None else id(source.graph), id(window),
+               input_name, owner_signal,
                tuple((target.data_ptr(), tuple(target.shape), target.stride(), target.storage_offset())
                      for target in targets), indices.data_ptr(), item.untyped_storage().data_ptr(),
                withheld, correspondence, None if source_indices is None else source_indices.data_ptr())
@@ -2641,7 +2654,14 @@ class Engine:
             running = torch.zeros_like(window.continuation) if source is None else source.run.state.continuation
             window.continuation.copy_((running != 0) | (window.ready != 0))
 
+        def source_addresses():
+            if source is not None:
+                ring.gather_rows(source_lease.bucket, source_lease.buffer_slot, source.run.state.dropping.rows)
+                for row, target in enumerate(correspondence):
+                    indices[target:target + 1].copy_(source_indices[row:row + 1])
+
         def publish():
+            source_addresses()
             positions = window.produced_positions(project(source.run.state.counts))
             active = kept()
             if source_capacity == capacity and correspondence == tuple(range(len(target_rows))):
@@ -2652,10 +2672,21 @@ class Engine:
                                       produced[row:row + 1], active[row:row + 1])
 
         def gather():
+            source_addresses()
+            destination_indices = None
+            if destination_owner is not None:
+                destination_indices = destination_owner.gather_rows(
+                    lease.bucket, lease.buffer_slot, state.dropping.rows,
+                )
+                destination_owner.head(lease.bucket, lease.buffer_slot, owner_signal, destination_input)
             for row, target in enumerate(targets):
                 positions = window.payload_positions(target.shape[1])
                 ring.ring_gather(signal, indices[row:row + 1], positions[row:row + 1], target,
                                  None if state.eligible is None else state.eligible[row:row + 1])
+            if destination_owner is not None:
+                computing = (window.selected >= 0) & (window.metadata[:, 5] != 0)
+                destination_indices.masked_fill_(~computing, 0)
+                destination_owner.tail(lease.bucket, lease.buffer_slot, owner_signal, destination_view)
 
         backend = runner._graph_backend
         def capture(fn):
@@ -3006,11 +3037,14 @@ class Engine:
                                 guard.refuse(f"future field {name} exceeds its captured destination")
                             target = target.narrow(dim, 0, value.shape[dim])
                             keys = tuple(expected.pop(name))
-                            routed = destinations(name, guard.copies(value, target, keys, set(keys) - back_keys))
+                            static_copies = guard.copies(value, target, keys, set(keys) - back_keys)
+                            # Certification still checks row bounds/strides even
+                            # when capture keeps static rather than owner views.
+                            routed = destinations(name, static_copies)
                             if streamed and incoming:
                                 if stream_target is not None or len(routed) != len(rows):
                                     guard.refuse("each streamed row needs one contiguous owner destination")
-                                stream_target = routed
+                                stream_target = (name, row_inputs.get(name), static_copies)
                             else:
                                 copies.extend(routed)
                             group.initial_copies.extend(destinations(

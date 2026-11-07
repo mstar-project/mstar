@@ -1489,7 +1489,9 @@ class AcceleratorGraphRunner:
             position = None
             active = state.select_rows() if window is not None or state.active is not None else None
             if window is not None:
-                indices = self._rows.iteration_rows(warmed.resident)
+                indices = self._rows.gather_rows(
+                    warmed.resident.bucket, warmed.resident.buffer_slot, warmed.resident.buffers.rows,
+                )
                 # Resident slots select the input bank; LoopbackRows indices
                 # select actual Loop progress. These are distinct namespaces.
                 resident_slots = warmed.resident.buffers.rows

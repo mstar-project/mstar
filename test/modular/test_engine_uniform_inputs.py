@@ -18,6 +18,22 @@ from mstar.engine.resources.step import BucketKey, SlotLease  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 
 
+def _resident_owner(owner, slots):
+    """The real owner's resident column, with independently assigned slots."""
+    store = torch.zeros(2 * (max(slots.values()) + 1), dtype=torch.long, device=owner._device)
+    planner = SimpleNamespace(
+        max_slots=max(slots.values()) + 1, slot_of=slots.get, covers=lambda bucket: False,
+        commit=lambda *args: None, store=store, table=lambda: SimpleNamespace(stride=2, col=1),
+    )
+    binding = owner.resident_binding()
+    binding.bind(planner, "rows")
+    for rid, slot in slots.items():
+        row = [0, 0]
+        binding.row(rid, slot, row, None)
+        store[slot * 2 + 1] = row[1]
+    return planner
+
+
 def _connected_engine(transform=None, *, head_state=False, mixed=False, device="cpu", width=2,
                       walks=("prefill", "prefill")):
     """Real ordinary preparation/plan/collect, with replay standing in for CUDA."""
@@ -1149,9 +1165,7 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         mgmt.device_stops["prefill"] = StopPolicy(StopKind.EOS, "token", frozenset({99}),
                                                   withhold=("x",) if name == "a" else ())
         mgmt.refills["prefill"] = None
-        resident_rows = torch.ones(1, dtype=torch.long, device=device)
-        mgmt.resident = SimpleNamespace(max_slots=3, slot_of=lambda rid: 1, covers=lambda bucket: False,
-                                        commit=lambda *args: None)
+        resident_rows = torch.full((1,), 2, dtype=torch.long, device=device)
         state = RunState(1, "token", (99,), device,
                          dropping=SimpleNamespace(rows=resident_rows, slots=resident_rows.clone()))
         run = slot.run = DeviceRun(state, {}, lambda: None, 4)
@@ -1178,6 +1192,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
                         torch.nn.functional.pad(item.tensor_inputs["x"], (0, 0, 0, 1)).t() for item in inputs
                     ])}
                 mgmt.submodule.preprocess = preprocess
+
+        mgmt.resident = _resident_owner(mgmt.loopback_rows, {2: 2})
 
         def entry(state=state, name=name):
             state.index.zero_()
@@ -1497,8 +1513,9 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
 
     ring = LoopbackRows(device, capacity=3)
     target_owner = LoopbackRows(device, capacity=3)
-    for rid in (2, 1, 3):
+    for rid in (3, 2, 1):
         ring.add(rid)
+    for rid in (1, 3, 2):
         target_owner.add(rid)
     ring.ask_ring("x", 8)
     ring.ring_table("x", torch.zeros(3, 1, device=device))
@@ -1566,10 +1583,11 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
         slot.dummy_rids = [-1, -2, -3, -4]
         slot.dummy_metadata = {rid: SimpleNamespace() for rid in slot.dummy_rids}
         slot.static_inputs = {"x": torch.zeros(size, 2, device=device)}
-        owner_rows = [2, 3] + [0] * (size - 2) if retired and name == "a" else [1, 2, 3, 0]
+        mapping = {2: 2, 1: 3, 3: 1} if name == "a" else {2: 3, 1: 1, 3: 2}
+        mgmt.resident = _resident_owner(mgmt.loopback_rows, mapping)
+        owner_rows = [mapping[rid] for rid in batch.request_ids] + [0] * (size - len(batch.request_ids))
         dropping = SimpleNamespace(rows=torch.tensor(owner_rows, device=device),
                                    slots=torch.tensor(owner_rows, device=device))
-        mgmt.resident = SimpleNamespace(max_slots=5, slot_of={2: 1, 1: 2, 3: 3}.get, covers=lambda bucket: False)
         state = RunState(size, "token", {99}, device, dropping=dropping, independent_rows=True)
         run = runs[name] = slot.run = DeviceRun(state, {}, lambda: None, 4)
         out = torch.zeros(size, 1, device=device)
@@ -1718,7 +1736,8 @@ def test_streamed_row_budgets_preserve_later_chunks_and_staggered_readiness(devi
     expected = [1, 1 if producer_limit == 4 else 0, 0, 0]
     assert outputs[1].check_stop_buffers[RUN_COUNTS].tolist() == expected
     assert outputs[1].check_stop_buffers[RUN_REPLAYS].tolist() == [1, 1, 1, 1]
-    assert owner_counts["b"][1:].tolist() == expected[:3]
+    assert [int(owner_counts["b"][eng._submodules["b"].resident.slot_of(rid)])
+            for rid in (2, 1, 3)] == expected[:3]
     assert target_owner.row("x", 2).flatten().tolist() == [101., 102.], "inactive input owners keep their last chunk"
     assert outputs[1].row_outputs["x"].reshape(4).tolist() == [203., 23. if producer_limit == 4 else 0., 0., 0.]
     assert target_owner.row("x", 3).eq(0).all(), "a stopped source supplies no consumer computation"
