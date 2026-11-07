@@ -27,7 +27,7 @@ from mstar.utils.fp8_block import quantize_fp8_block_weight
 
 HIDDEN, HEADS, KV_HEADS, HEAD_DIM, INTER, EXPERTS, VOCAB, LAYERS = 256, 4, 2, 128, 256, 4, 384, 2
 
-_EXPERT = re.compile(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)$")
+_EXPERT = re.compile(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight\w*)$")
 
 
 def remap(name: str) -> str | None:

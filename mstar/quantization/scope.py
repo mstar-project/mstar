@@ -98,7 +98,9 @@ class NodeQuantization:
         plan = self.plan_for(module)
         if plan is None or not plan.active:
             return weights
-        return apply.intercept(weights, plan, stacked_params, name_remapper)
+        decl = next(r for r in self.roots if type(module) is r.root_type)
+        return apply.intercept(weights, plan, stacked_params, name_remapper, ckpt=self._checkpoint(decl),
+                               prefix=decl.rules.prefix)
 
     def finalize_within(self, module: nn.Module) -> None:
         """Finalize the loaded roots at or under ``module`` (once each): quantize what loaded bf16 before the

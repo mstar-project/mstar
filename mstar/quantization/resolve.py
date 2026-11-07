@@ -29,8 +29,20 @@ from mstar.quantization.spec import NodeQuantSpec, pattern_matches
 
 LINEAR, EXPERTS, OTHER = "linear", "experts", "other"
 MIXED = "mixed"
-# stored formats the loader reads directly or dequantizes as it loads
+# stored formats the loader reads directly or dequantizes as it loads, and the checkpoint layouts it reads them in
 LOADABLE = ("fp8_block", "fp8_channel", "fp8_tensor")
+LOADABLE_LAYOUTS = {"w4a16": ("compressed-tensors", "awq", "gptq"), "mxfp4": ("compressed-tensors",),
+                    "nvfp4": ("modelopt",)}
+# stored formats ``auto`` refuses on a GPU without their kernels rather than dequantizing at 4x the memory
+_NO_SILENT_DEQUANT = ("nvfp4",)
+
+
+def loadable(stored: StoredBase) -> bool:
+    """Whether this build loads (or dequantizes) a base stored this way."""
+    if stored.format not in LOADABLE:
+        return False
+    layouts = LOADABLE_LAYOUTS.get(stored.format)
+    return layouts is None or stored.layout in layouts
 
 
 @dataclass(frozen=True)
@@ -68,6 +80,8 @@ class LayerPlan:
     block: tuple[int, int] | None = None
     # trailing sub-blocks of a fused linear that stay bf16 beside the format (``QuantizableLinears.bf16_tails``)
     tail: int = 0
+    # how the checkpoint stores it, when every shard is stored alike (its layout and params pick the loader)
+    source: StoredBase | None = None
 
 
 @dataclass
@@ -114,10 +128,11 @@ def layer_geometry(module: nn.Module, kind: str) -> Geometry | None:
 
 def geometry_problem(
     fmt: str, geometry: Geometry, direct: bool, kind: str, block: tuple[int, int] | None = None,
-    stored_layout: bool | None = None,
+    stored_layout: bool | None = None, source: StoredBase | None = None,
 ) -> str | None:
     """Why ``fmt``'s kernels (or, ``direct``, the checkpoint's scale blocks of ``block``) don't fit ``geometry``;
-    ``stored_layout`` (default ``direct``): the weight keeps the checkpoint's layout, partial last block included."""
+    ``stored_layout`` (default ``direct``): the weight keeps the checkpoint's layout, partial last block included;
+    ``source``: how the checkpoint stores it (a 4-bit checkpoint's group and symmetry)."""
     stored_layout = direct if stored_layout is None else stored_layout
     n, k = geometry.n, geometry.k
     if fmt in ("fp8_tensor", "fp8_channel"):
@@ -203,18 +218,24 @@ def _head_stored(module: nn.Module, tail: int, stored: str, block, by_shard: dic
                 return None, None
         else:
             head |= formats
-    return _stored_of(head)
+    return _stored_of(head)[:2]
 
 
-def _stored_of(stored: set[StoredBase]) -> tuple[str, tuple[int, int] | None]:
+def _stored_of(stored: set[StoredBase]) -> tuple[str, tuple[int, int] | None, StoredBase | None]:
+    """A layer's stored format, block and source from its shards'; shards of one 4-bit format stored with
+    different params (groups, symmetry) can't share one layer's storage, so they count as mixed."""
     if not stored:
-        return BF16, None
+        return BF16, None, None
     formats = {s.format for s in stored}
     if len(formats) > 1:
-        return MIXED, None
+        return MIXED, None, None
     only = next(iter(stored))
+    if len(stored) == 1:
+        return only.format, only.block, only
+    if only.format in LOADABLE_LAYOUTS:
+        return MIXED, None, None
     blocks = {s.block for s in stored}
-    return only.format, (only.block if len(blocks) == 1 else None)
+    return only.format, (only.block if len(blocks) == 1 else None), None
 
 
 def resolve_plan(
@@ -240,11 +261,21 @@ def resolve_plan(
     # (origin, runtime, why) -> the layers a rule can't apply to, reported once per rule and reason
     refused: dict[tuple[str, str, str], list[str]] = defaultdict(list)
     for path, (kind, module) in layers.items():
-        stored, block = _stored_of(stored_by_layer.get(path, set()))
+        shards = stored_by_layer.get(path, set())
+        stored, block, source = _stored_of(shards)
         head_stored, head_block = _head_stored(module, decl.linears.tail_of(path), stored, block,
                                                by_shard.get(path, {}))
-        if stored not in (BF16, MIXED) and stored not in LOADABLE:
-            unloadable[stored].append(path)
+        bad = sorted({s.format if s.format not in LOADABLE else f"{s.format} ({s.layout})"
+                      for s in shards if s.format != BF16 and not loadable(s)})
+        if bad:
+            for name in bad:
+                unloadable[name].append(path)
+            continue
+        if any(s.param("act_order") for s in shards):
+            plan.problems.append(
+                f"{where}: {path!r} comes from a GPTQ act-order checkpoint (desc_act, a non-trivial g_idx); this "
+                "build serves int4 groups in K order only. Use a checkpoint quantized without desc_act (or a "
+                "compressed-tensors one)")
             continue
         try:
             candidate = decl.linears.selected(path)
@@ -265,7 +296,9 @@ def resolve_plan(
         if runtime == AUTO:
             origin = AUTO
             runtime = stored if stored in LOADABLE and served(stored, kind) else BF16
-            if candidate and head_stored in LOADABLE and served(head_stored, kind) and head_stored != BF16:
+            # (a 4-bit head would be rounded a second time by the re-quantization below, so it serves bf16)
+            if (candidate and head_stored in LOADABLE and served(head_stored, kind) and head_stored != BF16
+                    and head_stored not in LOADABLE_LAYOUTS):
                 # a fused layer whose bf16 tail is all that differs: its head serves as stored
                 runtime, block = head_stored, head_block
             elif stored == MIXED:
@@ -279,10 +312,15 @@ def resolve_plan(
                               f"{head_stored or stored} with a bf16 tail)")
             stored = MIXED
         if runtime != BF16:
-            problem = _runtime_problem(module, kind, runtime, stored, block, device_capability, tail)
+            problem = _runtime_problem(module, kind, runtime, stored, block, device_capability, tail, source)
             if problem is not None:
                 if explicit or (origin == "format" and _always_wrong(problem)):
                     refused[(origin, runtime, problem)].append(path)
+                    continue
+                if origin == AUTO and stored in _NO_SILENT_DEQUANT and _always_wrong(problem):
+                    # an FP4 checkpoint dequantized to bf16 is ~4x its size: only when asked for
+                    plan.problems.append(f"{where}: {path!r} is stored {stored}, which this GPU can't run ({problem}); "
+                                         "ask for `format: bf16` to serve it dequantized")
                     continue
                 plan.notes.append(f"{path}: stays bf16 ({origin} {runtime}: {problem})")
                 runtime, tail = BF16, 0
@@ -293,7 +331,7 @@ def resolve_plan(
             action = Action.REQUANT
         if action is Action.DIRECT:
             geometry = layer_geometry(module, kind)
-            misfit = geometry_problem(runtime, geometry, direct=True, kind=kind, block=block)
+            misfit = geometry_problem(runtime, geometry, direct=True, kind=kind, block=block, source=source)
             if misfit is not None:
                 # the checkpoint's scales don't land on this rank's blocks: dequantize, then quantize the shard
                 # (or serve it bf16, when the shard has no whole blocks to quantize)
@@ -309,7 +347,7 @@ def resolve_plan(
                                       f"compounds two roundings; ask for {stored} or bf16 there")].append(path)
             continue
         tail = tail if runtime != BF16 else 0
-        plan.layers[path] = LayerPlan(path, kind, stored, runtime, action, origin, block, tail)
+        plan.layers[path] = LayerPlan(path, kind, stored, runtime, action, origin, block, tail, source)
 
     for (origin, runtime, problem), paths in refused.items():
         what = repr(paths[0]) if len(paths) == 1 else f"{len(paths)} layers (e.g. {paths[:2]})"
@@ -320,11 +358,12 @@ def resolve_plan(
             f"no loader for {fmt} checkpoints yet"
         )
     for path, stored in sorted(stray.items()):
-        if stored.format not in LOADABLE:
+        if not loadable(stored):
             plan.problems.append(f"{where}: checkpoint linear {path!r} is stored {stored.format}, outside any "
                                  "layer the model declares, and this build can't dequantize it")
         else:
-            plan.layers[path] = LayerPlan(path, OTHER, stored.format, BF16, Action.DEQUANT, "model", stored.block)
+            plan.layers[path] = LayerPlan(path, OTHER, stored.format, BF16, Action.DEQUANT, "model", stored.block,
+                                          source=stored)
     return plan
 
 
@@ -335,9 +374,12 @@ def _always_wrong(problem: str) -> bool:
 
 def _runtime_problem(
     module: nn.Module, kind: str, runtime: str, stored: str, block, device_capability, tail: int = 0,
+    source=None,
 ) -> str | None:
     if not served(runtime, kind):
         return f"this build serves {runtime} on no {kind} layer yet"
+    if kind == EXPERTS and runtime == "nvfp4" and stored != "nvfp4":
+        return "this build serves nvfp4 experts as a checkpoint stores them, not quantized at load"
     need = FORMATS[runtime].min_capability
     if device_capability is not None and tuple(device_capability) < need:
         have = device_capability
@@ -355,7 +397,7 @@ def _runtime_problem(
     # as stored, the layer keeps the checkpoint's block and layout; quantized here, the format's
     as_stored = stored == runtime
     return geometry_problem(runtime, geometry, direct=False, kind=kind, block=block if as_stored else None,
-                            stored_layout=as_stored)
+                            stored_layout=as_stored, source=source if as_stored else None)
 
 
 def _action(stored: str, runtime: str) -> Action | None:
@@ -371,6 +413,7 @@ def _action(stored: str, runtime: str) -> Action | None:
 
 
 __all__ = [
-    "LOADABLE", "Action", "Geometry", "LayerPlan", "QuantPlan", "QuantizationRoot", "UNKNOWN",
+    "LOADABLE", "LOADABLE_LAYOUTS", "loadable", "Action", "Geometry", "LayerPlan", "QuantPlan", "QuantizationRoot",
+    "UNKNOWN",
     "discover_layers", "geometry_problem", "layer_geometry", "resolve_plan", "stored_formats",
 ]

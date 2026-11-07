@@ -21,6 +21,11 @@ weight_packed u8, weight_scale u8  compressed-tensors mxfp4-pack-quantized      
 weight_packed i32, weight_scale    compressed-tensors pack-quantized (int4)     w4a16
 qweight, qzeros, scales            AutoAWQ / GPTQ                               w4a16
 =================================  ==========================================  ==============
+
+An int4 base also carries its ``params`` (group size, symmetry, the scales' dtype, GPTQ's zero-point offset), which
+pick the format's variant the loader repacks it with; a GPTQ checkpoint with ``desc_act`` gets ``act_order`` on the
+bases whose ``g_idx`` is not the trivial ``k // group`` (``scan_checkpoint`` reads those small tensors), and the
+resolver refuses them.
 """
 
 from __future__ import annotations
@@ -52,11 +57,20 @@ class TensorInfo(NamedTuple):
 
 class StoredBase(NamedTuple):
     """How one checkpoint linear is stored: a format name (``formats.FORMATS`` or ``bf16``, ``unknown``) and the
-    checkpoint layout it came in (``awq``, ``gptq``, ``compressed-tensors``, ``modelopt``, ``fp8``)."""
+    checkpoint layout it came in (``awq``, ``gptq``, ``compressed-tensors``, ``modelopt``, ``fp8``). ``params``
+    are the facts a format's loader needs beyond those, as sorted ``(key, value)`` pairs (int4: ``group``,
+    ``symmetric``, ``scale_dtype``, GPTQ's ``zero_offset``, ``act_order``)."""
 
     format: str
     layout: str = ""
     block: tuple[int, int] | None = None
+    params: tuple[tuple[str, Any], ...] = ()
+
+    def param(self, key: str, default: Any = None) -> Any:
+        return dict(self.params).get(key, default)
+
+    def with_params(self, **params: Any) -> StoredBase:
+        return self._replace(params=tuple(sorted({**dict(self.params), **params}.items())))
 
 
 def split_name(name: str) -> tuple[str, str]:
@@ -71,17 +85,63 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def classify(tensors: Mapping[str, TensorInfo], method: str = "", block: tuple[int, int] | None = None) -> StoredBase:
-    """The stored format of one base from its ``suffix -> TensorInfo``; ``method`` is the config's
-    ``quant_method`` (it tells AWQ from GPTQ), ``block`` its ``weight_block_size``."""
-    w = tensors.get("weight")
+def _int4_bits(config: Mapping[str, Any]) -> int:
+    """The weight bits an int4-looking checkpoint declares (AutoAWQ ``bits`` / ``w_bit``, GPTQ ``bits``,
+    compressed-tensors ``config_groups.*.weights.num_bits``, the largest of its groups); 4 when it says nothing."""
+    bits = config.get("bits", config.get("w_bit"))
+    if bits is None:
+        groups = config.get("config_groups") or {}
+        widths = [int(((g or {}).get("weights") or {}).get("num_bits", 4)) for g in groups.values()]
+        bits = max(widths, default=4)
+    return int(bits)
+
+
+def _w4a16(tensors: Mapping[str, TensorInfo], method: str, config: Mapping[str, Any]) -> StoredBase:
+    """An int4 base: AutoAWQ (``qweight [K, N/8]``, ``qzeros [K/g, N/8]``, ``scales [K/g, N]``), GPTQ
+    (``qweight [K/8, N]``, ``qzeros``, ``scales``, ``g_idx [K]``) or compressed-tensors pack-quantized
+    (``weight_packed [N, K/8]``, ``weight_scale [N, K/g]``, ``weight_zero_point [N/8, K/g]`` if asymmetric)."""
+    if _int4_bits(config) != 4:
+        return StoredBase(UNKNOWN, method)
     if "qweight" in tensors:
         layout = method if method in ("awq", "gptq") else ("gptq" if "g_idx" in tensors else "awq")
-        return StoredBase("w4a16", layout)
+        qweight, scales = tensors["qweight"], tensors.get("scales")
+        k = qweight.shape[0] * (8 if layout == "gptq" else 1)
+        if layout == "gptq":
+            symmetric = bool(config.get("sym", True))
+            # GPTQ's v1 checkpoints store each zero point minus one; gptq_v2 (GPTQModel) stores it as is
+            extra = {"zero_offset": 0 if config.get("checkpoint_format") == "gptq_v2" else 1}
+        else:
+            symmetric, extra = "qzeros" not in tensors, {}
+        groups = scales.shape[0] if scales is not None and len(scales.shape) == 2 else 0
+        scale_dtype = scales.dtype if scales is not None else ""
+    else:
+        packed, scale = tensors["weight_packed"], tensors.get("weight_scale")
+        layout, k = "compressed-tensors", packed.shape[-1] * 8
+        symmetric, extra = "weight_zero_point" not in tensors, {}
+        groups = scale.shape[-1] if scale is not None and len(scale.shape) == 2 else 0
+        scale_dtype = scale.dtype if scale is not None else ""
+    if not groups or k % groups:
+        return StoredBase(UNKNOWN, layout)
+    group = k // groups
+    return StoredBase("w4a16", layout, (1, group)).with_params(
+        group=group, symmetric=symmetric, scale_dtype=scale_dtype, **extra)
+
+
+def classify(
+    tensors: Mapping[str, TensorInfo], method: str = "", block: tuple[int, int] | None = None,
+    config: Mapping[str, Any] | None = None,
+) -> StoredBase:
+    """The stored format of one base from its ``suffix -> TensorInfo``; ``method`` is the config's
+    ``quant_method`` (it tells AWQ from GPTQ), ``block`` its ``weight_block_size``, ``config`` the whole
+    ``quantization_config`` (an int4 checkpoint's bits, GPTQ's symmetry and zero-point convention)."""
+    w = tensors.get("weight")
+    config = config or {}
+    if "qweight" in tensors:
+        return _w4a16(tensors, method, config)
     if "weight_packed" in tensors:
         packed, scale = tensors["weight_packed"], tensors.get("weight_scale")
         if packed.dtype == "I32":
-            return StoredBase("w4a16", "compressed-tensors")
+            return _w4a16(tensors, method or "compressed-tensors", config)
         if scale is not None and scale.dtype == "U8":
             return StoredBase("mxfp4", "compressed-tensors", (1, 32))
         if scale is not None and scale.dtype.startswith("F8"):
@@ -158,6 +218,8 @@ class CheckpointQuant:
     method: str = ""
     block: tuple[int, int] | None = None
     bases: dict[str, StoredBase] = field(default_factory=dict)
+    # the config's ``quantization_config`` (or modelopt's ``hf_quant_config.json``), as read
+    config: dict[str, Any] = field(default_factory=dict)
     # base -> its tensors' suffixes, for the loader's pairing
     suffixes: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
@@ -183,10 +245,40 @@ class CheckpointQuant:
         bases, suffixes = {}, {}
         for base, parts in grouped.items():
             # norms, biases-only, embeddings' `weight` with no linear around it still classify as bf16
-            bases[base] = classify(parts, method, block)
+            bases[base] = classify(parts, method, block, quant_config)
             suffixes[base] = tuple(sorted(parts))
-        return cls(method=method, block=block, bases=bases, suffixes=suffixes)
+        return cls(method=method, block=block, bases=bases, suffixes=suffixes, config=dict(quant_config or {}))
+
+    def mark_act_order(self, g_idx: Mapping[str, Any]) -> None:
+        """Flag the GPTQ bases whose ``g_idx`` (``base -> tensor``) isn't ``k // group``: act-order
+        (``desc_act``) checkpoints permute K, which the canonical layout and its kernels don't."""
+        import torch
+
+        for base, idx in g_idx.items():
+            stored = self.bases.get(base)
+            if stored is None or stored.format != "w4a16":
+                continue
+            group = stored.param("group")
+            trivial = torch.arange(idx.numel(), dtype=torch.int64) // group
+            if not torch.equal(idx.reshape(-1).to(torch.int64), trivial):
+                self.bases[base] = stored.with_params(act_order=True)
+
+
+def _read_g_idx(checkpoint_dir: str | Path, names: set[str]) -> dict[str, Any]:
+    """The named ``g_idx`` tensors (K int32 each, a few MB for a whole model), by base."""
+    from safetensors import safe_open
+
+    out = {}
+    for path in sorted(Path(checkpoint_dir).glob("*.safetensors")):
+        with safe_open(str(path), framework="pt") as f:
+            for name in names.intersection(f.keys()):
+                out[split_name(name)[0]] = f.get_tensor(name)
+    return out
 
 
 def scan_checkpoint(checkpoint_dir: str | Path) -> CheckpointQuant:
-    return CheckpointQuant.from_tensors(read_headers(checkpoint_dir), read_quant_config(checkpoint_dir))
+    headers = read_headers(checkpoint_dir)
+    ckpt = CheckpointQuant.from_tensors(headers, read_quant_config(checkpoint_dir))
+    if ckpt.method == "gptq" and ckpt.config.get("desc_act"):
+        ckpt.mark_act_order(_read_g_idx(checkpoint_dir, {n for n in headers if n.endswith(".g_idx")}))
+    return ckpt

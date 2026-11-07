@@ -1610,8 +1610,9 @@ class Qwen3OmniModel(Model):
         # We rewrite the name so StackedParamRule suffix matching works:
         # "experts.N.gate_proj.weight" → "experts.gate_proj.__N__.weight"
         # The weight_loader on the fused param extracts the expert index from shard_id.
-        # (a block-fp8 checkpoint's ``weight_scale_inv`` follows its weight onto ``<param>_scale_inv``)
-        m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)$", name)
+        # (a quantized checkpoint's ``weight_scale_inv``, ``weight_packed``, ... follow the weight onto
+        # ``<param>_scale_inv``, ``<param>_packed``, ...)
+        m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight\w*)$", name)
         if m:
             prefix, expert_idx, proj, suffix = m.groups()
             return f"{prefix}.experts.{proj}.__expert{expert_idx}__.{suffix}"

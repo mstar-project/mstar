@@ -114,6 +114,21 @@ class LinearFormat:
         only where ``has_glu``."""
         raise NotImplementedError
 
+    def for_stored(self, stored) -> LinearFormat:
+        """This format as one checkpoint stores it (a ``checkpoint.StoredBase``: its layout and ``params``, e.g. an
+        int4 checkpoint's group size and symmetry); self for a format with a single layout."""
+        return self
+
+    def adapt_checkpoint(self, suffix: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor] | None:
+        """One checkpoint tensor of a layer loaded as stored, before the model's name mapping sees it: renamed to
+        the suffix ``storage`` names (AWQ's ``qweight`` -> ``weight_packed``), checked, or dropped (None)."""
+        return suffix, tensor
+
+    def after_load(self, tensors: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """This rank's loaded storage (by name, in the dtypes it stands for) -> the tensors ``linear`` runs on, once
+        per layer after the load: a layout the TP loader can't shard (swizzled scales) is built here."""
+        return dict(tensors)
+
     def prepare_device(self, device: torch.device) -> None:
         """Load the format's kernels on ``device`` before any capture (once per process is enough)."""
 
@@ -465,10 +480,13 @@ class InPlaceQuant:
         storage = fmt.storage(n, k)
         if not storage:
             raise ValueError(f"{fmt.name} has no checkpoint layout to load into")
+        shards = len(self.quant_geometry().rows)
         del self.weight
         self._quant_views = {}
         for st in storage:
-            self.register_parameter(st.name, nn.Parameter(torch.empty(st.shape, dtype=st.dtype, device=device),
+            # a per-tensor scale keeps one slot per checkpoint shard (q/k/v, gate/up) until ``after_load``
+            shape = (shards,) if st.units == (None, None) and shards > 1 else st.shape
+            self.register_parameter(st.name, nn.Parameter(torch.empty(shape, dtype=st.dtype, device=device),
                                                           requires_grad=False))
             self._quant_views[st.name] = st.stands_for
         self.quant_format = fmt
@@ -499,6 +517,28 @@ class InPlaceQuant:
             self.register_parameter(name, nn.Parameter(as_container(tensor), requires_grad=False))
         self.quant_format = fmt
 
+    def quant_after_load(self) -> None:
+        """Hand this rank's loaded storage to the format's ``after_load`` and keep what it returns."""
+        views = self._quant_views
+        tensors = {}
+        for name, dtype in views.items():
+            data = getattr(self, name).data
+            tensors[name] = data if dtype is None or data.dtype == dtype else data.view(dtype)
+        out = self.quant_format.after_load(tensors)
+        if all(out.get(name) is tensors[name] for name in tensors) and out.keys() == tensors.keys():
+            return
+        self._quant_views = {}
+        for name in tensors:
+            delattr(self, name)
+        for name, tensor in out.items():
+            self._quant_views[name] = tensor.dtype if tensor.dtype.is_floating_point else None
+            self.register_parameter(name, nn.Parameter(as_container(tensor), requires_grad=False))
+        self._attach_weight_loaders()
+
+    def _quant_shard_index(self, shard_id) -> int:
+        # a per-shard scalar's slot: the stacked rules' shard ids, q/k/v or a merged index
+        return {"q": 0, "k": 1, "v": 2}.get(shard_id, shard_id) if isinstance(shard_id, str) else int(shard_id)
+
     def _attach_quant_loaders(self) -> bool:
         if self.quant_format is None:
             return False
@@ -514,6 +554,12 @@ class InPlaceQuant:
         if loaded.dtype != st.dtype:
             raise TypeError(f"{type(self).__name__}.{st.name}: the checkpoint tensor is {loaded.dtype}, "
                             f"{self.quant_format.name} keeps {st.dtype}")
+        if st.units == (None, None):
+            # a per-tensor scalar: one slot per checkpoint shard when the storage keeps one per shard
+            if param.numel() > 1 and shard_id is not None:
+                param.data[self._quant_shard_index(shard_id)] = loaded.reshape(())
+                return
+            loaded = loaded.reshape(param.shape)
         if shard_id is None:
             self.weight_loader(param, loaded, units=st.units)
         else:

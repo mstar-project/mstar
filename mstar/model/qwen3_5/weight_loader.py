@@ -59,14 +59,16 @@ def _load(
     device: torch.device | str,
     remapper,
     selectors: list[dict],
-    expected: set[str],
+    expected,
     stacked: list[StackedParamRule] | None = None,
 ) -> set[str]:
-    """Fill ``expected`` from the shards each selector picks out, or raise.
+    """Fill ``expected()`` from the shards each selector picks out, or raise.
 
     A selector (``prefix=`` or ``keys=``) only narrows which shards open;
     ``remapper`` decides what loads. An unfilled parameter is fatal, since a
-    half-loaded tower produces plausible garbage.
+    half-loaded tower produces plausible garbage. ``expected`` is asked after
+    the load: a layer loaded as a quantized checkpoint stores it under other
+    names (``mstar.quantization``).
     """
     loaded: set[str] = set()
     for selector in selectors:
@@ -76,7 +78,7 @@ def _load(
             name_remapper=remapper,
             stacked_params=stacked,
         )
-    missing = sorted(expected - loaded)
+    missing = sorted(expected() - loaded)
     if missing:
         raise ValueError(
             f"{len(missing)} parameter(s) got no weight, e.g. {missing[:5]}"
@@ -97,7 +99,7 @@ def load_qwen3_5_weights(
         selectors.append({"keys": {_LM_HEAD}})
     return _load(
         model, path, device, qwen3_5_name_remapper, selectors,
-        expected={
+        expected=lambda: {
             n for n, _ in model.named_parameters()
             # tied: the checkpoint carries no tensor for it
             if not (tied and n == _LM_HEAD)
@@ -115,5 +117,5 @@ def load_qwen3_5_vision_weights(
     return _load(
         model, path, device, qwen3_5_vision_name_remapper,
         [{"prefix": _VISION_PREFIX}],
-        expected={n for n, _ in model.named_parameters()},
+        expected=lambda: {n for n, _ in model.named_parameters()},
     )

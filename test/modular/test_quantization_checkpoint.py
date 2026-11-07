@@ -45,15 +45,17 @@ def T(dtype, *shape):
       "input_scale": T("F32")}, "modelopt", StoredBase("nvfp4", "modelopt", (1, 16))),
     # compressed-tensors pack-quantized int4 (Kimi K2.x, RedHat w4a16) and mxfp4 (Kimi K3)
     ({"weight_packed": T("I32", 256, 64), "weight_scale": T("BF16", 256, 16), "weight_shape": T("I64", 2)},
-     "compressed-tensors", StoredBase("w4a16", "compressed-tensors")),
+     "compressed-tensors", StoredBase("w4a16", "compressed-tensors", (1, 32)).with_params(
+         group=32, symmetric=True, scale_dtype="BF16")),
     ({"weight_packed": T("U8", 256, 256), "weight_scale": T("U8", 256, 16)}, "compressed-tensors",
      StoredBase("mxfp4", "compressed-tensors", (1, 32))),
     ({"weight_packed": T("U8", 256, 256), "weight_scale": T("F8_E4M3", 256, 32),
       "weight_global_scale": T("F32", 1)}, "compressed-tensors", StoredBase("nvfp4", "compressed-tensors", (1, 16))),
     ({"qweight": T("I32", 512, 32), "qzeros": T("I32", 4, 32), "scales": T("F16", 4, 256)}, "awq",
-     StoredBase("w4a16", "awq")),
+     StoredBase("w4a16", "awq", (1, 128)).with_params(group=128, symmetric=False, scale_dtype="F16")),
     ({"qweight": T("I32", 64, 256), "qzeros": T("I32", 4, 32), "scales": T("F16", 4, 256),
-      "g_idx": T("I32", 512)}, "gptq", StoredBase("w4a16", "gptq")),
+      "g_idx": T("I32", 512)}, "gptq", StoredBase("w4a16", "gptq", (1, 128)).with_params(
+          group=128, symmetric=True, scale_dtype="F16", zero_offset=1)),
     # e4m3 with no scale anywhere: not something to load as bytes
     ({"weight": T("F8_E4M3", 256, 512)}, "fp8", StoredBase("unknown", "fp8")),
 ])

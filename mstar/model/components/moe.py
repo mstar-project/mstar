@@ -715,10 +715,18 @@ class Fp8Experts:
         self.experts_fp8_block = tuple(block)
         self._reattach_loaders()
 
-    def experts_prepare(self, fmt: str, block: tuple[int, int] = (128, 128)) -> None:
-        """Hold the experts as a block-fp8 checkpoint stores them, before it loads."""
+    def experts_prepare(self, fmt: str, block: tuple[int, int] = (128, 128), source=None) -> None:
+        """Hold the experts as a block-fp8 checkpoint stores them, before it loads (``source``: how the
+        checkpoint stores them, ``checkpoint.StoredBase``; one layout here)."""
         assert fmt == "fp8_block", fmt
         self._fp8_storage(block)
+
+    def experts_scales(self) -> dict[str, torch.dtype]:
+        """The experts' scale params and the float each stands for (the loader checks they all arrived)."""
+        return {"gate_up_proj_scale_inv": torch.float32, "down_proj_scale_inv": torch.float32}
+
+    def experts_after_load(self) -> None:
+        """Put the loaded experts in their kernel's layout; block fp8 runs the checkpoint's as is."""
 
     @torch.no_grad()
     def experts_quantize(self, fmt: str, block: tuple[int, int] = (128, 128)) -> None:
