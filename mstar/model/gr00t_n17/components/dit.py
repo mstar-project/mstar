@@ -7,7 +7,6 @@ whether it is a CPU stand-in or one of M\\*'s ragged resources.
 """
 from __future__ import annotations
 
-import functools
 from collections.abc import Callable, Mapping
 
 import torch
@@ -16,18 +15,12 @@ from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
-from mstar.model.components.diffusion.attention import joint_attention
 from mstar.model.gr00t_n17.config import (
     SA_SPAN,
     VL_IMAGE_SPAN,
     VL_TEXT_SPAN,
     Gr00tN17Config,
 )
-
-# The attention when no ragged resource is bound: SDPA, the DiT scaffold's
-# parity backend. Module-level so its identity is stable: a compiled region
-# guards on the callables it is handed, and a fresh one per step retraces.
-_SDPA_ATTEND = functools.partial(joint_attention, ragged=None)
 
 # Every LayerNorm in the DT is non-affine: the checkpoint's `norm1` carries
 # only its `linear`, and `norm3` carries no tensor at all.
@@ -236,14 +229,13 @@ class DiT(nn.Module):
         vl_text: torch.Tensor,
         vl_image: torch.Tensor,
         timestep: torch.Tensor,
-        attends: Mapping[str, Callable] | None = None,
+        attends: Mapping[str, Callable],
     ) -> torch.Tensor:
         """The DT's ``[B, T, dim]`` rows and the bridge's two spans to
         ``[B, T, output_dim]``, conditioned on one ``[B]`` timestep.
 
-        ``attends`` maps a span label to its attention, built once per resource
-        binding. A missing label falls back to SDPA, which is how the CPU
-        parity tests run; a served model always binds its ragged resources.
+        ``attends`` maps each span label to its attention, built once per resource
+        binding.
         The same rows as ``vl_text`` and ``vl_image`` give the reference's
         plain, unmasked ``DiT.forward``.
         """
@@ -258,7 +250,7 @@ class DiT(nn.Module):
                 hidden_states,
                 temb,
                 spans.get(span),
-                _SDPA_ATTEND if attends is None else attends.get(span, _SDPA_ATTEND),
+                attends[span],
             )
         # `shift` first, where `AdaLayerNorm` takes `scale` first (`dit.py:331`);
         # both halves look plausible, so only parity catches a swap

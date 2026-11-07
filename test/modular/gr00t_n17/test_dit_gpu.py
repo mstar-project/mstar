@@ -40,7 +40,7 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     padded_head_dim,
 )
 from mstar.engine.resources.attn.workspace import Workspace
-from mstar.model.components.diffusion.attention import joint_attention
+from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.gr00t_n17.components.dit import DiT
 from mstar.model.gr00t_n17.config import (
     SA_SPAN,
@@ -422,13 +422,14 @@ def test_swapping_the_text_and_image_spans_breaks_the_bar(stacks: _Stacks):
 
     ``_span_for`` has a cross block read the text rows when ``idx % 4 == 0``, the image rows
     otherwise. Swapped, every block still runs and every shape fits; only the rows read are wrong.
-    Both runs are on **SDPA** (``attends=None``) so the span assignment is the only difference,
+    Both runs are on **SDPA** so the span assignment is the only difference,
     and the correct run must sit inside the bar, so the bar is not just rejecting everything.
     """
     layout = stacks.equal
     with torch.no_grad():
-        correct = stacks.ours(*layout.ours_args(), layout.timestep, None).float()
-        swapped = stacks.ours(*layout.ours_args(swap=True), layout.timestep, None).float()
+        sdpa = dict.fromkeys((SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN), sdpa_attention)
+        correct = stacks.ours(*layout.ours_args(), layout.timestep, sdpa).float()
+        swapped = stacks.ours(*layout.ours_args(swap=True), layout.timestep, sdpa).float()
 
     bar = _BAR * layout.floor_mean
     assert _mean_error(correct, layout.want) <= bar, "the control's own baseline misses the bar"

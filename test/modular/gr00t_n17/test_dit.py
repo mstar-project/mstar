@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import Timesteps
 
 from mstar.model.gr00t_n17.components.dit import (
-    _SDPA_ATTEND,
     ActionPositionEmbedding,
     AdaLayerNorm,
     BasicTransformerBlock,
@@ -890,18 +889,15 @@ def _dit_reference(
     image: torch.Tensor,
     timestep: torch.Tensor,
     deviation: str | None = None,
-    attends: dict | None = None,
 ) -> torch.Tensor:
     """The timestep encoder, every block through ``_block_reference`` with spans from
-    ``_reference_span``, then the head. ``attends`` defaults to the stand-in."""
+    ``_reference_span``, then the head."""
     temb = dit.timestep_encoder(timestep)
     rows = {SA_SPAN: None, VL_TEXT_SPAN: text, VL_IMAGE_SPAN: image}
     for index, block in enumerate(dit.transformer_blocks):
         span = _reference_span(index, dit.attend_text_every_n_blocks)
         # `deviation` is a reading of the head; the blocks here are always the right wiring
-        hidden = _block_reference(
-            block, hidden, temb, rows[span], None, (attends or {}).get(span, _sdpa),
-        )
+        hidden = _block_reference(block, hidden, temb, rows[span], None, _sdpa)
     return _head_reference(dit, hidden, temb, deviation)
 
 
@@ -1138,12 +1134,6 @@ def _spy(label: str, seen: list) -> Callable:
     return attend
 
 
-def _zeros(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """An attention whose output is nothing, in the contract's shape: it keeps ``to_out`` and
-    both residuals alive, so a supplied attention is distinguishable from the fallback."""
-    return torch.zeros_like(q)
-
-
 @torch.no_grad()
 def test_each_block_is_handed_the_attention_its_own_span_asked_for():
     """One attention per span over text, self, image, self, with lengths 41, 37 and 256, so a
@@ -1166,64 +1156,6 @@ def test_each_block_is_handed_the_attention_its_own_span_asked_for():
         (SA_SPAN, _SA_ROWS),
     ]
     assert torch.equal(out, _dit_reference(dit, hidden, text, image, timestep))
-
-
-@torch.no_grad()
-def test_a_span_with_no_attention_of_its_own_is_read_with_sdpa():
-    """The fallback the parity backend runs on: ``None``, an empty map and a partial map agree,
-    and a supplied label is read with what was supplied. The fallback is bit-identical to this
-    file's stand-in, so every parity test above also covers the default path."""
-    dit = _dit(4)
-    hidden = _dit_rows(_REQUESTS, _SA_ROWS)
-    text = _bridge_rows(True, _REQUESTS, _TEXT_ROWS, seed=30)
-    image = _bridge_rows(True, _REQUESTS, _IMAGE_ROWS, seed=31)
-    timestep = _steps()
-    default = dit(hidden, text, image, timestep)
-
-    assert torch.equal(default, dit(hidden, text, image, timestep, {}))
-    assert torch.equal(default, dit(hidden, text, image, timestep, {SA_SPAN: _SDPA_ATTEND}))
-    assert torch.equal(
-        default, dit(hidden, text, image, timestep, dict.fromkeys(_STAND_INS, _SDPA_ATTEND)),
-    )
-    assert torch.equal(default, _dit_reference(dit, hidden, text, image, timestep))
-
-    supplied = dit(hidden, text, image, timestep, {VL_IMAGE_SPAN: _zeros})
-    assert not torch.equal(supplied, default)
-    assert torch.equal(
-        supplied,
-        _dit_reference(dit, hidden, text, image, timestep, attends={VL_IMAGE_SPAN: _zeros}),
-    )
-
-
-@torch.no_grad()
-def test_the_sdpa_fallback_is_one_object_and_not_one_per_forward(monkeypatch):
-    """A compiled region guards on the callables' identity, so a fallback built per forward
-    retraces every step (the bound ``resource.run`` is one object per label for this reason)."""
-    seen: list = []
-    forward = BasicTransformerBlock.forward
-
-    def record(self, hidden_states, temb, encoder_hidden_states, attend):
-        seen.append(attend)
-        return forward(self, hidden_states, temb, encoder_hidden_states, attend)
-
-    monkeypatch.setattr(BasicTransformerBlock, "forward", record)
-    hidden = _dit_rows(_REQUESTS, _SA_ROWS)
-    text = _bridge_rows(True, _REQUESTS, _TEXT_ROWS, seed=30)
-    image = _bridge_rows(True, _REQUESTS, _IMAGE_ROWS, seed=31)
-    timestep = _steps()
-
-    dit = _dit(4)
-    dit(hidden, text, image, timestep)
-    dit(hidden, text, image, timestep)  # a second denoising step on the same stack
-    _dit(4)(hidden, text, image, timestep)  # and a second stack, so it is not per instance
-    assert len(seen) == 12
-    assert all(attend is _SDPA_ATTEND for attend in seen)
-    assert len({id(attend) for attend in seen}) == 1
-
-    # the spans a partial map leaves out fall back to that same object, not to a copy per span
-    dit(hidden, text, image, timestep, {SA_SPAN: _zeros})
-    assert [attend is _SDPA_ATTEND for attend in seen[12:]] == [True, False, True, False]
-    assert len({id(attend) for attend in seen}) == 2
 
 
 # ----------------------------------------------------------------------------

@@ -476,7 +476,6 @@ def test_the_request_inputs_carry_no_batch_dim_and_stack_into_the_forwards_shape
     assert single["vl_image"].shape == (_IMG, node.config.backbone_embedding_dim)
     assert single["state"].shape == (1, node.config.input_embedding_dim)
     assert int(single["embodiment_id"]) == _EMBODIMENT
-    # the spans come from the tensors, not the key, so a disagreeing key shows in the step's segments
     assert torch.equal(single["vl_text"], inputs["vl_text"][0])
     assert torch.equal(single["vl_image"], inputs["vl_image"][0])
 
@@ -569,9 +568,7 @@ def test_the_captures_placeholders_are_the_shapes_and_dtypes_a_real_row_brings()
 
 
 def test_the_attention_callables_are_memoised_per_binding_and_dropped_on_rebinding():
-    """A compiled region guards on the callables' identity, so fresh ones per step retrace
-    every step. After a rebind the old callables would run the retired resource's plan.
-    Identity is checked per span too: a cached dict of fresh callables would still retrace."""
+    """After a rebind the old callables would run the retired resource's plan."""
     node = _node()
     _, step = _declare(node)
     _bind(node, step)
@@ -608,36 +605,6 @@ def test_each_span_reads_its_own_resource_under_the_label_the_step_declared():
     # every label a callable asks for is a label the step's resource declared
     for key, span_labels in ((DT_ATTN, [SA_SPAN]), (DT_XATTN, [SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN])):
         assert {segment.label for segment in step.steps[key].segments} == set(span_labels)
-
-
-def test_nothing_bound_leaves_attends_empty_and_the_dt_reads_every_span_with_sdpa():
-    """Nothing bound is the parity backend: every span runs on SDPA. Unbound spans are left
-    out, not mapped to ``None``, which would reach ``joint_attention`` and raise mid-forward."""
-    node = _node()
-    _, step = _declare(node)
-    _bind(node, step, keys=())
-
-    assert node.attends() == {}
-    out = node.denoise(
-        None, _SHAPE, latents=_latents(1), **_scalars(0), **_stacked_cond(node.config),
-    )
-    assert out.shape == (1, _HORIZON, _ACTION_DIM)
-
-
-@pytest.mark.parametrize(
-    "bound,missing",
-    [((DT_ATTN,), DT_XATTN), ((DT_XATTN,), DT_ATTN)],
-    ids=["self-attention only", "cross-attention only"],
-)
-def test_binding_one_of_the_two_resources_is_refused(bound, missing):
-    """All or nothing: a half binding plans a kernel the forward does not use, and a captured
-    graph records SDPA where the plan says ragged, with the arithmetic still right."""
-    node = _node()
-    _, step = _declare(node)
-    _bind(node, step, keys=bound)
-
-    with pytest.raises(RuntimeError, match=missing):
-        node.attends()
 
 
 def test_the_two_resources_planned_from_the_step_are_the_sdpa_fallback_at_one_request():

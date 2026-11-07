@@ -928,7 +928,7 @@ def _served(path: Path, drop: str | None = None) -> tuple[Gr00tN17Model, dict[st
 
 def test_get_submodule_builds_each_node_once_and_hands_back_the_same_object(tmp_path):
     """Cached by identity: the model loads weights into the object it hands out, the
-    engine binds resources onto it, and compiled regions guard on it."""
+    engine binds resources onto it."""
     model, _ = _served(tmp_path)
     built = {name: model.get_submodule(name) for name in _SUBMODULES}
 

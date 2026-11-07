@@ -14,7 +14,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.ragged.config import RaggedCrossAttentionStep, cross_label
 from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
-from mstar.model.components.diffusion.attention import joint_attention
+from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
@@ -523,39 +523,20 @@ class Gr00tN17DenoiseStepSubmodule(DenoiseLoopSubmodule):
         self._attends = None  # the memoised callables hold the old resources
 
     def attends(self) -> dict[str, Any]:
-        """One callable per span, built once per binding.
-
-        A compiled region guards on the *identity* of the callables it is handed, so
-        a fresh one per step retraces it every step. A span whose resource is not
-        bound is left out, and the DT reads it with SDPA -- the parity backend.
-        """
+        """One callable per span, built once per binding; an unbound resource reads
+        with SDPA, the parity backend, as ``ltx2_5``'s does."""
         if self._attends is None:
-            self_attn = self.node_resources.get(DT_ATTN)
-            cross = self.node_resources.get(DT_XATTN)
-
-            def on(resource, label):
+            def on(key, label):
+                resource = self.node_resources.get(key)
                 if resource is None:
-                    return None
-                return functools.partial(
-                    joint_attention, ragged=functools.partial(resource.run, label=label),
-                )
+                    return sdpa_attention
+                return functools.partial(joint_attention, ragged=functools.partial(resource.run, label=label))
 
-            # All or nothing. Nothing bound is the parity backend (SDPA, as the CPU
-            # tests run); a deployment binds both (`get_node_resources`). Partly
-            # bound is incoherent: `declare_step` declares both, so the engine
-            # would plan a kernel the forward does not use.
-            if (self_attn is None) != (cross is None):
-                raise RuntimeError(
-                    f"denoise_step has {DT_ATTN if self_attn is not None else DT_XATTN} "
-                    f"but not {DT_XATTN if self_attn is not None else DT_ATTN}; it "
-                    "declares a step for both, so declare both specs or neither"
-                )
-            built = {
-                SA_SPAN: on(self_attn, SA_SPAN),
-                VL_TEXT_SPAN: on(cross, cross_label(SA_SPAN, VL_TEXT_SPAN)),
-                VL_IMAGE_SPAN: on(cross, cross_label(SA_SPAN, VL_IMAGE_SPAN)),
+            self._attends = {
+                SA_SPAN: on(DT_ATTN, SA_SPAN),
+                VL_TEXT_SPAN: on(DT_XATTN, cross_label(SA_SPAN, VL_TEXT_SPAN)),
+                VL_IMAGE_SPAN: on(DT_XATTN, cross_label(SA_SPAN, VL_IMAGE_SPAN)),
             }
-            self._attends = {k: v for k, v in built.items() if v is not None}
         return self._attends
 
     def attention_segments(self, bucket_key: Gr00tN17Shape) -> Sequence[tuple[str, int]]:
