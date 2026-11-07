@@ -109,9 +109,13 @@ def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> s
     upload_dir = Path(upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
     base = os.path.basename(filename or "") or "audio.wav"
-    path = upload_dir / f"{uuid.uuid4()}_{base}"
-    path.write_bytes(audio_bytes)
-    return str(path)
+    if len(base.encode("utf-8")) > 180:
+        ext = os.path.splitext(base)[1]
+        base = "audio" + (ext if len(ext.encode("utf-8")) <= 16 else ".bin")
+    path = os.path.join(upload_dir, f"{uuid.uuid4()}_{base}")
+    with open(path, "wb") as output:
+        output.write(audio_bytes)
+    return path
 
 
 def audio_duration_seconds(path: str) -> float | None:
@@ -525,13 +529,20 @@ def merge_windows(windows: list[Window], adapter, req) -> Transcript:
         # a window of unknown length (a headerless upload to an unbounded model) gets none
         untimed = [{"start": 0.0, "end": window.duration, "text": t.text}] if t.text and window.duration else []
         window_segments = t.segments or untimed
+        end = window.duration or float("inf")
         for seg in window_segments:
             segments.append({
-                **seg, "start": seg["start"] + window.offset, "end": seg["end"] + window.offset,
+                **seg,
+                "start": min(max(seg["start"], 0.0), end) + window.offset,
+                "end": min(max(seg["end"], seg["start"], 0.0), end) + window.offset,
                 "temperature": window.temperature, "compression_ratio": window.compression_ratio,
             })
         for word in t.words:
-            words.append({**word, "start": word["start"] + window.offset, "end": word["end"] + window.offset})
+            words.append({
+                **word,
+                "start": min(max(word["start"], 0.0), end) + window.offset,
+                "end": min(max(word["end"], word["start"], 0.0), end) + window.offset,
+            })
         language = language or t.language
     for idx, seg in enumerate(segments):
         seg["id"] = idx

@@ -221,9 +221,10 @@ def test_srt_and_vtt_rendering():
     assert vtt.startswith("WEBVTT\n\n00:00:00.000 --> 00:00:01.500\nHi")
 
 
-def test_save_upload_keeps_extension_and_drops_directories(tmp_path):
-    path = serving_transcriptions.save_upload(b"x", "../../evil.flac", tmp_path)
-    assert Path(path).parent == tmp_path and path.endswith("_evil.flac")
+@pytest.mark.parametrize("filename", ["../../evil.flac", "x" * 300 + ".flac", "é" * 200 + ".flac"])
+def test_save_upload_keeps_extension_and_drops_directories(tmp_path, filename):
+    path = serving_transcriptions.save_upload(b"x", filename, tmp_path)
+    assert Path(path).parent == tmp_path and path.endswith(".flac")
     assert Path(path).read_bytes() == b"x"
 
 
@@ -929,3 +930,13 @@ def test_client_gone_mid_long_form_stops_submitting(client_and_stub, monkeypatch
     assert len(stub.submits) == submitted
     assert set(stub.released) == {s["request_id"] for s in stub.submits[2:]}
     assert not list(stub.upload_dir.iterdir())
+
+
+def test_window_timestamps_cannot_overlap_the_next_window():
+    adapter = adapters.WhisperAdapter()
+    req = TranscriptionRequest(model="whisper", response_format="verbose_json")
+    window = serving_transcriptions.Window(path="", offset=7.0, duration=7.0,
+        raw_text="<|0.00|>hello<|7.22|>")
+    t = serving_transcriptions.merge_windows([window], adapter, req)
+    assert t.segments[0]["start"] == 7.0
+    assert t.segments[0]["end"] == 14.0
