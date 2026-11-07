@@ -14,8 +14,14 @@ import triton
 import triton.language as tl
 
 from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.resident_hooks import ResidentBinding, no_resident_effect, unbounded_repeats
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.utils.h2d import PinnedStager
+
+
+def run_rows_key(node: str) -> str:
+    return f"__run_rows_{node}"
+
 
 # One control word names both the descriptor generation and its publication phase.
 _OFFERED, _ACTIVE, _CANCELLED, _RETIRED = range(4)
@@ -120,6 +126,9 @@ class RunRows(Resource):
         self._observed = [0] * rows
         self._retired: set[int] = set()
         self._published: set[int] = set()
+        self._control_copy = (torch.empty(rows, dtype=torch.long, pin_memory=True)
+                              if device.type == "cuda" else None)
+        self._control_ready = None
         if self.publication_stream is not None:
             # Compilation alone leaves CUDA module loading until first launch,
             # which can wait for the active WHILE. Load the one scalar ABI now;
@@ -130,6 +139,44 @@ class RunRows(Resource):
     @classmethod
     def build(cls, spec: RunRowsSpec, info: EngineResourceInfo) -> RunRows:
         return cls(info.device, spec.rows, spec.capacity, spec.binding_width)
+
+    def repeat_refusal(self, walk: str, host_step=None) -> str | None:
+        return None  # only the captured boundary changes membership
+
+    def resident_binding(self) -> ResidentBinding:
+        return ResidentBinding(
+            check_streams=no_resident_effect, bind=no_resident_effect, row=no_resident_effect,
+            stage=no_resident_effect, gather=no_resident_effect, run_gather=no_resident_effect,
+            commit_in_graph=no_resident_effect, advance=no_resident_effect,
+            check_horizon=self._check_horizon, max_repeats=unbounded_repeats, rewind_run=no_resident_effect,
+        )
+
+    def _check_horizon(self, step, ctx) -> None:
+        if ctx.slot_lease is None or ctx.slot_lease.bucket.bs > self.rows:
+            raise ValueError("joining membership does not cover this capture")
+
+    def available_rows(self, width: int) -> tuple[int, ...]:
+        """Observe only a completed control copy; never wait for an active run.
+
+        The next copy runs on the publication stream, independent of WHILE.
+        A stale observation can postpone admission but cannot retire a newer
+        descriptor: acknowledgement checks the full generation word.
+        """
+        if not 0 < width <= self.rows:
+            raise ValueError("membership polling exceeds its capture prefix")
+        if self.publication_stream is None:
+            self.acknowledge(self.control.tolist())
+        else:
+            if self._control_ready is not None and self._control_ready.query():
+                self.acknowledge(self._control_copy.tolist())
+                self._control_ready = None
+            if self._control_ready is None:
+                with torch.cuda.stream(self.publication_stream):
+                    self._control_copy.copy_(self.control, non_blocking=True)
+                    self._control_ready = torch.cuda.Event()
+                    self._control_ready.record(self.publication_stream)
+        return tuple(row for row, handle in enumerate(self._row_handles[:width])
+                     if (not handle or handle in self._retired) and self._free)
 
     @property
     def idle(self) -> bool:

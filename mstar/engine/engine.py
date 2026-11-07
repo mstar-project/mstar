@@ -72,7 +72,7 @@ from mstar.engine.resources.resident import (
     watch_table_reads,
     watched_counts,
 )
-from mstar.engine.resources.run_rows import RunRow
+from mstar.engine.resources.run_rows import RunRow, RunRowsSpec, run_rows_key
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -759,6 +759,7 @@ class Engine:
         kv_cache_type=None,
         model: "Model | None" = None,
         row_nodes: Collection[str] = (),
+        joining: Mapping[str, int] | None = None,
     ):
         """``row_nodes``: the nodes whose config asks to keep their loop-back
         signals in device rows, beside those that declare a ``DeviceLoopback``."""
@@ -774,6 +775,18 @@ class Engine:
         # resource -> every node declaring it, on this worker or another
         declared_by: dict[str, frozenset[str]] = {}
         specs = [*specs, *self._row_specs(submodules, row_nodes), *self._iteration_specs(submodules)]
+        for node, limit in (joining or {}).items():
+            if node not in submodules:
+                continue
+            if device.type != "cuda" or parallel_groups.get_joint_group_for_node(node).world_size != 1:
+                raise ValueError(f"{node}: join_rows needs one CUDA rank")
+            configs = submodules[node].get_accelerator_graph_configs(device, 1)
+            rows = max((max(c.capture_batch_sizes or AcceleratorGraphRunner.CAPTURE_BATCH_SIZES)
+                        for c in configs), default=0)
+            if not rows:
+                raise ValueError(f"{node}: join_rows needs whole-forward captures")
+            specs.append(RunRowsSpec(resource_key=run_rows_key(node), nodes={node}, rows=rows,
+                                     capacity=rows * (limit + 1), binding_width=2))
         specs_by_key = resolve_spec_dependencies(specs)
         instance = {node: parallel_groups.get_joint_group_for_node(node).world_size for node in node_names}
         checkpoint = model.checkpoint_path() if model is not None else None
@@ -1089,7 +1102,11 @@ class Engine:
         for node_name, walk in carried:
             if node_name in self._submodules:
                 for resource in self._submodules[node_name].resources.values():
-                    resource.ask_repeats(walk)
+                    config = device_stops.get((node_name, walk))
+                    if config is not None and config.join_rows:
+                        resource.ask_repeats(walk, join_rows=True)
+                    else:
+                        resource.ask_repeats(walk)
         # before capture: a region inside a captured graph compiles in its warm-up
         self._compile_regions()
         ag_runners: dict[str, AcceleratorGraphRunner] = {}
@@ -1810,6 +1827,9 @@ class Engine:
             return
         mgmt.device_stops[graph_walk] = policy
         mgmt.refills[graph_walk] = config.refill_at
+        if config.join_rows and self._runner.prefix_chain_keys(node_name):
+            runner.refuse_run(graph_walk, "resource: joining rows cannot key a prefix chain")
+            return
         if iteration:
             refusal = None
             if loop is None or (policies and set(policies) != {loop.name}):
@@ -1838,6 +1858,7 @@ class Engine:
             mgmt.run_columns.get(graph_walk, frozenset()),
             frozenset(getattr(mgmt.submodule, "ITERATION_INPUTS", None) or ()), config.refill_at,
             config.stream_tokens, loop=loop,
+            membership=mgmt.resources[run_rows_key(node_name)] if config.join_rows else None,
         ))
 
     def ask_ring(self, node_name: str, signal: str, depth: int, walks: Collection[str]) -> LoopbackRows | str:
@@ -1999,6 +2020,7 @@ class Engine:
     def _write_routed_rows(
         batch: ExecutingBatch, mgmt: SubmoduleManagement, slot, engine_inputs: ModelInputsFromEngine,
         preprocessed: Mapping[str, Any],
+        *, stager=None,
     ) -> None:
         """A capture reads its rows at its head, so what a row brought routed
         (its first step here) goes into them first: a row's one host write."""
@@ -2011,7 +2033,10 @@ class Engine:
         for signal, name in slot.row_heads.items():
             value = preprocessed.get(name)
             if isinstance(value, torch.Tensor):
-                mgmt.loopback_rows.write_rows(signal, rids, value, routed)
+                if stager is None:
+                    mgmt.loopback_rows.write_rows(signal, rids, value, routed)
+                else:
+                    mgmt.loopback_rows.write_rows(signal, rids, value, routed, stager=stager)
 
     def resident_asked(self, node_name: str) -> bool:
         return resident_asked(self._submodules[node_name].submodule)
@@ -2775,12 +2800,10 @@ class Engine:
         if set(active.run_rows) != set(active.request_ids):
             raise ValueError("joining needs pinned incumbent descriptor readers")
         ctx = batch.step_context
-        if ctx.repeats > active.step_context.repeats or ctx.repeats < 1:
-            raise ValueError("joining horizon exceeds the active capture")
+        if ctx.repeats != active.step_context.repeats or ctx.repeats < 1:
+            raise ValueError("joining rows must reserve the complete active capture horizon")
         if batch.inputs is None or batch.failed_requests or batch.skipped_rids or batch.cached_rids:
             raise ValueError("joining needs a successfully prepared ordinary row")
-        if slot.row_heads and batch.kept_rows != [True]:
-            raise ValueError("joining needs its loop-back inputs already held by their owner")
         rid = batch.request_ids[0]
         ctx.slot, ctx.slot_lease, ctx.resident = lease.slot, lease, mgmt.resident
         step = batch.step = self._declare_step(batch, [rid], batch.inputs, mgmt.submodule, ctx, batch.step)
@@ -2795,10 +2818,23 @@ class Engine:
             if not outcome.ready:
                 return None
             plan = ctx.resident.prepare_rows(step, ctx)
+            if slot.row_heads:
+                inputs, infos = self._pad_batch(batch, mgmt, lease)
+                engine_inputs, preprocessed = self._preprocess_step(
+                    batch, mgmt, [rid], inputs, infos, ctx, lease, step,
+                )
+                for name, captured in slot.static_inputs.items():
+                    if not isinstance(captured, torch.Tensor) and preprocessed.get(name) != captured:
+                        raise ValueError("joining inputs change a captured non-tensor specialization")
+                if batch.kept_rows != [True] and any(
+                    not isinstance(preprocessed.get(name), torch.Tensor) for name in slot.row_heads.values()
+                ):
+                    raise ValueError("joining row has no routed value for a captured input owner")
+                self._write_routed_rows(batch, mgmt, slot, engine_inputs, preprocessed, stager=membership.stager)
             if slot.run.window is not None:
                 loop = self._loops[batch.node_name, batch.graph_walk]
                 padded = [rid, *slot.dummy_rids[1:]]
-                snapshot = self._iteration_columns(
+                snapshot = batch.iteration_columns or self._iteration_columns(
                     batch.node_name, mgmt.submodule, ctx, padded, batch.per_request_info_wrapped,
                     batch.per_request_input_tensors, actual_loop=loop,
                 )
@@ -2880,6 +2916,7 @@ class Engine:
         width = max(ctx.run_counts[rid] for rid in batch.request_ids)
         if ctx.repeats != width:
             raise ValueError("run output width must match its settled logical receipt")
+        columns = self.run_columns(batch.node_name, batch.graph_walk)
         rows = []
         for rid in batch.request_ids:
             descriptor = batch.run_rows[rid]
@@ -2887,6 +2924,10 @@ class Engine:
             output = self._run_row_output(records, descriptor.handle, width)
             if output is None or actual != ctx.run_counts[rid]:
                 raise ValueError("descriptor output count disagrees with its settled receipt")
+            for values in (output.row_outputs, output.output_spans):
+                for name, value in (values or {}).items():
+                    if name not in columns:
+                        values[name] = value[:, actual - 1]
             rows.append(output)
 
         def join(attribute: str, excluded=frozenset()):
@@ -2907,7 +2948,7 @@ class Engine:
             if batch.ring_width == 1:
                 ring_raw = BatchedModelOutput(
                     check_stop_buffers={k: v[:, 0] for k, v in (raw.check_stop_buffers or {}).items()},
-                    row_outputs={k: v[:, 0] for k, v in (raw.row_outputs or {}).items()},
+                    row_outputs={k: v[:, 0] if k in columns else v for k, v in (raw.row_outputs or {}).items()},
                 )
             self._write_rings(mgmt, batch, ring_raw)
         outputs = self._collect_outputs(
@@ -3244,9 +3285,6 @@ class Engine:
     ) -> tuple[ModelInputsFromEngine, dict[str, Any]]:
         """Plan and preprocess an admitted ordinary step, without launching it."""
         nvtx = self._enable_nvtx
-        cg_runner = submodule_mgmt.accelerator_graph_runner
-        submodule = submodule_mgmt.submodule
-        rids = list(ctx.padded_request_ids)
 
         if step is not None:
             if lease is not None and step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
@@ -3289,6 +3327,17 @@ class Engine:
                 if nvtx:
                     range_pop()
 
+        return self._preprocess_step(batch, submodule_mgmt, request_ids, inputs, req_info, ctx, lease, step)
+
+    def _preprocess_step(
+        self, batch: ExecutingBatch, submodule_mgmt: SubmoduleManagement,
+        request_ids: list[int], inputs: list[NodeInputs], req_info: Mapping[int, CurrentForwardPassInfo],
+        ctx: StepContext, lease: SlotLease | None, step: SubmoduleStep | None,
+    ) -> tuple[ModelInputsFromEngine, dict[str, Any]]:
+        """Prepare declared inputs without planning or writing capture buffers."""
+        nvtx = self._enable_nvtx
+        cg_runner, submodule = submodule_mgmt.accelerator_graph_runner, submodule_mgmt.submodule
+        rids = list(ctx.padded_request_ids)
         laps = PhaseLaps("engine.")
         engine_inputs = ModelInputsFromEngine(
             request_ids=rids,

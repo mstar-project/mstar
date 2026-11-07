@@ -95,6 +95,7 @@ class FlashInferManager(AttentionManager):
         self._decode_tensor_cores = decode_tensor_cores
         # walks asked to repeat: only tensor-core decode reads a row's length per replay
         self._repeat_walks: set[str] = set()
+        self._joining_walks: set[str] = set()
         self._decode_fmha = (
             decode_fmha and dtype == torch.bfloat16 and sliding_window is None
             and fmha_decode_applies(device)
@@ -105,8 +106,10 @@ class FlashInferManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def ask_repeats(self, walk: str) -> None:
+    def ask_repeats(self, walk: str, *, join_rows: bool = False) -> None:
         self._repeat_walks.add(walk)
+        if join_rows:
+            self._joining_walks.add(walk)
 
     def repeat_note(self, walk: str) -> str | None:
         if walk in self._repeat_walks and not self._decode_tensor_cores:
@@ -155,10 +158,8 @@ class FlashInferManager(AttentionManager):
             raise ValueError("new attention rows must name their captured addressing")
         stream = ctx.resident._walk_streams[ctx.graph_walk][self._kv_cache_name]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=lease.bucket, slot=lease.buffer_slot, label=stream.label))
-        if not isinstance(wrapper, FmhaDecodeWrapper):
-            # The fixed-grid FlashInfer operation exists, but its manager has
-            # not yet selected that binding before capture. A host page plan
-            # cannot address a row published after it was submitted.
+        if not (isinstance(wrapper, FmhaDecodeWrapper)
+                or isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None):
             raise ValueError("attention must gather both pages and lengths inside its capture")
 
     def resident_binding(self) -> ResidentBinding:
@@ -192,7 +193,9 @@ class FlashInferManager(AttentionManager):
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
         pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.buffer_slot, label=stream.label))
-        if isinstance(wrapper, FmhaDecodeWrapper) and not stream.reads:
+        resident = (isinstance(wrapper, FmhaDecodeWrapper)
+                    or isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None)
+        if resident and not stream.reads:
             table = step.block_tables[pool]
             wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
             step.reads_tables = True
@@ -244,6 +247,10 @@ class FlashInferManager(AttentionManager):
             **self._wrapper_kv_kwargs,
             "max_num_pages": captured_page_capacity(num_rows, bucket.num_tokens, self._kv_config, self._group),
         }
+        joining = bucket.graph_walk in self._joining_walks
+        if joining:
+            pages = (self._kv_config.max_seq_len + self._group.page_size - 1) // self._group.page_size
+            kv_kwargs["max_num_pages"] = num_rows * pages
         split = self._splits.get(bucket.graph_walk)
         if split is not None:
             # its own workspaces: both wrappers are planned for the one step
@@ -268,6 +275,8 @@ class FlashInferManager(AttentionManager):
                 use_tensor_cores=self._decode_tensor_cores or bucket.graph_walk in self._repeat_walks,
                 **kv_kwargs,
             )
+            if joining and isinstance(wrapper, FlashInferDecodeWrapper):
+                wrapper.plan_resident(pages, self._dtype)
         else:
             wrapper = FlashInferPrefillWrapper(
                 workspace_buffer=workspace,
@@ -385,6 +394,12 @@ class FlashInferManager(AttentionManager):
                     indptrs.qo_indptr[-1] == len(indptrs.qo_indptr) - 1
                 )
                 wrapper = self._eager_wrapper(label, is_decode, ctx.slot)
+
+            if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper._resident_pages is not None:
+                # Its full grid was planned once before capture. Current owner
+                # pages and lengths are gathered by the recorded body itself.
+                plan_states[label] = wrapper
+                continue
 
             kwargs = indptrs.to_kwargs_dict()
             if ctx.repeats > 1 and isinstance(wrapper, FlashInferDecodeWrapper):

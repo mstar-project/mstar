@@ -36,7 +36,7 @@ from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.device_run import RUN_REPLAYS, RUN_SKIPPED, run_item
+from mstar.engine.device_run import RUN_DESCRIPTORS, RUN_REPLAYS, RUN_SKIPPED, run_item
 from mstar.engine.engine import ExecutingBatch, ExecutionGroup
 from mstar.engine.resources import AdmitFailedReason, AllocationFailed
 from mstar.engine.resources.kv.config import without_layouts
@@ -2032,6 +2032,19 @@ class Worker(RepeatingSteps):
             engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
             repeats=max(batch.repeats, self._unchained_repeats(batch)),
         )
+        if self._step_repeats is not None and self._step_repeats.config(batch.node_name).join_rows:
+            bound = node_batch.step_context.repeats
+            if node_batch.stream_windows:
+                bound = min(bound, *(self.streams.window_bound(rid, edge)
+                                      for rid, edges in node_batch.stream_windows.items() for edge in edges))
+            if self._ring_signals.get(batch.node_name):
+                room = self.engine_manager.get_engine(batch.node_name).ring_room(
+                    batch.node_name, node_batch.request_ids,
+                )
+                bound = min(bound, max(1, room or 1))
+            if self._walk_drivers:
+                bound = self._steady_consumer_walks(batch, node_batch, node_batch.request_ids, bound)
+            node_batch.step_context.repeats = max(1, bound)
         if batch.tp_seq >= 0:
             node_batch.step_context.repeats = batch.repeats
             node_batch.step_context.tp_repeats = batch.repeats
@@ -5306,6 +5319,9 @@ class Worker(RepeatingSteps):
         and the (node, walk) to exclude on the non-speculative path."""
         if pending is not None and pending.group is not None:
             return None, None
+        if (pending is not None and self._step_repeats is not None
+                and self._step_repeats.config(pending.node_name).join_rows):
+            return None, None  # one closed publication window owns the next graph step
         speculation = None
         yield_away_from_target = None
         batch = None
@@ -5801,7 +5817,9 @@ class Worker(RepeatingSteps):
                     laps.skip()
                     # set node._in_flight to false, since
                     # the node has just completed
-                    self._clear_in_flight_flag(pending.batch)
+                    live_run = RUN_DESCRIPTORS in (outputs.check_stop_buffers or {})
+                    if not live_run:
+                        self._clear_in_flight_flag(pending.batch)
                     laps.lap("clear_in_flight")
 
                     def _maybe_clear_spec():
@@ -5930,11 +5948,13 @@ class Worker(RepeatingSteps):
                     # failed rids upstream.
                     laps.skip()
                     if pending.node_batch.admit_error is None:
-                        if self._is_device_run(pending):
+                        finished = False
+                        if live_run or self._is_device_run(pending):
                             with self._span("worker.await_run", cpu="worker.await_run.cpu"):
-                                self._await_run(pending, spec_pending, lanes, gpu_executor)
+                                finished = self._await_run(pending, spec_pending, lanes, gpu_executor)
                             laps.skip()
-                        self._finish_step(pending, outputs)
+                        if not finished:
+                            self._finish_step(pending, outputs)
                         laps.skip()
 
                     # After N, while N+1 runs: the same thread, but not ahead of

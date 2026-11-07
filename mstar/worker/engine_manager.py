@@ -19,6 +19,7 @@ from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dt
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
+from mstar.worker.step_repeats import RepeatConfig
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +344,9 @@ class EngineManager:
             kv_cache_type=autocast_dtype,
             model=model,
             row_nodes=_row_nodes(model, model_config, submodules),
+            joining={node: RepeatConfig.parse(node, block).max
+                     for node, block in (model_config.get("step_repeats") or {}).items()
+                     if isinstance(block, Mapping) and block.get("join_rows")},
         )
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}

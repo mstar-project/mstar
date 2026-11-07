@@ -49,6 +49,8 @@ class RepeatConfig:
     refill_at: float | None = None
     # send a run's tokens to the client as its replays finish, not when it lands
     stream_tokens: bool = False
+    # compatible ready rows may enter a captured run at an iteration boundary
+    join_rows: bool = False
     # ready rows wait for a run: after a step that took rows, the next takes none
     # and runs at its full length (or at most this many iterations), and ready
     # work doesn't end a run early
@@ -96,7 +98,7 @@ class RepeatConfig:
             config = replace(config, stream_queue={"depth": depth})
         if config.eos_odds is not None and not (type(config.eos_odds) in (int, float) and 0 < config.eos_odds < 1):
             raise ValueError(f"step_repeats for {node!r}: eos_odds is {config.eos_odds!r}; it must be in (0, 1)")
-        for name in ("stream_tokens", "past_cap", "auto") + (
+        for name in ("stream_tokens", "join_rows", "past_cap", "auto") + (
             ("ready_waits",) if type(config.ready_waits) is not int else ()
         ):
             if type(getattr(config, name)) is not bool:
@@ -108,6 +110,13 @@ class RepeatConfig:
                 raise ValueError(f"step_repeats for {node!r}: refill_at is {config.refill_at!r}; it must be in (0, 1]")
             if config.device_stop == "off":
                 raise ValueError(f"step_repeats for {node!r}: refill_at ends a device run, which needs device_stop")
+        if config.join_rows:
+            if config.device_stop == "off":
+                raise ValueError(f"step_repeats for {node!r}: join_rows needs device_stop")
+            unsupported = [name for name in ("refill_at", "stream_tokens", "past_cap", "auto", "eos_odds")
+                           if getattr(config, name)]
+            if unsupported:
+                raise ValueError(f"step_repeats for {node!r}: join_rows cannot currently combine with {unsupported}")
         default = cls()
         needs = [k for k in block if k != "max" and getattr(config, k) != getattr(default, k)]
         if config.max == 1 and needs:
@@ -345,7 +354,7 @@ class StepRepeats:
         there: one of a node whose steps never chain (``LoopEdges.chained``),
         for which this is the only step there is, whole rows of the one walk."""
         key = (batch.node_name, batch.graph_walk)
-        if key not in self._walks or self.edges[key].chained:
+        if key not in self._walks or (self.edges[key].chained and not self.config(batch.node_name).join_rows):
             return 1, None
         if batch.chunk_ranges or batch.request_walks:
             return 1, "rows mid-prefill or of more than one walk"

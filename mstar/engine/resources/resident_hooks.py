@@ -71,7 +71,7 @@ class ResidentHooks:
     each owner of that state keeps its own table. A resource overrides these
     only once it has one."""
 
-    def ask_repeats(self, walk: str) -> None:
+    def ask_repeats(self, walk: str, *, join_rows: bool = False) -> None:
         """Before capture: the config asks steps of ``walk`` to repeat, so
         build what serves that if there is a choice."""
         return

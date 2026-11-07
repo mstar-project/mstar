@@ -102,7 +102,9 @@ def test_a_capture_reads_its_rows_at_its_head_and_writes_them_at_its_tail_with_n
     assert static.tolist()[:2] == [11, 22]
 
 
-def test_only_a_routed_row_is_written_ahead_of_a_captures_head():
+@pytest.mark.parametrize("publication", [False, True])
+def test_only_a_routed_row_is_written_ahead_of_a_captures_head(publication, monkeypatch):
+    from mstar.utils.h2d import PinnedStager
     rows = LoopbackRows(CPU)
     for rid in (1, 2):
         rows.add(rid)
@@ -110,7 +112,11 @@ def test_only_a_routed_row_is_written_ahead_of_a_captures_head():
     mgmt, slot = SimpleNamespace(loopback_rows=rows), SimpleNamespace(row_heads={"t": "input_ids"})
     batch = SimpleNamespace(request_ids=[1, 2], kept_rows=[True, False])
     inputs = SimpleNamespace(request_ids=[1, 2, -1])
-    Engine._write_routed_rows(batch, mgmt, slot, inputs, {"input_ids": torch.tensor([0, 9, 0])})
+    stager = PinnedStager(torch.long) if publication else None
+    with monkeypatch.context() as patch:
+        if publication:
+            patch.setattr(rows._stager, "copy_", lambda *args: pytest.fail("publication reused ordinary staging"))
+        Engine._write_routed_rows(batch, mgmt, slot, inputs, {"input_ids": torch.tensor([0, 9, 0])}, stager=stager)
     assert rows.read("t", [1, 2]).tolist() == [5, 9]
     batch.kept_rows = [True, True]
     Engine._write_routed_rows(batch, mgmt, slot, inputs, {"input_ids": torch.tensor([0, 0, 0])})

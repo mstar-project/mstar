@@ -365,8 +365,18 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        resident, has one stop policy for its Loop, and keeps loop-back rows. These walks
        use actual per-row Loop progress and suppress stopped rows even with ``skip``;
        prefix chains and ``past_cap`` are refused. Streamed iteration inputs additionally
-       need fixed one-item chunks that continue after the producer ends in every enabled
-       consumer walk. Other chunk policies and final-chunk flush consumers remain unsupported.
+       need retained windows whose ordinary chunk policy supplies complete per-iteration
+       readiness, consumption and final-tail decisions. Unsupported windows are refused.
+       ``join_rows: true`` lets compatible ready requests enter free physical rows at iteration
+       boundaries, including rows released by EOS. It needs ``device_stop`` and resident
+       resource bindings for every owner. One capture window closes before another launches;
+       ordinary graph admission reserves each request's full horizon before publication, and
+       collection settles its actual executions once. Outputs are delivered at window closure.
+       The existing capture bucket bounds simultaneous rows; this setting does not enlarge it.
+       Prefix caching, multiple ranks, previously resident late rows, non-owned capture inputs
+       and custom host stops cannot join. Requests needing an unsupported input/state binding
+       stay on ordinary steps. ``refill_at``, ``stream_tokens``, ``past_cap``, ``auto`` and
+       ``eos_odds`` cannot currently be combined with ``join_rows``.
        An explicitly requested device stop that cannot run fails startup with its refusal
        reason; it never silently becomes a host-launched run. ``stream_tokens: true`` sends a run's tokens to the client as its replays
        finish rather than when it ends, where its landing rides inline. ``ready_waits: true``

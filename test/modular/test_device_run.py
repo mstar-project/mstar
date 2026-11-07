@@ -24,6 +24,7 @@ from mstar.engine.device_run import (
 from mstar.engine.resources.iteration_tables import IterationTables, tables_key
 from mstar.engine.resources.step import BucketKey, SlotLease
 from mstar.model.submodule_base import BatchedModelOutput, CarryPair
+from mstar.worker.step_repeats import RepeatConfig
 
 CPU = torch.device("cpu")
 WALK = "decode"
@@ -576,21 +577,23 @@ def _skipped_step(worker, log, words, rows=(1, 2), **node_batch):
         node_batch=SimpleNamespace(**{
             "run_started": Word(), "step_context": SimpleNamespace(repeats=8), "completion_event": None,
             "request_ids": list(rows), "cached_rids": set(), "failed_requests": {}, "ring_bases": {}, "ring_width": 8,
-            "stream_windows": {},
+            "stream_windows": {}, "run_rows": {},
             **node_batch,
         }),
     )
 
 
 @pytest.mark.parametrize("begun, skipped", [(RUN_SKIPPED, True), (RUN_RAN, False)])
-def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped):
+@pytest.mark.parametrize("membership", [False, True])
+def test_a_skipped_run_lands_as_a_step_that_never_ran(begun, skipped, membership):
     """Nothing it counted happened and it has no outputs: what admit counted goes back
     and its rows wait with the inputs they had, with no postprocess at all. The word
     can still be 0 at first: the step before has only just landed."""
     from mstar.worker.worker import Worker
 
     worker, log = Worker.__new__(Worker), []
-    step = _skipped_step(worker, log, iter([0, begun]))
+    step = _skipped_step(worker, log, iter([0, begun]), run_rows={1: object()} if membership else {})
+    skipped = skipped and not membership  # descriptor closure owns its reader/pin release
     assert worker._landed_skipped(step) is skipped
     assert log == ([("rewound", 0), ("flag", [1, 2]), ("queued", [1, 2])] if skipped else [])
 
@@ -733,6 +736,7 @@ def test_worker_closes_reused_physical_rows_as_separate_logical_receipts():
 
         def postprocess(self, request_id, request_info, outputs, inputs):
             log.append(("tail", request_id, inputs))
+            assert outputs["final"][0].item() == {1: 101, 3: 302}[request_id]
 
     engine = Engine.__new__(Engine)
     engine._enable_nvtx, engine._loopback_steps = False, {}
@@ -764,7 +768,10 @@ def test_worker_closes_reused_physical_rows_as_separate_logical_receipts():
     active, joined = receipt((original, zero)), receipt((late,))
     active.joined.append(joined)
     active.node_batch.outputs = BatchedModelOutput(
-        row_outputs={"frame": torch.tensor([[11, 31, 32, -1], [-1, -1, -1, -1]])},
+        row_outputs={
+            "frame": torch.tensor([[11, 31, 32, -1], [-1, -1, -1, -1]]),
+            "final": torch.tensor([[101, 301, 302, -1], [-1, -1, -1, -1]]),
+        },
         check_stop_buffers={RUN_DESCRIPTORS: torch.tensor([[original.handle, late.handle, late.handle, 0], [0]*4])},
     )
     worker = Worker.__new__(Worker)
@@ -791,6 +798,72 @@ def test_worker_closes_reused_physical_rows_as_separate_logical_receipts():
     ]
     assert log[-4:] == [("release", 2), ("unpin", (1,)), ("unpin", (2,)), ("unpin", (3,))]
     assert membership.idle and not active.node_batch.run_rows and not joined.node_batch.run_rows
+
+
+@pytest.mark.parametrize("admitted", [False, True])
+def test_ready_row_is_owned_by_the_graph_before_live_publication(admitted):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.resources.run_rows import RunRows
+    from mstar.engine.resources.step import StepContext
+    from mstar.worker.batch_builder import StepPick
+    from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
+    from mstar.worker.worker import PendingBatch, Worker
+
+    owner = RunRows(CPU, 2, 3, 2)
+    original = owner.reserve_row(1, 1, 0, (1, 0))
+    owner.publish_row(original)
+    ctx = StepContext([1], WALK, 0, False, repeats=4, slot_lease=SlotLease(0, BucketKey(WALK, 2, 2)))
+    batch = ExecutingBatch("n", {}, ctx)
+    batch.run_rows = {1: original}
+    batch.completion_event = SimpleNamespace(query=lambda: False)
+    active = PendingBatch(ScheduledBatch("n", WALK, {1: 0}, repeats=4), batch, "n", "p", WALK, None)
+    late = ExecutingBatch("n", {}, StepContext([2], WALK, 0, False, repeats=4))
+    worker = Worker.__new__(Worker)
+    owned, holds, ready = set(), set(), {2, 3}
+    worker._is_tearing_down = lambda rid: False
+    worker.request_state = object()
+    worker._build_executing_batch = lambda scheduled: late
+    worker._set_in_flight_flag = lambda scheduled, value: owned.update(scheduled.request_to_worker_graph)
+    worker._hold_rows = lambda lane, rids: (holds.clear(), holds.update(rids))
+    worker._all_on_device = lambda *args: False
+    worker._count_turn = lambda receipt: None
+    def retry(receipt, output):
+        owned.difference_update(receipt.batch.request_to_worker_graph)
+        ready.update(receipt.batch.request_to_worker_graph)
+    worker._return_unexecuted = retry
+    def take(state, chain):
+        assert chain.pick.taken == [2] and chain.pick.held_back == {3}
+        ready.difference_update(chain.pick.taken)
+        return ScheduledBatch("n", WALK, {2: 0}, repeats=4)
+    worker.scheduler = SimpleNamespace(
+        pick_chain_step=lambda *args: ChainPick(("n", WALK), StepPick([2, 3], [], None, set(), False), []),
+        take_chain_step=take,
+    )
+    def admit(candidate, incumbent, row):
+        assert owned == {2} and holds == {1, 2} and ready == {3}
+        assert active.joined[0].node_batch is candidate and row == 1
+        assert owner.control[row].item() == 0  # no publication before commit
+        if not admitted:
+            return None
+        descriptor = owner.reserve_row(2, 2, row, (2, 0))
+        candidate.run_rows[2] = descriptor
+        candidate.committed = object()
+        return descriptor
+    engine = SimpleNamespace(run_membership=lambda batch: owner, prepare_inputs=lambda batch: None,
+                             admit_run_row=admit)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assert worker._offer_run_row(active, executor) is admitted
+    if admitted:
+        ids, bindings = torch.zeros(2, dtype=torch.long), torch.zeros((2, 2), dtype=torch.long)
+        owner.boundary(ids, bindings)
+        assert ids[1].item() == late.run_rows[2].handle and bindings[1].tolist() == [2, 0]
+        assert ready == {3} and owned == {2} and len(active.joined) == 1
+    else:
+        assert ready == {2, 3} and not owned and not active.joined and holds == {1}
+        assert owner.control[1].item() == 0
 
 
 @pytest.mark.parametrize("later_tokens", [0, 4])
@@ -831,7 +904,7 @@ def test_a_walk_that_drops_rows_refuses_a_prefix_chain():
     runner = SimpleNamespace(
         ask_run=lambda walk, ask: asked.append(ask), refuse_run=lambda walk, why: asked.append(why),
     )
-    engine._ask_run("n", runner, WALK, SimpleNamespace(device_stop="drop_rows", max=4, refill_at=None), ())
+    engine._ask_run("n", runner, WALK, RepeatConfig(device_stop="drop_rows", max=4), ())
     assert len(asked) == 1 and "prefix" in asked[0]
 
 
@@ -884,7 +957,7 @@ def test_iteration_inputs_enable_only_a_resident_single_loop_run(refusal):
     runner = SimpleNamespace(
         ask_run=lambda walk, ask: asked.append(ask), refuse_run=lambda walk, why: refused.append(why),
     )
-    engine._ask_run("n", runner, WALK, SimpleNamespace(
+    engine._ask_run("n", runner, WALK, RepeatConfig(
         device_stop="skip", max=4, refill_at=None, stream_tokens=False, past_cap=refusal == "past_cap",
     ), ())
     if refusal in {None, "cap_only"}:
@@ -942,7 +1015,8 @@ def _run_step(rows, looks, **node_batch):
     landed = iter([False] * looks + [True])
     return SimpleNamespace(
         node_name="n", graph_walk=WALK, batch=SimpleNamespace(request_to_worker_graph=dict.fromkeys(rows)),
-        node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: next(landed)), **node_batch),
+        node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: next(landed)),
+                                   run_rows={}, **node_batch),
     )
 
 
@@ -1138,7 +1212,7 @@ def test_engine_asks_for_a_counted_device_run_without_a_token_signal():
     )}
     engine.get_stop_policies = lambda node, walk: {"loop": policy}
     runner = SimpleNamespace(ask_run=lambda walk, ask: asked.append(ask))
-    engine._ask_run("n", runner, WALK, SimpleNamespace(
+    engine._ask_run("n", runner, WALK, RepeatConfig(
         device_stop="skip", max=4, refill_at=None, stream_tokens=False,
     ), ())
     assert len(asked) == 1 and asked[0].token_signal is None
@@ -1544,6 +1618,7 @@ def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_t
     run.state.stream.begin([1])  # dynamic rows are not limited by the original rid list
     stops, outputs, _ = _run(run, 1, 5, columns=columns)
     current = replacement[0]
+    assert outputs["h"].shape == (2, 5)  # final-only values also survive physical row reuse
     assert stops[RUN_DESCRIPTORS].tolist() == [
         [0, late.handle, late.handle, current.handle, current.handle], [incumbent.handle] * 5,
     ]

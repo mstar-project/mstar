@@ -441,16 +441,17 @@ class LoopbackRows(Resource):
 
     # By request: an eager step, a mixed step's read, a row's first write
 
-    def _index(self, rids: Sequence[Hashable]) -> torch.Tensor:
+    def _index(self, rids: Sequence[Hashable], stager: PinnedStager | None = None) -> torch.Tensor:
         key = tuple(rids)
         last = self._last
-        if last is not None and last[0] == key:
+        if stager is None and last is not None and last[0] == key:
             return last[1]
         with self._lock:
             rows = [self._row_of.get(rid, TRASH_ROW) for rid in rids]
         index = torch.empty(len(rows), dtype=torch.long, device=self._device)
-        self._stager.copy_(index, rows)
-        self._last = (key, index)
+        (self._stager if stager is None else stager).copy_(index, rows)
+        if stager is None:
+            self._last = (key, index)
         return index
 
     def write(self, name: str, rids: Sequence[Hashable], values: torch.Tensor) -> None:
@@ -460,15 +461,16 @@ class LoopbackRows(Resource):
 
     def write_rows(
         self, name: str, rids: Sequence[Hashable], values: torch.Tensor, positions: Sequence[int],
+        *, stager: PinnedStager | None = None,
     ) -> None:
         """Row ``positions[i]`` of ``values`` into the row of ``rids[i]``."""
         table = self._table(name)
         values = values.reshape(values.shape[0], *table.shape[1:])
         if list(positions) != list(range(len(positions))):
             picked = torch.empty(len(positions), dtype=torch.long, device=values.device)
-            self._stager.copy_(picked, list(positions))
+            (self._stager if stager is None else stager).copy_(picked, list(positions))
             values = values.index_select(0, picked)
-        self.write(name, rids, values[:len(positions)])
+        table.index_copy_(0, self._index(rids, stager), values[:len(positions)].to(table.dtype))
 
     def input_copies(
         self, name: str, rids: Sequence[Hashable], target: torch.Tensor,

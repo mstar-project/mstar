@@ -13,7 +13,11 @@ from mstar.engine.resources.kv.config import PagedKVConfig
 
 class _Decode:
     def __init__(self, **kwargs):
-        pass
+        self.capacity = kwargs["max_num_pages"]
+        self.resident_pages = None
+
+    def plan_resident(self, pages, dtype):
+        self.resident_pages = pages
 
 
 class _Prefill:
@@ -40,9 +44,15 @@ def _lease(walk: str, bs: int, num_tokens: int) -> SlotLease:
     ))
 
 
-def test_a_one_token_per_row_bucket_plans_decode(manager):
+@pytest.mark.parametrize("joining", [False, True])
+def test_a_one_token_per_row_bucket_plans_decode(manager, joining):
+    if joining:
+        manager.ask_repeats("decode", join_rows=True)
     wrapper = manager._cg_wrapper(_lease("decode", 4, 4), "main", 4, force_prefill=False)
     assert isinstance(wrapper, _Decode)
+    assert wrapper.resident_pages == (4 if joining else None)
+    if joining:
+        assert wrapper.capacity == 4 * wrapper.resident_pages
 
 
 def test_a_packed_bucket_of_one_token_rows_plans_prefill(manager):

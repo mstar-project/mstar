@@ -880,6 +880,7 @@ def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk,
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._cg_plan_states, manager._splits, manager._decode_fmha = {}, {}, False
     manager._decode_tensor_cores, manager._repeat_walks = False, set()
+    manager._joining_walks = set()
     manager._wrapper_kv_kwargs, manager._kv_config, manager._group = {}, None, None
     manager._workspaces = SimpleNamespace(get=lambda label, slot: "workspace")
     monkeypatch.setattr(flashinfer, "captured_page_capacity", lambda *args: 8)
@@ -905,6 +906,9 @@ def test_a_walk_that_asks_for_repeats_gets_tensor_core_decode(monkeypatch, walk,
     ({"n": {"auto": True}}, "need max above 1"),
     ({"n": {"max": 2, "eos_odds": 1.5}}, "must be in"),
     ({"n": {"max": 2, "stream_queue": {"depth": 0}}}, "must be {depth"),
+    ({"n": {"max": 2, "join_rows": True}}, "needs device_stop"),
+    ({"n": {"max": 2, "device_stop": "skip", "join_rows": 1}}, "must be a boolean"),
+    ({"n": {"max": 2, "device_stop": "skip", "join_rows": True, "refill_at": 0.5}}, "cannot currently combine"),
 ])
 def test_a_step_repeats_block_that_asks_for_nothing_real_is_refused(block, why):
     with pytest.raises(ValueError, match=why):
@@ -1911,7 +1915,8 @@ def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(mon
 
 
 @pytest.mark.parametrize("actual", [0, 2, 4])
-def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, monkeypatch):
+@pytest.mark.parametrize("routed", [False, True])
+def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, routed, monkeypatch):
     from mstar.engine.engine import Engine, ExecutingBatch
     from mstar.engine.resources.run_rows import RunRows
 
@@ -1925,11 +1930,28 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     membership = RunRows(torch.device("cpu"), 4, 8, 2)
     slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership), window=None),
                            row_heads={}, dummy_rids=(-1, -2, -3, -4))
+    from mstar.engine.resources.loopback_rows import LoopbackRows
+    owner = LoopbackRows(CPU)
+    for rid in (1, 2):
+        owner.add(rid)
+    owner.write("token", [1, 2], torch.tensor([11, 22]))
+    if routed:
+        slot.row_heads = {"token": "input_ids"}
+        slot.static_inputs = {"input_ids": torch.zeros(4, dtype=torch.long)}
+    submodule = SimpleNamespace(preprocess=lambda walk, engine_inputs, inputs: {
+        "input_ids": torch.tensor([inp.token for inp in inputs]),
+    })
     eng = Engine.__new__(Engine)
     eng._runner, eng._enable_nvtx = runner, False
     eng._submodules = {"decode": SimpleNamespace(
-        resident=planner, submodule=None, device_stops={WALK: None},
-        accelerator_graph_runner=SimpleNamespace(slot_for=lambda lease: slot),
+        resident=planner, submodule=submodule, device_stops={WALK: None}, loopback_rows=owner,
+        resources=live, piecewise_runners={},
+        accelerator_graph_runner=SimpleNamespace(
+            slot_for=lambda lease: slot,
+            pad_inputs=lambda lease, inputs, **kwargs: inputs + [SimpleNamespace(input_seq_len=1, token=0)] * 3,
+            step_metadata=lambda lease, rids, infos: infos,
+            step_ids=lambda lease, rids: (*rids, *slot.dummy_rids[1:]),
+        ),
     )}
     active_step = SubmoduleStep({"kv": incumbent.kv, "pool": incumbent.pool, "rope": incumbent.rope})
     active_step.set_ctx(incumbent.ctx)
@@ -1949,7 +1971,8 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
     segments = (Segment(2, "main", 1),)
     step = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
                           "pool": RecurrentStep(segments=segments)})
-    candidate = ExecutingBatch("decode", {}, ctx, inputs=[SimpleNamespace(input_seq_len=1)], step=step)
+    candidate = ExecutingBatch("decode", {}, ctx, inputs=[SimpleNamespace(input_seq_len=1, token=42)], step=step,
+                               kept_rows=[False] if routed else None)
     stamps = planner._plan_seq, planner._commits, planner._committed_seq
     buffers = {key: (buf.rows.clone(), buf.cells.clone()) for key, buf in planner._buffers.items()}
     with monkeypatch.context() as patch:
@@ -1960,6 +1983,7 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, 
         assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3
         descriptor = eng.admit_run_row(candidate, active, 1)
     assert descriptor is candidate.run_rows[2]
+    assert owner.read("token", [1, 2]).tolist() == [11, 42 if routed else 22]
     assert candidate.committed is step and ctx.counted == {2: runner.request_generation(2)}
     assert membership.control[1:].tolist() == [0] * 3, "the worker attaches its receipt before publication"
     assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 7
@@ -3910,9 +3934,9 @@ def test_a_run_stops_short_of_the_iteration_whose_items_run_another_consumer_wal
             per_request_info={0: None},
         ),
     )
-    assert worker._steady_consumer_walks(speculation, 4) == 2
+    assert worker._steady_consumer_walks(batch, speculation.node_batch, speculation.continuing_rids, 4) == 2
     worker._walk_drivers = {}
-    assert worker._steady_consumer_walks(speculation, 4) == 4
+    assert worker._steady_consumer_walks(batch, speculation.node_batch, speculation.continuing_rids, 4) == 4
 
 
 

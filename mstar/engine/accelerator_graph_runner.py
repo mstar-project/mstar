@@ -1462,10 +1462,15 @@ class AcceleratorGraphRunner:
         # last column. Sized off the last warm-up forward, or one more.
         with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
             sized = BatchedModelOutput.coerce(warmed.output if warmed.output is not None else warmed.run(False))
+        if ask.membership is not None and (sized.per_rid_outputs or sized.packed_outputs):
+            raise ValueError("joining runs require row-addressed outputs")
+        # Every physical row may change owners, including outputs routed only
+        # when a Loop ends. Keep its value until the logical receipt is collected.
+        columns = tuple(sized.row_outputs or {}) if ask.membership is not None else ask.columns
         buffers, spans = sized.check_stop_buffers or {}, sized.output_spans or {}
         run.keep({name: t.reshape(t.shape[0], -1)[:, 0] for name, t in buffers.items()}, run.stops)
-        run.keep({name: sized.row_outputs[name] for name in ask.columns}, run.rows)
-        run.keep({name: spans[name] for name in ask.columns if name in spans}, run.spans)
+        run.keep({name: sized.row_outputs[name] for name in columns}, run.rows)
+        run.keep({name: spans[name] for name in columns if name in spans}, run.spans)
         run.sealed = True
         del sized, buffers, spans
         backend.synchronize()
@@ -1499,9 +1504,9 @@ class AcceleratorGraphRunner:
             buffers = output.check_stop_buffers or {}
             unique = {name: t.reshape(t.shape[0], -1)[:, 0] for name, t in buffers.items()}
             run.keep(unique, run.stops)
-            run.keep({name: output.row_outputs[name] for name in ask.columns}, run.rows)
+            run.keep({name: output.row_outputs[name] for name in columns}, run.rows)
             spans = output.output_spans or {}
-            run.keep({name: spans[name] for name in ask.columns if name in spans}, run.spans)
+            run.keep({name: spans[name] for name in columns if name in spans}, run.spans)
             for pair in ask.carries.values():
                 target = warmed.static_inputs[pair.input]
                 target.copy_(output_named(output, pair.output).reshape(target.shape))

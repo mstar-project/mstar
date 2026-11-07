@@ -132,7 +132,9 @@ class RepeatingSteps:
                 repeats, why = items, "its stream window"
         speculation.node_batch.stream_windows = windows
         if repeats > 1 and self._walk_drivers:
-            steady = self._steady_consumer_walks(speculation, repeats)
+            steady = self._steady_consumer_walks(
+                speculation.scheduled_batch, speculation.node_batch, speculation.continuing_rids, repeats,
+            )
             if steady < repeats:
                 repeats, why = steady, "its consumer's walk changes"
         speculation.node_batch.step_context.repeats = repeats
@@ -161,12 +163,11 @@ class RepeatingSteps:
             self._step_repeats.note_ask(key, repeats, why)
         return repeats
 
-    def _steady_consumer_walks(self, speculation: Speculation, repeats: int) -> int:
+    def _steady_consumer_walks(self, batch, node_batch, rids, repeats: int) -> int:
         """How far a run may go while every row's streamed items keep their
         consumer walk: a pass stamps one walk on what it sends, so a run
         stops short of the iteration whose items would run another
         (``Connection.consumer_walk``)."""
-        batch = speculation.scheduled_batch
         key = (batch.node_name, batch.graph_walk)
         drivers = [
             self._walk_drivers[partition] for partition in {
@@ -177,13 +178,13 @@ class RepeatingSteps:
         if not drivers:
             return repeats
         ctx = ProducerWalkCtx(producer_walk=batch.graph_walk, node=batch.node_name)
-        metadata = speculation.node_batch.per_request_input_metadata
+        metadata = node_batch.per_request_input_metadata
         loop = self._innermost_loop_by_node.get((batch.graph_walk, batch.node_name))
-        for rid in speculation.continuing_rids:
+        for rid in rids:
             meta = metadata.get(rid)
             iters = dict(meta.dynamic_loop_iter_counts) if meta else {}
             k = iters.get(loop, 0)
-            ctx.fwd_info = speculation.node_batch.per_request_info.get(rid)
+            ctx.fwd_info = node_batch.per_request_info.get(rid)
             for conn in drivers:
                 first = None
                 for i in range(repeats):
@@ -428,6 +429,8 @@ class RepeatingSteps:
         that can retry wait as a refused step's do: the runtime still holds their
         inputs."""
         node_batch = step.node_batch
+        if node_batch.run_rows:
+            return False  # descriptor closure also releases readers for proved-zero rows
         started = node_batch.run_started
         if started is None or node_batch.step_context.repeats <= 1:
             return False
@@ -581,21 +584,89 @@ class RepeatingSteps:
                     batch.run_rows.clear()
             gpu_executor.submit(release).result()
 
+    def _offer_run_row(self, active: PendingBatch, gpu_executor: ThreadPool) -> bool:
+        """Take one ordinary ready step and publish it only after owner admission."""
+        engine = self.engine_manager.get_engine(active.node_name)
+        membership = engine.run_membership(active.node_batch)
+        lease = active.node_batch.step_context.slot_lease
+        stream = membership.publication_stream
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            for part in (active, *active.joined):
+                for rid, descriptor in part.node_batch.run_rows.items():
+                    if self._is_tearing_down(rid):
+                        membership.cancel(descriptor)
+        available = membership.available_rows(lease.bucket.bs)
+        if not available or active.node_batch.completion_event.query():
+            return False
+        target = active.node_name, active.graph_walk
+        chain = self.scheduler.pick_chain_step(self.request_state, target, ())
+        if not chain.pick.taken:
+            return False
+        # The existing scheduler owns ordering, capture groups and backlog.
+        # One logical receipt reserves one descriptor; unchosen rows stay there.
+        pick = chain.pick._replace(
+            taken=chain.pick.taken[:1], held_back=chain.pick.held_back | set(chain.pick.taken[1:]),
+        )
+        scheduled = self.scheduler.take_chain_step(self.request_state, chain._replace(pick=pick))
+        if scheduled is None:
+            return False
+        horizon = active.node_batch.step_context.repeats
+        node_batch = self._build_executing_batch(scheduled)
+        if (scheduled.graph_walk != active.graph_walk or scheduled.request_walks or scheduled.chunk_ranges
+                or node_batch.step_context.repeats < horizon):
+            self._push_back_batch(scheduled)
+            return False
+        node_batch.step_context.repeats = scheduled.repeats = horizon
+        self._set_in_flight_flag(scheduled, True)
+        receipt = replace(active, batch=scheduled, node_batch=node_batch, future=None, joined=[])
+        active.joined.append(receipt)
+        held = {rid for part in (active, *active.joined) for rid in part.batch.request_to_worker_graph}
+        self._hold_rows(active.lane, held)
+
+        def prepare():
+            stream = membership.publication_stream
+            with torch.cuda.stream(stream) if stream is not None else nullcontext():
+                node_batch.rows_only = self._all_on_device(
+                    engine, scheduled.node_name, scheduled.graph_walk, scheduled.output_signals,
+                )
+                engine.prepare_inputs(node_batch)
+                try:
+                    descriptor = engine.admit_run_row(node_batch, active.node_batch, available[0])
+                except ValueError:
+                    if node_batch.committed is not None:
+                        raise
+                    descriptor = None  # this request needs an ordinary step
+                if stream is not None:
+                    node_batch.completion_event = torch.cuda.Event()
+                    node_batch.completion_event.record(stream)
+                return descriptor
+
+        receipt.future = gpu_executor.submit(prepare)
+        descriptor = receipt.future.result()
+        if descriptor is None:
+            active.joined.remove(receipt)
+            self._return_unexecuted(receipt, BatchedModelOutput())
+            self._hold_rows(active.lane, held - set(scheduled.request_to_worker_graph))
+            return False
+        # Graph in-flight state, request holds and the committed H-step are all
+        # attached before the publication stream can expose this descriptor.
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            membership.publish_row(descriptor)
+        self._count_turn(receipt)
+        return True
+
     def _await_run(
         self, batch_N: PendingBatch, spec_pending: PendingBatch | None, lanes: Sequence[Lane], gpu_executor: ThreadPool,
-    ) -> None:
-        """Serve what a run on the device leaves free until it lands: messages,
-        ready tensors, the lanes. Before ``_finish_step``, so a lane's postprocess
-        doesn't nest in N's. A row can't join a run, so it ends the run at its next
-        iteration, as the speculation's own yield does, and N+1 behind it before
-        its first, or after it if N+1 is one iteration (``run_start``): for other
-        work at once; for a row of the run's walk, as a prefill on a lane readies
-        one when it lands, once it turns ready here with nothing waiting, since
-        rows of its walk ready already are ones the step had no room for. With
-        the fairness peek on, other work never sits through a wait, so that
-        nothing is of its walk. Whether N+1 has room for the new row isn't asked:
-        one that doesn't fit costs the rest of N and N+1, which restarts behind a
-        host build, once, and the next wait sees it waiting."""
+    ) -> bool:
+        """Serve messages, input readiness and lanes until the run lands.
+
+        Joining captures offer compatible ordinary receipts at boundaries and
+        close them here; return True once their outputs have been routed.
+        Other runs retain the existing fairness/yield and ordinary landing.
+        """
+        live_run = bool(batch_N.node_batch.run_rows)
+        if live_run and spec_pending is not None:
+            raise ValueError("a joining capture must close before its successor is submitted")
         rows = set(batch_N.batch.request_to_worker_graph)
         if spec_pending is not None:
             # the loop's admit fence, for what follows: N+1's launch needs nothing of N's postprocess
@@ -637,16 +708,25 @@ class RepeatingSteps:
             self._poll_stream_buffers()
             for lane in lanes:
                 lane.launch(gpu_executor)
+            if live_run:
+                self._offer_run_row(batch_N, gpu_executor)
             end_for_ready_rows()
 
+        if live_run:
+            self._offer_run_row(batch_N, gpu_executor)
         end_for_ready_rows()
         node_batch = batch_N.node_batch
         if node_batch.token_stream is not None:
+            if live_run:
+                raise ValueError("live descriptor token streaming is not configured")
             self._stream_tokens(batch_N, serve)
-            return
+            return False
         while not node_batch.completion_event.query():
             serve()
             time.sleep(_LANDED_POLL_S)
+        if live_run:
+            self._finish_live_run(batch_N, gpu_executor)
+        return live_run
 
     def _stream_tokens(self, batch_N: PendingBatch, serve: Callable[[], None] | None = None) -> None:
         """While a run is in flight, send the client what it has landed, and
