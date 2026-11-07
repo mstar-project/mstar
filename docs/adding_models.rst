@@ -2141,7 +2141,7 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
 An ``ARNodeSubmodule`` takes a ``prefill_token_buckets`` constructor argument, which
 replaces its class's ``PREFILL_TOKEN_BUCKETS`` for that instance: a model passes a
 deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Muse
-Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive
+Glimmer, Ripple-65B, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive
 token counts, or the submodule raises ``ValueError`` when it is built.
 
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
