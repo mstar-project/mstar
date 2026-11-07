@@ -18,6 +18,54 @@ from mstar.engine.resources.step import BucketKey, SlotLease  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 
 
+@pytest.mark.parametrize("streamed", [False, True])
+def test_refused_stream_connection_preserves_the_producers_independent_repeat_ask(streamed):
+    from contextlib import nullcontext
+    from dataclasses import replace
+
+    from mstar.engine.engine import ExecutingBatch, ExecutionGroup
+    from mstar.engine.resources.step import StepContext
+    from mstar.model.submodule_base import BatchedModelOutput
+    from mstar.worker.micro_scheduler import ScheduledBatch
+    from mstar.worker.worker import Worker
+
+    scheduled = ScheduledBatch("a", "decode", {1: 0}, repeats=1)
+    batch = ExecutingBatch("a", {}, StepContext((1,), "decode", 0, False, repeats=4))
+    target = ExecutingBatch("b", {}, StepContext((1,), "consume", 0, False))
+    group = ExecutionGroup(
+        SimpleNamespace(streaming_edges=(("a", "b", "x"),) if streamed else ()), 1,
+        ((replace(scheduled, repeats=4), batch), (ScheduledBatch("b", "consume", {1: 0}), target)),
+    )
+    seen = []
+
+    def refuse(group):
+        assert batch.step_context.repeats == 4
+        batch.step_context.repeats = 1  # ordinary preview may narrow its own copy
+
+    def ordinary(batch):
+        seen.append(("execute", batch.step_context.repeats))
+        return BatchedModelOutput()
+
+    engine = SimpleNamespace(
+        exec_group=refuse, prepare_inputs=lambda batch: seen.append(("prepare", batch.step_context.repeats)),
+        exec_and_postprocess=ordinary, finalize_batch=lambda *args, **kwargs: {},
+    )
+    worker = Worker.__new__(Worker)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker._phase_period, worker.enable_nvtx = 0, False
+    worker.device_capability = SimpleNamespace(is_accelerator=False)
+    worker._span = lambda *args, **kwargs: nullcontext()
+    worker._all_on_device = lambda *args: False
+    worker._publishable_request_ids = lambda batch: batch.request_ids
+    worker._step_repeats = None
+    worker._execute_on_gpu_thread(scheduled, batch, group=group)
+    worker._await_admit_settled(SimpleNamespace(batch=scheduled, node_batch=batch))
+    expected = 4 if streamed else 1  # a shared multi-node Loop is not one repeated producer
+    assert seen == [("prepare", expected), ("execute", expected)]
+    assert scheduled.repeats == expected
+    assert not group.submitted
+
+
 def _resident_owner(owner, slots):
     """The real owner's resident column, with independently assigned slots."""
     store = torch.zeros(2 * (max(slots.values()) + 1), dtype=torch.long, device=owner._device)

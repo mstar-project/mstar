@@ -2580,8 +2580,12 @@ class Worker(RepeatingSteps):
         group_outputs = None
         original = None
         if group is not None:
+            # Streamed members have independent repeat asks. A refused
+            # consumer must not turn the producer's N-step fallback into N
+            # single steps. A shared multi-node Loop has no such solo ask.
+            repeats = node_batch.step_context.repeats if group.unit.streaming_edges else batch.repeats
             original = replace(
-                node_batch, step_context=replace(node_batch.step_context, repeats=batch.repeats),
+                node_batch, step_context=replace(node_batch.step_context, repeats=repeats),
                 skipped_rids=set(node_batch.skipped_rids), cached_rids=set(node_batch.cached_rids),
                 failed_requests=dict(node_batch.failed_requests), first_chunk_rids=set(node_batch.first_chunk_rids),
                 outputs_ready=threading.Event(), commit_done=threading.Event(),
