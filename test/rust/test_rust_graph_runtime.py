@@ -894,9 +894,11 @@ def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_
         launch_refusal=lambda walk, node=node: checked.append((node, walk)),
     )) for node in unit.nodes})
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    worker._build_executing_batch = lambda batch: ExecutingBatch(
-        batch.node_name, {}, StepContext([rid], batch.graph_walk, 0, False),
-    )
+    engine._submodules["a"].accelerator_graph_runner = None
+    def build(batch):
+        assert batch.node_name == "b", "a completed producer has no preparation inputs"
+        return ExecutingBatch(batch.node_name, {}, StepContext([rid], batch.graph_walk, 0, False))
+    worker._build_executing_batch = build
     popped = rt.pop_rids("b", "consume", [rid], check_ready=True)
     scheduled = ScheduledBatch("b", "consume", {rid: 9}, popped.input_edges, list(popped.output_signals))
     executing = worker._build_executing_batch(scheduled)
@@ -904,7 +906,7 @@ def test_stream_unit_drains_after_producer_done_without_advancing_that_producer_
     assert group.trigger == 1 and group.members[1][1] is executing
     assert group.finished_rids == (frozenset({rid}), frozenset())
     assert [(b.node_name, b.graph_walk) for b, _ in group.members] == [("a", "produce"), ("b", "consume")]
-    assert checked == [("a", "produce"), ("b", "consume")]
+    assert checked == [("b", "consume")]
     claim = group.claim
     group.submitted = True
     worker._settle_group_claim(group)

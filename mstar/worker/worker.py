@@ -38,7 +38,7 @@ from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.device_run import RUN_DESCRIPTORS, RUN_REPLAYS, RUN_SKIPPED, run_item
 from mstar.engine.engine import ExecutingBatch, ExecutionGroup
-from mstar.engine.resources import AdmitFailedReason, AllocationFailed
+from mstar.engine.resources import AdmitFailedReason, AllocationFailed, StepContext
 from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
@@ -2862,11 +2862,8 @@ class Worker(RepeatingSteps):
         if unit is None or batch.request_walks or batch.chunk_ranges or node_batch.failed_requests:
             return None
         engine = self.engine_manager.get_engine(batch.node_name)
-        for node, walk in zip(unit.nodes, unit.graph_walks, strict=True):
+        for node in unit.nodes:
             if self.engine_manager.get_engine(node) is not engine:
-                return None
-            runner = engine._submodules[node].accelerator_graph_runner
-            if runner is None or runner.launch_refusal(walk) is not None:
                 return None
         claimed = self._graph_runtime.claim_execution_unit(
             unit.nodes[0], unit.graph_walks[0], list(node_batch.request_ids), unit.graph_walks,
@@ -2885,7 +2882,19 @@ class Worker(RepeatingSteps):
                     request_to_worker_graph=dict(zip(part.wg_ids.keys, part.wg_ids.values, strict=True)),
                     input_edges=part.input_edges, output_signals=list(part.output_signals),
                 )
-                executing = node_batch if i == trigger else self._build_executing_batch(scheduled)
+                if part.finished_rids:
+                    if set(part.finished_rids) != set(node_batch.request_ids):
+                        self._graph_runtime.cancel_execution_unit(claim)
+                        return None  # mixed retired/live rows need per-member masking
+                    executing = ExecutingBatch(
+                        node, {}, StepContext(tuple(node_batch.request_ids), walk, 0, False),
+                    )
+                else:
+                    runner = engine._submodules[node].accelerator_graph_runner
+                    if runner is None or runner.launch_refusal(walk) is not None:
+                        self._graph_runtime.cancel_execution_unit(claim)
+                        return None
+                    executing = node_batch if i == trigger else self._build_executing_batch(scheduled)
                 if tuple(executing.request_ids) != tuple(node_batch.request_ids):
                     self._graph_runtime.cancel_execution_unit(claim)
                     return None

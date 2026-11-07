@@ -2421,6 +2421,9 @@ class Engine:
         admitted = []
         rows = tuple(group.members[0][1].request_ids)
         member_walks = dict(zip(group.unit.nodes, group.unit.graph_walks, strict=True))
+        finished = dict(zip(group.unit.nodes, group.finished_rids or [frozenset()] * len(group.members), strict=True))
+        active = [(scheduled, batch) for scheduled, batch in group.members
+                  if finished[batch.node_name] != frozenset(rows)]
         leases = {}
         slots = {}
         owners = {}
@@ -2428,10 +2431,12 @@ class Engine:
         boundary = []
         try:
             with torch.no_grad(), guard.preparing(), ExitStack() as preparation:
-                for _, batch in group.members:
+                if not active or any(finished[batch.node_name] for _, batch in active):
+                    guard.refuse("connected member retirement needs a uniform claimed row set")
+                for _, batch in active:
                     preparation.enter_context(guard.isolated_info(batch))
-                repeats = group.members[0][1].step_context.repeats
-                if any(batch.step_context.repeats != repeats for _, batch in group.members):
+                repeats = active[0][1].step_context.repeats
+                if any(batch.step_context.repeats != repeats for _, batch in active):
                     guard.refuse("members requested different iteration counts")
                 if repeats > 1 and group.unit.loop_name is None:
                     guard.refuse("the graph did not certify a complete connected Loop")
@@ -2445,6 +2450,8 @@ class Engine:
                         batch.step_context.repeats = 1
                 loop_back = group.unit.loop_back if repeats > 1 else ()
                 for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
+                    if finished[maker]:
+                        continue
                     producer = self._submodules[maker].submodule
                     kind = type(producer)
                     walk = member_walks[maker]
@@ -2455,13 +2462,16 @@ class Engine:
                             or producer.spanned_outputs(walk) or producer.get_stop_policies(walk) is None):
                         guard.refuse("a producer changes its routed outputs outside capture")
                 for member, (_, batch) in enumerate(group.members):
+                    if finished[batch.node_name]:
+                        continue
                     mgmt = self._submodules[batch.node_name]
                     runner, submodule = mgmt.accelerator_graph_runner, mgmt.submodule
                     if runner is None or batch.chunk_ranges or batch.step_context.request_walks:
                         guard.refuse("a member has no whole capture or has chunked/mixed rows")
                     if batch.graph_walk in self._keyed_walks.get(batch.node_name, ()) or mgmt.rings:
                         guard.refuse("a member prepares cached prefixes or stream windows")
-                    incoming = [(a, signal) for a, b, signal in group.unit.edges if b == batch.node_name]
+                    incoming = [(a, signal) for a, b, signal in group.unit.edges
+                                if b == batch.node_name and not finished[a]]
                     tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
                     for maker, signal in incoming:
                         maker_mgmt = self._submodules[maker]
@@ -2678,7 +2688,6 @@ class Engine:
                     graph_walk=batch.graph_walk, request_walks=batch.step_context.request_walks,
                 )
                 batch.commit_done.set()
-            outputs = []
             for (batch, mgmt, lease, inputs, info, _), columns in zip(prepared, retained, strict=True):
                 raw = mgmt.accelerator_graph_runner.slot_for(lease).static_outputs
                 if repeats > 1:
@@ -2692,8 +2701,8 @@ class Engine:
                     output.run_columns = self.run_columns(batch.node_name, batch.graph_walk)
                 batch.outputs = output
                 self._finish_outputs(batch)
-                outputs.append(self._postprocess_outputs(batch, output))
-            return outputs
+                batch.outputs = self._postprocess_outputs(batch, output)
+            return [batch.outputs for _, batch in group.members]
         except Exception:
             if group.submitted or guard.reason is None:
                 raise

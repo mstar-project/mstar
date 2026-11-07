@@ -202,6 +202,30 @@ def test_connected_output_binding_uses_the_producers_own_walk():
     assert outputs[1].per_rid_outputs[2]["x"][0].tolist() == [[112., 112.]]
     assert events == ["a", "b", "release:b", "release:a"]
 
+
+def test_connected_consumer_drains_without_preparing_or_leasing_its_finished_producer():
+    from dataclasses import replace
+
+    eng, group, events = _connected_engine(walks=("producer", "consumer"))
+    group.unit = replace(group.unit, streaming_edges=group.unit.edges)
+    group.trigger = 1
+    group.finished_rids = (frozenset({1, 2}), frozenset())
+    producer, consumer = [batch for _, batch in group.members]
+    # The completed partition may have no remaining inputs/capture/forward info.
+    producer.per_request_input_tensors = {}
+    producer.per_request_info = {rid: object() for rid in (2, 1)}
+    eng._submodules["a"].accelerator_graph_runner = None
+    consumer.per_request_input_tensors = {
+        rid: {"x": [torch.full((1, 2), 10. + rid)]} for rid in (2, 1)
+    }
+    output = eng.exec_group(group)
+    eng.release_group(group)
+    assert group.submitted and group.refusal is None
+    assert output[0] is producer.outputs and not output[0].per_rid_outputs
+    assert output[1].per_rid_outputs[2]["x"][0].tolist() == [[112., 112.]]
+    assert events == ["b", "release:b"]
+    assert producer.step is None and producer.step_context.slot_lease is None
+
 @pytest.mark.parametrize("transform,width", [
     (lambda x: x + 1, 2),
     (lambda x: torch.empty(2).copy_(x), 2),
