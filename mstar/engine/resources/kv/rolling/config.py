@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -39,8 +39,7 @@ class RollingKVConfig:
     dtype: torch.dtype | None = None
 
     def __post_init__(self):
-        if self.pool_tokens < 1:
-            raise ValueError(f"pool_tokens must be >= 1, got {self.pool_tokens}")
+        check_sizes({"pool_tokens": self.pool_tokens})
 
     def token_bytes(self, tokens: int, dtype: torch.dtype) -> int:
         """``tokens`` a layer, keys and values of every layer."""
