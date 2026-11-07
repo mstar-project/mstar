@@ -249,7 +249,10 @@ class FlashInferManager(AttentionManager):
         }
         joining = bucket.graph_walk in self._joining_walks
         if joining:
-            pages = (self._kv_config.max_seq_len + self._group.page_size - 1) // self._group.page_size
+            pages = min(
+                (self._kv_config.max_seq_len + self._group.page_size - 1) // self._group.page_size,
+                self._kv_config.request_pages,
+            )
             kv_kwargs["max_num_pages"] = num_rows * pages
         split = self._splits.get(bucket.graph_walk)
         if split is not None:

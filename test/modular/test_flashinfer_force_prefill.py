@@ -50,7 +50,9 @@ def test_a_one_token_per_row_bucket_plans_decode(manager, joining):
         manager.ask_repeats("decode", join_rows=True)
     wrapper = manager._cg_wrapper(_lease("decode", 4, 4), "main", 4, force_prefill=False)
     assert isinstance(wrapper, _Decode)
-    assert wrapper.resident_pages == (4 if joining else None)
+    # This pool is smaller than max_seq_len: the resident row has only three
+    # request pages after its sink page, so a four-page gather would cross it.
+    assert wrapper.resident_pages == (3 if joining else None)
     if joining:
         assert wrapper.capacity == 4 * wrapper.resident_pages
 
