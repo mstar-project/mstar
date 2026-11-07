@@ -20,6 +20,7 @@ the same server:
 * the streamed action, read off the binary frames, equals the non-streamed one;
 * malformed requests are a 400, and the next good request still returns the first answer;
 * a storm of dropped requests leaves nothing held, and the same request still returns the first answer;
+* a prompt length no graph holds answers too, alone and batched;
 * noise that does not match its oracle misses the bar, or the bar measures nothing.
 
     python test/gr00t_n17/serve_check.py --dump ~/gr00t-runs/dump \\
@@ -280,7 +281,12 @@ def main() -> int:
         report["serves_after_malformed"] = send(client, obs, seed) == payload
         storm = report["abort_storm"] = abort_storm(url, obs, seed)
         report["serves_after_aborts"] = client.health() and send(client, obs, seed) == payload
-        for key in ("repeat_identical", "stream_identical", "serves_after_malformed", "serves_after_aborts"):
+        # a length no graph holds runs eager, on the workspaces capture sealed: a plan there can't grow them
+        uncaptured = ("pick up the banana and place it in the bowl", *obs[1:])
+        burst(url, uncaptured, seed, [ANSWER] * 8)
+        report["uncaptured_finite"] = all(np.isfinite(g).all() for g in decode(send(client, uncaptured, seed)).values())
+        for key in ("repeat_identical", "stream_identical", "serves_after_malformed", "serves_after_aborts",
+                    "uncaptured_finite"):
             if not report[key]:
                 failures.append(key)
         failures += [f"{k}: {v}, not 400" for k, v in report["malformed_status"].items() if v != 400]
