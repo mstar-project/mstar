@@ -2656,7 +2656,7 @@ class Engine:
                     guard.refuse("members requested different iteration counts")
                 if not streamed and repeats > 1 and group.unit.loop_name is None:
                     guard.refuse("the graph did not certify a complete connected Loop")
-                if repeats > 1 and any(
+                if not streamed and repeats > 1 and any(
                     len(batch.per_request_input_tensors.get(rid, {}).get(signal, ())) != 1
                     for _, batch in group.members for _, consumer, signal in group.unit.loop_back
                     if consumer == batch.node_name for rid in rows
@@ -2664,7 +2664,10 @@ class Engine:
                     repeats = 1  # the first ordinary iteration produces an empty seed
                     for _, batch in group.members:
                         batch.step_context.repeats = 1
-                loop_back = group.unit.loop_back if repeats > 1 else ()
+                # Streamed members already carry and count their own Loops
+                # inside DeviceRun. Only a shared fixed-count Loop needs
+                # these inter-member boundary copies and seed checks.
+                loop_back = group.unit.loop_back if not streamed and repeats > 1 else ()
                 direct_producers = set()
                 for maker in {a for a, _, _ in (*group.unit.edges, *loop_back)}:
                     if finished[maker]:
@@ -2704,9 +2707,7 @@ class Engine:
                     incoming = [(a, signal) for a, b, signal in group.unit.edges
                                 if b == batch.node_name and (not finished[a] or streamed)]
                     tensors = {rid: dict(batch.per_request_input_tensors.get(rid, {})) for rid in rows}
-                    # Loop-back inputs are added below. They do not make the
-                    # producer a stream consumer or replace its preparation.
-                    stream_incoming = tuple(incoming) if streamed else ()
+                    stream_incoming = incoming if streamed else ()
                     if stream_incoming:
                         maker, signal = stream_incoming[0]
                         source = self._submodules[maker].loopback_rows
@@ -2915,7 +2916,7 @@ class Engine:
                             target = target.narrow(dim, 0, value.shape[dim])
                             keys = tuple(expected.pop(name))
                             routed = destinations(name, guard.copies(value, target, keys, set(keys) - back_keys))
-                            if streamed and any(key[:3] in group.unit.streaming_edges for key in keys):
+                            if streamed and incoming:
                                 if stream_target is not None or len(routed) != len(rows):
                                     guard.refuse("each streamed row needs one contiguous owner destination")
                                 stream_target = routed

@@ -998,6 +998,7 @@ def test_streamed_batch_callbacks_cannot_recover_unresolved_metadata(read):
                                   "direct_error", "direct_missing", "direct_walk", "direct_alias",
                                   "direct_spans", "direct_absent", "direct_shared",
                                   "direct_repeat", "direct_short", "direct_one", "direct_skip", "direct_repeat_error",
+                                  "direct_owned",
                                   "metadata", "declared_key"])
 def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
@@ -1015,9 +1016,11 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         pytest.skip("real Engine streamed composition")
     device = torch.device(device_name)
     direct = mode.startswith("direct")
-    repeated = mode in {"direct_repeat", "direct_short", "direct_one", "direct_skip", "direct_repeat_error"}
+    repeated = mode in {"direct_repeat", "direct_short", "direct_one", "direct_skip", "direct_repeat_error",
+                        "direct_owned"}
     producer_count = ({"direct_repeat": 4, "direct_short": 2, "direct_one": 1,
-                       "direct_skip": 0, "direct_repeat_error": 4}.get(mode, 0 if mode == "direct_zero" else 1))
+                       "direct_skip": 0, "direct_repeat_error": 4,
+                       "direct_owned": 4}.get(mode, 0 if mode == "direct_zero" else 1))
     producer_kept = producer_count - (mode in {"direct_eos", "direct_short", "direct_one"})
     full, yielded = mode == "full", mode in {"yield", "tail_zero", "direct_zero", "direct_skip"}
     packing = mode.startswith("packing")
@@ -1220,6 +1223,22 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         return lease
     eng.reserve_replay_slot = reserve
     a, b = (pair[1] for pair in group.members)
+    if mode == "direct_owned":
+        from mstar.model.submodule_base import CarryPair
+
+        # Ordinary resident routing passes an empty edge: the current value
+        # and the next replay's carry live in the existing row owner.
+        group.unit = replace(group.unit, loop_back=(("a", "a", "carry"),))
+        a.per_request_input_tensors = {2: {"carry": []}}
+        eng._loopback_steps = {2: ("a", "prefill")}
+        mgmt = eng._submodules["a"]
+        mgmt.submodule.REPEAT_CARRIES = {"carry": CarryPair("x", "x")}
+        mgmt.row_signals["prefill"] = mgmt.submodule.repeat_carry("prefill", {"carry"})
+        ordinary_prepare = mgmt.submodule.prepare_inputs
+        mgmt.submodule.prepare_inputs = lambda inputs, **kw: ordinary_prepare(inputs={"x": inputs["carry"]}, **kw)
+        ring.write("carry", [2], torch.full((1, 1, 2), 2., device=device))
+        ring.indices(leases["a"].bucket, 0).fill_(1)
+        slots["a"].row_heads = {"carry": "x"}
     declarations = []
     if mode == "metadata":
         ordinary_preprocess = eng._submodules["b"].submodule.preprocess
