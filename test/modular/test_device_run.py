@@ -925,6 +925,7 @@ def test_a_run_that_ends_short_repeats_its_last_iteration_in_the_columns_it_neve
     assert rows["t"].tolist() == [[5, 6, 6, 6]] and stops["t"].tolist() == [[5, 6, 6, 6]]
     assert stops[RUN_REPLAYS].tolist() == [2]
     state.index.fill_(4)
+    assert stops[RUN_REPLAYS].tolist() == [2]  # a staged successor cannot rewrite this receipt
     run.rows["t"] = torch.tensor([[1, 2, 3, 4]])
     assert run.results(4)[1]["t"].tolist() == [[1, 2, 3, 4]]
 

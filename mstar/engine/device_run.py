@@ -221,6 +221,8 @@ class RunState:
         self._immune_stager = PinnedStager(torch.bool, numel=bs)
         self.marks = torch.zeros(bs, dtype=torch.bool, device=device)
         self.counts = torch.zeros(bs, dtype=torch.long, device=device)
+        # Fixed-row successors can stage before the previous step is collected.
+        self.replays = (torch.zeros_like(self.counts) if membership is None else None)
         # Each stage publishes its identity on the execution stream, behind
         # any previous launch using this state. The host cutoff never clears:
         # staging a successor cannot erase a yield the current launch reads.
@@ -508,7 +510,14 @@ class DeviceRun:
 
     def execution_counts(self) -> dict[str, torch.Tensor]:
         """The launched width and each row's logical executions, including width one."""
-        return {RUN_REPLAYS: self.state.index.expand_as(self.state.counts), RUN_COUNTS: self.state.counts}
+        state = self.state
+        if state.descriptors is None:
+            state.replays.copy_(state.index.expand_as(state.replays))
+            replays = state.replays
+        else:
+            # Membership closes before any successor can restage this state.
+            replays = state.index.expand_as(state.counts)
+        return {RUN_REPLAYS: replays, RUN_COUNTS: state.counts}
 
     def results(self, repeats: int) -> tuple[dict, dict, dict]:
         """After the launch: what ``AcceleratorGraphRunner.repeat`` returns, and
