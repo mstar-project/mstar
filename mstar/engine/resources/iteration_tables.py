@@ -47,7 +47,7 @@ STREAM_TRANSITION = "__stream_transition__"
 
 @dataclass
 class IterationTablesSpec(NodeResourceSpec):
-    """Declared by the engine, for a node with ``ITERATION_INPUTS``: a model writes none."""
+    """Declared by the engine for nodes with captured input or policy tables."""
 
     @property
     def resource_class(self) -> type[IterationTables]:
@@ -164,6 +164,38 @@ class StreamWindow:
         self.bank.terminal.index_copy_(0, rows, kept & self.terminal)
 
 
+@dataclass
+class PreparedInputs:
+    """One invocation's immutable values, selected through masked owner slots."""
+    columns: Mapping[str, torch.Tensor]
+    targets: Mapping[str, tuple[int, torch.Tensor]]
+    slots: torch.Tensor
+
+    def gather(self) -> None:
+        for name, (_, target) in self.targets.items():
+            target.copy_(self.columns[name].index_select(0, self.slots))
+
+    def stage(self, slots: Sequence[int], values: Mapping[str, object]) -> None:
+        selected = {}
+        for name, (dim, target) in self.targets.items():
+            value = values.get(name)
+            bank = self.columns[name]
+            if (not isinstance(value, torch.Tensor) or value.ndim != target.ndim
+                    or value.dtype != bank.dtype or value.device != bank.device):
+                raise ValueError(f"prepared input {name!r} does not match its captured owner bank")
+            value = value.movedim(dim, 0)
+            if (not len(slots) <= value.shape[0] <= len(self.slots) or value.shape[1:] != bank.shape[1:]
+                    or len(set(slots)) != len(slots)
+                    or any(type(slot) is not int or not 0 < slot < len(bank) for slot in slots)):
+                raise ValueError(f"prepared input {name!r} does not fit its captured owner rows")
+            selected[name] = value
+        # All fields are checked first. These fresh pinned rows may be staged
+        # on the publication stream while other owners still execute.
+        for name, value in selected.items():
+            for row, slot in enumerate(slots):
+                self.columns[name][slot].copy_(value[row], non_blocking=True)
+
+
 class _Table:
     """Doubles as requests need and never shrinks, outside any memory budget: its
     high-water mark stays, as a long-running server's concurrency peak."""
@@ -188,7 +220,7 @@ class _Table:
 
 
 class IterationTables(Resource):
-    """One table a non-streamed ``IterationInput`` of a node."""
+    """A node's input tables and fixed captured owner banks."""
 
     def __init__(self, device: torch.device):
         self._device = torch.device(device)
@@ -202,6 +234,7 @@ class IterationTables(Resource):
         self._window_indices: dict[tuple, torch.Tensor] = {}
         self._window_fills: dict[tuple, Mapping[str, float | int]] = {}
         self._stream_windows: dict[tuple, StreamWindow] = {}
+        self._prepared_inputs: dict[tuple, PreparedInputs] = {}
 
     @classmethod
     def build(cls, spec: IterationTablesSpec, info: EngineResourceInfo) -> IterationTables:
@@ -227,6 +260,10 @@ class IterationTables(Resource):
 
     def _check_horizon(self, step, ctx) -> None:
         lease = ctx.slot_lease
+        if lease is not None and (lease.bucket, lease.buffer_slot) in self._prepared_inputs:
+            if ctx.repeats != 1:
+                raise ValueError("prepared owner inputs permit one computation per descriptor")
+            return
         window = None if lease is None else self._windows.get((lease.bucket, lease.buffer_slot))
         if window is None:
             raise ValueError("new iteration rows need their captured owner input bank")
@@ -278,6 +315,40 @@ class IterationTables(Resource):
         self._window_indices.pop(key, None)
         self._window_fills.pop(key, None)
         self._stream_windows.pop(key, None)
+        self._prepared_inputs.pop(key, None)
+
+    def prepare_inputs(
+        self, lease: SlotLease, inputs: Mapping[str, torch.Tensor], dimensions: Mapping[str, int],
+        *, rows: torch.Tensor, slots: int,
+    ) -> PreparedInputs:
+        """Bind explicitly row-addressed inputs of a single-compute member."""
+        if (not inputs or inputs.keys() != dimensions.keys() or slots < 2
+                or rows.shape != (lease.bucket.bs,) or rows.dtype != torch.long
+                or rows.device.type != self._device.type
+                or (self._device.index is not None and rows.device.index != self._device.index)):
+            raise ValueError("prepared inputs need declared row geometry and masked resident slots")
+        targets = {}
+        for name, value in inputs.items():
+            dim = dimensions[name]
+            if (type(dim) is not int or not -value.ndim <= dim < value.ndim
+                    or value.device != rows.device or value.shape[dim] != lease.bucket.bs):
+                raise ValueError(f"prepared input {name!r} has no declared captured row axis")
+            dim %= value.ndim
+            targets[name] = dim, value.movedim(dim, 0)
+        key = (lease.bucket, lease.buffer_slot)
+        if (bank := self._prepared_inputs.get(key)) is not None:
+            if (bank.slots.data_ptr() != rows.data_ptr() or bank.targets.keys() != targets.keys()
+                    or any(bank.targets[name][0] != dim or bank.targets[name][1].data_ptr() != value.data_ptr()
+                           or bank.columns[name].shape != (slots, *value.shape[1:])
+                           or bank.columns[name].dtype != value.dtype
+                           for name, (dim, value) in targets.items())):
+                raise ValueError("prepared input geometry changed for the same capture")
+            return bank
+        bank = PreparedInputs(
+            {name: value.new_zeros((slots, *value.shape[1:])) for name, (_, value) in targets.items()}, targets, rows,
+        )
+        self._prepared_inputs[key] = bank
+        return bank
 
     def prepare_stream_window(
         self, lease: SlotLease, decisions: int, transitions: int, positions: int = 0,

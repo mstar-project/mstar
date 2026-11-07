@@ -1955,7 +1955,8 @@ def test_engine_prepares_one_logical_joining_receipt_without_replanning(
         _host_step(live, [rid], [3])
     incumbent = _captured_step(live, planner, [1], slot=0, bs=4, repeats=4)
     membership = RunRows(torch.device("cpu"), 4, 8, 3 * (member + 1))
-    slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership), window=None),
+    slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership),
+                                              window=None, prepared=None),
                            row_heads={}, static_inputs={"flag": False}, dummy_rids=(-1, -2, -3, -4))
     from mstar.engine.resources.loopback_rows import LoopbackRows
     owner = LoopbackRows(CPU)
@@ -4524,3 +4525,50 @@ def test_unit_seed_publishes_complete_bindings_or_reverses_every_owner(failure, 
         for descriptor in batch.run_rows.values():
             eng.release_run_row(batch, descriptor)
     assert not held and owner.idle
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize("axis", [0, 1])
+def test_prepared_input_banks_keep_old_owners_and_mask_inactive_rows(device_name, axis):
+    if device_name == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA prepared owner inputs")
+    device = torch.device(device_name, 0) if device_name == "cuda" else CPU
+    owner = IterationTables(device)
+    lease = SlotLease(0, BucketKey("consume", 3, 3), "codec")
+    slots = torch.tensor([1, 2, 0], device=device)
+    target = torch.zeros((3, 2), device=device).movedim(0, axis)
+    flag = torch.zeros(3, dtype=torch.bool, device=device)
+    bank = owner.prepare_inputs(lease, {"lengths": target, "flag": flag}, {"lengths": axis, "flag": 0},
+                                rows=slots, slots=5)
+    value = torch.tensor([[8., 9.], [4., 5.], [0., 0.]], device=device).movedim(0, axis)
+    bank.stage([1, 2], {"lengths": value, "flag": torch.tensor([True, False, False], device=device)})
+    graph = None
+    bank.gather()
+    if device_name == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            bank.gather()
+
+    def execute():
+        if graph is None:
+            bank.gather()
+        else:
+            graph.replay()
+        return target.movedim(axis, 0).tolist()
+
+    assert execute() == [[8., 9.], [4., 5.], [0., 0.]]
+    before = {name: value.clone() for name, value in bank.columns.items()}
+    with pytest.raises(ValueError, match="prepared input 'flag'"):
+        bank.stage([3], {"lengths": value + 100, "flag": flag.float()})
+    assert all(torch.equal(before[name], value) for name, value in bank.columns.items())
+    # Stage a new owner without touching either old bank or the captured target.
+    replacement = torch.tensor([[2., 3.]], device=device).movedim(0, axis)
+    bank.stage([3], {"lengths": replacement, "flag": torch.tensor([True], device=device)})
+    assert execute() == [[8., 9.], [4., 5.], [0., 0.]]
+    slots.copy_(torch.tensor([3, 0, 0], device=device))
+    assert execute() == [[2., 3.], [0., 0.], [0., 0.]]
+    assert bank.columns["lengths"][1:3].tolist() == [[8., 9.], [4., 5.]]
+    assert flag.tolist() == [True, False, False]
+    with pytest.raises(ValueError, match="row axis"):
+        owner.prepare_inputs(replace(lease, slot=1), {"scalar": torch.tensor(1., device=device)}, {"scalar": 0},
+                             rows=slots, slots=5)

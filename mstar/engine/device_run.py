@@ -31,6 +31,7 @@ from mstar.utils.h2d import PinnedStager
 
 if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_backend import CapturedGraph
+    from mstar.engine.resources.iteration_tables import PreparedInputs
     from mstar.engine.resources.run_rows import RunRows, RunRowsSnapshot
 
 # a stop buffer of a run that repeats: the iterations it ran, on every row
@@ -513,6 +514,7 @@ class DeviceRun:
         self.sealed = False
         self.inputs = inputs
         self.window = window
+        self.prepared: PreparedInputs | None = None
         self.limit = limit
         # a column index per iteration (``results``)
         self._columns = torch.arange(limit, device=state.index.device)

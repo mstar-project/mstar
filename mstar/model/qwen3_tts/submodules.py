@@ -1309,6 +1309,7 @@ class CodecSubmodule(ARNodeSubmodule):
                 ),
                 additional_key_info=window,
                 capture_batch_sizes=self.CAPTURE_BATCH_SIZES,
+                input_seq_dims={"lengths": 0},
                 # the decode inside is compiled already, once for every capture
                 compile=False,
             )

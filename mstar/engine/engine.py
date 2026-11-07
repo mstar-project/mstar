@@ -3682,6 +3682,8 @@ class Engine:
                     lease, plan.slots.tolist(), snapshot, stager=membership.stager,
                 )
                 batch.iteration_columns = snapshot
+            if slot.run.prepared is not None:
+                slot.run.prepared.stage(plan.slots.tolist(), preprocessed)
             policy = mgmt.device_stops[batch.graph_walk]
             immune = policy is not None and policy.limits(batch.per_request_info_wrapped[rid]).ignore_eos
             descriptor = membership.reserve_row(
@@ -4375,6 +4377,8 @@ class Engine:
                 )
             else:
                 slot.run.stage_inputs(batch.iteration_columns)
+            if slot.run.prepared is not None:
+                slot.run.prepared.stage(ctx.resident_plan.slots.tolist(), preprocessed)
             batch.run_started = slot.run.state.started
         streamed = submodule_mgmt.device_stream_tokens.get(graph_walk)
         if streamed is not None and ctx.repeats > 1:

@@ -1075,12 +1075,21 @@ class AcceleratorGraphRunner:
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs
 
-    def _input_bank_bytes(self, spec: CGSlotSpec, inputs: Mapping[str, Any]) -> int:
+    def _input_bank_bytes(self, spec: CGSlotSpec, warmed: WarmedSpec) -> int:
         ask = self._run_asks.get(spec.bucket.graph_walk)
         if ask is None:
             return 0
+        inputs = warmed.static_inputs
         membership = 8 * spec.bucket.bs * (3 + ask.limit) if ask.membership is not None else 0
         if ask.loop is None:
+            if ask.membership is not None and self._resident is not None:
+                for name, dim in (spec.config.input_seq_dims or {}).items():
+                    if name in warmed.row_heads.values() or name in ask.iteration:
+                        continue
+                    value = inputs.get(name)
+                    if (isinstance(value, torch.Tensor) and type(dim) is int
+                            and -value.ndim <= dim < value.ndim and value.shape[dim] == spec.bucket.bs):
+                        membership += self._resident.max_slots * value.numel() // spec.bucket.bs * value.element_size()
             return membership
         return membership + IterationTables.window_bytes(
             self._resident.max_slots, ask.limit, 2 + len(ask.loop.ancestors),
@@ -1120,7 +1129,7 @@ class AcceleratorGraphRunner:
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
-                        extra = self._input_bank_bytes(spec, warmed.static_inputs)
+                        extra = self._input_bank_bytes(spec, warmed)
                         cost = self._capture_costs[spec.bucket]
                         if cost.graph is not None:
                             self._capture_costs[spec.bucket] = cost._replace(
@@ -1165,7 +1174,7 @@ class AcceleratorGraphRunner:
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
                     )
                 if memory is not None:
-                    extra = self._input_bank_bytes(spec, warmed.static_inputs)
+                    extra = self._input_bank_bytes(spec, warmed)
                     cost = cost._replace(graph=memory.pool + extra, outside=memory.outside)
             except Exception:
                 logger.warning(
@@ -1418,6 +1427,7 @@ class AcceleratorGraphRunner:
         if ask.loop is not None and (self._rows is None or warmed.resident is None):
             self._run_failures[walk] = "planner: actual Loop progress needs resident loop-back rows"
             return None, None, None
+        prepared_names = set()
         if ask.membership is not None:
             unbound = next((key for key, binding in self._resident.bindings.items()
                             if binding.check_horizon is unbound_horizon), None)
@@ -1426,8 +1436,16 @@ class AcceleratorGraphRunner:
                 return None, None, None
             uncovered = set(warmed.static_input_keys) - set(warmed.row_heads.values()) - set(ask.iteration)
             if uncovered:
-                self._run_failures[walk] = f"resource: joining inputs have no execution-time owner: {sorted(uncovered)}"
-                return None, None, None
+                if (ask.loop is not None or ask.iteration or warmed.resident is None
+                        or spec.config.get_config_type() != AcceleratorGraphConfigType.BASIC_BATCHED
+                        or spec.config.total_tokens_multiplier != 1 or spec.bucket.num_tokens != spec.bucket.bs
+                        or not uncovered <= (spec.config.input_seq_dims or {}).keys()
+                        or tables_key(self._submodule_name) not in self._resources):
+                    self._run_failures[walk] = (
+                        f"resource: joining inputs have no execution-time owner: {sorted(uncovered)}"
+                    )
+                    return None, None, None
+                prepared_names = uncovered
             if ask.carries:
                 self._run_failures[walk] = "resource: joining rows require owner-backed carries"
                 return None, None, None
@@ -1465,6 +1483,18 @@ class AcceleratorGraphRunner:
             inputs = {name: value.new_zeros((value.shape[0], ask.limit, *value.shape[1:]))
                       for name, value in shapes.items()}
         run = DeviceRun(state, inputs, lambda: None, ask.limit, window)
+        if prepared_names:
+            owner = self._resources[tables_key(self._submodule_name)]
+            try:
+                run.prepared = owner.prepare_inputs(
+                    SlotLease(spec.slot, spec.bucket, self._member),
+                    {name: warmed.static_inputs[name] for name in prepared_names},
+                    {name: spec.config.input_seq_dims[name] for name in prepared_names},
+                    rows=warmed.resident.slots, slots=self._resident.max_slots,
+                )
+            except ValueError as error:
+                self._run_failures[walk] = f"resource: {error}"
+                return None, None, None
         # The run's columns live outside the capture's pool: a block the forward
         # frees mid-capture goes to a later allocation of the same capture, so
         # the next iteration's forward would write its scratch over all but the
@@ -1509,6 +1539,8 @@ class AcceleratorGraphRunner:
             state.head()
 
             def select_inputs():
+                if run.prepared is not None:
+                    run.prepared.gather()
                 if window is None:
                     for name, column in inputs.items():
                         column_in(state.index, column, warmed.static_inputs[name])
@@ -1547,7 +1579,7 @@ class AcceleratorGraphRunner:
             raw_graph = int(graph.raw_cuda_graph())
             if (refusal := cuda.node_refusal(raw_graph)) is not None:
                 self._run_failures[walk] = f"runner: {refusal}"
-                if window is not None:
+                if window is not None or run.prepared is not None:
                     owner.discard_window(SlotLease(spec.slot, spec.bucket, self._member))
                 return None, None, None
             entry, _ = capture_into_graph(
@@ -1573,7 +1605,7 @@ class AcceleratorGraphRunner:
         except Exception as error:
             self._run_failures[walk] = f"runner: its capture into a WHILE body failed: {error}"
             logger.warning("AcceleratorGraphRunner[%s]: %s", self._submodule_name, error)
-            if window is not None:
+            if window is not None or run.prepared is not None:
                 owner.discard_window(SlotLease(spec.slot, spec.bucket, self._member))
             return None, None, None
         return run, graph, output

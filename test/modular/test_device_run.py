@@ -99,6 +99,7 @@ class _Loop:
 def _runner(
     monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False,
     progress=False, membership=None, unmanaged=False, ask=None, independent=False, owned=False, member=0,
+    config=None,
 ):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
@@ -172,7 +173,8 @@ def _runner(
         return SimpleNamespace(raw_cuda_graph=lambda: 7, replay=body), out
 
     monkeypatch.setattr(runner_mod, "capture_into_graph", capture)
-    spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, config=SimpleNamespace(get_config_type=lambda: None))
+    spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0,
+                           config=config or SimpleNamespace(get_config_type=lambda: None))
     warmed = SimpleNamespace(run=forward, static_inputs=static, static_input_keys=tuple(static),
                              row_heads={}, output=None, resident=resident)
     run, _, _ = runner._capture_run(spec, warmed)
@@ -2126,3 +2128,45 @@ def test_independent_row_masks_execute_in_a_real_conditional_capture(budget):
     assert state.eligible.tolist() == [True, True, True]
     assert stops[RUN_COUNTS].tolist() == [0, 0, 0]
     assert not values["frame"].any() and not values["last"].any()
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_plain_joining_capture_reads_prepared_values_from_masked_owners(monkeypatch, declared):
+    from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
+    from mstar.engine.resources.run_rows import RunRows
+    from mstar.engine.resources.step import StepContext
+
+    membership = RunRows(CPU, rows=2, capacity=4, binding_width=3)
+    ask = RunAsk(None, frozenset(), False, 6, {}, ("frame",), (), membership=membership, independent_rows=True)
+    config = SimpleNamespace(get_config_type=lambda: AcceleratorGraphConfigType.BASIC_BATCHED,
+                             total_tokens_multiplier=1, input_seq_dims={"cond": 0} if declared else None)
+    runner, run, _, calls = _runner(monkeypatch, _Loop(), [[1, 1]], owned=True, membership=membership,
+                                   independent=True, ask=ask, config=config)
+    if not declared:
+        assert run is None and "execution-time owner" in runner._run_failures[WALK]
+        return  # equal tensor extent and batch size alone do not prove row ownership
+    assert run is not None and run.window is None and not run.inputs
+    owner, lease, _ = run.test_inputs
+    ctx = StepContext((1, 2), WALK, 0, False, slot_lease=lease, repeats=1)
+    owner.resident_binding().check_horizon(None, ctx)
+    ctx.repeats = 2
+    with pytest.raises(ValueError, match="one computation"):
+        owner.resident_binding().check_horizon(None, ctx)
+    run.prepared.stage([3, 1], {"cond": torch.tensor([7., 4.])})
+    first = membership.reserve_row(1, 1, 0, (3, 0, 1))
+    sibling = membership.reserve_row(2, 1, 1, (1, 0, 1))
+    membership.publish_row(first)
+    membership.publish_row(sibling)
+    runner.test_resource.zero_()
+    _run(run, 2, 6)
+    assert calls[0].tolist() == [7., 4.]  # read after the resident gather overwrote static inputs
+    assert runner.test_resource.tolist() == [0., 4., 0., 7., 0.]
+    # A retained completed descriptor still names its slot. It must read the
+    # neutral padding bank when another owner executes on the physical row.
+    run.state.marks[0] = True
+    run.state.eligible.fill_(True)
+    run.state.select_rows()
+    run.state.head()
+    run.prepared.gather()
+    assert runner._resident.drop_rows(None, None).rows.tolist() == [3, 1]
+    assert run.prepared.targets["cond"][1].tolist() == [0., 0.]
