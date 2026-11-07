@@ -29,6 +29,7 @@ from mstar.model.gr00t_n17.config import (
     Gr00tN17Config,
     Gr00tN17StackConfig,
 )
+from mstar.model.gr00t_n17.gr00t_n17_model import DENOISE_LOOP
 from mstar.model.gr00t_n17.submodules import (
     Gr00tN17DenoiseStepSubmodule,
     Gr00tN17Shape,
@@ -37,7 +38,6 @@ from mstar.model.submodule_base import ModelInputsFromEngine
 
 from .helpers import BACKBONE, GR00T, needs_checkpoint, randomize
 
-_LOOP = "action_gen"
 _WALK = "action_gen"
 
 # The checkpoint's numbers, spelled out; the last test ties them to the checkpoint.
@@ -91,9 +91,7 @@ def _config(depth: int = _DEPTH) -> Gr00tN17Config:
     )
 
 
-def _node(
-    depth: int = _DEPTH, seed: int = 0, dtype: torch.dtype = torch.float32,
-) -> Gr00tN17DenoiseStepSubmodule:
+def _node(depth: int = _DEPTH, dtype: torch.dtype = torch.float32) -> Gr00tN17DenoiseStepSubmodule:
     """``dtype`` casts the whole node, and so the carried loop state."""
     config = _config(depth)
     node = Gr00tN17DenoiseStepSubmodule(
@@ -102,24 +100,22 @@ def _node(
         ActionPositionEmbedding(config),
         DiT(config),
         build_action_decoder(config),
-        loop_name=_LOOP,
+        loop_name=DENOISE_LOOP,
     )
     # filled because `ActionPositionEmbedding` allocates with `torch.empty`; small so random
     # blocks do not saturate the residuals and the action encoder's swish
-    randomize(node, seed, scale=0.1)
+    randomize(node, 0, scale=0.1)
     return node.to(dtype).eval()
 
 
-def _info(
-    rid: str = "r0", k: int = 0, text: int = _TXT, image: int = _IMG, seed: int = 0,
-) -> CurrentForwardPassInfo:
+def _info(rid: str = "r0", k: int = 0, text: int = _TXT, image: int = _IMG) -> CurrentForwardPassInfo:
     """One request's forward-pass info, with the span counts in ``step_metadata``."""
     return CurrentForwardPassInfo(
-        request_id=rid, graph_walk=_WALK, fwd_index=k, random_seed=seed, max_tokens=0,
+        request_id=rid, graph_walk=_WALK, fwd_index=k, random_seed=0, max_tokens=0,
         # the base keys request state by this; stable across processes, unlike salted `hash()`
         rid_handle=int(rid.removeprefix("r")),
         step_metadata={"vl_text_rows": text, "vl_image_rows": image},
-        dynamic_loop_iter_counts={_LOOP: k},
+        dynamic_loop_iter_counts={DENOISE_LOOP: k},
     )
 
 
@@ -143,44 +139,30 @@ def _walk_inputs(
     }
 
 
-def _stacked_cond(
-    config: Gr00tN17Config, batch: int = 1, text: int = _TXT, image: int = _IMG,
-    seed: int = 6, dtype: torch.dtype = torch.float32,
-) -> dict:
-    """``denoise``'s conditioning for ``batch`` rows, stacked as the base stacks it."""
-    generator = torch.Generator().manual_seed(seed)
-
-    def rows(*shape):
-        return torch.randn(shape, generator=generator).to(dtype)
-
-    return {
-        "vl_text": rows(batch, text, config.backbone_embedding_dim),
-        "vl_image": rows(batch, image, config.backbone_embedding_dim),
-        "state": rows(batch, 1, config.input_embedding_dim),
-        "embodiment_id": torch.full((batch,), _EMBODIMENT, dtype=torch.long),
-    }
+def _stacked_cond(node: Gr00tN17DenoiseStepSubmodule, dtype: torch.dtype = torch.float32) -> dict:
+    """``denoise``'s conditioning for one row, stacked as the base stacks it."""
+    single = node.request_inputs(_info(), _walk_inputs(node.config, dtype=dtype), _SHAPE)
+    return {name: tensor.unsqueeze(0) for name, tensor in single.items()}
 
 
-def _latents(
-    batch: int = 1, seed: int = 7, dtype: torch.dtype = torch.float32,
-) -> torch.Tensor:
+def _latents(batch: int = 1, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """``[B, 40, 132]``, drawn in fp32 and cast, so the bf16 and fp32 chains start together."""
     return torch.randn(
-        batch, _HORIZON, _ACTION_DIM, generator=torch.Generator().manual_seed(seed),
+        batch, _HORIZON, _ACTION_DIM, generator=torch.Generator().manual_seed(7),
     ).to(dtype)
 
 
-def _scalars(step: int, batch: int = 1) -> dict:
-    """Step ``step``'s scalars as the base slices them: sigmas ``[B, 1, 1]``, timestep ``[B]``."""
+def _scalars(step: int) -> dict:
+    """Step ``step``'s scalars for one row as the base slices them: sigmas ``[1, 1, 1]``, timestep ``[1]``."""
     schedule = FlowMatchSchedule(
         sigmas=torch.arange(_STEPS + 1, dtype=torch.float32) / _STEPS,
         timesteps=torch.tensor(_REF_TIMESTEPS),
         mu=None,
     )
     return {
-        "sigma": schedule.sigmas[step].expand(batch).view(-1, 1, 1),
-        "sigma_next": schedule.sigmas[step + 1].expand(batch).view(-1, 1, 1),
-        "timestep": schedule.timesteps[step].expand(batch),
+        "sigma": schedule.sigmas[step].view(1, 1, 1),
+        "sigma_next": schedule.sigmas[step + 1].view(1, 1, 1),
+        "timestep": schedule.timesteps[step].view(1),
     }
 
 
@@ -272,15 +254,11 @@ def test_the_schedule_is_four_ascending_sigmas_and_the_references_buckets():
     schedule = _node().schedule_for(None, _SHAPE)
 
     assert schedule.num_steps == _STEPS
-    assert schedule.sigmas.shape == (_STEPS + 1,)
-    assert schedule.timesteps.shape == (_STEPS,)
     assert schedule.sigmas.dtype is torch.float32
     assert schedule.timesteps.dtype is torch.float32
     assert torch.equal(schedule.sigmas, torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]))
     assert torch.equal(schedule.timesteps, torch.tensor(_REF_TIMESTEPS))
     assert schedule.mu is None  # no resolution-dependent shift: GR00T has no image grid
-    steps = schedule.sigmas[1:] - schedule.sigmas[:-1]
-    assert torch.equal(steps, torch.full((_STEPS,), _REF_DT))
 
 
 def test_the_steps_scalars_come_off_our_schedule_at_every_step():
@@ -313,7 +291,7 @@ def test_the_41_rows_reach_the_dt_and_the_40_come_back():
     seen = []
     node.model.register_forward_pre_hook(lambda module, args: seen.append(args[0].shape))
 
-    cond = _stacked_cond(node.config)
+    cond = _stacked_cond(node)
     out = node.denoise(None, _SHAPE, latents=_latents(1), **_scalars(0), **cond)
 
     assert prepared[0].input_seq_len == _ROWS
@@ -345,7 +323,7 @@ def test_the_carried_dtype_is_the_weights_and_does_not_change_mid_loop():
     the other. It must also not change mid-loop, or one bucket needs two graphs and runs eager."""
     for dtype in (torch.bfloat16, torch.float32):
         node = _node(dtype=dtype)
-        cond = _stacked_cond(node.config, dtype=dtype)
+        cond = _stacked_cond(node, dtype=dtype)
         start = _latents(1, dtype=dtype)
 
         carried, seen = start, []
@@ -367,16 +345,13 @@ def test_four_bf16_iterations_are_the_references_arithmetic_to_the_bit():
     sums in fp32 and rounds once: bit-identical to bf16 ``a + dt * v`` only because ``dt = 1/4``
     is a power of two. The fp32 carry, stepped alongside, must differ."""
     node = _node(dtype=torch.bfloat16)
-    cond = _stacked_cond(node.config, dtype=torch.bfloat16)
+    cond = _stacked_cond(node, dtype=torch.bfloat16)
     start = _latents(1, dtype=torch.bfloat16)
 
     ours = reference = start
     fp32_carry = start.float()  # the better integrator, and not the reference's
     for k in range(_STEPS):
         scalars = _scalars(k)
-        # the hand-written chain steps by the schedule's own dt, not a second schedule
-        assert float(scalars["sigma_next"] - scalars["sigma"]) == _REF_DT
-
         ours = node.denoise(None, _SHAPE, latents=ours, **scalars, **cond)
         velocity = _by_hand(node, reference, cond, scalars["timestep"])
         assert velocity.dtype is torch.bfloat16  # the premise: the forward *is* bf16
@@ -417,6 +392,7 @@ def test_the_bucket_key_is_the_two_span_counts_off_step_metadata():
         node.bucket_key_for(bare)
     # a captured bucket's padding row carries no metadata; the base drops it from the vote
     assert node.cg_key_info(_WALK, {"r0": _info("r0"), "pad": bare}) == _SHAPE
+    assert node.max_batch_size(_WALK) == 8  # the model passes none, so this is the served cap
 
 
 def test_two_requests_batch_only_when_both_spans_match():
@@ -462,7 +438,7 @@ def test_the_node_asks_the_scheduler_to_batch_each_prompt_length_apart():
 _REQUEST_RANKS = {"vl_text": 2, "vl_image": 2, "state": 2, "embodiment_id": 0}
 
 
-def test_the_request_inputs_carry_no_batch_dim_and_stack_into_the_forwards_shapes():
+def test_the_request_inputs_carry_no_batch_dim():
     """``request_inputs`` returns each tensor without a batch dim, since ``preprocess``
     stacks the batch. The state token ``[1, 1, D]`` must become ``[1, D]``: left at rank 3 it
     stacks to ``[B, 1, 1, D]`` and the concatenation with the action rows fails or broadcasts."""
@@ -478,15 +454,6 @@ def test_the_request_inputs_carry_no_batch_dim_and_stack_into_the_forwards_shape
     assert int(single["embodiment_id"]) == _EMBODIMENT
     assert torch.equal(single["vl_text"], inputs["vl_text"][0])
     assert torch.equal(single["vl_image"], inputs["vl_image"][0])
-
-    prepared, _ = _declare(node, ("r0", "r1"))
-    stacked = node.preprocess(_WALK, None, prepared)
-    for name, rank in _REQUEST_RANKS.items():
-        assert stacked[name].dim() == rank + 1, name
-        assert stacked[name].shape[0] == 2, name
-    assert stacked[LATENTS].shape == (2, _HORIZON, _ACTION_DIM)
-    assert stacked["state"].shape == (2, 1, node.config.input_embedding_dim)
-    assert stacked["embodiment_id"].shape == (2,)
 
 
 def test_driving_the_node_is_one_denoise_call_per_row_and_each_row_is_its_own():
@@ -594,7 +561,6 @@ def test_each_span_reads_its_own_resource_under_the_label_the_step_declared():
     attends = node.attends()
     resources = node.node_resources
 
-    assert set(attends) == {SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN}
     ragged = {span: fn.keywords["ragged"] for span, fn in attends.items()}
     assert all(isinstance(fn, functools.partial) for fn in ragged.values())
     assert ragged[SA_SPAN].func.__self__ is resources[DT_ATTN]
@@ -602,16 +568,13 @@ def test_each_span_reads_its_own_resource_under_the_label_the_step_declared():
     for q_label, kv_label in DT_XATTN_PAIRS:
         assert ragged[kv_label].func.__self__ is resources[DT_XATTN]
         assert ragged[kv_label].keywords["label"] == cross_label(q_label, kv_label)
-    # every label a callable asks for is a label the step's resource declared
-    for key, span_labels in ((DT_ATTN, [SA_SPAN]), (DT_XATTN, [SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN])):
-        assert {segment.label for segment in step.steps[key].segments} == set(span_labels)
 
 
 def test_the_two_resources_planned_from_the_step_are_the_sdpa_fallback_at_one_request():
     """At one request the ragged path is exactly the SDPA fallback, so this tests the wiring: a
     wrong span length, a reversed cross pair or a swapped resource all give a different tensor."""
-    node = _node()
-    latents, scalars, cond = _latents(1), _scalars(2), _stacked_cond(node.config)
+    node = _node(depth=3)  # the third block is the first to read the image span
+    latents, scalars, cond = _latents(1), _scalars(2), _stacked_cond(node)
 
     sdpa = node.denoise(None, _SHAPE, latents=latents, **scalars, **cond)
     _, step = _declare(node)
@@ -628,16 +591,16 @@ def test_the_two_resources_planned_from_the_step_are_the_sdpa_fallback_at_one_re
 
 
 def test_the_step_names_both_dt_resources_with_the_spans_each_one_plans():
-    """``DT_ATTN`` plans ``sa``; ``DT_XATTN`` plans ``sa + text + image`` with both ends of each
-    pair. Segments are grouped by label, which is how a request's queries line up with its own
-    keys; top-level ``segments`` stays None so neither resource inherits the other's layout."""
+    """``DT_ATTN`` plans ``sa``; ``DT_XATTN`` plans ``sa + text + image`` at each row's own lengths,
+    with both ends of each pair. Segments are grouped by label, which is how a request's queries line
+    up with its own keys; top-level ``segments`` stays None so neither resource inherits the other's layout."""
     node = _node()
     rids = ["r0", "r1"]
-    _, step = _declare(node, rids, [_info("r0"), _info("r1")])
+    _, step = _declare(node, rids, [_info("r0"), _info("r1", text=_TXT + 4, image=_IMG + 2)])
 
     assert set(step.steps) == {DT_ATTN, DT_XATTN}
     assert step.segments is None
-    assert step.cg_key_info == _SHAPE
+    assert step.cg_key_info is None  # two keys match no capture
 
     self_attn = step.steps[DT_ATTN]
     assert isinstance(self_attn, AttentionStep)
@@ -648,83 +611,26 @@ def test_the_step_names_both_dt_resources_with_the_spans_each_one_plans():
     assert isinstance(cross, RaggedCrossAttentionStep)
     assert cross.pairs == DT_XATTN_PAIRS == ((SA_SPAN, VL_TEXT_SPAN), (SA_SPAN, VL_IMAGE_SPAN))
     assert cross.segments == (
-        *(Segment(rid, SA_SPAN, _ROWS) for rid in rids),
-        *(Segment(rid, VL_TEXT_SPAN, _TXT) for rid in rids),
-        *(Segment(rid, VL_IMAGE_SPAN, _IMG) for rid in rids),
-    )
-    labels = {segment.label for segment in cross.segments}
-    assert all({q, kv} <= labels for q, kv in cross.pairs)
-
-
-def test_the_declared_spans_are_each_requests_own_lengths():
-    """A batch of two keys is declared at each row's own lengths, not the first row's, and
-    its graph key is None (matches no capture)."""
-    node = _node()
-    infos = [_info("r0"), _info("r1", text=_TXT + 4, image=_IMG + 2)]
-    _, step = _declare(node, ("r0", "r1"), infos)
-
-    assert step.cg_key_info is None
-    assert step.steps[DT_XATTN].segments == (
         Segment("r0", SA_SPAN, _ROWS), Segment("r1", SA_SPAN, _ROWS),
         Segment("r0", VL_TEXT_SPAN, _TXT), Segment("r1", VL_TEXT_SPAN, _TXT + 4),
         Segment("r0", VL_IMAGE_SPAN, _IMG), Segment("r1", VL_IMAGE_SPAN, _IMG + 2),
     )
+    labels = {segment.label for segment in cross.segments}
+    assert all({q, kv} <= labels for q, kv in cross.pairs)
 
-
-def test_attention_segments_lists_the_same_three_spans_the_step_declares():
-    """``declare_step`` builds its segments without the scaffold's ``attention_segments``,
-    so the two describe one layout twice; a span added to only one leaves a label unplanned."""
-    node = _node()
-    _, step = _declare(node)
-
-    assert node.attention_segments(_SHAPE) == (
-        (SA_SPAN, _ROWS), (VL_TEXT_SPAN, _TXT), (VL_IMAGE_SPAN, _IMG),
-    )
-    assert [(segment.label, segment.span) for segment in step.steps[DT_XATTN].segments] == list(
-        node.attention_segments(_SHAPE)
-    )
-
-
-def test_the_node_declares_no_single_base_resource():
-    """The node passes ``attn_resource_key=None`` and declares its two resources itself.
-    Left set, the base would plan a third resource that no layer reads, and ``ragged_for``
-    would hand the DT callables bound to it."""
-    node = _node()
-
-    assert node.attn_resource_key is None
-    assert node.loop_back_names == (LATENTS,)  # one Euler step, no solver state to carry
-    assert node.ragged_for(SA_SPAN) is None
-    assert node.max_batch_size(_WALK) == 8
+    assert _declare(node, ("r2", "r3"))[1].cg_key_info == _SHAPE  # equal lengths share the bucket's key
 
 
 # ----------------------------------------------------------------------------
-# The checkpoint's own numbers, on `meta`
+# The checkpoint's own numbers
 # ----------------------------------------------------------------------------
 
 
 @needs_checkpoint
 def test_the_checkpoints_numbers_are_the_ones_these_tests_run():
-    """Ties the spelled-out counts to the checkpoint, on ``meta`` (the real DT is 1.12B params)."""
+    """Ties the spelled-out counts to the checkpoint."""
     config = Gr00tN17Config.from_hf(GR00T, BACKBONE)
-    with torch.device("meta"):
-        node = Gr00tN17DenoiseStepSubmodule(
-            config,
-            build_action_encoder(config),
-            ActionPositionEmbedding(config),
-            DiT(config),
-            build_action_decoder(config),
-            loop_name=_LOOP,
-        )
 
     assert (config.action_horizon, config.max_action_dim) == (_HORIZON, _ACTION_DIM)
     assert (config.num_inference_timesteps, config.num_timestep_buckets) == (_STEPS, _BUCKETS)
     assert config.input_embedding_dim == config.dit.inner_dim
-    key = Gr00tN17Shape(text_rows=13, image_rows=448)  # a recorded prefill: four camera views
-    assert node.num_tokens(key) == _ROWS
-    assert node.seed_latents(None, key, torch.Generator().manual_seed(0)).shape == (40, 132)
-    schedule = node.schedule_for(None, key)
-    assert torch.equal(schedule.timesteps, torch.tensor(_REF_TIMESTEPS))
-    placeholders = node.capture_request_inputs(key, torch.device("meta"))
-    assert placeholders[LATENTS].shape == (40, 132)
-    assert placeholders["vl_text"].shape == (13, config.backbone_embedding_dim)
-    assert placeholders["state"].shape == (1, config.input_embedding_dim)

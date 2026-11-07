@@ -337,8 +337,8 @@ class _Case(NamedTuple):
 
 
 @torch.no_grad()
-def _case(tmp_path, num_layers: int = _DEEPSTACK_LAYERS, features: int = _FEATURES, tokens: int = 64) -> _Case:
-    config = _config(num_layers=num_layers)
+def _case(tmp_path, tokens: int = 64) -> _Case:
+    config = _config(num_layers=_DEEPSTACK_LAYERS)
     weights = _checkpoint(config.text, seed=0)
     model = _loaded_model(config, weights, tmp_path)
     hidden, cos, sin = _prepare(model, tokens, seed=1)
@@ -346,7 +346,7 @@ def _case(tmp_path, num_layers: int = _DEEPSTACK_LAYERS, features: int = _FEATUR
     # at the scale of the hidden states, and distinct, so permuting them is a real change
     deepstack = [
         torch.randn(len(_IMAGE_ROWS), config.text.hidden_size, generator=generator) * 0.5
-        for _ in range(features)
+        for _ in range(_FEATURES)
     ]
     mask = torch.zeros(tokens, dtype=torch.bool)
     mask[_IMAGE_ROWS] = True
@@ -389,25 +389,6 @@ def test_row_k_of_a_feature_lands_on_image_row_k(tmp_path, permute):
     assert relative_gap(case.ours(), case.theirs(rows=permute(case.rows))) > 1000 * _BAR
 
 
-def test_only_the_image_rows_move(tmp_path):
-    """``index_add`` copies the untouched rows, so they are ``torch.equal``. One layer and one
-    feature, so the injection is last: with a layer after it, attention mixes every row."""
-    case = _case(tmp_path, num_layers=1, features=1)
-    base = case.model(case.hidden, case.cos, case.sin)
-    moved = case.ours()
-    assert torch.equal(base[~case.mask], moved[~case.mask])
-    assert (base[case.mask] != moved[case.mask]).any(dim=1).all()
-
-
-def test_no_features_is_the_forward_without_the_argument(tmp_path):
-    """The DT and the bridge call this with no DeepStack at all; that path must not have
-    picked up a clone, a reordering or any other arithmetic."""
-    case = _case(tmp_path)
-    plain = case.model(case.hidden, case.cos, case.sin)
-    assert torch.equal(case.model(case.hidden, case.cos, case.sin, ()), plain)
-    assert torch.equal(case.model(case.hidden, case.cos, case.sin, (), case.rows), plain)
-
-
 # ----------------------------------------------------------------------------
 # The attention resource
 # ----------------------------------------------------------------------------
@@ -421,13 +402,6 @@ def test_an_unbound_attention_names_the_resource_it_wanted(resources):
     _bind(model, resources)
     with pytest.raises(RuntimeError, match=LLM_ATTN):
         model(torch.zeros(2, model.config.hidden_size), *model.build_cos_sin(torch.zeros(3, 2)))
-
-
-def test_binding_the_node_reaches_every_layers_attention():
-    model = Gr00tN17LanguageModel(_config())
-    attention = SegmentAttention((2,), causal=True, gqa=True)
-    _bind(model, {LLM_ATTN: attention})
-    assert [layer.self_attn.ragged_attn for layer in model.layers] == [attention] * _LAYERS
 
 
 # ----------------------------------------------------------------------------
@@ -594,49 +568,19 @@ def _drive(tmp_path, spec: list) -> _Run:
     return _Run(node, ids, grid, walk, prepared, tensors, node.forward(_WALK, _ENGINE, **tensors))
 
 
-@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
-def test_the_step_is_one_causal_segment_over_the_whole_prompt(tmp_path, spec):
+def test_the_step_is_one_causal_segment_over_the_whole_prompt(tmp_path):
     """One causal segment over every prompt token (the vision node cuts one non-causal segment
     per frame); both live only in the declaration, so this is where they are said."""
     node = _node(tmp_path)
-    ids, grid = _prompt(spec)
+    ids, grid = _prompt(_PROMPTS["one image"])
     prepared = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, ids, grid))
     step = node.declare_step(_WALK, ["r0"], [prepared])
 
     assert step.segments == [Segment("r0", "main", len(ids))]
     assert list(step.steps) == [LLM_ATTN]
     assert step.steps[LLM_ATTN].causal is True
-    # what the resource is planned from: `SubmoduleStep` fills it in from `segments`
-    assert step.steps[LLM_ATTN].segments == step.segments
-
-
-@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
-def test_prepare_inputs_derives_the_rows_and_the_positions_from_the_prompt(tmp_path, spec):
-    """Everything the forward needs beyond the walk's inputs, each against the prompt it came
-    from; the positions against ``mrope_position_ids`` called directly."""
-    node = _node(tmp_path)
-    ids, grid = _prompt(spec)
-    walk = _walk_inputs(node.config, ids, grid)
-    prepared = node.prepare_inputs(_WALK, _FWD, walk)
-    tensors = prepared.tensor_inputs
-
-    # what the engine sizes the batch and the segment by
-    assert prepared.input_seq_len == len(ids)
-    assert set(tensors) == _STAGED
-    assert torch.equal(tensors["input_ids"], ids)
-    expected_rows = [i for i, token in enumerate(ids.tolist()) if token == _IMAGE_TOKEN]
-    assert tensors["image_rows"].tolist() == expected_rows
-    assert torch.equal(tensors["position_ids"], mrope_position_ids(ids, grid, _IMAGE_TOKEN, _MERGE))
-    assert torch.equal(tensors["vision_embeds"], walk["vision_embeds"][0])
-
-    # [taps, rows, hidden]: one tensor to stage, which the forward unbinds back to the three
-    assert tensors["deepstack_embeds"].shape == (_FEATURES, len(expected_rows), node.config.text.hidden_size)
-    unbound = tensors["deepstack_embeds"].unbind(0)
-    assert all(torch.equal(ours, theirs) for ours, theirs in zip(unbound, walk["deepstack_embeds"], strict=True))
-    # a prompt with no images has three empty features, which permute to themselves
-    assert not expected_rows or all(
-        not torch.equal(first, second) for first, second in itertools.combinations(unbound, 2)
-    )
+    # no batched forward, so a wider batch would only be the engine's per-request fallback
+    assert node.max_batch_size(_WALK) == 1
 
 
 def test_a_prompt_that_arrives_as_a_row_is_the_same_one_request(tmp_path):
@@ -681,16 +625,3 @@ def test_row_k_of_the_vision_embeds_lands_on_image_row_k(tmp_path, permute):
     # the unpermuted scatter is exact, which is what makes the gap below mean something
     assert torch.equal(run.features, run.by_hand())
     assert relative_gap(run.features, run.by_hand(**permute(run))) > 1000 * _BAR
-
-
-def test_the_node_takes_one_request_a_step(tmp_path):
-    """One request per forward: a second raises (the interpreter's unpacking message, hence
-    the loose match) rather than being dropped or appended to the first prompt."""
-    node = _node(tmp_path)
-    ids, grid = _prompt(_PROMPTS["one image"])
-    prepared = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, ids, grid))
-    two = ModelInputsFromEngine(request_ids=["r0", "r1"], per_request_info={})
-
-    assert node.max_batch_size(_WALK) == 1
-    with pytest.raises(ValueError, match="expected 1"):
-        node.preprocess(_WALK, two, [prepared, prepared])

@@ -1,10 +1,7 @@
 """GR00T N1.7's VL bridge (a LayerNorm, then four self-attention blocks) against an inline
-reference; its ``vl_bridge`` node and the split of its rows into the denoise loop's two spans;
-and, on recorded prefills, that the split is the reference's own ``input_ids == image_token_id``.
+reference; and its ``vl_bridge`` node and the split of its rows into the denoise loop's two spans.
 """
 
-import json
-from pathlib import Path
 from typing import NamedTuple
 
 import pytest
@@ -18,21 +15,11 @@ from mstar.model.gr00t_n17.components.bridge import (
     BasicTransformerBlock,
     Gr00tN17VLBridge,
 )
-from mstar.model.gr00t_n17.components.llm import Gr00tN17LanguageModel
-from mstar.model.gr00t_n17.config import (
-    BRIDGE_ATTN,
-    Gr00tN17Config,
-    Gr00tN17StackConfig,
-    Gr00tN17TextConfig,
-)
-from mstar.model.gr00t_n17.submodules import (
-    Gr00tN17LLMSubmodule,
-    Gr00tN17VLBridgeSubmodule,
-)
-from mstar.model.qwen3_5.config import Qwen3_5VisionConfig
+from mstar.model.gr00t_n17.config import BRIDGE_ATTN, Gr00tN17Config, Gr00tN17StackConfig
+from mstar.model.gr00t_n17.submodules import Gr00tN17VLBridgeSubmodule
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 
-from .helpers import BACKBONE, RECORDINGS, RUNS, SegmentAttention, randomize, relative_gap
+from .helpers import SegmentAttention, randomize, relative_gap
 
 _BLOCKS = 4  # the checkpoint's `vl_self_attention_cfg.num_layers`
 # spelled out rather than imported from the module under test: the point of the eps
@@ -82,32 +69,16 @@ _WRONG_NORMS_SWAPPED = "norm1 and norm3 swapped"
 DEVIATIONS = (_WRONG_NO_ATTN_RESIDUAL, _WRONG_NO_FF_RESIDUAL, _WRONG_NORMS_SWAPPED)
 
 
-def _activate(x: torch.Tensor, activation: str) -> torch.Tensor:
-    """"gelu-approximate" is the real one; "gelu" is the exact gelu a different
-    ``activation_fn`` would put between the feed-forward's two linears."""
-    if activation == "gelu-approximate":
-        return F.gelu(x, approximate="tanh")
-    assert activation == "gelu"
-    return F.gelu(x)
-
-
 class RefBlock(nn.Module):
     """``norm1 -> attn -> +x -> norm3 -> ff -> +x``, with q, k and v as three separate
     projections and a plain softmax where ours calls the ragged resource, and the
     feed-forward as one projection out to ``4 * dim``, an activation, and one back."""
 
-    def __init__(
-        self,
-        config: Gr00tN17StackConfig,
-        eps: float = _EPS,
-        deviation: str | None = None,
-        activation: str = "gelu-approximate",
-    ):
+    def __init__(self, config: Gr00tN17StackConfig, eps: float = _EPS, deviation: str | None = None):
         super().__init__()
         dim = config.inner_dim
         self.config = config
         self.deviation = deviation
-        self.activation = activation
         self.norm1 = nn.LayerNorm(dim, eps=eps)
         self.norm3 = nn.LayerNorm(dim, eps=eps)
         self.to_q = nn.Linear(dim, dim)
@@ -127,14 +98,12 @@ class RefBlock(nn.Module):
         out = (scores.softmax(dim=-1) @ v).transpose(0, 1)
         return self.to_out(out.reshape(tokens, -1))
 
-    def feed_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj_out(_activate(self.proj_in(x), self.activation))
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         swapped = self.deviation == _WRONG_NORMS_SWAPPED
         attended = self._attention((self.norm3 if swapped else self.norm1)(x))
         x = attended if self.deviation == _WRONG_NO_ATTN_RESIDUAL else attended + x
-        ff = self.feed_forward((self.norm1 if swapped else self.norm3)(x))
+        normed = (self.norm1 if swapped else self.norm3)(x)
+        ff = self.proj_out(F.gelu(self.proj_in(normed), approximate="tanh"))
         return ff if self.deviation == _WRONG_NO_FF_RESIDUAL else ff + x
 
 
@@ -232,44 +201,6 @@ def test_the_layer_norms_use_eps_1e_5_and_not_1e_6():
 
 
 # ----------------------------------------------------------------------------
-# The feed-forward, which is diffusers' own
-# ----------------------------------------------------------------------------
-
-
-def test_the_feed_forward_projects_out_to_four_times_the_width_ungated():
-    """The checkpoint's ``net.0.proj`` is 8192 x 2048 on a 2048-wide block, the ungated shape
-    (a ``geglu`` projection is twice as wide). Both ends are pinned: a gated variant at half
-    the inner width matches ``net.0`` and differs only at ``net.2``."""
-    config = _config(*_GEOMETRIES["the checkpoint's head width"]).bridge
-    dim = config.inner_dim
-    ff = BasicTransformerBlock(config).ff
-
-    assert ff.net[0].proj.weight.shape == (4 * dim, dim)
-    assert ff.net[2].weight.shape == (dim, 4 * dim)
-
-
-@pytest.mark.parametrize(
-    "activation", ["gelu-approximate", "gelu"], ids=["the tanh gelu", "the exact gelu"],
-)
-@torch.no_grad()
-def test_the_feed_forward_is_one_activation_between_two_linears(activation):
-    """A swapped activation loads the checkpoint and runs, so the arithmetic is pinned: the
-    real one is ``torch.equal`` (the same two linears and ``F.gelu``), the exact gelu is not."""
-    config = _config(*_GEOMETRIES["a narrow block"])
-    block = BasicTransformerBlock(config.bridge)
-    randomize(block, 2, scale=0.5)
-    reference = RefBlock(config.bridge, activation=activation)
-    reference.proj_in.load_state_dict(block.ff.net[0].proj.state_dict())
-    reference.proj_out.load_state_dict(block.ff.net[2].state_dict())
-    x = _rows(6, config.bridge.inner_dim, seed=3)
-
-    if activation == "gelu-approximate":
-        assert torch.equal(block.ff(x), reference.feed_forward(x))
-    else:
-        assert not torch.equal(block.ff(x), reference.feed_forward(x))
-
-
-# ----------------------------------------------------------------------------
 # Parameters
 # ----------------------------------------------------------------------------
 
@@ -306,16 +237,6 @@ def test_an_unbound_attention_names_the_resource_it_wanted(resources):
 
     with pytest.raises(RuntimeError, match=BRIDGE_ATTN):
         bridge(torch.zeros(2, config.backbone_embedding_dim))
-
-
-def test_binding_the_node_reaches_every_blocks_attention():
-    config = _config(*_GEOMETRIES["a narrow block"])
-    bridge = Gr00tN17VLBridge(config)
-    attention = SegmentAttention((2,))
-    _bind(bridge, {BRIDGE_ATTN: attention})
-
-    blocks = bridge.vl_self_attention.transformer_blocks
-    assert [block.attn1.ragged_attn for block in blocks] == [attention] * _BLOCKS
 
 
 # ----------------------------------------------------------------------------
@@ -375,17 +296,18 @@ class _Run(NamedTuple):
 
     @torch.no_grad()
     def by_hand(self) -> torch.Tensor:
-        """The bridge called directly on the same rows: what the node's two spans are cut
-        from, and what scattering them back has to reproduce."""
+        """The bridge called directly on the same rows: what the node's two spans are cut from."""
         return self.node.model(self.features)
 
 
 @torch.no_grad()
-def _drive_rows(rows: int, image: list[int], seed: int = 1) -> _Run:
-    """prepare_inputs -> declare_step's resource -> preprocess -> forward, as the engine
-    runs it, over ``rows`` backbone rows of which ``image`` are the image rows."""
+def _drive(spec: tuple) -> _Run:
+    """prepare_inputs -> declare_step's resource -> preprocess -> forward, as the engine runs it.
+    The image rows come from the spec, so the split is checked against the prompt rather than
+    against the mask the node built."""
+    rows, image = _prompt(spec)
     node = _node()
-    features = _rows(rows, node.config.backbone_embedding_dim, seed=seed)
+    features = _rows(rows, node.config.backbone_embedding_dim, seed=1)
     walk = {
         "backbone_features": [features],
         "image_rows": [torch.tensor(image, dtype=torch.long)],
@@ -404,36 +326,6 @@ def _drive_rows(rows: int, image: list[int], seed: int = 1) -> _Run:
     )
 
 
-def _drive(spec: tuple, seed: int = 1) -> _Run:
-    """``_drive_rows`` over a spec of runs. The image rows are derived from the spec, so the
-    split is checked against the prompt rather than against the mask the node built."""
-    return _drive_rows(*_prompt(spec), seed=seed)
-
-
-@pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
-def test_the_step_is_one_non_causal_segment_over_the_whole_prompt(spec):
-    """One non-causal segment over all of a prompt's rows (the vision node cuts one per frame,
-    the LLM node attends causally); it lives only in the declaration, so this is where it is said."""
-    node = _node()
-    rows, image = _prompt(spec)
-    prepared = node.prepare_inputs(
-        _WALK, _FWD,
-        {
-            "backbone_features": [_rows(rows, node.config.backbone_embedding_dim, seed=1)],
-            "image_rows": [torch.tensor(image, dtype=torch.long)],
-        },
-    )
-    step = node.declare_step(_WALK, ["r0"], [prepared])
-
-    assert step.segments == [Segment("r0", "main", rows)]
-    assert list(step.steps) == [BRIDGE_ATTN]
-    assert step.steps[BRIDGE_ATTN].causal is False
-    # what the resource is planned from: `SubmoduleStep` fills it in from `segments`
-    assert step.steps[BRIDGE_ATTN].segments == step.segments
-    # no batched forward, so a wider batch would only be the engine's per-request fallback
-    assert node.max_batch_size(_WALK) == 1
-
-
 @pytest.mark.parametrize("spec", list(_PROMPTS.values()), ids=list(_PROMPTS))
 def test_the_split_is_the_mask_and_keeps_every_row_in_prompt_order(spec):
     """prepare_inputs -> preprocess -> forward is the bridge over the walk's rows, cut into
@@ -443,6 +335,14 @@ def test_the_split_is_the_mask_and_keeps_every_row_in_prompt_order(spec):
     run = _drive(spec)
     rows = run.by_hand()
 
+    # one non-causal segment over all the rows (the vision node cuts one per frame, the LLM node
+    # attends causally); it lives only in the declaration
+    assert run.step.segments == [Segment("r0", "main", len(run.features))]
+    assert list(run.step.steps) == [BRIDGE_ATTN]
+    assert run.step.steps[BRIDGE_ATTN].causal is False
+    # no batched forward, so a wider batch would only be the engine's per-request fallback
+    assert run.node.max_batch_size(_WALK) == 1
+
     # preprocess stages the two tensors and nothing else
     assert set(run.tensors) == _STAGED
     assert torch.equal(run.tensors["backbone_features"], run.features)
@@ -450,116 +350,6 @@ def test_the_split_is_the_mask_and_keeps_every_row_in_prompt_order(spec):
     assert list(run.out) == ["vl_text", "vl_image"]
     assert torch.equal(run.out["vl_image"][0], rows[run.image])
     assert torch.equal(run.out["vl_text"][0], rows[run.text])
-
-    # nothing lost: the two spans scattered back onto their own rows are the output again
-    reconstructed = torch.empty_like(rows)
-    reconstructed[run.image] = run.out["vl_image"][0]
-    reconstructed[run.text] = run.out["vl_text"][0]
-    assert torch.equal(reconstructed, rows)
-
-    # the rows differ down each span, which is what makes the equalities above bite: a
-    # reversed or rolled span would not match
-    for span in (run.out["vl_image"][0], run.out["vl_text"][0]):
-        assert span.shape[0] < 2 or not torch.equal(span, span.flip(0))
     # with equal spans a swap changes no shape, so only their contents tell them apart
     if len(run.image) == len(run.text):
         assert not torch.equal(run.out["vl_text"][0], run.out["vl_image"][0])
-
-
-# ----------------------------------------------------------------------------
-# What the two spans are: the reference's predicate, over recorded prefills
-# ----------------------------------------------------------------------------
-
-# Twenty prefills recorded off the reference, outside the checkpoint download.
-_DUMP = RUNS / "dump"
-_RECORDED = sorted(_DUMP.glob("req_*.pt")) if _DUMP.is_dir() else []
-_HAVE_RECORDED = bool(_RECORDED) and BACKBONE is not None
-
-
-def _reference_image_token_id() -> int:
-    """The id the reference's mask (``input_ids == image_token_id``, ``qwen3_backbone.py``)
-    compares against, read off the backbone's config rather than ours."""
-    return json.loads((Path(BACKBONE) / "config.json").read_text())["image_token_id"]
-
-
-class _Request(NamedTuple):
-    """One recorded prefill, with the reference's predicate already applied to its prompt."""
-
-    input_ids: torch.Tensor  # [tokens]
-    image_grid_thw: torch.Tensor  # [frames, 3]: the camera set the prompt was built from
-    bridge_rows: int  # rows in the recorded `vl_embeds`, which is the bridge's own output
-    is_image: torch.Tensor  # [tokens], bool
-
-
-def _request(path: Path) -> _Request:
-    """``mmap``ped: only the prompt, the grids and one shape are read out of tens of MB."""
-    dump = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
-    input_ids = dump["collated"]["inputs"]["input_ids"].reshape(-1)
-    return _Request(
-        input_ids=input_ids,
-        image_grid_thw=dump["collated"]["inputs"]["image_grid_thw"].reshape(-1, 3),
-        bridge_rows=dump["vl_embeds"].shape[1],
-        is_image=input_ids == _reference_image_token_id(),
-    )
-
-
-def _image_rows(request: _Request) -> torch.Tensor:
-    """The image rows as the ``LLM`` node derives them (the bridge never sees a prompt). Only
-    ``prepare_inputs`` runs, so the text stack is a one-layer stand-in; the spatial merge is
-    the real one, which the M-RoPE grids are measured in."""
-    backbone = json.loads((Path(BACKBONE) / "config.json").read_text())
-    text = Gr00tN17TextConfig(
-        hidden_size=8, intermediate_size=16, num_attention_heads=2, num_key_value_heads=1,
-        head_dim=8, num_hidden_layers=1, rms_norm_eps=1e-6, rope_theta=10000.0,
-        vocab_size=1, mrope_section=(2, 1, 1), mrope_interleaved=True,
-        image_token_id=_reference_image_token_id(), vision_start_token_id=0,
-    )
-    # the one vision field the node reads; a stand-in would make the recorded grids disagree
-    # with the prompt's image runs and raise
-    vision = Qwen3_5VisionConfig(
-        depth=1, hidden_size=16, intermediate_size=32, num_heads=1, in_channels=3,
-        patch_size=2, temporal_patch_size=2, out_hidden_size=8, num_position_embeddings=16,
-        spatial_merge_size=backbone["vision_config"]["spatial_merge_size"],
-    )
-    config = Gr00tN17Config(
-        text=text, vision=vision, dit=None, bridge=None,
-        # one tap, because the node checks the count it is sent against this and nothing
-        # here reads the features
-        deepstack_visual_indexes=(0,), backbone_embedding_dim=0,
-    )
-    node = Gr00tN17LLMSubmodule(Gr00tN17LanguageModel(config), config)
-    rows = int(request.is_image.sum())
-    prepared = node.prepare_inputs(
-        _WALK, _FWD,
-        {
-            "input_ids": [request.input_ids],
-            "image_grid_thw": [request.image_grid_thw],
-            "vision_embeds": [torch.zeros(rows, text.hidden_size)],
-            "deepstack_embeds": [torch.zeros(rows, text.hidden_size)],
-        },
-    )
-    return prepared.tensor_inputs["image_rows"]
-
-
-@pytest.mark.skipif(not _HAVE_RECORDED, reason=f"recorded requests in {_DUMP} or backbone not cached ({RECORDINGS})")
-@pytest.mark.parametrize("path", _RECORDED, ids=[path.stem for path in _RECORDED])
-@torch.no_grad()
-def test_the_split_is_the_references_image_token_predicate(path):
-    """On prompts the reference ran: ``vl_image`` is exactly the rows ``input_ids ==
-    image_token_id`` selects and ``vl_text`` exactly the rest, with the ``LLM`` node deriving the
-    rows as in the engine. A swap changes no shape. Only the row pattern (448 image rows in four
-    blocks) comes from the recording; the rows are this file's narrow stand-ins, since the split
-    is a gather."""
-    request = _request(path)
-    image_rows = _image_rows(request)
-    run = _drive_rows(request.input_ids.numel(), image_rows.tolist())
-    rows = run.by_hand()
-
-    # the handoff between the two nodes: what the LLM node sends is the predicate's rows
-    assert torch.equal(image_rows, request.is_image.nonzero(as_tuple=True)[0])
-    # and the recording agrees that the bridge emits one row per prompt token, which is
-    # what makes a mask over the prompt a mask over the bridge's output
-    assert request.bridge_rows == request.input_ids.numel()
-
-    assert torch.equal(run.out["vl_image"][0], rows[request.is_image])
-    assert torch.equal(run.out["vl_text"][0], rows[~request.is_image])

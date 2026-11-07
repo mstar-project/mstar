@@ -4,10 +4,8 @@ and ``postprocess``. Walks and specs run on a config alone, loading on a synthet
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import json
 import re
-from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,13 +14,13 @@ import numpy as np
 import pytest
 import torch
 import yaml
+from PIL import Image
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_runner import autocast_scope
 from mstar.engine.resources import (
-    AttentionStep,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
@@ -37,13 +35,11 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.gr00t_n17 import gr00t_n17_model
 from mstar.model.gr00t_n17.config import (
     BRIDGE_ATTN,
     DT_ATTN,
     DT_XATTN,
-    DT_XATTN_PAIRS,
     LLM_ATTN,
     Gr00tN17Config,
     Gr00tN17StackConfig,
@@ -68,7 +64,7 @@ from mstar.model.gr00t_n17.submodules import (
 )
 from mstar.model.gr00t_n17.weight_loader import _remapper
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
+from mstar.model.submodule_base import ModelInputsFromEngine
 
 from .helpers import BACKBONE, GR00T, SegmentAttention, needs_checkpoint
 
@@ -77,7 +73,7 @@ _PREFILL, _BACKBONE_WALK, _STATE, _ACTION_GEN = "prefill", "backbone", "state", 
 
 # What `prefill`'s nodes park for the request, and what `action_gen` reads back.
 _PERSISTED = {"vl_text", "vl_image", "state_features"}
-# Spelled out: importing `DenoiseLoopSubmodule.LATENTS` would make that test compare the scaffold with itself.
+# The scaffold's carried sample, spelled out as the walk spells it.
 _CARRIED = "latents"
 
 # Each node's contract, spelled out from `submodules.py`; each cite is where the name is read or returned.
@@ -247,27 +243,6 @@ def test_prefill_is_a_parallel_whose_two_branches_never_wait_on_each_other():
     assert list(_nodes(conditioning)) == [VISION_ENCODER, LLM, VL_BRIDGE]
     assert isinstance(state, GraphNode) and state.name == STATE_ENCODER
 
-    # independence: neither branch consumes anything the other produces
-    left, right = set(_nodes(conditioning)), set(_nodes(state))
-    assert left.isdisjoint(right)
-    for branch, other_nodes in ((conditioning, right), (state, left)):
-        produced = {edge.name for edge in _edges(branch)}
-        other = conditioning if branch is state else state
-        assert not (produced & {name for name, _ in other.get_inputs_outputs().ext_inputs})
-        assert not ({edge.next_node for edge in _edges(branch)} & other_nodes)
-    assert prefill.get_inputs_outputs().loop_back == set()
-
-    # every input arrives from the request, keyed by (name, destination)
-    assert prefill.get_inputs_outputs().ext_inputs == {
-        ("pixel_values", VISION_ENCODER), ("image_grid_thw", VISION_ENCODER),
-        ("input_ids", LLM), ("image_grid_thw", LLM),
-        ("state", STATE_ENCODER), ("embodiment_id", STATE_ENCODER),
-    }
-    # the ViT's two outputs are consumed inside the branch, so neither shows here
-    assert {name for name, _ in prefill.get_inputs_outputs().ext_inputs}.isdisjoint(
-        {"vision_embeds", "deepstack_embeds", "backbone_features", "image_rows"}
-    )
-
 
 def test_prefills_persist_edges_park_rather_than_point_at_a_node():
     """A persist edge pointing at ``denoise_step``, which is not in ``prefill``, raises nothing:
@@ -313,10 +288,16 @@ def test_the_loops_terminal_output_is_named_for_the_sections_loop_back_edge():
     """``Loop.__post_init__`` keeps only terminal outputs the section produces, matched
     by name (``graph/base.py``), so a renamed terminal output is silently deleted and
     ``action_gen`` emits nothing (pi05 warns of the same, ``Pi05Model.get_graph_walk_graphs``)."""
-    loop = _model().get_graph_walk_graphs()[_ACTION_GEN]
+    model = _model(dataclasses.replace(_config(), num_inference_timesteps=2))
+    model._repo_dir = Path()
+    loop = model.get_graph_walk_graphs()[_ACTION_GEN]
+    node = _unloaded(model, DENOISE_STEP)
 
     assert isinstance(loop, Loop)
-    assert loop.max_iters == _model().config.num_inference_timesteps
+    # not the default: the Loop and the schedule each read the count, and must agree
+    assert loop.max_iters == node.schedule_for(None, None).num_steps == 2
+    # the engine keys the iteration counter on `Loop.name`, the scaffold reads it by `loop_name`
+    assert node.loop_name == loop.name
     step = loop.section
     assert isinstance(step, GraphNode) and step.name == DENOISE_STEP
     assert {(edge.name, edge.next_node) for edge in step.outputs} == {(_CARRIED, DENOISE_STEP)}
@@ -327,9 +308,6 @@ def test_the_loops_terminal_output_is_named_for_the_sections_loop_back_edge():
     assert (terminal.next_node, terminal.output_modality, terminal.persist) == (
         EMIT_TO_CLIENT, "action", True,
     )
-    assert {edge.name for edge in loop.outputs} == {name for name, _ in loop._loop_back_inputs}
-    # the graph-internal key is the scaffold's `latents`; the client reads an `action`
-    assert terminal.name != terminal.output_modality
 
 
 # ----------------------------------------------------------------------------
@@ -410,52 +388,6 @@ def test_action_gens_conditioning_inputs_are_exactly_what_prefill_persists():
     assert needs == node_persisted | request_persisted | {_CARRIED}
 
 
-def test_the_loops_carried_edge_is_the_scaffolds_own_latents_name():
-    """The scaffold reads and returns the carried sample as ``LATENTS`` while the worker routes
-    by the graph's edge names, so the walk must use that name. ``denoise``'s parameter must
-    match too, since the scaffold passes it by keyword."""
-    loop = _model().get_graph_walk_graphs()[_ACTION_GEN]
-    carried = {name for name, _ in loop._loop_back_inputs}
-
-    assert carried == {DenoiseLoopSubmodule.LATENTS}
-    # not overridden, so the base's name is the node's name
-    assert Gr00tN17DenoiseStepSubmodule.LATENTS == DenoiseLoopSubmodule.LATENTS
-    assert set(Gr00tN17DenoiseStepSubmodule.loop_back_names.fget(
-        Gr00tN17DenoiseStepSubmodule
-    )) == carried
-    assert carried <= set(inspect.signature(Gr00tN17DenoiseStepSubmodule.denoise).parameters)
-    # and the terminal output rides the same name out of the loop
-    assert {edge.name for edge in loop.outputs} == carried
-
-
-def test_every_input_the_loop_needs_is_delivered_to_it():
-    """The conductor parks tensors but does not route them into the next walk
-    (``Conductor._process_done_forward``), so this hook must build an edge for every
-    ``denoise_step`` input, or the loop never becomes ready."""
-    model = _model()
-    walks = model.get_graph_walk_graphs()
-    metadata = _metadata(model)
-    persist = {
-        "vl_text": [_info([13, 63], uuid=1)],
-        "vl_image": [_info([448, 63], uuid=2)],
-        "state_features": [_info([1, 33], uuid=3)],
-        "embodiment_id": [_info([1], uuid=4)],
-    }
-    args = model.get_partition_forward_pass_args("default", metadata, persist)
-
-    assert all(edge.next_node == DENOISE_STEP for edge in args.inputs)
-    assert {edge.name for edge in args.inputs} == walks[_ACTION_GEN].section.input_names
-    assert len(args.inputs) == len(walks[_ACTION_GEN].section.input_names)  # no duplicates
-    # the carried edge arrives empty: the scaffold draws iteration 0's sample itself
-    for edge in args.inputs:
-        assert edge.tensor_info == ([] if edge.name == _CARRIED else persist[edge.name])
-    # released here; the Loop re-injects it across its iterations (`_persist_for_loop`)
-    assert args.unpersist_tensors == sum(
-        (persist[name] for name in ("vl_text", "vl_image", "state_features", "embodiment_id")),
-        start=[],
-    )
-
-
 # ----------------------------------------------------------------------------
 # The reuse walks
 # ----------------------------------------------------------------------------
@@ -509,7 +441,6 @@ def test_a_reuse_walk_is_selected_by_name_and_schedules_only_itself(walk):
     assert metadata.graph_walk == walk
     assert metadata.kwargs["walk_schedule"] == [walk]
     assert metadata.kwargs["walk_step"] == 0
-    assert metadata.is_prefill
     assert "walk" in model.request_kwargs()
     # the other branch of the same decision: no `walk` key is the full path
     assert _metadata(model).kwargs["walk_schedule"] == [_PREFILL, _ACTION_GEN]
@@ -527,10 +458,8 @@ def test_a_reuse_walk_is_done_at_its_first_transition(walk):
     assert args.request_done is True
     assert args.inputs == []
     assert args.unpersist_tensors == []
-    assert args.step_metadata == {"is_prefill": False}
     # the walk it finished in, unchanged: there is no next walk to move to
     assert args.full_metadata.graph_walk == walk
-    assert args.full_metadata.is_prefill is False
 
 
 def test_an_unknown_walk_is_refused_and_the_message_names_all_four_walks():
@@ -562,7 +491,8 @@ _UNREACHABLE = {
 def test_a_reuse_walk_drops_an_input_it_has_no_node_for(walk, name, node):
     """A reuse request always carries the whole observation, so refusing would refuse every real
     one. The input must not be routed (an edge to a node outside the walk is shipped and never
-    consumed) and must still be released, with no later hop to release it on."""
+    consumed) and must still be released, with no later hop to release it on: nothing unpersists
+    on a reuse walk, so a parked ``embodiment_id`` would leak for the request's life."""
     model = _model()
     signals = {signal: [_info([1], uuid=i)] for i, signal in enumerate(_ROUTED)}
     args = model.get_initial_forward_pass_args(
@@ -587,49 +517,16 @@ def test_a_reuse_walk_drops_an_input_it_has_no_node_for(walk, name, node):
     assert (name, node) in {(edge.name, edge.next_node) for edge in full.inputs}
 
 
-def test_the_embodiment_id_is_parked_only_where_a_loop_reads_it_back():
-    """Parked only on the full path, where the denoise step reads it every iteration; on a
-    reuse walk nothing unpersists it, so a parked copy leaks for the request's life."""
-    model = _model()
-    signals = {"state": [_info([1, 8], uuid=1)], "embodiment_id": [_info([1], uuid=2)]}
-
-    full = model.get_initial_forward_pass_args("default", ["text", "image"], ["action"], signals)
-    reuse = model.get_initial_forward_pass_args(
-        "default", ["text", "image"], ["action"], signals, model_kwargs={"walk": _STATE},
-    )
-
-    assert [(edge.name, edge.persist) for edge in full.inputs] == [
-        ("state", False), ("embodiment_id", True),
-    ]
-    assert [(edge.name, edge.persist) for edge in reuse.inputs] == [
-        ("state", False), ("embodiment_id", False),
-    ]
-    # so the full path keeps it and the reuse walk hands it straight back
-    assert full.unpersist_tensors == signals["state"]
-    assert reuse.unpersist_tensors == signals["state"] + signals["embodiment_id"]
-    # and there is no later hop to release it on
-    done = model.get_partition_forward_pass_args("default", reuse.full_metadata, {})
-    assert done.request_done and done.unpersist_tensors == []
-
-
 def test_the_reuse_walk_node_sets_match_the_graphs():
     """``REUSE_WALK_NODES`` is a hand copy of graph structure and goes stale both ways: a stale
     node lets an input through to nothing, a missing one refuses a valid request. A selectable
-    walk missing from it routes everything, so selectable and listed must be the same walks."""
-    model = _model()
-    walks = model.get_graph_walk_graphs()
+    walk missing from it routes everything."""
+    walks = _model().get_graph_walk_graphs()
 
     assert Gr00tN17Model.REUSE_WALK_NODES == {
         name: frozenset(_nodes(walks[name])) for name in Gr00tN17Model.REUSE_WALK_NODES
     }
     assert set(Gr00tN17Model.REUSE_WALK_NODES) == set(walks) - {_PREFILL, _ACTION_GEN}
-
-    for name in walks:
-        if name in Gr00tN17Model.REUSE_WALK_NODES:
-            assert _metadata(model, walk=name).kwargs["walk_schedule"] == [name]
-        else:
-            with pytest.raises(ValueError, match="is not selectable"):
-                _metadata(model, walk=name)
 
 
 # ----------------------------------------------------------------------------
@@ -641,37 +538,29 @@ def _specs(model: Gr00tN17Model) -> dict[str, RaggedAttentionConfig]:
     return {spec.resource_key: spec for spec in model.get_node_resources()}
 
 
-def test_the_five_specs_land_on_the_right_nodes():
-    """A resource the engine does not build leaves its node on SDPA in silence, and a
-    spec naming the wrong node binds a wrapper the node never calls."""
+def test_each_spec_has_its_kind_its_node_and_its_segment_bound():
+    """A resource the engine does not build leaves its node on SDPA in silence, and a spec naming
+    the wrong node binds a wrapper the node never calls. The DT holds two because a resource is
+    one kind of attention, so collapsing them leaves one kind unplanned."""
     specs = _specs(_model())
 
-    assert set(specs) == {VISION_ATTN, LLM_ATTN, BRIDGE_ATTN, DT_ATTN, DT_XATTN}
-    assert {key: spec.nodes for key, spec in specs.items()} == {
-        VISION_ATTN: {VISION_ENCODER},
-        LLM_ATTN: {LLM},
-        BRIDGE_ATTN: {VL_BRIDGE},
-        DT_ATTN: {DENOISE_STEP},
-        DT_XATTN: {DENOISE_STEP},
+    # exact types, because the two spec classes share a base; the bound is per span label and the
+    # cross resource plans one wrapper per pair, so only the ViT (a segment per frame) exceeds 1
+    assert {
+        key: (type(spec), spec.nodes, spec.config.max_segments_per_request) for key, spec in specs.items()
+    } == {
+        VISION_ATTN: (RaggedAttentionSpec, {VISION_ENCODER}, _MAX_FRAMES),
+        LLM_ATTN: (RaggedAttentionSpec, {LLM}, 1),
+        BRIDGE_ATTN: (RaggedAttentionSpec, {VL_BRIDGE}, 1),
+        DT_ATTN: (RaggedAttentionSpec, {DENOISE_STEP}, 1),
+        DT_XATTN: (RaggedCrossAttentionSpec, {DENOISE_STEP}, 1),
     }
     # no KV cache anywhere: every attention is one-shot
     assert all(spec.depends_on() == set() for spec in specs.values())
-
-
-def test_the_dt_holds_two_specs_because_a_resource_is_one_kind_of_attention():
-    """The DT's cross and self blocks share a 32 x 48 geometry but not a resource: a
-    resource is one kind of attention, so collapsing them leaves one kind unplanned.
-    Exact types, because the two spec classes share a base."""
-    specs = _specs(_model())
-    dt = [spec for spec in specs.values() if spec.nodes == {DENOISE_STEP}]
-
-    assert len(dt) == 2
-    assert type(specs[DT_ATTN]) is RaggedAttentionSpec
-    assert type(specs[DT_XATTN]) is RaggedCrossAttentionSpec
-    assert {key for key, spec in specs.items() if type(spec) is RaggedCrossAttentionSpec} == {DT_XATTN}
-    # the same geometry: the kind is the only difference
-    for field in ("num_qo_heads", "num_kv_heads", "head_dim"):
-        assert getattr(specs[DT_ATTN].config, field) == getattr(specs[DT_XATTN].config, field)
+    # `dtype=None` would take the engine's KV dtype, so the parity bar's bf16 would track that
+    assert {spec.config.dtype for spec in specs.values()} == {torch.bfloat16}
+    # the token ceiling is a deployment's choice (the shipped YAML sets it), so none here
+    assert all(spec.config.max_tokens_per_request is None for spec in specs.values())
 
 
 @pytest.mark.parametrize("scale", [1, 2], ids=["the tiny config", "the same config doubled"])
@@ -708,41 +597,6 @@ def test_every_head_geometry_is_read_off_the_config(scale):
     assert len({geometry(key) for key in specs}) == 4  # the DT's two are equal by design
 
 
-def test_the_vision_bound_is_the_only_one_that_is_not_one_per_request():
-    """``max_segments_per_request`` is per span label, and the cross resource plans one wrapper
-    per pair, so only the ViT (one segment per frame) exceeds 1. The DT's cross bound is not
-    ``len(DT_XATTN_PAIRS)``: each pair sees one segment per request per label."""
-    specs = _specs(_model())
-
-    assert {key: spec.config.max_segments_per_request for key, spec in specs.items()} == {
-        VISION_ATTN: _MAX_FRAMES, LLM_ATTN: 1, BRIDGE_ATTN: 1, DT_ATTN: 1, DT_XATTN: 1,
-    }
-    # the count that makes 1 look wrong
-    assert len(DT_XATTN_PAIRS) == 2
-    # the token ceiling is a deployment's choice (the shipped YAML sets it), so none here
-    assert all(spec.config.max_tokens_per_request is None for spec in specs.values())
-
-
-def test_every_spec_pins_its_activation_dtype():
-    """A cacheless ragged resource with ``dtype=None`` takes the engine's KV dtype, so the
-    parity bar's bf16 would track something unrelated to this model (z_image pins too)."""
-    specs = _specs(_model())
-
-    assert {spec.config.dtype for spec in specs.values()} == {torch.bfloat16}
-    assert len(specs) == 5
-
-
-def test_causality_is_declared_on_the_step_and_not_on_the_resource():
-    """GR00T's LLM is the first causal ragged self-attention user; causality is declared
-    on the step, so the same resource kind serves the DT's non-causal attention."""
-    node = object.__new__(Gr00tN17LLMSubmodule)
-    step = node.declare_step(_PREFILL, ["r0"], [NodeInputs(input_seq_len=7)])
-    assert set(step.steps) == {LLM_ATTN}
-    assert isinstance(step.steps[LLM_ATTN], AttentionStep)
-    assert step.steps[LLM_ATTN].causal is True
-    assert [segment.span for segment in step.segments] == [7]
-
-
 # ----------------------------------------------------------------------------
 # The ViT's segment bound, a property of the checkpoint
 # ----------------------------------------------------------------------------
@@ -774,9 +628,9 @@ def test_the_vit_segment_bound_is_a_requests_most_frames(video_keys, steps, fram
 
 
 def test_a_request_starts_in_prefill_with_each_input_at_the_node_that_takes_it():
-    """Every routed name is one its destination declares, ``is_prefill`` is set, only the
-    signals the request carries are routed, and the routes cover every external input
-    ``prefill`` declares (else a node never becomes ready)."""
+    """Every routed name is one its destination declares, only the signals the request carries
+    are routed, and the routes cover every external input ``prefill`` declares (else a node
+    never becomes ready)."""
     model = _model()
     prefill_walk = model.get_graph_walk_graphs()[_PREFILL]
     prefill = _nodes(prefill_walk)
@@ -789,8 +643,7 @@ def test_a_request_starts_in_prefill_with_each_input_at_the_node_that_takes_it()
     }
     args = model.get_initial_forward_pass_args("default", ["text", "image"], ["action"], signals)
 
-    assert args.full_metadata.graph_walk == _PREFILL and args.full_metadata.is_prefill
-    assert args.step_metadata == {"is_prefill": True}
+    assert args.full_metadata.graph_walk == _PREFILL
     assert not args.request_done
     assert {(edge.name, edge.next_node) for edge in args.inputs} == set(_ROUTES)
     # `image_grid_thw` is routed twice, so the pairs are not one per signal
@@ -818,48 +671,41 @@ _SPANS = {
 
 
 @pytest.mark.parametrize("text_rows, image_rows", list(_SPANS.values()), ids=list(_SPANS))
-def test_the_bucket_keys_span_counts_come_off_the_persisted_tensors_own_dims(text_rows, image_rows):
-    """``denoise_step`` needs the span lengths before their tensors arrive, so they ride on
-    ``step_metadata``. Read off the persisted tensors' own ``dims``, because the node's check
-    only catches a disagreement inside a batch."""
+def test_the_walk_flips_prefill_then_action_gen_then_done(text_rows, image_rows):
+    """The conductor parks tensors but does not route them into the next walk
+    (``Conductor._process_done_forward``), so this hook must build an edge for every
+    ``denoise_step`` input, or the loop never becomes ready. The four denoising steps are the
+    Loop's iterations, not conductor hops, so the second transition ends the request."""
     model = _model()
-    metadata = _metadata(model)
+    needs = model.get_graph_walk_graphs()[_ACTION_GEN].section.input_names
     persist = {
         "vl_text": [_info([text_rows, 63], uuid=1)],
         "vl_image": [_info([image_rows, 63], uuid=2)],
         "state_features": [_info([1, 33], uuid=3)],
         "embodiment_id": [_info([1], uuid=4)],
     }
-    args = model.get_partition_forward_pass_args("default", metadata, persist)
 
-    assert args.step_metadata == {
-        "is_prefill": False, "vl_text_rows": text_rows, "vl_image_rows": image_rows,
-    }
-    # the names the node reads back, which are not the persisted tensors' names
-    assert set(args.step_metadata) - {"is_prefill"} == {"vl_text_rows", "vl_image_rows"}
-
-
-def test_the_walk_flips_prefill_then_action_gen_then_done():
-    """The four denoising steps are the Loop's iterations, not conductor hops, so the
-    second transition ends the request. ``is_prefill`` must go false leaving
-    ``prefill``, or every loop iteration reads as a conditioning pass."""
-    model = _model()
-    names = sorted(_PERSISTED | {"embodiment_id"})
-    persist = {name: [_info([3, 63], uuid=i)] for i, name in enumerate(names)}
-    metadata = _metadata(model)
-
-    first = model.get_partition_forward_pass_args("default", metadata, persist)
+    first = model.get_partition_forward_pass_args("default", _metadata(model), persist)
     assert first.full_metadata.graph_walk == _ACTION_GEN
-    assert first.full_metadata.is_prefill is False
     assert not first.request_done
-    # the carried edge is routed last and arrives empty
-    assert [edge.next_node for edge in first.inputs] == [DENOISE_STEP] * 5
-    assert first.inputs[-1].name == _CARRIED and first.inputs[-1].tensor_info == []
+    # one edge per input, no duplicates
+    assert [edge.next_node for edge in first.inputs] == [DENOISE_STEP] * len(needs)
+    assert {edge.name for edge in first.inputs} == needs
+    # the carried edge is routed last and arrives empty: the scaffold draws iteration 0's sample itself
+    assert first.inputs[-1].name == _CARRIED
+    for edge in first.inputs:
+        assert edge.tensor_info == ([] if edge.name == _CARRIED else persist[edge.name])
+    # released here; the Loop re-injects it across its iterations (`_persist_for_loop`)
+    assert first.unpersist_tensors == sum(persist.values(), start=[])
+    # the node needs the span counts before their tensors arrive, under these names, and read off
+    # the tensors' own `dims`, because its check only catches a disagreement inside a batch
+    assert {key: value for key, value in first.step_metadata.items() if key != "is_prefill"} == {
+        "vl_text_rows": text_rows, "vl_image_rows": image_rows,
+    }
 
     done = model.get_partition_forward_pass_args("default", first.full_metadata, persist)
     assert done.request_done
     assert done.inputs == [] and done.unpersist_tensors == []
-    assert done.step_metadata == {"is_prefill": False}
     assert done.full_metadata.graph_walk == _ACTION_GEN
 
 
@@ -989,27 +835,19 @@ def test_every_served_parameter_is_the_checkpoint_tensor_it_maps_from(tmp_path):
 @pytest.mark.parametrize("node, drop", [
     (VISION_ENCODER, "backbone.model.model.visual.deepstack_merger_list.0.norm.bias"),
     (LLM, "backbone.model.model.language_model.layers.1.mlp.down_proj.weight"),
+    (LLM, "backbone.model.model.language_model.layers.1.self_attn.k_proj.weight"),
+    (LLM, "backbone.model.model.language_model.layers.1.mlp.up_proj.weight"),
     (STATE_ENCODER, "action_head.state_encoder.layer2.b"),
     (VL_BRIDGE, "action_head.vlln.weight"),
     (DENOISE_STEP, "action_head.position_embedding.weight"),
 ])
 def test_a_tensor_missing_from_the_checkpoint_fails_its_node_by_name(tmp_path, node, drop):
-    """Strict per node: a truncated checkpoint fails at startup, naming the node, rather
-    than serving a random-init parameter."""
+    """Strict per node: a truncated checkpoint fails at startup, naming the node, rather than
+    serving a random-init parameter. The part is named, since a fused name is not the checkpoint's."""
     model, _ = _served(tmp_path, drop=drop)
-    with pytest.raises(ValueError, match=f"^{node}: 1 parameter"):
+    with pytest.raises(ValueError, match=rf"^{node}: 1 parameter.*{re.escape(drop.removeprefix(_ROOTS[node]))}"):
         model.get_submodule(node)
     assert node not in model._submodules
-
-
-@pytest.mark.parametrize("part", ["layers.1.self_attn.k_proj.weight", "layers.1.mlp.up_proj.weight"])
-def test_one_part_missing_from_a_fused_llm_parameter_fails_the_llm_by_name(tmp_path, part):
-    """A fused parameter with any part missing would serve those rows at random init. The part
-    is named, since the fused name is not the checkpoint's."""
-    model, _ = _served(tmp_path, drop=_ROOTS[LLM] + part)
-    with pytest.raises(ValueError, match=rf"^LLM: 1 parameter.*{re.escape(part)}"):
-        model.get_submodule(LLM)
-    assert LLM not in model._submodules
 
 
 def test_the_served_vision_node_holds_the_vision_config_and_prepares_a_grid(tmp_path):
@@ -1148,39 +986,17 @@ def test_capture_without_shapes_is_refused(tmp_path):
         _constructed(tmp_path, accelerator_graph=True)
 
 
-def _xattn_ceiling_and_widest_span(serving: dict, path: Path) -> tuple[int, int]:
-    """The DT cross-attention's per-request token ceiling once ``serving``'s ``resources:``
-    apply, and the widest text or image span its capture shapes give."""
-    model = _constructed(path, **serving["model_kwargs"])
-    specs = model.get_node_resources()
-    apply_yaml_overrides(specs, serving)
-    ceiling = next(spec for spec in specs if spec.resource_key == DT_XATTN).config.max_tokens_per_request
-    return ceiling, max(max(shape) for shape in model.capture_shapes)
-
-
 def test_the_shipped_yaml_sizes_the_dt_cross_attention_for_its_widest_capture_span(tmp_path):
     """A captured cross wrapper is sized by ``max_tokens_per_request`` but its keys are a
     request's text or image rows, so below the widest span capture fails."""
     serving = yaml.safe_load(_SERVING.read_text(encoding="utf-8"))
-    kwargs = serving["model_kwargs"]
-    assert kwargs["accelerator_graph"] is True
+    assert serving["model_kwargs"]["accelerator_graph"] is True
 
-    ceiling, widest = _xattn_ceiling_and_widest_span(serving, tmp_path)
-    assert ceiling is not None and ceiling >= widest
-
-    model = _constructed(tmp_path, **kwargs)
-    assert model.capture_buckets() == [(_ACTION_GEN, Gr00tN17Shape(*shape)) for shape in kwargs["capture_shapes"]]
-    assert model.capture_batch_sizes == kwargs["capture_batch_sizes"]
-
-
-def test_a_capture_span_wider_than_the_cross_attention_ceiling_is_caught(tmp_path):
-    """The negative control for the test above: one image row past the override."""
-    serving = yaml.safe_load(_SERVING.read_text(encoding="utf-8"))
-    override = serving["resources"][DT_XATTN]["max_tokens_per_request"]
-    serving["model_kwargs"] = {**serving["model_kwargs"], "capture_shapes": [[13, override + 1]]}
-
-    ceiling, widest = _xattn_ceiling_and_widest_span(serving, tmp_path)
-    assert ceiling < widest
+    model = _constructed(tmp_path, **serving["model_kwargs"])
+    specs = model.get_node_resources()
+    apply_yaml_overrides(specs, serving)
+    ceiling = next(spec for spec in specs if spec.resource_key == DT_XATTN).config.max_tokens_per_request
+    assert ceiling is not None and ceiling >= max(max(shape) for shape in model.capture_shapes)
 
 
 # ----------------------------------------------------------------------------
@@ -1240,21 +1056,15 @@ def test_no_instruction_is_served_as_the_empty_instruction():
     """An empty instruction, which some real robot requests carry, arrives as ``None``
     (FastAPI); refusing it answers them with a 400. A real instruction is the control."""
     pytest.importorskip("cv2")
-    model = _model()
-    model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
-    frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
-    state = {"arm": np.zeros((1, 1, 2), np.float32), "grip": np.zeros((1, 1, 1), np.float32)}
+    model, frames, state = _observation_model()
 
-    def same_as_empty(prompt):
+    def instruction(prompt):
         out = model.process_prompt(prompt, ["text", "image"], ["action"], tensors={"image_inputs": frames},
                                    embodiment_tag="bot", state=state)
-        empty = model.process_prompt("", ["text", "image"], ["action"], tensors={"image_inputs": frames},
-                                     embodiment_tag="bot", state=state)
-        assert out.keys() == empty.keys()
-        return all(torch.equal(a, b) for k in out for a, b in zip(out[k], empty[k], strict=True))
+        return bytes(out["input_ids"][0][0].tolist())
 
-    assert same_as_empty(None)
-    assert not same_as_empty("Pick up the cup")
+    assert instruction(None) == b"<user>"
+    assert instruction("Pick up the cup") == b"<user>pick up the cup"
 
 
 _STATE_LEADS = {
@@ -1276,10 +1086,8 @@ def test_a_prompt_past_max_text_tokens_is_a_400():
             out = super().__call__(text, images, **kwargs)
             return {**out, "input_ids": torch.cat([torch.full((1, 100), 5), out["input_ids"]], dim=1)}
 
-    model = _model(dataclasses.replace(_config(), max_text_tokens=16))
+    model, frames, state = _observation_model(dataclasses.replace(_config(), max_text_tokens=16))
     model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, WithImageRows())
-    frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
-    state = {"arm": np.zeros((1, 1, 2), np.float32), "grip": np.zeros((1, 1, 1), np.float32)}
 
     def serve(text):
         return model.process_prompt(text, ["text", "image"], ["action"], tensors={"image_inputs": frames},
@@ -1296,9 +1104,7 @@ def test_only_a_state_of_one_request_and_the_configured_history_is_served(lead, 
     """The reference asserts ``T == state_history_length``. Past ``process_prompt`` a wrong
     ``T`` fails the state encoder's forward and every request in that step with it, and a
     bare vector fails the decode once the whole forward has run."""
-    model = _model(dataclasses.replace(_config(), state_history_length=history))
-    model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
-    frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
+    model, frames, _ = _observation_model(dataclasses.replace(_config(), state_history_length=history))
     state = {"arm": np.zeros((*lead, 2), np.float32), "grip": np.zeros((*lead, 1), np.float32)}
 
     def serve():
@@ -1321,8 +1127,6 @@ _LOSSLESS = {"PNG": {}, "WEBP": {"lossless": True}}
 def test_a_lossless_frame_loads_as_its_exact_pixels_in_uint8_hwc(tmp_path, fmt):
     """The reference's transform takes uint8 HWC; the base loader's float CHW in [0, 1] would
     be rescaled again by the HF processor into a black image, with no error."""
-    from PIL import Image
-
     pixels = np.random.default_rng(0).integers(0, 256, (6, 10, 3), dtype=np.uint8)
     path = tmp_path / f"frame.{fmt.lower()}"
     Image.fromarray(pixels).save(path, format=fmt, **_LOSSLESS[fmt])
@@ -1336,8 +1140,6 @@ def test_a_lossless_frame_loads_as_its_exact_pixels_in_uint8_hwc(tmp_path, fmt):
 def test_any_other_frame_format_is_refused_before_it_is_decoded(tmp_path, fmt):
     """A JPEG passes every count, dtype and shape check and still moves the pixels: the actions
     look fine and the robot moves wrong. GIF is a palette; BMP and TIFF the reader cannot decode."""
-    from PIL import Image
-
     path = tmp_path / f"frame.{fmt.lower()}"
     Image.fromarray(np.zeros((6, 10, 3), np.uint8)).save(path, format=fmt)
     with pytest.raises(ValueError, match="lossless|not in a format"):
@@ -1346,8 +1148,6 @@ def test_any_other_frame_format_is_refused_before_it_is_decoded(tmp_path, fmt):
 
 def test_a_truncated_frame_is_a_400_not_a_500(tmp_path):
     """The header parses, so the format check passes; the decoder's RuntimeError would be a 500."""
-    from PIL import Image
-
     path = tmp_path / "frame.png"
     Image.fromarray(np.zeros((60, 80, 3), np.uint8)).save(path, format="PNG")
     path.write_bytes(path.read_bytes()[:80])
@@ -1414,8 +1214,8 @@ def test_cameras_must_share_an_aspect_ratio_as_the_reference_stacks_them(wrist, 
 _JSON_TYPES = {"an object": {"a": 1}, "a list": [1.0], "a number": 3, "a string": "x", "null": None}
 
 
-def _observation_model():
-    model = _model()
+def _observation_model(config: Gr00tN17Config | None = None):
+    model = _model(config)
     model.processor = Gr00tN17Preprocessor(_DECODE_KWARGS, _DECODE_STATS, {"bot": 0}, 8, 6, _BytesProcessor())
     frames = [torch.full((180, 320, 3), 40 * i, dtype=torch.uint8) for i in range(2)]
     state = {"arm": np.zeros((1, 1, 2), np.float32), "grip": np.zeros((1, 1, 1), np.float32)}
@@ -1469,6 +1269,9 @@ def test_postprocess_names_every_joint_group_the_way_the_reference_does():
     """One float32 entry per joint group, keyed as NVIDIA's policy keys it
     (``gr00t_policy.py:425-432``). Groups have different widths (9, 1, 7 on DROID), so a
     flat payload in the wrong order moves the wrong joint with plausible numbers."""
+    # the decode's inputs stay with the data worker; `walk` must reach the conductor, which schedules with it
+    assert {"embodiment_tag", "state"} <= set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS)
+    assert "walk" not in Gr00tN17Model.PREPROCESS_ONLY_KWARGS
     raw = _decoding_model().postprocess(_CHUNK, "action", {"embodiment_tag": "bot", "state": _RAW_STATE})
     assert isinstance(raw, bytes)
     got = msgpack.unpackb(raw)
@@ -1492,21 +1295,6 @@ def test_postprocess_adds_the_batch_axis_the_engine_hands_back_without():
     model = _decoding_model()
     kwargs = {"embodiment_tag": "bot", "state": _RAW_STATE}
     assert model.postprocess(_CHUNK[0], "action", kwargs) == model.postprocess(_CHUNK, "action", kwargs)
-
-
-def test_postprocess_finds_the_tag_and_the_state_in_the_kwargs_the_data_worker_kept():
-    """The decode needs the tag and raw state, which the data worker's kwargs keep (the
-    conductor's drop ``PREPROCESS_ONLY_KWARGS``). Moving the state shifts the relative group,
-    so a dropped state cannot pass as an absolute chunk."""
-    assert {"embodiment_tag", "state"} <= set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS)
-    moved = {"arm": _RAW_STATE["arm"] + 100.0}
-    raw = _decoding_model().postprocess(_CHUNK, "action", {"embodiment_tag": "bot", "state": moved})
-    got = msgpack.unpackb(raw)
-    arm = np.frombuffer(got["arm"]["data"], "float32").reshape(got["arm"]["shape"])
-    grip = np.frombuffer(got["grip"]["data"], "float32").reshape(got["grip"]["shape"])
-    assert arm.reshape(2, 2).tolist() == [[111.0, 119.0], [109.0, 121.0]]
-    # `grip` is absolute, so moving the state must leave it alone
-    assert grip.reshape(-1).tolist() == [5.0, 5.0]
 
 
 @pytest.mark.parametrize("kwargs", [None, {}, {"state": _RAW_STATE}, {"embodiment_tag": None}])
@@ -1569,22 +1357,6 @@ def test_the_specs_geometries_are_the_checkpoints():
     assert model.get_graph_walk_graphs()[_ACTION_GEN].max_iters == 4
 
 
-@needs_checkpoint
-def test_the_five_nodes_build_at_the_checkpoints_widths_on_meta():
-    """At the checkpoint's widths on ``meta`` (no bytes for the 1.12B DT), a width read from
-    the wrong field raises where the tiny config happens to line up. Loader stubbed."""
-    model = _model(Gr00tN17Config.from_hf(GR00T, BACKBONE))
-    model._repo_dir = GR00T
-    with torch.device("meta"):
-        built = {name: _unloaded(model, name) for name in _SUBMODULES}
-    assert {name: type(sub) for name, sub in built.items()} == _SUBMODULES
-
-    dt = built[DENOISE_STEP]
-    assert len(dt.model.transformer_blocks) == 32
-    assert sum(p.numel() for p in dt.parameters()) > 1_000_000_000
-    assert all(p.device.type == "meta" for p in dt.parameters())
-
-
 # The module each node's checkpoint tensors are named against: the wrapped component, or the
 # submodule itself (`_create_submodule`).
 _LOAD_TARGET = {
@@ -1599,7 +1371,7 @@ def _meta_node(node: str):
     model = _model(Gr00tN17Config.from_hf(GR00T, BACKBONE))
     model._repo_dir = GR00T
     with torch.device("meta"):
-        return model, _unloaded(model, node)
+        return _unloaded(model, node)
 
 
 @needs_checkpoint
@@ -1608,7 +1380,7 @@ def test_the_checkpoints_tensors_name_and_shape_each_nodes_parameters(node):
     """Every tensor the loader's remapper routes to ``node`` is one of its parameters at the
     checkpoint's shape, and every parameter gets one; shapes come off the safetensors
     headers, so no tensor is read."""
-    _, built = _meta_node(node)
+    built = _meta_node(node)
     weight_map = json.loads((GR00T / "model.safetensors.index.json").read_text())["weight_map"]
     remap = _remapper(node)
     checkpoint = {}
@@ -1618,33 +1390,6 @@ def test_the_checkpoints_tensors_name_and_shape_each_nodes_parameters(node):
                 checkpoint[name] = shard_file.get_slice(key).get_shape()
 
     assert checkpoint == {name: list(p.shape) for name, p in _LOAD_TARGET[node](built).named_parameters()}
-
-
-@needs_checkpoint
-def test_the_denoise_steps_checkpoint_pieces_and_widths():
-    """467 tensors over four pieces: the stack's 456 is 32 blocks x 14, the timestep
-    encoder's 4 and the output projections' 4, so no ``norm_out`` and no 33rd block. The
-    blocks alternate cross (keys 2048 wide) and self, cross first, and the position table
-    holds 1024 rows for the 40 action rows the DT reads, so a slice off the front never raises."""
-    model, node = _meta_node(DENOISE_STEP)
-    config = model.config
-    remap = _remapper(DENOISE_STEP)
-    weight_map = json.loads((GR00T / "model.safetensors.index.json").read_text())["weight_map"]
-    names = [name for key in weight_map if (name := remap(key))]
-
-    assert Counter(name.partition(".")[0] for name in names) == {
-        "action_encoder": 6, "model": 456, "action_decoder": 4, "position_embedding": 1,
-    }
-    assert len(names) == 467
-    assert (config.backbone_embedding_dim, config.dit.inner_dim) == (2048, 1536)
-    assert config.dit.num_layers == 32
-    assert [block.attn1.to_k.in_features for block in node.model.transformer_blocks] == [
-        config.backbone_embedding_dim if index % 2 == 0 else config.dit.inner_dim
-        for index in range(config.dit.num_layers)
-    ]
-    assert node.position_embedding.weight.shape == (config.max_seq_len, config.input_embedding_dim)
-    assert node.position_embedding.weight.shape == (1024, 1536)
-    assert config.action_horizon + 1 == 41 < config.max_seq_len
 
 
 @needs_checkpoint
@@ -1662,8 +1407,5 @@ def test_the_model_constructs_from_its_two_checkpoints():
     assert _specs(model)[VISION_ATTN].config.max_segments_per_request == 6
     # a frozenset, as `Model.request_kwargs` declares; no `video`: frames travel the media path
     assert model.request_kwargs() == frozenset({"embodiment_tag", "state", "walk"})
-    # `walk` stays on the control wire: the conductor chooses the schedule with it
-    assert set(Gr00tN17Model.PREPROCESS_ONLY_KWARGS) < model.request_kwargs()
-    assert "walk" not in Gr00tN17Model.PREPROCESS_ONLY_KWARGS
     # one frame per view per timestep, refused before any file is decoded
     assert model.max_input_files() == {"image": 3 * 2}

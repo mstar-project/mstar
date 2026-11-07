@@ -19,6 +19,13 @@ needs_checkpoint = pytest.mark.skipif(not (GR00T.exists() and BACKBONE), reason=
 RUNS = Path(os.environ.get("GR00T_N17_ORACLE_DIR", Path.home() / "gr00t-runs"))
 REFERENCE_SRC = Path(os.environ.get("GR00T_N17_REFERENCE_SRC", Path.home() / "ref/Isaac-GR00T"))
 RECORDINGS = "set GR00T_N17_ORACLE_DIR; test/gr00t_n17/record_dumps.py and record_oracle.py make them"
+REQUESTS = 20  # the DROID requests in every recording
+BAR = 1.2  # a multiple of the floor measured in the test, never an absolute tolerance
+
+
+def complete(*dirs: Path) -> bool:
+    """Whether every recording holds all its requests: a partial set would silently shrink the sample."""
+    return all(d.is_dir() and len(list(d.glob("req_*.pt"))) == REQUESTS for d in dirs)
 
 
 def randomize(module: nn.Module, seed: int, scale: float) -> None:

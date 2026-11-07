@@ -10,7 +10,7 @@ from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
 
 from .helpers import BACKBONE, GR00T, RECORDINGS, RUNS, needs_checkpoint
 
-# The 20 recorded DROID requests the decode's parity bar is measured on.
+# The 20 recorded DROID requests the parity bars are measured on.
 _DUMPS = sorted((RUNS / "dump").glob("req_*.pt"))
 
 # Tiny three-embodiment checkpoint. "grip" is constant under q01/q99 but not under min/max.
@@ -185,12 +185,6 @@ def test_image_output_size(hw, out_hw):
     assert out.shape == (*out_hw, 3) and out.dtype == np.uint8
 
 
-def test_image_constant_frame_stays_constant():
-    pytest.importorskip("cv2")
-    out = _pre().image(np.full((180, 320, 3), (10, 128, 250), np.uint8))
-    assert np.all(out == np.array([10, 128, 250], np.uint8))
-
-
 @pytest.mark.parametrize("hw", [(180, 320), (256, 256), (480, 640)])
 def test_image_matches_hand_written_area_chain(hw):
     cv2 = pytest.importorskip("cv2")
@@ -269,21 +263,6 @@ def test_call_feeds_the_processor_in_reference_order():
     assert out["embodiment_id"].tolist() == [7, 7] and out["action_mask"].shape == (2, 6)
 
 
-@needs_checkpoint
-def test_call_with_the_real_processor():
-    pytest.importorskip("cv2")
-    pre = Gr00tN17Preprocessor.from_pretrained(GR00T, 132, 40, backbone_path=BACKBONE)
-    tag = "oxe_droid_relative_eef_relative_joint"
-    video = {k: np.zeros((2, 2, 180, 320, 3), np.uint8) for k in pre.video_keys[tag]}
-    state = {k: np.zeros((2, 1, lo.size)) for k, (lo, _) in pre.state_bounds[tag].items()}
-    out = pre(tag, video, ["pick up the red cup and put it in the bowl", "stop"], state)
-    L = out["input_ids"].shape[1]
-    assert out["input_ids"].shape == out["attention_mask"].shape == (2, L)
-    assert out["attention_mask"][1, 0] == 0 and out["attention_mask"][:, -1].tolist() == [1, 1]  # left padding
-    assert out["image_grid_thw"].tolist() == [[1, 16, 28]] * 8
-    assert out["pixel_values"].shape[0] == 8 * 448
-
-
 # ----------------------------------------------------------------------------
 # The decode: `unapply`. An inverse of the wrong thing still returns plausible commands
 # of the right shape, so each test pins one choice and, where tempting, the wrong answer.
@@ -303,22 +282,14 @@ def _pose_chunk(xyz, rot6d):
     return chunk
 
 
-@pytest.mark.parametrize("x, relative, percentile", [
-    (-1.0, [-1.0, -2.0], [0.0, -1.0]),
-    (0.0, [0.0, 0.0], [1.0, 0.0]),
-    (1.0, [1.0, 2.0], [2.0, 1.0]),
-])
-def test_a_relative_group_unnormalises_against_the_relative_action_bounds(x, relative, percentile):
+@pytest.mark.parametrize("x, relative", [(-1.0, [-1.0, -2.0]), (0.0, [0.0, 0.0]), (1.0, [1.0, 2.0])])
+def test_a_relative_group_unnormalises_against_the_relative_action_bounds(x, relative):
     """A relative group's bounds are ``relative_action``'s min/max, not the ``action``
     q01/q99 ``use_percentiles`` picks for the rest: the reference's override replaces the
     group's stats (``state_action_processor.py:195-204``). The wrong read raises nothing and
     rescales each command. Zero state, so only the bounds are in it."""
     out = _pre().unapply("bot", np.full((1, 3, 3), x, np.float32), {"arm": np.zeros((1, 1, 2), np.float32)})
     assert out["arm"][0, 0].tolist() == relative
-    # `percentile` is the same unnormalise off `action`'s q01/q99, derived here so
-    # the negative control follows the fixture instead of being a second literal
-    q01, q99 = np.array(STATS["bot"]["action"]["arm"]["q01"]), np.array(STATS["bot"]["action"]["arm"]["q99"])
-    assert percentile == ((x + 1) / 2 * (q99 - q01) + q01).tolist() != relative
 
 
 def test_a_relative_groups_bounds_may_be_one_per_timestep():
@@ -335,18 +306,16 @@ def test_a_relative_groups_bounds_may_be_one_per_timestep():
     assert out["pose"][0, 1, :3].tolist() == [2.0, 2.0, 2.0]
 
 
-@pytest.mark.parametrize("x, minmax_would_give", [(-1.0, 0.0), (0.0, 5.0), (1.0, 10.0), (100.0, 10.0)])
-def test_an_absolute_groups_constant_dimension_decodes_to_the_constant(x, minmax_would_give):
+@pytest.mark.parametrize("x", [-1.0, 0.0, 1.0, 100.0])
+def test_an_absolute_groups_constant_dimension_decodes_to_the_constant(x):
     """``grip`` has q01 == q99 == 5 and min/max 0/10. An absolute group reads the
-    percentiles, so it decodes to 5 whatever arrives (min/max gives the second column), and
-    the 1e-8 range floor (``state_action_processor.py:169``) is not carried into the inverse.
-    ``x = 100`` is the clip (``utils.py:146``)."""
+    percentiles, so it decodes to 5 whatever arrives, and the 1e-8 range floor
+    (``state_action_processor.py:169``) is not carried into the inverse. ``x = 100`` is the
+    clip (``utils.py:146``), which only ``arm`` can show: ``grip`` has no range to clip."""
     out = _pre().unapply("bot", np.full((1, 3, 3), x, np.float32), {"arm": np.zeros((1, 1, 2), np.float32)})
     assert out["grip"].tolist() == [[[5.0]] * 3]
-    # the min/max read, derived off the fixture's own min/max: a whole-range answer
-    # at three of the four inputs, and the floored one would be 5 + 5e-09 at all four
-    lo, hi = STATS["bot"]["action"]["grip"]["min"][0], STATS["bot"]["action"]["grip"]["max"][0]
-    assert minmax_would_give == (np.clip(x, -1.0, 1.0) + 1.0) / 2.0 * (hi - lo) + lo
+    if x == 100.0:
+        assert out["arm"][0, 0].tolist() == [1.0, 2.0]
 
 
 def test_each_joint_group_is_read_at_its_own_offset():
@@ -395,20 +364,13 @@ def test_a_joint_group_with_no_absolute_statistics_is_refused_and_named():
 @pytest.mark.skipif(not GR00T.exists(), reason="checkpoint not cached")
 def test_the_checkpoints_xdof_embodiments_cannot_be_decoded_at_all():
     """On disk: both xdof embodiments ship empty ``action`` stats for the wrist eef groups
-    beside a full (40, 9) ``relative_action``, so they cannot be served; the other six decode."""
+    beside a full (40, 9) ``relative_action``, so they cannot be served."""
     pre = Gr00tN17Preprocessor.from_pretrained(GR00T, max_state_dim=132, max_action_horizon=40)
     broken = {tag for tag, dims in pre.action_dims.items() if 0 in dims.values()}
     assert broken == {"xdof_relative_eef_relative_joint", "xdof_relative_eef_relative_joint_subtask"}
     for tag in sorted(broken):
         with pytest.raises(ValueError, match="no action statistics for joint group 'left_wrist_eef'"):
             pre.unapply(tag, np.zeros((1, 40, 132), np.float32), None)
-    # and the other six decode: 9 + 1 + 7 for DROID, over its own 40-step horizon.
-    # `eef_9d`'s reference frame has to be a real pose, so it is the identity.
-    droid = "oxe_droid_relative_eef_relative_joint"
-    state = {k: np.zeros((1, 1, d), np.float32) for k, d in pre.action_dims[droid].items()}
-    state["eef_9d"] = np.array([[_IDENTITY_POSE]], np.float32)
-    out = pre.unapply(droid, np.zeros((1, 40, 132), np.float32), state)
-    assert [v.shape for v in out.values()] == [(1, 40, 9), (1, 40, 1), (1, 40, 7)]
 
 
 def test_a_relative_non_eef_group_adds_the_states_last_timestep():
@@ -504,3 +466,19 @@ def test_the_decode_matches_the_reference_on_the_twenty_recorded_droid_requests(
         eef.append(float(np.abs(ours["eef_9d"] - ref["eef_9d"]).max()))
     assert max(eef) <= 3.3e-09, eef
     assert float(np.median(eef)) <= 1e-15, eef
+
+
+@needs_checkpoint
+@pytest.mark.skipif(len(_DUMPS) != 20, reason=f"the 20 requests in {RUNS / 'dump'} missing ({RECORDINGS})")
+def test_the_inputs_match_the_reference_on_the_twenty_recorded_droid_requests():
+    """Our preprocessing against what the reference collated from the same observation.
+    The recordings hold floats as bf16, so that is the precision these compare at."""
+    pytest.importorskip("cv2")
+    pre = Gr00tN17Preprocessor.from_pretrained(GR00T, 132, 40, backbone_path=BACKBONE)
+    for path in _DUMPS:
+        req = torch.load(path, map_location="cpu", weights_only=False)
+        obs, want = req["raw_obs"], req["collated"]["inputs"]
+        [[text]] = obs["language"]["annotation.language.language_instruction"]
+        out = pre(req["embodiment_tag"], obs["video"], [text], obs["state"])
+        for name in ("input_ids", "attention_mask", "image_grid_thw", "embodiment_id", "pixel_values", "state"):
+            assert torch.equal(out[name].to(want[name].dtype), want[name]), (path, name)

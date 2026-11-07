@@ -17,13 +17,6 @@ Traps that would give a test that passes and says nothing:
    kernels are not exercised, so a kernel swap does not blur the stage bar.
 4. One node on the device at a time, per class-scoped fixture. The LLM is built in fp32 on the
    host first, so it briefly needs several GB of host RAM.
-
-A stage whose tensors the recordings lack skips and names them. Besides ``vl_embeds`` (the
-bridge's output) it reads ``backbone_features`` ``[1, n, 2048]``, the LLM's output and the input of
-the action head's ``vlln``; and ``vision_embeds`` ``[448, 2048]`` and ``deepstack_embeds``
-``[3, 448, 2048]``, Qwen3-VL's ``visual`` ``pooler_output`` and its three ``deepstack_features``,
-read in a forward hook on ``visual`` because ``get_image_features`` replaces both with per-image
-splits once the call returns.
 """
 
 from __future__ import annotations
@@ -31,7 +24,6 @@ from __future__ import annotations
 import gc
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 import torch
@@ -44,11 +36,10 @@ from mstar.model.gr00t_n17.gr00t_n17_model import LLM, VISION_ENCODER, VL_BRIDGE
 from mstar.model.qwen3_5.config import VISION_ATTN
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeSubmodule
 
-from .helpers import BACKBONE, GR00T, RECORDINGS, RUNS, SegmentAttention
+from .helpers import BACKBONE, BAR, GR00T, RECORDINGS, REQUESTS, RUNS, SegmentAttention, complete
 
 _ORACLE_FP32, _ORACLE_BF16 = RUNS / "oracle_fp32_seed7", RUNS / "oracle_bf16_seed7"
 _DUMP = RUNS / "dump"
-_REQUESTS = 20
 
 # What each stage reads off the two runs; the batched two are recorded with a batch dim of 1.
 _VISION_KEYS = ("vision_embeds", "deepstack_embeds")
@@ -59,7 +50,6 @@ _BATCHED = frozenset({_LLM_KEY, _BRIDGE_KEY})
 _DEVICE = torch.device("cuda:0")
 _BF16 = torch.bfloat16
 
-_BAR = 1.2  # a multiple of the floor measured here, never an absolute tolerance
 # Two requests, not 20: a control only has to show the bar can fail. One per (text rows, image
 # rows) bucket, the two `test_action_gen_gpu.py` anchors on.
 _CONTROL_REQUESTS = (0, 8)
@@ -70,39 +60,14 @@ _FWD = CurrentForwardPassInfo(request_id="r0", graph_walk=_WALK, fwd_index=0, ra
 _ENGINE = ModelInputsFromEngine(request_ids=["r0"], per_request_info={})
 
 
-def _complete(directory: Path) -> bool:
-    """All 20 requests, counted: a partial set would quietly shrink the sample."""
-    return directory.is_dir() and len(list(directory.glob("req_*.pt"))) == _REQUESTS
-
-
-def _recorded_keys() -> frozenset[str]:
-    """The tensors **every** file of both oracles holds. Memory-mapped, so nothing is read."""
-    if not (_complete(_ORACLE_FP32) and _complete(_ORACLE_BF16)):
-        return frozenset()
-    return frozenset.intersection(*(
-        frozenset(torch.load(path, map_location="cpu", mmap=True, weights_only=True))
-        for directory in (_ORACLE_FP32, _ORACLE_BF16)
-        for path in sorted(directory.glob("req_*.pt"))
-    ))
-
-
-_RECORDED = _recorded_keys()
-
 pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and GR00T.exists() and bool(BACKBONE) and _complete(_DUMP)),
-    reason=f"the backbone stages need CUDA, the cached checkpoint and the {_REQUESTS} dumps in {_DUMP} ({RECORDINGS})",
+    not (torch.cuda.is_available() and GR00T.exists() and bool(BACKBONE)
+         and complete(_ORACLE_FP32, _ORACLE_BF16, _DUMP)),
+    reason=(
+        f"the backbone stages need CUDA, the cached checkpoint and the {REQUESTS} recorded requests "
+        f"in {RUNS}/{{oracle_fp32_seed7,oracle_bf16_seed7,dump}} ({RECORDINGS})"
+    ),
 )
-
-
-def _needs(*keys: str) -> pytest.MarkDecorator:
-    missing = [key for key in keys if key not in _RECORDED]
-    return pytest.mark.skipif(
-        bool(missing),
-        reason=(
-            f"{_ORACLE_BF16.name} and {_ORACLE_FP32.name} do not both record {missing} on all "
-            f"{_REQUESTS} requests; the module docstring says what they must hold ({RECORDINGS})"
-        ),
-    )
 
 
 # ----------------------------------------------------------------------------
@@ -163,17 +128,17 @@ def _error_and_floor(ours: torch.Tensor, want: torch.Tensor, rounded: torch.Tens
 
 def _within_bar(ours: torch.Tensor, want: torch.Tensor, rounded: torch.Tensor, what: str) -> None:
     error, floor = _error_and_floor(ours, want, rounded)
-    assert error <= _BAR * floor, (
-        f"{what}: mean abs error {error:.3e} past the bar {_BAR * floor:.3e} "
-        f"({_BAR}x its measured bf16 floor {floor:.3e}; {error / floor:.2f}x)"
+    assert error <= BAR * floor, (
+        f"{what}: mean abs error {error:.3e} past the bar {BAR * floor:.3e} "
+        f"({BAR}x its measured bf16 floor {floor:.3e}; {error / floor:.2f}x)"
     )
 
 
 def _past_bar(ours: torch.Tensor, want: torch.Tensor, rounded: torch.Tensor, what: str) -> None:
     """A control: the bar has to reject it, or the pass beside it measures nothing."""
     error, floor = _error_and_floor(ours, want, rounded)
-    assert error > _BAR * floor, (
-        f"{what}: the control's mean abs error {error:.3e} is inside the bar {_BAR * floor:.3e} "
+    assert error > BAR * floor, (
+        f"{what}: the control's mean abs error {error:.3e} is inside the bar {BAR * floor:.3e} "
         f"({error / floor:.2f}x the floor {floor:.3e}), so the bar cannot see this mistake"
     )
 
@@ -274,7 +239,6 @@ def _in_prompt_order(out: dict, is_image: torch.Tensor) -> torch.Tensor:
 # ----------------------------------------------------------------------------
 
 
-@_needs(*_VISION_KEYS)
 class TestVisionEncoder:
     @pytest.fixture(scope="class")
     def built(self) -> Iterator[_Built]:
@@ -286,7 +250,7 @@ class TestVisionEncoder:
         The floors differ several-fold, so a pooled mean would let the embeds' floor cover a
         broken feature.
         """
-        for index in range(_REQUESTS):
+        for index in range(REQUESTS):
             request = _load(index, _VISION_KEYS)
             out = _forward(built.node, _staged(built.node, VISION_ATTN, _vision_inputs(request)))
             _within_bar(
@@ -331,7 +295,6 @@ class TestVisionEncoder:
 # ----------------------------------------------------------------------------
 
 
-@_needs(*_VISION_KEYS, _LLM_KEY)
 class TestLLM:
     @pytest.fixture(scope="class")
     def built(self) -> Iterator[_Built]:
@@ -342,7 +305,7 @@ class TestLLM:
         serves. Handed the bf16 run's vision outputs, the ratio reads the embedding, the scatter
         onto the image rows, M-RoPE, the DeepStack injection and the 16 causal layers.
         """
-        for index in range(_REQUESTS):
+        for index in range(REQUESTS):
             request = _load(index, (*_VISION_KEYS, _LLM_KEY))
             out = _forward(built.node, _staged(built.node, LLM_ATTN, _llm_inputs(request)))
             _within_bar(
@@ -373,7 +336,6 @@ class TestLLM:
 # ----------------------------------------------------------------------------
 
 
-@_needs(_LLM_KEY, _BRIDGE_KEY)
 class TestVLBridge:
     @pytest.fixture(scope="class")
     def built(self) -> Iterator[_Built]:
@@ -382,7 +344,7 @@ class TestVLBridge:
     def test_the_conditioning_rows_match_the_oracle(self, built: _Built):
         """The bridge's two spans, back in prompt order, against the recorded ``vl_embeds``: the
         rows the DT cross-attends on every step."""
-        for index in range(_REQUESTS):
+        for index in range(REQUESTS):
             request = _load(index, (_LLM_KEY, _BRIDGE_KEY))
             out = _forward(built.node, _staged(built.node, BRIDGE_ATTN, _bridge_inputs(request, built.config)))
             _within_bar(

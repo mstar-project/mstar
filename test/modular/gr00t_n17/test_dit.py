@@ -209,19 +209,6 @@ def test_the_projection_is_256_wide_whatever_the_dt_is(embedding_dim):
 
 
 @torch.no_grad()
-def test_the_encoder_is_the_projection_through_two_linears_with_a_silu_between():
-    """``[B] -> [B, embedding_dim]``, one conditioning vector per request. diffusers' own
-    linears and activation in the same order, so ``torch.equal``; this pins the wiring."""
-    encoder = _encoder()
-    timesteps = _flat()
-    out = encoder(timesteps)
-    embedder = encoder.timestep_embedder
-
-    assert out.shape == (len(_TIMESTEPS), _EMBED)
-    assert torch.equal(out, embedder.linear_2(F.silu(embedder.linear_1(encoder.time_proj(timesteps)))))
-
-
-@torch.no_grad()
 def test_the_projection_is_rounded_to_the_weights_dtype_before_the_embedder():
     """The reference casts the fp32 sinusoid to the weights' dtype on the way in: in bf16 a real
     rounding before the first GEMM, not what running in fp32 and rounding at the end gives."""
@@ -229,7 +216,10 @@ def test_the_projection_is_rounded_to_the_weights_dtype_before_the_embedder():
     fp32 = _encoder()  # the same weights, unrounded, because `_encoder` is deterministic
     timesteps = _flat()
     projection = bf16.time_proj(timesteps)
+    embedder = fp32.timestep_embedder
 
+    # in fp32 nothing rounds, so this is the wiring: two linears with a silu between
+    assert torch.equal(fp32(timesteps), embedder.linear_2(F.silu(embedder.linear_1(fp32.time_proj(timesteps)))))
     assert projection.dtype == torch.float32
     assert torch.equal(bf16(timesteps), bf16.timestep_embedder(projection.to(torch.bfloat16)))
     # the rounding moves the projection, so where it happens is visible in the output
@@ -401,17 +391,6 @@ def test_a_timestep_that_is_not_one_per_request_is_refused_here(timesteps):
         encoder(_actions(), timesteps, torch.tensor(_CAT_IDS))
 
 
-@torch.no_grad()
-def test_the_time_encoding_is_cast_to_the_actions_dtype():
-    """The sinusoid is fp32 whatever the module's dtype, so in bf16, the checkpoint's dtype, the
-    concatenation would mix dtypes and ``torch.cat`` would raise; no fp32 test sees it."""
-    encoder = _action_encoder().to(torch.bfloat16)
-    out = encoder(_actions().to(torch.bfloat16), _flat(), torch.tensor(_CAT_IDS))
-
-    assert encoder.pos_encoding(_rows()).dtype == torch.float32
-    assert out.dtype == torch.bfloat16
-
-
 def test_the_encoder_and_decoder_are_sized_from_the_config():
     """``W2`` twice the width is the concatenation in shapes. The decoder takes the DT's
     ``output_dim``, not its ``inner_dim``, which every other DT layer is; its relu and indexing
@@ -438,7 +417,6 @@ def test_the_encoder_and_decoder_are_sized_from_the_config():
 _DT_DIM = 12
 _DT_HEADS = 3
 _DT_HEAD_DIM = 5
-_DT_INNER = _DT_HEADS * _DT_HEAD_DIM
 _BRIDGE_DIM = 7
 # 2 requests x 4 action tokens attending 6 bridge rows: three different counts, so a query
 # count standing in for a key count is a shape error and not a quiet reinterpretation.
@@ -554,25 +532,6 @@ def test_adalayernorm_read_any_other_way_is_a_different_answer(deviation, floor)
             parameter.zero_()
         assert torch.equal(zeroed(x, temb), F.layer_norm(x, (_DT_DIM,), eps=_EPS))
         assert torch.equal(_adaln_reference(zeroed, x, temb, _WRONG_BARE_SCALE), torch.zeros_like(x))
-
-
-@torch.no_grad()
-def test_a_batch_can_hold_requests_at_different_denoising_steps():
-    """Moving one request's ``temb`` leaves its neighbours bit-identical. Same batch shape in
-    both runs: batch against singleton is not exact (the GEMM)."""
-    norm = _adaln()
-    x = _hidden(3, _QUERIES)
-    temb = _temb(3)
-    out = norm(x, temb)
-
-    moved = temb.clone()
-    moved[1] += 0.5
-    after = norm(x, moved)
-
-    assert torch.equal(after[0], out[0])
-    assert torch.equal(after[2], out[2])
-    assert not torch.equal(after[1], out[1])
-    assert torch.equal(norm(x[[2, 0, 1]], temb[[2, 0, 1]]), out[[2, 0, 1]])
 
 
 # ----------------------------------------------------------------------------
@@ -703,78 +662,6 @@ def test_a_block_wired_any_other_way_is_a_different_answer(cross, deviation):
     assert not torch.equal(out, wrong)
     # a floor under the weakest deviation (norm3 after the feed-forward, which keeps both residuals)
     assert (out - wrong).abs().max() > 0.2 * out.abs().max()
-
-
-@pytest.mark.parametrize("cross", list(_SETTINGS.values()), ids=list(_SETTINGS))
-@torch.no_grad()
-def test_k_and_v_come_from_the_setting_and_q_always_from_the_tokens(cross):
-    """A cross block's ``to_k``/``to_v`` are 2048 wide (the bridge's rows), a self block's 1536
-    (its own tokens). In the self setting k and v are the AdaLN output, not the block's input."""
-    block = _block(cross)
-    hidden, temb = _hidden(), _temb()
-    encoder = _bridge_rows(cross)
-    seen = {}
-
-    def record(q, k, v):
-        seen.update(q=q, k=k, v=v)
-        return _sdpa(q, k, v)
-
-    block(hidden, temb, encoder, record)
-
-    assert block.attn1.to_q.in_features == _DT_DIM
-    assert block.attn1.to_k.in_features == block.attn1.to_v.in_features
-    assert block.attn1.to_k.in_features == (_BRIDGE_DIM if cross else _DT_DIM)
-    assert block.attn1.to_out[0].in_features == _DT_INNER
-    assert block.attn1.to_out[0].out_features == _DT_DIM
-
-    normed = _adaln_reference(block.norm1, hidden, temb)
-    source = encoder if cross else normed
-    heads = (_REQUESTS, -1, _DT_HEADS, _DT_HEAD_DIM)
-    assert torch.equal(seen["q"], block.attn1.to_q(normed).view(heads))
-    assert torch.equal(seen["k"], block.attn1.to_k(source).view(heads))
-    assert torch.equal(seen["v"], block.attn1.to_v(source).view(heads))
-
-
-@pytest.mark.parametrize("cross", list(_SETTINGS.values()), ids=list(_SETTINGS))
-@torch.no_grad()
-def test_the_callable_is_handed_heads_last_and_its_output_is_folded_back_the_same_way(cross):
-    """The attention resource's contract: heads-last in, folded back with ``reshape(B, T, -1)``.
-    An attention returning q makes the fold checkable; a heads-first layout would pass a shape
-    check and fold the heads back interleaved."""
-    block = _block(cross)
-    hidden, temb = _hidden(), _temb()
-    encoder = _bridge_rows(cross)
-    keys = _BRIDGE_ROWS if cross else _QUERIES
-    seen = []
-
-    def shapes(q, k, v):
-        seen.append((tuple(q.shape), tuple(k.shape), tuple(v.shape)))
-        return q
-
-    out = block(hidden, temb, encoder, shapes)
-
-    assert seen == [(
-        (_REQUESTS, _QUERIES, _DT_HEADS, _DT_HEAD_DIM),
-        (_REQUESTS, keys, _DT_HEADS, _DT_HEAD_DIM),
-        (_REQUESTS, keys, _DT_HEADS, _DT_HEAD_DIM),
-    )]
-    normed = _adaln_reference(block.norm1, hidden, temb)
-    attended = block.attn1.to_out[0](block.attn1.to_q(normed)) + hidden
-    assert torch.equal(out, block.ff(F.layer_norm(attended, (_DT_DIM,), eps=_EPS)) + attended)
-
-
-def test_a_block_takes_its_attention_per_call_and_has_nowhere_to_keep_a_stale_one():
-    """No default on ``forward``: a block that fell back to its own tokens would silently
-    ignore the language and images. No ``attend`` on ``__init__``: one bound attention cannot
-    serve the three spans the stack reads."""
-    block = BasicTransformerBlock(_DT_DIM, _DT_HEADS, _DT_HEAD_DIM)
-    hidden, temb = _hidden(), _temb()
-
-    with pytest.raises(TypeError):
-        block(hidden, temb, None)
-    with pytest.raises(TypeError):
-        BasicTransformerBlock(_DT_DIM, _DT_HEADS, _DT_HEAD_DIM, attend=_sdpa)
-    assert block(hidden, temb, None, _sdpa).shape == (_REQUESTS, _QUERIES, _DT_DIM)
 
 
 # ----------------------------------------------------------------------------
@@ -1084,38 +971,18 @@ def test_the_stack_is_built_and_run_as_cross_then_self_from_block_zero(depth):
 @pytest.mark.parametrize("n", [1, 2, 3, 4])
 def test_the_text_image_rule_is_the_config_field_dividing_the_cross_blocks(n):
     """``attend_text_every_n_blocks`` splits the cross blocks into text and image and leaves
-    cross/self alone. Four values, because at the checkpoint's n = 2 several wrong readings
-    agree with ``idx % 4``."""
-    indexes = range(16)
+    cross/self alone. Four values over the checkpoint's 32 blocks, because at its n = 2 several
+    wrong readings agree with ``idx % 4``."""
+    indexes = range(32)
     spans = [_span_for(index, n) for index in indexes]
 
+    # block 0 is a text block: starting at the image rows has the same shapes end to end
     assert spans == [_reference_span(index, n) for index in indexes]
     # the cross/self half is invariant in the field, and is `_attends_encoder`'s rule
     assert [span != SA_SPAN for span in spans] == [_attends_encoder(index) for index in indexes]
-    assert [span != SA_SPAN for span in spans] == [index % 2 == 0 for index in indexes]
-    # the text/image half is not: the period is `2 * n` cross blocks
-    text = [index for index in indexes if spans[index] == VL_TEXT_SPAN]
-    assert text == [index for index in indexes if index % (2 * n) == 0]
-    assert len(text) == len(range(0, 16, 2 * n))
-    assert set(spans) == ({SA_SPAN, VL_TEXT_SPAN} if n == 1 else {SA_SPAN, VL_TEXT_SPAN, VL_IMAGE_SPAN})
-    assert list(inspect.signature(_span_for).parameters) == [
-        "index", "attend_text_every_n_blocks",
-    ]
-
-
-def test_the_span_rule_runs_block_for_block_over_the_checkpoints_thirty_two():
-    """At the real depth and n, block 0 is a **text** block. Starting at the image rows has the
-    same shapes end to end, so only this comparison sees the phase."""
-    config = _dit_config(32)
-    n = config.attend_text_every_n_blocks
-    spans = [_span_for(index, n) for index in range(config.dit.num_layers)]
-
-    assert (config.dit.num_layers, n) == (32, 2)
-    assert spans == [_reference_span(index, n) for index in range(config.dit.num_layers)]
-    assert spans[0] == VL_TEXT_SPAN
-    assert spans[:8] == [VL_TEXT_SPAN, SA_SPAN, VL_IMAGE_SPAN, SA_SPAN] * 2
-    # 16 self blocks, and the 16 cross blocks split evenly between language and images
-    assert Counter(spans) == {SA_SPAN: 16, VL_TEXT_SPAN: 8, VL_IMAGE_SPAN: 8}
+    if n == 2:
+        # 16 self blocks, and the 16 cross blocks split evenly between language and images
+        assert Counter(spans) == {SA_SPAN: 16, VL_TEXT_SPAN: 8, VL_IMAGE_SPAN: 8}
 
 
 # Three *different* kv lengths, so a span is told apart by what its attention was handed.

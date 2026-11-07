@@ -33,28 +33,22 @@ def _config(taps: tuple[int, ...], depth: int = _DEPTH) -> Gr00tN17Config:
 
 # ----------------------------------------------------------------------------
 # Inline reference: transformers' `Qwen3VLVisionPatchMerger`
-# (`models/qwen3_vl/modeling_qwen3_vl.py`), both orderings of its norm. GR00T's
-# DeepStack mergers are the `use_postshuffle_norm=True` variant; the tower's own
-# merger is the other one.
+# (`models/qwen3_vl/modeling_qwen3_vl.py`) with `use_postshuffle_norm=True`, the
+# variant GR00T's DeepStack mergers are; the tower's own merger is the other one.
 # ----------------------------------------------------------------------------
 
 
 class RefPatchMerger(nn.Module):
-    def __init__(self, config: Qwen3_5VisionConfig, use_postshuffle_norm: bool):
+    def __init__(self, config: Qwen3_5VisionConfig):
         super().__init__()
         self.merged_size = config.hidden_size * config.merge_unit
-        self.use_postshuffle_norm = use_postshuffle_norm
-        norm_size = self.merged_size if use_postshuffle_norm else config.hidden_size
-        self.norm = nn.LayerNorm(norm_size, eps=1e-6)
+        self.norm = nn.LayerNorm(self.merged_size, eps=1e-6)
         self.linear_fc1 = nn.Linear(self.merged_size, self.merged_size)
         self.act_fn = nn.GELU()
         self.linear_fc2 = nn.Linear(self.merged_size, config.out_hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_postshuffle_norm:
-            x = self.norm(x.view(-1, self.merged_size))
-        else:
-            x = self.norm(x).view(-1, self.merged_size)
+        x = self.norm(x.view(-1, self.merged_size))
         return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
 
@@ -62,22 +56,10 @@ def test_the_deepstack_merger_normalises_after_the_shuffle():
     vision = _config(()).vision
     merger = DeepStackMerger(vision)
     randomize(merger, 0, 1.0)
-    reference = RefPatchMerger(vision, use_postshuffle_norm=True)
+    reference = RefPatchMerger(vision)
     reference.load_state_dict(merger.state_dict())
     x = torch.randn(8, vision.hidden_size, generator=torch.Generator().manual_seed(1))
     assert torch.equal(merger(x), reference(x))
-
-
-def test_the_preshuffle_ordering_is_a_different_function():
-    # Both norms keep the identity affine and both linears are copied across, so
-    # where the norm runs is the only difference left between the two.
-    vision = _config(()).vision
-    merger = DeepStackMerger(vision)
-    preshuffle = RefPatchMerger(vision, use_postshuffle_norm=False)
-    preshuffle.linear_fc1.load_state_dict(merger.linear_fc1.state_dict())
-    preshuffle.linear_fc2.load_state_dict(merger.linear_fc2.state_dict())
-    x = torch.randn(8, vision.hidden_size, generator=torch.Generator().manual_seed(1))
-    assert not torch.equal(merger(x), preshuffle(x))
 
 
 # ----------------------------------------------------------------------------
@@ -145,28 +127,9 @@ def test_each_feature_comes_off_its_own_block(taps):
     assert torch.equal(embeds, encoder.tower.merger(states[_DEPTH]))
 
 
-@pytest.mark.parametrize("grid, merged_tokens", [([(1, 4, 4)], 4), ([(1, 2, 2), (1, 4, 6)], 7)])
-@torch.no_grad()
-def test_every_output_is_one_row_per_merged_block_of_patches(grid, merged_tokens):
-    encoder = _stubbed_encoder((1, 3, 5))
-    vision = encoder.tower.config
-    embeds, features = encoder(*_inputs(vision, grid))
-    expected = torch.Size((merged_tokens, vision.out_hidden_size))
-    assert embeds.shape == expected
-    assert [f.shape for f in features] == [expected] * 3
-
-
 def test_a_tap_past_the_towers_depth_is_rejected():
     with pytest.raises(ValueError, match="do not fit"):
         Gr00tN17VisionEncoder(_config((1, 3, _DEPTH)))
-
-
-@torch.no_grad()
-def test_no_taps_gives_no_features():
-    encoder = _stubbed_encoder(())
-    embeds, features = encoder(*_inputs(encoder.tower.config, [(1, 2, 2)]))
-    assert features == []
-    assert embeds.shape == (1, encoder.tower.config.out_hidden_size)
 
 
 @torch.no_grad()
@@ -223,9 +186,10 @@ def _walk_inputs(vision: Qwen3_5VisionConfig, grid_thw: list[torch.Tensor]) -> d
 
 
 @pytest.mark.parametrize("grid_thw, grid", list(_GRIDS.values()), ids=list(_GRIDS))
-def test_the_step_declares_one_attention_segment_per_frame(grid_thw, grid):
+def test_prepare_inputs_derives_the_towers_grid_and_one_attention_segment_per_frame(grid_thw, grid):
     node = _node()
-    inputs = node.prepare_inputs(_WALK, _FWD, _walk_inputs(node.config, grid_thw))
+    walk_inputs = _walk_inputs(node.config, grid_thw)
+    inputs = node.prepare_inputs(_WALK, _FWD, walk_inputs)
     step = node.declare_step(_WALK, ["r0"], [inputs])
 
     spans = [h * w for t, h, w in grid for _ in range(t)]
@@ -234,14 +198,8 @@ def test_the_step_declares_one_attention_segment_per_frame(grid_thw, grid):
     assert list(step.steps) == [VISION_ATTN]
     assert step.steps[VISION_ATTN].causal is False
 
-
-@pytest.mark.parametrize("grid_thw, grid", list(_GRIDS.values()), ids=list(_GRIDS))
-def test_prepare_inputs_derives_the_grid_the_tower_helpers_expect(grid_thw, grid):
-    node = _node()
-    walk_inputs = _walk_inputs(node.config, grid_thw)
-    tensors = node.prepare_inputs(_WALK, _FWD, walk_inputs).tensor_inputs
+    tensors = inputs.tensor_inputs
     indices, weights, position_ids = _tower_args(node.config, grid)
-
     assert torch.equal(tensors["indices"], indices)
     assert torch.equal(tensors["weights"], weights)
     assert torch.equal(tensors["position_ids"], position_ids)

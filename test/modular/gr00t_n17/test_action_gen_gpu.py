@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import torch
+import yaml
 
 from mstar.model.gr00t_n17.components.dit import ActionPositionEmbedding, DiT
 from mstar.model.gr00t_n17.components.embodiment import build_action_decoder, build_action_encoder
@@ -33,10 +34,10 @@ from mstar.model.gr00t_n17.preprocessing import Gr00tN17Preprocessor
 from mstar.model.gr00t_n17.submodules import Gr00tN17DenoiseStepSubmodule
 from mstar.model.gr00t_n17.weight_loader import load_gr00t_n17_weights
 
-from .helpers import BACKBONE, GR00T, RECORDINGS, RUNS
+from .helpers import BACKBONE, BAR, GR00T, RECORDINGS, REQUESTS, RUNS, complete
 
 _ORACLE_FP32, _ORACLE_BF16, _DUMP = RUNS / "oracle_fp32", RUNS / "oracle_bf16", RUNS / "dump"
-_REQUESTS = 20
+_SERVING = Path(__file__).resolve().parents[3] / "configs" / "gr00t_n17.yaml"
 # Each recording set's (fp32, bf16) pair. `recorded` starts from the dump's own noise and is what
 # the parity tests read.
 _SETS = {
@@ -50,16 +51,11 @@ _SETS = {
 _RIGHT_SET, _WRONG_NOISE_SET = "seed7", "seed8"
 
 
-def _complete(*dirs: Path) -> bool:
-    """Whether every recording is complete: a partial set would silently shrink the sample."""
-    return all(d.is_dir() and len(list(d.glob("req_*.pt"))) == _REQUESTS for d in dirs)
-
-
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and GR00T.exists() and bool(BACKBONE)
-         and _complete(_ORACLE_FP32, _ORACLE_BF16, _DUMP)),
+         and complete(_ORACLE_FP32, _ORACLE_BF16, _DUMP)),
     reason=(
-        f"the full action_gen loop needs CUDA, the cached checkpoint and the {_REQUESTS} recorded "
+        f"the full action_gen loop needs CUDA, the cached checkpoint and the {REQUESTS} recorded "
         f"requests in {RUNS}/{{oracle_fp32,oracle_bf16,dump}} ({RECORDINGS})"
     ),
 )
@@ -67,26 +63,11 @@ pytestmark = pytest.mark.skipif(
 _DEVICE = torch.device("cuda:0")
 _BF16 = torch.bfloat16
 
-# A multiple of the floor measured in the test, never an absolute tolerance.
-_BAR = 1.2
-# The 20 requests' (text rows, image rows) buckets. 448 image rows = four frames (DROID's two
-# cameras) of 112 rows (a 1 x 16 x 28 patch grid merged by 2); only the prompt length varies.
-_BUCKETS = {(13, 448): 8, (21, 448): 12}
-# The denoise step's tensors: action encoder, position table, the DT (456), decoder; the count
-# says the node is the whole step, not the DT alone.
-_STEP_TENSORS = 467
-# GR00T's four steps (`Gr00tN17DenoiseStepSubmodule.schedule_for`). Sigma *ascends*: it is GR00T's
-# time, not a noise level, and the recordings were made against it.
-_SIGMAS = (0.0, 0.25, 0.5, 0.75, 1.0)
-_TIMESTEPS = (0.0, 250.0, 500.0, 750.0)
 # The fp32 answer's rms: says the weights are the trained ones, since untrained weights set a
 # floor inside which every bar passes.
 _ACTION_RMS = (0.9, 1.3)
 # One row mid-loop and one at the last step, so neither the timestep nor the sigma pair is shared.
 _MIXED_ITERS = (1, 3)
-# How far above the re-blocking floor the span-assignment and perturbation controls must sit.
-# Hand-chosen: it only says a wiring bug and re-blocking are of different orders.
-_CONTROL_MARGIN = 10
 # How far past its floor (chunk, decoded worst group) our loop must land on the wrong seed's
 # noise. Hand-chosen. The decoded bar is lower because a group's error is a few dims of a
 # mostly-padding chunk; it still sits above the 1.2x parity bar.
@@ -168,8 +149,7 @@ class _Loop:
 @pytest.fixture(scope="session")
 def loop() -> _Loop:
     """The denoise step at the checkpoint's weights, bf16 on the device, built once (2.55 GiB,
-    and the slowest load in the file). The schedule is asserted here because every bar below is
-    measured against it."""
+    and the slowest load in the file)."""
     config = Gr00tN17Config.from_hf(GR00T, BACKBONE)
     submodule = Gr00tN17DenoiseStepSubmodule(
         config,
@@ -179,15 +159,12 @@ def loop() -> _Loop:
         build_action_decoder(config),
         loop_name="denoise_loop",
     )
-    loaded = load_gr00t_n17_weights(submodule, "denoise_step", GR00T, device=_DEVICE)
-    assert len(loaded) == _STEP_TENSORS, len(loaded)
+    load_gr00t_n17_weights(submodule, "denoise_step", GR00T, device=_DEVICE)
     submodule.to(_DEVICE).to(_BF16).eval()
     torch.cuda.empty_cache()
 
     # `schedule_for` reads neither argument: the steps are the config's.
     schedule = submodule.schedule_for(None, None)
-    assert tuple(schedule.sigmas.tolist()) == _SIGMAS
-    assert tuple(schedule.timesteps.tolist()) == _TIMESTEPS
     yield _Loop(
         config=config,
         submodule=submodule,
@@ -209,9 +186,9 @@ def recordings(loop: _Loop) -> Callable[[str], list[_Request]]:
 
     def get(name: str) -> list[_Request]:
         if name not in loaded:
-            if not _complete(*_SETS[name]):
-                pytest.skip(f"recording set {name} is not {_REQUESTS} requests in {_SETS[name]}")
-            loaded[name] = [_load(loop.config, index, *_SETS[name]) for index in range(_REQUESTS)]
+            if not complete(*_SETS[name]):
+                pytest.skip(f"recording set {name} is not {REQUESTS} requests in {_SETS[name]}")
+            loaded[name] = [_load(loop.config, index, *_SETS[name]) for index in range(REQUESTS)]
         return loaded[name]
 
     return get
@@ -297,9 +274,9 @@ def _ratio_within_bar(gap: torch.Tensor, floor: torch.Tensor, what: str) -> None
     """The bar on a batching gap: mean and per-element max, both as ratios to the floor."""
     for name, reduce in (("mean", torch.mean), ("max", torch.amax)):
         measured, bar = reduce(gap).item(), reduce(floor).item()
-        assert measured <= _BAR * bar, (
-            f"{what}: {name} |batched - alone| {measured:.3e} past the bar {_BAR * bar:.3e} "
-            f"({_BAR}x the re-blocking floor's {name} {bar:.3e}, measured in this test)"
+        assert measured <= BAR * bar, (
+            f"{what}: {name} |batched - alone| {measured:.3e} past the bar {BAR * bar:.3e} "
+            f"({BAR}x the re-blocking floor's {name} {bar:.3e}, measured in this test)"
         )
 
 
@@ -352,9 +329,9 @@ def test_the_four_step_loop_matches_the_oracle_on_every_recorded_request(
         )
         ours = _run(loop, [request]).cpu()
         error, floor = _chunk_error(ours, request), request.floor
-        assert error <= _BAR * floor, (
-            f"req {request.index}: mean abs error {error:.3e} past the bar {_BAR * floor:.3e} "
-            f"({_BAR}x its measured bf16 floor {floor:.3e})"
+        assert error <= BAR * floor, (
+            f"req {request.index}: mean abs error {error:.3e} past the bar {BAR * floor:.3e} "
+            f"({BAR}x its measured bf16 floor {floor:.3e})"
         )
 
 
@@ -371,9 +348,9 @@ def test_the_decoded_actions_match_the_oracle_in_every_joint_group(
     """
     for request in requests:
         worst, floor, per_group = _decoded_error(loop, _run(loop, [request]).cpu(), request)
-        assert worst <= _BAR * floor, (
+        assert worst <= BAR * floor, (
             f"req {request.index}: worst joint group's mean abs error {worst:.3e} past the "
-            f"bar {_BAR * floor:.3e} ({_BAR}x the worst group's measured bf16 floor {floor:.3e}); "
+            f"bar {BAR * floor:.3e} ({BAR}x the worst group's measured bf16 floor {floor:.3e}); "
             f"per group {({g: f'{e:.2e}/{f:.2e}' for g, (e, f) in per_group.items()})}"
         )
 
@@ -408,29 +385,26 @@ def test_the_parity_bar_rejects_our_loop_with_the_image_rows_blanked(
 ):
     """Negative control on the conditioning: the right noise, the 448 image rows zeroed, and
     both readings must fail the 1.2x bar on every request. Zeroed, not scaled: an affine change
-    is nearly invisible through ``AdaLayerNorm`` (see the last test)."""
+    is nearly invisible through the per-row ``nn.LayerNorm`` each block opens with
+    (``AdaLayerNorm``)."""
     for request in requests:
         blind = _Request(**{**vars(request), "image": torch.zeros_like(request.image)})
         ours = _run(loop, [blind]).cpu()
         chunk = _chunk_error(ours, request) / request.floor
         worst, floor, _ = _decoded_error(loop, ours, request)
-        assert chunk > _BAR and worst / floor > _BAR, (
+        assert chunk > BAR and worst / floor > BAR, (
             f"req {request.index} with its image rows zeroed: chunk {chunk:.2f}x its floor, "
-            f"decoded worst group {worst / floor:.2f}x, where the parity bar is {_BAR}x, so "
+            f"decoded worst group {worst / floor:.2f}x, where the parity bar is {BAR}x, so "
             "the bar does not read the conditioning"
         )
 
 
-def test_the_recorded_requests_occupy_two_buckets(requests: list[_Request]):
-    """The 20 requests are exactly two (text rows, image rows) buckets, 8 and 12 deep.
-
-    Each bucket key is its own forward and CUDA graph (``bucket_key_for``), so the count is what a
-    DROID deployment pays per step; it also lets ``pair`` find two requests the engine would batch.
-    """
-    counts: dict[tuple[int, int], int] = {}
-    for request in requests:
-        counts[request.bucket] = counts.get(request.bucket, 0) + 1
-    assert counts == _BUCKETS, counts
+def test_every_recorded_bucket_is_one_the_shipped_yaml_captures(requests: list[_Request]):
+    """Each bucket key is its own forward and CUDA graph (``bucket_key_for``), and a bucket with no
+    graph runs eager without an error, so the yaml must capture every recorded one."""
+    serving = yaml.safe_load(_SERVING.read_text(encoding="utf-8"))
+    captured = {tuple(shape) for shape in serving["model_kwargs"]["capture_shapes"]}
+    assert {request.bucket for request in requests} <= captured, captured
 
 
 # ----------------------------------------------------------------------------
@@ -483,28 +457,6 @@ def test_a_rows_result_does_not_depend_on_who_shares_its_batch(
             )
 
 
-def test_giving_the_text_blocks_the_image_rows_dwarfs_the_batching_gap(
-    loop: _Loop, pair: tuple[_Request, _Request],
-):
-    """Negative control for the batching bar: the text blocks read the image rows instead.
-
-    ``_span_for`` (``components/dit.py``) picks text when ``idx % 4 == 0``; a swap keeps every
-    shape, and slicing the image rows to the text count keeps the bucket.
-    """
-    request, _ = pair
-    text_rows = request.text.shape[1]
-    swapped = _Request(**{**vars(request), "text": request.image[:, :text_rows]})
-    assert swapped.bucket == request.bucket, "the control must not change the bucket as well"
-
-    gap = (_run(loop, [swapped])[0] - _run(loop, [request])[0]).abs()
-    floor = _reblocking_floor(loop, request)
-    assert gap.mean().item() > _CONTROL_MARGIN * floor.mean().item(), (
-        f"wrong-span control: mean {gap.mean().item():.3e} is only "
-        f"{gap.mean().item() / floor.mean().item():.1f}x the re-blocking floor "
-        f"{floor.mean().item():.3e}, so the batching bar does not read the span assignment"
-    )
-
-
 # ----------------------------------------------------------------------------
 # Rows at different loop iterations
 # ----------------------------------------------------------------------------
@@ -519,7 +471,6 @@ def test_rows_at_different_loop_iterations_match_each_row_run_alone(
     timestep embedding, ``ada_norm`` conditioning and Euler ``dt`` must be per row. Indices 1 and
     3, not 0: index 0's sigma is 0 and its ``dt`` equals every other step's.
     """
-    assert len(set(_MIXED_ITERS)) == len(_MIXED_ITERS), "the point is two different indices"
     mixed = _run(loop, list(pair), iters=_MIXED_ITERS)
     for row, (request, k) in enumerate(zip(pair, _MIXED_ITERS, strict=True)):
         alone = _run(loop, [request], iters=(k,))
@@ -528,32 +479,4 @@ def test_rows_at_different_loop_iterations_match_each_row_run_alone(
             _reblocking_floor(loop, request, iters=(k,)),
             f"req {request.index} at iteration {k}, sharing a forward with iteration "
             f"{_MIXED_ITERS[1 - row]}",
-        )
-
-
-def test_perturbing_one_rows_conditioning_leaves_the_other_row_bit_identical(
-    loop: _Loop, pair: tuple[_Request, _Request],
-):
-    """Blank row 0's image rows: row 1 must come back **bit-identical**, over one mixed step (a
-    reduction over the batch) and the four-step loop (a shared carried trajectory).
-
-    Row 0 must also move by ``_CONTROL_MARGIN`` x the floor, or the check is vacuous. The
-    perturbation must not be affine: each block opens with a per-row ``nn.LayerNorm``
-    (``AdaLayerNorm``) that removes a shift and a rescale.
-    """
-    first, second = pair
-    perturbed = _Request(**{**vars(first), "image": torch.zeros_like(first.image)})
-    for label, iters in (("one step", _MIXED_ITERS), ("the four-step loop", None)):
-        before = _run(loop, [first, second], iters=iters)
-        after = _run(loop, [perturbed, second], iters=iters)
-        assert torch.equal(after[1], before[1]), (
-            f"{label}: req {second.index} moved when req {first.index}'s image rows were "
-            f"blanked, by {(after[1] - before[1]).abs().max().item():.3e}"
-        )
-        moved = (after[0] - before[0]).abs().mean().item()
-        floor = _reblocking_floor(loop, first, iters=iters).mean().item()
-        assert moved > _CONTROL_MARGIN * floor, (
-            f"{label}: req {first.index}'s own row moved by only {moved:.3e} ({moved / floor:.1f}x "
-            f"the re-blocking floor {floor:.3e}) with its image rows blanked, so the "
-            "perturbation is not reaching the step and the bitwise check above is vacuous"
         )

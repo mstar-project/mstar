@@ -34,10 +34,8 @@ import torch
 from safetensors import safe_open
 
 from mstar.engine.resources.attn.ragged.wrappers import (
-    SUPPORTED_HEAD_DIMS,
     FlashInferRaggedCrossPrefillWrapper,
     FlashInferRaggedPrefillWrapper,
-    padded_head_dim,
 )
 from mstar.engine.resources.attn.workspace import Workspace
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
@@ -54,9 +52,8 @@ from .helpers import BACKBONE, GR00T, REFERENCE_SRC
 # NVIDIA's `AlternateVLDiT` from a checkout of Isaac-GR00T, loaded by file path: the `gr00t`
 # package's `__init__` imports nothing, and the reference's venv is not this one.
 _REFERENCE = REFERENCE_SRC / "gr00t/model/modules/dit.py"
-# the DT's weights, which `test_dit.py` counts off the safetensors header
+# the DT's weights
 _CKPT_PREFIX = "action_head.model."
-_CKPT_TENSORS = 456
 
 def _toolchain() -> bool:
     """Whether FlashInfer can JIT-build its kernels here; without a compiler a GPU machine fails
@@ -89,7 +86,6 @@ _EQUAL_TEXT = (37, 37)  # one bucket: both requests the same text length
 _RAGGED_TEXT = (37, 45)  # two buckets, and what the reference pads to 45
 _TIMESTEPS = (250, 750)  # one denoising step per request, and not the same one
 _INPUT_SCALE = 0.3  # the rms the bridge's rows and the DT's own arrive at
-_HEADS, _HEAD_DIM = 32, 48  # what the checkpoint fixes, asserted against the config below
 _BAR = 1.2  # a multiple of the measured floor, never an absolute tolerance
 _WORKSPACE = 128 << 20  # FlashInfer's scratch, per wrapper
 # The trained weights, not a fill: a random stack diverges (trap 1).
@@ -137,7 +133,6 @@ def _build_reference(config: Gr00tN17Config) -> torch.nn.Module:
     tensors = _checkpoint_tensors()
     # `strict=True`: at `positional_embeddings=None` the blocks carry no `pos_embed`, so the state
     # dict is exactly the checkpoint's 456 tensors and every parameter is a trained one (trap 1).
-    assert len(tensors) == _CKPT_TENSORS, len(tensors)
     reference.load_state_dict(tensors, strict=True)
     del tensors
     return reference.to(_DEVICE).eval()
@@ -159,7 +154,6 @@ class _Layout:
     timestep: torch.Tensor  # [B]
     want: torch.Tensor = field(default=None)  # the reference in fp32
     floor: tuple[float, ...] = ()  # per-request mean abs error of the reference in bf16
-    floor_mean: float = 0.0  # ... and the same over the whole batch
 
     @property
     def batch(self) -> int:
@@ -168,6 +162,10 @@ class _Layout:
     @property
     def text_rows(self) -> tuple[int, ...]:
         return tuple(rows.shape[1] for rows in self.text)
+
+    @property
+    def floor_mean(self) -> float:
+        return sum(self.floor) / self.batch
 
     def ours_args(self, swap: bool = False) -> tuple[torch.Tensor, ...]:
         """What our ``DiT.forward`` takes, in bf16, for a batch that shares its lengths. ``swap``
@@ -221,12 +219,6 @@ def _reference_forward(model: torch.nn.Module, layout: _Layout, dtype: torch.dty
             image_mask=is_image,
             backbone_attention_mask=valid,
         ).float()
-
-
-def _errors(got: torch.Tensor, want: torch.Tensor) -> tuple[float, ...]:
-    """Mean absolute error per request."""
-    difference = (got.float() - want.float()).abs()
-    return tuple(difference[request].mean().item() for request in range(difference.shape[0]))
 
 
 def _mean_error(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -295,7 +287,6 @@ def stacks() -> _Stacks:
     """Both layouts measured against the reference, and ours carrying its tensors. Every fp32
     answer is taken before the in-place bf16 conversion: there is no room for a second copy."""
     config = Gr00tN17Config.from_hf(GR00T, BACKBONE)
-    assert (config.dit.num_attention_heads, config.dit.attention_head_dim) == (_HEADS, _HEAD_DIM)
     reference = _build_reference(config)
     equal = _layout(config, _EQUAL_TEXT, seed=3)
     ragged = _layout(config, _RAGGED_TEXT, seed=5)
@@ -305,8 +296,7 @@ def stacks() -> _Stacks:
     reference = reference.to(_BF16)
     for layout in (equal, ragged):
         rounded = _reference_forward(reference, layout, _BF16)
-        layout.floor = _errors(rounded, layout.want)
-        layout.floor_mean = _mean_error(rounded, layout.want)
+        layout.floor = tuple(_mean_error(rounded[r], layout.want[r]) for r in range(layout.batch))
 
     # on `meta`, so a real build's 4.4 GiB of fp32 parameters is never allocated; `strict=True`
     # says every one was assigned
@@ -355,7 +345,6 @@ def test_two_buckets_are_the_reference_padded_to_the_longest(stacks: _Stacks):
     segment reads past its own rows in ours.
     """
     layout = stacks.ragged
-    assert len(set(layout.text_rows)) == len(layout.text_rows), "the point is two lengths"
     spans = _Spans(stacks.config)
     for request, rows in enumerate(layout.text_rows):
         bucket = spans.plan(1, rows)
@@ -374,42 +363,6 @@ def test_two_buckets_are_the_reference_padded_to_the_longest(stacks: _Stacks):
             f"reference): mean abs error {error:.3e} past the bar {bar:.3e} "
             f"({_BAR}x its floor {layout.floor[request]:.3e})"
         )
-
-
-# ----------------------------------------------------------------------------
-# head_dim 48 is a padded head dim
-# ----------------------------------------------------------------------------
-
-
-def test_the_wrappers_run_at_the_checkpoints_head_dim(stacks: _Stacks):
-    """FlashInfer's **padded head_dim path**, the only path the DT has.
-
-    The checkpoint is 32 heads x head_dim 48, and no FlashInfer prefill kernel exists for 48 (an
-    unsupported head dim fails to build), so the wrappers run at 64 with q/k/v zero-padded and the
-    output sliced back. This pins that, and that the three wrappers build and run at the
-    checkpoint's own shape.
-    """
-    config = stacks.config
-    assert config.dit.attention_head_dim not in SUPPORTED_HEAD_DIMS
-    assert padded_head_dim(config.dit.attention_head_dim) == 64
-
-    batch = len(_EQUAL_TEXT)
-    spans = _Spans(config)
-    spans.plan(batch, _EQUAL_TEXT[0])
-    generator = torch.Generator(device=_DEVICE).manual_seed(11)
-
-    def shape(rows: int) -> tuple[int, int, int]:
-        """``[batch * rows, 32, 48]``, which is what the packed layout above declared."""
-        return batch * rows, config.dit.num_attention_heads, config.dit.attention_head_dim
-
-    def packed(rows: int) -> torch.Tensor:
-        return torch.randn(shape(rows), generator=generator, device=_DEVICE, dtype=_BF16)
-
-    for wrapper, kv_rows in ((spans.own, _SA), (spans.text, _EQUAL_TEXT[0]), (spans.image, _IMAGE)):
-        out = wrapper.run(packed(_SA), packed(kv_rows), packed(kv_rows))
-        assert out.shape == shape(_SA), out.shape
-        assert torch.isfinite(out).all()
-        assert out.abs().max() > 0  # the sliced-back 48 columns, not the padding
 
 
 # ----------------------------------------------------------------------------

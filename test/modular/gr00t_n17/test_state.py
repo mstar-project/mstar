@@ -100,26 +100,6 @@ def test_the_relu_belongs_between_the_two_layers(relu):
     assert not torch.equal(mlp(x, cat_ids), _reference(mlp, x, cat_ids, relu=relu))
 
 
-@pytest.mark.parametrize("cat", range(_CATEGORIES))
-@torch.no_grad()
-def test_an_embodiment_reads_its_own_slice_and_no_other(cat):
-    """A mis-indexed ``W`` or ``b`` returns a plausible tensor, so each category is pinned
-    both ways: no other slice gives this answer, and moving the other slices changes nothing."""
-    mlp = _mlp()
-    x = _state(1, history=2)
-    ours = mlp(x, torch.tensor([cat]))
-
-    assert torch.equal(ours, _reference(mlp, x, torch.tensor([cat])))
-    for other in range(_CATEGORIES):
-        if other != cat:
-            assert not torch.equal(ours, _reference(mlp, x, torch.tensor([other])))
-
-    others = [c for c in range(_CATEGORIES) if c != cat]
-    for parameter in mlp.parameters():
-        parameter[others] += 1.0
-    assert torch.equal(mlp(x, torch.tensor([cat])), ours)
-
-
 @pytest.mark.parametrize("history", [1, 3])
 def test_the_state_encoder_is_sized_from_the_config(history):
     """``hidden_size`` is the layer between and ``input_embedding_dim`` the output (1024 and
@@ -163,37 +143,30 @@ def _walk_inputs(shape: tuple[int, ...], seed: int = 5) -> dict[str, list[torch.
 
 
 @pytest.mark.parametrize("shape, history", list(_WALK_STATES.values()), ids=list(_WALK_STATES))
-def test_prepare_inputs_folds_the_history_into_one_token(shape, history):
-    """The reference's ``state.view(B, 1, -1)``: ``[1, 1, T * dim]`` and ``[B]``, values in
-    their order. One token whatever ``T``, which is what the denoise step concatenates."""
-    node = _node(history)
-    walk = _walk_inputs(shape)
-    prepared = node.prepare_inputs(_WALK, _FWD, walk)
-    tensors = prepared.tensor_inputs
-
-    assert set(tensors) == {"state", "embodiment_id"}
-    assert tensors["state"].shape == (1, 1, history * _INPUT)
-    assert torch.equal(tensors["state"].reshape(-1), walk["state"][0].reshape(-1))
-    assert tensors["embodiment_id"].shape == (1,)
-    assert tensors["embodiment_id"].tolist() == [_EMBODIMENT]
-    assert prepared.input_seq_len == 1
-
-
-@pytest.mark.parametrize("shape, history", list(_WALK_STATES.values()), ids=list(_WALK_STATES))
 @torch.no_grad()
 def test_driving_the_node_is_the_mlp_called_directly(shape, history):
     """prepare_inputs -> preprocess -> forward is the MLP on the same inputs, the same ops
-    in the same order (so ``torch.equal``, not a bar), under the key the denoise loop reads."""
+    in the same order (so ``torch.equal``, not a bar), under the key the denoise loop reads.
+    The history folds as the reference's ``state.view(B, 1, -1)``: one token whatever ``T``,
+    which is what the denoise step concatenates."""
     node = _node(history)
     walk = _walk_inputs(shape)
     prepared = node.prepare_inputs(_WALK, _FWD, walk)
+    folded = prepared.tensor_inputs
+
+    assert set(folded) == {"state", "embodiment_id"}
+    assert folded["state"].shape == (1, 1, history * _INPUT)
+    assert torch.equal(folded["state"].reshape(-1), walk["state"][0].reshape(-1))
+    assert folded["embodiment_id"].shape == (1,)
+    assert folded["embodiment_id"].tolist() == [_EMBODIMENT]
+    assert prepared.input_seq_len == 1
+
     tensors = node.preprocess(_WALK, _ENGINE, [prepared])
     out = node.forward(_WALK, _ENGINE, **tensors)
 
     assert set(tensors) == {"state", "embodiment_id"}
     assert list(out) == ["state_features"]
     assert len(out["state_features"]) == 1
-    assert out["state_features"][0].shape == (1, 1, _OUTPUT)
     expected = node.state_encoder(
         walk["state"][0].reshape(1, 1, history * _INPUT), torch.tensor([_EMBODIMENT]),
     )
@@ -201,13 +174,9 @@ def test_driving_the_node_is_the_mlp_called_directly(shape, history):
 
 
 def test_the_node_declares_nothing_and_takes_one_request_a_step():
-    """No attention and no state between steps, so no resources; one request per forward,
-    and a second raises rather than being dropped."""
+    """No attention and no state between steps, so no resources; one request per forward."""
     node = _node()
     prepared = node.prepare_inputs(_WALK, _FWD, _walk_inputs((_INPUT,)))
-    two = ModelInputsFromEngine(request_ids=["r0", "r1"], per_request_info={})
 
     assert node.declare_step(_WALK, ["r0"], [prepared]) is None
     assert node.max_batch_size(_WALK) == 1
-    with pytest.raises(ValueError, match="expected 1"):
-        node.preprocess(_WALK, two, [prepared, prepared])

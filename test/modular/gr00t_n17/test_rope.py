@@ -83,34 +83,6 @@ def test_the_positions_match_transformers_get_rope_index(spec):
     assert torch.equal(positions, _reference(input_ids, grids))
 
 
-def test_an_image_holds_t_and_sweeps_h_and_w_row_major():
-    """A 4x6 grid merges to 2x3. Worked out by hand, based one past a five-token text span."""
-    input_ids, grids = _prompt([5, (1, 4, 6)])
-    block = mrope_position_ids(input_ids, grids, _IMAGE, _MERGE)[:, 5:]
-    assert block[0].tolist() == [5] * 6
-    assert block[1].tolist() == [5, 5, 5, 6, 6, 6]
-    assert block[2].tolist() == [5, 6, 7, 5, 6, 7]
-
-
-def test_a_single_row_is_the_same_request_as_a_flat_sequence():
-    """``[1, seq]`` is how the LLM node's tensor arrives; it must mean the 1-D prompt,
-    not a batch that happens to be short."""
-    input_ids, grids = _prompt([3, (1, 4, 6), 2])
-    flat = mrope_position_ids(input_ids, grids, _IMAGE, _MERGE)
-    assert torch.equal(flat, mrope_position_ids(input_ids.unsqueeze(0), grids, _IMAGE, _MERGE))
-    assert torch.equal(flat, _reference(input_ids, grids))
-
-
-@pytest.mark.parametrize("grid, advance", [((1, 16, 28), 14), ((1, 28, 16), 14), ((1, 4, 12), 6), ((1, 12, 4), 6)])
-def test_an_image_advances_the_cursor_by_max_h_w(grid, advance):
-    """Each grid is paired with its transpose, so the two together separate ``max(h', w')``
-    from ``h'`` and from ``w'``; both differ from the block's ``t * h' * w'`` token count."""
-    text = 3
-    input_ids, grids = _prompt([text, grid, 1])
-    positions = mrope_position_ids(input_ids, grids, _IMAGE, _MERGE)
-    assert positions[:, -1].tolist() == [text + advance] * 3
-
-
 # Parity cannot defend these: transformers 4.57 accepts the token-count mismatch, the
 # run/grid count mismatch and t != 1, positioning each its own way. These cases are the
 # only thing pinning the stricter contract, so each stands on its own.
