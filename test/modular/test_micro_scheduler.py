@@ -1428,13 +1428,14 @@ class _Submodule:
 
 
 def _capture_group(split=True, captured=(WALK,)):
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk in captured)
-    engine = Engine.__new__(Engine)
-    engine._submodules = {
-        NODE: SimpleNamespace(submodule=_Submodule(split), accelerator_graph_runner=runner, piecewise_runners={}),
-    }
+    engine = make_engine(
+        _submodules={
+            NODE: make_mgmt(_Submodule(split), accelerator_graph_runner=runner),
+        },
+    )
     return engine.capture_group(NODE, WALK, 0, SimpleNamespace(guided=True))
 
 
@@ -1466,15 +1467,15 @@ class _StreamKeyedSubmodule:
 
 
 def _stream_engine():
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     runner = SimpleNamespace(captures_walk=lambda walk: walk == WALK)
+    grouping = make_engine(_submodules={
+        NODE: make_mgmt(_StreamKeyedSubmodule(), accelerator_graph_runner=runner),
+    })
     engine = _Engine(max_bs=16)  # readiness and the cap; the grouping is the real Engine's
-    engine._submodules = {
-        NODE: SimpleNamespace(submodule=_StreamKeyedSubmodule(), accelerator_graph_runner=runner, piecewise_runners={}),
-    }
-    engine.splits_by_capture_key = lambda node, walk: Engine.splits_by_capture_key(engine, node, walk)
-    engine.capture_group = lambda *a, **kw: Engine.capture_group(engine, *a, **kw)
+    engine.splits_by_capture_key = grouping.splits_by_capture_key
+    engine.capture_group = grouping.capture_group
     return engine
 
 
