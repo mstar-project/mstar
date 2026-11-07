@@ -563,6 +563,29 @@ def test_pi05_process_prompt_tokenizes_openpi_text():
     assert result.metadata["kv_layout"][LLM_KV]["main"].spans[1].length == 3
 
 
+@pytest.mark.parametrize("over", [0, 1])
+def test_pi05_refuses_a_prompt_over_max_lang_tokens(over):
+    """openpi truncates the prompt at max_lang_tokens, which drops the state and
+    "Action:" at its end. A prompt that long is refused instead, on every route."""
+    from types import SimpleNamespace
+
+    from mstar.model.pi05.components.tokenization import Pi05Tokenizer
+
+    model = _make_model()
+    n = model.config.max_lang_tokens + over
+    model.tokenizer = Pi05Tokenizer(lambda text, add_special_tokens: SimpleNamespace(input_ids=[7] * n), model.config)
+
+    def call():
+        return model.process_prompt("a long task", ["image", "text"], ["action"], tensors=_ONE_IMAGE,
+                                    robot_state=[0.5, -0.5])
+
+    if over:
+        with pytest.raises(ValueError, match=f"{n} tokens.*at most {n - 1} \\(max_lang_tokens\\)"):
+            call()
+    else:
+        assert call().new_input_tensors["text_inputs"][0].numel() == n
+
+
 # ----------------------------------------------------------------------
 # Deployment norm stats (openpi's quantile normalization)
 # ----------------------------------------------------------------------
