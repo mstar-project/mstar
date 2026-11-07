@@ -5,7 +5,7 @@ Declarations are values: mappings are read-only, sets are frozensets, and everyt
 
 from collections.abc import Iterator, Mapping
 from dataclasses import KW_ONLY, dataclass
-from typing import Literal, NamedTuple, get_args, get_origin
+from typing import ClassVar, Literal, NamedTuple, get_args, get_origin
 
 import torch
 
@@ -104,32 +104,80 @@ class Bidirectional(Mask):
     within-step form."""
 
 
+class Op:
+    """A kernel the engine plans before the step and runs on an array's entries.
+
+    ``reads`` and ``writes`` name the entry fields it reads and overwrites in place, ``adds`` the fields of the entries
+    it appends, and ``mutates`` the arguments of its call that it changes in place.
+    """
+
+    reads: ClassVar[tuple[str, ...]] = ()
+    writes: ClassVar[tuple[str, ...]] = ()
+    adds: ClassVar[tuple[str, ...]] = ()
+    mutates: ClassVar[tuple[str, ...]] = ()
+
+    def check(self, where: str, entry: Entry) -> None:
+        """Raise if the kernel can't run as configured on ``entry``, in a message that opens with ``where``. ``entry``
+        holds every field the op names."""
+
+
 @dataclass(frozen=True)
-class Attend:
+class Attend(Op):
+    reads = ("k", "v")
     q_heads: int    # a multiple of the heads of the entry's k and v
 
+    def check(self, where: str, entry: Entry) -> None:
+        if not _is_positive(self.q_heads):
+            raise ValueError(f"{where}.q_heads must be a positive int, got {self.q_heads!r}")
+        k, v = entry.tensors["k"], entry.tensors["v"]
+        if len(k.shape) != 2 or len(v.shape) != 2 or k.shape[0] != v.shape[0]:
+            raise ValueError(f"{where}: Attend needs entry fields k (h, d_k) and v (h, d_v)")
+        if k.dtype != v.dtype or k.shard != v.shard or k.shard not in (0, None):
+            raise ValueError(f"{where}: Attend needs k and v of one dtype and one shard, 0 or None; "
+                             f"got {k.dtype}, {v.dtype} and {k.shard}, {v.shard}")
+        if self.q_heads % k.shape[0]:
+            raise ValueError(f"{where}: q_heads {self.q_heads} is not a multiple of k's {k.shape[0]} heads")
 
-# An update reads and writes one entry field in one kernel.
+
 @dataclass(frozen=True, kw_only=True)
-class CausalConv:
+class CausalConv(Op):
+    reads = ("conv",)
+    writes = ("conv",)
     activation: Literal["silu"] | None = "silu"
 
+    def check(self, where: str, entry: Entry) -> None:
+        if len(entry.tensors["conv"].shape) != 2:
+            raise ValueError(f"{where}: CausalConv needs entry field conv of shape (channels, kernel - 1)")
+
 
 @dataclass(frozen=True, kw_only=True)
-class GatedDeltaNet:
+class GatedDeltaNet(Op):
+    reads = ("state",)
+    writes = ("state",)
     qk_l2norm: bool = True
     scale: float | None = None    # None: head_k_dim ** -0.5
+
+    def check(self, where: str, entry: Entry) -> None:
+        if len(entry.tensors["state"].shape) != 3:
+            raise ValueError(f"{where}: GatedDeltaNet needs entry field state of shape (h_v, d_k, d_v)")
 
 
 @dataclass(frozen=True, kw_only=True)
 class Read:
     mask: Mask
-    op: Attend | None = None
+    op: Op | None = None
     layers: frozenset[int] | None = None    # None: all of the array's layers
     walks: frozenset[str] | None = None     # None: all walks
     queries: str | None = None              # the array whose segments lay out the queries; None: this array
 
     def __post_init__(self):
+        if not isinstance(self.mask, Mask):
+            raise ValueError(f"Read.mask must be a Mask, got {self.mask!r}")
+        if not (self.op is None or isinstance(self.op, Op)):
+            raise ValueError(f"Read.op must be None or an Op, got {self.op!r}")
+        if self.op is not None and (self.op.writes or self.op.adds):
+            raise ValueError(f"Read.op: a read changes no field, and {type(self.op).__name__} writes "
+                             f"{list(self.op.writes)} and adds {list(self.op.adds)}")
         for name in ("layers", "walks"):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, frozenset(getattr(self, name)))
@@ -170,7 +218,7 @@ class Array:
     entry: Entry
     max_len: int
     reads: Mapping[str, Read] = EMPTY    # empty: read whole
-    updates: Mapping[str, CausalConv | GatedDeltaNet] = EMPTY
+    updates: Mapping[str, Op] = EMPTY
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
@@ -233,32 +281,25 @@ class Array:
                              f"position, Block or Bidirectional, and {type(read.mask).__name__} does")
         if read.queries is not None and read.op is None:
             raise ValueError(f"{where}.queries: a read with no op lays out no queries")
-        if not isinstance(read.op, Attend):
-            return
-        if not _is_positive(read.op.q_heads):
-            raise ValueError(f"{where}.op.q_heads must be a positive int, got {read.op.q_heads!r}")
-        k, v = self.entry.tensors.get("k"), self.entry.tensors.get("v")
-        if k is None or v is None or len(k.shape) != 2 or len(v.shape) != 2 or k.shape[0] != v.shape[0]:
-            raise ValueError(f"{where}.op: Attend needs entry fields k (h, d_k) and v (h, d_v)")
-        if k.dtype != v.dtype or k.shard != v.shard or k.shard not in (0, None):
-            raise ValueError(f"{where}.op: Attend needs k and v of one dtype and one shard, 0 or None; "
-                             f"got {k.dtype}, {v.dtype} and {k.shard}, {v.shard}")
-        if read.op.q_heads % k.shape[0]:
-            raise ValueError(f"{where}.op: q_heads {read.op.q_heads} is not a multiple of k's {k.shape[0]} heads")
+        if read.op is not None:
+            self._check_op(f"{where}.op", read.op)
 
-    def _check_update(self, key: str, update: CausalConv | GatedDeltaNet) -> None:
+    def _check_update(self, key: str, update: Op) -> None:
         where = f"Array {self.name!r}.updates[{key!r}]"
         if not is_value(self):
             raise ValueError(f"{where}: only a Value (rewritable, max_len 1) takes an update")
-        if isinstance(update, CausalConv):
-            field, rank, shape = "conv", 2, "(channels, kernel - 1)"
-        elif isinstance(update, GatedDeltaNet):
-            field, rank, shape = "state", 3, "(h_v, d_k, d_v)"
-        else:
-            raise ValueError(f"{where} must be a CausalConv or a GatedDeltaNet, got {update!r}")
-        tensor = self.entry.tensors.get(field)
-        if tensor is None or len(tensor.shape) != rank:
-            raise ValueError(f"{where}: {type(update).__name__} needs entry field {field} of shape {shape}")
+        if not isinstance(update, Op):
+            raise ValueError(f"{where} must be an Op, got {update!r}")
+        if not update.writes or update.adds:
+            raise ValueError(f"{where}: an update overwrites fields in place, and {type(update).__name__} writes "
+                             f"{list(update.writes)} and adds {list(update.adds)}")
+        self._check_op(where, update)
+
+    def _check_op(self, where: str, op: Op) -> None:
+        missing = sorted({*op.reads, *op.writes, *op.adds} - self.entry.tensors.keys())
+        if missing:
+            raise ValueError(f"{where}: {type(op).__name__} needs entry fields {missing}")
+        op.check(where, self.entry)
 
 
 def is_value(array: Array) -> bool:
