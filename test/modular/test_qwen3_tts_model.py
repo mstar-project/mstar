@@ -1818,7 +1818,7 @@ def test_qwen3_tts_codec_without_watermark_emits_the_same_bytes_through_the_engi
                 register_failure=failures.__setitem__,
                 step_context=SimpleNamespace(graph_walk="codec_chunk", repeats=1),
             )
-            Engine._postprocess_batch(engine, batch, out)
+            Engine._postprocess_batch(engine, batch, BatchedModelOutput(per_rid_outputs=out))
             assert not failures
             for rid in rids:
                 got, want = out[rid]["audio_chunk"][0], alone[rid]["audio_chunk"][0]
