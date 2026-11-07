@@ -29,6 +29,7 @@ def make_test_api_server(**overrides) -> APIServer:
     server = object.__new__(APIServer)
     server._init_request_state()
     server.upload_dir = Path(tempfile.gettempdir())
+    server._upload_dir_owner = None
     server.timeout_seconds = 5.0
     server.enable_nvtx = False
     server.log_stats = False

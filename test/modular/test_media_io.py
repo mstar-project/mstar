@@ -147,3 +147,23 @@ def test_remove_uploads_leaves_a_file_outside_the_upload_dir(tmp_path):
     media_io.remove_uploads({"audio": [str(saved), str(preset)]}, upload_dir)
 
     assert not saved.exists() and preset.exists()
+
+
+def test_upload_cleanup_uses_the_loop_without_threads(tmp_path, monkeypatch):
+    import asyncio
+    import os
+    import threading
+
+    def no_thread(*args, **kwargs):
+        raise AssertionError("cleanup must not start a thread")
+
+    monkeypatch.setattr(threading.Thread, "start", no_thread)
+    monkeypatch.setattr(media_io, "UPLOAD_CLEANUP_DELAY_S", 0)
+    async def run():
+        path = media_io.save_upload(b"audio", "clip.wav", tmp_path)
+        media_io.schedule_upload_cleanup({"audio": [path]}, tmp_path)
+        assert os.path.exists(path)
+        await asyncio.sleep(0.01)
+        assert not os.path.exists(path)
+
+    asyncio.run(run())

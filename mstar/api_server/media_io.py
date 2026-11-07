@@ -18,20 +18,18 @@ the base install stays slim.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import math
 import os
 import threading
-import time
 import wave
 from pathlib import Path
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import numpy as np
-
-from mstar.utils.threads import Thread
 
 # MIME (top-level type or full type) -> file extension used when persisting.
 _MIME_TO_EXT: dict[str, str] = {
@@ -373,11 +371,9 @@ def schedule_upload_cleanup(file_paths: dict[str, list[str]] | None, upload_dir:
     if not file_paths:
         return
 
-    def _cleanup() -> None:
-        time.sleep(UPLOAD_CLEANUP_DELAY_S)
-        remove_uploads(file_paths, upload_dir)
-
-    Thread(target=_cleanup, daemon=True).start()
+    asyncio.get_running_loop().call_later(
+        UPLOAD_CLEANUP_DELAY_S, remove_uploads, file_paths, upload_dir,
+    )
 
 
 # ---------------------------------------------------------------------------

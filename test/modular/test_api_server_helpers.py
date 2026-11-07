@@ -16,7 +16,10 @@ from mstar.api_server import entrypoint
 @pytest.fixture
 def real_server(monkeypatch, tmp_path):
     monkeypatch.setattr(
-        entrypoint, "PreprocessWorker", lambda **kwargs: SimpleNamespace(adapter_prefix_roots=None),
+        entrypoint, "PreprocessWorker", lambda **kwargs: SimpleNamespace(
+            adapter_prefix_roots=None, shutdown=lambda: None,
+            results_wakeup=SimpleNamespace(signal=lambda: None),
+        ),
     )
     monkeypatch.setattr(entrypoint, "make_communicator", lambda **kwargs: object())
     return entrypoint.APIServer(upload_dir=str(tmp_path / "uploads"))
@@ -32,7 +35,7 @@ def test_helper_sets_every_field_init_sets(real_server):
 def test_field_types_match_init(real_server):
     helper = make_test_api_server()
     for name in vars(real_server):
-        if name in {"preprocess_worker", "communicator", "_msg_thread", "upload_dir"}:
+        if name in {"preprocess_worker", "communicator", "_msg_thread", "upload_dir", "_upload_dir_owner"}:
             continue
         real, made = getattr(real_server, name), getattr(helper, name)
         assert type(made) is type(real), name
@@ -51,3 +54,17 @@ def test_overrides_replace_fields_and_reject_unknown_names():
     assert server._liveness_interval_s == 0.0
     with pytest.raises(TypeError, match="no field 'timeout'"):
         make_test_api_server(timeout=1.0)
+
+
+def test_shutdown_removes_only_its_own_uploads(real_server):
+    other = entrypoint.APIServer(upload_dir=str(real_server.upload_dir.parent))
+    try:
+        own = real_server.upload_dir / "one.wav"
+        sibling = other.upload_dir / "two.wav"
+        own.write_bytes(b"one")
+        sibling.write_bytes(b"two")
+        real_server.cleanup()
+        assert not own.exists()
+        assert sibling.read_bytes() == b"two"
+    finally:
+        other.cleanup()

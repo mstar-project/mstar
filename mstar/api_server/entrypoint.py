@@ -13,6 +13,7 @@ import os
 import re
 import signal
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -461,8 +462,9 @@ class APIServer:
         enable_nvtx: bool = False,
         model_config: dict | None = None,
     ):
-        self.upload_dir = Path(upload_dir)
-        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        os.makedirs(upload_dir, exist_ok=True)
+        self._upload_dir_owner = tempfile.TemporaryDirectory(prefix="deployment-", dir=upload_dir)
+        self.upload_dir = Path(self._upload_dir_owner.name)
         self.timeout_seconds = timeout_seconds
 
         # The result-delivery path runs on this process, not the worker's, so its
@@ -1844,8 +1846,10 @@ class APIServer:
         self.preprocess_worker.shutdown()
         self.running = False
         self._wake_message_loop()
-        if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
+        if self._msg_thread is not None and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
+        if self._upload_dir_owner is not None:
+            self._upload_dir_owner.cleanup()
 
 
 def _resolve_warmup_path(path: str) -> str:
@@ -2894,6 +2898,7 @@ def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # own, uvicorn's records reach the root logger and its writer thread.
     return uvicorn.Config(
         app, host=host, port=port, access_log=False, log_config=None,
+        timeout_graceful_shutdown=5,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
         ws_max_size=_ws_max_size(config),
     )
@@ -3124,8 +3129,6 @@ def main(argv: list[str] | None = None):
         if args.enable_metrics:
             api_server.enable_metrics()
         if args.rust_frontend:
-            import tempfile
-
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
                 launch_rust_server,
@@ -3137,7 +3140,7 @@ def main(argv: list[str] | None = None):
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
             rust_proc = launch_rust_server(
                 rust_frontend_bin, model_name,
-                args.port, bridge_dir, args.upload_dir, api_key=api_key)
+                args.port, bridge_dir, str(api_server.upload_dir), api_key=api_key)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
