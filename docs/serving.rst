@@ -1101,7 +1101,9 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 ``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
 which the API server's data worker sends and reads. ``transport`` is the protocol:
-``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. A
+``SHM`` (the arena on CUDA and CPU, and the tensors it spills to files; other
+accelerators send every tensor as a file until the arena is measured there), ``TCP``
+or ``RDMA``. A
 tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is

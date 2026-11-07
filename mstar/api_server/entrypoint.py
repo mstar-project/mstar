@@ -488,6 +488,13 @@ class APIServer:
 
         # Before any tensor manager; the conductor and workers inherit it.
         ensure_deployment_token()
+        if tensor_comm_protocol == CommProtocol.SHM:
+            # Likewise before any arena: every one is sized from the same
+            # measurement, so none depends on how many started before it.
+            from mstar.communication.arena import export_arena_plan
+
+            export_arena_plan(None if model_config is None else deployment_workers(
+                model_config, accelerator_type()).devices)
         self.preprocess_worker = PreprocessWorker(
             model=model,
             model_config=model_config,
