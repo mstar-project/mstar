@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import time as _time
+import traceback
 from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
@@ -4946,6 +4947,9 @@ class Worker:
                 )
 
         self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
+        # A completed Future retains the raised forward's frame and its tensors.
+        # Release those locals now so an OOM does not poison the next batch.
+        traceback.clear_frames(exc.__traceback__)
 
     def _fail_requests(self, errors: dict[int, str]) -> None:
         """Report requests this worker can no longer serve to the conductor.
