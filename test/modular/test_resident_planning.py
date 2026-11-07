@@ -1889,11 +1889,16 @@ def test_resident_readers_survive_displacement_and_recycled_handles():
     _slot_ledger(planner)
 
 
-def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(monkeypatch):
+@pytest.mark.parametrize("cached", [False, True])
+def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(monkeypatch, cached):
     from mstar.utils.h2d import PinnedStager
 
     live, _, planner = _setup({1: 3, 2: 3})
     _captured_step(live, planner, [1], slot=0, bs=4)
+    if cached:
+        _captured_step(live, planner, [2], slot=0, bs=4)
+    old_slot = planner.slot_of(2)
+    before_length = live["kv"]._streams[2]["main"].stored_len
     # Reserve the joining horizon first. Its publication must not use ordinary
     # planning, which would replace the capture staged for request 1 below.
     joining = _captured_step(live, planner, [2], slot=0, bs=4, repeats=4, run=False)
@@ -1902,29 +1907,32 @@ def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(mon
     stamps = planner._plan_seq, planner._commits, planner._committed_seq
     before = {key: (buf.rows.clone(), buf.cells.clone(), buf.staged) for key, buf in planner._buffers.items()}
     rewrite = planner.rewrite
-    with monkeypatch.context() as patch:
-        def fail_row(*args):
-            rewrite(*args)
-            raise ValueError("owner row refused")
-        patch.setattr(planner, "rewrite", fail_row)
-        for _ in range(planner.max_slots + 1):
-            with pytest.raises(ValueError, match="owner row refused"):
-                planner.prepare_rows(joining.step, joining.ctx)
-    assert planner.slot_of(2) is None
-    _slot_ledger(planner)
+    if not cached:
+        with monkeypatch.context() as patch:
+            def fail_row(*args):
+                rewrite(*args)
+                raise ValueError("owner row refused")
+            patch.setattr(planner, "rewrite", fail_row)
+            for _ in range(planner.max_slots + 1):
+                with pytest.raises(ValueError, match="owner row refused"):
+                    planner.prepare_rows(joining.step, joining.ctx)
+        assert planner.slot_of(2) is None
+        _slot_ledger(planner)
 
     snapshot = planner.prepare_rows(joining.step, joining.ctx)
     planner.flush(snapshot, stager=PinnedStager(torch.int64))
     slot = planner.slot_of(2)
+    if cached:
+        assert slot == old_slot
     assert planner._readers[slot] == 1
     tables = live["kv"]._resident
-    assert tables.host_len[slot] == 3
+    assert tables.host_len[slot] == before_length
     assert tables.host_cols[slot] == 2
     assert tables.block_table.view[slot, :2].tolist() == live["kv"]._streams[2]["main"].page_indices[:2]
-    assert tables.kv_len.view[slot, 0].item() == 3
+    assert tables.kv_len.view[slot, 0].item() == before_length
     planner.advance(snapshot)
-    assert tables.host_len[slot] == 7
-    assert tables.kv_len.view[slot, 0].item() == 3, "only executed iterations advance device state"
+    assert tables.host_len[slot] == before_length + 4
+    assert tables.kv_len.view[slot, 0].item() == before_length, "only executed iterations advance device state"
     assert planner._staged is staged
     assert (planner._plan_seq, planner._commits, planner._committed_seq) == stamps
     for key, (rows, cells, identity) in before.items():
@@ -1934,6 +1942,30 @@ def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(mon
     _replay(live, planner, queued)
     _assert_step_read_its_streams(live, queued, [1])
     planner.release(2)
+    planner.unpin(tuple(snapshot.slots.tolist()))
+    _slot_ledger(planner)
+
+
+def test_joining_reuses_cached_rows_only_after_their_commit_and_last_reader():
+    live, _, planner = _setup({1: 3})
+    _captured_step(live, planner, [1], slot=0, bs=2)
+    queued = _captured_step(live, planner, [1], slot=1, bs=2, preplan=True, run=False)
+    original_slot = planner.slot_of(1)
+    before = planner.store.clone()
+    with pytest.raises(ValueError, match="outstanding reader or commit"):
+        planner.prepare_rows(queued.step, queued.ctx)
+    torch.testing.assert_close(planner.store, before)
+    assert not planner._readers.any()
+    _replay(live, planner, queued)
+    held = planner.pin([1])
+    with pytest.raises(ValueError, match="outstanding reader or commit"):
+        planner.prepare_rows(queued.step, queued.ctx)
+    assert planner._readers[original_slot] == 1
+    planner.unpin(held)
+    snapshot = planner.prepare_rows(queued.step, queued.ctx)
+    planner.flush(snapshot)
+    assert snapshot.slots.tolist() == [original_slot]
+    assert live["kv"]._resident.kv_len.view[original_slot, 0].item() == live["kv"]._streams[1]["main"].stored_len
     planner.unpin(tuple(snapshot.slots.tolist()))
     _slot_ledger(planner)
 

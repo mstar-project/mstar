@@ -587,7 +587,7 @@ class ResidentPlanner:
             raise ValueError(f"resident walk {ctx.graph_walk!r} on {self.node}: {refusal}")
 
     def prepare_rows(self, step: SubmoduleStep, ctx) -> ResidentPlan:
-        """Retain fresh rows without changing an already staged capture.
+        """Retain unheld rows without changing an already staged capture.
 
         The caller has admitted the entire outstanding horizon and holds the
         requests and their resources through all device readers. Flush this
@@ -599,14 +599,24 @@ class ResidentPlanner:
         rids = tuple(ctx.request_ids)
         streams = self._walk_streams[ctx.graph_walk]
         with self._lock:
-            if any(rid in self._slot_of for rid in rids):
-                raise ValueError("resident row publication needs previously unheld requests")
-            slots = np.array(self._take_slots(len(rids), self._plan_seq), dtype=np.int64)
-            self._slot_of.update(zip(rids, slots.tolist(), strict=True))
+            cached = [self._slot_of[rid] for rid in rids if rid in self._slot_of]
+            if any(self._readers[slot] or self._last_read[slot] > self._committed_seq for slot in cached):
+                raise ValueError("resident row publication overlaps an outstanding reader or commit")
+            # Pin cached rows before displacement can select them as victims
+            # while allocating the other rows of this same publication.
+            self._readers[cached] += 1
+            fresh = [rid for rid in rids if rid not in self._slot_of]
+            try:
+                taken = self._take_slots(len(fresh), self._plan_seq)
+            except BaseException:
+                self._readers[cached] -= 1
+                raise
+            self._slot_of.update(zip(fresh, taken, strict=True))
+            self._readers[taken] += 1
+            slots = np.array([self._slot_of[rid] for rid in rids], dtype=np.int64)
             # Only the explicit pins retain these readers; no ordinary step
             # has read the new rows. A refused snapshot can be reused at once.
             self._last_read[slots] = self._committed_seq
-            self._readers[slots] += 1
             # Taking slots can displace a row in the last ordinary batch.
             self._last_rids = None
         plan = ResidentPlan(
