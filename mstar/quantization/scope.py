@@ -1,0 +1,122 @@
+"""The engine's side: quantization around a node's ``get_submodule``.
+
+The engine manager opens a ``node_scope`` while the model builds and loads a node; ``load_weights_into``
+(every model's loader goes through it) asks ``active_scope()`` whether the module it fills is a declared
+weights root, and if so the scope resolves that root's plan, prepares it and intercepts the stream. When
+``get_submodule`` returns, ``finish`` quantizes what loaded bf16. A model only declares
+(``Model.get_quantization_roots``); a node with no declared root and no ``quantization:`` block costs nothing.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextvars import ContextVar
+from typing import Any
+
+import torch
+from torch import nn
+
+from mstar.model.loader.base import StackedParamRule
+from mstar.quantization import apply
+from mstar.quantization.checkpoint import CheckpointQuant, scan_checkpoint
+from mstar.quantization.formats import AUTO, BF16
+from mstar.quantization.resolve import QuantizationRoot, QuantPlan, resolve_plan
+from mstar.quantization.spec import NodeQuantSpec, parse_quantization
+
+logger = logging.getLogger(__name__)
+
+_ACTIVE: ContextVar[NodeQuantization | None] = ContextVar("mstar_quantization_scope", default=None)
+
+
+def device_capability(device: torch.device | str | None) -> tuple[int, int] | None:
+    from mstar.platforms import current_platform
+
+    if device is None or torch.device(device).type != "cuda":
+        return None
+    return current_platform.cuda_capability(torch.device(device))
+
+
+class NodeQuantization:
+    """One node's quantization while it loads: its spec, its declared roots, and each root's plan."""
+
+    def __init__(self, node: str, spec: NodeQuantSpec, roots: list[QuantizationRoot],
+                 device: torch.device | str | None = None):
+        self.node = node
+        self.spec = spec
+        self.roots = roots
+        self.device = device
+        self._checkpoints: dict[str, CheckpointQuant | None] = {}
+        # id(root module) -> (module, plan), in load order
+        self.plans: dict[int, tuple[nn.Module, QuantPlan]] = {}
+
+    def _checkpoint(self, decl: QuantizationRoot) -> CheckpointQuant | None:
+        directory = decl.checkpoint_dir()
+        if directory is None:
+            return None
+        if directory not in self._checkpoints:
+            self._checkpoints[directory] = scan_checkpoint(directory)
+        return self._checkpoints[directory]
+
+    def plan_for(self, module: nn.Module) -> QuantPlan | None:
+        """The plan for ``module`` if it is one of this node's declared roots (resolved, checked and prepared
+        on first sight), else None."""
+        key = id(module)
+        if key in self.plans:
+            return self.plans[key][1]
+        decl = next((r for r in self.roots if type(module) is r.root_type), None)
+        if decl is None:
+            return None
+        plan = resolve_plan(module, decl, self.spec, self._checkpoint(decl), device_capability(self.device))
+        if plan.problems:
+            raise ValueError(f"quantization of node {self.node!r} refused:\n  - " + "\n  - ".join(plan.problems))
+        for note in plan.notes:
+            logger.info("%s: %s", self.node, note)
+        apply.prepare(module, plan)
+        self.plans[key] = (module, plan)
+        return plan
+
+    def wrap_load(
+        self, module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]],
+        stacked_params: list[StackedParamRule] | None, name_remapper: Callable[[str], str | None] | None,
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        plan = self.plan_for(module)
+        if plan is None or not plan.active:
+            return weights
+        return apply.intercept(weights, plan, stacked_params, name_remapper)
+
+    def finish(self, submodule: nn.Module | None) -> None:
+        """Finalize every root this node loaded; refuse a spec that asked for a format no root took."""
+        for module, plan in self.plans.values():
+            apply.finalize(module, plan, self.device)
+        asked = self.spec.format not in (AUTO, BF16) or any(rule.format != BF16 for rule in self.spec.rules)
+        if submodule is not None and asked and not self.plans:
+            raise ValueError(
+                f"quantization asks {self.spec.format} for node {self.node!r}, but its weights never went through "
+                f"a declared root ({[r.root_type.__name__ for r in self.roots]})"
+            )
+
+
+def active_scope() -> NodeQuantization | None:
+    return _ACTIVE.get()
+
+
+@contextlib.contextmanager
+def node_scope(
+    model: Any, node: str, model_config: Mapping[str, Any], device: torch.device | str | None = None,
+) -> Iterator[NodeQuantization | None]:
+    """Quantization for ``node`` while the body builds and loads it; yields None when there is nothing to do."""
+    spec = parse_quantization(model_config.get("quantization")).for_node(node)
+    getter = getattr(model, "get_quantization_roots", None)
+    roots = [r for r in (getter() if getter is not None else []) if r.node == node]
+    if not roots:
+        # validate_deployment refused a block naming this node or asking a format of a model with no roots
+        yield None
+        return
+    scope = NodeQuantization(node, spec, roots, device)
+    token = _ACTIVE.set(scope)
+    try:
+        yield scope
+    finally:
+        _ACTIVE.reset(token)
