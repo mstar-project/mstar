@@ -7,7 +7,9 @@ model author reads a shape error from a worker minutes later.
 
 from __future__ import annotations
 
+import re
 import sys
+from dataclasses import dataclass
 
 sys.path.insert(0, ".")
 
@@ -32,6 +34,7 @@ from mstar.engine.state import (
     Value,
     Window,
 )
+from mstar.engine.state.contract import Op
 
 _ENTRY = KVEntry(heads=4, head_dim=8)
 _GDN = Entry({
@@ -167,6 +170,34 @@ def test_a_bad_declaration_is_refused_naming_the_array_and_field(name):
     with pytest.raises(ValueError) as refused:
         build()
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
+
+
+@pytest.mark.parametrize("build, where", [
+    (lambda: Read(mask="nope"), "Read.mask"),
+    (lambda: Read(mask=Causal(), op="garbage"), "Read.op"),
+    (lambda: Read(mask=Causal(), op=CausalConv()), "Read.op: a read changes no field"),
+])
+def test_a_bad_mask_or_op_is_refused_when_the_read_is_built(build, where):
+    with pytest.raises(ValueError) as refused:
+        build()
+    assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
+
+
+@dataclass(frozen=True)
+class _Decay(Op):
+    """An update kernel the contract doesn't define yet, on a state of rank 3."""
+
+    writes = ("state",)
+
+    def check(self, where, entry):
+        if len(entry.tensors["state"].shape) != 3:
+            raise ValueError(f"{where}: _Decay needs a state of rank 3")
+
+
+def test_a_new_op_brings_its_own_check():
+    _value(updates={"u": _Decay()})
+    with pytest.raises(ValueError, match=re.escape("Array 'gdn'.updates['u']: _Decay needs a state of rank 3")):
+        _value(entry=Entry({"state": TensorType((4, 8), dtype=None)}), updates={"u": _Decay()})
 
 
 @pytest.mark.parametrize("build", [
