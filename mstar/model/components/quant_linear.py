@@ -44,6 +44,8 @@ _FORMAT_MODULES = {
     "fp8_tensor": "mstar.model.components.fp8_formats",
     "fp8_channel": "mstar.model.components.fp8_formats",
     "fp8_block": "mstar.model.components.fp8_formats",
+    "w4a16": "mstar.model.components.int4_formats",
+    "mxfp4": "mstar.model.components.int4_formats",
 }
 LINEAR_DTYPES = (BF16, *_FORMAT_MODULES)
 _FORMATS: dict[str, LinearFormat] = {}

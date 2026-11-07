@@ -127,7 +127,7 @@ def test_a_default_that_doesnt_fit_a_layer_is_a_note_a_rule_is_a_problem():
     ({"layers": [{"match": "layers.*.attn.*", "format": "bf16"}]}, None, None, "matches none of its"),
     ("fp8_channel", "fp8", None, "compounds two roundings"),
     ("fp8_block", None, (8, 0), "needs compute capability 8.9"),
-    ("mxfp4", None, None, "serves mxfp4 on no linear layer yet"),
+    ("nvfp4", None, (9, 0), "needs compute capability 10.0"),
     ({"layers": [{"match": "layers.*.moe.experts", "format": "fp8_channel"}]}, None, None,
      "serves fp8_channel on no experts layer"),
 ])
@@ -137,10 +137,12 @@ def test_specs_the_build_cant_serve_are_refused(quantization, ckpt, capability, 
 
 
 def test_a_checkpoint_format_without_a_loader_is_refused_by_name():
-    tensors = {"layers.0.mlp.gate_proj.weight_packed": TensorInfo("I32", (INTER, HIDDEN // 8)),
-               "layers.0.mlp.gate_proj.weight_scale": TensorInfo("BF16", (INTER, HIDDEN // 32))}
+    # compressed-tensors' NVFP4 (inverted global scales) has no loader yet
+    tensors = {"layers.0.mlp.gate_proj.weight_packed": TensorInfo("U8", (INTER, HIDDEN // 2)),
+               "layers.0.mlp.gate_proj.weight_scale": TensorInfo("F8_E4M3", (INTER, HIDDEN // 16)),
+               "layers.0.mlp.gate_proj.weight_global_scale": TensorInfo("F32", (1,))}
     plan = plan_for(None, CheckpointQuant.from_tensors(tensors, {"quant_method": "compressed-tensors"}))
-    assert any("as w4a16" in p and "no loader for w4a16" in p for p in plan.problems), plan.problems
+    assert any("as nvfp4" in p and "no loader for nvfp4" in p for p in plan.problems), plan.problems
 
 
 def test_a_linear_the_model_didnt_declare_is_a_problem_not_a_silent_skip():

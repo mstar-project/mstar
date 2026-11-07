@@ -30,9 +30,11 @@ from mstar.quantization.spec import NodeQuantSpec, pattern_matches
 LINEAR, EXPERTS, OTHER = "linear", "experts", "other"
 MIXED = "mixed"
 # stored formats the loader reads directly or dequantizes as it loads, and the checkpoint layouts it reads them in
-LOADABLE = ("fp8_block", "fp8_channel", "fp8_tensor")
+LOADABLE = ("fp8_block", "fp8_channel", "fp8_tensor", "w4a16", "mxfp4")
 LOADABLE_LAYOUTS = {"w4a16": ("compressed-tensors", "awq", "gptq"), "mxfp4": ("compressed-tensors",),
                     "nvfp4": ("modelopt",)}
+# the 4-bit formats' group along K (w4a16's is the checkpoint's own)
+_GROUP = {"mxfp4": 32, "nvfp4": 16}
 # stored formats ``auto`` refuses on a GPU without their kernels rather than dequantizing at 4x the memory
 _NO_SILENT_DEQUANT = ("nvfp4",)
 
@@ -126,6 +128,25 @@ def layer_geometry(module: nn.Module, kind: str) -> Geometry | None:
     return Geometry(n, k, (n,), (k,))
 
 
+def _group_problem(fmt: str, geometry: Geometry, direct: bool, kind: str, source: StoredBase | None) -> str | None:
+    """The 4-bit formats': K (and, for experts, the expert width that down contracts over) in whole groups per rank;
+    loaded as stored, every per-rank sub-block in whole groups (columns) and whole packed zero-point rows."""
+    group = _GROUP.get(fmt) or (source.param("group") if source is not None else None) or 128
+    ks = (geometry.k, geometry.rows[0]) if kind == EXPERTS else (geometry.k,)
+    for k in ks:
+        if k % group or k % 8:
+            return f"{fmt} runs K in whole groups of {group} per rank; this layer's K is {k}"
+    if fmt == "nvfp4" and kind == LINEAR and (geometry.k % 64 or geometry.n % 16):
+        return f"nvfp4 needs K a multiple of 64 and N of 16 per rank; this layer is {geometry.n} x {geometry.k}"
+    if direct:
+        if any(c % group for c in geometry.cols):
+            return f"a checkpoint group of {group} would straddle this rank's column blocks {list(geometry.cols)}"
+        asymmetric = source is not None and source.param("symmetric") is False
+        if asymmetric and any(r % 8 for r in geometry.rows):
+            return f"packed zero points (8 rows each) would straddle this rank's row blocks {list(geometry.rows)}"
+    return None
+
+
 def geometry_problem(
     fmt: str, geometry: Geometry, direct: bool, kind: str, block: tuple[int, int] | None = None,
     stored_layout: bool | None = None, source: StoredBase | None = None,
@@ -135,6 +156,8 @@ def geometry_problem(
     ``source``: how the checkpoint stores it (a 4-bit checkpoint's group and symmetry)."""
     stored_layout = direct if stored_layout is None else stored_layout
     n, k = geometry.n, geometry.k
+    if fmt in ("w4a16", "mxfp4", "nvfp4"):
+        return _group_problem(fmt, geometry, direct, kind, source)
     if fmt in ("fp8_tensor", "fp8_channel"):
         if n % 16 or k % 16:
             return f"{fmt} needs N and K multiples of 16 per rank; this layer is {n} x {k}"

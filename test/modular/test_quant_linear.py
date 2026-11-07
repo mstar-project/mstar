@@ -442,7 +442,7 @@ def test_knobs_default_to_bf16_and_refuse_a_typo():
     assert Flux2KleinModel(skip_weight_loading=True).linear_dtype == "bf16"
     assert ZImageModel(skip_weight_loading=True).linear_dtype == "bf16"
     with pytest.raises(ValueError, match="linear_dtype must be one of"):
-        Flux2KleinModel(skip_weight_loading=True, linear_dtype="mxfp4")
+        Flux2KleinModel(skip_weight_loading=True, linear_dtype="fp4")
 
 
 # ---------------------------------------------------------------- step schedules

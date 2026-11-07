@@ -43,11 +43,13 @@ _CATALOG = (
                "e4m3, one e8m0 scale per 32 along K; cuBLASLt block-scaled GEMM"),
     FormatInfo("nvfp4", 4, "nvfp4", (1, 16), (10, 0), True, False,
                "e2m1, one e4m3 scale per 16 along K plus an fp32 tensor scale; cuBLASLt / FlashInfer FP4 GEMM"),
-    FormatInfo("mxfp4", 4, "bf16 or mxfp8", (1, 32), (10, 0), False, False,
-               "e2m1, one e8m0 scale per 32 along K (Kimi K3's routed experts, gpt-oss); FlashInfer MoE"),
-    FormatInfo("w4a16", 4, "bf16", (1, 128), (8, 0), False, False,
-               "int4, one bf16/fp16 scale (and zero point if asymmetric) per group along K "
-               "(compressed-tensors pack-quantized, AWQ, GPTQ); Triton / Marlin-style dequant GEMM"),
+    FormatInfo("mxfp4", 4, "bf16", (1, 32), (8, 0), True, False,
+               "e2m1, one e8m0 scale per 32 along K (compressed-tensors mxfp4-pack-quantized: Kimi K3's routed "
+               "experts); H100/H200: Triton, dequantized to bf16 in registers; B200/B300 experts: FlashInfer's "
+               "TRT-LLM FP4 MoE"),
+    FormatInfo("w4a16", 4, "bf16", (1, 128), (8, 0), True, False,
+               "int4, one bf16/fp16 scale (and zero point if asymmetric) per group along K (compressed-tensors "
+               "pack-quantized, AutoAWQ, GPTQ without act-order); Triton, dequantized to bf16 in registers"),
 )
 
 FORMATS: dict[str, FormatInfo] = {info.name: info for info in _CATALOG}
