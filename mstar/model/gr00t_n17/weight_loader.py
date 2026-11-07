@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
-from mstar.model.loader.base import StackedParamRule, load_weights_into
+from mstar.model.loader.base import LLAMA_STACKED_PARAMS, apply_stacked, load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_shards
 
 _VISION = "backbone.model.model.visual."
@@ -45,14 +45,6 @@ SKIPPED = frozenset({
     "backbone.model.model.language_model.norm.weight",
     "backbone.model.lm_head.weight",
 })
-
-_LLM_STACKED: list[StackedParamRule] = [
-    StackedParamRule(".qkv_proj", ".q_proj", "q"),
-    StackedParamRule(".qkv_proj", ".k_proj", "k"),
-    StackedParamRule(".qkv_proj", ".v_proj", "v"),
-    StackedParamRule(".gate_up_proj", ".gate_proj", 0),
-    StackedParamRule(".gate_up_proj", ".up_proj", 1),
-]
 
 
 def node_of(name: str) -> str | None:
@@ -90,6 +82,7 @@ def load_gr00t_n17_weights(
     """Load one node's tensors, strictly: every parameter gets one, every tensor lands."""
     root, _ = NODE_PREFIXES[node]
     remap, arrived = _remapper(node), set()
+    stacked = LLAMA_STACKED_PARAMS if node == "LLM" else []
 
     def tracked(tensors):
         for name, tensor in tensors:
@@ -101,25 +94,22 @@ def load_gr00t_n17_weights(
         module,
         tracked(iter_safetensors_shards(Path(path), device=device, prefix=root)),
         name_remapper=remap,
-        stacked_params=_LLM_STACKED if node == "LLM" else None,
+        stacked_params=stacked,
     )
     # A fused parameter counts as loaded once *any* of its parts lands (`load_weights_into`),
     # so a checkpoint missing one of q/k/v or gate/up would serve those rows at random init.
     missing = sorted({n for n, _ in module.named_parameters()} - loaded) + sorted(
         name.replace(rule.target_suffix, rule.source_suffix)
-        for name, _ in module.named_parameters() if node == "LLM"
-        for rule in _LLM_STACKED
+        for name, _ in module.named_parameters()
+        for rule in stacked
         if rule.target_suffix in name and name.replace(rule.target_suffix, rule.source_suffix) not in arrived
     )
     if missing:
         raise ValueError(f"{node}: {len(missing)} parameter(s) got no weight, e.g. {missing[:5]}")
     # `load_weights_into` only logs a key that matches no parameter; under this node's
     # prefixes that is a renamed or missing module whose trained weights go unused.
-    stacked = _LLM_STACKED if node == "LLM" else []
     unexpected = sorted(
-        name for name in arrived - {None}
-        if next((name.replace(r.source_suffix, r.target_suffix) for r in stacked if r.source_suffix in name), name)
-        not in loaded
+        name for name in arrived - {None} if apply_stacked(name, stacked)[0] not in loaded
     )
     if unexpected:
         raise ValueError(f"{node}: {len(unexpected)} tensor(s) matched no parameter, e.g. {unexpected[:5]}")
