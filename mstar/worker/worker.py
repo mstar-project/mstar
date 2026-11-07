@@ -3664,6 +3664,7 @@ class Worker:
                 exc, f"Worker {self.worker_id} step {pending.node_name}/{pending.graph_walk} failed",
                 log=logger,
             )
+            traceback.clear_frames(exc.__traceback__)
             failed = pending.node_batch.failed_requests
             for rid in pending.batch.request_to_worker_graph:
                 failed.setdefault(rid, f"Error in worker: {err}")

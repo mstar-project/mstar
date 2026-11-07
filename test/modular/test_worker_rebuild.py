@@ -348,7 +348,8 @@ def test_the_scheduler_sees_the_rows_every_lane_holds():
     )
 
 
-def test_failed_forward_releases_traceback_tensors_without_gc():
+@pytest.mark.parametrize("handler", ["main_loop", "step_result"])
+def test_failed_forward_releases_traceback_tensors_without_gc(handler):
     import gc
     import weakref
     refs = []
@@ -363,7 +364,16 @@ def test_failed_forward_releases_traceback_tensors_without_gc():
         try:
             forward()
         except torch.OutOfMemoryError as exc:
-            w._handle_main_loop_error(exc, (), None)
+            if handler == "main_loop":
+                w._handle_main_loop_error(exc, (), None)
+            else:
+                from concurrent.futures import Future
+                future = Future()
+                future.set_exception(exc)
+                pending = SimpleNamespace(future=future, node_name=NODE, graph_walk=DECODE,
+                    node_batch=SimpleNamespace(failed_requests={}),
+                    batch=SimpleNamespace(request_to_worker_graph={}))
+                w._step_result(pending)
             assert refs[0]() is None
     finally:
         if was_enabled:
