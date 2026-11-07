@@ -8,6 +8,7 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+from mstar.utils.client_errors import RequestError
 
 
 class Status(Enum):
@@ -363,12 +364,12 @@ class ReadsDone(MessageBody):
 class FailRequests(MessageBody):
     """A worker reporting requests it can no longer serve.
 
-    ``errors`` maps request_id -> message. It's a dict rather than a
+    ``errors`` maps request_id -> message and HTTP status. It's a dict rather than a
     (rids, message) pair because per-rid stages (prepare_inputs,
     postprocess) attribute a distinct error to each request, and one
     step can fail several of them for different reasons.
     """
-    errors: dict[str, str]
+    errors: dict[str, RequestError]
 
 
 @dataclass

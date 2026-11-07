@@ -130,9 +130,9 @@ def test_a_worker_exception_reaches_the_client_as_an_error_id(tmp_path, caplog):
     w._handle_main_loop_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
 
     (message,) = w.sent
-    text = message.body.errors["r1"]
+    text = message.body.errors["r1"].message
     _assert_clean(text)
-    assert text.startswith("Error in worker: internal error (error id ")
+    assert text.startswith("internal error (error id ")
     assert tensor_file in _logged(caplog, _error_id(text)).getMessage()
 
 
@@ -141,9 +141,9 @@ def test_a_per_request_stage_failure_reaches_the_client_as_an_error_id(tmp_path,
     ExecutingBatch.register_failure(batch, 7, RuntimeError(f"bad weights at {tmp_path}"))
     ExecutingBatch.register_failure(batch, 8, ValueError(f"no frames in {tmp_path}/a_b.wav"))
 
-    _assert_clean(batch.failed_requests[7])
-    assert str(tmp_path) in _logged(caplog, _error_id(batch.failed_requests[7])).getMessage()
-    assert batch.failed_requests[8] == "ValueError: no frames in a_b.wav"
+    _assert_clean(batch.failed_requests[7].message)
+    assert str(tmp_path) in _logged(caplog, _error_id(batch.failed_requests[7].message)).getMessage()
+    assert batch.failed_requests[8].message == "ValueError: no frames in a_b.wav"
 
 
 class _FailingServer:

@@ -21,6 +21,7 @@ from mstar.conductor.request_info import (
 )
 from mstar.model.base import ForwardPassArgs
 from mstar.testing_utils.model import StubModel
+from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -221,7 +222,7 @@ def test_a_completion_that_raises_after_notifying_is_torn_down_quietly():
 def _fail_ab():
     return ConductorMessage(
         message_type=ConductorMessageType.FAIL_REQUESTS,
-        body=FailRequests(errors={"a": "worker failed a", "b": "worker failed b"}),
+        body=FailRequests(errors={"a": RequestError("worker failed a"), "b": RequestError("worker failed b")}),
     )
 
 
@@ -254,10 +255,10 @@ def test_one_request_that_raises_in_a_failure_batch_keeps_the_others_errors():
     c = _conductor([_fail_ab()], _drained_ab(), requests={"a": _request(), "b": _request()})
     remove_request = c._remove_request
 
-    def _raise_once_for_a(rid, request_data, failure_error=None):
+    def _raise_once_for_a(rid, request_data, failure_error=None, failure_status=500):
         if rid == "a" and failure_error == "worker failed a":
             raise RuntimeError("could not tear a down")
-        remove_request(rid, request_data, failure_error=failure_error)
+        remove_request(rid, request_data, failure_error=failure_error, failure_status=failure_status)
     c._remove_request = _raise_once_for_a
     _run(c)
     failed = [

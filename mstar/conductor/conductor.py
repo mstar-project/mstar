@@ -1699,7 +1699,8 @@ class Conductor:
         """Tear down requests a worker reported as unservable. Routes through the
         drain barrier; the client is notified (request_failed) only once every
         reader has drained, so no output is unlinked under an in-flight read."""
-        for rid, error_message in body.errors.items():
+        for rid, failure in body.errors.items():
+            error_message = failure.message
             request_data = self.requests.get(rid)
             if request_data is None or rid in self.draining:
                 # Expected under TP: every rank raises symmetrically and each
@@ -1712,7 +1713,7 @@ class Conductor:
                 continue
             logger.error("Request %s failed on a worker: %s", rid, error_message)
             try:
-                self._remove_request(rid, request_data, failure_error=error_message)
+                self._remove_request(rid, request_data, failure_error=error_message, failure_status=failure.status)
             except Exception as exc:
                 # the other requests in the batch keep their own error
                 self._fail_after_error(rid, "failing it", exc)
@@ -1754,7 +1755,7 @@ class Conductor:
 
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1774,6 +1775,7 @@ class Conductor:
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(

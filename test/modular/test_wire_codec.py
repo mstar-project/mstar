@@ -23,6 +23,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import GraphTiming, RxInfo, TxInfo
+from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -254,9 +255,9 @@ def test_api_server_result_tensors():
 def test_fail_requests_and_empty_collections():
     msg = ConductorMessage(
         message_type=ConductorMessageType.FAIL_REQUESTS,
-        body=FailRequests(errors={"r0": "oom", "r1": "admit rejected"}),
+        body=FailRequests(errors={"r0": RequestError("oom"), "r1": RequestError("admit rejected")}),
     )
-    assert roundtrip(msg).body.errors == {"r0": "oom", "r1": "admit rejected"}
+    assert roundtrip(msg).body.errors == {"r0": RequestError("oom"), "r1": RequestError("admit rejected")}
 
     # a body where every optional collection is left at its default
     msg = ConductorMessage(

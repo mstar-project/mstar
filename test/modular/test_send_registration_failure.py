@@ -148,7 +148,7 @@ def test_the_worker_fails_only_the_refused_request():
 
         (errors,) = reported
         assert list(errors) == [7]
-        assert errors[7].startswith("Error in worker: Mooncake memory registration failed")
+        assert errors[7].message.startswith("Error in worker: Mooncake memory registration failed")
         assert mgr.tensor_store.is_registered(r8[0])
     finally:
         mgr._async_reader._executor.shutdown(wait=True)

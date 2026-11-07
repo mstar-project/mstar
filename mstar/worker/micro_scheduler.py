@@ -13,6 +13,7 @@ from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, GraphRuntime, ReadyNodeSpec, RequestWalks
 from mstar.model.submodule_base import CHUNK_LOOP_END, InputMetadata, StepOrder, chunk_loop_name
+from mstar.utils.client_errors import RequestError
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode
 from mstar.worker.batch_builder import (
     BatchBuilderType,
@@ -481,7 +482,7 @@ class MicroScheduler:
         self.failed_rids: set[int] = set()
         # rid -> message, for requests a resource declared unservable during a
         # readiness check. Drained by the worker, which reports them onward.
-        self.admit_errors: dict[int, str] = {}
+        self.admit_errors: dict[int, RequestError] = {}
         # Rids an input read of which failed on this rank. A TP follower never
         # gets those inputs, so it builds the leader's step without the row and
         # the step's read check takes it out on every rank (see
@@ -2238,7 +2239,7 @@ class MicroScheduler:
                 "Request %s cannot be served on node %s by resource %s: %s",
                 rid, node_name, outcome.failed_resource, outcome.reason.message,
             )
-            self.admit_errors[rid] = (
+            self.admit_errors[rid] = RequestError(
                 f"resource {outcome.failed_resource} rejected the request: "
                 f"{outcome.reason.message}"
             )
@@ -2262,7 +2263,7 @@ class MicroScheduler:
             rows[spec.node_name] += len(spec.rids)
         return rows
 
-    def take_admit_errors(self) -> dict[int, str]:
+    def take_admit_errors(self) -> dict[int, RequestError]:
         """Hand the accumulated terminal admit failures to the caller, once."""
         errors, self.admit_errors = self.admit_errors, {}
         return errors

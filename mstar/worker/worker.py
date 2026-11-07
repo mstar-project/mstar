@@ -73,7 +73,7 @@ from mstar.profile.worker import WorkerProfileInfo
 from mstar.streaming.stream_buffer import StreamingEdge
 from mstar.streaming.topology import Connection, ProducerWalkCtx
 from mstar.utils import cpus, knobs
-from mstar.utils.client_errors import client_error_text
+from mstar.utils.client_errors import RequestError
 from mstar.utils.containers import ParallelList, RecentSet
 from mstar.utils.device import DeviceCapability
 from mstar.utils.ipc_format import (
@@ -1821,7 +1821,7 @@ class Worker:
             return
         for rid in flagged:
             node_batch.failed_requests.setdefault(
-                rid, "Error in worker: input tensor read failed on a rank of its TP group",
+                rid, RequestError("Error in worker: input tensor read failed on a rank of its TP group"),
             )
         node_batch.drop_rids(flagged)
 
@@ -1841,10 +1841,10 @@ class Worker:
             # reported once per request; the tensor manager logged the read's
             # error where it failed
             failed = {
-                f.request_id: "Error in worker: input tensor read failed: " + client_error_text(
+                f.request_id: RequestError.from_exception(
                     f.error, f"Worker {self.worker_id}: input tensor read of request {f.request_id} failed",
                     log=logger, traceback=False,
-                )[0]
+                )
                 for f in failed_reads
                 if f.request_id not in self.scheduler.failed_rids
             }
@@ -2227,7 +2227,7 @@ class Worker:
             return frozenset()
         # A follower still runs a failed rid while rank 0 sends it; report once.
         self._fail_requests({
-            rid: f"Error in worker: {msg}" for rid, msg in failed.items()
+            rid: RequestError(f"Error in worker: {msg}") for rid, msg in failed.items()
             if rid not in self.scheduler.failed_rids
         })
         return frozenset(failed)
@@ -2808,7 +2808,7 @@ class Worker:
                 reason.message, len(doomed), len(rids),
             )
             self._fail_requests({
-                rid: f"Error in worker: {reason.message}" for rid in doomed
+                rid: RequestError(reason.message) for rid in doomed
             })
 
     def _handle_allocation_failure(
@@ -3683,14 +3683,14 @@ class Worker:
         try:
             return pending.future.result()
         except Exception as exc:
-            err, _ = client_error_text(
+            err = RequestError.from_exception(
                 exc, f"Worker {self.worker_id} step {pending.node_name}/{pending.graph_walk} failed",
                 log=logger,
             )
             traceback.clear_frames(exc.__traceback__)
             failed = pending.node_batch.failed_requests
             for rid in pending.batch.request_to_worker_graph:
-                failed.setdefault(rid, f"Error in worker: {err}")
+                failed.setdefault(rid, err)
             return BatchedModelOutput()
 
     def _await_tp_follow_step(
@@ -4031,8 +4031,10 @@ class Worker:
         skipped = (rebuild & node_batch.skipped_rids) - node_batch.cached_rids
         if skipped:
             self._fail_requests({
-                rid: f"Error in worker: {node} skipped the rebuild row of {self._rid_str(rid)}, whose inputs come "
-                "from its kept ids" for rid in skipped
+                rid: RequestError(
+                    f"Error in worker: {node} skipped the rebuild row of {self._rid_str(rid)}, "
+                    "whose inputs come from its kept ids"
+                ) for rid in skipped
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
@@ -4935,7 +4937,7 @@ class Worker:
         """
         # Report the leaf exception to the client and keep the full chain in
         # the log. A forward's own raise doesn't come here (``_step_result``).
-        err, _ = client_error_text(
+        err = RequestError.from_exception(
             exc, f"Worker {self.worker_id} error in main loop", log=logger,
         )
 
@@ -5000,15 +5002,15 @@ class Worker:
                     sb.node_name, list(fresh), list(fresh.values()),
                 )
 
-        self._fail_requests({rid: f"Error in worker: {err}" for rid in failed_rids})
+        self._fail_requests({rid: err for rid in failed_rids})
         # A completed Future retains the raised forward's frame and its tensors.
         # Release those locals now so an OOM does not poison the next batch.
         traceback.clear_frames(exc.__traceback__)
 
-    def _fail_requests(self, errors: dict[int, str]) -> None:
+    def _fail_requests(self, errors: dict[int, RequestError]) -> None:
         """Report requests this worker can no longer serve to the conductor.
 
-        ``errors`` maps request_id -> message. Rids the worker has already
+        ``errors`` maps request_id -> message and HTTP status. Rids the worker has already
         torn down are dropped: reporting them would leave a permanent entry
         in ``scheduler.failed_rids`` (the conductor answers a failure with a
         REMOVE_REQUEST, and it won't send one for a request it no longer
@@ -5048,8 +5050,8 @@ class Worker:
         rids = [r for r in rids if r not in self.scheduler.failed_rids]
         if not rids:
             return
-        text, _ = client_error_text(err, f"Worker {self.worker_id}: {what}", log=logger)
-        self._fail_requests({rid: f"Error in worker: {text}" for rid in rids})
+        failure = RequestError.from_exception(err, f"Worker {self.worker_id}: {what}", log=logger)
+        self._fail_requests({rid: failure for rid in rids})
 
     def _build_speculation(
         self, pending: PendingBatch | None, consecutive: int,

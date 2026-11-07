@@ -12,6 +12,8 @@ pytest.importorskip("mstar_rust")
 
 from mstar.communication.event import EventWakeup
 from mstar.communication.rust_communicator import RustZMQCommunicator
+from mstar.utils.client_errors import RequestError
+from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, FailRequests
 
 
 def _wait_msgs(comm, n=1, timeout=5.0):
@@ -31,9 +33,16 @@ def pair():
     return a, b
 
 
-def test_unregistered_payload_both_directions(pair):
+@pytest.mark.parametrize("payload", [
+    {"op": "execute", "rids": [1, 2, 3], "nested": {"f": 1.5}},
+    ConductorMessage(ConductorMessageType.FAIL_REQUESTS, FailRequests({
+        "bad": RequestError("bad input", 400),
+        "busy": RequestError("session in use", 409),
+        "broken": RequestError("internal error", 500),
+    })),
+])
+def test_payload_both_directions(pair, payload):
     a, b = pair
-    payload = {"op": "execute", "rids": [1, 2, 3], "nested": {"f": 1.5}}
     a.send("b", payload)
     assert _wait_msgs(b) == [payload]
     b.send("a", ("done", 42))
