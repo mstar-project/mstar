@@ -9,8 +9,8 @@ with no index upload or gather.
 Row 0 of a table is the input's ``capture_fill``, which padding rows read. Read
 past its rows, a request reads its last: that is the pad's repeat.
 
-A table is read outside the graphs, so it may grow, and a request never waits
-for room. Streamed inputs are a step's own items, and don't come here.
+The source arena is read outside graphs and may grow. Captured runs instead
+read fixed banks owned here, including their snapshotted streamed inputs.
 """
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from mstar.engine.device_run import IterationWindow
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.resident_hooks import (
     ResidentBinding,
@@ -29,6 +30,7 @@ from mstar.engine.resources.resident_hooks import (
     unbounded_repeats,
 )
 from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.step import SlotLease
 from mstar.utils.h2d import PinnedStager
 
 if TYPE_CHECKING:
@@ -95,6 +97,11 @@ class IterationTables(Resource):
         # the main thread frees what the GPU thread's steps take
         self._lock = threading.Lock()
         self._stager = PinnedStager(torch.long)
+        # Fixed captured views, distinct from the growing outside-capture arena.
+        # Canonical bucket + member-qualified slot: aliases share, other buckets do not.
+        self._windows: dict[tuple, IterationWindow] = {}
+        self._window_indices: dict[tuple, torch.Tensor] = {}
+        self._window_fills: dict[tuple, Mapping[str, float | int]] = {}
 
     @classmethod
     def build(cls, spec: IterationTablesSpec, info: EngineResourceInfo) -> IterationTables:
@@ -117,6 +124,87 @@ class IterationTables(Resource):
             max_repeats=unbounded_repeats,
             rewind_run=no_resident_effect,
         )
+
+    @staticmethod
+    def window_bytes(slots: int, limit: int, entries: int, inputs: Mapping[str, torch.Tensor], bs: int) -> int:
+        """Persistent bytes per captured bank, before capture selection."""
+        columns = sum(value[0].numel() * value.element_size() for value in inputs.values())
+        return slots * (2 * limit * columns + 8 * (1 + entries)) + 8 * bs
+
+    def prepare_window(
+        self, lease: SlotLease, inputs: Mapping[str, torch.Tensor], limit: int,
+        entries: int, slots: int, fills: Mapping[str, float | int],
+    ) -> IterationWindow:
+        """Allocate a selected capture's fixed bank before capture, once."""
+        key = (lease.bucket, lease.buffer_slot)
+        if limit < 1 or entries < 2 or slots < 1 or inputs.keys() != fills.keys():
+            raise ValueError("invalid captured input-bank geometry")
+        if (window := self._windows.get(key)) is not None:
+            if (window.origins.shape != (slots,) or window.entries.shape != (slots, entries)
+                    or window.columns.keys() != inputs.keys() or self._window_fills[key] != fills
+                    or any(window.columns[name].shape != (slots, 2 * limit, *value.shape[1:])
+                           or window.columns[name].dtype != value.dtype
+                           or window.columns[name].device != value.device for name, value in inputs.items())):
+                raise ValueError("captured input-bank geometry changed for the same capture")
+            return window
+        window = IterationWindow(
+            {name: value.new_full((slots, 2 * limit, *value.shape[1:]), fills[name])
+             for name, value in inputs.items()},
+            torch.zeros(slots, dtype=torch.long, device=self._device),
+            torch.full((slots, entries), -1, dtype=torch.long, device=self._device),
+        )
+        self._windows[key] = window
+        self._window_indices[key] = torch.empty(lease.bucket.bs, dtype=torch.long, device=self._device)
+        self._window_fills[key] = dict(fills)
+        return window
+
+    def discard_window(self, lease: SlotLease) -> None:
+        """Release a bank whose capture failed, before it can have readers."""
+        key = (lease.bucket, lease.buffer_slot)
+        self._windows.pop(key, None)
+        self._window_indices.pop(key, None)
+        self._window_fills.pop(key, None)
+
+    def stage_window(self, lease: SlotLease, slots: Sequence[int], snapshot: IterationWindow) -> None:
+        """On the execution stream, after the previous use of this capture.
+
+        Preplanning never calls this. Validate every input before any copy, then
+        write only the selected resident rows. This staging scratch belongs to
+        the capture's submission stream; live publication must not borrow it.
+        """
+        key = (lease.bucket, lease.buffer_slot)
+        target = self._windows.get(key)
+        if target is None or not isinstance(snapshot, IterationWindow):
+            raise ValueError("actual-progress execution needs its prepared owner input bank")
+        n, rows = len(slots), snapshot.origins.numel()
+        if (len(set(slots)) != n or any(type(slot) is not int or not 0 < slot < len(target.origins) for slot in slots)
+                or n > lease.bucket.bs or rows != lease.bucket.bs
+                or snapshot.origins.shape != (rows,) or snapshot.origins.dtype != torch.long
+                or snapshot.origins.device != target.origins.device
+                or snapshot.entries.shape != (rows, target.entries.shape[1])
+                or snapshot.entries.dtype != torch.long or snapshot.entries.device != target.entries.device
+                or snapshot.columns.keys() != target.columns.keys()):
+            raise ValueError("input window does not match its captured owner rows")
+        for name, column in snapshot.columns.items():
+            bank = target.columns[name]
+            if (column.ndim != bank.ndim or column.shape[0] != rows or not 0 < column.shape[1] <= bank.shape[1]
+                    or column.shape[2:] != bank.shape[2:]
+                    or column.dtype != bank.dtype or column.device != bank.device):
+                raise ValueError(f"iteration input {name!r} exceeds its captured owner bank")
+        if not n:
+            return
+        indices = self._window_indices[key][:n]
+        self._stager.copy_(indices, slots)
+        for name, column in snapshot.columns.items():
+            bank = target.columns[name]
+            width = column.shape[1]
+            bank[:, :width].index_copy_(0, indices, column[:n])
+            if width < bank.shape[1]:
+                # Clear the unread tail of a reused row too; never inherit an
+                # earlier request's columns from the same capture bank.
+                bank[:, width:].index_fill_(0, indices, self._window_fills[key][name])
+        target.origins.index_copy_(0, indices, snapshot.origins[:n])
+        target.entries.index_copy_(0, indices, snapshot.entries[:n])
 
     def remove_request(self, rid: Hashable) -> None:
         with self._lock:

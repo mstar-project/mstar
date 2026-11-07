@@ -20,7 +20,8 @@ from mstar.engine.device_run import (
     RunState,
     TokenStream,
 )
-from mstar.engine.resources.step import BucketKey
+from mstar.engine.resources.iteration_tables import IterationTables, tables_key
+from mstar.engine.resources.step import BucketKey, SlotLease
 from mstar.model.submodule_base import BatchedModelOutput, CarryPair
 
 CPU = torch.device("cpu")
@@ -91,6 +92,9 @@ def _runner(
     runner._device, runner._memory_pool, runner._autocast_dtype = CPU, None, None
     runner._submodule_name, runner._capture_stream, runner._resident = "n", None, None
     runner._run_asks, runner._run_failures, runner._generator_walks = {}, {}, set()
+    runner._member = ""
+    runner._resources = {tables_key("n"): IterationTables(CPU)}
+    runner._submodule = SimpleNamespace(ITERATION_INPUTS={"cond": SimpleNamespace(capture_fill=0)})
     runner._graph_backend = SimpleNamespace(
         while_refusal=lambda: None, while_runtime=lambda: loop,
         raw_stream=lambda: 0, synchronize=lambda: None,
@@ -108,7 +112,7 @@ def _runner(
         planner = runner._resident = SimpleNamespace(
             store=torch.tensor([0] + [rows._row_of[rid] for rid in range(1, bs + 1)]),
             table=lambda: SimpleNamespace(stride=1, col=0), covers=lambda bucket: True,
-            drop_rows=lambda bucket, slot: buffers,
+            drop_rows=lambda bucket, slot: buffers, max_slots=bs + 1,
         )
         rows.resident_binding().bind(planner, "rows")
         resident = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, buffers=buffers, slots=buffers.slots)
@@ -147,13 +151,23 @@ def _runner(
     spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, config=SimpleNamespace(get_config_type=lambda: None))
     warmed = SimpleNamespace(run=forward, static_inputs=static, output=None, resident=resident)
     run, _, _ = runner._capture_run(spec, warmed)
+    if run is not None:
+        run.test_inputs = (runner._resources[tables_key("n")], SlotLease(0, spec.bucket), list(range(1, bs + 1)))
     runner._buckets = {spec.bucket: SimpleNamespace(slots=[SimpleNamespace(run=run)])}
     return runner, run, static, calls
 
 
+def _stage_inputs(run, columns):
+    if run.window is None:
+        run.stage_inputs(columns)
+    else:
+        owner, lease, slots = run.test_inputs
+        owner.stage_window(lease, slots, columns)
+
+
 def _run(run, real, repeats, immune=None, refill_at=None, columns=None):
     run.state.stage(real, immune or [False] * real, repeats, refill_at)
-    run.stage_inputs(columns)
+    _stage_inputs(run, columns)
     run.launch()
     return run.results(repeats)
 
@@ -458,7 +472,8 @@ def test_a_run_holds_the_device_handle_its_graph_reads(monkeypatch):
     assert handles[0]() is not None and run is not None
 
 
-def test_a_failed_while_capture_settles_its_walk_and_a_plain_capture_serves(monkeypatch):
+@pytest.mark.parametrize("progress", [False, True])
+def test_a_failed_while_capture_settles_its_walk_and_a_plain_capture_serves(monkeypatch, progress):
     """One failure is the walk's answer: trying each bucket cost a second capture
     of every one of them."""
     class Failing(_Loop):
@@ -472,7 +487,8 @@ def test_a_failed_while_capture_settles_its_walk_and_a_plain_capture_serves(monk
             raise RuntimeError("no such stream")
 
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
-    runner, run, _, _ = _runner(monkeypatch, Failing(), [[1, 2]])
+    runner, run, _, _ = _runner(monkeypatch, Failing(), [[1, 2]], progress=progress)
+    assert not runner._resources[tables_key("n")]._windows
     assert run is None and "no such stream" in runner.run_refusal(WALK)
     spec = SimpleNamespace(bucket=BucketKey(WALK, 2, 2), slot=1, config=SimpleNamespace(get_config_type=lambda: None))
     assert runner._capture_run(spec, None) == (None, None, None) and Failing.loops == 1
@@ -1071,7 +1087,7 @@ def test_a_queued_window_reads_actual_progress_and_suppresses_predecessor_stops(
     # The immutable successor already exists before the first launch.
     successor = IterationWindow(columns, torch.zeros(2, dtype=torch.long), entries)
     run.state.stage(2, [False, False], 4)
-    run.stage_inputs(successor)
+    _stage_inputs(run, successor)
     if first_count == 0:
         run.state.request_yield()
     else:
@@ -1081,15 +1097,15 @@ def test_a_queued_window_reads_actual_progress_and_suppresses_predecessor_stops(
     calls.clear()
     loop.on_iteration = lambda i: None
     run.state.stage(2, [False, False], 4)
-    run.stage_inputs(successor)
+    _stage_inputs(run, successor)
     run.launch()
     assert run.state.counts.tolist() == [max(0, 3 - first_count), 4]
     assert calls[0][1].item() == 20 + first_count
     assert runner.test_resource[1].item() == 7 + 8 + 9, "stale successor cannot overwrite recurrent state"
-    assert run.inputs["cond"].shape[1] == 8 and run.rows["frame"].shape[1] == 4
+    assert run.window.columns["cond"].shape[1] == 8 and run.rows["frame"].shape[1] == 4
     # A new graph pass is a new entry, even when the resident row/slot is unchanged.
     run.state.stage(2, [False, False], 1)
-    run.stage_inputs(IterationWindow(columns, torch.zeros(2, dtype=torch.long), entries + torch.tensor([0, 1])))
+    _stage_inputs(run, IterationWindow(columns, torch.zeros(2, dtype=torch.long), entries + torch.tensor([0, 1])))
     run.launch()
     assert run.state.counts.tolist() == [1, 1]
     assert calls[-1].tolist() == [7, 20]
@@ -1156,7 +1172,7 @@ def test_ordinary_and_device_steps_publish_the_same_actual_loop_progress(monkeyp
     )
     eager([1, 2], [0, 0], [0, 0])
     run.state.stage(2, [False, False], 2)
-    run.stage_inputs(window)
+    _stage_inputs(run, window)
     calls.clear()
     run.launch()
     assert run.state.counts.tolist() == [0, 2], "eager EOS must suppress an already queued captured successor"
@@ -1166,11 +1182,11 @@ def test_ordinary_and_device_steps_publish_the_same_actual_loop_progress(monkeyp
     eager([1, 2], [0, 3], [1, 0], walks={1: WALK, 2: "prefill"})
     eager([2], [3], [0])  # the unbatched output representation stops row 2
     run.state.stage(2, [False, False], 1)
-    run.stage_inputs(window._replace(entries=torch.tensor([[1, 1], [1, 0]])))
+    _stage_inputs(run, window._replace(entries=torch.tensor([[1, 1], [1, 0]])))
     run.launch()
     assert run.state.counts.tolist() == [0, 0]
     indices = runner._rows._index([1, 2])
-    positions, _ = runner._rows.iteration_head(WALK, engine._loops["n", WALK], indices, run.window.entries)
+    positions, _ = runner._rows.iteration_head(WALK, engine._loops["n", WALK], indices, run.window.entries[1:])
     assert positions.tolist() == [1, 4]
 
     failed = ExecutingBatch(

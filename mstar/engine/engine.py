@@ -859,7 +859,7 @@ class Engine:
         """The tables of each node with a request's own iteration inputs; a model declares none."""
         return [
             IterationTablesSpec(resource_key=tables_key(name), nodes={name}) for name, submodule in submodules.items()
-            if any(not spec.streamed for spec in (getattr(submodule, "ITERATION_INPUTS", None) or {}).values())
+            if getattr(submodule, "ITERATION_INPUTS", None)
         ]
 
     def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner, looped: Collection[str]) -> None:
@@ -3142,7 +3142,12 @@ class Engine:
                     [policy is not None and policy.limits(infos[rid]).ignore_eos for rid in request_ids],
                     ctx.repeats, submodule_mgmt.refills[graph_walk],
                 )
-                slot.run.stage_inputs(batch.iteration_columns)
+                if slot.run.window is not None:
+                    submodule_mgmt.submodule.iteration_tables.stage_window(
+                        lease, ctx.resident_plan.slots.tolist(), batch.iteration_columns,
+                    )
+                else:
+                    slot.run.stage_inputs(batch.iteration_columns)
                 batch.run_started = slot.run.state.started
             streamed = submodule_mgmt.device_stream_tokens.get(graph_walk)
             if streamed is not None and ctx.repeats > 1:

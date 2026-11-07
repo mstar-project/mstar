@@ -63,6 +63,7 @@ _PREFILL = _bucket("prefill_vision", 1, 16384)
 class _StubMeasuredRunner:
     """`size_captures` over stub warm-ups of ``steps``, two slots each, in capture order."""
 
+    _input_bank_bytes = AcceleratorGraphRunner._input_bank_bytes
     size_captures = AcceleratorGraphRunner.size_captures
     size_lent_captures = AcceleratorGraphRunner.size_lent_captures
     _template = AcceleratorGraphRunner._template
@@ -73,6 +74,8 @@ class _StubMeasuredRunner:
     _capture_run = staticmethod(lambda spec, warmed: (None, None, None))
 
     def __init__(self, device: torch.device, steps: dict[BucketKey, CaptureCost]):
+        self._run_asks = {}
+        self.static_inputs = {}
         self._steps = steps
         self._device = device
         self._autocast_dtype = None
@@ -98,7 +101,7 @@ class _StubMeasuredRunner:
         self.forwards.append(forwards)
         step = self._steps[spec.bucket]
         yield WarmedSpec(
-            run=lambda: step, static_inputs={}, static_input_keys=(), dummy_rids=[], dummy_metadata={},
+            run=lambda: step, static_inputs=self.static_inputs, static_input_keys=(), dummy_rids=[], dummy_metadata={},
             peak=step.peak, returned=step.kept,
         )
 
@@ -904,3 +907,25 @@ def test_a_runner_with_no_graphs_keeps_its_largest_bucket_as_its_batch_cap():
     cap = Engine.get_max_batch_size(engine, "Code2Wav", "code2wav_chunk")
 
     assert cap == 32, "a batch past the largest bucket is an eager step the floor never measured"
+
+
+
+def test_retained_input_banks_are_budgeted_before_selecting_captures(measured):
+    from mstar.engine.resources.iteration_tables import IterationTables
+
+    bucket = _bucket("decode", 1, 1)
+    costs = {bucket: CaptureCost(0, 0, 0, 2)}
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), costs)
+    plain = runner.size_captures()
+    free = 16 * _MIB
+    assert plan_captures({"n": plain}, free=free).buckets == {"n": {bucket}}
+    owner = IterationTables(torch.device("cpu"))
+    runner._resources = {"iteration_tables:Thinker": owner}
+    runner._run_asks = {"decode": SimpleNamespace(loop=SimpleNamespace(ancestors=()), limit=4, iteration={"cond"})}
+    runner._resident = SimpleNamespace(max_slots=16)
+    runner.static_inputs = {"cond": torch.empty(1, 32768)}
+    retained = runner.size_captures()
+    assert retained[bucket].outside == plain[bucket].outside
+    assert retained[bucket].graph == retained[bucket].kept > free
+    assert plan_captures({"n": retained}, free=free).buckets == {"n": set()}
+    assert not owner._windows  # sizing does not allocate banks for discarded captures

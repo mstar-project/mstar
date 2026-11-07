@@ -4078,3 +4078,48 @@ def test_stream_padding_uses_its_snapshotted_tail_position(items, tail, expected
     tables = _window_tables([spec], {"text": [torch.tensor(items)]} if items else {}, metadata)
     actual = iteration_columns(node, [(1, 0, tables)], 6, CPU)["cond"]
     assert actual.tolist() == [expected]
+
+
+@pytest.mark.parametrize("other", ["slot", "bucket", "member"])
+def test_captured_input_banks_hold_two_windows_after_source_growth_and_validate_before_writes(other):
+    from mstar.engine.device_run import IterationWindow
+
+    owner = IterationTables(CPU)
+    specs = {"cond": IterationInput("source", capture_fill=-9),
+             "mask": IterationInput("mask", dtype=torch.bool, capture_fill=False)}
+    states = {1: {"source": torch.arange(8).float(), "mask": torch.ones(8, dtype=torch.bool)}}
+    lease = SlotLease(0, BucketKey("decode", 1, 1), "a")
+    second = {"slot": replace(lease, slot=1), "bucket": replace(lease, bucket=BucketKey("decode2", 1, 1)),
+              "member": replace(lease, member="b")}[other]
+    inputs = {"cond": torch.zeros(1), "mask": torch.zeros(1, dtype=torch.bool)}
+    fills = {"cond": -9, "mask": False}
+    banks = [owner.prepare_window(key, inputs, 2, 2, 4, fills) for key in (lease, second)]
+    assert owner.prepare_window(replace(lease), inputs, 2, 2, 4, fills) is banks[0]
+    with pytest.raises(ValueError, match="geometry changed"):
+        owner.prepare_window(lease, inputs, 3, 2, 4, fills)
+    pointers = [[tensor.data_ptr() for tensor in bank.columns.values()] for bank in banks]
+    for start, key in zip((0, 2), (lease, second), strict=True):
+        snapshot = IterationWindow(owner.read(specs, [(1, start)], states, 4),
+                                   torch.tensor([start]), torch.tensor([[7, 0]]))
+        owner.stage_window(key, [2], snapshot)
+    # Both captured addresses survive arena growth and source reassignment.
+    states[2] = {"source": torch.arange(1024).float(), "mask": torch.zeros(1024, dtype=torch.bool)}
+    owner.read(specs, [(2, 0)], states, 4)
+    states[1]["source"] = torch.arange(8).float() + 100
+    owner.read(specs, [(1, 0)], states, 4)
+    for start, bank, addresses in zip((0, 2), banks, pointers, strict=True):
+        assert [tensor.data_ptr() for tensor in bank.columns.values()] == addresses
+        assert bank.columns["cond"][2].tolist() == list(range(start, start + 4))
+        assert bank.origins[2] == start and bank.entries[2].tolist() == [7, 0]
+    before = {name: value.clone() for name, value in banks[0].columns.items()}
+    bad = IterationWindow({"cond": torch.full((1, 1), 99.), "mask": torch.ones(1, 1)},
+                          torch.tensor([4]), torch.tensor([[8, 1]]))
+    with pytest.raises(ValueError, match="iteration input 'mask'"):
+        owner.stage_window(lease, [2], bad)
+    for name, value in before.items():
+        assert torch.equal(value, banks[0].columns[name])
+    # Reuse clears the unread tail, without touching another resident row.
+    good = bad._replace(columns={"cond": bad.columns["cond"], "mask": bad.columns["mask"].bool()})
+    owner.stage_window(lease, [1], good)
+    assert banks[0].columns["cond"][1].tolist() == [99., -9., -9., -9.]
+    assert torch.equal(banks[0].columns["cond"][2], before["cond"][2])

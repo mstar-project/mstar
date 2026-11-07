@@ -27,10 +27,11 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
-from mstar.engine.device_run import DeviceRun, IterationWindow, RunAsk, RunState, TokenStream, column_in
+from mstar.engine.device_run import DeviceRun, RunAsk, RunState, TokenStream, column_in
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.base import reachable_resources
+from mstar.engine.resources.iteration_tables import IterationTables, tables_key
 from mstar.engine.resources.loopback_rows import LoopbackRows
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlanner, watched_counts
@@ -1071,6 +1072,15 @@ class AcceleratorGraphRunner:
             self._prepared_slot_specs = slot_specs
         return self._prepared_slot_specs
 
+    def _input_bank_bytes(self, spec: CGSlotSpec, inputs: Mapping[str, Any]) -> int:
+        ask = self._run_asks.get(spec.bucket.graph_walk)
+        if ask is None or ask.loop is None:
+            return 0
+        return IterationTables.window_bytes(
+            self._resident.max_slots, ask.limit, 2 + len(ask.loop.ancestors),
+            {name: value for name, value in inputs.items() if name in ask.iteration}, spec.bucket.bs,
+        )
+
     def size_captures(self) -> dict[BucketKey, CaptureCost]:
         """Warm every spec up, and capture each walk's largest buckets once,
         thrown away, before any runner captures for real.
@@ -1104,6 +1114,12 @@ class AcceleratorGraphRunner:
                             ),
                             f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
                         )
+                        extra = self._input_bank_bytes(spec, warmed.static_inputs)
+                        cost = self._capture_costs[spec.bucket]
+                        if cost.graph is not None:
+                            self._capture_costs[spec.bucket] = cost._replace(
+                                graph=cost.graph + extra, kept=cost.kept + extra,
+                            )
                         if lent:
                             self._lent.add(spec.bucket)
             except Exception as e:
@@ -1143,7 +1159,8 @@ class AcceleratorGraphRunner:
                         self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
                     )
                 if memory is not None:
-                    cost = cost._replace(graph=memory.pool, outside=memory.outside)
+                    extra = self._input_bank_bytes(spec, warmed.static_inputs)
+                    cost = cost._replace(graph=memory.pool + extra, outside=memory.outside)
             except Exception:
                 logger.warning(
                     "AcceleratorGraphRunner[%s]: could not prepare %s to size its capture",
@@ -1403,17 +1420,19 @@ class AcceleratorGraphRunner:
         state = RunState(
             spec.bucket.bs, ask.token_signal, ask.stop_ids, self._device, dropping, stream,
         )
-        inputs = {
-            name: torch.zeros(
-                value.shape[0], ask.limit * (2 if ask.loop is not None else 1), *value.shape[1:],
-                dtype=value.dtype, device=value.device,
+        shapes = {name: value for name, value in warmed.static_inputs.items() if name in ask.iteration}
+        window = None
+        if ask.loop is not None:
+            owner = self._resources[tables_key(self._submodule_name)]
+            window = owner.prepare_window(
+                SlotLease(spec.slot, spec.bucket, self._member), shapes, ask.limit,
+                2 + len(ask.loop.ancestors), self._resident.max_slots,
+                {name: self._submodule.ITERATION_INPUTS[name].capture_fill for name in shapes},
             )
-            for name, value in warmed.static_inputs.items() if name in ask.iteration
-        }
-        window = None if ask.loop is None else IterationWindow(
-            inputs, torch.zeros(spec.bucket.bs, dtype=torch.long, device=self._device),
-            torch.zeros(spec.bucket.bs, 2 + len(ask.loop.ancestors), dtype=torch.long, device=self._device),
-        )
+            inputs = {}  # the captured view belongs solely to IterationTables
+        else:
+            inputs = {name: value.new_zeros((value.shape[0], ask.limit, *value.shape[1:]))
+                      for name, value in shapes.items()}
         graph_exec: list[int] = []
         run = DeviceRun(
             state, inputs, lambda: cuda.launch(graph_exec[0], backend.raw_stream()), ask.limit, device_handle, window,
@@ -1436,14 +1455,24 @@ class AcceleratorGraphRunner:
             position = active = None
             if window is not None:
                 indices = self._rows.iteration_rows(warmed.resident)
-                position, active = self._rows.iteration_head(walk, ask.loop, indices, window.entries, ~state.marks)
+                # Resident slots select the input bank; LoopbackRows indices
+                # select actual Loop progress. These are distinct namespaces.
+                resident_slots = warmed.resident.buffers.rows
+                entries = window.entries.index_select(0, resident_slots)
+                origins = window.origins.index_select(0, resident_slots)
+                position, active = self._rows.iteration_head(walk, ask.loop, indices, entries, ~state.marks)
                 state.marks.logical_or_(~active)
             state.head()
 
             def select_inputs():
-                selected = state.index if window is None else torch.where(active, position - window.origins, 0)
-                for name, column in inputs.items():
-                    column_in(selected, column, warmed.static_inputs[name])
+                if window is None:
+                    for name, column in inputs.items():
+                        column_in(state.index, column, warmed.static_inputs[name])
+                else:
+                    selected = torch.where(active, position - origins, 0)
+                    selected_rows = torch.where(active, resident_slots, 0)
+                    for name, column in window.columns.items():
+                        warmed.static_inputs[name].copy_(column[selected_rows, selected])
 
             raw = warmed.run(True, select_inputs)
             output = BatchedModelOutput.coerce(raw)
@@ -1472,11 +1501,15 @@ class AcceleratorGraphRunner:
             raw_graph = int(graph.raw_cuda_graph())
             if (refusal := cuda.node_refusal(raw_graph)) is not None:
                 self._run_failures[walk] = f"runner: {refusal}"
+                if window is not None:
+                    owner.discard_window(SlotLease(spec.slot, spec.bucket, self._member))
                 return None, None, None
             graph_exec.append(cuda.finish(outer, handle, raw_graph, state, device_handle))
         except Exception as error:
             self._run_failures[walk] = f"runner: its capture into a WHILE body failed: {error}"
             logger.warning("AcceleratorGraphRunner[%s]: %s", self._submodule_name, error)
+            if window is not None:
+                owner.discard_window(SlotLease(spec.slot, spec.bucket, self._member))
             return None, None, None
         return run, graph, output
 

@@ -408,15 +408,9 @@ class DeviceRun:
         self.rows: dict[str, torch.Tensor] = {}
         self.spans: dict[str, torch.Tensor] = {}
 
-    def stage_inputs(self, iteration: Mapping[str, torch.Tensor] | IterationWindow | None) -> None:
-        if self.window is not None:
-            if not isinstance(iteration, IterationWindow):
-                raise ValueError("an actual-progress run needs an immutable input window")
-            self.window.origins.copy_(iteration.origins)
-            self.window.entries.copy_(iteration.entries)
-            iteration = iteration.columns
-        elif isinstance(iteration, IterationWindow):
-            raise ValueError("this run has no actual-progress input selection")
+    def stage_inputs(self, iteration: Mapping[str, torch.Tensor] | None) -> None:
+        if self.window is not None or isinstance(iteration, IterationWindow):
+            raise ValueError("actual-progress inputs are staged by their IterationTables owner")
         for name, column in (iteration or {}).items():
             target = self.inputs[name]
             if column.shape[0] != target.shape[0] or column.shape[1] > target.shape[1]:
