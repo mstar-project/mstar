@@ -40,7 +40,7 @@ from mstar.engine.state import (
     Window,
 )
 from mstar.engine.state.adapters import build_specs, node_resources
-from mstar.engine.state.contract import Mask
+from mstar.engine.state.contract import Mask, Op
 from mstar.model.base import Model, enabled_resources
 from mstar.validation import DeploymentError
 
@@ -242,6 +242,13 @@ class _OtherMask(Mask):
     """A mask `build_specs` has no layout for."""
 
 
+@dataclass(frozen=True)
+class _OtherUpdate(Op):
+    """An update kernel `build_specs` has no layout for."""
+
+    writes = ("state",)
+
+
 _MIXED = _read(op=Attend(q_heads=4))
 # The array each refusal names, its declarations, and what the message says is missing.
 NO_LAYOUT = {
@@ -300,6 +307,9 @@ NO_LAYOUT = {
     "a value with a host field": ("gdn", lambda: [_kv(), _gdn(entry=_gdn_entry(host={"done": bool}))], "entry"),
     "a value with no update": ("gdn", lambda: [_kv(), _gdn(updates={})], "GatedDeltaNet"),
     "a value with only a conv": ("gdn", lambda: [_kv(), _gdn(updates={"conv": CausalConv()})], "GatedDeltaNet"),
+    "an update of another kernel": (
+        "gdn", lambda: [_kv(), _gdn(updates={"delta": GatedDeltaNet(), "x": _OtherUpdate()})], "updates ['x']",
+    ),
     "two delta nets": (
         "gdn", lambda: [_kv(), _gdn(updates={"a": GatedDeltaNet(), "b": GatedDeltaNet()})], "GatedDeltaNet",
     ),
