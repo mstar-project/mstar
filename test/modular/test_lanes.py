@@ -1175,8 +1175,11 @@ def test_a_step_off_the_chain_on_the_chains_resources_waits_out_the_plan_threads
     engine._runner = SimpleNamespace(lane_held=held)
     ran = threading.Event()
     engine.exec = lambda batch: ran.set()
-    batch = SimpleNamespace(node_name="n", graph_walk="prefill", admit_error=None, rows_only=True, cached_rids=())
-    engine._submodules["n"].submodule = SimpleNamespace()
+    batch = SimpleNamespace(
+        node_name="n", graph_walk="prefill", admit_error=None, rows_only=True, cached_rids=(), run_started=None,
+    )
+    engine._submodules["n"].submodule = _StateSub.__new__(_StateSub)
+    engine._submodules["n"].device_stops = {}
     with engine._stage_lock:  # the plan thread, mid-stage
         step = threading.Thread(target=engine.exec_and_postprocess, args=(batch,))
         step.start()
