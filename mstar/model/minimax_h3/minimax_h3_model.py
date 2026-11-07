@@ -17,10 +17,8 @@ walk only picks the decoders. Request knobs: docs/models.rst.
 from __future__ import annotations
 
 import functools
-import io
 import logging
 import math
-from fractions import Fraction
 from typing import NamedTuple
 
 import numpy as np
@@ -33,6 +31,7 @@ from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, Ragg
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.components.video_encode import encode_mp4
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.minimax_h3.components.layout import H3Layout
 from mstar.model.minimax_h3.config import (
@@ -613,23 +612,9 @@ class H3Model(Model):
             return pcm.T.contiguous().cpu().numpy().tobytes()
         if modality != "video":
             raise ValueError(f"unsupported output modality for MiniMax-H3: {modality!r}")
-        import av
-
         frames = (output[0] if output.ndim == 5 else output).cpu().numpy()
-        buffer = io.BytesIO()
-        container = av.open(buffer, mode="w", format="mp4")
-        stream = container.add_stream("libx264", rate=Fraction(FPS))
-        stream.height, stream.width = frames.shape[1], frames.shape[2]
-        stream.pix_fmt = "yuv420p"
         # CRF 18, ultrafast: the encode is on the request's critical path
-        stream.options = {"crf": "18", "preset": "ultrafast", "threads": "0"}
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
-        container.close()
-        return buffer.getvalue()
+        return encode_mp4(frames, FPS, options={"crf": "18", "preset": "ultrafast", "threads": "0"})
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.audio_vae.sample_rate
