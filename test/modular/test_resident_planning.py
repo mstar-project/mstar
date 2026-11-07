@@ -3435,6 +3435,7 @@ def test_connected_engine_launches_shared_owners_once_and_snapshots_each_commit(
     engine.reserve_replay_slot = reserve
     free = kv._arena.num_free
     outputs = engine.exec_group(group)
+    engine.release_group(group)
     if settlement in {"refuse", "unsupported", "state_read"}:
         assert outputs is None and not group.submitted and not planned
         assert kv._arena.num_free == free
