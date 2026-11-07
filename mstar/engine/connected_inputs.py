@@ -5,6 +5,7 @@ from leased outputs and real inputs; a fake tensor is never staged.
 This scope deliberately does not enter a torch dispatch mode: independent
 operations on real tensors must keep doing real work.
 """
+from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass, replace
@@ -18,6 +19,27 @@ from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode, unset_fake
 from mstar.streaming.stream_buffer import StreamChunkInfo
 
 _ACTIVE: ContextVar["ConnectedInputs | None"] = ContextVar("connected_inputs", default=None)
+
+
+class _UnresolvedMapping(Mapping):
+    """Stable keys whose unresolved values cannot escape preparation."""
+
+    def __init__(self, values, blocked, guard):
+        self._values, self._blocked, self._guard = values, blocked, guard
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def __getitem__(self, key):
+        if key in self._blocked:
+            self._guard.refuse("preparation reads unresolved stream metadata")
+        return self._values[key]
+
+    def copy(self):
+        return dict(self)
 
 
 def active_guard() -> "ConnectedInputs | None":
@@ -41,6 +63,43 @@ class ConnectedInputs(FakeTensorMode):
             yield
         finally:
             _ACTIVE.reset(token)
+
+    @contextmanager
+    def stream_metadata(self, batch: Any, alternatives: Mapping) -> Iterator[None]:
+        """Hide unresolved policy records from full-batch preparation readers.
+
+        Per-row ordinary preparation already selected equal NodeInputs. Later
+        callbacks must use those inputs, not an arbitrary representative of a
+        future policy decision. A record stays ordinary only when every compute
+        alternative agrees; no partial record or truth-value sentinel escapes.
+        """
+        metadata, wrapped, windows = (batch.per_request_input_metadata,
+                                      batch.per_request_info_wrapped, batch.stream_windows)
+        protected = dict(metadata)
+        for rid, signals in alternatives.items():
+            row = metadata[rid]
+            chunks, blocked = dict(row.stream_chunks), set()
+            for signal, choices in signals.items():
+                first, *rest = choices
+                if any(choice.is_final != first.is_final for choice in rest):
+                    self.refuse("policy alternatives change full-batch final-row facts")
+                if any(not self.same(first, choice) for choice in rest):
+                    blocked.add(signal)
+                chunks[signal] = first
+            protected[rid] = row._replace(stream_chunks=_UnresolvedMapping(chunks, blocked, self))
+        batch.per_request_input_metadata = protected
+        batch.per_request_info_wrapped = {
+            rid: replace(info, metadata=protected.get(rid, info.metadata)) for rid, info in wrapped.items()
+        }
+        # The retained owner receipt exposes the same alternatives through a
+        # second alias. No model preparation callback may inspect it.
+        batch.stream_windows = _UnresolvedMapping(windows, set(alternatives), self)
+        try:
+            yield
+        finally:
+            batch.per_request_input_metadata, batch.per_request_info_wrapped, batch.stream_windows = (
+                metadata, wrapped, windows,
+            )
 
     @contextmanager
     def isolated_info(self, batch: Any) -> Iterator[None]:

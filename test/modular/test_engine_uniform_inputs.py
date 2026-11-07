@@ -129,7 +129,7 @@ def _connected_engine(transform=None, *, head_state=False, mixed=False, device="
         members.append((ScheduledBatch(name, walk, {2: 1, 1: 1}), batch))
     eng._chunking = ChunkingManagement(eng._submodules)
 
-    def reserve(batch):
+    def reserve(batch, *, capture_step=None):
         lease = leases[batch.node_name]
         batch.lease_slot(lease)
         return lease
@@ -153,7 +153,7 @@ def test_connected_members_launch_once_with_ordered_real_and_future_rows(mixed, 
     b.slot_rotation = a.slot_rotation
     a.slot_rotation.count = 2
 
-    def reserve(batch):
+    def reserve(batch, *, capture_step=None):
         mgmt = eng._submodules[batch.node_name]
         if batch.slot is None:
             batch.set_slot(mgmt.lease_slot())
@@ -897,14 +897,98 @@ def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_valu
     with guard.preparing():
         if change in ("host", "real"):
             with pytest.raises(ValueError, match="prepared host inputs"):
-                eng._prepare_stream_choices(batch, "a", "x", torch.empty(4, 2), guard)
+                eng._prepare_stream_choices(batch, "a", "x", torch.empty(4, 2), guard, 2)
         else:
-            choices = eng._prepare_stream_choices(batch, "a", "x", torch.empty(4, 2), guard)
+            choices = eng._prepare_stream_choices(batch, "a", "x", torch.empty(4, 2), guard, 2)
             assert all(choice is None for choice in choices) if change == "empty" else all(choices)
     assert seen and events == []
     assert source._executed_chunks == 0 and source.owns_window(snapshot.reservation)
     assert batch.request_ids == [2] and batch.inputs is None
     assert not batch.failed_requests and not batch.skipped_rids
+
+
+@pytest.mark.parametrize("read", ["index", "get", "items", "values", "copy", "unpack", "wrapped", "owner",
+                                  "stable", "final"])
+def test_streamed_batch_callbacks_cannot_recover_unresolved_metadata(read):
+    from mstar.engine.connected_inputs import ConnectedInputs
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer, StreamingEdge
+
+    eng, group, events = _connected_engine()
+    batch = group.members[1][1]
+    node = eng._submodules["b"].submodule
+    ordinary = node.prepare_inputs
+    seen = []
+
+    def prepare(**kwargs):
+        seen.append(kwargs["fwd_info"].request_id)
+        return ordinary(**kwargs)
+
+    node.prepare_inputs = prepare
+    guard = ConnectedInputs({})
+    alternatives, references = {}, {}
+    for rid in batch.request_ids:
+        owner = StreamBuffer(rid, "x", "a", FixedChunkPolicy(2))
+        snapshot = owner.reserve_future_window(range(4), 2, may_finish=False)
+        batch.stream_windows[rid] = [StreamingEdge("x", "b", [], snapshot.info)]
+        with guard.preparing():
+            choices = eng._prepare_stream_choices(batch, "a", "x", torch.empty(4, 2), guard, rid)
+        assert all(choice.request_ids == [rid] and set(choice.per_request_info) == {rid} for choice in choices)
+        references[rid] = choices[0]
+        alternatives[rid] = {"x": tuple(choice.per_request_input_metadata[rid].stream_chunks["x"]
+                                       for choice in choices)}
+    assert set(seen) == set(batch.request_ids)
+    batch.per_request_input_metadata = {rid: ref.per_request_input_metadata[rid] for rid, ref in references.items()}
+    batch.per_request_info_wrapped = {rid: ref.per_request_info_wrapped[rid] for rid, ref in references.items()}
+    batch.inputs = [references[rid].inputs[0] for rid in batch.request_ids]
+    original = batch.per_request_input_metadata, batch.per_request_info_wrapped, batch.stream_windows
+    if read == "stable":
+        alternatives = {rid: {"x": (values["x"][0],) * len(values["x"])}
+                        for rid, values in alternatives.items()}
+    elif read == "final":
+        rid = batch.request_ids[-1]
+        choices = alternatives[rid]["x"]
+        alternatives[rid]["x"] = (*choices, choices[-1]._replace(is_final=True))
+
+    def can_batch(*, batch, model_inputs):
+        assert len(model_inputs) == 2  # this decision belongs to the full batch
+        first, second = batch.request_ids
+        chunks = batch.per_request_input_metadata[first].stream_chunks
+        assert list(chunks) == ["x"]
+        if read in {"index", "stable"}:
+            value = chunks["x"]
+            assert type(value) is type(alternatives[first]["x"][0])
+        elif read == "get":
+            value = chunks.get("x")
+        elif read == "items":
+            value = list(chunks.items())
+        elif read == "values":
+            value = list(chunks.values())
+        elif read == "copy":
+            value = chunks.copy()
+        elif read == "unpack":
+            value = {**chunks}
+        elif read == "wrapped":
+            value = batch.per_request_info_wrapped[first].metadata.stream_chunks["x"]
+        else:
+            value = batch.stream_windows[first]
+        # Identity/type branches must never see a placeholder or a chosen
+        # future record, including when they combine two different rows.
+        return value is None or batch.per_request_input_metadata[second].stream_chunks["x"].is_final
+
+    node.can_batch = can_batch
+    with guard.preparing():
+        if read == "stable":
+            with guard.stream_metadata(batch, alternatives):
+                assert node.can_batch(batch=batch, model_inputs=batch.inputs) is False
+        else:
+            reason = "final-row facts" if read == "final" else "unresolved stream metadata"
+            with pytest.raises(ValueError, match=reason), guard.stream_metadata(batch, alternatives):
+                node.can_batch(batch=batch, model_inputs=batch.inputs)
+    assert all(actual is expected for actual, expected in zip(
+        (batch.per_request_input_metadata, batch.per_request_info_wrapped, batch.stream_windows), original, strict=True,
+    ))
+    assert events == []
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
@@ -913,7 +997,8 @@ def test_streamed_alternatives_preserve_host_meaning_and_do_not_read_future_valu
                                   "packing", "packing_refuse", "direct", "direct_zero", "direct_eos",
                                   "direct_error", "direct_missing", "direct_walk", "direct_alias",
                                   "direct_spans", "direct_absent", "direct_shared",
-                                  "direct_repeat", "direct_short", "direct_one", "direct_skip", "direct_repeat_error"])
+                                  "direct_repeat", "direct_short", "direct_one", "direct_skip", "direct_repeat_error",
+                                  "metadata", "declared_key"])
 def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name, mode, monkeypatch):
     from dataclasses import replace
 
@@ -1127,12 +1212,37 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         if mode in {"direct_error", "direct_repeat_error"} and name == "b":
             batch.step_context.repeats = scheduled.repeats = 1
 
-    def reserve(batch):
+    def reserve(batch, *, capture_step=None):
         lease = leases[batch.node_name]
         batch.lease_slot(lease)
         return lease
     eng.reserve_replay_slot = reserve
     a, b = (pair[1] for pair in group.members)
+    declarations = []
+    if mode == "metadata":
+        ordinary_preprocess = eng._submodules["b"].submodule.preprocess
+        def preprocess(graph_walk, engine_inputs, inputs):
+            chunk = engine_inputs.per_request_info[2].metadata.stream_chunks["x"]
+            assert chunk is not None  # constant for every representative; still unresolved
+            return ordinary_preprocess(graph_walk, engine_inputs, inputs)
+        eng._submodules["b"].submodule.preprocess = preprocess
+    if mode == "declared_key":
+        from mstar.engine.resources.step import SubmoduleStep
+
+        node = eng._submodules["b"].submodule
+        def declare_step(*, slot_lease=None, **kwargs):
+            declarations.append(slot_lease)
+            return SubmoduleStep(segments=[], steps={})
+        node.declare_step = declare_step
+        node.cg_key_info = lambda *a, **kw: pytest.fail("capture key must come from certified prepared inputs")
+        eng._walk_lanes = {}
+        runner = eng._submodules["b"].accelerator_graph_runner
+        runner.lease_slot = lambda **kwargs: leases["b"]
+        original_reserve = eng.reserve_replay_slot
+        eng.reserve_replay_slot = lambda batch, **kw: (
+            Engine.reserve_replay_slot(eng, batch, **kw) if batch.node_name == "b"
+            else original_reserve(batch, **kw)
+        )
     from mstar.worker.stream_buffers import StreamBufferManager
     from mstar.worker.worker import PendingBatch, Worker
 
@@ -1174,7 +1284,7 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
     output = eng.exec_group(group)
     if mode in {"unsupported", "bank_small", "tail_wide", "producer_tail", "packing_refuse",
                 "direct_missing", "direct_walk", "direct_alias", "direct_spans", "direct_absent",
-                "direct_shared"}:
+                "direct_shared", "metadata"}:
         assert output is None and group.refusal is not None
         assert not group.submitted and not launches
         if packing:
@@ -1184,6 +1294,8 @@ def test_streamed_engine_composes_independent_bodies_and_owner_reads(device_name
         assert ring.ring_room("x", 2) == (6 if direct else 8)
         return
     assert output is not None, group.refusal
+    if mode == "declared_key":
+        assert declarations == [None, leases["b"]], "preview is discarded; the padded leased step is declared afresh"
     if device_name == "cuda":
         backend.synchronize()
     assert launches == [1]

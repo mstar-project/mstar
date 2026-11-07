@@ -2425,23 +2425,20 @@ class Engine:
                 cg_runner.release(lease, real_bs)
             laps.lap("release")
 
-    def _prepare_stream_choices(self, batch: ExecutingBatch, maker: str, signal: str, prototype: torch.Tensor, guard):
+    def _prepare_stream_choices(self, batch: ExecutingBatch, maker: str, signal: str,
+                                prototype: torch.Tensor, guard, rid: int):
         """Certify each ordinary policy pop before selecting one on the device.
 
         Only structural input changes are allowed. Compute choices must have
-        identical host inputs and resource declarations; an empty final pop
+        identical prepared inputs; an empty final pop
         may complete without a forward. The stream owner keeps the decisions.
         """
-        if len(batch.request_ids) != 1:
-            guard.refuse("independently ready streamed rows need descriptor-addressed outputs")
-        rid = batch.request_ids[0]
         edges = [edge for edge in batch.stream_windows.get(rid, ()) if edge.name == signal]
         if len(edges) != 1 or edges[0].chunk.reservation is None or not edges[0].chunk.reservation.decisions:
             guard.refuse("a connected stream has no retained policy decisions")
         reservation = edges[0].chunk.reservation
         choices = []
         reference = None
-        mgmt = self._submodules[batch.node_name]
         for transition in reservation.transitions:
             chunk = transition.chunk._replace(reservation=None)
             if chunk.num_items > prototype.shape[0]:
@@ -2456,11 +2453,14 @@ class Engine:
             metadata = batch.per_request_input_metadata.get(rid, EMPTY_INPUT_METADATA)
             metadata = metadata._replace(stream_chunks={**metadata.stream_chunks, signal: chunk})
             candidate = dataclasses.replace(
-                batch, step_context=dataclasses.replace(batch.step_context),
+                batch, step_context=dataclasses.replace(batch.step_context, request_ids=[rid],
+                                                        _padded_request_ids=None, _real_rids=None),
+                per_request_info={rid: batch.per_request_info[rid]},
                 per_request_input_tensors={rid: tensors}, per_request_input_metadata={rid: metadata},
+                stream_windows={rid: batch.stream_windows[rid]},
                 inputs=None, prepared_rids=(), skipped_rids=set(), cached_rids=set(), failed_requests={},
                 final_stream_rids={rid} if chunk.is_final else set(),
-                partition_done_rids=set(batch.partition_done_rids),
+                partition_done_rids=batch.partition_done_rids & {rid},
             )
             with guard.isolated_info(candidate):
                 self.prepare_inputs(candidate)
@@ -2471,17 +2471,9 @@ class Engine:
                         guard.refuse("only an empty final policy chunk may finish without computation")
                     choices.append(None)
                     continue
-                with watch_table_reads() as reads:
-                    declaration = self._declare_step(
-                        candidate, candidate.request_ids, candidate.inputs, mgmt.submodule,
-                        candidate.step_context, None,
-                    )
-                _refuse_counter_read(batch.node_name, candidate.step_context, reads, "declare_step")
-                shape = (candidate.inputs, None if declaration is None else declaration.steps)
-                guard.require_real(shape[1], "streamed resource declarations")
-                if reference is not None and not guard.same(reference, shape):
-                    guard.refuse("policy alternatives change prepared host inputs or resource declarations")
-                reference = shape
+                if reference is not None and not guard.same(reference, candidate.inputs):
+                    guard.refuse("policy alternatives change prepared host inputs")
+                reference = candidate.inputs
             choices.append(candidate)
         return choices
 
@@ -2631,6 +2623,7 @@ class Engine:
         composed = None
         try:
             with torch.no_grad(), guard.preparing(), ExitStack() as preparation:
+                metadata_preparation = ExitStack()
                 if not active or any(finished[batch.node_name] for _, batch in active):
                     guard.refuse("connected member retirement needs a uniform claimed row set")
                 if streamed and (len(rows) != 1 or len(group.members) != 2 or len(group.unit.streaming_edges) != 1
@@ -2638,6 +2631,7 @@ class Engine:
                     guard.refuse("streamed composition currently needs two members and one logical row")
                 for _, batch in active:
                     preparation.enter_context(guard.isolated_info(batch))
+                preparation.enter_context(metadata_preparation)
                 repeats = active[0][1].step_context.repeats
                 if not streamed and any(batch.step_context.repeats != repeats for _, batch in active):
                     guard.refuse("members requested different iteration counts")
@@ -2696,7 +2690,7 @@ class Engine:
                         maker, signal = stream_incoming[0]
                         source = self._submodules[maker].loopback_rows
                         stream_choices = self._prepare_stream_choices(
-                            batch, maker, signal, source.row(signal, rows[0]), guard,
+                            batch, maker, signal, source.row(signal, rows[0]), guard, rows[0],
                         )
                         reference = next((choice for choice in stream_choices if choice is not None), None)
                         if reference is None:
@@ -2705,7 +2699,13 @@ class Engine:
                         batch.per_request_input_metadata = reference.per_request_input_metadata
                         batch.per_request_info_wrapped = reference.per_request_info_wrapped
                         batch.inputs, batch.prepared_rids = reference.inputs, reference.prepared_rids
-                        batch.running_batched, batch.kept_rows = reference.running_batched, reference.kept_rows
+                        batch.kept_rows = reference.kept_rows
+                        batch.final_stream_rids = reference.final_stream_rids
+                        metadata_preparation.enter_context(guard.stream_metadata(batch, {
+                            rows[0]: {signal: tuple(choice.per_request_input_metadata[rows[0]].stream_chunks[signal]
+                                                   for choice in stream_choices if choice is not None)},
+                        }))
+                        batch.running_batched = submodule.can_batch(batch=batch, model_inputs=batch.inputs)
                     for maker, signal in (() if stream_incoming else incoming):
                         maker_mgmt = self._submodules[maker]
                         maker_slot = maker_mgmt.accelerator_graph_runner.slot_for(leases[maker])
@@ -2751,7 +2751,24 @@ class Engine:
                     # still-live component slot from the preceding step.
                     if mgmt.slot_rotation in slots:
                         batch.set_slot(slots[mgmt.slot_rotation])
-                    lease = self.reserve_replay_slot(batch)
+                    preview = None
+                    if stream_incoming:
+                        if mgmt.piecewise_runners:
+                            guard.refuse("streamed capture selection needs a whole-step declaration")
+                        # The existing declaration derives the capture key
+                        # from certified inputs, without reading an arbitrary
+                        # policy alternative in cg_key_info. This unpadded
+                        # preview is never admitted or planned.
+                        with watch_table_reads() as reads:
+                            preview = engine_step(
+                                submodule, graph_walk=batch.graph_walk, request_ids=batch.request_ids,
+                                inputs=batch.inputs, slot_lease=None, piecewise_leases={},
+                                per_request_info=batch.per_request_info,
+                            )
+                        _refuse_counter_read(batch.node_name, batch.step_context, reads, "declare_step")
+                        guard.require_real(preview, "streamed capture declaration")
+                    lease = (self.reserve_replay_slot(batch, capture_step=preview) if preview is not None
+                             else self.reserve_replay_slot(batch))
                     if lease is None:
                         guard.refuse("a member has no capture for the common rows")
                     slots.setdefault(mgmt.slot_rotation, lease.slot)
@@ -2784,6 +2801,8 @@ class Engine:
                     _refuse_counter_read(batch.node_name, batch.step_context, reads, "declare_step")
                     if batch.step is not None:
                         batch.step.set_ctx(batch.step_context)
+                        if preview is not None and batch.step.cg_key_info != preview.cg_key_info:
+                            guard.refuse("padded streamed declaration changes its capture key")
                         guard.require_real(batch.step.steps, "resource declarations")
                         for resource_step in batch.step.steps.values():
                             if getattr(resource_step, "pre_forks", ()) or getattr(resource_step, "post_forks", ()):
@@ -2842,16 +2861,6 @@ class Engine:
                     guard.require_real(batch.step_context.plan_results, "resource plans")
                     runner = mgmt.accelerator_graph_runner
                     slot = runner.slot_for(lease)
-                    if streamed and incoming:
-                        for choice in (part for part in stream_choices if part is not None):
-                            choice.step_context = batch.step_context
-                            choice.step = batch.step
-                            _, alternative = self._preprocess_step(
-                                choice, mgmt, choice.request_ids, choice.inputs, choice.per_request_info_wrapped,
-                                choice.step_context, lease, choice.step,
-                            )
-                            if not guard.same(values, alternative):
-                                guard.refuse("policy alternatives change independent staged values or packing")
                     row_inputs = {name: signal for signal, name in slot.row_heads.items()}
 
                     def destinations(name, copies, mgmt=mgmt, slot=slot, batch=batch, row_inputs=row_inputs):
@@ -2923,6 +2932,10 @@ class Engine:
                         *self._runner.replay_columns(batch.step, repeats),
                     ]
                     group.parts.append(RunPart(slot, copies, columns))
+                # Model preparation is over. Owner staging below reads the
+                # retained policy receipts themselves, not a model-visible
+                # representative of an unresolved decision.
+                metadata_preparation.close()
                 if streamed:
                     maker, consumer, signal = group.unit.streaming_edges[0]
                     batches = {batch.node_name: batch for _, batch in group.members}
@@ -5001,7 +5014,9 @@ class Engine:
         `Admission.admit_waiting`."""
         return self._runner.admit_waiting(published_of)
 
-    def reserve_replay_slot(self, batch: ExecutingBatch) -> SlotLease | None:
+    def reserve_replay_slot(
+        self, batch: ExecutingBatch, *, capture_step: SubmoduleStep | None = None,
+    ) -> SlotLease | None:
         """Lease the slot this batch will replay on, before it is dispatched.
 
         Reserving up front is what puts pre-plan(N+1) and replay(N) on
@@ -5038,7 +5053,7 @@ class Engine:
         # business (bagel: guidance on/off) — and the lease is taken before the
         # step is declared, so the submodule is asked directly. It answers from
         # the same per-request facts its `declare_step` stamps on the step.
-        key = submodule_mgmt.submodule.cg_key_info(
+        key = capture_step.cg_key_info if capture_step is not None else submodule_mgmt.submodule.cg_key_info(
             batch.step_context.graph_walk, batch.per_request_info_wrapped,
             per_request_input_metadata=batch.per_request_input_metadata,
         )
