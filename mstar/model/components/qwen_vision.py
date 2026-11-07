@@ -16,9 +16,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.qwen3_vit import VisionBlock, VisionPatchEmbed, VisionRotaryEmbedding
-
-# the tower's cacheless attention resource, by default
-VISION_ATTN = "vision_attn"
+from mstar.model.keys import VISION_ATTN
 
 
 @dataclass
