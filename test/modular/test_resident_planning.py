@@ -1910,6 +1910,77 @@ def test_fresh_resident_rows_preserve_a_queued_capture_and_ordinary_sequence(mon
     _slot_ledger(planner)
 
 
+@pytest.mark.parametrize("actual", [0, 2, 4])
+def test_engine_prepares_one_logical_joining_receipt_without_replanning(actual, monkeypatch):
+    from mstar.engine.engine import Engine, ExecutingBatch
+    from mstar.engine.resources.run_rows import RunRows
+
+    live = _resources(prefix_cache=False)
+    planner = _planner(live, max_bs=4)
+    runner = StepRunner(live)
+    for rid in (1, 2):
+        runner.ingest_request(rid, {"kv": KVReqConfig()})
+        _host_step(live, [rid], [3])
+    incumbent = _captured_step(live, planner, [1], slot=0, bs=4, repeats=4)
+    membership = RunRows(torch.device("cpu"), 4, 8, 2)
+    slot = SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership), window=None),
+                           row_heads={}, dummy_rids=(-1, -2, -3, -4))
+    eng = Engine.__new__(Engine)
+    eng._runner, eng._enable_nvtx = runner, False
+    eng._submodules = {"decode": SimpleNamespace(
+        resident=planner, submodule=None, device_stops={WALK: None},
+        accelerator_graph_runner=SimpleNamespace(slot_for=lambda lease: slot),
+    )}
+    active_step = SubmoduleStep({"kv": incumbent.kv, "pool": incumbent.pool, "rope": incumbent.rope})
+    active_step.set_ctx(incumbent.ctx)
+    active = ExecutingBatch("decode", {}, incumbent.ctx, step=active_step)
+    if actual == 0:
+        publish = membership.publish_row
+        def fail_publication(descriptor):
+            publish(descriptor)
+            raise ValueError("publication failed before launch")
+        with monkeypatch.context() as patch:
+            patch.setattr(membership, "publish_row", fail_publication)
+            with pytest.raises(ValueError, match="publication failed"):
+                eng._seed_run_rows(active, slot, [False])
+        assert membership.idle and not active.run_rows and not planner._readers.any()
+    eng._seed_run_rows(active, slot, [False])
+    ctx = StepContext((2,), WALK, 0, False, repeats=4)
+    segments = (Segment(2, "main", 1),)
+    step = SubmoduleStep({"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
+                          "pool": RecurrentStep(segments=segments)})
+    candidate = ExecutingBatch("decode", {}, ctx, inputs=[SimpleNamespace(input_seq_len=1)], step=step)
+    stamps = planner._plan_seq, planner._commits, planner._committed_seq
+    buffers = {key: (buf.rows.clone(), buf.cells.clone()) for key, buf in planner._buffers.items()}
+    with monkeypatch.context() as patch:
+        patch.setattr(runner, "plan", lambda *args: pytest.fail("joining replaced an active plan"))
+        pages = live["kv"]._arena.num_free
+        assert eng.admit_run_row(candidate, active, 0) is None  # the incumbent still owns this row
+        assert planner.slot_of(2) is None and live["kv"]._arena.num_free == pages
+        assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3
+        descriptor = eng.admit_run_row(candidate, active, 1)
+    assert descriptor is candidate.run_rows[2]
+    assert candidate.committed is step and ctx.counted == {2: runner.request_generation(2)}
+    assert membership.control[1:].tolist() == [0] * 3, "the worker attaches its receipt before publication"
+    assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 7
+    assert (planner._plan_seq, planner._commits, planner._committed_seq) == stamps
+    for key, (rows, cells) in buffers.items():
+        assert torch.equal(planner._buffers[key].rows, rows)
+        assert torch.equal(planner._buffers[key].cells, cells)
+    membership.publish_row(descriptor)
+    membership.drain()
+    membership.acknowledge(membership.control.tolist())
+    eng.settle_run(candidate, actual, {2: actual})
+    assert live["kv"]._streams[2]["main"].stored_len == live["rope"].position(2, "main") == 3 + actual
+    assert membership.release(descriptor)
+    planner.unpin((descriptor.bindings[0],))
+    for incumbent_descriptor in active.run_rows.values():
+        assert membership.release(incumbent_descriptor)
+        planner.unpin((incumbent_descriptor.bindings[0],))
+    assert membership.idle
+    _slot_ledger(planner)
+
+
 @pytest.mark.parametrize("first_count", [0, 1, 2])
 def test_joining_horizon_preserves_other_preplans_and_settles_both_receipts(monkeypatch, first_count):
     from mstar.engine.resources.step import AdmitFailedReason, AdmitOutcome
@@ -4094,6 +4165,11 @@ def test_captured_input_banks_hold_two_windows_after_source_growth_and_validate_
     inputs = {"cond": torch.zeros(1), "mask": torch.zeros(1, dtype=torch.bool)}
     fills = {"cond": -9, "mask": False}
     banks = [owner.prepare_window(key, inputs, 2, 2, 4, fills) for key in (lease, second)]
+    horizon = StepContext((1,), "decode", 0, False, slot_lease=lease, repeats=4)
+    owner.resident_binding().check_horizon(None, horizon)
+    horizon.repeats = 5
+    with pytest.raises(ValueError, match="horizon"):
+        owner.resident_binding().check_horizon(None, horizon)
     assert owner.prepare_window(replace(lease), inputs, 2, 2, 4, fills) is banks[0]
     with pytest.raises(ValueError, match="geometry changed"):
         owner.prepare_window(lease, inputs, 3, 2, 4, fills)

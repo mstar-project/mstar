@@ -26,7 +26,6 @@ from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.resident_hooks import (
     ResidentBinding,
     no_resident_effect,
-    unbound_horizon,
     unbounded_repeats,
 )
 from mstar.engine.resources.spec import NodeResourceSpec
@@ -120,10 +119,21 @@ class IterationTables(Resource):
             run_gather=no_resident_effect,
             commit_in_graph=no_resident_effect,
             advance=no_resident_effect,
-            check_horizon=unbound_horizon,
+            check_horizon=self._check_horizon,
             max_repeats=unbounded_repeats,
             rewind_run=no_resident_effect,
         )
+
+    def _check_horizon(self, step, ctx) -> None:
+        lease = ctx.slot_lease
+        window = None if lease is None else self._windows.get((lease.bucket, lease.buffer_slot))
+        if window is None:
+            raise ValueError("new iteration rows need their captured owner input bank")
+        if any(ctx.repeats > column.shape[1] for column in window.columns.values()):
+            raise ValueError("joining horizon exceeds its captured input bank")
+        # The publisher stages a validated immutable snapshot into fresh pinned
+        # resident slots before exposing its descriptor. This binding promises
+        # fixed storage; stream readiness/retention belongs to that snapshot.
 
     @staticmethod
     def window_bytes(slots: int, limit: int, entries: int, inputs: Mapping[str, torch.Tensor], bs: int) -> int:

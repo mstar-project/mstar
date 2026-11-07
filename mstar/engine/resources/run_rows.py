@@ -131,6 +131,11 @@ class RunRows(Resource):
     def build(cls, spec: RunRowsSpec, info: EngineResourceInfo) -> RunRows:
         return cls(info.device, spec.rows, spec.capacity, spec.binding_width)
 
+    @property
+    def idle(self) -> bool:
+        """Every publication and output reader from the previous window ended."""
+        return not self._descriptors
+
     def reserve_row(
         self, request_id: int, request_generation: int, row: int, bindings: Sequence[int],
     ) -> RunRow | None:

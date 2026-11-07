@@ -1156,7 +1156,7 @@ class RecurrentStatePool(Resource):
         if (self.config.prefix_slots or self._kv is not None or step.pre_forks or step.post_forks
                 or any(not self._slots.get(seg.request_id, {}).get(seg.label)
                        or not self._slots[seg.request_id][seg.label].has_state
-                       for seg in step.segments or ())):
+                       for seg in step.segments or () if ctx.is_real_row(seg.request_id))):
             raise ValueError("needs existing state without prefix snapshots or forks")
 
     def resident_binding(self) -> ResidentBinding:

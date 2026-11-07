@@ -72,6 +72,7 @@ from mstar.engine.resources.resident import (
     watch_table_reads,
     watched_counts,
 )
+from mstar.engine.resources.run_rows import RunRow
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -446,6 +447,8 @@ class ExecutingBatch:
     slot: int | None = None
     # how its run on the device began (``RunState.started``), for one that went on one
     run_started: torch.Tensor | None = None
+    # Descriptor readers owned by this ordinary logical step, until collection.
+    run_rows: dict[int, RunRow] = field(default_factory=dict)
 
     # Selects among a walk's capture buckets; matches SubmoduleStep.cg_key_info
     cg_key_info: Any | None = None
@@ -2703,6 +2706,134 @@ class Engine:
         self._add_resource_host_rows(submodule_mgmt, out, batch.step_context.repeats)
         return out
 
+    def _seed_run_rows(self, batch: ExecutingBatch, slot, immune: Sequence[bool]) -> None:
+        """Pin and publish incumbents before launching an empty membership window."""
+        membership = slot.run.state.membership
+        if not membership.idle or batch.run_rows:
+            raise ValueError("a joining capture must close its previous descriptor readers before reuse")
+        ctx = batch.step_context
+        if ctx.resident is None or batch.step is None or len(immune) != len(batch.request_ids):
+            raise ValueError("joining incumbents need their admitted resident step")
+        for key, binding in ctx.resident.bindings.items():
+            binding.check_horizon(batch.step.get(key), ctx)
+        pins = ctx.resident.pin(batch.request_ids)
+        execution = torch.cuda.current_stream(self._device) if membership.publication_stream is not None else None
+        if execution is not None:
+            membership.publication_stream.wait_stream(execution)
+        publication = torch.cuda.stream(membership.publication_stream) if execution is not None else nullcontext()
+        try:
+            with publication:
+                for row, (rid, resident, ignore) in enumerate(zip(batch.request_ids, pins, immune, strict=True)):
+                    descriptor = membership.reserve_row(
+                        rid, self._runner.request_generation(rid), row, (resident, int(ignore)),
+                    )
+                    if descriptor is None:
+                        raise ValueError("a fresh membership window lacks descriptor credits")
+                    batch.run_rows[rid] = descriptor
+                for descriptor in batch.run_rows.values():
+                    membership.publish_row(descriptor)
+            if execution is not None:
+                execution.wait_stream(membership.publication_stream)
+        except BaseException:
+            # No WHILE was submitted. Drain only this previously empty window,
+            # and finish queued copies before making owner rows reusable.
+            with torch.cuda.stream(membership.publication_stream) if execution is not None else nullcontext():
+                for descriptor in batch.run_rows.values():
+                    membership.cancel(descriptor)
+                membership.drain()
+            if execution is not None:
+                membership.publication_stream.synchronize()
+            membership.acknowledge(membership.control.cpu().tolist())
+            for descriptor in batch.run_rows.values():
+                membership.release(descriptor)
+            batch.run_rows.clear()
+            ctx.resident.unpin(pins)
+            raise
+
+    def admit_run_row(self, batch: ExecutingBatch, active: ExecutingBatch, row: int) -> RunRow | None:
+        """Prepare one ordinary logical step beside an active capture.
+
+        Called on its membership publication stream, after the worker takes
+        the ordinary graph in-flight flag/request hold. No host plan, capture
+        staging, or forward runs here. The worker attaches the returned receipt
+        before publishing its descriptor; an unpublished receipt can settle at
+        zero using the same actual-count path as an executed one.
+        """
+        if (batch.node_name != active.node_name or batch.graph_walk != active.graph_walk
+                or len(batch.request_ids) != 1 or batch.run_rows or batch.committed is not None
+                or batch.chunk_ranges or batch.step_context.request_walks):
+            raise ValueError("joining needs one fresh ordinary row of the active walk")
+        mgmt = self._submodules[batch.node_name]
+        lease = active.step_context.slot_lease
+        if lease is None or mgmt.resident is None:
+            raise ValueError("joining needs an active resident capture")
+        slot = mgmt.accelerator_graph_runner.slot_for(lease)
+        membership = None if slot.run is None else slot.run.state.membership
+        if membership is None or not 0 <= row < lease.bucket.bs:
+            raise ValueError("joining row falls outside the active membership capture")
+        membership._check_publication_stream()
+        if set(active.run_rows) != set(active.request_ids):
+            raise ValueError("joining needs pinned incumbent descriptor readers")
+        ctx = batch.step_context
+        if ctx.repeats > active.step_context.repeats or ctx.repeats < 1:
+            raise ValueError("joining horizon exceeds the active capture")
+        if batch.inputs is None or batch.failed_requests or batch.skipped_rids or batch.cached_rids:
+            raise ValueError("joining needs a successfully prepared ordinary row")
+        if slot.row_heads and batch.kept_rows != [True]:
+            raise ValueError("joining needs its loop-back inputs already held by their owner")
+        rid = batch.request_ids[0]
+        ctx.slot, ctx.slot_lease, ctx.resident = lease.slot, lease, mgmt.resident
+        step = batch.step = self._declare_step(batch, [rid], batch.inputs, mgmt.submodule, ctx, batch.step)
+        if step is None or step.cg_key_info != node_capture_key(lease.bucket.cg_key_info):
+            raise ValueError("joining step does not match the active capture declaration")
+        step.set_ctx(ctx)
+        outcome = self._runner.admit_rows(step)
+        if not outcome.ok:
+            return None  # admit_rows already unwound this candidate alone
+        plan = descriptor = None
+        try:
+            if not outcome.ready:
+                return None
+            plan = ctx.resident.prepare_rows(step, ctx)
+            if slot.run.window is not None:
+                loop = self._loops[batch.node_name, batch.graph_walk]
+                padded = [rid, *slot.dummy_rids[1:]]
+                snapshot = self._iteration_columns(
+                    batch.node_name, mgmt.submodule, ctx, padded, batch.per_request_info_wrapped,
+                    batch.per_request_input_tensors, actual_loop=loop,
+                )
+                mgmt.submodule.iteration_tables.stage_window(
+                    lease, plan.slots.tolist(), snapshot, stager=membership.stager,
+                )
+                batch.iteration_columns = snapshot
+            policy = mgmt.device_stops[batch.graph_walk]
+            immune = policy is not None and policy.limits(batch.per_request_info_wrapped[rid]).ignore_eos
+            descriptor = membership.reserve_row(
+                rid, self._runner.request_generation(rid), row, (int(plan.slots[0]), int(immune)),
+            )
+            if descriptor is None:
+                return None
+            ctx.resident.flush(plan, stager=membership.stager)
+            self._runner.commit(step, track_rows=True)
+            batch.committed = step
+            ctx.resident_plan = plan
+            batch.run_rows[rid] = descriptor
+            ctx.resident.advance(plan)
+            return descriptor
+        finally:
+            if batch.committed is None:
+                # Failed preparation may have queued writes into the candidate's
+                # private rows. Finish those before releasing/reusing owners.
+                if membership.publication_stream is not None:
+                    membership.publication_stream.synchronize()
+                if descriptor is not None:
+                    membership.cancel(descriptor)
+                    membership.release(descriptor)
+                if plan is not None:
+                    ctx.resident.release(rid)
+                    ctx.resident.unpin(tuple(plan.slots.tolist()))
+                self._runner.rollback_admit(step)
+
     def finish_run_outputs(self, batch: ExecutingBatch, outputs: BatchedModelOutput) -> None:
         """Finish a retained capture after all descriptor copies are enqueued.
 
@@ -3256,11 +3387,10 @@ class Engine:
             if slot.run is not None:
                 policy = submodule_mgmt.device_stops[graph_walk]
                 infos = engine_inputs.per_request_info
-                slot.run.state.stage(
-                    len(request_ids),
-                    [policy is not None and policy.limits(infos[rid]).ignore_eos for rid in request_ids],
-                    ctx.repeats, submodule_mgmt.refills[graph_walk],
-                )
+                immune = [policy is not None and policy.limits(infos[rid]).ignore_eos for rid in request_ids]
+                slot.run.state.stage(len(request_ids), immune, ctx.repeats, submodule_mgmt.refills[graph_walk])
+                if slot.run.state.membership is not None:
+                    self._seed_run_rows(batch, slot, immune)
                 if slot.run.window is not None:
                     submodule_mgmt.submodule.iteration_tables.stage_window(
                         lease, ctx.resident_plan.slots.tolist(), batch.iteration_columns,
@@ -3277,7 +3407,7 @@ class Engine:
                 plan_done_event=batch.preplan_event,
                 launch_started_event=release_event,
             )
-            if ctx.repeats > 1 and slot.run is not None:
+            if slot.run is not None and (ctx.repeats > 1 or slot.run.state.membership is not None):
                 stops, rows, spans = slot.run.results(ctx.repeats)
                 out = dataclasses.replace(
                     out, check_stop_buffers=stops, row_outputs={**(out.row_outputs or {}), **rows},

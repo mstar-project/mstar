@@ -1416,6 +1416,10 @@ class AcceleratorGraphRunner:
             self._run_failures[walk] = "planner: actual Loop progress needs resident loop-back rows"
             return None, None, None
         if ask.membership is not None:
+            uncovered = set(warmed.static_input_keys) - set(warmed.row_heads.values()) - set(ask.iteration)
+            if uncovered:
+                self._run_failures[walk] = f"resource: joining inputs have no execution-time owner: {sorted(uncovered)}"
+                return None, None, None
             if ask.carries:
                 self._run_failures[walk] = "resource: joining rows require owner-backed carries"
                 return None, None, None

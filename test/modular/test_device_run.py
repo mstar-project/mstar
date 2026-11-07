@@ -90,7 +90,7 @@ class _Loop:
 
 def _runner(
     monkeypatch, loop, tokens, bs=2, limit=6, refill_at=None, carries=None, stream_tokens=False, counted=False,
-    progress=False, membership=None,
+    progress=False, membership=None, unmanaged=False,
 ):
     """A runner holding a captured run whose forward samples ``tokens[iteration]``."""
     monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
@@ -127,7 +127,9 @@ def _runner(
     runner.ask_run(WALK, RunAsk(None if counted else "new_token", frozenset() if counted else frozenset({EOS}),
                                 False, limit, carries or {}, ("frame",), ("cond",),
                                 refill_at, stream_tokens, layout, membership))
-    static = {"cond": torch.zeros(bs), "h": torch.zeros(bs)}
+    static = {"cond": torch.zeros(bs)}
+    if membership is None or unmanaged:
+        static["h"] = torch.zeros(bs)
     calls = []
 
     def forward(in_run=False, select_inputs=None):
@@ -143,7 +145,7 @@ def _runner(
             runner.test_resource.index_add_(0, resident.slots, static["cond"])
         return BatchedModelOutput(
             check_stop_buffers={} if counted else {"new_token": token},
-            row_outputs={"frame": token.float() * 2, "h": static["h"] + 1},
+            row_outputs={"frame": token.float() * 2, "h": static.get("h", torch.zeros(bs)) + 1},
         )
 
     def capture(body, *args, **kwargs):
@@ -151,12 +153,14 @@ def _runner(
         loop.capturing(body)
         out = body()
         calls.clear()  # capture records; it doesn't run
-        static["h"].zero_()
+        if "h" in static:
+            static["h"].zero_()
         return SimpleNamespace(raw_cuda_graph=lambda: 7), out
 
     monkeypatch.setattr(runner_mod, "capture_into_graph", capture)
     spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0, config=SimpleNamespace(get_config_type=lambda: None))
-    warmed = SimpleNamespace(run=forward, static_inputs=static, output=None, resident=resident)
+    warmed = SimpleNamespace(run=forward, static_inputs=static, static_input_keys=tuple(static),
+                             row_heads={}, output=None, resident=resident)
     run, _, _ = runner._capture_run(spec, warmed)
     if run is not None:
         run.test_inputs = (runner._resources[tables_key("n")], SlotLease(0, spec.bucket), list(range(1, bs + 1)))
@@ -1401,6 +1405,9 @@ def test_captured_membership_uses_one_owner_snapshot_and_keeps_output_identity_t
     from mstar.engine.resources.run_rows import RunRows
 
     membership = RunRows(CPU, rows=3, capacity=4, binding_width=2)
+    _, refused, _, _ = _runner(monkeypatch, _Loop(), [[0, 0]], bs=2, limit=5,
+                               progress=True, membership=membership, unmanaged=True)
+    assert refused is None  # a live join must not inherit an incumbent's private static input
     loop = _Loop()
     runner, run, _, _ = _runner(monkeypatch, loop, [[0, 0]], bs=2, limit=5,
                               progress=True, stream_tokens=True, membership=membership)
