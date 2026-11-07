@@ -47,6 +47,7 @@ from mstar.conductor.request_info import (
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
+    BlockCausalAttentionSpec,
     KVReqConfig,
     KVSpec,
     NodeResourceSpec,
@@ -83,7 +84,14 @@ from mstar.model.chatterbox.loader import resolve_snapshot
 from mstar.model.cosyvoice3.config import (
     END_OF_PROMPT,
     END_OF_PROMPT_ID,
+    FLOW_ATTN,
+    FLOW_COND_LABEL,
+    FLOW_KV,
+    FLOW_KV_PAGE_FRAMES,
     FLOW_NODE,
+    FLOW_TAILS,
+    FLOW_TAILS_LABEL,
+    FLOW_UNCOND_LABEL,
     HIFT_NODE,
     HIFT_STATE,
     HIFT_STATE_LABEL,
@@ -111,6 +119,7 @@ from mstar.model.cosyvoice3.submodules import (
     PROMPT_TOKENS,
     REF_AUDIO,
     SPEECH_TOKENS,
+    TAILS_BLOCK,
     TEXT_INPUTS,
     VOICE_KEY,
     reference_tokens,
@@ -145,6 +154,8 @@ MAX_TEMPERATURE = 5.0
 MAX_RAS_WINDOW = 64
 # Requests the vocoder's state pool holds, past any request cap in configs/
 HIFT_STATE_REQUESTS = 128
+# What the flow's pools hold by default, as configs/cosyvoice3.yaml's request cap
+DEFAULT_FLOW_REQUESTS = 32
 
 
 def _sizes(name: str, values: Any) -> tuple[int, ...]:
@@ -180,6 +191,9 @@ class CosyVoice3Model(Model):
         flow_capture_batch_frames: int | None = None,
         hift_capture_frame_buckets: list[int] | None = None,
         hift_capture_batch_sizes: list[int] | None = None,
+        flow_cache_frames: int | None = None,
+        flow_new_frame_buckets: list[int] | None = None,
+        flow_new_batch_sizes: list[int] | None = None,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -221,6 +235,13 @@ class CosyVoice3Model(Model):
                 f"the largest hift_capture_frame_buckets must hold more than a stream's {needed} frames of "
                 "tail and pending mel"
             )
+        if flow_cache_frames is not None:
+            cfg.flow_cache_frames = _integer("flow_cache_frames", flow_cache_frames, low=0)
+        if flow_new_frame_buckets is not None:
+            cfg.flow_new_frame_buckets = _sizes("flow_new_frame_buckets", flow_new_frame_buckets)
+        if flow_new_batch_sizes is not None:
+            cfg.flow_new_batch_sizes = _sizes("flow_new_batch_sizes", flow_new_batch_sizes)
+        self._settle_flow_cache()
         if max_new_tokens_limit is not None:
             cfg.max_new_tokens_limit = _integer(
                 "max_new_tokens_limit",
@@ -237,6 +258,27 @@ class CosyVoice3Model(Model):
         self.tokenizer = self._build_text_tokenizer()
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
         self._shared: dict[str, Any] = {}
+
+    def _settle_flow_cache(self) -> None:
+        """Turn incremental solves off where they can't run: they need the streaming
+        attention mask, captured regions, and an estimator in the KV cache's dtype,
+        since FlashInfer's kernels have no float32."""
+        cfg = self.config
+        if not (
+            cfg.stream_hop_tokens
+            and cfg.flow_new_frame_buckets
+            and cfg.flow_new_batch_sizes
+            and cfg.flow_estimator_dtype.lower() in ("bfloat16", "bf16")
+            and self._lm_dtype == torch.bfloat16
+        ):
+            cfg.flow_cache_frames = 0
+        if cfg.flow_cache_frames > max(cfg.flow_new_frame_buckets, default=0):
+            raise ValueError(
+                f"flow_cache_frames {cfg.flow_cache_frames} is past the largest flow_new_frame_buckets "
+                f"{max(cfg.flow_new_frame_buckets)}: a row's first solve could fit no capture"
+            )
+        if cfg.flow_cache_frames % FLOW_KV_PAGE_FRAMES:
+            raise ValueError(f"flow_cache_frames must be a multiple of {FLOW_KV_PAGE_FRAMES}")
 
     def _build_text_tokenizer(self):
         from mstar.model.cosyvoice3.components.text import CosyVoice3TextTokenizer
@@ -260,6 +302,18 @@ class CosyVoice3Model(Model):
         """Refuse a request cap the LM KV pool cannot hold: nothing preempts a
         stream once the pool is full."""
         check_kv_pools_fit(self, config, config_path, logger)
+        cap = config.get("max_concurrent_requests")
+        if self.config.flow_cache_frames and cap:
+            # the common check counts one stream a request, and a row keeps two
+            pages = (config.get("resources", {}).get(FLOW_KV) or {}).get("max_num_pages", self._flow_kv_pages(cap))
+            if pages < self._flow_kv_pages(cap):
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent requests need {self._flow_kv_pages(cap)} pages of "
+                    f"resources.{FLOW_KV}: each keeps two streams of {self.config.flow_cache_frames} frames"
+                )
+
+    def _flow_kv_pages(self, requests: int) -> int:
+        return 1 + requests * 2 * -(-self.config.flow_cache_frames // FLOW_KV_PAGE_FRAMES)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         lm = self.config.lm
@@ -279,7 +333,52 @@ class CosyVoice3Model(Model):
                 config=PositionConfig(kv_cache=LM_KV, rope_theta=lm.rope_theta),
             ),
         ]
-        return specs + hift_state_specs(self.config)
+        return specs + hift_state_specs(self.config) + self._flow_resources()
+
+    def _flow_resources(self) -> list[NodeResourceSpec]:
+        cfg = self.config
+        if not cfg.flow_cache_frames:
+            return []
+        dit = cfg.flow.dit
+        steps = cfg.flow.cfm.n_timesteps
+        return [
+            # one layer per DiT block per Euler step: each sees its own K/V of the frames before it
+            KVSpec(
+                resource_key=FLOW_KV,
+                nodes={FLOW_NODE},
+                config=PagedKVConfig(
+                    num_layers=dit.depth * steps,
+                    num_kv_heads=dit.heads,
+                    num_qo_heads=dit.heads,
+                    head_dim=dit.dim_head,
+                    max_seq_len=cfg.flow_cache_frames,
+                    max_num_pages=self._flow_kv_pages(DEFAULT_FLOW_REQUESTS),
+                    page_size=FLOW_KV_PAGE_FRAMES,
+                    prefix_cache=False,
+                ),
+            ),
+            BlockCausalAttentionSpec(
+                resource_key=FLOW_ATTN,
+                nodes={FLOW_NODE},
+                config=AttentionConfig(kv_cache=FLOW_KV),
+                block_size=dit.static_chunk_size,
+            ),
+            RecurrentStateSpec(
+                resource_key=FLOW_TAILS,
+                nodes={FLOW_NODE},
+                config=RecurrentStateConfig(
+                    num_layers=1,
+                    # Euler step, CFG branch, convolution: the kernel's left context
+                    blocks={
+                        TAILS_BLOCK: RecurrentBlockConfig(
+                            shape=(4 * steps, dit.conv_pos_kernel - 1, dit.dim), dtype=None, per_layer=False,
+                        )
+                    },
+                    max_slots=2 * DEFAULT_FLOW_REQUESTS,
+                    labels=(FLOW_TAILS_LABEL,),
+                ),
+            ),
+        ]
 
     def get_request_resource_configs(
         self,
@@ -287,7 +386,10 @@ class CosyVoice3Model(Model):
         model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
         del partition_fwd_args, model_kwargs
-        return {LM_KV: KVReqConfig(needed_labels=[LM_LABEL])}
+        configs: dict[str, ResourceReqConfig] = {LM_KV: KVReqConfig(needed_labels=[LM_LABEL])}
+        if self.config.flow_cache_frames:
+            configs[FLOW_KV] = KVReqConfig(needed_labels=[FLOW_COND_LABEL, FLOW_UNCOND_LABEL])
+        return configs
 
     def resolve_generation_kwargs(self, model_kwargs: dict | None) -> dict[str, Any]:
         """Every public knob, defaulted and range-checked, so a bad value is a
@@ -337,7 +439,15 @@ class CosyVoice3Model(Model):
         return {DECODE_LOOP: max(1, budget - 1)}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {LM_KV: {LM_LABEL: KVLabel(growth=(("decode", DECODE_LOOP),))}}
+        labels = {LM_KV: {LM_LABEL: KVLabel(growth=(("decode", DECODE_LOOP),))}}
+        if self.config.flow_cache_frames:
+            labels[FLOW_KV] = {FLOW_COND_LABEL: KVLabel(), FLOW_UNCOND_LABEL: KVLabel()}
+        return labels
+
+    def _flow_layout(self) -> LabelLayout:
+        """At most a row's budget; hops decide how it splits into steps."""
+        frames = self.config.flow_cache_frames
+        return LabelLayout(spans=(Span("rows", "token2wav", frames, frames, SPEECH_TOKENS),))
 
     @staticmethod
     def _lm_layout(walk: str, text_tokens: int, prompt_tokens: int) -> LabelLayout:
@@ -595,7 +705,14 @@ class CosyVoice3Model(Model):
                 MAX_SPEECH_TOKENS: max(max_len, 1),
                 VOICE_KEY: int(voice_key_for(wav)[0]),
                 PROMPT_MODE: mode,
-                "kv_layout": {LM_KV: {LM_LABEL: layout}},
+                "kv_layout": {
+                    LM_KV: {LM_LABEL: layout},
+                    **(
+                        {FLOW_KV: {FLOW_COND_LABEL: self._flow_layout(), FLOW_UNCOND_LABEL: self._flow_layout()}}
+                        if self.config.flow_cache_frames
+                        else {}
+                    ),
+                },
             },
         )
 

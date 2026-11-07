@@ -50,7 +50,7 @@ from torch import nn
 
 from mstar.model.chatterbox.components.s3gen_cfm import CausalConditionalCFM
 from mstar.model.chatterbox.loader import load_component
-from mstar.model.cosyvoice3.components.dit import DiT, chunk_attention_mask
+from mstar.model.cosyvoice3.components.dit import DiT, PackedRows, chunk_attention_mask
 from mstar.model.cosyvoice3.config import FlowConfig
 from mstar.utils.h2d import PinnedStager
 
@@ -89,6 +89,17 @@ class SolveInputs(NamedTuple):
     spks: torch.Tensor  # [B, 80] projected x-vector
     valid: torch.Tensor  # [B] long, frames each row attends to (prompt and settled tokens)
     streaming: torch.Tensor  # [B] bool, block-causal attention
+
+
+class NewFramesInputs(NamedTuple):
+    """A batch's new frames, packed: the fixed-shape input of ``solve_new_frames``.
+    Padded buffers leave zeros past the real tokens and rows (``PackedRows``)."""
+
+    noise: torch.Tensor  # [T, 80]
+    mu: torch.Tensor  # [T, 80]
+    cond: torch.Tensor  # [T, 80]
+    spks: torch.Tensor  # [T, 80]
+    rows: PackedRows
 
 
 class PreLookaheadLayer(nn.Module):
@@ -217,6 +228,30 @@ class CosyVoice3Flow(nn.Module):
         mask = chunk_attention_mask(inputs.valid, frames, cfg.dit.static_chunk_size, inputs.streaming)
         noise = self.noise[:, :, :frames].to(self.device, self.dtype).expand(batch, -1, -1).contiguous()
         return self.decoder.solve(inputs.mu, mask, inputs.spks, inputs.cond, noise, n_timesteps)
+
+    @torch.no_grad()
+    def solve_new_frames(
+        self, inputs: NewFramesInputs, tails: torch.Tensor, attend, n_timesteps: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The Euler solve of a batch's new frames, with the K/V of every frame before
+        them in the cache ``attend`` reads: ``[T, 80]`` mel and the rows' next tails.
+        ``tails`` is ``[B, S * 4, K-1, D]``: Euler step, CFG branch, convolution."""
+        estimator, rate = self.decoder.estimator, self.decoder.config.inference_cfg_rate
+        x = inputs.noise
+        t_span = self.decoder.time_grid(n_timesteps, x.device, x.dtype, meanflow=False)
+        depth = estimator.config.depth
+        b, _, width, dim = tails.shape
+        # [S, branch, convolution, B, K-1, D]
+        state = tails.reshape(b, n_timesteps, 2, 2, width, dim).permute(1, 2, 3, 0, 4, 5)
+        next_state = []
+        for i, (t, r) in enumerate(zip(t_span[:-1], t_span[1:], strict=True)):
+            v, tail = estimator.forward_new_frames(
+                x, inputs.cond, inputs.mu, inputs.spks, t, state[i], inputs.rows, attend, i * depth,
+            )
+            next_state.append(tail)
+            v = v.to(x.dtype)
+            x = x + (r - t) * ((1.0 + rate) * v[0] - rate * v[1])
+        return x, torch.stack(next_state).permute(3, 0, 1, 2, 4, 5).reshape(tails.shape)
 
     def row_mels(self, rows: Sequence[CosyVoice3FlowRow], mel: torch.Tensor) -> list[torch.Tensor]:
         """Each row's generated frames ``[80, 2 * settle]`` of a batched solve."""

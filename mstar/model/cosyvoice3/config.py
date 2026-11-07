@@ -37,6 +37,15 @@ LM_LABEL = "main"
 # Resource keys (vocoder node)
 HIFT_STATE = "hift_state"
 HIFT_STATE_LABEL = "main"
+# Resource keys (flow node): what a request's streamed solves keep between hops
+FLOW_KV = "flow_kv"
+FLOW_ATTN = "flow_attn"
+FLOW_TAILS = "flow_tails"
+FLOW_COND_LABEL = "cond"
+FLOW_UNCOND_LABEL = "uncond"
+FLOW_CFG_LABEL = "cfg"
+FLOW_TAILS_LABEL = "main"
+FLOW_KV_PAGE_FRAMES = 64
 
 # Node names
 SPEAKER_ENCODER_NODE = "speaker_encoder"
@@ -248,6 +257,18 @@ class CosyVoice3Config:
     # (``hift_context_frames = 0``), runs ``stream_vocode`` eagerly instead.
     hift_capture_frame_buckets: tuple[int, ...] = (128, 192, 256, 320, 400)
     hift_capture_batch_sizes: tuple[int, ...] = (1, 2, 4, 8)
+    # A streamed row keeps its solved frames' K/V per Euler step and CFG branch
+    # (about 1.8 MB a frame) and solves only new frames each hop, which attention's
+    # block-causal mask makes exact. Past this many frames a row goes back to
+    # re-solving all of them, which keeps the pool's size bounded. 0 re-solves every hop.
+    flow_cache_frames: int = 768
+    # Captured incremental solves: one per total new frames of a batch and batch size.
+    # The largest must hold a row's whole budget.
+    flow_new_frame_buckets: tuple[int, ...] = (
+        64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048, 2304,
+        2560, 3200,
+    )
+    flow_new_batch_sizes: tuple[int, ...] = (1, 2, 4, 8)
 
     @property
     def hift_captured(self) -> bool:
