@@ -3,11 +3,13 @@ they divide into, the parallel groups each worker is handed, and the weights
 that pick a request's replica among them."""
 
 from collections.abc import Iterator, Mapping, Sequence
+from copy import copy
 from typing import Any
 
 from mstar.conductor.routing import RoutingWeights
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig
+from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
 from mstar.model.base import Model, WorkerGraph
@@ -492,6 +494,16 @@ def _worker_parallelism(
                 f"Resource spec {spec.resource_key} nodes {sorted(spec.nodes)} "
                 "must use the same TP x SP shape across replicas"
             )
+        if isinstance(spec, KVSpec):
+            for shards in sorted({
+                any_worker.get_instance_world_size_for_node(node) for node in spec.nodes & all_nodes
+            }):
+                try:
+                    # Run the worker's geometry check without narrowing the
+                    # model's declaration before the real resource is built.
+                    copy(spec.config).shard(shards)
+                except ValueError as exc:
+                    yield f"Resource {spec.resource_key}: {exc}"
         shared: dict[tuple[str, ...], list[str]] = {}
         for wid, nodes in deployed.items():
             local = spec.nodes & nodes
