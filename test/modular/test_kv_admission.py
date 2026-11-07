@@ -1,7 +1,7 @@
-"""A request is admitted only once its prompt fits, in the order requests first asked.
+"""A request is admitted only once its declared peak fits, in the order requests first asked.
 
 "Not ready" is an answer the scheduler already retries, so the pool gives it until the
-prompt at the head of its queue fits beside the prompts already admitted. A cache hit on a
+request at the head of its queue fits beside the peaks already admitted. A cache hit on a
 page only the index holds counts as a page taken, since eviction could hand that page out.
 Nothing passes the head, or a stream of short requests would starve a long one.
 """
@@ -156,9 +156,15 @@ def test_removing_the_head_makes_the_next_request_the_head():
     assert _ready(kv, "short"), "a request that left still heads the queue"
 
 
-def test_a_prompt_bigger_than_the_pool_fails_as_it_joins():
+@pytest.mark.parametrize("decode_tokens", [0, 48])
+def test_a_request_bigger_than_the_pool_fails_as_it_joins(decode_tokens):
     kv = _manager(max_num_pages=4)
-    _laid_out(kv, "a", list(range(64)))
+    prompt_tokens = 64 - decode_tokens
+    kv.ingest_request("a", KVReqConfig(
+        kv_layout={"main": StreamLayout(
+            spans=(PrefixSpan(prompt_tokens, prompt_tokens, WALK),), growth=(("decode", 1),),
+        )}, loop_caps={"decode": decode_tokens},
+    ))
 
     outcome = _runner(kv).admit_retrieve("a", NODE, WALK)
 
@@ -731,3 +737,25 @@ def test_two_copies_under_one_parent_page_release_it_once_each_and_leave_it_cach
     host._land(kv)
 
     assert all(kv._arena.owners(page) == 1 for page in shared), "a landing left the shared parent pages held"
+
+
+def test_decode_growth_cannot_fill_the_pool_with_requests_that_cannot_finish():
+    kv = _manager(max_num_pages=5)
+    for rid in ("first", "waiting"):
+        kv.ingest_request(rid, KVReqConfig(
+            kv_layout={"main": StreamLayout(
+                spans=(PrefixSpan(PAGE_SIZE, PAGE_SIZE, WALK),), growth=(("decode", 1),),
+            )}, loop_caps={"decode": 2 * PAGE_SIZE},
+        ))
+    assert _ready(kv, "first")
+    assert not _ready(kv, "waiting")
+    _grow(kv, "first", PAGE_SIZE)
+    for _ in range(2 * PAGE_SIZE):
+        _grow(kv, "first", 1)
+    _remove(kv, "first")
+    assert _ready(kv, "waiting")
+    _grow(kv, "waiting", PAGE_SIZE)
+    for _ in range(2 * PAGE_SIZE):
+        _grow(kv, "waiting", 1)
+    _remove(kv, "waiting")
+    kv.assert_pages_conserved()

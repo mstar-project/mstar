@@ -345,13 +345,14 @@ class KVPageCounts(NamedTuple):
 
 @dataclass(slots=True)
 class Allotment:
-    """Pages an admitted request may take from free and evictable pages: its prompt, less the
-    cache hits another request holds, and less what a window doesn't hold once its prompt is
-    written. ``remaining`` is its share of `KVManager._unused`, and ``prompt`` is the request's
-    prompt in pages, which `unreserve` puts back in `_asks`."""
+    """Pages reserved for a request's declared peak, less borrowed cache hits.
+
+    ``remaining`` is its share of `KVManager._unused`; ``footprint`` is the
+    original peak in pages, which `unreserve` puts back in `_asks`.
+    """
     pages: int
     remaining: int = 0
-    prompt: int = 0
+    footprint: int = 0
 
 
 @dataclass
@@ -663,7 +664,7 @@ class KVManager(AttentionResource):
         # admit, so a grant could pass on one rank and fail on another.
         self._decides = self._world_size == 1 and leads
         # An allotment covers the labels `_nodes` open.
-        # `_asks` holds the prompt pages of each request that asked and has no allotment yet.
+        # `_asks` holds the peak pages of each request that asked and has no allotment yet.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         self._nodes = nodes
         self._asks: dict[str, int] = {}
@@ -4447,22 +4448,20 @@ class KVManager(AttentionResource):
         with self._lock:
             if rid not in self._asks:
                 overrides = self._overrides[rid]
-                prompt = overrides.pages(
-                    self._nodes, dict.fromkeys(overrides.loop_caps or (), 0), self.config,
-                )
+                footprint = overrides.pages(self._nodes, overrides.loop_caps or {}, self.config)
                 capacity = self.config.request_pages
-                if prompt > capacity:
+                if footprint > capacity:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                        f"KV {self.name}: request {rid} needs {self.config.pages_of(prompt, round_up=True)} pages "
-                        f"for its prompt, and the pool has {self.config.pages_of(capacity)} for requests"
+                        f"KV {self.name}: request {rid} needs {self.config.pages_of(footprint, round_up=True)} pages "
+                        f"at its declared peak, and the pool has {self.config.pages_of(capacity)} for requests"
                     ))
-                self._asks[rid] = prompt
+                self._asks[rid] = footprint
         return ASKS
 
     def reserve(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> RoomMark | None:
-        """Allot ``rid`` its prompt, less the cache hits another request holds."""
+        """Allot ``rid`` its declared peak, less the cache hits another request holds."""
         with self._lock:
             if self._host_copies:
                 self._land_host_copies()
@@ -4478,7 +4477,7 @@ class KVManager(AttentionResource):
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
             if pages > room:
                 return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
-            self._allotments[rid] = Allotment(pages=pages, prompt=self._asks.pop(rid))
+            self._allotments[rid] = Allotment(pages=pages, footprint=self._asks.pop(rid))
             self._recount(rid)
             return None
 
@@ -4486,7 +4485,7 @@ class KVManager(AttentionResource):
         with self._lock:
             allotment = self._allotments.pop(rid)
             self._unused -= allotment.remaining
-            self._asks[rid] = allotment.prompt
+            self._asks[rid] = allotment.footprint
 
     def grew_since(self, mark: RoomMark) -> bool:
         """A newly filed page can raise a waiting request's hit, and a hit page another request
