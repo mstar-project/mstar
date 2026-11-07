@@ -41,7 +41,12 @@ def test_a_raising_ingest_rolls_back_every_resource_it_reached():
     ]
 
 
-def test_the_worker_fails_only_the_request_whose_ingest_raised():
+def _raise(err):
+    raise err
+
+
+@pytest.mark.parametrize("raises_in", ["engine_add", "input_read"])
+def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     w = Worker.__new__(Worker)
     w.worker_id = "w0"
     w._draining_rids = set()
@@ -54,20 +59,27 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
     )
     w.engine_manager = SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
+        add_request=lambda rid, cfg, info: (
+            _raise(RuntimeError("over capacity")) if raises_in == "engine_add" else None
+        ),
     )
     w.request_state = SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None)
-    w.scheduler = SimpleNamespace(note_arrival=lambda rid: None)
+    w.scheduler = SimpleNamespace(note_arrival=lambda rid: None, read_failed_rids=set(), failed_rids=set())
+    w.streams = SimpleNamespace(add_request=lambda rid, info: None)
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sharding: registered.append(rid),
-        start_read_tensors=lambda *a, **kw: pytest.fail("no reads for a failed request"),
+        start_read_tensors=lambda *a, **kw: (
+            _raise(RuntimeError("CUDA out of memory")) if raises_in == "input_read"
+            else pytest.fail("no reads for a failed request")
+        ),
     )
     w._fail_requests = failed.append
     w._process_message_list = processed.extend
     body = SimpleNamespace(
         request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
+        initial_inputs=[],
         request_info=SimpleNamespace(
-            partition_name="p", graph_walk="g", resource_configs=None, rid_handle=None,
+            partition_name="p", graph_walk="g", resource_configs={}, rid_handle=None,
         ),
     )
     Worker._add_new_request(w, body)

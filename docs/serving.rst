@@ -308,18 +308,18 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        the server at startup.
    * - ``ws_per_message_deflate``
      - *(optional, default true)* Whether the server offers per-message deflate on its
-       WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.
+       WebSocket routes; it applies to every route.
        Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
        event loop, not the network, is the bottleneck.
    * - ``ws_max_message_mb``
-     - *(optional, default 16)* The largest WebSocket message the server reads, in MiB,
-       on every WebSocket route. A larger one closes its socket with ``1009`` before any
-       handler sees it, so the client gets no error frame. Raise it for clients that send
-       big uncompressed frames, such as several raw camera images in one openpi
-       observation.
+     - *(optional)* The largest WebSocket message the server reads, in MiB, on every
+       WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
+       closes its socket with ``1009`` before any handler sees it, so the client gets no
+       error frame. Raise it for clients that send big uncompressed frames, such as several
+       raw camera images in one openpi observation.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
