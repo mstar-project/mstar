@@ -33,7 +33,8 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec, ResourceReqConfig
-from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVReqConfig, RollingKVSpec
+from mstar.engine.resources.kv.rolling import RollingKVSpec
+from mstar.engine.resources.request_pool import RequestPoolConfig, RequestPoolReqConfig, RequestPoolSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
@@ -48,10 +49,13 @@ from mstar.model.lingbot_world.config import (
 from mstar.model.lingbot_world.submodules import (
     DIT_ATTN,
     DIT_KV,
+    DIT_POOL,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
     LingBotDitSubmodule,
+    rolling_config,
     rolling_extent,
+    rollout_state_buffers,
 )
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
@@ -104,16 +108,15 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The rolling K/V store, and the ragged attention over it unless
+        """The request pool that holds each rollout's rolling K/V, the rolling K/V
+        window over them, and the ragged attention over the window unless
         ``reference_numerics`` attends with the reference's FA2 instead."""
         cfg = self.config
-        specs: list[NodeResourceSpec] = [RollingKVSpec(
-            resource_key=DIT_KV, nodes={"dit"},
-            config=RollingKVConfig(
-                num_layers=cfg.num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                pool_tokens=self.max_window_tokens(), dtype=torch.bfloat16,
-            ),
-        )]
+        specs: list[NodeResourceSpec] = [
+            RequestPoolSpec(resource_key=DIT_POOL, nodes={"dit"},
+                            config=RequestPoolConfig(pool_bytes=self.default_pool_bytes())),
+            RollingKVSpec(resource_key=DIT_KV, nodes={"dit"}, config=rolling_config(cfg)),
+        ]
         if not cfg.reference_numerics:
             specs.append(RaggedCrossAttentionSpec(
                 resource_key=DIT_ATTN, nodes={"dit"},
@@ -127,12 +130,16 @@ class LingBotWorldModel(Model):
     def max_window_tokens(self) -> int:
         """Tokens of rolling K/V one rollout keeps per layer at the largest area
         a request may ask for: ``local_attn_size`` latent frames of at most
-        ``max_area / 256`` tokens each, whatever the aspect (see ``geometry``).
-        The default pool: room for any one rollout, or several smaller ones."""
+        ``max_area / 256`` tokens each, whatever the aspect (see ``geometry``)."""
         cfg = self.config
         cell = cfg.vae_stride[1] * cfg.vae_stride[2] * cfg.patch_size[1] * cfg.patch_size[2]
         frames = cfg.local_attn_size if cfg.local_attn_size > -1 else cfg.max_chunks * cfg.chunk_size
         return frames * (cfg.max_area // cell)
+
+    def default_pool_bytes(self) -> int:
+        """Room for one rollout at the largest area (``max_window_tokens``), or
+        several smaller ones."""
+        return RequestPoolReqConfig.of(rollout_state_buffers(self.config, self.max_window_tokens())).nbytes()
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse to serve more than one rollout at a time.
@@ -370,13 +377,13 @@ class LingBotWorldModel(Model):
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
     ) -> dict[str, ResourceReqConfig]:
-        """The rollout's rolling K/V, declared up front so it waits in the engine's
-        queue for room in the pool, and a size the pool can never hold is a 400."""
+        """The rollout's state in the pool, declared up front so it waits in the
+        engine's queue for room, and a size the pool can never hold is a 400."""
         del model_kwargs
         for fwd in partition_fwd_args.values():
             tokens = fwd.full_metadata.kwargs.get("dit_kv_tokens")
             if tokens is not None:
-                return {DIT_KV: RollingKVReqConfig(tokens=int(tokens))}
+                return {DIT_POOL: RequestPoolReqConfig.of(rollout_state_buffers(self.config, int(tokens)))}
         return {}
 
     def get_partition_forward_pass_args(

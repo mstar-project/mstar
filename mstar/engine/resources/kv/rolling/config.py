@@ -1,15 +1,17 @@
-"""What a model declares about a rolling KV store.
+"""What a model declares about a rolling KV window.
 
-A request's keys and values are a stream it appends to step by step. The store
+A request's keys and values are a stream it appends to step by step. The window
 keeps the stream's first ``sink`` tokens and its last ``window`` (the step's own
 included), in stream order and compacted: once a step would overflow, the
 retained window shifts left behind the sink. A step's retained tokens and its
 own are therefore always one contiguous range, which the model hands to
-whatever attention it runs (a ragged kernel, say). The store runs no attention.
+whatever attention it runs (a ragged kernel, say). The window runs no attention.
 
-The K/V live in one pool reserved at startup (``pool_tokens`` a layer). Each
-request takes a contiguous region of exactly its ``sink + window`` there, so
-requests of different sizes share the pool without each holding the largest.
+It owns no memory either: each request's K/V live in a buffer of its region in
+a request pool (``RollingKVConfig.pool``), named after this resource's key and
+shaped ``[layers, 2, sink + window, heads, head_dim]``, which the model declares
+with the request's other buffers (``RollingKVConfig.buffer``). The window is the
+rules over that buffer, as linear attention is over the recurrent state pool.
 
 Unlike bounded KV, whose window is a ring that its own kernel reads in pieces,
 the range here is one slice, so the same kernel over the same keys gives the
@@ -21,7 +23,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
+from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -33,16 +35,18 @@ class RollingKVConfig:
     num_layers: int
     num_heads: int
     head_dim: int
-    # tokens a layer the pool holds, shared by every request's sink + window
-    pool_tokens: int
-    # None takes the engine's KV dtype (``EngineResourceInfo.kv_dtype``)
-    dtype: torch.dtype | None = None
+    # the request pool whose regions hold each request's K/V
+    pool: str
+    dtype: torch.dtype = torch.bfloat16
 
-    def __post_init__(self):
-        check_sizes({"pool_tokens": self.pool_tokens})
+    def buffer(self, tokens: int) -> tuple[tuple[int, ...], torch.dtype]:
+        """The pool buffer a request keeping ``tokens`` a layer (its sink plus
+        window) declares, under this resource's key."""
+        return (self.num_layers, 2, tokens, self.num_heads, self.head_dim), self.dtype
 
-    def token_bytes(self, tokens: int, dtype: torch.dtype) -> int:
+    def token_bytes(self, tokens: int, dtype: torch.dtype | None = None) -> int:
         """``tokens`` a layer, keys and values of every layer."""
+        dtype = dtype or self.dtype
         return self.num_layers * 2 * tokens * self.num_heads * self.head_dim * dtype.itemsize
 
 
@@ -55,25 +59,6 @@ class RollingPosition(NamedTuple):
     sink: int
     # trailing tokens kept, this step's own included
     window: int
-
-
-@dataclass
-class RollingKVReqConfig(ResourceReqConfig):
-    """The tokens a request keeps a layer, its sink plus window, declared when it
-    opens: it waits in line for that much of the pool before its first step,
-    instead of having that step refused until room frees up."""
-
-    tokens: int
-
-    def validate(self, spec: "NodeResourceSpec | None" = None) -> None:
-        if self.tokens < 1:
-            raise ValueError(f"rolling KV request keeps {self.tokens} tokens; it must keep at least one")
-        config = getattr(spec, "config", None)
-        if isinstance(config, RollingKVConfig) and self.tokens > config.pool_tokens:
-            raise ValueError(
-                f"the request keeps {self.tokens} tokens of rolling K/V a layer; the pool holds "
-                f"{config.pool_tokens} (resources: {spec.resource_key}: pool_tokens)"
-            )
 
 
 @dataclass(frozen=True)
@@ -97,9 +82,5 @@ class RollingKVSpec(NodeResourceSpec):
 
         return RollingKVManager
 
-    def apply_yaml_overrides(self, pool_tokens: int | None = None):
-        """The pool's size is the deployment's memory trade: what it reserves at
-        startup against how many requests, and how large, it holds at once."""
-        if pool_tokens is not None:
-            self.config.pool_tokens = pool_tokens
-        self.config.__post_init__()
+    def depends_on(self) -> set[str]:
+        return {self.config.pool}

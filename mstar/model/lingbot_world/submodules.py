@@ -16,16 +16,17 @@
     dit          -> LingBotDitSubmodule (one chunk per rollout iteration: the
                     chunk's I2V condition and Plucker rays, the DiT, the decode)
 
-The rolling self-attention K/V live in the engine's rolling KV store
-(``DIT_KV``): each request takes a region of the pool, its sink plus the
-latest window kept compacted, so a chunk's keys are one contiguous range. The
-attention over them is a ragged cross-attention (``DIT_ATTN``) whose step
-pairs the chunk's queries with that range and with the text. The text K/V
-(computed once per request) and the VAE encoder's and decoder's causal-conv
-caches stay in the request's ``PerRequestState``, outside the pool. Nothing in
-the engine counts them, and at small output sizes the pool admits many
-rollouts, so the model refuses a config that runs more than one at a time
-(``LingBotWorldModel.validate_config_yaml``).
+The rolling self-attention K/V live in each request's region of the engine's
+request pool (``DIT_POOL``), declared when the request opens
+(``rollout_state_buffers``) so it waits in line for room. The rolling KV window
+(``DIT_KV``) keeps their sink plus latest window compacted in that buffer, so a
+chunk's keys are one contiguous range; the attention over them is a ragged
+cross-attention (``DIT_ATTN``) whose step pairs the chunk's queries with that
+range and with the text. The text K/V (computed once per request) and the VAE
+encoder's and decoder's causal-conv caches stay in the request's
+``PerRequestState``, outside the pool. Nothing in the engine counts them, and at
+small output sizes the pool admits many rollouts, so the model refuses a config
+that runs more than one at a time (``LingBotWorldModel.validate_config_yaml``).
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
@@ -43,7 +44,8 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleStep, cross_label
-from mstar.engine.resources.kv.rolling import RollingKVStep, RollingPosition
+from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVStep, RollingPosition
+from mstar.engine.resources.request_pool import RequestPoolStep
 from mstar.model.components import wan_vae
 from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.lingbot_world.components.camera import plucker_embedding
@@ -66,6 +68,8 @@ ROLLOUT_WALK = "rollout"
 
 DIT_ATTN = "dit_attn"
 DIT_KV = "dit_kv"
+# the request pool whose regions hold each rollout's state: its rolling K/V (the DIT_KV buffer)
+DIT_POOL = "dit_pool"
 CHUNK_SPAN, WINDOW_SPAN, TEXT_SPAN = "chunk", "window", "text"
 DIT_ATTN_PAIRS = ((CHUNK_SPAN, WINDOW_SPAN), (CHUNK_SPAN, TEXT_SPAN))
 
@@ -102,6 +106,17 @@ def rolling_extent(
     if num_latent_frames is None:
         raise ValueError("without a window, the rolling K/V extent needs the rollout's num_latent_frames")
     return 0, num_latent_frames * frame_seqlen
+
+
+def rolling_config(cfg: LingBotWorldConfig) -> RollingKVConfig:
+    """The dit's rolling K/V window, over the ``DIT_KV`` buffer of each rollout's pool region."""
+    return RollingKVConfig(num_layers=cfg.num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                           pool=DIT_POOL, dtype=torch.bfloat16)
+
+
+def rollout_state_buffers(cfg: LingBotWorldConfig, kv_tokens: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    """What a rollout keeps in the pool between chunks: its rolling K/V, ``kv_tokens`` a layer."""
+    return {DIT_KV: rolling_config(cfg).buffer(kv_tokens)}
 
 
 def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> torch.Tensor:
@@ -327,6 +342,11 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
     def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep | None:
         steps = {}
         spans: list[ChunkSpans] = [inp.resource_step_info for inp in inputs]
+        if DIT_POOL in self.node_resources:
+            steps[DIT_POOL] = RequestPoolStep(
+                segments=tuple(Segment(request_id=rid, label=CHUNK_SPAN, span=s.chunk)
+                               for rid, s in zip(request_ids, spans, strict=True)),
+            )
         if DIT_KV in self.node_resources:
             steps[DIT_KV] = RollingKVStep(
                 segments=tuple(Segment(request_id=rid, label=CHUNK_SPAN, span=s.chunk)

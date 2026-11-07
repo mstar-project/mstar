@@ -1,39 +1,31 @@
 """Concurrent LingBot-World rollouts through the served path.
 
-Starts the API server on a LingBot config (``--max-concurrent`` sets its
-``max_concurrent_requests``, ``--pool-tokens`` its ``resources: dit_kv: pool_tokens``), streams each distinct
-rollout alone, then all the sessions at once (``--sessions`` of the same rollout, or one per ``--session HxW:CHUNKS``,
-started ``--stagger`` seconds apart in that order), and checks:
+Starts the API server on a LingBot config (``--pool-gib`` sets its ``resources:
+dit_pool: pool_bytes``, ``--max-concurrent`` its ``max_concurrent_requests``), streams
+each distinct rollout alone, then all the sessions at once (``--sessions`` of the same
+rollout, or one per ``--session HxW:CHUNKS``, started ``--stagger`` seconds apart in
+that order), and checks:
 
   * every concurrent rollout's frames are byte-identical to its solo run: a
-    session's rolling K/V never reach another's
-  * when the pool or ``max_concurrent_requests`` has room for fewer rollouts
-    than sessions, the extra rollouts wait (their first chunk arrives after an
-    earlier rollout's last) and still finish, instead of running the GPU out of
-    memory
-  * with room for every session, the rollouts' chunks interleave
-  * ``--expect-rearranges``: the pool rearranged at least that often (the
-    server log's count, at INFO), which sizes like these force: D takes the front of
-    the pool, S the room after it, and L fits only once D has ended and S has
-    slid left into D's gap, with S's K/V moved under it while it runs
+    session's state in the pool never reaches another's
+  * ``--expect-waits``: at least that many rollouts waited (their first chunk
+    arrived after an earlier rollout's last) and still finished, instead of
+    running the GPU out of memory, when the pool has room for fewer rollouts
+    than sessions
+  * ``--expect-rearranges``: the pool rearranged at least that often (the server
+    log's count, at INFO), which sizes like these force: D takes the front of the
+    pool, S the room after it, and L fits only once D has ended and S has slid
+    left into D's gap, its K/V and VAE caches moved under it while it runs
 
 The trajectory is synthetic and the image one of Cosmos3-Edge's assets, as in
-``run_served_numerics.py``.
+``run_served_numerics.py``. The default pool holds one rollout at 720x1280 or two
+at the default size (8.6 GiB each with this image's aspect).
 
-LingBot-World refuses any ``max_concurrent_requests`` but 1 until the rollouts'
-text K/V and VAE caches are engine resources (``LingBotWorldModel.validate_config_yaml``),
-so the cases below that pass ``--max-concurrent`` above 1 need that check lifted locally.
-
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc1
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc2 --max-concurrent 2
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/pool --max-concurrent 2 \
-        --pool-tokens 28080 --expect-waits 1
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/rearrange --max-concurrent 3 \
+    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc2
+    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc3 --sessions 3 --expect-waits 1
+    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/pool --pool-gib 9 --expect-waits 1
+    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/rearrange \
         --session 480x832:4 --session 240x416:24 --session 576x1024:6 --stagger 1 --expect-rearranges 1
-    # a 72-token D: S slides across a gap short enough to be staged
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/short_gap --max-concurrent 3 \
-        --pool-tokens 46440 --session 32x64:8 --session 240x416:24 --session 576x1024:6 --stagger 0.5 \
-        --expect-rearranges 1
 """
 
 from __future__ import annotations
@@ -83,19 +75,21 @@ def parse_session(text: str) -> Session:
     return Session(int(height), int(width), int(chunks))
 
 
-def kept_tokens(image: str, session: Session) -> int:
-    """The rolling K/V tokens a layer the session's rollout declares, as the model computes them."""
+def region_gib(image: str, session: Session) -> float:
+    """The pool region the session's rollout declares, as the model computes it."""
     from PIL import Image
 
+    from mstar.engine.resources.request_pool import RequestPoolReqConfig
     from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel
-    from mstar.model.lingbot_world.submodules import rolling_extent
+    from mstar.model.lingbot_world.submodules import rolling_extent, rollout_state_buffers
 
     model = LingBotWorldModel(skip_weight_loading=True)
     cfg = model.config
     width, height = Image.open(image).size
     lat_h, lat_w = model.geometry((height, width), session.height or cfg.default_height,
                                   session.width or cfg.default_width)
-    return sum(rolling_extent(cfg, (lat_h * cfg.vae_stride[1], lat_w * cfg.vae_stride[2])))
+    tokens = sum(rolling_extent(cfg, (lat_h * cfg.vae_stride[1], lat_w * cfg.vae_stride[2])))
+    return round(RequestPoolReqConfig.of(rollout_state_buffers(cfg, tokens)).nbytes() / 2**30, 2)
 
 
 def rollout(client: MStarClient, image: str, request_id: str, session: Session, t0: float) -> dict:
@@ -118,9 +112,10 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--config", type=Path, default=REPO / "configs/lingbot_world_1_3b.yaml")
     ap.add_argument("--max-concurrent", type=int, help="the YAML's max_concurrent_requests")
-    ap.add_argument("--pool-tokens", type=int, help="the YAML's resources: dit_kv: pool_tokens")
+    ap.add_argument("--pool-gib", type=float, help="the YAML's resources: dit_pool: pool_bytes, in GiB")
     ap.add_argument("--expect-waits", type=int,
-                    help="rollouts that must wait for an earlier one; default: sessions - max_concurrent_requests")
+                    help="rollouts that must wait for an earlier one; default: sessions - max_concurrent_requests, "
+                         "or none without that limit")
     ap.add_argument("--sessions", type=int, default=2, help="concurrent copies of the default rollout")
     ap.add_argument("--chunks", type=int, default=6)
     ap.add_argument("--session", type=parse_session, action="append", dest="specs",
@@ -139,8 +134,8 @@ def main() -> int:
     config = yaml.safe_load(args.config.read_text())
     if args.max_concurrent is not None:
         config["max_concurrent_requests"] = args.max_concurrent
-    if args.pool_tokens is not None:
-        config.setdefault("resources", {}).setdefault("dit_kv", {})["pool_tokens"] = args.pool_tokens
+    if args.pool_gib is not None:
+        config.setdefault("resources", {}).setdefault("dit_pool", {})["pool_bytes"] = int(args.pool_gib * 2**30)
     sessions = args.specs or [Session(None, None, args.chunks)] * args.sessions
     concurrent = config.get("max_concurrent_requests", len(sessions))
     expected_waits = args.expect_waits if args.expect_waits is not None else max(0, len(sessions) - concurrent)
@@ -157,9 +152,9 @@ def main() -> int:
         stdout=log, stderr=subprocess.STDOUT, cwd=REPO,
     )
     client = MStarClient(f"http://127.0.0.1:{args.port}", timeout=900)
-    report: dict = {"max_concurrent": concurrent, "pool_tokens": (config.get("resources") or {}).get("dit_kv", {}),
+    report: dict = {"max_concurrent": concurrent, "pool": (config.get("resources") or {}).get("dit_pool", "default"),
                     "sessions": [s._asdict() for s in sessions], "expected_waits": expected_waits,
-                    "kept_tokens": [kept_tokens(args.image, s) for s in sessions]}
+                    "region_gib": [region_gib(args.image, s) for s in sessions]}
     try:
         deadline = time.time() + 1200
         while not client.health():
@@ -174,7 +169,7 @@ def main() -> int:
                     np.stack([np.frombuffer(c, dtype=np.uint8) for c in solo["chunks"][1:]]))
             np.save(args.out / f"solo{tag}_first_chunk.npy", np.frombuffer(solo["chunks"][0], dtype=np.uint8))
         log.flush()
-        rearranges_alone = (args.out / "server.log").read_text().count("rearranged the pool")
+        rearranges_alone = (args.out / "server.log").read_text().count(": rearranged, moving")
         results: dict[int, dict] = {}
         errors: dict[int, str] = {}
         t0 = time.perf_counter()
@@ -214,7 +209,7 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
         log.close()
-    report["rearranges"] = (args.out / "server.log").read_text().count("rearranged the pool") - rearranges_alone
+    report["rearranges"] = (args.out / "server.log").read_text().count(": rearranged, moving") - rearranges_alone
     (args.out / "concurrent.json").write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report, indent=2, default=str))
     ok = not report.get("errors") and all(report.get("identical_to_solo", {0: False}).values()) \

@@ -18,11 +18,16 @@ from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import RaggedCrossAttentionSpec, RaggedCrossAttentionStep, cross_label  # noqa: E402
 from mstar.engine.resources.kv.rolling import (  # noqa: E402
     RollingKVConfig,
-    RollingKVReqConfig,
     RollingKVSpec,
     RollingKVStep,
 )
 from mstar.engine.resources.kv.rolling.manager import RollingKVManager  # noqa: E402
+from mstar.engine.resources.request_pool import (  # noqa: E402
+    RequestPoolConfig,
+    RequestPoolReqConfig,
+    RequestPoolSpec,
+)
+from mstar.engine.resources.request_pool.manager import RequestPool  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
@@ -35,12 +40,14 @@ from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
     DIT_ATTN,
     DIT_KV,
+    DIT_POOL,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
     EncoderStream,
     LingBotDitSubmodule,
     encode_condition_chunk,
     first_frame_mask,
+    rollout_state_buffers,
 )
 from mstar.model.submodule_base import NodeInputs  # noqa: E402
 
@@ -66,9 +73,27 @@ def test_colliding_timesteps_resolve_first_for_x0_and_second_for_noise():
     assert schedule.noise_sigma(t).item() == schedule.sigmas[matches[1]].item()
 
 
-def _store(cfg, pool_tokens: int, dtype=torch.float32) -> RollingKVManager:
-    config = RollingKVConfig(num_layers=cfg.num_layers, num_heads=1, head_dim=1, pool_tokens=pool_tokens, dtype=dtype)
-    return RollingKVManager(config, torch.device("cpu"))
+def _pool_and_window(num_layers: int, tokens: int, num_heads: int = 1, head_dim: int = 1, dtype=torch.float32):
+    """A CPU request pool holding one rollout's K/V buffer of ``tokens`` a layer, the
+    rolling window over it, and the rollout (request 7) opened in it."""
+    window = RollingKVManager(RollingKVConfig(num_layers=num_layers, num_heads=num_heads, head_dim=head_dim,
+                                              pool=DIT_POOL, dtype=dtype), torch.device("cpu"), name=DIT_KV)
+    wants = RequestPoolReqConfig.of({DIT_KV: window.config.buffer(tokens)})
+    pool = RequestPool(RequestPoolConfig(pool_bytes=wants.nbytes()), torch.device("cpu"), name=DIT_POOL)
+    window.bind_dependencies({DIT_POOL: pool})
+    pool.ingest_request(7, wants)
+    assert pool.reserve(7, "dit", ROLLOUT_WALK, None) is None
+    return pool, window
+
+
+def _step_chunk(sub, spans, pool, window, rid: int = 7):
+    """Admit and plan the chunk the dit declares, pool first, as the engine does."""
+    steps = sub.declare_step(ROLLOUT_WALK, [rid], [NodeInputs(resource_step_info=spans)]).steps
+    ctx = StepContext(request_ids=(rid,), graph_walk=ROLLOUT_WALK, slot=0, capture=False)
+    assert pool.admit(steps[DIT_POOL], ctx).ok and window.admit(steps[DIT_KV], ctx).ok
+    pool.plan(steps[DIT_POOL], ctx)
+    window.plan(steps[DIT_KV], ctx)
+    return steps[DIT_KV], ctx
 
 
 def _rollout_frames(model, image_hw, num_chunks: int, passes: int = 5):
@@ -80,15 +105,10 @@ def _rollout_frames(model, image_hw, num_chunks: int, passes: int = 5):
     spans = [sub.chunk_spans(c, image_hw, num_chunks * cfg.chunk_size) for c in range(num_chunks)]
     fs = spans[0].chunk // cfg.chunk_size
     tokens = max(s.position.sink + s.position.window for s in spans)
-    store = _store(cfg, tokens)
-    sub.node_resources = {DIT_KV: store}
-    store.ingest_request(7, RollingKVReqConfig(tokens=tokens))
-    assert store.reserve(7, "dit", ROLLOUT_WALK, None) is None
+    pool, store = _pool_and_window(cfg.num_layers, tokens)
+    sub.node_resources = {DIT_POOL: pool, DIT_KV: store}
     for c, s in enumerate(spans):
-        step = sub.declare_step(ROLLOUT_WALK, [7], [NodeInputs(resource_step_info=s)]).steps[DIT_KV]
-        ctx = StepContext(request_ids=(7,), graph_walk=ROLLOUT_WALK, slot=0, capture=False)
-        assert store.admit(step, ctx).ok
-        store.plan(step, ctx)
+        step, ctx = _step_chunk(sub, s, pool, store)
         tags = torch.arange(c * cfg.chunk_size, (c + 1) * cfg.chunk_size).repeat_interleave(fs).float()
         for _ in range(passes):
             store.write(0, tags.view(1, -1, 1, 1), tags.view(1, -1, 1, 1))
@@ -507,18 +527,20 @@ def test_the_engine_attention_dit_builds_without_flash_attn(monkeypatch):
         LingBotWorldModel().get_submodule("dit")
 
 
-def test_the_dit_declares_the_rolling_kv_and_a_ragged_cross_attention(model):
-    kv, attn = model.get_node_resources()
+def test_the_dit_declares_a_request_pool_the_rolling_kv_over_it_and_a_ragged_cross_attention(model):
+    pool, kv, attn = model.get_node_resources()
+    assert isinstance(pool, RequestPoolSpec) and pool.resource_key == DIT_POOL and pool.nodes == {"dit"}
+    assert pool.config.pool_bytes == model.default_pool_bytes()
     assert isinstance(kv, RollingKVSpec) and kv.resource_key == DIT_KV and kv.nodes == {"dit"}
     assert (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim) == (30, 12, 128)
-    assert kv.config.dtype == torch.bfloat16 and kv.config.pool_tokens == model.max_window_tokens()
+    assert kv.config.dtype == torch.bfloat16 and kv.config.pool == DIT_POOL and kv.depends_on() == {DIT_POOL}
     assert isinstance(attn, RaggedCrossAttentionSpec)
     assert attn.resource_key == DIT_ATTN and attn.nodes == {"dit"}
     assert (attn.config.num_qo_heads, attn.config.num_kv_heads, attn.config.head_dim) == (12, 12, 128)
     assert attn.config.dtype == torch.bfloat16
     # the reference's FA2 attends the same store
-    (ref_kv,) = LingBotWorldModel(skip_weight_loading=True, reference_numerics=True).get_node_resources()
-    assert isinstance(ref_kv, RollingKVSpec) and ref_kv.resource_key == DIT_KV
+    (ref_pool, ref_kv) = LingBotWorldModel(skip_weight_loading=True, reference_numerics=True).get_node_resources()
+    assert isinstance(ref_pool, RequestPoolSpec) and isinstance(ref_kv, RollingKVSpec) and ref_kv.resource_key == DIT_KV
 
 
 def test_the_default_pool_holds_the_window_of_the_largest_area_at_any_aspect(model):
@@ -526,12 +548,11 @@ def test_the_default_pool_holds_the_window_of_the_largest_area_at_any_aspect(mod
     holds one rollout at 720x1280 or two at the default 464x832 (4.7 GiB each)."""
     cfg = model.config
     assert model.max_window_tokens() == 18 * (720 * 1280 // 256)
-    (kv, _) = model.get_node_resources()
-    assert round(kv.config.token_bytes(kv.config.pool_tokens, torch.bfloat16) / 2**30, 1) == 11.1
-    default = _bare_dit_submodule(model, {}).chunk_spans(0, (464, 832)).position
-    assert round(kv.config.token_bytes(default.sink + default.window, torch.bfloat16) / 2**30, 1) == 4.7
-    assert kv.config.pool_tokens // (default.sink + default.window) == 2
+    assert round(model.default_pool_bytes() / 2**30, 1) == 11.1
     sub = _bare_dit_submodule(model, {})
+    first = sub.chunk_spans(0, (464, 832)).position
+    default = RequestPoolReqConfig.of(rollout_state_buffers(cfg, first.sink + first.window)).nbytes()
+    assert round(default / 2**30, 1) == 4.7 and model.default_pool_bytes() // default == 2
     for image_hw in [(720, 1280), (1280, 720), (960, 960), (408, 2256), (2256, 408), (480, 832)]:
         lat = model.geometry(image_hw, 720, 1280)
         last = sub.chunk_spans(cfg.max_chunks - 1, (lat[0] * 8, lat[1] * 8)).position
@@ -553,12 +574,13 @@ def test_a_rollout_declares_its_rolling_kv_so_it_waits_in_line_for_the_pool(mode
     fwd = model.get_initial_forward_pass_args("main", ["image"], ["video_frame"], signals)
     configs = model.get_request_resource_configs({"main": fwd})
     first = _bare_dit_submodule(model, {}).chunk_spans(0, image_hw).position
-    assert configs == {DIT_KV: RollingKVReqConfig(tokens=first.sink + first.window)}
-    (kv, _) = model.get_node_resources()
-    configs[DIT_KV].validate(kv)
-    kv.apply_yaml_overrides(pool_tokens=first.sink + first.window - 1)
-    with pytest.raises(ValueError, match="pool_tokens"):
-        configs[DIT_KV].validate(kv)
+    wants = RequestPoolReqConfig.of(rollout_state_buffers(model.config, first.sink + first.window))
+    assert configs == {DIT_POOL: wants}
+    (pool, _, _) = model.get_node_resources()
+    configs[DIT_POOL].validate(pool)
+    pool.apply_yaml_overrides(pool_bytes=configs[DIT_POOL].nbytes() - 1)
+    with pytest.raises(ValueError, match="pool_bytes"):
+        configs[DIT_POOL].validate(pool)
 
 
 SWITCHES = ("reference_numerics", "dit_compile_autotune")
@@ -667,20 +689,19 @@ def test_a_config_must_run_one_rollout_at_a_time(model):
     assert "text K/V (90 MiB) and VAE caches" in str(err.value)
 
 
-def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_largest(model):
+def test_the_shipped_config_runs_one_rollout_at_a_time_over_the_default_pool(model):
     """Concurrency is the conductor's max_concurrent_requests; the K/V memory is
-    the pool's, sized in the config to one rollout at the largest area."""
+    the request pool's default, room for one rollout at the largest area."""
     from pathlib import Path
 
     import yaml
 
     path = Path(__file__).parents[2] / "configs" / "lingbot_world_1_3b.yaml"
     config = yaml.safe_load(path.read_text())
-    assert config["max_concurrent_requests"] == 1
+    assert config["max_concurrent_requests"] == 1 and not config.get("resources")
     model.validate_config_yaml(config, str(path))
-    (kv, _) = model.get_node_resources()
-    kv.apply_yaml_overrides(**config["resources"][DIT_KV])
-    assert kv.config.pool_tokens == model.max_window_tokens()
+    (pool, _, _) = model.get_node_resources()
+    assert pool.config.pool_bytes == model.default_pool_bytes()
 
 
 def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
@@ -706,20 +727,12 @@ def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
     conditioning = dit.chunk_conditioning(torch.zeros(1, 384, cs, 4, 4), 0)
     dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), text_kv, torch.randn(20, cs, 4, 4),
         conditioning, ChunkOnlyStore(), attention)
-    store = RollingKVManager(RollingKVConfig(num_layers=num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                                             pool_tokens=cfg.local_attn_size * frame_seqlen,
-                                             dtype=torch.float32),
-                             torch.device("cpu"))
-    sub = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True), {DIT_KV: store})
+    pool, store = _pool_and_window(num_layers, cfg.local_attn_size * frame_seqlen, cfg.num_heads, cfg.head_dim)
+    sub = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True), {DIT_POOL: pool, DIT_KV: store})
     sub.config = cfg
-    store.ingest_request(1, RollingKVReqConfig(tokens=store.config.pool_tokens))
-    assert store.reserve(1, "dit", ROLLOUT_WALK, None) is None
     for chunk in range(chunks):
         spans = sub.chunk_spans(chunk, (32, 32))
-        step = sub.declare_step(ROLLOUT_WALK, [1], [NodeInputs(resource_step_info=spans)]).steps[DIT_KV]
-        ctx = StepContext(request_ids=(1,), graph_walk=ROLLOUT_WALK, slot=0, capture=False)
-        assert store.admit(step, ctx).ok
-        store.plan(step, ctx)
+        step, ctx = _step_chunk(sub, spans, pool, store)
         conditioning = dit.chunk_conditioning(torch.zeros(1, 384, cs, 4, 4), chunk * cs)
         for _ in range(2):
             dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), text_kv, torch.randn(20, cs, 4, 4),
@@ -736,3 +749,4 @@ def test_compiled_blocks_trace_once_for_every_layer_and_chunk():
     one_chunk = _compiled_rollout_graphs(num_layers=2, chunks=1)
     assert one_chunk > 0
     assert _compiled_rollout_graphs(num_layers=4, chunks=5) == one_chunk
+

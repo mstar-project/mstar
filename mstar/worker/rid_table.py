@@ -21,10 +21,10 @@ Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and the tensor sto
 rid -> uuids ownership, held in the Rust bookkeeper under RustTensorStore; purged by
 force_cleanup_request), RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes,
 _decode, _unkeyed, _admit_restores, _admit_snaps, _admit_taken, _preplan_taken,
-_reserved}, KDAManager._verifying and RollingKVManager.{_requests, _admit_taken,
-_wants, _reserved} (purged by remove_request), ResidentPlanner.{_slot_of, _stale,
-_moved} (purged by release), SamplerCells._cells (purged by the sampler's
-remove_request), and
+_reserved}, KDAManager._verifying, RollingKVManager.{_requests, _admit_started} and
+RequestPool.{_regions, _admit_taken, _wants, _reserved} (purged by remove_request),
+ResidentPlanner.{_slot_of, _stale, _moved} (purged by release), SamplerCells._cells
+(purged by the sampler's remove_request), and
 WorkerProfileInfo.
 
 Lockstep's follow count is the one deliberate exception: a

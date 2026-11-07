@@ -37,17 +37,18 @@ torch.set_float32_matmul_precision("high")
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import StepRunner  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
-from mstar.engine.resources.kv.rolling import RollingKVReqConfig  # noqa: E402
+from mstar.engine.resources.request_pool import RequestPoolReqConfig  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
 from mstar.model.lingbot_world.components.camera import plucker_embedding  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
-    DIT_KV,
+    DIT_POOL,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
     first_frame_mask,
     rolling_extent,
+    rollout_state_buffers,
 )
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
@@ -111,22 +112,25 @@ def bind_resources(model, sub, overrides: dict | None = None) -> StepRunner:
     """Build the node's engine resources as the engine does (``overrides`` are a
     YAML's ``resources:`` entries), bind them, and return the runner that
     ``drive`` steps them with."""
-    resources = {}
-    for spec in model.get_node_resources():
+    resources, specs = {}, model.get_node_resources()
+    for spec in specs:
         if overrides and spec.resource_key in overrides:
             spec.apply_yaml_overrides(**overrides[spec.resource_key])
         resources[spec.resource_key] = spec.resource_class.build(
             spec, EngineResourceInfo(device=DEVICE, nodes=frozenset(spec.nodes)))
+    for spec in specs:
+        resources[spec.resource_key].bind_dependencies({dep: resources[dep] for dep in spec.depends_on()})
     sub.bind_node_resources(resources)
     return StepRunner(resources)
 
 
 def open_request(sub, runner: StepRunner, rid: int, image: torch.Tensor, num_latent_frames: int) -> None:
-    """Open ``rid`` as the worker does: ingest the rolling K/V it declares (its sink
-    plus window at the output size, as ``get_request_resource_configs`` returns), then
+    """Open ``rid`` as the worker does: ingest the state it declares in the pool (its
+    rolling K/V at the output size, as ``get_request_resource_configs`` returns), then
     admit it through the engine's queue, which sets that room aside."""
-    tokens = sum(rolling_extent(sub.config, tuple(image.shape[-2:]), num_latent_frames))
-    runner.ingest_request(rid, {DIT_KV: RollingKVReqConfig(tokens=tokens)})
+    cfg = sub.config
+    tokens = sum(rolling_extent(cfg, tuple(image.shape[-2:]), num_latent_frames))
+    runner.ingest_request(rid, {DIT_POOL: RequestPoolReqConfig.of(rollout_state_buffers(cfg, tokens))})
     admitted = runner.admit_retrieve(rid, "dit", ROLLOUT_WALK)
     if not (admitted.outcome.ok and admitted.outcome.ready):
         raise RuntimeError(f"request {rid} was not admitted: {admitted.outcome.reason}")

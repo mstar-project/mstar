@@ -29,6 +29,7 @@ torch.set_float32_matmul_precision("high")
 
 from run_parity import DEVICE, bind_resources, drive, frame_stats, fwd_info, open_request, same, stats  # noqa: E402
 
+from mstar.engine.resources.request_pool import RequestPoolReqConfig  # noqa: E402
 from mstar.model.components import wan_vae  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
@@ -120,8 +121,9 @@ def main():
     report["seed43_vs_oracle"] = [stats(x, ref_latents[:, k * cs:(k + 1) * cs]) for k, x in enumerate(lat43)]
 
     cfg.local_attn_size = -1
-    # keeping every frame takes more than the windowed bound
-    full = bind_resources(model, sub, {"dit_kv": {"pool_tokens": lat_f * frame_seqlen}})
+    # keeping every frame takes more than the windowed bound: a pool for this one rollout
+    state = submodules.rollout_state_buffers(cfg, lat_f * frame_seqlen)
+    full = bind_resources(model, sub, {submodules.DIT_POOL: {"pool_bytes": RequestPoolReqConfig.of(state).nbytes()}})
     lat_full, _, _, _ = timed_rollout(sub, full, text, image, cond, poses, intr, md, rid=13)
     cfg.local_attn_size = 18
     report["no_window_vs_oracle"] = [stats(x, ref_latents[:, k * cs:(k + 1) * cs]) for k, x in enumerate(lat_full)]

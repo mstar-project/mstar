@@ -200,7 +200,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
        rows for up to the 4,077-frame maximum. One rollout at a time: the model refuses any
        other ``max_concurrent_requests`` until each rollout's text K/V and VAE caches, which
-       are outside the rolling K/V pool (``resources: dit_kv: pool_tokens``), are engine
+       are outside its request pool (``resources: dit_pool: pool_bytes``), are engine
        resources. The DiT's attention runs
        through the engine's ragged attention resource, its blocks are compiled (Inductor's
        deterministic mode), the condition encode runs channels-last, and the VAE decode is
