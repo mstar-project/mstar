@@ -213,7 +213,7 @@ class _SegmentSdpa(SegmentAttention):
     def __init__(self, step: SubmoduleStep, key: str):
         super().__init__(tuple(segment.span for segment in step.segments), causal=step.steps[key].causal)
 
-    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, label: str | None = None) -> torch.Tensor:
         assert q.shape[0] == sum(self.seq_lengths), (q.shape[0], self.seq_lengths)
         # `enable_gqa` only where KV heads are grouped, as transformers passes it
         self.gqa = q.shape[1] != k.shape[1]

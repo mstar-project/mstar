@@ -37,7 +37,7 @@ class SegmentAttention:
     def __init__(self, seq_lengths: tuple[int, ...] | None = None, causal: bool = False, gqa: bool = False):
         self.seq_lengths, self.causal, self.gqa = seq_lengths, causal, gqa
 
-    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, label: str | None = None) -> torch.Tensor:
         out, start = [], 0
         for span in (q.shape[0],) if self.seq_lengths is None else self.seq_lengths:
             rows = slice(start, start + span)
