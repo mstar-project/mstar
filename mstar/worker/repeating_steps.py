@@ -9,12 +9,15 @@ are the ones that need the worker's runtime, engine and streams, kept out of
 from __future__ import annotations
 
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.device_run import RUN_COUNTS, RUN_REPLAYS, RUN_SKIPPED, TokenStream, run_item
+from mstar.engine.device_run import RUN_COUNTS, RUN_DESCRIPTORS, RUN_REPLAYS, RUN_SKIPPED, TokenStream, run_item
 from mstar.engine.resources.resident import NOT_ASKED
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import EMITTED_COUNT, BatchedModelOutput, HostRows
@@ -442,6 +445,18 @@ class RepeatingSteps:
         phase_record(f"repeats.ran.{step.graph_walk}#", 0)
         engine = self.engine_manager.get_engine(step.node_name)
         engine.settle_run(node_batch, 0)
+        self._return_unexecuted(step, outputs)
+        return True
+
+    def _return_unexecuted(self, step: PendingBatch, outputs: BatchedModelOutput) -> None:
+        """Return a proved-zero, already settled receipt without consuming its inputs.
+
+        Both a skipped physical run and a descriptor never accepted by a closed
+        run window own ordinary ready work. Neither completes a graph iteration.
+        Publication/drain and resource settlement must precede this transition.
+        """
+        node_batch = step.node_batch
+        engine = self.engine_manager.get_engine(step.node_name)
         for signal, bases in node_batch.ring_bases.items():
             # what it reserved holds no room: only postprocess gives it back otherwise
             for rid, base in bases.items():
@@ -454,13 +469,117 @@ class RepeatingSteps:
         self._push_back_batch(step.batch)
         if node_batch.failed_requests:
             self._fail_step_rows(step, outputs)
-        return True
 
     def _is_device_run(self, step: PendingBatch) -> bool:
         return (
             (step.node_name, step.graph_walk) in self._device_runs
             and step.node_batch.step_context.repeats > 1 and step.node_batch.completion_event is not None
         )
+
+    @staticmethod
+    def _run_receipt_rows(step: PendingBatch, rids: list[int]) -> PendingBatch:
+        """An output/retry view after the original resource receipt settled once."""
+        original = step.node_batch
+        wanted = set(rids)
+        scheduled = step.batch._sub_batch(rids)
+        scheduled.repeats = max((original.step_context.run_counts[rid] for rid in rids), default=0)
+        ctx = replace(original.step_context, request_ids=rids, repeats=scheduled.repeats,
+                      _padded_request_ids=None, _real_rids=None)
+        ctx.run_counts = original.step_context.run_counts
+        inputs = dict(zip(original.request_ids, original.inputs, strict=True))
+        view = replace(
+            original, step_context=ctx, inputs=[inputs[rid] for rid in rids], prepared_rids=tuple(rids),
+            per_request_info={rid: original.per_request_info[rid] for rid in rids},
+            final_stream_rids=original.final_stream_rids & wanted,
+            partition_done_rids=original.partition_done_rids & wanted,
+            failed_requests={rid: error for rid, error in original.failed_requests.items() if rid in wanted},
+            run_rows={rid: original.run_rows[rid] for rid in rids},
+            stream_windows={rid: edges for rid, edges in original.stream_windows.items() if rid in wanted},
+            ring_bases={name: {rid: base for rid, base in bases.items() if rid in wanted}
+                        for name, bases in original.ring_bases.items()},
+            loopback_rids=original.loopback_rids & wanted,
+        )
+        return replace(step, batch=scheduled, node_batch=view, joined=[])
+
+    def _finish_live_run(self, active: PendingBatch, gpu_executor: ThreadPool) -> None:
+        """Close one capture, settle logical receipts, then route their own outputs.
+
+        Publication is no longer offered by the caller. The execution event and
+        publication-stream drain precede count inspection. Capture and resource
+        readers outlive every collection/tail copy, including failed tails.
+        """
+        engine = self.engine_manager.get_engine(active.node_name)
+        membership = engine.run_membership(active.node_batch)
+        if membership is None:
+            raise ValueError("a live run has no captured membership owner")
+        receipts = (active, *active.joined)
+        self._wait_for_step(active)
+        raw = active.node_batch.outputs
+        identities = raw.check_stop_buffers[RUN_DESCRIPTORS].cpu().tolist()
+        counts = Counter(handle for ids in identities for handle in ids if handle)
+        descriptors = {row.handle: row for receipt in receipts for row in receipt.node_batch.run_rows.values()}
+        if counts.keys() - descriptors.keys():
+            raise ValueError("a captured output has no attached logical receipt")
+        stream = membership.publication_stream
+        with torch.cuda.stream(stream) if stream is not None else nullcontext():
+            membership.drain()
+        if stream is not None:
+            stream.synchronize()
+        membership.acknowledge(membership.control.cpu().tolist())
+
+        try:
+            # Settle every owner before invoking any model tail or graph route;
+            # a failure in the first tail must not leave later H reservations.
+            for receipt in receipts:
+                batch = receipt.node_batch
+                actual = {rid: counts[row.handle] for rid, row in batch.run_rows.items()}
+                engine.settle_run(batch, max(actual.values(), default=0), actual)
+            for receipt in receipts:
+                batch = receipt.node_batch
+                actual = batch.step_context.run_counts
+                zero = [rid for rid in batch.request_ids if not actual[rid]]
+                live = [rid for rid in batch.request_ids if actual[rid]]
+                if zero:
+                    self._return_unexecuted(self._run_receipt_rows(receipt, zero), BatchedModelOutput())
+                if not live:
+                    continue
+                part = self._run_receipt_rows(receipt, live)
+                self._settle_stream_windows(part.node_batch, actual)
+
+                def collect(part=part):
+                    batch = part.node_batch
+                    output = engine.collect_run_outputs(batch, [(raw, identities)])
+                    batch.outputs = output
+                    self._stage_host_rows(output, part.lane)
+                    if self.device_capability.is_accelerator:
+                        batch.completion_event = torch.Event(device=self.device)
+                        batch.completion_event.record(torch.accelerator.current_stream(self.device))
+                    batch.resource_publish_info = engine.finalize_batch(
+                        batch, publish_request_ids=self._publishable_request_ids(batch),
+                    )
+                    return output
+
+                output = gpu_executor.submit(collect).result()
+                # The pinned-host ring may be reused by the next receipt; route
+                # this one first, after its own copy event, on the main thread.
+                self._wait_for_step(part)
+                self._clear_in_flight_flag(part.batch)
+                self._finish_step(part, output)
+        finally:
+            # A tail can raise after queuing copies. Fence the executor stream
+            # before releasing any output reader or resetting capture padding.
+            def release():
+                if self.device_capability.is_accelerator:
+                    torch.accelerator.current_stream(self.device).synchronize()
+                engine.finish_run_outputs(active.node_batch, BatchedModelOutput())
+                for receipt in receipts:
+                    batch = receipt.node_batch
+                    for descriptor in batch.run_rows.values():
+                        if not membership.release(descriptor):
+                            raise ValueError("a closed run still has a live descriptor reader")
+                        batch.step_context.resident.unpin((descriptor.bindings[0],))
+                    batch.run_rows.clear()
+            gpu_executor.submit(release).result()
 
     def _await_run(
         self, batch_N: PendingBatch, spec_pending: PendingBatch | None, lanes: Sequence[Lane], gpu_executor: ThreadPool,

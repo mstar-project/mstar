@@ -2816,6 +2816,7 @@ class Engine:
             ctx.resident.flush(plan, stager=membership.stager)
             self._runner.commit(step, track_rows=True)
             batch.committed = step
+            batch.run_started = active.run_started
             ctx.resident_plan = plan
             batch.run_rows[rid] = descriptor
             ctx.resident.advance(plan)
@@ -2849,7 +2850,74 @@ class Engine:
             raise ValueError("a retained run has no capture lease")
         self._submodules[batch.node_name].accelerator_graph_runner.release(lease, len(batch.request_ids))
         batch.outputs = outputs
-        self._finish_outputs(batch)
+        # Each positive logical receipt already published its own loop-back
+        # metadata. This physical capture may also have zero-execution rows.
+        batch.outputs_ready.set()
+
+    def run_membership(self, batch: ExecutingBatch):
+        """The declared membership owner of this retained capture."""
+        lease = batch.step_context.slot_lease
+        if lease is None or not batch.run_rows:
+            return None
+        runner = self._submodules[batch.node_name].accelerator_graph_runner
+        return runner.slot_for(lease).run.state.membership
+
+    def collect_run_outputs(
+        self, batch: ExecutingBatch,
+        records: Sequence[tuple[BatchedModelOutput, Sequence[Sequence[int]]]],
+    ) -> BatchedModelOutput:
+        """Collect a settled logical receipt under its own inputs and metadata.
+
+        The worker settles the complete admitted membership first and returns
+        proved-zero rows separately. This tail only sees rows that executed;
+        descriptor identities, never the physical capture rows, select values.
+        Capture storage and owner pins remain held until these copies finish.
+        """
+        ctx = batch.step_context
+        if (ctx.run_counts is None or not batch.request_ids
+                or any(ctx.run_counts.get(rid, 0) <= 0 for rid in batch.request_ids)):
+            raise ValueError("run output collection needs settled, nonempty logical rows")
+        width = max(ctx.run_counts[rid] for rid in batch.request_ids)
+        if ctx.repeats != width:
+            raise ValueError("run output width must match its settled logical receipt")
+        rows = []
+        for rid in batch.request_ids:
+            descriptor = batch.run_rows[rid]
+            actual = sum(ids.count(descriptor.handle) for _, identities in records for ids in identities)
+            output = self._run_row_output(records, descriptor.handle, width)
+            if output is None or actual != ctx.run_counts[rid]:
+                raise ValueError("descriptor output count disagrees with its settled receipt")
+            rows.append(output)
+
+        def join(attribute: str, excluded=frozenset()):
+            values = [getattr(row, attribute) or {} for row in rows]
+            names = values[0].keys() - excluded
+            if any(value.keys() - excluded != names for value in values):
+                raise ValueError("logical rows have incompatible retained outputs")
+            return {name: torch.cat([value[name] for value in values]) for name in names}
+
+        raw = BatchedModelOutput(
+            check_stop_buffers=join("check_stop_buffers", {RUN_COUNTS, RUN_REPLAYS}),
+            row_outputs=join("row_outputs") or None, output_spans=join("output_spans") or None,
+        )
+        mgmt = self._submodules[batch.node_name]
+        if mgmt.rings:
+            # A width-one physical capture still stores an iteration axis.
+            ring_raw = raw
+            if batch.ring_width == 1:
+                ring_raw = BatchedModelOutput(
+                    check_stop_buffers={k: v[:, 0] for k, v in (raw.check_stop_buffers or {}).items()},
+                    row_outputs={k: v[:, 0] for k, v in (raw.row_outputs or {}).items()},
+                )
+            self._write_rings(mgmt, batch, ring_raw)
+        outputs = self._collect_outputs(
+            mgmt, None, raw, batch.inputs, batch.per_request_info_wrapped,
+            batch.request_ids, tuple(batch.request_ids), batch.graph_walk, rows_only=batch.rows_only,
+        )
+        outputs.run_columns = self.run_columns(batch.node_name, batch.graph_walk)
+        outputs.loopback_rids = batch.loopback_rids
+        self._record_loopback(batch)
+        return self._postprocess_outputs(batch, outputs)
 
     @staticmethod
     def _run_row_output(
@@ -3522,7 +3590,7 @@ class Engine:
         submodule = submodule_mgmt.submodule
         failed = batch.failed_requests
         columns = loop_back = ()
-        if batch.step_context.repeats > 1:
+        if batch.step_context.repeats > 1 or outputs.run_columns:
             columns = submodule_mgmt.run_columns.get(batch.graph_walk, frozenset())
             # loop-back signals a node may name after a run column (``text_inputs = new_token``)
             loop_back = [s for s in submodule_mgmt.carries.get(batch.graph_walk, {}) if s not in columns]

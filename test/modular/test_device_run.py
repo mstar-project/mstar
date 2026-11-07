@@ -665,7 +665,8 @@ def test_a_skipped_steps_ring_positions_hold_no_room():
     assert rings == [("ring", "codes", 1, [16, 17]), ("ring", "codes", 2, [24, 25])]
 
 
-def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would():
+@pytest.mark.parametrize("unaccepted_descriptor", [False, True])
+def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would(unaccepted_descriptor):
     """The step was built before N landed. A row whose loop stopped at N has an emptied
     node, which would pop with no inputs and run past its stop. One prepare_inputs
     vetoed has spent its inputs, and one a stage blamed fails."""
@@ -686,11 +687,110 @@ def test_a_skipped_step_gives_back_only_the_rows_a_refused_one_would():
     worker.streams = SimpleNamespace(settle_window=lambda rid, edge, n: retired.append((rid, n)))
     failed = []
     worker._fail_step_rows = lambda step, outputs: failed.append((dict(step.node_batch.failed_requests), outputs))
-    assert worker._landed_skipped(step) is True
+    if unaccepted_descriptor:
+        # A closed membership window already settled its logical receipt to
+        # zero. It has no RUN_SKIPPED word, but owns the same unread graph work.
+        step.node_batch.run_started = None
+        worker._return_unexecuted(step, "outputs")
+        assert not any(entry[0] == "rewound" for entry in log)
+    else:
+        assert worker._landed_skipped(step) is True
     assert ("queued", [1, 4]) in log, log
     assert failed == [({4: "boom"}, "outputs")]
     assert retired == ["completed", (2, 0), (3, 0), (4, 0)]
     assert set(step.node_batch.stream_windows) == {1}, "only a retried row retains its original reader"
+
+
+def test_worker_closes_reused_physical_rows_as_separate_logical_receipts():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mstar.engine.engine import Engine, ExecutingBatch
+    from mstar.engine.resources.run_rows import RunRows
+    from mstar.engine.resources.step import StepContext
+    from mstar.model.submodule_base import NodeSubmodule
+    from mstar.worker.micro_scheduler import ScheduledBatch
+    from mstar.worker.worker import PendingBatch, Worker
+
+    membership = RunRows(CPU, 2, 4, 2)
+    original = membership.reserve_row(1, 1, 0, (1, 0))
+    zero = membership.reserve_row(2, 2, 1, (2, 0))
+    for row in (original, zero):
+        membership.publish_row(row)
+    ids, bindings = torch.zeros(2, dtype=torch.long), torch.zeros((2, 2), dtype=torch.long)
+    membership.boundary(ids, bindings)
+    membership.stop(ids, torch.tensor([True, False]))
+    membership.acknowledge(membership.control.tolist())
+    late = membership.reserve_row(3, 3, 0, (3, 0))
+    membership.publish_row(late)
+    log = []
+
+    class Node(NodeSubmodule):
+        def prepare_inputs(self, *args, **kwargs):
+            pass
+
+        def forward(self, *args, **kwargs):
+            pass
+
+        def postprocess(self, request_id, request_info, outputs, inputs):
+            log.append(("tail", request_id, inputs))
+
+    engine = Engine.__new__(Engine)
+    engine._enable_nvtx, engine._loopback_steps = False, {}
+    engine._submodules = {"n": SimpleNamespace(
+        submodule=Node.__new__(Node), rings={}, run_columns={WALK: frozenset({"frame"})}, carries={},
+        device_stops={}, accelerator_graph_runner=SimpleNamespace(
+            slot_for=lambda lease: SimpleNamespace(run=SimpleNamespace(state=SimpleNamespace(membership=membership))),
+            release=lambda lease, count: log.append(("release", count)),
+        ),
+    )}
+    def settle(step, counts):
+        log.append(("settle", dict(counts)))
+        step.ctx.run_counts = dict(counts)
+    engine._runner = SimpleNamespace(settle_run=settle)
+    engine.finalize_batch = lambda *args, **kwargs: {}
+    resident = SimpleNamespace(unpin=lambda slots: log.append(("unpin", slots)))
+    def receipt(rows):
+        rids = [row.request_id for row in rows]
+        ctx = StepContext(rids, WALK, 0, False, repeats=4, resident=resident,
+                          slot_lease=SlotLease(0, BucketKey(WALK, 2, 2)))
+        batch = ExecutingBatch("n", {}, ctx, inputs=[f"input{rid}" for rid in rids])
+        batch.per_request_info = dict.fromkeys(rids, SimpleNamespace())
+        batch.per_request_info_wrapped = dict(batch.per_request_info)
+        batch.run_rows = {row.request_id: row for row in rows}
+        batch.step = SimpleNamespace(ctx=ctx)
+        batch.run_started = torch.tensor([RUN_RAN])
+        scheduled = ScheduledBatch("n", WALK, dict.fromkeys(rids, 0), repeats=4)
+        return PendingBatch(scheduled, batch, "n", "partition", WALK, None)
+    active, joined = receipt((original, zero)), receipt((late,))
+    active.joined.append(joined)
+    active.node_batch.outputs = BatchedModelOutput(
+        row_outputs={"frame": torch.tensor([[11, 31, 32, -1], [-1, -1, -1, -1]])},
+        check_stop_buffers={RUN_DESCRIPTORS: torch.tensor([[original.handle, late.handle, late.handle, 0], [0]*4])},
+    )
+    worker = Worker.__new__(Worker)
+    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker.device, worker.device_capability = CPU, SimpleNamespace(is_accelerator=False)
+    worker._wait_for_step = lambda part: None
+    worker._stage_host_rows = lambda *args: None
+    worker._publishable_request_ids = lambda batch: batch.request_ids
+    worker._clear_in_flight_flag = lambda batch: log.append(("flag", list(batch.request_to_worker_graph)))
+    worker._drop_rows_whose_loop_stopped = lambda step: None
+    worker._push_back_batch = lambda batch: log.append(("retry", list(batch.request_to_worker_graph)))
+    def finish(part, outputs):
+        log.append(("route", part.batch.repeats, {
+            rid: out["frame"][0].tolist() for rid, out in outputs.per_rid_outputs.items()
+        }))
+    worker._finish_step = finish
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        worker._finish_live_run(active, executor)
+    assert log[:2] == [("settle", {1: 1, 2: 0}), ("settle", {3: 2})]
+    assert ("retry", [2]) in log
+    assert [event for event in log if event[0] == "tail"] == [("tail", 1, "input1"), ("tail", 3, "input3")]
+    assert [event for event in log if event[0] == "route"] == [
+        ("route", 1, {1: [[11]]}), ("route", 2, {3: [[31, 32]]}),
+    ]
+    assert log[-4:] == [("release", 2), ("unpin", (1,)), ("unpin", (2,)), ("unpin", (3,))]
+    assert membership.idle and not active.node_batch.run_rows and not joined.node_batch.run_rows
 
 
 @pytest.mark.parametrize("later_tokens", [0, 4])

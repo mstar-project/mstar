@@ -89,10 +89,12 @@ def test_an_unbatched_step_clears_rows_only(rids):
     assert eng._loopback_steps == {}
 
 
-def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata():
+@pytest.mark.parametrize("executions", [1, 2])
+def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata(executions):
     import torch
 
     from mstar.engine.device_run import RUN_COUNTS, RUN_DESCRIPTORS, RUN_REPLAYS
+    from mstar.engine.engine import ExecutingBatch
 
     def raw(values):
         values = torch.tensor([values])
@@ -136,6 +138,25 @@ def test_run_row_collection_uses_descriptor_order_and_the_late_requests_metadata
     assert collected.row_request_ids == (44,) and collected.span_request_ids == (44,)
     eng._postprocess_outputs(pending, collected)
     assert eng.per_request_tails == [pending]
+    # The real deferred tail sees this receipt's inputs/metadata and only its
+    # actual columns, including an accepted row that ran exactly once.
+    eng._submodules["llm"].rings = {}
+    eng._submodules["llm"].run_columns = {"decode": frozenset({"frame"})}
+    ctx = StepContext((44,), "decode", 0, False, repeats=executions)
+    ctx.run_counts = {44: executions}
+    receipt = ExecutingBatch("llm", {}, ctx, inputs=[None])
+    receipt.per_request_info_wrapped = {44: SimpleNamespace(signal="late")}
+    receipt.run_rows = {44: SimpleNamespace(handle=8)}
+    receipt.run_started = torch.tensor([1])
+    selected = records if executions == 2 else records[:1]
+    resolved = eng.collect_run_outputs(receipt, selected)
+    assert resolved.per_rid_outputs[44]["late"][0].tolist() == [[21, 22][:executions]]
+    assert resolved.run_columns == frozenset({"frame"})
+    assert RUN_COUNTS not in resolved.check_stop_buffers and RUN_REPLAYS not in resolved.check_stop_buffers
+    assert eng.per_request_tails == [pending, receipt]
+    ctx.run_counts = {44: 0}
+    with pytest.raises(ValueError, match="settled, nonempty"):
+        eng.collect_run_outputs(receipt, selected)
     first.row_outputs["frame"].fill_(-1)
     second.row_outputs["frame"].fill_(-2)
     assert collected.per_rid_outputs[44]["late"][0].tolist() == [[21, 22, 22, 22]]

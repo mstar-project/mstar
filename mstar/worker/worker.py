@@ -11,7 +11,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Iterable, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import cache, cached_property, partial
 from time import sleep
@@ -316,6 +316,9 @@ class PendingBatch:
     # the chain's step, or another lane's (``mstar.worker.lanes``)
     lane: int = CHAIN_LANE
     group: ExecutionGroup | None = None
+    # Ordinary logical receipts attached before their descriptor is published.
+    # Their graph work and request holds survive until this capture closes.
+    joined: list["PendingBatch"] = field(default_factory=list)
 
 
 class EvictionPolicy(Enum):
