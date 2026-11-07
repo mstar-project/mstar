@@ -173,7 +173,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         # DROID, the smallest shipped embodiment. The frames arrive as one
         # positional list, so their order is what names each camera.
         lines.append("    # lossless frames: every view 15 steps back, then every view now")
-        lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
+        lines.append("    res = client.generate(text=\"put the blue block in the green bowl\",")
         lines.append("        images=[\"ext_t-15.png\", \"wrist_t-15.png\", \"ext_t0.png\", \"wrist_t0.png\"],")
         lines.append("        output_modalities=(\"action\",),")
         lines.append("        embodiment_tag=\"oxe_droid_relative_eef_relative_joint\",")
