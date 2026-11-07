@@ -72,10 +72,9 @@ def _worker(
         register_stop_limits=lambda rid, info: None,
         get_rid_string=lambda h: h,
         remove_request=lambda h: None,
-        # The TP fan-out reads the sharding config off the runtime now; no
-        # groups means no followers, which is what these tests assume.
         get_sharding_config=lambda r: (
-            SimpleNamespace(groups=[]) if r in known_rids else None
+            SimpleNamespace(groups=[SimpleNamespace(tp_size=2, _tp_rank=1, _workers=["lead", "w0"])])
+            if is_follower and r in known_rids else SimpleNamespace(groups=[])
         ),
     )
     w._rebuilds = Rebuilds({}, {})
@@ -646,3 +645,30 @@ def test_preprocess_hard_cleanup_force_drops_and_clears():
     assert "X" not in wt.request_model_kwargs
     assert "X" not in wt.in_flight_requests
     assert "X" not in wt.request_output_state
+
+
+@pytest.mark.parametrize("follows", [False, True])
+def test_drain_follows_the_requests_replica_not_the_workers_role(follows):
+    w = _worker(is_follower=True)
+    group = SimpleNamespace(tp_size=2, _tp_rank=1 if follows else -1,
+                            _workers=["leader", "w0" if follows else "other-follower"])
+    w._graph_runtime.get_sharding_config = lambda rid: SimpleNamespace(groups=[group])
+    Worker._drain_request(w, DrainRequest(request_id="X"))
+    assert bool(_reads_done(w)) is (not follows)
+    if follows:
+        Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
+        assert len(_reads_done(w)) == 1
+
+
+def test_inflight_follower_removal_does_not_block_an_unrelated_request():
+    w = _worker(known_rids=("X", "Y", "Z"), is_follower=True)
+    follower = SimpleNamespace(tp_size=2, _tp_rank=1, _workers=["lead", "w0"])
+    w._graph_runtime.get_sharding_config = lambda rid: SimpleNamespace(groups=[] if rid == "Z" else [follower])
+    w._pending_removes = dict.fromkeys(("X", "Y", "Z"))
+    removed = []
+    w._remove_request = lambda body: removed.append(body.request_id)
+    w._apply_pending_removes_safe_to_drop({"X"})
+    assert removed == ["Z"]
+    assert list(w._pending_removes) == ["X", "Y"]
+    w._apply_pending_removes_safe_to_drop(set())
+    assert removed == ["Z", "X", "Y"]

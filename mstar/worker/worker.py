@@ -1122,6 +1122,16 @@ class Worker:
             self.tensor_manager.ack_unread_tensors(message.body.inputs)
 
 
+    def _is_tp_follower_request(self, request_id: int) -> bool:
+        """Follow teardown only for a replica this request actually uses here."""
+        if not self.is_tp_follower:
+            return False
+        sharding = self._graph_runtime.get_sharding_config(request_id)
+        return sharding is not None and any(
+            group.tp_size > 1 and self.worker_id in group._workers[1:]
+            for group in sharding.groups
+        )
+
     def _remove_request(self, body: RemoveRequest) -> None:
         request_id = self._rid(body.request_id)
         if request_id is None:
@@ -1134,7 +1144,7 @@ class Worker:
             self._mark_removed(body.request_id)
             self.scheduler.clear_wire_rid(body.request_id)
             return
-        if self.is_tp_follower:
+        if self._is_tp_follower_request(request_id):
             if body.source not in (MessageSource.TP_RANK_0, MessageSource.SELF):
                 return # wait for rank 0's forward, to avoid race conditions
             if not self._removal_step_reached(body):
@@ -1162,8 +1172,8 @@ class Worker:
         # A follower tears down in rank 0's order, so never ahead of one it deferred
         # earlier.
         behind = (
-            self.is_tp_follower
-            and next(iter(self._pending_removes), request_id) != request_id
+            self._is_tp_follower_request(request_id)
+            and next((r for r in self._pending_removes if self._is_tp_follower_request(r)), request_id) != request_id
         )
         if request_id in self._in_flight_rids or behind:
             self._pending_removes.setdefault(request_id)
@@ -1261,7 +1271,7 @@ class Worker:
         # request never admitted here: the conductor sends a NEW_REQUEST ahead of
         # its drain on one FIFO socket, so the leader has no handle either and
         # forwards nothing.
-        if self.is_tp_follower and handle is not None and body.source not in (
+        if handle is not None and self._is_tp_follower_request(handle) and body.source not in (
             MessageSource.TP_RANK_0, MessageSource.SELF
         ):
             return
@@ -4842,10 +4852,13 @@ class Worker:
         an in-flight GPU step, in the order they were deferred. Removes for
         in-flight rids stay deferred and are reattempted next iter; on a
         follower, so do the ones after them, which rank 0 tore down later."""
+        follower_blocked = False
         for rid in list(self._pending_removes):
+            follows = self._is_tp_follower_request(rid)
             if rid in in_flight_rids or rid in self._in_flight_rids:
-                if self.is_tp_follower:
-                    break
+                follower_blocked |= follows
+                continue
+            if follows and follower_blocked:
                 continue
             self._remove_request(RemoveRequest(
                 request_id=self._rid_str(rid), source=MessageSource.SELF,
