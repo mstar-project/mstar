@@ -17,6 +17,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = REPO_ROOT / ".claude/skills/live-pr-test/scripts"
 GPU = runpy.run_path(str(SCRIPTS / "gpu.py"))
+HEALTH = runpy.run_path(str(SCRIPTS / "gpu_health.py"))
 CFG = {"budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_total_usd": 100}, "ssh_public_key": "/dev/null",
        "runpod": {"image": "img", "hf_home": "/workspace/hf"}}
 OFFER = {"id": "runpod:H100:US-1:1", "provider": "runpod", "gpu": "H100", "count": 1, "vram_gb": 80,
@@ -121,6 +122,12 @@ class TestBootstrap(unittest.TestCase):
                                env={"PATH": "/usr/bin:/bin", "HOME": home, "HF_HOME": f"{home}/hf"}, check=False)
             self.assertEqual(r.returncode, code, r.stderr)
             self.assertEqual(os.listdir(home), [], f"bootstrap.sh {argv} wrote to HOME")
+
+
+class TestHealth(unittest.TestCase):
+    def test_only_the_visible_gpus_are_judged_by_torch_index(self):
+        smi = ("GPU-aaaa, 35, 345, 0x0\nGPU-bbbb, 60, 1980, 0x0\nGPU-cccc, 61, 1975, 0x0\nGPU-dddd, 34, 345, 0x0\n")
+        self.assertEqual(HEALTH["by_torch_index"](smi, ["cccc", "bbbb"]), [(0, 61, 1975, 0), (1, 60, 1980, 0)])
 
 
 if __name__ == "__main__":
