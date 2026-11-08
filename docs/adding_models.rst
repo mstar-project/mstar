@@ -3370,7 +3370,8 @@ streams (audio and video, say): each has its own buffer and its own end.
   ``/v1/realtime`` conversations it also declares ``turn_tokens = (start_id, end_id)`` on
   the model (a property when the ids come from its config): the text tokens that open and
   close each reply, and, if its replies may get no end mark, ``turn_idle_steps``: a reply
-  then also ends after that many steps whose text is only padding, and text outside a reply
+  then also ends after that many steps with no text and no audio above ``turn_silence_rms``
+  (the RMS of samples in [-1, 1], 0.005 unless the model sets it), and text outside a reply
   opens one. Without them ``/generate/ws`` still serves it, and a conversation is
   refused (an omitted ``intent`` then means transcription, if the model's adapter serves it). The data worker marks the text chunks they arrive in with
   ``metadata["turn"]``, their marks (``"start"`` / ``"end"``) in token order, on every

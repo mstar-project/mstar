@@ -950,14 +950,16 @@ _UNSUPPORTED_EVENTS = frozenset({
 class _AgentTurn:
     """One agent reply: the text steps from its start mark to its end mark
     (for a model with ``turn_idle_steps``, from any text outside a reply, and to
-    that much padding), and the audio of the same steps."""
+    that many steps with neither text nor audible audio), and the audio of the
+    same steps."""
     start: int                  # its first step
     end: int | None = None      # its last step, once the end mark arrived
     response_id: str = field(default_factory=lambda: f"resp_{uuid.uuid4().hex[:16]}")
     item_id: str = field(default_factory=lambda: f"item_{uuid.uuid4().hex[:12]}")
     text: Utf8Stream = field(default_factory=Utf8Stream)
     transcript: list[str] = field(default_factory=list)
-    idle: int = 0               # its steps in a row whose text is only padding
+    last_text: int | None = None    # its last step with text or a mark
+    last_heard: int | None = None   # its last step whose audio was above the model's silence
 
     def item(self, status: str) -> dict:
         content = [] if status == "in_progress" else [{"type": "output_audio", "transcript": "".join(self.transcript)}]
@@ -994,6 +996,7 @@ class RealtimeConversation:
         self.output_rate = model.get_output_sample_rate("audio")
         self.voice = model.get_default_voice()
         self.idle_steps = getattr(model, "turn_idle_steps", None)
+        self.silence_rms = getattr(model, "turn_silence_rms", 0.005)
         self.session_id = f"sess_{uuid.uuid4().hex[:16]}"
         self.instructions = ""
         self.turn_detection = "server_vad"
@@ -1317,7 +1320,7 @@ class RealtimeConversation:
         data = bytes(chunk.data)
         marks = meta.get("turn", ())
         if turn is None and data and self.idle_steps is not None and "start" not in marks:
-            # text after a reply ended for its padding, with no start mark: the model speaks again
+            # text after a reply ended on quiet, with no start mark: the model speaks again
             turn = await self._start_turn(step)
         for mark in marks:
             if mark == "start":
@@ -1332,11 +1335,8 @@ class RealtimeConversation:
                 data, turn.end, turn = b"", step, None
         if turn is not None:   # between replies the text channel is padding
             await self._feed(turn, data)
-            turn.idle = 0 if data or meta.get("turn") else turn.idle + 1
-            if self.idle_steps is not None and turn.idle >= self.idle_steps:
-                # the model sent no end mark: its reply ends after its padding (turn_idle_steps)
-                await self._feed(turn, b"", final=True)
-                turn.end = step
+            if data or marks:
+                turn.last_text = step
         while self.early and self.early[0][0] < self.text_steps:
             await self._play(*self.early.popleft())
 
@@ -1382,6 +1382,10 @@ class RealtimeConversation:
         turn = self.turns[0] if self.turns and self.turns[0].start <= step else None
         if turn is None:
             return   # silence between replies
+        if turn.end is None and self.idle_steps is not None:
+            self._end_if_idle(turn, step, pcm)
+            if turn.end is not None:   # its text's held tail goes out, as on every other end
+                await self._feed(turn, b"", final=True)
         last = turn.end == step
         audio = (self._encode_out(pcm, last) if len(pcm) <= 2 * INLINE_RESAMPLE_SAMPLES
                  else await asyncio.to_thread(self._encode_out, pcm, last))
@@ -1389,6 +1393,18 @@ class RealtimeConversation:
             await self.send(content_event("response.output_audio.delta", turn.response_id, turn.item_id, delta=audio))
         if last:
             await self._finish_turn("completed")
+
+    def _end_if_idle(self, turn: _AgentTurn, step: int, pcm: bytes) -> None:
+        """A model that may send no end mark (``turn_idle_steps``): its reply
+        ends once that many steps have passed with no text and no audio above
+        ``turn_silence_rms``. Counted from the audio, which runs behind the text,
+        so the speech still sounding after the last text stays in the reply."""
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+        if samples.size and float(np.sqrt(np.mean(samples * samples))) > self.silence_rms:
+            turn.last_heard = step
+        since = max(s for s in (turn.start, turn.last_text, turn.last_heard) if s is not None)
+        if step - since >= self.idle_steps:
+            turn.end = step
 
     def _encode_out(self, pcm: bytes, last: bool) -> str:
         audio = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
