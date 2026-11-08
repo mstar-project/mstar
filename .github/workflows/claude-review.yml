@@ -809,64 +809,33 @@ jobs:
           perm=$(gh api "repos/$REPO/collaborators/$author/permission" --jq .permission 2> /dev/null || echo none)
           case "$perm" in admin|maintain|write) echo "trusted=true" >> "$GITHUB_OUTPUT" ;; esac
           gpus=$(jq -r --argjson cap "$MAX_GPUS" '[.live_test.gpus // 1, $cap] | min' review.json)
-          run=$(jq -r '.live_test.run // "full"' review.json)
-          case "$run" in none|targeted|full) ;; *) run=full ;; esac   # model output: only the enum reaches a shell
-          # The kinds of check, likewise only the two words (gpu_review.py checks them again); both if none is left.
-          checks=$(jq -r '.live_test.checks // [] | if type == "array" then . else [] end
-            | map(select(. == "correctness" or . == "performance")) | unique | join(",")' review.json)
-          [ -n "$checks" ] || checks=correctness,performance
-          { echo "gpus=$gpus"; echo "run=$run"; echo "checks=$checks"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
+          { echo "gpus=$gpus"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
-      # The review's `none` or `targeted` stands unless the PR's last live test didn't pass on an
-      # ancestor of this head (it failed, was partial or unavailable, or ran on a commit rebased
-      # away): then the live test runs in full, every kind of check, so a failure is never hidden.
-      # After a pass on an ancestor, a `targeted` run is told that commit and given that report;
-      # with no earlier live test it runs as it is. A `none` that stands runs nothing, and counts
-      # as a pass for approval (verdict `skipped`). It posts no live-test marker: it isn't a live
-      # test, so the next run still checks against the last real one.
+      # The review's call stands unless it builds on a live test that didn't pass on an ancestor of
+      # this head (gpu_review.py carry): then the live test runs in full, every kind of check, so a
+      # failure is never hidden. After a pass on an ancestor, a `targeted` run is told that commit and
+      # given that report. A `none` that stands runs nothing, and counts as a pass for approval
+      # (verdict `skipped`). It posts no live-test marker: it isn't a live test, so the next run still
+      # checks against the last real one. A failed read of the PR's comments fails this step.
       - name: Check the last live test
-        if: steps.cfg.outputs.run != 'full' && steps.cfg.outputs.trusted == 'true'
+        if: steps.cfg.outputs.trusted == 'true'
         id: carry
-        env:
-          RUN: ${{ steps.cfg.outputs.run }}
         run: |
-          # The marker is only the first line of the bot's live-test comments: the report below it
-          # is the box's text, which goes to a targeted run as data.
-          gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
-              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
-                (.body | startswith("<!-- claude-live-test sha="))) | {marker: (.body | split("\n")[0]), body}' \
-            | jq -s '[.[] | select(.marker | test("^<!-- claude-live-test sha=[0-9a-f]{40} verdict=[a-z]+ -->$"))] | last // {}' \
-            > earlier.json
-          marker=$(jq -r '.marker // empty' earlier.json)
-          sha=$(sed -E 's/.*sha=([0-9a-f]*).*/\1/' <<< "$marker"); verdict=$(sed -E 's/.*verdict=([a-z]*).*/\1/' <<< "$marker")
-          status=$( [ -n "$sha" ] && gh api "repos/$REPO/compare/$sha...$HEAD_SHA" --jq .status 2> /dev/null || true )
-          passed=false
-          if [ "$verdict" = "pass" ] && { [ "$status" = "ahead" ] || [ "$status" = "identical" ]; }; then passed=true; fi
-          if [ -n "$marker" ] && [ "$passed" != "true" ]; then
-            echo "::notice::The review asked for a $RUN live test, but the last one didn't pass on an ancestor; running it in full."
-            { echo "run=full"; echo "checks=correctness,performance"; } >> "$GITHUB_OUTPUT"
-          elif [ "$RUN" = "none" ]; then
-            { echo "run=none"; echo "verdict=skipped"; } >> "$GITHUB_OUTPUT"
-          else
-            echo "run=targeted" >> "$GITHUB_OUTPUT"
-            if [ "$passed" = "true" ]; then
-              echo "since=$sha" >> "$GITHUB_OUTPUT"
-              jq -r .body earlier.json > earlier-live-test.md
-            fi
-          fi
+          set -o pipefail  # an error in the decision fails this step, rather than tee's exit 0 hiding it
+          python3 .github/review/gpu_review.py carry --pr "$PR" --sha "$HEAD_SHA" --review review.json \
+            --earlier-report earlier-live-test.md | tee carry.log
+          grep '^[a-z]*=' carry.log >> "$GITHUB_OUTPUT"
 
       - name: Get GPUs and start the live test
-        if: >-
-          steps.cfg.outputs.trusted == 'true' &&
-          (steps.cfg.outputs.run == 'full' || (steps.carry.outputs.run != '' && steps.carry.outputs.run != 'none'))
+        if: steps.carry.outputs.run == 'full' || steps.carry.outputs.run == 'targeted'
         id: start
         continue-on-error: true
         env:
           # The box's own key, never the review's: the box runs PR code with a shell.
           LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
-          RUN: ${{ steps.carry.outputs.run || steps.cfg.outputs.run }}
-          CHECKS: ${{ steps.carry.outputs.checks || steps.cfg.outputs.checks }}
+          RUN: ${{ steps.carry.outputs.run }}
+          CHECKS: ${{ steps.carry.outputs.checks }}
           SINCE: ${{ steps.carry.outputs.since }}
         run: |
           set +e

@@ -7,6 +7,7 @@ decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config the workflow writes: the team's
 Slurm node when it has them free, else any open Eras listing under the hourly cap.
 
+    gpu_review.py carry    --pr N --sha SHA --review review.json --earlier-report FILE
     gpu_review.py start    --pr N --sha SHA --main-sha SHA [--base BRANCH] --gpus G --hours H --run full|targeted
                            --checks correctness,performance [--since SHA --earlier-report FILE] --review review.json
                            --out DIR
@@ -130,6 +131,46 @@ def checks(text):
     if len(set(kinds)) != len(kinds) or not set(kinds) <= set(CHECKS):
         raise argparse.ArgumentTypeError(f"unexpected checks {text!r}")
     return [k for k in CHECKS if k in kinds]
+
+
+def last_live_test(pr):
+    """The bot's last live-test comment on the PR, {"sha", "verdict", "body"}, or None. Only its first
+    line, the marker, is read: the report below it is the box's text. A failed fetch raises: it never
+    reads as "no earlier live test"."""
+    pages = json.loads(gh("api", "--paginate", "--slurp", f"repos/{REPO}/issues/{pr}/comments").stdout)
+    last = None
+    for c in (c for page in pages for c in page):
+        marker = (c["body"] or "").split("\n")[0]
+        m = re.fullmatch(r"<!-- claude-live-test sha=([0-9a-f]{40}) verdict=([a-z]+) -->", marker)
+        if m and c["user"]["login"] in [f"{b}[bot]" for b in SUMMARY["BOTS"]]:
+            last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
+    return last
+
+
+def cmd_carry(a):
+    """What the live test runs, printed as the step's outputs: the review's call, read as its enums only
+    (model output on its way to a shell and the brief). `none` and `targeted` build on the last live
+    test, so they stand only when it passed on an ancestor of the head; otherwise the run is full, with
+    every kind of check."""
+    live = json.loads(Path(a.review).read_text()).get("live_test") or {}
+    run = live.get("run") if live.get("run") in ("none", "targeted", "full") else "full"
+    asked = live.get("checks") if isinstance(live.get("checks"), list) else []
+    out = {"run": run, "checks": ",".join([k for k in CHECKS if k in asked] or CHECKS)}
+    if run != "full":
+        last = last_live_test(a.pr)
+        passed = bool(last) and last["verdict"] == "pass" and gh(
+            "api", f"repos/{REPO}/compare/{last['sha']}...{a.sha}", "--jq", ".status",
+            check=False).stdout.strip() in ("ahead", "identical")
+        if last and not passed:
+            print(f"::notice::The review asked for a {run} live test, but the last one didn't pass on an ancestor; "
+                  "running it in full.")
+            out.update(run="full", checks=",".join(CHECKS))
+        elif run == "none":
+            out["verdict"] = "skipped"
+        elif passed:
+            out["since"] = last["sha"]
+            Path(a.earlier_report).write_text(last["body"])
+    print("\n".join(f"{k}={v}" for k, v in out.items()))
 
 
 def brief(a):
@@ -470,6 +511,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("configure")
+    p = sub.add_parser("carry")
+    for name in ("--sha", "--review", "--earlier-report"):
+        p.add_argument(name, required=True)
+    p.add_argument("--pr", type=int, required=True)
     p = sub.add_parser("start")
     for name in ("--sha", "--main-sha", "--review", "--out", "--tag"):
         p.add_argument(name, required=True)
@@ -507,8 +552,8 @@ def main():
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--media-url", default="")
     a = ap.parse_args()
-    {"configure": cmd_configure, "start": cmd_start, "wait": cmd_wait, "cleanup": cmd_cleanup, "approve": cmd_approve,
-     "dismiss": cmd_dismiss, "comment": cmd_comment}[a.cmd](a)
+    {"configure": cmd_configure, "carry": cmd_carry, "start": cmd_start, "wait": cmd_wait, "cleanup": cmd_cleanup,
+     "approve": cmd_approve, "dismiss": cmd_dismiss, "comment": cmd_comment}[a.cmd](a)
 
 
 if __name__ == "__main__":
