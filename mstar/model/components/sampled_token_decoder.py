@@ -132,20 +132,29 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         self.config = config
         self._encoders = tuple(encoders)
         self._media_walks = frozenset(media_walk_names(self._encoders))
+        self.token_stop = self.node_token_stop(config.stop_token_ids, self._encoders)
+        self.device_loopback = self.node_device_loopback()
+
+    @classmethod
+    def node_token_stop(cls, stop_token_ids, encoders: Sequence[MediaEncoder] = ()) -> TokenStop:
+        """The node's `TokenStop`, as `__init__` sets it: also for a declaration
+        read before the submodule exists (a model's `verify_nodes`)."""
         # the prompt is one prefill row, on the text walk or a media walk: its
         # token is the reply's first
-        self.token_stop = TokenStop(
-            loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(config.stop_token_ids),
-            sampler=self.SAMPLER, walk=self.DECODE_WALK,
-            prefill_walks=self._media_walks | {"prefill_text"},
+        return TokenStop(
+            loop=cls.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(stop_token_ids),
+            sampler=cls.SAMPLER, walk=cls.DECODE_WALK,
+            prefill_walks=frozenset(media_walk_names(tuple(encoders))) | {"prefill_text"},
             # the graph runtime checks a decode row's stop ids itself, without
             # calling check_stop (measured on Qwen3.5; see TokenStop.runtime_check)
             runtime_check=True,
         )
+
+    @classmethod
+    def node_device_loopback(cls) -> DeviceLoopback:
+        """The node's `DeviceLoopback`, as `__init__` sets it."""
         # the decode walk reads its input ids off the sampler's slot masters
-        self.device_loopback = DeviceLoopback(
-            walk=self.DECODE_WALK, signal="text_inputs", sampler=self.SAMPLER, buffer="new_token",
-        )
+        return DeviceLoopback(walk=cls.DECODE_WALK, signal="text_inputs", sampler=cls.SAMPLER, buffer="new_token")
 
     # ------------------------------------------------------------------
     # What a model declares
@@ -465,10 +474,22 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             if rows is not None and rows.shape[0]:
                 embeds = splice_media(embeds, e.pads(input_ids), rows)
         hidden = self.model(embeds, label="main", **decoder_kwargs)
-        if graph_walk != "decode":
-            # only the last token of each prefill row feeds the head
-            hidden = engine_inputs.resources[self.ATTN_KEY].select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        if graph_walk == "decode":
+            return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        # only the last token of each prefill row feeds the head
+        last = engine_inputs.resources[self.ATTN_KEY].select_last_hidden(hidden)
+        tokens = sampler.sample(engine_inputs.request_ids, logits=self.model.logits(last))
+        self.after_prompt_rows(engine_inputs, hidden, embeds, tokens, decoder_kwargs, tensors)
+        return tokens
+
+    def after_prompt_rows(
+        self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, embeds: torch.Tensor,
+        tokens: torch.Tensor, decoder_kwargs: dict[str, Any], tensors: Mapping[str, torch.Tensor],
+    ) -> None:
+        """Run after a step with prompt rows samples, on every row's ``hidden``
+        (the stack's output) and ``embeds`` (its input): a drafter's pass over
+        the prompt. ``tensors`` are `preprocess`'s other outputs. Nothing by
+        default."""
 
     def forward(
         self,

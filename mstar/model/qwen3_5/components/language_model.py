@@ -281,12 +281,22 @@ class Qwen3_5LanguageModel(nn.Module):
 
 
 class Qwen3_5ForCausalLM(nn.Module):
+    """The text stack and LM head; with ``with_mtp`` the checkpoint's MTP head
+    too (``mtp``, speculative decoding's drafter), whose KV is one layer past
+    the stack's full-attention layers."""
+
     def __init__(
-        self, config: Qwen3_5Config, comm_group: CommGroup | None = None,
+        self, config: Qwen3_5Config, comm_group: CommGroup | None = None, with_mtp: bool = False,
     ):
         super().__init__()
         self.config = config
         self.model = Qwen3_5LanguageModel(config, comm_group)
+        self.mtp = None
+        if with_mtp:
+            from mstar.model.qwen3_5.components.mtp import Qwen3_5MTPHead
+
+            # its KV layer is bound from the pool's layer set when the engine binds the node
+            self.mtp = Qwen3_5MTPHead(config, comm_group=self.model.comm_group)
         # Gathers the vocab so the sampler is TP-oblivious. Its `[vocab/tp,
         # hidden]` shard matches the embedding's, so the tie works per rank.
         self.lm_head = ColumnParallelLinear(

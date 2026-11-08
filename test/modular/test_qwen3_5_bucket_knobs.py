@@ -85,12 +85,20 @@ def _configs_with_prefill_ladders():
     return ladders
 
 
-def _shipped_prefill_ladders():
-    """None (the default) and every ``prefill_token_buckets`` a Qwen3.5 config sets."""
+def _shipped_prefill_ladders(mixed_only: bool = False):
+    """None (the default) and every ``prefill_token_buckets`` a Qwen3.5 config
+    sets; ``mixed_only``: only a config whose LLM runs mixed steps (a node that
+    verifies drafts runs none)."""
+    import yaml
+
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     ladders = {str(None): None}
+    root = Path(__file__).resolve().parents[2] / "configs"
     for name, (cls, buckets) in _configs_with_prefill_ladders().items():
-        if cls is Qwen3_5DenseModel:
+        if cls is not Qwen3_5DenseModel:
+            continue
+        drafts = "draft" in (yaml.safe_load((root / name).read_text()).get("model_kwargs") or {})
+        if not (mixed_only and drafts):
             ladders[name] = buckets
     return ladders
 
@@ -118,7 +126,9 @@ def test_every_shipped_prefill_ladder_is_a_model_argument(config):
                           prefill_token_buckets=buckets).config.prefill_token_buckets == buckets
 
 
-@pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
+@pytest.mark.parametrize(
+    "buckets", _shipped_prefill_ladders(mixed_only=True).values(), ids=_shipped_prefill_ladders(mixed_only=True).keys(),
+)
 def test_shipped_ladders_hold_a_mixed_step_without_the_next_power_of_two(buckets):
     """A mixed step a few tokens over the step budget replays at 2176, not
     padded to 4096, on every ladder a config ships."""

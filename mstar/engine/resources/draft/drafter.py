@@ -47,6 +47,9 @@ class ChunkBoundary(Enum):
     UNDECLARED = "undeclared"
     # its state at row ``p`` depends only on the target at ``p`` (DSpark)
     NONE = "none"
+    # row ``p`` reads token ``p + 1``: a prompt chunk's last row takes it from the
+    # prompt (the model's ``split_inputs``), a final chunk's from the token its step samples (MTP)
+    READS_NEXT_TOKEN = "reads_next_token"
 
 
 class CarrySpec(NamedTuple):
