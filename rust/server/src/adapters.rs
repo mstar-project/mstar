@@ -299,10 +299,16 @@ pub struct SpeechChunking {
     pub lookahead: usize,
     /// Most pieces one input may split into; more is a 400.
     pub max_pieces: usize,
+    pub splitter: crate::speech_chunking::Splitter,
 }
 
-const SPEECH_CHUNKING: SpeechChunking =
-    SpeechChunking { min_chars: None, max_chars: 400, lookahead: 2, max_pieces: 32 };
+const SPEECH_CHUNKING: SpeechChunking = SpeechChunking {
+    min_chars: None,
+    max_chars: 400,
+    lookahead: 2,
+    max_pieces: 32,
+    splitter: crate::speech_chunking::Splitter::Sentences,
+};
 
 /// Which OpenAI surfaces a model serves + the request translation. One
 /// variant per ported `OpenAIAdapter` subclass.
@@ -317,6 +323,12 @@ pub enum Adapter {
     Qwen3TTS,
     DiffusionImage,
     TextChat,
+    Kokoro,
+    Chatterbox,
+    FishS2Pro,
+    CosyVoice3,
+    OmniVoice,
+    VoxCPM2,
 }
 
 impl Adapter {
@@ -333,6 +345,12 @@ impl Adapter {
             "Qwen3TTSAdapter" => Some(Adapter::Qwen3TTS),
             "DiffusionImageAdapter" => Some(Adapter::DiffusionImage),
             "TextChatAdapter" => Some(Adapter::TextChat),
+            "KokoroAdapter" => Some(Adapter::Kokoro),
+            "ChatterboxAdapter" => Some(Adapter::Chatterbox),
+            "FishS2ProAdapter" => Some(Adapter::FishS2Pro),
+            "CosyVoice3Adapter" => Some(Adapter::CosyVoice3),
+            "OmniVoiceAdapter" => Some(Adapter::OmniVoice),
+            "VoxCPM2Adapter" => Some(Adapter::VoxCPM2),
             _ => None,
         }
     }
@@ -345,13 +363,31 @@ impl Adapter {
     }
 
     pub fn supports_speech(&self) -> bool {
-        matches!(self, Adapter::Qwen3Omni | Adapter::Orpheus | Adapter::Qwen3TTS)
+        matches!(
+            self,
+            Adapter::Qwen3Omni
+                | Adapter::Orpheus
+                | Adapter::Qwen3TTS
+                | Adapter::Kokoro
+                | Adapter::Chatterbox
+                | Adapter::FishS2Pro
+                | Adapter::CosyVoice3
+                | Adapter::OmniVoice
+                | Adapter::VoxCPM2
+        )
     }
 
     pub fn speech_chunking(&self) -> SpeechChunking {
         match self {
             // Each Talker request stays near the lengths the model was trained on.
-            Adapter::Qwen3TTS => SpeechChunking { min_chars: Some(600), ..SPEECH_CHUNKING },
+            Adapter::Qwen3TTS | Adapter::FishS2Pro => SpeechChunking { min_chars: Some(600), ..SPEECH_CHUNKING },
+            // 80 tokens at ~4 characters each; nothing under 80 characters of Chinese is split
+            Adapter::CosyVoice3 => SpeechChunking {
+                min_chars: Some(81),
+                max_chars: 320,
+                splitter: crate::speech_chunking::Splitter::CosyVoice3,
+                ..SPEECH_CHUNKING
+            },
             _ => SPEECH_CHUNKING,
         }
     }
@@ -442,7 +478,16 @@ impl Adapter {
                     parts,
                 })
             }
-            Adapter::Orpheus | Adapter::Cosmos3 | Adapter::Qwen3TTS | Adapter::DiffusionImage => {
+            Adapter::Orpheus
+            | Adapter::Cosmos3
+            | Adapter::Qwen3TTS
+            | Adapter::DiffusionImage
+            | Adapter::Kokoro
+            | Adapter::Chatterbox
+            | Adapter::FishS2Pro
+            | Adapter::CosyVoice3
+            | Adapter::OmniVoice
+            | Adapter::VoxCPM2 => {
                 Err("chat is not supported by this model".to_string())
             }
         }
@@ -452,7 +497,8 @@ impl Adapter {
     /// (`_resolve_ref_audio`'s `decoder`); `None` for a model that takes none.
     fn ref_audio_decoder(&self) -> Option<&'static str> {
         match self {
-            Adapter::Qwen3TTS => Some("soundfile"),
+            Adapter::Qwen3TTS | Adapter::FishS2Pro | Adapter::CosyVoice3 | Adapter::VoxCPM2 => Some("soundfile"),
+            Adapter::Chatterbox | Adapter::OmniVoice => Some("soundfile+torchcodec"),
             _ => None,
         }
     }
@@ -474,7 +520,11 @@ impl Adapter {
         };
         let check = crate::media::save_ref_audio(&reference, upload_dir, allow_remote, decoder)?;
         args.file_paths.insert("audio".to_string(), vec![check.path.clone()]);
-        args.input_modalities = vec!["audio".to_string(), "text".to_string()];
+        // Qwen3-TTS lays the clip out before the text; the others after it
+        args.input_modalities = if *self == Adapter::Qwen3TTS { vec!["audio", "text"] } else { vec!["text", "audio"] }
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         Ok(Speech { args, ref_audio: Some(check) })
     }
 
@@ -542,10 +592,112 @@ impl Adapter {
                     parts: Vec::new(),
                 })
             }
+            Adapter::Kokoro
+            | Adapter::Chatterbox
+            | Adapter::FishS2Pro
+            | Adapter::CosyVoice3
+            | Adapter::OmniVoice
+            | Adapter::VoxCPM2 => Ok(self.voice_model_args(req)),
             Adapter::Bagel | Adapter::Qwen3_5 | Adapter::Cosmos3 | Adapter::Cosmos3Edge
             | Adapter::DiffusionImage | Adapter::TextChat => {
                 Err("audio/speech is not supported by this model".to_string())
             }
+        }
+    }
+
+    /// `speech_to_request` of the Kokoro, Chatterbox, Fish S2-Pro, CosyVoice3,
+    /// OmniVoice and VoxCPM2 adapters, short of the `ref_audio` each takes
+    /// (`speech_to_request` saves it). Which standard fields each forwards
+    /// differs per model, as the Python adapters' docstrings say why.
+    fn voice_model_args(&self, req: &SpeechRequest) -> SubmitArgs {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        // `SpeechRequest.speed` defaults to 1.0: unsent reads as 1.0, `null` as None
+        let speed = match req.speed {
+            None => Some(1.0),
+            Some(sent) => sent,
+        };
+        let seed = |mk: &mut Map<String, Value>| {
+            if let Some(seed) = req.seed {
+                set_default(mk, "seed", Value::from(seed));
+            }
+        };
+        let instructions = |mk: &mut Map<String, Value>| {
+            if let Some(instructions) = mk.remove("instructions").filter(truthy) {
+                set_default(mk, "instruct", instructions);
+            }
+        };
+        let sampling = |mk: &mut Map<String, Value>| {
+            apply_sampling(
+                mk,
+                Sampling {
+                    temperature: req.temperature.clone(),
+                    top_p: req.top_p.clone(),
+                    seed: req.seed,
+                    max_tokens: None,
+                    temperature_key: "temperature",
+                    top_p_key: "top_p",
+                    max_tokens_key: None,
+                },
+            )
+        };
+        match self {
+            Adapter::Kokoro => {
+                if let Some(voice) = &req.voice {
+                    set_default(&mut mk, "voice", Value::from(voice.clone()));
+                }
+                if let Some(speed) = speed {
+                    set_default(&mut mk, "speed", json_num(speed));
+                }
+                seed(&mut mk);
+            }
+            Adapter::Chatterbox => {
+                if let Some(voice) = &req.voice {
+                    set_default(&mut mk, "voice", Value::from(voice.clone()));
+                }
+                sampling(&mut mk);
+                forward_sent_speed(&mut mk, req);
+            }
+            Adapter::FishS2Pro => {
+                sampling(&mut mk);
+                // a transcript without its clip
+                if !mk.get("ref_audio").is_some_and(truthy) {
+                    mk.remove("ref_text");
+                }
+            }
+            Adapter::CosyVoice3 => {
+                if let Some(voice) = req.voice.as_ref().filter(|v| !v.is_empty()) {
+                    set_default(&mut mk, "voice", Value::from(voice.clone()));
+                }
+                instructions(&mut mk);
+                sampling(&mut mk);
+            }
+            Adapter::OmniVoice => {
+                // is-not-None, so an empty voice reaches the model and is refused there
+                if let Some(voice) = &req.voice {
+                    if mk.get("instruct").is_none_or(Value::is_null) {
+                        mk.insert("instruct".to_string(), Value::from(voice.clone()));
+                    }
+                }
+                mk.remove("voice");
+                if let Some(speed) = speed {
+                    set_default(&mut mk, "speed", json_num(speed));
+                }
+                seed(&mut mk);
+            }
+            Adapter::VoxCPM2 => {
+                instructions(&mut mk);
+                seed(&mut mk);
+            }
+            _ => unreachable!("voice_model_args for {self:?}"),
+        }
+        SubmitArgs {
+            tokens: None,
+            text: Some(req.input.clone()),
+            file_paths: BTreeMap::new(),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["audio".to_string()],
+            model_kwargs: mk,
+            parts: Vec::new(),
         }
     }
 

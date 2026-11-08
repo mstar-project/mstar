@@ -41,7 +41,11 @@ SPEECH_CLASSES = sorted(c for c, a in _classes().items()
 
 
 def test_the_speech_classes_are_the_ported_ones():
-    assert SPEECH_CLASSES == ["OrpheusAdapter", "Qwen3OmniAdapter", "Qwen3TTSAdapter"]
+    # every speech class the registry has
+    assert SPEECH_CLASSES == sorted(c for c, a in _classes().items() if a.supports_speech) == [
+        "ChatterboxAdapter", "CosyVoice3Adapter", "FishS2ProAdapter", "KokoroAdapter", "OmniVoiceAdapter",
+        "OrpheusAdapter", "Qwen3OmniAdapter", "Qwen3TTSAdapter", "VoxCPM2Adapter",
+    ]
 
 
 def _audio(text: str) -> list[_Chunk]:
@@ -330,6 +334,40 @@ def test_split_sentences_matches_python_on_random_long_inputs(tmp_path, monkeypa
             assert [s["text"] for s in stub.submitted] == want, text
 
 
+@pytest.mark.parametrize("script", ["chinese", "other"])
+def test_cosyvoice3_cuts_long_text_as_its_python_adapter_does(script, tmp_path, monkeypatch):
+    """CosyVoice3 splits by its own rules (``split_speech_text``): Chinese as the
+    reference's ``split_paragraph``, re-cut at commas past 300 characters, and
+    other text by an estimate of its tokens. Random inputs over those rules'
+    edges, with every piece text compared."""
+    model = _model_of("CosyVoice3Adapter")
+    adapter = ADAPTER_REGISTRY[model]
+    chinese = ["今天天气很好。", "我们去公园吧！", "你觉得呢？", "第一；第二：", "苹果、香蕉、", "他说：“好的。”",
+               "价格是3.5元。", "没有标点的长句子" * 9, "这是一个逗号，", "Hello world. ", "数字123，", "\n\n", " ",
+               "”", "。。", "a" * 90]
+    other = ["안녕하세요. ", "こんにちは。", "Привет, мир! ", "The price is 3.5 dollars. ", "Really?", "end; ",
+             "ok, ", "x" * 130, "é" * 200, "Done.” ", "\n\n", "  "]
+    words = chinese if script == "chinese" else other
+    rng = random.Random(7 if script == "chinese" else 8)
+    texts = []
+    while len(texts) < 80:
+        text = "".join(rng.choice(words) for _ in range(rng.randint(10, 80)))
+        if len(text) >= 81 and (script == "other" or any("\u4e00" <= c <= "\u9fff" for c in text)):
+            texts.append(text)
+    stub = _RustSpeechStub()
+    with _model_stack(model, stub) as (port, _upload):
+        for text in texts:
+            stub.submitted.clear()
+            status, data = _post(port, "/v1/audio/speech", {"input": text})
+            want = adapter.split_speech_text(text) or [text]
+            if len(want) > 32:
+                assert (status, json.loads(data)["error"]["message"]) == (
+                    400, f"input splits into {len(want)} sentence chunks; at most 32 are allowed")
+                continue
+            assert status == 200, data
+            assert [s["text"] for s in stub.submitted] == want, text
+
+
 # ── voice cloning: ref_audio ────────────────────────────────────────────────
 
 def _wav(seconds: float, rate: int = 16000) -> bytes:
@@ -369,14 +407,21 @@ def _with_bytes(submits: list[dict]) -> list[dict]:
             for s in submits]
 
 
+CLONING = ["ChatterboxAdapter", "CosyVoice3Adapter", "FishS2ProAdapter", "OmniVoiceAdapter",
+           "Qwen3TTSAdapter", "VoxCPM2Adapter"]
+
+
 @pytest.mark.parametrize("case", sorted(CLONES))
-def test_both_frontends_take_or_refuse_a_voice_clip_alike(case, tmp_path, monkeypatch):
+@pytest.mark.parametrize("cls", CLONING)
+def test_both_frontends_take_or_refuse_a_voice_clip_alike(cls, case, tmp_path, monkeypatch):
     """mstar-server saves the clip and the API server checks it with the model's
     loader (``check_saved_ref_audio``) before anything is submitted, so a clip
     either frontend takes reaches the backend as the same audio input, and one
     it refuses gets the same status and text."""
     pytest.importorskip("soundfile")
-    model = _model_of("Qwen3TTSAdapter")
+    if cls in ("ChatterboxAdapter", "OmniVoiceAdapter"):
+        pytest.importorskip("torchcodec")  # their loader falls back to FFmpeg
+    model = _model_of(cls)
     body = {"input": "Hi.", "voice": "ryan", "ref_audio": CLONES[case]()}
     stub = _RustSpeechStub()
     with _model_stack(model, stub) as (port, upload):
@@ -395,4 +440,4 @@ def test_both_frontends_take_or_refuse_a_voice_clip_alike(case, tmp_path, monkey
     assert status == 200, rust_body
     assert (headers.get("content-type"), rust_body) == (py.headers.get("content-type"), py.content)
     assert rust_submits == python_submits
-    assert rust_submits[0]["in"] == ["audio", "text"]
+    assert "audio" in rust_submits[0]["in"]

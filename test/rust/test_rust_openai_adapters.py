@@ -50,12 +50,6 @@ ROUTES = {
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
 # /v1/audio/transcriptions and /v1/realtime have no route there at all.
 NOT_PORTED = {
-    ("ChatterboxAdapter", "speech"),
-    ("CosyVoice3Adapter", "speech"),
-    ("FishS2ProAdapter", "speech"),
-    ("KokoroAdapter", "speech"),
-    ("OmniVoiceAdapter", "speech"),
-    ("VoxCPM2Adapter", "speech"),
     ("LTX25Adapter", "videos"),
     ("Wan22Adapter", "videos"),
 }
