@@ -561,7 +561,7 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
     d.ops.load(LoadLoraAdapter(op_id="op2", lora_name="a1", lora_path=paths["a1"]))
     _finish_when_read(d.workers["worker_0"])
     gate.set()
-    for _ in range(3):  # the first load, then the retry queued behind its rollback
+    for _ in range(2):  # the first load (which applies the rollback behind it), then the retry
         _finish_when_read(d.workers["worker_1"])
     assert not d.workers["worker_1"].ingest.lora_loads
     assert answers[-1] == LoraAdapterResult(op_id="op2", status=200, served=True)
