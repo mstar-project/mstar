@@ -122,19 +122,18 @@ def test_the_codec_decoder_compiles_at_start_up_not_on_a_request(monkeypatch):
     import torch
     from torch._dynamo.testing import CompileCounter
 
-    from mstar.engine.engine import Engine
     from mstar.model.omnivoice.components.codec import decode_canvas
     from mstar.model.omnivoice.config import OmniVoiceConfig
     from mstar.model.omnivoice.submodules import OmniVoiceCode2WavSubmodule
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     codec = _codec(decoder_hidden_size=1024)
 
-    engine = Engine.__new__(Engine)
-    engine._device = torch.device("cpu")
-    engine._device_capability = SimpleNamespace(is_available=True)
     code2wav = OmniVoiceCode2WavSubmodule(codec, OmniVoiceConfig())
-    engine._submodules = {"code2wav": SimpleNamespace(submodule=code2wav, fp32_precision=None, node_dtype=None,
-                                                      idle_keys=())}
+    engine = make_engine(
+        _device_capability=SimpleNamespace(is_available=True),
+        _submodules={"code2wav": make_mgmt(code2wav)},
+    )
     counter, compile_ = CompileCounter(), torch.compile
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: compile_(fn, backend=counter, **kwargs))
     torch._dynamo.reset()

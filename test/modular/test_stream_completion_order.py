@@ -36,6 +36,8 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.model.base import ForwardPassArgs, WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -45,7 +47,6 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 PRODUCER = "worker_0"
 CONSUMER = "worker_1"
@@ -129,7 +130,7 @@ class _Producer:
         return to_consumer[0], to_conductor[0]
 
 
-class _EndsLLM:
+class _EndsLLM(StubModel):
     """The LLM partition ends on its ``passes``-th pass."""
 
     def __init__(self, passes):
@@ -200,10 +201,7 @@ def _conduct(c, wgds) -> InputSignals:
 
 def _consumer(policy):
     """A consumer worker holding one StreamBuffer; reads land at once."""
-    w = Worker.__new__(Worker)
-    w._reads_done_sent = set()  # takes every input (`_takes_input`)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
+    w = make_worker()
     buf = StreamBuffer(1, EDGE, "LLM", policy)
     w.worker_id = CONSUMER
     w._reads_done_sent = set()

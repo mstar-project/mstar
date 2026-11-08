@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -27,10 +27,7 @@ from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
-    PiecewiseAcceleratorGraphConfig,
     PiecewiseCallInputs,
-    PiecewiseCaptureShape,
-    PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
@@ -46,6 +43,7 @@ from mstar.engine.resources.attn.flashinfer import FlashInferManager
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.aut_encoder import AuTEncoder
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
+from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.components.mrope import mrope_position_ids
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_seq_lengths
@@ -76,7 +74,6 @@ from mstar.model.qwen3_omni.config import (
     THINKER_POS,
     THINKER_SAMPLER,
     THINKER_TEXT_DECODE,
-    VISION_ATTN,
     Qwen3OmniModelConfig,
 )
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, image_span
@@ -96,9 +93,6 @@ from mstar.model.submodule_base import (
 from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
-
-# The vision tower's block loop, as a piecewise capture region
-VISION_BLOCK_LOOP = "vision_block_loop"
 
 THINKER_DECODE_WALKS = frozenset({"thinker_decode", THINKER_TEXT_DECODE})
 
@@ -154,19 +148,17 @@ class AudioEncoderSubmodule(AuTEncoderSubmodule):
 # ===================================================================
 
 
-class VisionEncoderSubmodule(NodeSubmodule):
+class VisionEncoderSubmodule(PackedBlockLoopEncoder):
     """The ViT, which turns a request's pixel patches into Thinker-width
     embeddings and the deepstack features.
 
     A request's images (or one video's frames) go through packed, in one
     call. Grid maths runs in ``prepare_inputs`` and each frame is one segment
     of the node's ragged-attention step, so the only size the tower sees
-    change is its patch count.
-
-    The block loop is captured one request per replay (eager, the tower is
-    launch-bound), so the encoder takes one request a step. A replay's
-    attention plan holds at most the resource's ``max_segments_per_request``
-    frames; a request with more runs the block loop eagerly.
+    change is its patch count. The block loop is captured (eager, the tower
+    is launch-bound), one request per replay; a request with more frames than
+    a replay plans runs it eagerly. On top of the shared encoder, the
+    captured region also returns the hidden states after each deepstack block.
     """
 
     # Patch-count buckets, one request per replay. A larger request runs eagerly.
@@ -177,9 +169,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
     disable_torch_compile = True
 
     def __init__(self, vision_encoder: Qwen3OmniVisionTower, config: Qwen3OmniModelConfig):
-        super().__init__()
-        self.vision_encoder = vision_encoder
-        self.config = config
+        super().__init__(vision_encoder, config.vision, "vision_embeds")
 
     def prepare_inputs(
         self,
@@ -192,8 +182,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         ``Qwen3OmniModel.process_prompt`` (a video walk maps its
         ``pixel_values_videos`` / ``video_grid_thw`` onto them)."""
         device = self.get_device()
-        vision = self.config.vision
-        merge = vision.spatial_merge_size
+        merge = self.config.spatial_merge_size
         # (num_images, 3): a single image's grid arrives as a bare [t, h, w]
         grid = [
             (int(t), int(h), int(w))
@@ -203,7 +192,7 @@ class VisionEncoderSubmodule(NodeSubmodule):
         # Built here, not in the forward, so the tower reads nothing off the host;
         # and built on the host, as Qwen3.5's encoder does: on the device, the
         # grid upload and the per-patch index maths each block on the stream.
-        indices, weights = vision_interpolation(grid, vision.num_grid_per_side, merge)
+        indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge)
         return NodeInputs(
             # what the engine leases the captured block loop's bucket by
             input_seq_len=sum(t * h * w for t, h, w in grid),
@@ -212,160 +201,40 @@ class VisionEncoderSubmodule(NodeSubmodule):
                 "indices": to_device_nonblocking(indices, device),
                 "weights": to_device_nonblocking(weights, device),
                 "position_ids": to_device_nonblocking(vision_grid_position_ids(grid, merge), device),
-                # not a forward arg: `declare_step` makes a segment of each
-                "seq_lengths": vision_seq_lengths(grid),
             },
+            # one segment per frame: a frame attends to itself alone
+            resource_step_info={"main": vision_seq_lengths(grid)},
         )
-
-    def declare_step(
-        self,
-        graph_walk: str,
-        request_ids: list[str],
-        inputs: list[NodeInputs],
-        piecewise_leases: Mapping[str, SlotLease] | None = None,
-        **kwargs,
-    ) -> SubmoduleStep | None:
-        # leased, the captured block loop plans its own attention per replay
-        if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
-            return None
-        # one segment per frame: a frame attends to itself alone
-        segments = [
-            Segment(request_id=rid, label="main", span=span)
-            for rid, inp in zip(request_ids, inputs, strict=True)
-            for span in inp.tensor_inputs["seq_lengths"]
-        ]
-        return SubmoduleStep(segments=segments, steps={VISION_ATTN: AttentionStep(causal=False)})
-
-    def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
-        return True
-
-    def max_batch_size(self, graph_walk: str) -> int | None:
-        # one request a step, so it can take the captured block loop
-        return 1
-
-    def get_piecewise_accelerator_graph_configs(
-        self, device: torch.device, autocast_dtype: torch.dtype,
-        tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
-        """The block loop, one request per replay, by patch-count bucket.
-
-        Patch embed, position resample and rope run eagerly before it, the
-        mergers after (they quarter the row count, which a region's output
-        view cannot express)."""
-        vision = self.config.vision
-        hidden, head_dim = vision.hidden_size, vision.head_dim
-
-        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
-            n = shape.total_tokens
-            return {
-                "hidden": torch.zeros(n, hidden, dtype=autocast_dtype, device=device),
-                "cos": torch.zeros(n, head_dim, dtype=autocast_dtype, device=device),
-                "sin": torch.zeros(n, head_dim, dtype=autocast_dtype, device=device),
-            }
-
-        def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
-            (rid,) = request_ids
-            return SubmoduleStep(
-                segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
-                steps={VISION_ATTN: AttentionStep(causal=False)},
-            )
-
-        return {
-            VISION_BLOCK_LOOP: PiecewisePackedConfig(
-                capture_fn=self._capture_block_loop,
-                make_static_inputs=make_static_inputs,
-                declare_step=declare_step,
-                lease_before_step=True,
-                can_lease=self._fits_capture,
-                total_tokens=self.BLOCK_LOOP_PATCH_BUCKETS,
-                capture_batch_sizes=[1],
-            )
-        }
-
-    def _fits_capture(self, inputs: list[NodeInputs]) -> bool:
-        """Whether the batch's frames fit a replay's attention plan: the
-        resource's per-request ceiling, read from it so a YAML override holds."""
-        per_request = self.node_resources[VISION_ATTN].max_segments_per_request
-        segments = sum(len(inp.tensor_inputs["seq_lengths"]) for inp in inputs)
-        return segments <= per_request * len(inputs)
 
     def _capture_block_loop(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
         """The captured region: reads the runner's buffers, never rebinds."""
         s = inp.static_inputs
-        hidden, taps = self.vision_encoder.encode(s["hidden"], s["cos"], s["sin"])
+        hidden, taps = self.model.encode(s["hidden"], s["cos"], s["sin"])
         return {"hidden": hidden, **{f"deepstack_{i}": t for i, t in enumerate(taps)}}
-
-    @torch.compiler.disable
-    def _replay_block_loop(
-        self,
-        engine_inputs: ModelInputsFromEngine,
-        hidden: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        seq_lengths: tuple[int, ...],
-    ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
-        """The block loop replayed once per request, or None if not leased."""
-        if VISION_BLOCK_LOOP not in engine_inputs.piecewise_leases:
-            return None
-        # one replay for every frame: a second plan overwrites the schedule a queued replay still reads
-        out = engine_inputs.piecewise_runners[VISION_BLOCK_LOOP].run(
-            static_inputs={"hidden": hidden, "cos": cos, "sin": sin},
-            request_ids=[engine_inputs.request_ids[0]],
-            seq_lens=list(seq_lengths),
-            real_bs=1,
-        )
-        # views of the runner's buffers, merged into new tensors within this step
-        taps = [out.get_view(f"deepstack_{i}") for i in range(len(self.config.vision.deepstack_visual_indexes))]
-        return out.get_view("hidden"), taps
-
-    def preprocess(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        inputs: list[NodeInputs],
-    ) -> dict[str, Any]:
-        """The batch's one request (see `max_batch_size`), its frames packed
-        in `declare_step`'s segment order."""
-        (inp,) = inputs
-        device = self.get_device()
-        tensors = inp.tensor_inputs
-        return {
-            "pixel_values": tensors["pixel_values"].to(device),
-            "indices": tensors["indices"].to(device),
-            "weights": tensors["weights"].to(device),
-            "position_ids": tensors["position_ids"].to(device),
-            "seq_lengths": tuple(tensors["seq_lengths"]),
-        }
-
-    def forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        **kwargs,
-    ) -> NameToTensorList:
-        rid = engine_inputs.request_ids[0]
-        return self.forward_batched(graph_walk, engine_inputs, **kwargs)[rid]
 
     def forward_batched(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        pixel_values: torch.Tensor,
-        indices: torch.Tensor,
-        weights: torch.Tensor,
-        position_ids: torch.Tensor,
-        seq_lengths: tuple[int, ...] = (),
-        **kwargs,
+        segment_lengths: Mapping[str, Sequence[int]],
+        row_patches: tuple[int, ...] = (),
+        **tensors: torch.Tensor,
     ) -> dict[str, NameToTensorList]:
         """Returns ``vision_embeds`` ``[merged_tokens, out_hidden]`` and one
         ``deepstack`` tensor of that size per deepstack block."""
-        tower = self.vision_encoder
-        hidden, cos, sin = tower.embed(pixel_values, indices, weights, position_ids)
-        encoded = self._replay_block_loop(engine_inputs, hidden, cos, sin, seq_lengths)
-        if encoded is None:
+        tower = self.model
+        hidden, cos, sin = tower.embed(**tensors)
+        out = self._replay_block_loop(engine_inputs, hidden, cos, sin, segment_lengths)
+        if out is None:
             encoded = tower.encode(hidden, cos, sin)
+        else:
+            # views of the runner's buffers, merged into new tensors within this step
+            taps = [out.get_view(f"deepstack_{i}") for i in range(len(self.config.deepstack_visual_indexes))]
+            encoded = out.get_view("hidden"), taps
         embeds, deepstack = tower.merge(*encoded)
-        return {engine_inputs.request_ids[0]: {"vision_embeds": [embeds], "deepstack": deepstack}}
+        return self._split_rows(
+            engine_inputs.request_ids, {self.output: [embeds], "deepstack": deepstack}, row_patches,
+        )
 
 
 # ===================================================================
@@ -2095,7 +1964,8 @@ class Code2WavSubmodule(NodeSubmodule):
         results: dict[str, NameToTensorList] = {}
         for i, rid in enumerate(request_ids):
             wav = wavs[i]
-            audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16).squeeze()
+            # in fp32: bf16 rounds a full-scale 32767 up to 32768, which wraps to -32768
+            audio_int16 = (wav.float().clamp(-1, 1) * 32767).to(torch.int16).squeeze()
             results[rid] = {"audio_chunk": [audio_int16]}
         return results
 
@@ -2117,7 +1987,7 @@ class Code2WavSubmodule(NodeSubmodule):
             return {}
 
         wav = self.code2wav(codec_tokens, position_ids)
-        audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
+        audio_int16 = (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:

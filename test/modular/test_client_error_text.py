@@ -18,9 +18,9 @@ from test_output_failure_teardown import _Model, _TensorManager, _thread
 from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.engine.engine import ExecutingBatch
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import ConductorMessageType
 from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler
-from mstar.worker.worker import Worker
 
 USER = getpass.getuser()
 ERROR_ID = re.compile(r"error id ([0-9a-f]{12})\)")
@@ -106,8 +106,7 @@ def test_an_arena_io_error_reaches_the_client_as_an_error_id(caplog):
 
 
 def _worker(rids=("r1",)):
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
+    w = make_worker()
     w.sent = []
     w.communicator = SimpleNamespace(send=lambda entity, msg: w.sent.append(msg))
     w.request_state = SimpleNamespace(per_request_info={rid: object() for rid in rids})
@@ -119,6 +118,7 @@ def _worker(rids=("r1",)):
     w.scheduler.held_until = {}
     w.scheduler.admit_errors = {}
     w.scheduler.backlog = {}
+    w._in_flight_rids = set()
     w._hold_rows(CHAIN_LANE, rids)
     return w
 

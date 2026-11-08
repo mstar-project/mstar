@@ -9,6 +9,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine
 from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.utils.device import DeviceCapability
 from mstar.worker.worker import Worker
 
@@ -99,14 +100,14 @@ def test_cpu_output_copy_needs_no_accelerator_runtime():
      ("cuda", True, True), ("xpu", True, True)],
 )
 def test_engine_compile_checks_its_own_device(monkeypatch, device_type, available, compiled):
-    engine = object.__new__(Engine)
-    engine._device = torch.device(device_type)
-    engine._device_capability = SimpleNamespace(
-        is_available=available and device_type != "cpu",
-    )
     submodule = SimpleNamespace(forward=Mock(), forward_batched=Mock())
-    engine._submodules = {"node": SimpleNamespace(submodule=submodule)}
-    engine._item_encoders = set()
+    engine = make_engine(
+        _device=torch.device(device_type),
+        _device_capability=SimpleNamespace(
+            is_available=available and device_type != "cpu",
+        ),
+        _submodules={"node": make_mgmt(submodule=submodule)},
+    )
     compile_fn = Mock(side_effect=lambda fn, **kwargs: fn)
     monkeypatch.setattr(torch, "compile", compile_fn)
 

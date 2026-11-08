@@ -289,7 +289,7 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
             hidden_states: [tokens, hidden_size] -- final normed hidden states
             layer_0_embed: [tokens, hidden_size] -- input before any layers
             layer_n_hidden: [tokens, hidden_size] or None -- hidden states
-                after ``accept_hidden_layer`` (for Talker conditioning)
+                entering layer ``accept_hidden_layer`` (for Talker conditioning)
         """
         # The fused norms update the residual stream in place, so it starts from
         # a copy: ``input_embeds`` (a captured graph's static input) stays as
@@ -322,8 +322,9 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
                     deepstack_visual_embeds[layer_idx],
                 )
 
-            # Capture hidden states at the accept_hidden_layer for Talker
-            if keep_states and layer_idx == self.accept_hidden_layer:
+            # The Talker takes transformers' hidden_states[accept_hidden_layer]: index 0 is
+            # the embeds, so index k is the stream leaving layer k - 1
+            if keep_states and layer_idx == self.accept_hidden_layer - 1:
                 layer_n_hidden = residual + hidden_states
 
         # Final layer norm

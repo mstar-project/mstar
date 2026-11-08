@@ -42,7 +42,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
-from mstar.model.qwen3_5.config import LLM_MIXED  # noqa: E402
+from mstar.model.keys import MIXED  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, NodeInputs, engine_step  # noqa: E402
 
 F64 = torch.float64
@@ -171,7 +171,7 @@ def test_lora_changes_no_capture_bucket_and_captures_on_the_zero_slot(qwen_adapt
 @pytest.mark.parametrize("walk,bs,n,rows", [
     ("decode", 8, 8, [("d0", "decode", 1), ("d1", "decode", 1), ("d2", "decode", 1)]),
     # decode rows, then a prompt, then an empty padding row
-    (LLM_MIXED, 4, 32, [("d0", "decode", 1), ("d1", "decode", 1), ("p0", "prefill_text", 9)]),
+    (MIXED, 4, 32, [("d0", "decode", 1), ("d1", "decode", 1), ("p0", "prefill_text", 9)]),
 ])
 def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, walk, bs, n, rows):
     """Replayed on the captured views at the bucket's width, each real token gets its own
@@ -342,8 +342,8 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_an_idle_step(compiled
     from lora_module_helpers import pool as lora_pool
     from lora_module_helpers import serve
 
-    from mstar.engine.engine import Engine
     from mstar.model.components.lora.modules import bind_module_lora, module_lora_spec
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     real = torch.compile
     monkeypatch.setattr(torch, "compile", (lambda fn, **kw: real(fn, backend="eager", **kw)) if compiled
@@ -352,10 +352,10 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_an_idle_step(compiled
     spec = module_lora_spec(lambda _: _Warmed(), nodes={"N"}, root_path="")
     node, pool = _Warmed(), lora_pool(serve(spec, {}))
     bind_module_lora(node, {"lora": pool})
-    engine = object.__new__(Engine)
-    engine._device, engine._device_capability = CPU, SimpleNamespace(is_available=True)
-    engine._submodules = {"N": SimpleNamespace(submodule=node, fp32_precision=None, node_dtype=None,
-                                               idle_keys=("lora",), resources={"lora": pool})}
+    engine = make_engine(
+        _device_capability=SimpleNamespace(is_available=True),
+        _submodules={"N": make_mgmt(node, resources={"lora": pool})},
+    )
     engine._compile_regions()
     assert pool._current is None and pool.active
     with pytest.raises(RuntimeError, match="no plan"):
@@ -444,25 +444,25 @@ def test_only_a_config_whose_step_drives_the_idle_resource_captures_idle_twins()
 
 def test_a_node_takes_at_most_one_idle_capable_resource():
     """A step is idle or not as a whole, so one idle twin cannot leave two resources out."""
-    from mstar.engine.engine import SubmoduleManagement
+    from mstar.testing_utils.engine import make_mgmt
 
     resource = SimpleNamespace(idle_capture=True, force_double_buffer=False, supports_preplan=False)
     with pytest.raises(ValueError, match="at most one idle-capable resource"):
-        SubmoduleManagement(None, None, None, None, resources={"lora": resource, "vision_lora": resource})
+        make_mgmt(resources={"lora": resource, "vision_lora": resource})
 
 
 def _mgmt(idle_keys, runner=None, adapters=None):
     """A node whose idle-capable resources answer from ``adapters`` (rid -> the adapter
     it was ingested with), as a pool answers from its ingests."""
-    from mstar.engine.engine import SubmoduleManagement
+    from mstar.testing_utils.engine import make_mgmt
 
     named = adapters or {}
     resource = SimpleNamespace(
         idle_capture=True, force_double_buffer=False, supports_preplan=False,
         idle_for=lambda rids: all(named.get(rid) is None for rid in rids),
     )
-    return SubmoduleManagement(
-        SimpleNamespace(cg_key_info=lambda walk, info, **kw: "cfg"), None, None, None,
+    return make_mgmt(
+        SimpleNamespace(cg_key_info=lambda walk, info, **kw: "cfg"),
         resources=dict.fromkeys(idle_keys, resource), accelerator_graph_runner=runner,
     )
 
@@ -470,7 +470,7 @@ def _mgmt(idle_keys, runner=None, adapters=None):
 def _engine_with(captured, idle_keys=(LORA_RESOURCE_KEY,), adapters=None):
     """An engine whose node captured the decode buckets ``captured``, (bs, idle) pairs."""
     from mstar.engine.accelerator_graph_runner import AcceleratorGraphBucket, AcceleratorGraphRunner
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine
 
     config = BatchedAcceleratorGraphConfig(
         capture_graph_walk="decode", single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
@@ -480,9 +480,7 @@ def _engine_with(captured, idle_keys=(LORA_RESOURCE_KEY,), adapters=None):
         BucketKey("decode", bs, bs, "cfg", idle=idle): AcceleratorGraphBucket(config, 0, slots=[None])
         for bs, idle in captured
     }
-    engine = object.__new__(Engine)
-    engine._submodules = {"LLM": _mgmt(idle_keys, runner, adapters)}
-    return engine
+    return make_engine(_submodules={"LLM": _mgmt(idle_keys, runner, adapters)})
 
 
 def _batch(rids):
@@ -527,12 +525,13 @@ def test_each_nodes_pool_reads_the_config_the_conductor_opens_a_request_with():
 
     from mstar.conductor.conductor import Conductor
     from mstar.engine.resources.lora import LORA_ADAPTER_KWARG
+    from mstar.testing_utils.model import make_model
 
     spec = P.make_spec({})
     spec.nodes = {"LLM", "vision"}
     spec.targets = {"qkv": dataclasses.replace(P.QKV, node="LLM"), "o": dataclasses.replace(P.O, node="vision")}
     conductor = object.__new__(Conductor)
-    conductor.model = SimpleNamespace(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
+    conductor.model = make_model(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
     conductor.model_config = {"resources": {LORA_RESOURCE_KEY: {}}}
     conductor._kv_labels = {}
     configs = conductor._get_resource_configs({LORA_ADAPTER_KWARG: "a1"}, {})
@@ -543,14 +542,12 @@ def test_each_nodes_pool_reads_the_config_the_conductor_opens_a_request_with():
 def test_an_idle_lease_checks_the_models_key():
     """The lease/declare_step check compares the model's own key, the same under an idle
     lease."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine
 
     def plan(step, phase):
         raise NotImplementedError("reached plan")
 
-    engine = object.__new__(Engine)
-    engine._enable_nvtx, engine._runner = False, SimpleNamespace(plan=plan)
-    engine._pre_plan_done = {}
+    engine = make_engine(_runner=SimpleNamespace(plan=plan))
     lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1, "cfg", idle=True))
     ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease, idle=True)
 
