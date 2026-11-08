@@ -25,10 +25,10 @@ so a chunk's keys are one contiguous range; the attention over them is a ragged
 cross-attention (``DIT_ATTN``) whose step pairs the chunk's queries with that
 range and with the text. The encoder and decoder write their caches straight
 into the pool (``wan_vae.PoolFeatCache``, ``wan_vae.encoder_saves_uncopied``,
-``wan_vae.decoder_saves_uncopied``). Only the noise drawn for the whole rollout
-and small host-side bookkeeping stay in the request's ``PerRequestState``; the
-noise isn't counted by the engine, so the model still refuses a config that
-runs more than one rollout at a time (``LingBotWorldModel.validate_config_yaml``).
+``wan_vae.decoder_saves_uncopied``). How many rollouts run at once is the pool's
+to decide: a rollout waits in line until its region fits. Only the noise drawn
+for the whole rollout (at most 4.4% of the rollout's region) and small host-side
+bookkeeping stay in the request's ``PerRequestState``, outside the pool.
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE

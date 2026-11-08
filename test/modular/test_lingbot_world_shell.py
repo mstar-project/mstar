@@ -830,27 +830,16 @@ def test_the_fast_config_only_adds_the_autotuned_compile():
     LingBotWorldModel(skip_weight_loading=True).validate_config_yaml(fast, "lingbot_world_1_3b_fast.yaml")
 
 
-def test_a_config_must_run_one_rollout_at_a_time(model):
-    """The pool doesn't bound the rollouts' noise, so until the limit is lifted the
-    conductor runs one rollout at a time."""
-    model.validate_config_yaml({"max_concurrent_requests": 1}, "lingbot.yaml")
-    for limit in (None, 0, 2, 16, True, "1", 1.0):
-        config = {"max_concurrent_requests": limit} if limit is not None else {}
-        with pytest.raises(ValueError, match="requires `max_concurrent_requests: 1`") as err:
-            model.validate_config_yaml(config, "lingbot.yaml")
-    assert "noise is allocated by the dit outside" in str(err.value)
-
-
-def test_the_shipped_config_runs_one_rollout_at_a_time_over_the_default_pool(model):
-    """Concurrency is the conductor's max_concurrent_requests; the K/V memory is
-    the request pool's default, room for one rollout at the largest area."""
+def test_the_shipped_config_lets_the_pool_decide_how_many_rollouts_run(model):
+    """Every rollout's state is in the request pool, which queues a rollout until it
+    has room, so the config sets no conductor limit and keeps the default pool."""
     from pathlib import Path
 
     import yaml
 
     path = Path(__file__).parents[2] / "configs" / "lingbot_world_1_3b.yaml"
     config = yaml.safe_load(path.read_text())
-    assert config["max_concurrent_requests"] == 1 and not config.get("resources")
+    assert "max_concurrent_requests" not in config and not config.get("resources")
     model.validate_config_yaml(config, str(path))
     (pool, _, _) = model.get_node_resources()
     assert pool.config.pool_bytes == model.default_pool_bytes()

@@ -23,10 +23,6 @@ The trajectory is synthetic and the image one of Cosmos3-Edge's assets, as in
 (``region_gib``); the default pool holds one rollout at 720x1280 or two at the
 default size.
 
-While LingBot refuses more than one rollout at a time
-(``LingBotWorldModel.validate_config_yaml``), the examples with several rollouts at
-once need that check lifted locally.
-
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc2
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc3 --sessions 3 --expect-waits 1
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/pool --pool-gib 9 --expect-waits 1

@@ -13,14 +13,11 @@ model_kwargs:
 # text length; the dit's K/V and VAE caches live in its request pool (below).
 max_seq_len: 512
 
-# One rollout at a time for now; the model refuses any other value. Each rollout's
-# noise for the whole rollout lives outside the request pool below.
-max_concurrent_requests: 1
-
-# The dit's request pool, reserved at startup, holds each rollout's rolling K/V,
-# text K/V and VAE caches. The default, 20.1 GiB with a bf16 decode, holds one
-# rollout at the largest size (720x1280); one at the default size (464x832) takes
-# 8.5 GiB. To change it, set
+# Each rollout keeps its rolling K/V, text K/V and VAE caches in the dit's request
+# pool, reserved at startup, and waits for room there when it is full (the wait
+# counts against the API server's request timeout, --timeout). The default pool,
+# 20.1 GiB with a bf16 decode, holds one rollout at the largest size (720x1280) or
+# two at the default size (464x832, 8.5 GiB each). To change it, set
 #   resources:
 #     dit_pool:
 #       pool_bytes: 34359738368   # 32 GiB

@@ -1185,8 +1185,8 @@ views are inference tensors and pass to the model's compiled graphs as they are,
 those guard on their inputs' dispatch keys. LingBot-World keeps each rollout's rolling K/V,
 text K/V and VAE encoder and decoder caches in one (``DIT_POOL``); both write their caches
 straight into it (``wan_vae.PoolFeatCache`` with ``wan_vae.encoder_saves_uncopied`` and
-``wan_vae.decoder_saves_uncopied``). Its noise for the whole rollout is still the model's,
-so it requires ``max_concurrent_requests: 1`` for now.
+``wan_vae.decoder_saves_uncopied``), and the pool decides how many rollouts run. Its noise
+for the whole rollout (at most 4.4% of a rollout's region) is still the model's.
 
 Rolling (compacted) caches
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
