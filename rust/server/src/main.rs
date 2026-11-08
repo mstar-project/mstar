@@ -45,7 +45,7 @@ use std::sync::Arc;
 use axum::{
     body::{Body, Bytes},
     extract::{multipart::MultipartError, rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{header::CONTENT_TYPE, Request, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -111,11 +111,12 @@ async fn main() {
         .unwrap_or(24000);
     let allow_remote = std::env::var("MSTAR_ALLOW_REMOTE").as_deref() == Ok("1");
     // Total per-request budget (mstar's APIServer timeout_seconds default).
-    let request_timeout = std::time::Duration::from_secs(
+    let request_timeout = std::time::Duration::from_secs_f64(
         std::env::var("MSTAR_REQUEST_TIMEOUT_S")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(600),
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(600.0),
     );
     // Same variable and default as serving_images.max_images_per_request.
     let max_images_per_request =
@@ -174,7 +175,7 @@ async fn main() {
     let max_concurrent: usize = std::env::var("MSTAR_MAX_CONCURRENT_REQUESTS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(512);
     let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     // Uploads (audio/video multipart) routinely exceed axum's 2 MB default.
     let body_limit_mb = body_limit_mb();
@@ -223,9 +224,15 @@ async fn main() {
             auth::API_KEY_ENV
         );
     }
+    // MSTAR_ROOT_PATH: routed before the router sees the path, as Starlette's
+    // root_path is, so the prefixed and the bare path both reach a route.
+    let root_path = std::env::var("MSTAR_ROOT_PATH").unwrap_or_default();
+    let app = tower::Layer::layer(&tower::util::MapRequestLayer::new(move |req: Request<Body>| {
+        strip_root_path(&root_path, req)
+    }), app);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
-    axum::serve(listener, app)
+    axum::serve(listener, axum::ServiceExt::<Request<Body>>::into_make_service(app))
         // Disable Nagle: SSE/NDJSON streams write many small chunks, and
         // Nagle + delayed ACK turns each flush into a ~40 ms stall.
         .tcp_nodelay(true)
@@ -315,6 +322,38 @@ fn error_type(status: u16) -> &'static str {
 
 /// `MSTAR_MAX_BODY_MB`, default 128. The Python frontend parses it the same
 /// way (`mstar/api_server/body_limit.py`).
+/// The path a route sees under `MSTAR_ROOT_PATH`, by Starlette's
+/// `get_route_path`: a path under `root` loses it, and any other path is
+/// routed as sent.
+fn route_path<'a>(root: &str, path: &'a str) -> &'a str {
+    let root = root.trim_end_matches('/');
+    match path.strip_prefix(root) {
+        Some("") if !root.is_empty() => "/",
+        Some(rest) if !root.is_empty() && rest.starts_with('/') => rest,
+        _ => path,
+    }
+}
+
+fn strip_root_path(root: &str, mut req: Request<Body>) -> Request<Body> {
+    let path = req.uri().path();
+    let routed = route_path(root, path);
+    if routed.len() != path.len() {
+        let mut target = routed.to_string();
+        if let Some(q) = req.uri().query() {
+            target.push('?');
+            target.push_str(q);
+        }
+        if let Ok(pq) = target.parse::<axum::http::uri::PathAndQuery>() {
+            let mut parts = req.uri().clone().into_parts();
+            parts.path_and_query = Some(pq);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *req.uri_mut() = uri;
+            }
+        }
+    }
+    req
+}
+
 fn body_limit_mb() -> usize {
     std::env::var("MSTAR_MAX_BODY_MB")
         .ok()
@@ -327,11 +366,27 @@ fn body_limit_mb() -> usize {
 /// 400 with `fallback`.
 fn multipart_failure(e: &MultipartError, fallback: String) -> (u16, String) {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        let mb = body_limit_mb();
-        (413, format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"))
+        (413, body_too_large())
     } else {
         (400, fallback)
     }
+}
+
+fn body_too_large() -> String {
+    let mb = body_limit_mb();
+    format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)")
+}
+
+/// A body read that stopped at its limit (`to_bytes` wraps `LengthLimitError`).
+fn is_length_limit(e: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = source {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 fn error(status: u16, message: &str, type_: &str) -> Response {
@@ -1092,8 +1147,11 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
     if content_type.starts_with("application/x-www-form-urlencoded") {
         // No file uploads on this path (files force multipart), matching how
         // these clients already behave.
-        let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        // Bounded here: `DefaultBodyLimit` binds only the extractors, and this
+        // path reads the body itself.
+        let body = match axum::body::to_bytes(req.into_body(), body_limit_mb() << 20).await {
             Ok(b) => b,
+            Err(e) if is_length_limit(&e) => return detail_error(413, &body_too_large()),
             Err(e) => return detail_error(400, &format!("reading form body: {e}")),
         };
         for (k, v) in form_urlencoded::parse(&body) {
@@ -1400,6 +1458,30 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_root_path_is_stripped_as_starlette_strips_it() {
+        use super::route_path;
+        // unset: every path as sent
+        assert_eq!(route_path("", "/v1/models"), "/v1/models");
+        // a path under the prefix loses it; the bare path still routes
+        assert_eq!(route_path("/proj/job", "/proj/job/v1/models"), "/v1/models");
+        assert_eq!(route_path("/proj/job/", "/proj/job/v1/models"), "/v1/models");
+        assert_eq!(route_path("/proj/job", "/v1/models"), "/v1/models");
+        // a sibling that only shares the prefix's characters is not under it
+        assert_eq!(route_path("/proj/job", "/proj/jobs/v1/models"), "/proj/jobs/v1/models");
+        assert_eq!(route_path("/proj/job", "/proj/job"), "/");
+    }
+
+    #[test]
+    fn the_rewrite_keeps_the_query() {
+        let req = axum::http::Request::builder()
+            .uri("/p/generate?tokenize=true")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let req = super::strip_root_path("/p", req);
+        assert_eq!(req.uri().path_and_query().unwrap().as_str(), "/generate?tokenize=true");
+    }
+
     use super::*;
     use mstar_rust::communicator::RawZmqCommunicator;
     use std::sync::atomic::{AtomicBool, Ordering};

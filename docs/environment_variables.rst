@@ -290,8 +290,11 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - Mount the app under a URL sub-path. Set it when an ingress routes the
        deployment at a prefix and does not strip that prefix before the
        request reaches the pod (Run:AI serves a workload at
-       ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
-       every route. Empty by default, so a direct deployment is unaffected.
+       ``/<project>/<job-name>/``, for instance); without it every route
+       404s. A path under the prefix is routed without it, and any other path
+       as sent, on both frontends (Starlette's ``root_path``; ``route_path``
+       in ``rust/server/src/main.rs``). Empty by default, so a direct
+       deployment is unaffected.
    * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
      - ``10``
      - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
@@ -355,11 +358,15 @@ Read by the ``mstar-server`` binary and its bridge
        sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
-     - Per-request budget in the Rust frontend; on expiry the client gets
-       an error and the request is aborted in the backend.
+     - Per-request budget in the Rust frontend, in seconds; on expiry the
+       client gets an error and the request is aborted in the backend.
+       ``mstar serve --rust-frontend`` sets it from ``--timeout``
+       (``launch_rust_server``).
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``
-     - Sample rate stamped on ``/v1/audio/speech`` WAV output.
+     - Sample rate stamped on the Rust frontend's WAV output.
+       ``mstar serve --rust-frontend`` sets it to the model's
+       ``get_output_sample_rate("audio")``, as the Python frontend reads it.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -393,7 +400,7 @@ Read by the ``mstar-server`` binary and its bridge
        ``Content-Length`` and while streaming. Read like
        ``MSTAR_REMOTE_ALLOWED_HOSTS``.
    * - ``MSTAR_MAX_CONCURRENT_REQUESTS``
-     - ``256``
+     - ``512``
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
        ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.

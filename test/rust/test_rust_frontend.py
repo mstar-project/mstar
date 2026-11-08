@@ -13,6 +13,7 @@ import threading
 import time
 import types
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
@@ -834,9 +835,10 @@ _CHAT = {"messages": [{"role": "user", "content": "hi"}]}
 
 
 def test_body_over_limit_is_413_like_the_python_frontend(monkeypatch):
-    """MSTAR_MAX_BODY_MB: a JSON body and a multipart upload over the limit
-    both get a 413 naming it, as `mstar/api_server/body_limit.py` answers
-    (axum's own rejections were a 422 and a 400)."""
+    """MSTAR_MAX_BODY_MB: a JSON body, a multipart upload and a urlencoded
+    form over the limit each get a 413 naming it, as
+    `mstar/api_server/body_limit.py` answers (axum's own rejections were a 422
+    and a 400, and the urlencoded `/generate` body was read unbounded)."""
     monkeypatch.setenv("MSTAR_MAX_BODY_MB", "1")
     big = b"x" * (2 * 2**20)
     message = "request body is larger than the 1 MiB limit (MSTAR_MAX_BODY_MB)"
@@ -863,6 +865,9 @@ def test_body_over_limit_is_413_like_the_python_frontend(monkeypatch):
         code, body = post(port, "/v1/images/edits", form("image", "a.png"), ctype)
         assert code == 413 and body["error"]["message"] == message
         code, body = post(port, "/generate", form("files", "a.wav"), ctype)
+        assert code == 413 and body["detail"] == message
+        urlencoded = urllib.parse.urlencode({"text": "a" * len(big)}).encode()
+        code, body = post(port, "/generate", urlencoded, "application/x-www-form-urlencoded")
         assert code == 413 and body["detail"] == message
 
 

@@ -163,15 +163,28 @@ def _stale_server(binary: str, rust_dir: Path) -> str | None:
             f"but {rust_dir} and its server/ hash to {' '.join(current)}")
 
 
+#: The serve settings ``mstar-server`` reads from its environment. The
+#: launcher's resolved values win over inherited ones, as the API key's does.
+REQUEST_TIMEOUT_ENV = "MSTAR_REQUEST_TIMEOUT_S"
+SAMPLE_RATE_ENV = "MSTAR_SAMPLE_RATE"
+
+
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
-                       api_key: str | None = None) -> subprocess.Popen:
+                       api_key: str | None = None, timeout_s: float | None = None,
+                       sample_rate: int | None = None) -> subprocess.Popen:
+    """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
+    (``get_output_sample_rate``); ``None`` leaves the frontend's own default."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
     env = {k: v for k, v in os.environ.items() if k != API_KEY_ENV}
     if api_key:
         env[API_KEY_ENV] = api_key
+    if timeout_s is not None:
+        env[REQUEST_TIMEOUT_ENV] = repr(float(timeout_s))
+    if sample_rate is not None:
+        env[SAMPLE_RATE_ENV] = str(int(sample_rate))
     env[OPENAI_ADAPTER_ENV] = openai_adapter_class(model_name)
     proc = subprocess.Popen([binary, model_name, str(port), bridge_dir,
                              upload_dir], env=env)
