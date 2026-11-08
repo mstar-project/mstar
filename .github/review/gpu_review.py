@@ -312,7 +312,9 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
         out["unavailable"] = "true"
         sys.exit(3)
     cfg = gpu_py()["load_config"]()
-    listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json").stdout)
+    # check=False: offers exits 1 with its JSON when something errored and nothing has an offer. That
+    # is "no GPUs" here too, with the errors listed.
+    listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json", check=False).stdout)
     cap = listing["max_usd_per_hour"]
     free = [o for o in listing["offers"] if o["usd_per_hour"] <= cap
             and o["availability"] != "none" and not str(o["availability"]).startswith("busy")]
@@ -351,7 +353,7 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
             print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
             return
         tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
-    everything = json.loads(gpu("offers", "--gpus", str(gpus), "--json", "--all-regions").stdout)
+    everything = json.loads(gpu("offers", "--gpus", str(gpus), "--json", "--all-regions", check=False).stdout)
     lines = [f"No GPUs for the live test: it needs {gpus} Hopper-class GPU(s), at most ${cap}/hr."]
     lines += [f"- tried {t}" for t in tried]
     lines += [f"- `{o['id']}`: {o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr, {o['availability']}"
@@ -452,7 +454,7 @@ def cleanup(out, pr: int, tag, runner_temp):
             print(f"slurm {sl['name']}: {err}")
     if state["enabled"](cfg, "eras"):
         name = state["job_name"](None, pr, tag)
-        for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []:
+        for i in state["eras_instances"]():
             if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
         state["eras_delete_key"](name)

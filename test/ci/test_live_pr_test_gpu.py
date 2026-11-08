@@ -3,6 +3,7 @@
 import argparse
 import base64
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -119,13 +120,17 @@ class TestSlurm(unittest.TestCase):
         self.globals.update(STATE=state, LEDGER=state / "instances.json")
         soon = time.time() + 600
         with GPU["ledger_txn"]() as d:
-            d.update({f"{p}:i": {"provider": p, "deadline": soon} for p in ("eras", "runpod")})
-        with self.assertRaises(SystemExit, msg="the watchdog would move but the Pod would still end at its old time"), \
-                contextlib.redirect_stderr(io.StringIO()):
-            GPU["cmd_extend"](argparse.Namespace(instance="eras:i", hours=1), {})
+            d.update({f"{p}:i": {"provider": p, "deadline": soon, "launched_at": time.time(), "usd_per_hour": 1.0}
+                      for p in ("eras", "slurm", "runpod")})
+        cfg = {"budget": {"max_hours": 4}}
+        for p in ("eras", "slurm"):  # --allow-over-budget lifts the caps, not what was fixed at launch
+            with self.assertRaises(SystemExit, msg="the watchdog would move but the box would end at its old time"), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                GPU["cmd_extend"](argparse.Namespace(instance=f"{p}:i", hours=1, allow_over_budget=True), cfg)
+        extend = functools.partial(argparse.Namespace, allow_over_budget=False)
         with contextlib.redirect_stdout(io.StringIO()):
-            GPU["cmd_extend"](argparse.Namespace(instance="runpod:i", hours=1), {})
-            GPU["cmd_extend"](argparse.Namespace(instance="eras:i", hours=0), {})  # how a lost API key still terminates
+            GPU["cmd_extend"](extend(instance="runpod:i", hours=1), cfg)
+            GPU["cmd_extend"](extend(instance="eras:i", hours=0), cfg)  # how a lost API key still terminates
         self.assertLess(GPU["ledger"]()["eras:i"]["deadline"], soon)
         self.assertGreater(GPU["ledger"]()["runpod:i"]["deadline"], soon)
 
@@ -175,6 +180,12 @@ class TestSlurm(unittest.TestCase):
             GPU["cmd_launch"](args, cfg)
         self.assertIn("HF_HOME=/workspace/shared/hf", out.getvalue(),
                       "each run would download the weights again into its own directory")
+        self.assertIn("-J live-pr-7-1-1 ", out.getvalue(), "gpu_review's cleanup finds the job by its --tag name")
+        args.tag = None
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            GPU["cmd_launch"](args, cfg)
+        self.assertRegex(out.getvalue(), r"-J live-pr-7-\d{4}-\d{6}-[0-9a-f]{4} ",
+                         "a lost create's job is found by this name, so two launches must not share it")
 
     def test_offers_cover_every_node_and_the_freest_comes_first(self):
         """Node a has 2 GPUs free, b has 6, and c doesn't answer: offers lists b, then a, says why c is
@@ -208,6 +219,67 @@ class TestSlurm(unittest.TestCase):
         with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()):
             GPU["cmd_launch"](args, cfg)
         self.assertEqual([n for n, c in calls if c.startswith("sbatch")], ["b"])
+
+        # No offers: an unknown node makes that an error, in both modes; nodes merely full don't.
+        full = fake_slurm({"sinfo": "x gpu:8 gpu:8 mixed\n"})
+        for down, code in ((True, 1), (False, None)):
+            nodes.update(a=full, b=full, **({} if down else {"c": full}))
+            for as_json in (True, False):
+                query = argparse.Namespace(gpus=2, min_vram=80, all_regions=False, allow_arm=False, json=as_json)
+                with self.subTest(down=down, as_json=as_json), contextlib.redirect_stdout(io.StringIO()), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        GPU["cmd_offers"](query, cfg)
+                        exit_code = None
+                    except SystemExit as e:
+                        exit_code = e.code
+                    self.assertEqual(exit_code, code, "a down node would read as 'no availability'")
+
+    def test_a_lost_sbatch_is_found_or_ended_by_name(self):
+        key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
+        key.write_text("ssh-ed25519 AAAA test")
+        saved = {k: self.globals[k] for k in ("STATE", "LEDGER", "load_config")}
+        self.addCleanup(self.globals.update, saved)
+        cfg = {**SLURM_CFG, "ssh_public_key": str(key), "budget": {
+            "max_usd_per_hour": 0, "max_hours": 4, "max_concurrent_instances": 9}}
+        self.globals.update(STATE=state, LEDGER=state / "instances.json", load_config=lambda: cfg)
+        args = argparse.Namespace(offer="slurm:node1:1", pr=7, hours=1, tag="t", run=None, input=[], cache="ro",
+                                  allow_over_budget=False, dry_run=False)
+
+        def launch(sbatch, squeue):
+            calls.clear()
+            self.globals["slurm_run"] = fake_slurm(
+                {"sinfo": "node1 gpu:8 gpu:0 idle\n", "sbatch": sbatch, "squeue": squeue, "scancel": ""}, calls)
+            with unittest.mock.patch.object(subprocess, "Popen"), unittest.mock.patch("time.sleep"), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    GPU["cmd_launch"](args, cfg)
+                except SystemExit:
+                    pass
+
+        lost = GPU["ApiError"](255, "slurm: sbatch: ssh: connection reset")
+        launch(lost, "42\n")
+        self.assertEqual(list(GPU["ledger"]()), ["slurm:node1:42"], "the job would run on with no watchdog")
+        self.assertEqual(GPU["ledger"]()["slurm:node1:42"]["instance_id"], "42")
+
+        GPU["save_ledger"]({})
+        with self.assertRaises(GPU["ApiError"]), unittest.mock.patch.object(subprocess, "Popen"), \
+                contextlib.redirect_stdout(io.StringIO()):  # sbatch's own refusal made nothing
+            launch(GPU["ApiError"](1, "slurm: sbatch: error: invalid partition"), "")
+        self.assertEqual(GPU["ledger"](), {})
+
+        launch(subprocess.TimeoutExpired("sbatch", 120), "")
+        pending = "pending:live-pr-7-t"
+        e = GPU["ledger"]()[pending]
+        self.assertIsNone(e["instance_id"])
+        self.assertIn("answer lost", GPU["status"](e, cfg)[0], "squeue -j None would call it ended")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            GPU["reachable"](pending)  # srun --jobid=None otherwise
+        with contextlib.redirect_stdout(io.StringIO()):
+            GPU["terminate"](pending, e)
+        self.assertTrue(any("scancel --name=live-pr-7-t" in c for c in calls),
+                        f"a job submitted with its answer lost would run to its --time: {calls}")
+        self.assertEqual(GPU["ledger"](), {})
 
 
 class TestEras(unittest.TestCase):
@@ -276,7 +348,7 @@ class TestEras(unittest.TestCase):
         tpl = {"endpoints": {"ssh": {"port": 22}}, "pod": {"containers": [
             {"resources": {"limits": {"nvidia.com/gpu": "1"}}, "volumeMounts": []}], "volumes": []}}
 
-        def eras(method, path, body=None, params=None):
+        def eras(method, path, body=None, params=None, retry=True):
             calls.append((method, path, json.loads(json.dumps(body))))  # as sent, not as changed later
             bound = method == "POST" and path.startswith("/instances") and \
                 (body["run"]["bindings"]["volumes"].get("cache") or {}).get("volume_id") in held
@@ -344,6 +416,48 @@ class TestEras(unittest.TestCase):
         self.assertEqual([ids == ["k0"] for ids in bound], [True, False],
                          "a launch reusing a key another launch deleted mid-launch would fail")
         self.assertNotIn("exit", [c[0] for c in calls])
+
+    def test_a_create_whose_answer_was_lost_is_not_sent_again(self):
+        posts, globs = [], GPU["eras"].__globals__
+        self.addCleanup(globs.update, {"_eras_org": globs["_eras_org"]})
+        globs["_eras_org"] = "org"
+
+        def urlopen(req, timeout=None):
+            if req.full_url.endswith("/instances/preview"):
+                return io.BytesIO(json.dumps({"run": {"problems": []}, "is_available": True, "available_until": None,
+                                              "quote": {"line_items": []}}).encode())
+            posts.append(req.full_url)
+            raise TimeoutError("timed out")
+
+        body = {"listing_id": "l1", "name": "live-pr-7-t", "run": {"bindings": {
+            "volumes": {}, "secrets": {"authorized-keys": {"ssh_key_ids": ["k1"]}}}}}
+        with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}), unittest.mock.patch("time.sleep"), \
+                unittest.mock.patch("urllib.request.urlopen", urlopen), \
+                self.assertRaises(GPU["ApiError"]) as caught:
+            GPU["eras_create"](body, "ssh-ed25519 AAAA test")
+        self.assertEqual(len(posts), 1, "the retry loop would buy a box for each resend it couldn't confirm")
+        self.assertEqual(caught.exception.status, -1)
+
+    def test_a_pending_entry_releases_the_live_instance_with_its_name(self):
+        calls, state = [], Path(tempfile.mkdtemp())
+
+        def eras(method, path, body=None, params=None, retry=True):
+            calls.append((method, path))
+            items = [{"id": "gone", "name": "live-pr-7-t", "status": "releasing"},
+                     {"id": "other", "name": "live-pr-8-t", "status": "active"},
+                     {"id": "i-9", "name": "live-pr-7-t", "status": "active"}]
+            return {"items": items if path == "/instances" else [], "next_page_token": None}
+
+        globs = GPU["terminate"].__globals__
+        self.addCleanup(globs.update, {k: globs[k] for k in ("eras", "STATE", "LEDGER")})
+        globs.update(eras=eras, STATE=state, LEDGER=state / "instances.json")
+        e = {"provider": "eras", "instance_id": None, "name": "live-pr-7-t", "launched_at": 0, "usd_per_hour": 1.0,
+             "region": "x"}
+        GPU["save_ledger"]({"pending:live-pr-7-t": e})
+        with contextlib.redirect_stdout(io.StringIO()):
+            GPU["terminate"]("pending:live-pr-7-t", e)
+        self.assertEqual([p for m, p in calls if m == "POST"], ["/instances/i-9/release"])
+        self.assertEqual(GPU["ledger"](), {})
 
     def test_a_launch_past_the_caps_registers_nothing(self):
         calls = self.eras_launch(max_running=0)

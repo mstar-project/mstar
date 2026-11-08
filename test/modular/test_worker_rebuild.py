@@ -24,12 +24,13 @@ from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import make_model
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.host_pool import HostCopy, HostPool, HostSlice
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.rebuild import KeptIds, RebuildCursor, Rebuilds
 from mstar.worker.side_steps import SIDE_LANE
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import PendingBatch, Speculation, Worker, _make_rebuilds
+from mstar.worker.worker import PendingBatch, Speculation, _make_rebuilds
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
 R, A = 7, 8
@@ -63,28 +64,29 @@ def _worker():
     eng.land_rebuild = lambda node, rid: eng.landed.append(rid)
     eng.release_chunk_inputs = lambda rid, node: eng.released.append(rid)
     eng.release_cached_prefix = lambda batch: None
-    w = Worker.__new__(Worker)
-    w.worker_id, w._phase_period, w.enable_nvtx, w.enable_prof, w.device = "w", 0, False, False, torch.device("cpu")
-    w._in_flight_rids = set()
-    w.tensor_manager = SimpleNamespace(get_tensor=None, get_tensors=None, cleanup_collectable=lambda *a: None)
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), w.tensor_manager, [])  # no streams
-    w._rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
-    w._pending_removes, w._pending_drains, w._draining_rids = {}, set(), set()
-    # keeps the rows the worker hands it in ``w.seen``, and holds no row, so any routing, stop or loop-count
+    tm = SimpleNamespace(get_tensor=None, get_tensors=None, cleanup_collectable=lambda *a: None)
+    seen = []
+    # keeps the rows the worker hands it in ``seen``, and holds no row, so any routing, stop or loop-count
     # call fails the test
-    w._graph_runtime = SimpleNamespace(
+    runtime = SimpleNamespace(
         cleanup_consumed_inputs=_cleanup, clear_pending_loop_stops=lambda: None, get_rid_string=str,
-        push_back_node=lambda node, rids, wgs: w.seen.extend(rids),
-        set_in_flight=lambda node, rids, wgs, value: w.seen.extend(rids),
-        commit_speculation=lambda spec_id, ok, dropped, node, wg_ids, scheduled_rids: w.seen.extend(scheduled_rids),
-        speculate_node=lambda node, walks, rows, counts, strides: w.seen.extend(rows) or [],
+        push_back_node=lambda node, rids, wgs: seen.extend(rids),
+        set_in_flight=lambda node, rids, wgs, value: seen.extend(rids),
+        commit_speculation=lambda spec_id, ok, dropped, node, wg_ids, scheduled_rids: seen.extend(scheduled_rids),
+        speculate_node=lambda node, walks, rows, counts, strides: seen.extend(rows) or [],
     )
-    w.parallel_nodes, w.parallel_leader_nodes = set(), set()
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: eng)
-    w.seen, w.failed = [], {}
-    w.scheduler = SimpleNamespace(held_until={}, backlog={}, failed_rids=set())
-    w.infos = {rid: CurrentForwardPassInfo(str(rid), DECODE, 0, 0, 8) for rid in (R, A)}
-    w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p", get_fwd_info=lambda r, p: w.infos[r])
+    infos = {rid: CurrentForwardPassInfo(str(rid), DECODE, 0, 0, 8) for rid in (R, A)}
+    w = make_worker(
+        worker_id="w",
+        tensor_manager=tm,
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),  # no streams
+        _rebuilds=Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu"))),
+        _graph_runtime=runtime,
+        engine_manager=SimpleNamespace(get_engine=lambda node: eng),
+        scheduler=SimpleNamespace(held_until={}, backlog={}, failed_rids=set()),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: "p", get_fwd_info=lambda r, p: infos[r]),
+    )
+    w.seen, w.failed, w.infos = seen, {}, infos
     w._fail_requests = w.failed.update
     return w, eng
 
@@ -335,8 +337,8 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
 
 
 def test_the_scheduler_sees_the_rows_every_lane_holds():
-    w = Worker.__new__(Worker)
-    shared = w._in_flight_rids = set()
+    w = make_worker()
+    shared = w._in_flight_rids
 
     w._hold_rows(CHAIN_LANE, [R])
     w._hold_rows(SIDE_LANE, [A])
