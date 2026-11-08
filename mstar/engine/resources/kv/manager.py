@@ -660,8 +660,8 @@ class KVManager(AttentionResource):
         # set by the engine on rank 0 of a TP node
         self.journal: Callable[..., None] | None = None
         # An allotment covers the labels `_nodes` open.
-        # `_asks` holds the pages `ask` counted for each request that asked and has no allotment yet, which its
-        #   allotment is sized from.
+        # `_asks` holds the pages each waiting request asks for: what `ask` counted for one with no allotment yet,
+        #   which its allotment is sized from, or the shortage one that holds its allotment waits on (`_wait`).
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their

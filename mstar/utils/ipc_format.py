@@ -181,8 +181,8 @@ class Move(NamedTuple):
     rid: str
     kind: MoveKind
     # A move applies to the KV resource keyed `pool`, or, when `pool` is empty, to the whole of node `node`.
-    # `count` is the number of pages of a RESERVE, an EARMARK or an ALLOT, the pages a GUARANTEE asks for, and the
-    # tokens a DROP's rebuild writes.
+    # `count` is the number of pages of a RESERVE, an EARMARK or an ALLOT, the pages a GUARANTEE or a WAIT asks for,
+    # 1 for an UNRESERVE whose RESERVE made the allotment rather than grew it, and the tokens a DROP's rebuild writes.
     pool: str = ""
     count: int = 0
     victims: tuple[str, ...] = ()
@@ -191,10 +191,12 @@ class Move(NamedTuple):
 
 @dataclass
 class OffloadDelta:
-    """A rank's moves, in the order it made them.
+    """A rank's moves, in the order the followers replay them.
 
-    Ordered so the follower replays the leader's decisions in the same order: a
-    sequence that worked for the leader works for the followers too.
+    That is the order the leader made them in, so a sequence that worked for the
+    leader works for the followers too, except that a node's offload goes ahead of
+    the moves its pools made as it freed room (`add` with ``at``). A follower can
+    replay those only after the offload.
 
     Holds WIRE request ids, not worker-local handles: a handle is minted per
     worker, so rank 0's would name different requests on the follower.
