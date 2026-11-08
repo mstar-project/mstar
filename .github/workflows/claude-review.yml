@@ -558,8 +558,7 @@ jobs:
           # contributor's own review, CLAUDE_REVIEW_MAX_TURNS_TEAM (2000) when someone
           # with write access asked. The Skill tool is off: it could load a skill from
           # pr-head/; the prompt reads skills by path from the root instead. Subagents
-          # (Task/Agent) review slices of a big PR, and in thorough and gpu modes run
-          # the review-standard second pass, under the same restrictions.
+          # (Task/Agent) review slices of a big PR under the same restrictions.
           claude_args: |
             --model claude-opus-5-5
             --effort ${{ steps.prev.outputs.effort || steps.pr.outputs.effort }}

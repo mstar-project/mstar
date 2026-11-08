@@ -14,8 +14,6 @@ An LLM reviewer runs on a PR when someone asks for it with `/review`, including 
 
 The method in every mode is the [`pr-review`](../../.claude/skills/pr-review/SKILL.md) skill; [`review-prompt.md`](review-prompt.md) adds the bot's inputs, re-review scope and output. A run someone with write access starts has a turn cap meant only to stop a loop (`CLAUDE_REVIEW_MAX_TURNS_TEAM`, 2000, and a 5-hour timeout); a contributor's own light review keeps `CLAUDE_REVIEW_MAX_TURNS` (40).
 
-**Two passes in nogpu and gpu modes.** After its own pass, the reviewer gives the same inputs to a subagent with a fresh context that reviews with [`review-standard`](../../.claude/skills/review-standard/SKILL.md) (its hard rules, review bar and four passes). The reviewer verifies what it returns like its own findings and posts one merged review; the summary's checked list says what the second pass added.
-
 **Re-reviews.** When the bot's last summary is on a commit that is still an ancestor of the head, the next run re-checks each earlier finding at the head (fixed, fixed in a PR stacked above, still open, or moot), reviews only the commits since, plus whatever they reach elsewhere, and checks what merges of `main` changed under the PR. After a force-push it reviews the whole PR again, and a `nogpu` or `gpu` run does too unless the last review was `nogpu` or `gpu` and skipped no file. An earlier finding counts as open until a later review judges it fixed, fixed in a PR stacked above (which merges with it, and whose diff the workflow fetched for the review), or moot, or a commit outdates its thread, whether or not someone resolved the thread.
 
 To re-review after pushes, comment the same command again. The `skip-ai-review` label turns off the author's own `/review light`; a review someone with write access asks for still runs.
@@ -33,7 +31,7 @@ Running out of turns is handled in two ways. A review that finished but went pas
 | File | Role |
 | --- | --- |
 | [`../../AGENTS.md`](../../AGENTS.md) | **The substance.** Numbered invariants the reviewer checks and cites. Also read by contributors' own coding agents. |
-| [`review-prompt.md`](review-prompt.md) | The bot's inputs, trust boundary, re-review scope, second pass and output. The method and bar are in `pr-review`. |
+| [`review-prompt.md`](review-prompt.md) | The bot's inputs, trust boundary, re-review scope and output. The method and bar are in `pr-review`. |
 | [`../workflows/claude-review.yml`](../workflows/claude-review.yml) | The workflow, and the safety rules that come with running on `issue_comment`. |
 | [`render_summary.py`](render_summary.py) | The summary's fields (its `--schema`), and the comment they render to. |
 | [`session.py`](session.py) | Reads a run's execution file and transcripts: the usage record, and the handoff for `/review continue`. |
