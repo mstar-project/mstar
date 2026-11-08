@@ -213,12 +213,13 @@ Maps to: AGENTS.md "Splitting work across PRs", "Keep PRs focused"; C10, C12.
 - Does the PR defer anything (a TODO, a "follow-up", an issue)? Each deferral that a finding needs
   is itself the finding.
 
-## 14. A test counts only if it runs in CI and can fail
+## 14. A test counts only if something runs it and it can fail
 
-New tests sit where CI runs them, exercise the real path, use an independent oracle, and fail if the
-code is wrong. Tests CI skips, tests whose setup makes the assertion vacuous, tests comparing code
-with a copy of itself, and tests pinning incidental details (literal YAML, log text) give false
-confidence.
+New tests sit where something runs them, exercise the real path, use an independent oracle, and fail
+if the code is wrong. CPU tests go under `CPU_TEST_PATHS`, or in `NOT_CPU_CORE` with where they run;
+GPU-only tests go in a path the GPU live test runs and skip cleanly on CPU. A test nothing runs is the
+finding. Tests whose setup makes the assertion vacuous, tests comparing code with a copy of itself,
+and tests pinning incidental details (literal YAML, log text) give false confidence.
 
 Maps to: AGENTS.md "Testing" (`CPU_TEST_PATHS` and `NOT_CPU_CORE` in
 `scripts/ci/select_cpu_tests.py`); C7.

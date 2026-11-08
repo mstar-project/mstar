@@ -38,8 +38,9 @@ both return.
 ## Working efficiently
 
 These rules make the review faster, not shallower: never skip a pass, a read or a check to save
-turns. A run someone with write access starts has a turn cap that only stops a loop. A review's cost
-is its turns times its context: every turn re-reads everything read so far.
+turns; only a contributor's capped run may skip files, as below. A run someone with write access
+starts has a turn cap that only stops a loop. A review's cost is its turns times its context: every
+turn re-reads everything read so far.
 
 - **Batch.** Issue independent reads and searches as parallel tool calls in one message. A turn
   with one small call is the exception.
@@ -59,7 +60,8 @@ is its turns times its context: every turn re-reads everything read so far.
   an independent subagent with this skill, the slice's files, the base tree, and the contracts it
   relies on from other slices. Then verify every finding they return yourself, merge duplicates, and
   review what crosses slices (a caller in one and a callee in another, state one writes and another
-  reads): those are the defects no slice sees. Phase A and the big picture stay yours.
+  reads): those are the defects no slice sees. Phase A and the big picture stay yours. A run
+  someone with write access starts never skips a file: it slices.
 - **Nothing runs in light or thorough mode.** No tests, scripts, servers or reproductions: findings
   are traced (§5).
 
@@ -78,9 +80,9 @@ is its turns times its context: every turn re-reads everything read so far.
   the finding asks, and a move, rename or deleted file isn't a fix (#392, above #387, deleted
   `dsa.py` but still planned DSA in `preprocess`). A partial fix is a plain open finding. Before
   folding a finding into another, check its callers at every stacked head. When you can't read the
-  PR above (no shell, as in the bot), a finding said to be fixed there stays a plain open finding
-  that adds "said to be fixed in #N, not checked". If the PR carries another PR's commit, say
-  whether it is byte-identical.
+  PR above (the bot reads only the diffs its workflow fetched), a finding said to be fixed there
+  stays a plain open finding that adds "said to be fixed in #N, not checked". If the PR carries
+  another PR's commit, say whether it is byte-identical.
 - **Rules.** `AGENTS.md` every review; then the skills it points to for the layers the PR touches:
   `async-worker` before judging any worker-loop change, `engine-resources` for resources,
   `prefix-caching` for KV, `benchmarking` for performance claims, `writing-prs` for the description,
@@ -253,8 +255,9 @@ Judge the PR as a whole, before the line-level design passes.
   flight, and should it wait or fold into another PR? (A split request stays a note, §1.)
 - **Is the overall approach right?** Name the 2–3 system-level ways to build it, including the PR's,
   and say which you'd pick and why. Compare with how vLLM, SGLang and their -Omni variants (and
-  LMCache, Dynamo or diffusers where relevant) solve it; read their code when you can, and say so
-  when the comparison is from memory.
+  LMCache, Dynamo or diffusers where relevant) solve it. Read their code or docs (the web tools are
+  limited to code hosts, the projects' docs, Hugging Face, PyTorch and arXiv) and say what you read;
+  don't go from memory.
 - **Scope, timing and commitments:** is this the right slice to land now? What does it commit mstar
   to (public config keys, API fields, wire formats, base-class hooks or invariants that are hard to
   undo), and does it make the likely next step (TP, a new modality, disaggregation, another cache
@@ -528,7 +531,8 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
 - **Design verdict** (thorough), always present, even when the approach is right; at most six lines:
   the Phase A ideal, the rows where the code differs and which side is better, the north star and
   the PR's distance from it. Every gap named here is also a finding or a question.
-- **Skipped:** files not reviewed, on a diff too large to cover.
+- **Skipped:** files not reviewed, only on a contributor's capped run whose diff is too large for
+  its cap.
 - **Risk:** the design-risk rating, its sentence and, above low, the decisions (§6).
 
 **Before reporting, check:** every cited `path:line` says what the finding claims at the head; every
