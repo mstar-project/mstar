@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 class PreemptionCounts:
     """A node's preemptions since its worker started."""
     # `rebuild_tokens`: tokens the rebuild rows prefilled.
-    # `returns_preempted`: returned requests preempted again before they kept another token.
+    # `returns_preempted`: requests preempted again before they sampled a token since they were last preempted.
     victims: int = 0
     drops: int = 0
     rebuild_tokens: int = 0
