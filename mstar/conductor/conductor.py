@@ -741,8 +741,9 @@ class Conductor:
             getattr(cfg, "return_logprobs", False) for cfg in configs.values()
         ):
             raise ValueError("this model does not report logprobs; leave return_logprobs unset")
+        layout = (model_kwargs or {}).get("kv_layout") or {}
         for key, labels in self._kv_labels.items():
-            configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
+            configs.setdefault(key, KVReqConfig(needed_labels=list(layout.get(key, labels))))
         # the adapter config is the conductor's to fill, like the KV configs above,
         # so a model that declares a LoRA spec needs no request code of its own; every
         # node with a LoRA pool (an LLM, its vision encoder) runs the request's adapter
