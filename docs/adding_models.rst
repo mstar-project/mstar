@@ -180,8 +180,9 @@ You must implement these abstract methods:
    In a partition a stream moves (``Connection.consumer_walk``), the stream decides how
    many passes each step runs, but the conductor moves past a step on its first report
    when it is the last step (the partition ends) or the next step takes inputs it sends,
-   so such a step must run once (a ``Loop``, say). Its plan must list every walk the stream
-   can move it to: a report of a walk the plan doesn't run fails the request.
+   so such a step must run once (a ``Loop``, say). Such a partition's plan must list every
+   walk the stream can move it to: before the partition's last pass, a report of a walk
+   the plan doesn't run fails the request.
    Qwen3.5 (through ``MultimodalDecoderModel``), Z-Image, Orpheus and Chatterbox are
    references.
 

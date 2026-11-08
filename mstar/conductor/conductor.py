@@ -2095,7 +2095,8 @@ class Conductor:
         whose walk the stream moves (`Connection.consumer_walk`), the report
         names the step that ran; the conductor enters the next step only to
         send it something, and otherwise leaves it to the stream. A report of
-        a walk the plan doesn't run is a model bug, and fails the request.
+        a walk the plan doesn't run, before the partition's last pass, is a
+        model bug, and fails the request.
         """
         pstate = request_data.partition_states[partition_name]
         plan, k, walk = pstate.plan, pstate.cursor, pstate.graph_walk
