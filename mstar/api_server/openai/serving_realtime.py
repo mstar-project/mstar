@@ -1325,6 +1325,9 @@ class RealtimeConversation:
             elif mark == "end" and turn is not None:
                 await self._feed(turn, data, final=True)
                 data, turn.end, turn = b"", step, None
+        if turn is None and data and self.idle_steps is not None:
+            # text after a reply ended for its padding, with no start mark: the model speaks again
+            turn = await self._start_turn(step)
         if turn is not None:   # between replies the text channel is padding
             await self._feed(turn, data)
             turn.idle = 0 if data or meta.get("turn") else turn.idle + 1
