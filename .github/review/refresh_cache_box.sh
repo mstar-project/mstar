@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Fill one of the review bot's cache volumes from main: model weights, and the compile caches each
-# model's first server start writes. review-cache.yml launches it with
-# `gpu.py launch --run --cache rw --cache-volume ID` on an Eras box, where that volume is /cache,
-# read-write. Only main's code runs here, never a PR's; live tests mount the volumes read-only.
+# model's first server start writes. review-cache.yml launches it with `gpu.py launch --run
+# --cache-write ID` on an Eras box, where that volume is /cache, read-write. Only main's code runs
+# here, never a PR's; live tests mount the volumes read-only.
 #
 # Weights download straight onto the volume (HF_HOME=/cache/hf), so a deadline keeps every model
 # that finished, and the next refresh resumes a partial one. The compile caches are saved to it

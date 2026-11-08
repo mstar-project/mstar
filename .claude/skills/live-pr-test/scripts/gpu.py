@@ -5,7 +5,7 @@ usage:
   gpu.py check                                   keys, persistent storage, budget
   gpu.py offers --gpus N [--min-vram GB] [--all-regions] [--allow-arm] [--json]
   gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]]
-               [--cache ro|rw|none] [--cache-volume ID] [--allow-over-budget] [--dry-run]
+               [--cache ro|none] [--cache-write ID] [--allow-over-budget] [--dry-run]
   gpu.py wait <instance>                         until ssh answers; prints how to reach it
   gpu.py ssh <instance> [command ...]            run a command (or a shell) on it
   gpu.py push <instance> <local> <remote>        scp -r to the box
@@ -506,9 +506,9 @@ def cmd_launch(args, cfg):
                                 shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
                                else ["-o /dev/null", "--wrap 'sleep infinity'"])])
         elif o["provider"] == "eras":
-            volumes = eras_cache_volumes(cfg, args.cache, args.cache_volume)
+            volumes = eras_cache_volumes(cfg, args.cache, args.cache_write)
             body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input, volumes[0] if volumes else None,
-                                    args.cache == "rw")
+                                    bool(args.cache_write))
         elif o["provider"] == "runpod":
             rp = cfg["runpod"]
             vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
@@ -550,7 +550,7 @@ def cmd_launch(args, cfg):
                     except ApiError as err:  # another box took the cache volume since: the next free one, then cold
                         if not volume_refused(err):
                             raise
-                        if args.cache == "rw":  # a refresh without its volume would write nothing that lasts
+                        if args.cache_write:  # a refresh without its volume would write nothing that lasts
                             die(f"cache volume {held} is held: {err}")
                         print(f"gpu.py: cache volume {held} is held ({str(err)[:200]}); launching "
                               f"{f'with {nxt}' if nxt else 'cold'}", file=sys.stderr)
@@ -663,22 +663,19 @@ def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float, r
     }
 
 
-def eras_cache_volumes(cfg: dict, cache: str, named: str | None) -> list[str]:
+def eras_cache_volumes(cfg: dict, cache: str, write: str | None) -> list[str]:
     """The cache volumes a launch tries to bind, in order. An instance binds one volume, so
     eras.cache_volume_ids are replicas, one per box: "ro" tries those no box holds, then none (the
-    box starts cold); "rw" takes only `named`, and dies if a box holds it."""
-    if cache == "none":
-        return []
-    if cache == "rw" and not named:
-        die("--cache rw needs --cache-volume ID: the volume to write")
+    box starts cold). `write` (a cache refresh) takes only that volume, and dies if a box holds it."""
+    ids = [write] if write else [] if cache == "none" else cfg.get("eras", {}).get("cache_volume_ids") or []
     free = []
-    for vid in [named] if named else cfg.get("eras", {}).get("cache_volume_ids") or []:
+    for vid in ids:
         att = eras("GET", f"/volumes/{vid}").get("attachment") or {}
         if not att.get("instance_id") or att.get("detached_at"):
             free.append(vid)
-        elif cache == "rw":
+        elif write:
             die(f"cache volume {vid} is held by instance {att['instance_id']}; wait for it to end")
-    if not free and (named or cfg.get("eras", {}).get("cache_volume_ids")):
+    if ids and not free:
         print("gpu.py: every cache volume is held by another box; launching cold", file=sys.stderr)
     return free
 
@@ -986,10 +983,10 @@ def main():
     p.add_argument("--run", help="a script that is the work itself; the GPUs go when it ends")
     p.add_argument("--input", action="append", default=[],
                    help="a file for the --run script: in its working directory on Slurm, in /run/live-pr on Eras")
-    p.add_argument("--cache", choices=("ro", "rw", "none"), default="ro",
-                   help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), "
-                        "--cache-volume read-write, or none")
-    p.add_argument("--cache-volume", help="Eras: the cache volume to mount; required with --cache rw")
+    p.add_argument("--cache", choices=("ro", "none"), default="ro",
+                   help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
+    p.add_argument("--cache-write", metavar="ID",
+                   help="Eras: mount this cache volume read-write at /cache instead, to fill it; dies if it is held")
     p.add_argument("--allow-over-budget", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("wait")

@@ -86,7 +86,7 @@ jobs:
           offer=$(python3 "$S" offers --gpus "$GPUS" --json | jq -r --argjson cap "$MAX_USD" \
             '[.offers[] | select(.provider == "eras" and .availability == "now" and .usd_per_hour <= ($cap * 2))][0].id // empty')
           [ -n "$offer" ] || { echo "::error::No Eras listing with $GPUS GPUs free now."; exit 1; }
-          python3 "$S" launch "$offer" --pr 0 --hours "$HOURS" --tag "$TAG" --cache rw --cache-volume "$VOLUME" \
+          python3 "$S" launch "$offer" --pr 0 --hours "$HOURS" --tag "$TAG" --cache-write "$VOLUME" \
             --allow-over-budget \
             --run .github/review/refresh_cache_box.sh --input "$out/run.json" | tail -n 1 > "$out/instance"
 

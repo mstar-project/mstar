@@ -315,7 +315,7 @@ class TestEras(unittest.TestCase):
             GPU["terminate"]("eras:i-1", e)
         self.assertEqual(GPU["ledger"](), {}, "the watchdog would retry a released instance forever")
 
-    def eras_launch(self, cache, max_running=None, held=("v1",)):
+    def eras_launch(self, write=None, max_running=None, held=("v1",)):
         """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview refuses
         those `held` (as the spec has it), as when another box took them in between; the calls it made."""
         key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
@@ -343,8 +343,8 @@ class TestEras(unittest.TestCase):
                 "storage": True})
         cfg = {"ssh_public_key": str(key), "eras": {"cache_volume_ids": ["v1", "v2"]},
                "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": max_running}}
-        args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=None, input=[], cache=cache,
-                                  cache_volume="v1" if cache == "rw" else None, allow_over_budget=False, dry_run=False)
+        args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=None, input=[], cache="ro",
+                                  cache_write=write, allow_over_budget=False, dry_run=False)
         with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()), \
                 unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}), contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -354,17 +354,17 @@ class TestEras(unittest.TestCase):
         return calls
 
     def test_a_cache_refresh_never_launches_without_its_volume(self):
-        calls = self.eras_launch("rw")
+        calls = self.eras_launch(write="v1")
         self.assertEqual([c for c in calls if c[1] == "/instances" and c[0] == "POST"], [],
                          "the refresh would fill a box's local disk and report success, writing nothing to the volume")
         for held, bound in ((["v1"], ["v2"]), (["v1", "v2"], [])):
-            created = [c[2] for c in self.eras_launch("ro", held=held) if c[1] == "/instances" and c[0] == "POST"]
+            created = [c[2] for c in self.eras_launch(held=held) if c[1] == "/instances" and c[0] == "POST"]
             self.assertEqual([[v["volume_id"] for k, v in b["run"]["bindings"]["volumes"].items() if k == "cache"]
                               for b in created], [bound],
                              "a live test would give up on Eras rather than take the next free volume or start cold")
 
     def test_a_launch_past_the_caps_registers_nothing(self):
-        calls = self.eras_launch("ro", max_running=0)
+        calls = self.eras_launch(max_running=0)
         self.assertEqual([c[:2] for c in calls if c[0] in ("POST", "exit")], [("exit", 4)],
                          "a refused launch would leave an ssh key in the organization")
 
