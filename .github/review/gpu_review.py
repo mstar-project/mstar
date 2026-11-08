@@ -402,7 +402,8 @@ def reasons_not_to_approve(a, review):
     if perm not in WRITE:
         why.append(f"the author has {perm or 'no'} access, not write")
     # `skipped`: the review chose `none` and the workflow let it stand (the last live test passed on an
-    # ancestor, or there is none). On runtime code it counts only after that passing live test (below).
+    # ancestor, or there is none and the review didn't build on an earlier one or the PR changes no
+    # runtime code). On runtime code it counts only after that passing live test (below).
     if not (a.verdict == "pass" or (a.verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none")):
         why.append(f"the live test's verdict is {a.verdict}")
     if (review.get("risk") or {}).get("level") != "low":
