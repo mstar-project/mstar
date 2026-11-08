@@ -13,9 +13,10 @@ from types import SimpleNamespace
 sys.path.insert(0, ".")
 
 from mstar.graph.runtime.base import SpeculationOutput
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.batch_builder import StepPick
 from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
-from mstar.worker.worker import SpeculationTarget, Worker
+from mstar.worker.worker import SpeculationTarget
 
 
 class _Preparer:
@@ -27,7 +28,7 @@ class _Preparer:
 
 
 def test_a_request_the_next_node_holds_back_is_not_continued_onto_it():
-    worker = Worker.__new__(Worker)
+    worker = make_worker()
     worker._spec_preparer = _Preparer()
     # nothing is tearing down
     worker._pending_removes, worker._pending_drains, worker._draining_rids = {}, {}, set()
