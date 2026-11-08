@@ -63,11 +63,11 @@ class TestApproval(unittest.TestCase):
         saved = {k: globs[k] for k in ("gh", "gh_json", "review_threads")}
         self.addCleanup(globs.update, saved)
 
-        def why(verdict, run, files=("docs/models.rst",), since=None):
+        def why(verdict, run, files=("docs/models.rst",), since=None, skipped=()):
             compare = {"files": [{"filename": f} for f in files]}
             globs.update(gh=lambda *a, check=True: argparse.Namespace(stdout="write\n"),
                          gh_json=lambda path: compare if "/compare/" in path else pr, review_threads=lambda pr: [])
-            r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": [],
+            r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": list(skipped),
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "confirm": [], "checks": ["correctness"], "gpus": 1}}
             a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict, since=since,
@@ -75,6 +75,8 @@ class TestApproval(unittest.TestCase):
             return GPU_REVIEW["reasons_not_to_approve"](a, r)[0]
 
         self.assertEqual(why("pass", "full"), [])
+        self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), ["the review skipped files"],
+                         "a review that left files unread could approve them")
         self.assertEqual(why("skipped", "none", ("docs/models.rst", "test/ci/test_x.py", "benchmark/run.py")), [],
                          "a change that needs no GPU run could never be approved")
         self.assertEqual(why("skipped", "targeted"), ["the live test's verdict is skipped"],
