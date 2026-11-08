@@ -3316,6 +3316,11 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
             layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start, self.get_device(),
         )
 
+    def resident_walks(self) -> frozenset[str]:
+        # a captured decode step builds its rope inside the graph (`_rope_in_graph`),
+        # so its `preprocess` reads nothing the tables fill
+        return frozenset({self.DECODE_WALK})
+
     @staticmethod
     def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
         """A captured step of a text walk, whose rotary tables come from the
