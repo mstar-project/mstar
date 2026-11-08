@@ -743,16 +743,18 @@ class VJepa2Model(Model):
             # in process_prompt so the client gets a clear error before any
             # forward pass runs.  Sliced per-iter inside the rollout submodule
             # (see ``VJepa2ACRolloutPredictorSubmodule._rollout_step``).
-            if int(kwargs.get("rollout_horizon", 0) or 0) > 1:
-                # the loop's cap: the rollout runs no more iterations than that
+            requested = int(kwargs.get("rollout_horizon", 0) or 0)
+            if requested > 1:
+                # H is the loop's cap: the rollout runs no more iterations than that
                 rollout_horizon = self._rollout_horizon(kwargs)
+                capped = f" (capped at max_rollout_horizon={rollout_horizon})" if rollout_horizon < requested else ""
                 t_ctx = 1
                 required = t_ctx + rollout_horizon - 1
                 act_tensor = out["actions"][0]
                 t_total = act_tensor.size(0) if act_tensor.dim() == 2 else act_tensor.size(1)
                 if t_total < required:
                     raise ValueError(
-                        f"AC rollout with rollout_horizon={rollout_horizon} requires "
+                        f"AC rollout with rollout_horizon={requested}{capped} requires "
                         f"actions/states trajectory length >= T_ctx + H - 1 = "
                         f"{t_ctx} + {rollout_horizon} - 1 = {required}; got {t_total}."
                     )
