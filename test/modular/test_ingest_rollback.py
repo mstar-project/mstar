@@ -41,8 +41,15 @@ def test_a_raising_ingest_rolls_back_every_resource_it_reached():
     ]
 
 
-def test_the_worker_fails_only_the_request_whose_ingest_raised():
-    registered, processed = [], []
+def _raise(err):
+    raise err
+
+
+@pytest.mark.parametrize("raises_in", ["engine_add", "input_read"])
+def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
+    """An engine that refuses the request, or a read that raises as it starts
+    (a CUDA OOM in the H2D copy, say): the request fails, alone."""
+    registered, processed, reads = [], [], []
     parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
     w = make_worker(
         graph_runtime=SimpleNamespace(
@@ -51,26 +58,35 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised():
         ),
         engine_manager=SimpleNamespace(
             engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-            add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
+            add_request=lambda rid, cfg, info: (
+                _raise(RuntimeError("over capacity")) if raises_in == "engine_add" else None
+            ),
         ),
         request_state=SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None),
+        streams=SimpleNamespace(add_request=lambda rid, info: None),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
         tensor_manager=SimpleNamespace(
             get_tensor=None,
             register_request=lambda rid, sharding: registered.append(rid),
-            start_read_tensors=lambda *a, **kw: pytest.fail("no reads for a failed request"),
+            start_read_tensors=lambda *a, **kw: (
+                reads.append(a[0]) or _raise(RuntimeError("CUDA out of memory")) if raises_in == "input_read"
+                else pytest.fail("no reads for a failed request")
+            ),
         ),
     )
     assert w.lifecycle.park(parked)
     w.ingest._dispatch = processed.extend
     body = SimpleNamespace(
         request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
+        initial_inputs=[],
         request_info=SimpleNamespace(
-            partition_name="p", graph_walk="g", resource_configs=None, rid_handle=None,
+            partition_name="p", graph_walk="g", resource_configs={}, rid_handle=None,
         ),
     )
     w.ingest._add_new_request(body)
     failed = w.lifecycle.take_failures()
     assert registered == [5] and list(failed) == [5]
+    assert reads == ([5] if raises_in == "input_read" else [])  # the read itself raised
     assert failed[5].startswith("Error in worker: internal error (error id ")
     # messages parked before the NEW still go through (a parked REMOVE among them)
     assert processed == [parked] and "wire" not in w.lifecycle._parked

@@ -349,9 +349,12 @@ class StepExecutor:
             )
 
     def _engine_thread_pool(self, name: str) -> ThreadPool:
-        """A one-thread pool for the GPU or plan thread, started here: before torch 2.12 dynamo's
-        config is process-wide, so an initializer that ran at the first step could reset a
-        recompile limit the other thread's compiled call had raised (``with_recompile_limit``)."""
+        """A one-thread pool for the GPU or plan thread, started here, before the loop: before torch
+        2.12 dynamo's config is process-wide, and a plan thread whose initializer ran at its first
+        pre-plan could read and write the recompile limit while the GPU thread's compiled call patches it
+        (``with_recompile_limit``). ``apply_dynamo_config`` never lowering the limit covers a limit
+        raised before the pools start (a DiT's, at compile time), not that interleaving. A failed
+        initializer also stops the worker here rather than failing every step."""
         pool = ThreadPool(
             max_workers=1, thread_name_prefix=f"{name}-{self.worker_id}",
             initializer=self._init_engine_thread,
@@ -1383,7 +1386,7 @@ class StepExecutor:
 
     def drop_failed_rids(
         self, pending: PendingBatch,
-        outputs: dict[int, NameToTensorList],
+        outputs: BatchedModelOutput,
         failed_requests: Collection[int],
     ) -> None:
         """Excise ``failed_requests`` (rids, or a rid -> error map) from a finished batch.
@@ -1402,6 +1405,7 @@ class StepExecutor:
             outputs.pop(rid, None)
             pending.batch.discard_rid(rid)
             pending.node_batch.per_request_info.pop(rid, None)
+            pending.node_batch.cached_rids.discard(rid)
             # Clear what we just reported, so a later stage that fails more
             # rids (check_stop, below the forward) can tell its own from these
             # and doesn't report them to the conductor twice.

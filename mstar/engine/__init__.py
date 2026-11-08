@@ -51,8 +51,10 @@ def recompile_limit() -> int:
 
 
 def apply_dynamo_config() -> None:
-    # dynamo config is per-thread since torch 2.12, so every compiling thread calls this
-    torch._dynamo.config.recompile_limit = recompile_limit()
+    # dynamo config is per-thread since torch 2.12, so every compiling thread calls this. Before 2.12 it is
+    # process-wide, and a compiled DiT may have raised the limit for its own forward
+    # (compile_transformer_forward), so a thread starting later never lowers it.
+    torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, recompile_limit())
     torch._dynamo.config.allow_unspec_int_on_nn_module = True
     torch._dynamo.config.specialize_int = False
 

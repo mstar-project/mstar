@@ -723,7 +723,7 @@ class Lockstep:
         failed the read reported it, and the others fail it here, so its outputs
         and its pages never exist on any rank.
 
-        One vote of a flag per row over the TP x SP block (``JointGroups.agree``
+        One vote of a flag per row over the instance (``JointGroups.agree``
         with MAX), in the leader's row order, on the GPU thread where every rank
         prepares the step."""
         rids = node_batch.read_check_rids

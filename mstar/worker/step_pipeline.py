@@ -8,7 +8,6 @@ from collections.abc import Collection, Iterable, Mapping
 from functools import partial
 from types import MappingProxyType
 
-from mstar.communication.tensors import NameToTensorList
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import AllocationFailed
 from mstar.model.submodule_base import BatchedModelOutput
@@ -97,6 +96,15 @@ class StepPipeline:
         self._spec_pending: PendingBatch | None = None
         self._speculation: Speculation | None = None
         self._batch: ScheduledBatch | None = None
+        # The step whose decision on the next one (a head from it, or its marker)
+        # ``Speculator.build`` settled, for a TP-async lead step. The error handler
+        # owes the followers a marker for any other lead step it drops.
+        self._decided: PendingBatch | None = None
+        # The seq of a lockstep step this leader broadcast and has not submitted:
+        # the followers run it unless N's verdict voids it on every rank, so a
+        # raise that drops it must stop this rank (see ``run``). A follower's own
+        # raises are not covered.
+        self._committed: int | None = None
         # lane -> the rows its step in flight holds; replaced, never updated in place
         self._rows_by_lane: Mapping[int, frozenset[int]] = MappingProxyType({})
         # every lane's rows: removes and drains for these are deferred. Shared
@@ -116,14 +124,34 @@ class StepPipeline:
             try:
                 self._pass()
             except Exception as e:
-                self._handle_error(e, (self.pending, self._spec_pending), self._batch, self._speculation)
+                pending, spec_pending = self.pending, self._spec_pending
+                self._handle_error(e, (pending, spec_pending), self._batch, self._speculation)
+                if self._committed is not None:
+                    # Failing the step's rows is all this rank can do: the followers
+                    # are in its collectives, or will be, and no marker releases
+                    # them. Stop, and the conductor's dead-worker check fails the
+                    # rest instead of the group hanging.
+                    raise SystemExit(
+                        f"Worker {self.worker_id}: dropped lockstep step seq {self._committed} "
+                        f"that the followers run ({e!r})"
+                    ) from e
                 # Follower: a head from a step that raised must not sit at the
                 # FIFO front with failed rids.
-                if self.pending is not None and self.speculator.is_tp_follow_pending(self.pending):
-                    self.lockstep.close_follow_step(self.pending)
-                # Clear the in-flight step. Without this the next iteration
-                # calls .result() on the same completed-with-exception future
-                # and re-raises forever, wedging the worker on one bad batch.
+                if pending is not None and self.speculator.is_tp_follow_pending(pending):
+                    self.lockstep.close_follow_step(pending)
+                # Leader: a dropped step whose decision never went out (the raise
+                # came before or in the speculation build, or N+1 was already
+                # submitted) leaves the followers awaiting it, and a drain
+                # deferred behind it with them.
+                else:
+                    for dropped in (pending, spec_pending if spec_pending is not pending else None):
+                        if (
+                            dropped is not None and dropped is not self._decided
+                            and self.speculator._can_speculate(dropped.batch)
+                        ):
+                            self.lockstep.maybe_broadcast_nospec(dropped, None)
+                # Clear the in-flight step: its rows are failed and its future
+                # drained, and it must not be post-processed again.
                 self._set_pending(None)
                 self.speculator.chain_ended()
                 _time.sleep(0.01)
@@ -140,6 +168,7 @@ class StepPipeline:
         # Reset per pass so the error handler sees only this pass's work: a stale
         # ``batch`` from a previous pass would otherwise be failed twice.
         self._batch = self._spec_pending = self._speculation = None
+        self._decided = self._committed = None
         timer = self.timer
         phase_period = timer.period
         iter_start = _time.perf_counter() if phase_period else 0.0
@@ -153,6 +182,9 @@ class StepPipeline:
         # to the fresh path below for a step that can't (not AR, loop ended).
         speculation, yield_away_from_target = self.speculator.build(self.pending)
         self._speculation = speculation
+        self._decided = self.pending
+        if speculation is not None and speculation.tp_seq >= 0 and not self.is_tp_follower:
+            self._committed = speculation.tp_seq
         # inclusive of `speculate` and `worker.schedule_yield_away`
         laps.lap("build_speculation")
         if speculation is not None:
@@ -200,12 +232,15 @@ class StepPipeline:
         # the token count is known. A leader stamps the seq it sends; a follower's
         # batch keeps the one it came off the FIFO with; everyone else -1.
         broadcast_seq = self.lockstep.broadcast(node_batch)
+        if broadcast_seq >= 0:
+            self._committed = broadcast_seq
         tp_seq = broadcast_seq if broadcast_seq >= 0 else batch.tp_seq
 
         # Unlike the spec submit, this path doesn't hold off the GIL for the
         # launch, but it still has to be fenceable, or the next pass schedules
         # against an admit that hasn't run.
         step = self.executor.submit(batch, node_batch, partition=batch_partition, tp_seq=tp_seq)
+        self._committed = None
         logger.debug("Scheduling: %s %s", batch.node_name, node_batch.request_ids)
         self._set_pending(step)
         if phase_period:
@@ -273,7 +308,7 @@ class StepPipeline:
         timer = self.timer
         phase_period = timer.period
         enable_nvtx = self.enable_nvtx
-        outputs: dict[int, NameToTensorList] | None = None
+        outputs: BatchedModelOutput | None = None
         if self._speculation is None and self.speculator.is_tp_follow_pending(pending):
             # Follower: watch for the head while N runs and settle the leader's
             # decision before N is post-processed.
@@ -290,12 +325,15 @@ class StepPipeline:
             if enable_nvtx:
                 range_push("worker.await_gpu", synchronize=False)
             t0 = _time.perf_counter() if phase_period else 0.0
-            outputs = pending.future.result()
+            outputs = self._step_result(pending)
             if phase_period:
                 timer.record("await_gpu", _time.perf_counter() - t0)
             if enable_nvtx:
                 range_pop(synchronize=False)
 
+        speculation = self._speculation
+        if speculation is not None and not speculation.is_yield_away and self.speculator.step_voids_head(pending):
+            self._committed = None  # when the verdict (a raise, say) is on every rank, every rank voids the head
         laps.skip()
         # the node has just completed
         self.executor.clear_in_flight(pending.batch)
@@ -388,7 +426,7 @@ class StepPipeline:
         )
         self._speculation = None
 
-    def _launch_speculation(self, outputs: dict[int, NameToTensorList], laps: PhaseLaps) -> None:
+    def _launch_speculation(self, outputs: BatchedModelOutput, laps: PhaseLaps) -> None:
         """5 and 6. Reconcile N's outputs into N+1 and launch it."""
         speculation = self._speculation
         spec_batch = speculation.scheduled_batch
@@ -424,6 +462,7 @@ class StepPipeline:
             # the GPU thread owns the pre-plan and the rids from here; see _handle_error
             speculation.plan_future = None
             speculation.submitted = True
+            self._committed = None
             if self.enable_nvtx:
                 range_pop(synchronize=False)
                 range_push("worker.gpu_submit_queued", synchronize=False)
@@ -435,15 +474,18 @@ class StepPipeline:
                 timer.record("submit_spec", _time.perf_counter() - t0)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
-        elif speculation.plan_future is not None:
-            # All continuing rids were dropped, so no spec batch was submitted.
-            # Drop the orphaned pre-plan so the next step to lease that slot doesn't
-            # promote it. Await first: this batch never reaches the GPU thread, so
-            # nothing else joins the future, and resetting under a running plan
-            # races it.
-            speculation.plan_future.result()
-            self.executor.reset_skip_plan_flags(speculation.node_batch)
-            speculation.plan_future = None
+        else:
+            # Every rank drops the same rows, so none runs it.
+            self._committed = None
+            if speculation.plan_future is not None:
+                # All continuing rids were dropped, so no spec batch was submitted.
+                # Drop the orphaned pre-plan so the next step to lease that slot
+                # doesn't promote it. Await first: this batch never reaches the GPU
+                # thread, so nothing else joins the future, and resetting under a
+                # running plan races it.
+                speculation.plan_future.result()
+                self.executor.reset_skip_plan_flags(speculation.node_batch)
+                speculation.plan_future = None
 
     # -- the side lane -----------------------------------------------------------
 
@@ -622,18 +664,36 @@ class StepPipeline:
             could_refill=partial(self.scheduler.could_refill, node, walk, batch_ids),
         )
 
+    def _step_result(self, pending: PendingBatch) -> BatchedModelOutput:
+        """N's outputs. A forward that raised becomes N's verdict instead: no
+        outputs and every row failed (``failed_requests``), which voids a head
+        built on N and lets a step independent of N run. When the raise is on
+        every rank, every rank does so alike. A raise on one rank alone leaves
+        the others in a step it won't run, and the group wedges (#1235)."""
+        try:
+            return pending.future.result()
+        except Exception as exc:
+            err, _ = client_error_text(
+                exc, f"Worker {self.worker_id} step {pending.node_name}/{pending.graph_walk} failed",
+                log=logger,
+            )
+            failed = pending.node_batch.failed_requests
+            for rid in pending.batch.request_to_worker_graph:
+                failed.setdefault(rid, f"Error in worker: {err}")
+            return BatchedModelOutput()
+
     def _await_tp_follow_step(
         self, pending: PendingBatch,
-    ) -> tuple[dict[int, NameToTensorList] | None, Speculation | None]:
+    ) -> tuple[BatchedModelOutput | None, Speculation | None]:
         """Wait for step N and settle the leader's decision about N+1. Returns
         ``(outputs or None, armed head or None)``. Once N is done this never
         returns without a decision: going serial early strands the leader."""
         s = pending.tp_seq
-        outputs: dict[int, NameToTensorList] | None = None
+        outputs: BatchedModelOutput | None = None
         t_done = last_warn = 0.0
         while True:
             if outputs is None and pending.future.done():
-                outputs = pending.future.result()
+                outputs = self._step_result(pending)
                 t_done = last_warn = _time.perf_counter()
             if self.lockstep.is_no_spec(s):
                 return outputs, None
@@ -692,8 +752,8 @@ class StepPipeline:
     ) -> None:
         """Fail everything the crashed iteration touched and drain its futures.
 
-        Attribution is batch-granular here: a raise out of the forward, the
-        batch build, or output routing can't be pinned on one request (the
+        Attribution is batch-granular here: a raise out of the batch build or
+        output routing can't be pinned on one request (the
         stages that *can* attribute report through
         ``ExecutingBatch.failed_requests`` instead), so every rid this iteration
         touched fails together. Sequential retry of the batch — see the design
@@ -703,10 +763,8 @@ class StepPipeline:
         The caller still has to clear its own in-flight state; see the main
         loop's handler.
         """
-        # The exception is usually surfacing out of ``pending.future.result()``,
-        # where the concurrent.futures machinery has already wrapped the
-        # engine's traceback. Report the leaf exception to the client and keep
-        # the full chain in the log.
+        # Report the leaf exception to the client and keep the full chain in
+        # the log. A forward's own raise doesn't come here (``_step_result``).
         err, _ = client_error_text(
             exc, f"Worker {self.worker_id} error in main loop", log=logger,
         )
@@ -720,8 +778,8 @@ class StepPipeline:
             self.executor.clear_in_flight(stale.batch)
             # Drain before dropping the reference: the future owns engine state
             # on the GPU thread, and an abandoned one leaves that thread writing
-            # into a batch nobody will collect. Already-finished futures (the
-            # common case — one of them is what just raised) return at once.
+            # into a batch nobody will collect. Already-finished futures return
+            # at once.
             if stale.future is None:
                 continue
             try:

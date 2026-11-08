@@ -1106,7 +1106,7 @@ class Speculator:
     @staticmethod
     def step_voids_head(pending: PendingBatch) -> str | None:
         """Why N's verdict voids a head built on it, or ``None``. Both fields are
-        final once N's future is done; the leader clears on exactly these two."""
+        final once N's result is taken (``StepPipeline._step_result``); the leader clears on exactly these two."""
         if pending.node_batch.admit_error is not None:
             return "admit_error"
         if pending.node_batch.failed_requests:

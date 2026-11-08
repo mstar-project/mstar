@@ -499,6 +499,36 @@ def test_a_backlogged_chunk_is_rechecked_before_going_back_out():
     assert list(sched.backlog[(NODE, WALK)].request_to_worker_graph) == ["r2"]
 
 
+@pytest.mark.parametrize("path", ["scan", "chain"])
+def test_a_raising_scheduling_pass_fails_the_rows_it_took(path, monkeypatch):
+    """The popped rows are in no queue and no step, and a ready row left queued
+    would raise the pass again every time, so if the pass raises they fail or
+    their requests hang, as a rebuild the log would offer again does. The scan
+    raises before it pops the queued row, the chain's step after; a rejection
+    recorded earlier stands."""
+    sched = _admitted(_scheduler(_Engine(max_bs=5)), "r2", "r3", "r4", "r5")
+    sched.backlog[(NODE, WALK)] = _batch(["r2", "r3"])
+    sched.lifecycle.fail({"r2": "unservable"})
+    manager = _Manager(["r4"])
+    monkeypatch.setattr(sched, "_rebuild_rows", lambda *a, **kw: [MidPrefillRow("r5", 0, WALK, 0, 4)])
+    manager.per_request_info["r5"] = object()
+
+    def blow_up(*args, **kwargs):
+        raise RuntimeError("blew up")
+
+    with pytest.raises(RuntimeError, match="blew up"):
+        if path == "scan":
+            monkeypatch.setattr(sched.batch_builder, "pick", blow_up)
+            _next_batch(sched, manager)
+        else:
+            monkeypatch.setattr(sched, "_build_step", blow_up)
+            _chain(sched, manager, ["c0"])
+
+    errors = sched.lifecycle.take_failures()
+    assert set(errors) == {"r2", "r3", "r4", "r5"} and errors["r2"] == "unservable"
+    assert {"r2", "r3", "r4", "r5"} <= sched.lifecycle.failed_rids
+
+
 def test_an_uncapped_node_can_be_served_from_the_backlog():
     """The backlog path resolves the cap itself, and `None` has to survive
     that resolution rather than being subtracted from."""

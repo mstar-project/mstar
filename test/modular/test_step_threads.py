@@ -1276,6 +1276,9 @@ def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(worker_mod.cpus, "device_addresses", lambda devices: [addresses.get(d) for d in devices])
     monkeypatch.setattr(worker_mod.cpus, "deployment_plan", plan)
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "always")
+    # deployment_cpu_plan leaves this set, so an earlier test in the process
+    # picks the slot this one reads; see #1223
+    monkeypatch.delenv(cpus.CORE_SET_ENV, raising=False)
     w = _bare_worker()
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
         step, process_cpus = w._plan_step_cpus(["worker_0", "worker_1", "worker_2"], ["cuda:0", "cuda:1", "cuda:2"])

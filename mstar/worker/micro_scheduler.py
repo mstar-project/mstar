@@ -153,7 +153,7 @@ class MicroScheduler:
         self.cached_prefix: dict[tuple[int, str], int] = {}
         self.sched_type = sched_type
 
-        # lockstep-parallel (TP / SP instance) scheduling
+        # lockstep-parallel (TP / SP / CFG instance) scheduling
         self.parallel_leader_nodes = layout.parallel_leader_nodes
         self.num_consec_tp_follower_batches = 0
         self.max_consec_tp_follower_batches = max_consec_tp_follower_batches
@@ -571,27 +571,46 @@ class MicroScheduler:
         yield-away from that walk) stay parked."""
         rebuilds = self._rebuild_rows(node_walk, skip_walk=skip_walk)
         backlogged = self.backlog.pop(node_walk, None)
-        live = [] if backlogged is None else self._backlog_candidates(
-            backlogged, skip_walk=skip_walk,
-        )
-        if rebuilds:
-            live = [row.request_id for row in rebuilds] + live
-        found = {entry.request_id for entry in entries}.union(row.request_id for row in rebuilds)
-        walk_of = None
-        if node_walk in self._walks_of_key:
-            walks = {entry.request_id: entry.graph_walk for entry in entries}
-            walks.update((row.request_id, row.graph_walk) for row in rebuilds)
-            walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
-        check = self._readiness(node_walk[0])
-        pick = self.batch_builder.pick(self._step_candidates(
-            node_walk, backlog=live,
-            queued=[entry.request_id for entry in entries],
-            walk_of=walk_of,
-            ready=lambda rid: rid in found or check(rid),
-        ))
-        fresh = self._assemble_batch(*node_walk, entries) \
-            if entries else None
-        return self._build_step(node_walk, backlogged, fresh or None, pick, rebuilds)
+        try:
+            live = [] if backlogged is None else self._backlog_candidates(
+                backlogged, skip_walk=skip_walk,
+            )
+            if rebuilds:
+                live = [row.request_id for row in rebuilds] + live
+            found = {entry.request_id for entry in entries}.union(row.request_id for row in rebuilds)
+            walk_of = None
+            if node_walk in self._walks_of_key:
+                walks = {entry.request_id: entry.graph_walk for entry in entries}
+                walks.update((row.request_id, row.graph_walk) for row in rebuilds)
+                walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
+            check = self._readiness(node_walk[0])
+            pick = self.batch_builder.pick(self._step_candidates(
+                node_walk, backlog=live,
+                queued=[entry.request_id for entry in entries],
+                walk_of=walk_of,
+                ready=lambda rid: rid in found or check(rid),
+            ))
+            fresh = self._assemble_batch(*node_walk, entries) \
+                if entries else None
+            return self._build_step(node_walk, backlogged, fresh or None, pick, rebuilds)
+        except Exception:
+            self._fail_unscheduled(backlogged, entries, rebuilds)
+            raise
+
+    def _fail_unscheduled(
+        self, backlogged: ScheduledBatch | None, entries: list[ReadyNodeEntry],
+        rebuilds: Sequence[MidPrefillRow],
+    ) -> None:
+        """A scheduling pass raised with ``backlogged`` popped and ``entries``
+        popped too, or still queued. The popped rows are in no queue and no
+        step, so nothing else would ever schedule or fail them; the queued ones,
+        and ``rebuilds``, which the log offers until they run, would raise the
+        next pass again. They fail rather than go back, where a persistent raise
+        would loop. A rejection already recorded stands."""
+        lost = {entry.request_id for entry in entries}.union(row.request_id for row in rebuilds)
+        if backlogged is not None:
+            lost.update(backlogged.request_to_worker_graph)
+        self.lifecycle.fail(dict.fromkeys(lost, "Error in worker: scheduling failed (see the worker log)"))
 
     def _build_step(
         self, node_walk: tuple[str, str],
@@ -821,11 +840,15 @@ class MicroScheduler:
             self.backlog.pop(key)
         else:
             backlogged = None
-        fresh = self._assemble_batch(*key, entries) if entries else None
-        return self._build_step(
-            key, backlogged, fresh or None, chain.pick,
-            [*chain.mid_prefill, *chain.rebuilds], pre_existing_batch_size, pre_existing_seq_lens,
-        )
+        try:
+            fresh = self._assemble_batch(*key, entries) if entries else None
+            return self._build_step(
+                key, backlogged, fresh or None, chain.pick,
+                [*chain.mid_prefill, *chain.rebuilds], pre_existing_batch_size, pre_existing_seq_lens,
+            )
+        except Exception:
+            self._fail_unscheduled(backlogged, entries, chain.rebuilds)
+            raise
 
     def _step_candidates(
         self, key: tuple[str, str], *,
