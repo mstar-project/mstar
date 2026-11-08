@@ -833,7 +833,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -1011,22 +1011,22 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">be purged on the same REMOVE_REQUEST that releases it. A leaked string key was</span>
 <span class="sd">harmless -- the string never recurred -- but a leaked handle silently attaches</span>
 <span class="sd">to whichever request gets that handle next. Known handle-keyed state:</span>
-<span class="sd">MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog, last_ran,</span>
-<span class="sd">arrival, chunk_started, cached_prefix} (purged by clear_rid),</span>
-<span class="sd">Worker.{_pending_removes, _pending_loop_stops,</span>
-<span class="sd">_lockstep_unread}, Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info,</span>
-<span class="sd">_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request),</span>
-<span class="sd">the engine's and tensor manager's per-request state (including</span>
-<span class="sd">ChunkingManagement.prepared, Glm52LLMSubmodule's MTP maps, cleared by its</span>
-<span class="sd">cleanup_request, and the tensor store's rid -&gt; uuids ownership, held in the</span>
-<span class="sd">Rust bookkeeper under RustTensorStore; purged by force_cleanup_request),</span>
-<span class="sd">RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode, _unkeyed,</span>
-<span class="sd">_admit_restores, _admit_snaps, _admit_taken, _preplan_taken, _reserved} and</span>
-<span class="sd">KDAManager._verifying (purged by remove_request), ResidentPlanner.{_slot_of,</span>
-<span class="sd">_stale, _moved} (purged by release), SamplerCells._cells (purged by the</span>
-<span class="sd">sampler's remove_request), and WorkerProfileInfo.</span>
+<span class="sd">MicroScheduler.{failed_rids, backlog, last_ran, arrival, chunk_started,</span>
+<span class="sd">cached_prefix} (purged by clear_rid), Admission.{admit_errors, held_until,</span>
+<span class="sd">parked} and Lockstep.{_unread, read_failed_rids} (purged by clear),</span>
+<span class="sd">Worker._pending_removes, Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info,</span>
+<span class="sd">_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the engine's and</span>
+<span class="sd">tensor manager's per-request state (including ChunkingManagement.prepared,</span>
+<span class="sd">Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and</span>
+<span class="sd">the tensor store's rid -&gt; uuids ownership, held in the Rust bookkeeper under</span>
+<span class="sd">RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,</span>
+<span class="sd">_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,</span>
+<span class="sd">_admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying</span>
+<span class="sd">(purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by</span>
+<span class="sd">release), SamplerCells._cells (purged by the sampler's remove_request), and</span>
+<span class="sd">WorkerProfileInfo.</span>
 
-<span class="sd">MicroScheduler.pending_tp_follow_count is the one deliberate exception: a</span>
+<span class="sd">Lockstep._follow_count is the one deliberate exception: a</span>
 <span class="sd">ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it</span>
 <span class="sd">stays keyed by the wire string and is purged by clear_wire_rid.</span>
 <span class="sd">"""</span>

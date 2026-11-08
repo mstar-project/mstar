@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.worker.side_steps" href="mstar.worker.side_steps.html" />
+    <link rel="next" title="mstar.worker.scheduled_batch" href="mstar.worker.scheduled_batch.html" />
     <link rel="prev" title="mstar.worker.rebuild" href="mstar.worker.rebuild.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -480,7 +480,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.worker.rid_table</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -738,21 +738,21 @@ string goes back on the wire at each send site.</p>
 be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless – the string never recurred – but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
-MicroScheduler.{failed_rids, admit_errors, held_until, parked, backlog, last_ran,
-arrival, chunk_started, cached_prefix} (purged by clear_rid),
-Worker.{_pending_removes, _pending_loop_stops,
-_lockstep_unread}, Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info,
-_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request),
-the engine’s and tensor manager’s per-request state (including
-ChunkingManagement.prepared, Glm52LLMSubmodule’s MTP maps, cleared by its
-cleanup_request, and the tensor store’s rid -&gt; uuids ownership, held in the
-Rust bookkeeper under RustTensorStore; purged by force_cleanup_request),
-RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes, _decode, _unkeyed,
-_admit_restores, _admit_snaps, _admit_taken, _preplan_taken, _reserved} and
-KDAManager._verifying (purged by remove_request), ResidentPlanner.{_slot_of,
-_stale, _moved} (purged by release), SamplerCells._cells (purged by the
-sampler’s remove_request), and WorkerProfileInfo.</p>
-<p>MicroScheduler.pending_tp_follow_count is the one deliberate exception: a
+MicroScheduler.{failed_rids, backlog, last_ran, arrival, chunk_started,
+cached_prefix} (purged by clear_rid), Admission.{admit_errors, held_until,
+parked} and Lockstep.{_unread, read_failed_rids} (purged by clear),
+Worker._pending_removes, Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info,
+_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the engine’s and
+tensor manager’s per-request state (including ChunkingManagement.prepared,
+Glm52LLMSubmodule’s MTP maps, cleared by its cleanup_request, and
+the tensor store’s rid -&gt; uuids ownership, held in the Rust bookkeeper under
+RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
+_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
+_admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying
+(purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
+release), SamplerCells._cells (purged by the sampler’s remove_request), and
+WorkerProfileInfo.</p>
+<p>Lockstep._follow_count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
 stays keyed by the wire string and is purged by clear_wire_rid.</p>
 <p class="rubric">Classes</p>
@@ -854,11 +854,11 @@ been purged of it.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.worker.side_steps.html"
+       href="mstar.worker.scheduled_batch.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.worker.side_steps</p>
+        <p class="prev-next-title">mstar.worker.scheduled_batch</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>

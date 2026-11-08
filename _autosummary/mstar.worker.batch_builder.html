@@ -480,7 +480,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
-<li class="toctree-l3"><a class="reference internal" href="mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -882,7 +882,7 @@ group would never take them.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>backlog</strong> (<em>ScheduledBatch</em>)</p></li>
+<li><p><strong>backlog</strong> (<a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><em>ScheduledBatch</em></a>)</p></li>
 <li><p><strong>live_rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 <li><p><strong>anchor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>capture_group</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
@@ -920,10 +920,10 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>backlog</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
-<li><p><strong>fresh</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>backlog</strong> (<a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><em>ScheduledBatch</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>fresh</strong> (<a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><em>ScheduledBatch</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>pick</strong> (<a class="reference internal" href="#mstar.worker.batch_builder.StepPick" title="mstar.worker.batch_builder.StepPick"><em>StepPick</em></a><em> | </em><em>None</em>)</p></li>
-<li><p><strong>continuing</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>continuing</strong> (<a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><em>ScheduledBatch</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>max_batch_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>walk_max_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>row_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
@@ -935,7 +935,7 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.backlog">
-<span class="sig-name descname"><span class="pre">backlog</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.backlog" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">backlog</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><span class="pre">ScheduledBatch</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.backlog" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -945,12 +945,12 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.continuing">
-<span class="sig-name descname"><span class="pre">continuing</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.continuing" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">continuing</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><span class="pre">ScheduledBatch</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.continuing" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildRequest.fresh">
-<span class="sig-name descname"><span class="pre">fresh</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.fresh" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">fresh</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><span class="pre">ScheduledBatch</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildRequest.fresh" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1002,8 +1002,8 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>scheduled</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
-<li><p><strong>backlog</strong> (<em>ScheduledBatch</em><em> | </em><em>None</em>)</p></li>
+<li><p><strong>scheduled</strong> (<a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><em>ScheduledBatch</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>backlog</strong> (<a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><em>ScheduledBatch</em></a><em> | </em><em>None</em>)</p></li>
 <li><p><strong>returned</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>chunk_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
@@ -1011,7 +1011,7 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildResult.backlog">
-<span class="sig-name descname"><span class="pre">backlog</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildResult.backlog" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">backlog</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><span class="pre">ScheduledBatch</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildResult.backlog" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 1</p>
 </dd></dl>
 
@@ -1029,7 +1029,7 @@ for a speculation chain and for a step the scheduler builds fresh.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.batch_builder.BatchBuildResult.scheduled">
-<span class="sig-name descname"><span class="pre">scheduled</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">ScheduledBatch</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildResult.scheduled" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">scheduled</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><span class="pre">ScheduledBatch</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.worker.batch_builder.BatchBuildResult.scheduled" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 0</p>
 </dd></dl>
 
@@ -1414,7 +1414,7 @@ the first eligible rid’s when no anchor is given.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>batch</strong> (<em>ScheduledBatch</em>)</p></li>
+<li><p><strong>batch</strong> (<a class="reference internal" href="mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch" title="mstar.worker.scheduled_batch.ScheduledBatch"><em>ScheduledBatch</em></a>)</p></li>
 <li><p><strong>capture_group</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
 <li><p><strong>exclude_rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#set" title="(in Python v3.12)"><em>set</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 <li><p><strong>anchor</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>

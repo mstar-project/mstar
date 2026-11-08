@@ -480,7 +480,7 @@
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
-<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
@@ -904,7 +904,7 @@
 <hr class="docutils" />
 <section id="preemption">
 <h2>3. Preemption<a class="headerlink" href="#preemption" title="Link to this heading">#</a></h2>
-<p>Preemption starts when a grant past a reservation fails, in <code class="docutils literal notranslate"><span class="pre">Worker._handle_allocation_failure</span></code> (<a class="reference download internal" download="" href="../_downloads/de1b1ad2a070cfcbefb1feab5cce8263/worker.py"><span class="xref download myst">worker.py</span></a>), which calls <code class="docutils literal notranslate"><span class="pre">Worker._preempt</span></code>. In place of today’s 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads first, as it does today (the row last in the refused step’s line), since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.</p>
+<p>Preemption starts when a grant past a reservation fails, in <code class="docutils literal notranslate"><span class="pre">Worker._handle_admit_failure</span></code> (<code class="docutils literal notranslate"><span class="pre">Admission.relieve</span></code>, <a class="reference download internal" download="" href="../_downloads/6c842e10196003639fc90041ae6111d7/admission.py"><span class="xref download myst">admission.py</span></a>), which calls <code class="docutils literal notranslate"><span class="pre">Worker._preempt</span></code>. In place of today’s 50 ms hold, the worker drops victims, drops the request itself, or makes it wait. When the host pool has room, it still offloads first, as it does today (the row last in the refused step’s line), since dropping and rebuilding such requests made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.</p>
 <p>Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler’s in-graph rows and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can’t use.</p>
 <section id="arrival-numbers">
 <h3>3.1 Arrival numbers<a class="headerlink" href="#arrival-numbers" title="Link to this heading">#</a></h3>
