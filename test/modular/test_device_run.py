@@ -260,14 +260,15 @@ def test_a_run_staged_with_its_word_set_runs_nothing_unless_it_is_one_iteration(
 
 
 @pytest.mark.parametrize("yield_after_stage", [False, True])
-def test_a_yield_names_only_already_staged_runs_on_a_shared_state(monkeypatch, yield_after_stage):
+@pytest.mark.parametrize("counted", [False, True])
+def test_a_yield_names_only_already_staged_runs_on_a_shared_state(monkeypatch, yield_after_stage, counted):
     """N is live while N+1 stages on the same state. A yield before N+1's
     stage must survive for N without cancelling the new row merged into N+1;
     a yield after that stage skips N+1 too. Later identical stages run again."""
     from torch.utils._python_dispatch import TorchDispatchMode
 
     loop = _Loop()
-    runner, run, _, calls = _runner(monkeypatch, loop, [[1, 1]])
+    runner, run, _, calls = _runner(monkeypatch, loop, [[1, 1]], counted=counted)
     state = run.state
     queued = []
     # CPU stand-in for the device execution stream: stage's device writes
@@ -361,13 +362,14 @@ def test_a_step_graph_a_while_body_cant_hold_is_refused(kinds, why):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA captured body reuse")
-def test_one_run_body_reuses_standalone_and_composed_parents():
+@pytest.mark.parametrize("counted", [False, True])
+def test_one_run_body_reuses_standalone_and_composed_parents(counted):
     from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
     from mstar.engine.accelerator_graph_runner import capture_into_graph
 
     backend = get_accelerator_graph_backend(torch.device("cuda:0"))
     cuda, device = backend.while_runtime(), backend.device
-    state = RunState(2, "token", {3, 14}, device)
+    state = RunState(2, None if counted else "token", () if counted else {3, 14}, device)
     token = torch.zeros(2, dtype=torch.long, device=device)
     history = torch.zeros((2, 6), dtype=torch.long, device=device)
     offsets = torch.tensor([1, 11], device=device)
@@ -378,7 +380,7 @@ def test_one_run_body_reuses_standalone_and_composed_parents():
     def body():
         token.copy_(state.index + offsets)
         history.scatter_(1, state.index.clamp(0, 5).expand(2, 1), token[:, None])
-        cuda.stop(state, token, backend.raw_stream())
+        cuda.stop(state, None if counted else token, backend.raw_stream())
         tail.copy_(state.index)
 
     captured = capture_into_graph(body, pool, device, None, keep_graph=True)[0]
@@ -407,11 +409,11 @@ def test_one_run_body_reuses_standalone_and_composed_parents():
             parent.replay()
             backend.synchronize()
             skip = yielded and width > 1
-            count = 0 if skip else min(width, 4)
-            assert state.counts.tolist() == [min(count, 3), count]
+            count = 0 if skip else width if counted else min(width, 4)
+            assert state.counts.tolist() == [count if counted else min(count, 3), count]
             assert state.index.item() == tail.item() == count
             assert state.continuation.item() == 0
-            assert bool(state.halted) == (skip or width == 1)
+            assert bool(state.halted) == (skip or count == width)
             assert state.started.item() == (RUN_SKIPPED if skip else RUN_RAN)
             assert history.tolist() == [
                 list(range(1, count + 1)) + [0] * (6 - count),
@@ -1305,24 +1307,36 @@ def test_counted_run_cannot_request_token_streaming(monkeypatch):
     assert "no token signal" in runner.run_refusal(WALK)
 
 
-def test_engine_asks_for_a_counted_device_run_without_a_token_signal():
+@pytest.mark.parametrize("kind", ["declared", "graph", "nonloop", "custom", "past_cap"])
+def test_engine_asks_for_a_counted_device_run_without_a_token_signal(kind):
     from mstar.engine.engine import Engine
+    from mstar.graph.loop_indices import LoopLayout
     from mstar.model.submodule_base import StopKind, StopPolicy
 
-    asked = []
+    asked, refused = [], []
     policy = StopPolicy(StopKind.ITER)
     engine = Engine.__new__(Engine)
     engine._submodules = {"n": SimpleNamespace(
         joint_comm_group=SimpleNamespace(world_size=1), device_stops={}, refills={}, loopback_rows=None,
         submodule=SimpleNamespace(repeat_carry=lambda walk, signals: {}), run_columns={},
     )}
-    engine.get_stop_policies = lambda node, walk: {"loop": policy}
-    runner = SimpleNamespace(ask_run=lambda walk, ask: asked.append(ask))
+    engine._loops = {} if kind == "nonloop" else {("n", WALK): LoopLayout("loop")}
+    policies = {"loop": policy} if kind == "declared" else None if kind == "custom" else {}
+    engine.get_stop_policies = lambda node, walk: policies
+    runner = SimpleNamespace(
+        ask_run=lambda walk, ask: asked.append(ask), refuse_run=lambda walk, why: refused.append(why),
+    )
     engine._ask_run("n", runner, WALK, RepeatConfig(
-        device_stop="skip", max=4, refill_at=None, stream_tokens=False,
+        device_stop="skip", max=4, refill_at=None, stream_tokens=False, past_cap=kind == "past_cap",
     ), ())
+    if kind in ("nonloop", "custom", "past_cap"):
+        assert not asked
+        assert bool(refused) == (kind == "past_cap")
+        return
+    assert not refused
     assert len(asked) == 1 and asked[0].token_signal is None
-    assert engine._submodules["n"].device_stops[WALK] is policy
+    assert asked[0].loop is None, "graph caps do not need an iteration-input owner"
+    assert engine._submodules["n"].device_stops[WALK] is (policy if kind == "declared" else None)
 
 
 def test_a_width_one_device_launch_returns_zero_row_counts_without_changing_output_shapes(monkeypatch):

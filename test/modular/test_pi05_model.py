@@ -227,12 +227,16 @@ def test_pi05_load_image_ships_uint8_with_unchanged_vit_input(tmp_path):
 @pytest.mark.parametrize("config_name", ["pi05.yaml", "pi05_droid.yaml"])
 @pytest.mark.parametrize("strides", [(1,) * 10, (1, 9), (1, 4, 4, 1)])
 def test_pi05_one_walk_seeds_and_finishes_the_action_loop(config_name, strides):
+    from types import SimpleNamespace
+
     from mstar.communication.tensor_store import RustTensorBookkeeping
     from mstar.distributed.base import ShardingConfig
+    from mstar.engine.engine import Engine
     from mstar.graph.base import TensorPointerInfo
     from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
     from mstar.graph.runtime.rust import RustGraphRuntime
     from mstar.utils.containers import ParallelList
+    from mstar.worker.step_repeats import RepeatConfig
 
     model = _make_model()
     worker_graphs = model.get_worker_graphs(str(Path(CONFIG_PATH).with_name(config_name)))
@@ -254,6 +258,18 @@ def test_pi05_one_walk_seeds_and_finishes_the_action_loop(config_name, strides):
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
         bookkeeping=book,
     )
+    action = Pi05ActionSubmodule(*(torch.nn.Identity() for _ in range(4)), model.config)
+    engine = Engine.__new__(Engine)
+    engine._submodules = {"LLM": SimpleNamespace(
+        submodule=action, joint_comm_group=SimpleNamespace(world_size=1),
+        device_stops={}, refills={}, loopback_rows=None, run_columns={},
+    )}
+    engine._loops = {("LLM", walk): runtime.loop_layout(walk, next(iter(loops)))}
+    asks = []
+    engine._ask_run("LLM", SimpleNamespace(ask_run=lambda walk, ask: asks.append(ask)), walk,
+                    RepeatConfig(max=10, device_stop="skip"), runtime.get_output_signals("LLM", walk))
+    assert len(asks) == 1 and asks[0].token_signal is None and asks[0].loop is None
+    assert set(asks[0].carries) == {"noisy_actions", "timestep_index"}
     rid = runtime.add_request(
         "action", "default", walk, [wg_id], ParallelList([wg_id], [["worker"]]),
         {name: loop.max_iters for name, loop in loops.items()},

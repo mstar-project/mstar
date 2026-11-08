@@ -1939,7 +1939,8 @@ class Engine:
             return  # the stop must match on every rank, and NCCL in a WHILE body is untested
         layout = self._run_layouts.get(node_name)
         iteration = bool(getattr(mgmt.submodule, "ITERATION_INPUTS", None))
-        loop = self._loops.get((node_name, graph_walk)) if iteration else None
+        graph_loop = self._loops.get((node_name, graph_walk))
+        loop = graph_loop if iteration else None
         policies = self.get_stop_policies(node_name, graph_walk)
         if policies is None:
             return  # a custom host stop cannot be skipped
@@ -1948,10 +1949,13 @@ class Engine:
             unit.streaming_edges and (node_name, graph_walk) in zip(unit.nodes, unit.graph_walks, strict=True)
             for walk in self._walk_runs for unit in self._graph_runtime.execution_units(walk)
         )
-        if policy is None and (not iteration or loop is None) and not connected:
+        if policy is None and graph_loop is None and not connected:
             return
         mgmt.device_stops[graph_walk] = policy
         mgmt.refills[graph_walk] = config.refill_at
+        if not policies and graph_loop is not None and config.past_cap:
+            runner.refuse_run(graph_walk, "graph: a counted run without row stops cannot run past its Loop cap")
+            return
         if connected and self._runner.prefix_chain_keys(node_name):
             runner.refuse_run(graph_walk, "resource: independently ready rows cannot key a prefix chain")
             return
