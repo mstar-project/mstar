@@ -75,7 +75,8 @@ class _Harness:
         )
         self.handles = _handles()
 
-    def run(self, graph_walk: str, span: int, pos_ids=None) -> None:
+    def run(self, graph_walk: str, span: int, pos_ids=None) -> dict[str, list[int]]:
+        """One step on ``graph_walk``, committed. The positions it planned, by plan."""
         inputs = ARNodeInputs(input_seq_len=span)
         inputs.resource_step_info = True  # requires_cfg
         if pos_ids is not None:
@@ -92,7 +93,9 @@ class _Harness:
         ))
         assert self.runner.admit(step).ok
         self.runner.plan(step)
+        planned = {plan: ids.tolist() for plan, ids in self.rope._current_pos_ids.items()}
         self.runner.commit(step)
+        return planned
 
     def denoise(self) -> dict[str, int]:
         """One Euler step, latents pinned at each branch's current position."""
@@ -158,6 +161,22 @@ def test_image_editing_forks_cfg_text_after_the_image_blocks(harness):
         "cfg_text": S_SYS + 2,
         "cfg_img": S_SYS + S_PROMPT,
     }
+
+
+def test_a_guided_decode_after_an_image_plans_each_label_at_its_own_position(harness):
+    """A guided decode plans ``main`` and ``cfg_img`` as one plan, ``main``'s row first. After an edit's image, a VAE
+    block and a ViT block, ``cfg_img`` is two positions behind ``main``, so a plan that took one counter for both rows
+    would rotate ``cfg_img``'s query at a position its keys were never written at."""
+    n_img = 256
+    harness.run("prefill_text", S_SYS)
+    harness.run("prefill_vae", n_img)
+    harness.run("prefill_vit", n_img)
+    harness.run("prefill_text", S_PROMPT)
+    before = harness.positions()
+
+    planned = harness.run("decode", 1)
+
+    assert planned == {"main+cfg_img": [before["main"], before["cfg_img"]]}, "a row would decode at another's position"
 
 
 def test_flow_matching_leaves_the_counters_where_prefill_left_them(harness):
