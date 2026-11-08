@@ -1575,7 +1575,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
                                      graph_walk=batch.graph_walk, slot=0, capture=False),
         )
 
-    def next_batch(request_state, exclude_target=None):
+    def next_batch(exclude_target=None):
         mask("main")
         if not schedule:
             raise _StopLoopError
@@ -1624,18 +1624,15 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
         communicator=SimpleNamespace(send=stub, wait_for_work=stub),
         wakeup_event=SimpleNamespace(register_future=stub),
         request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
-        scheduler=SimpleNamespace(
-        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
-    ),
+        scheduler=SimpleNamespace(next_batch=next_batch, note_ran=stub),
     )
-    for name in ("_verify_tp_async_sched_agrees", "_await_admit_settled",
+    for name in ("_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
                  "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
                  "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_settle_speculation", "_drop_rows_whose_loop_stopped", "_handle_admit_failure",
                  "_thread_outputs_to_speculative", "_postprocess_batch"):
         setattr(w, name, stub)
-    w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
     w._build_executing_batch = executing
     w._build_speculation = build_speculation
     w._plans_ahead = lambda spec: True

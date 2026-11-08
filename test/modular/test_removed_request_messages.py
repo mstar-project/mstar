@@ -30,6 +30,7 @@ from mstar.utils.ipc_format import (
     MessageSource,
     NewRequest,
     RemoveRequest,
+    ScheduleTPNode,
     StopLoops,
     WorkerMessage,
     WorkerMessageType,
@@ -70,9 +71,9 @@ def _worker(is_tp_follower=False) -> Worker:
     worker_graph = WorkerGraph(
         section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
     )
-    w = make_worker(worker_id=WORKER, is_tp_follower=is_tp_follower, tensor_manager=_TensorManager())
-    w._graph_runtime = build_runtime(
-        bookkeeping=w.tensor_manager.tensor_store.bookkeeping,
+    tensor_manager = _TensorManager()
+    runtime = build_runtime(
+        bookkeeping=tensor_manager.tensor_store.bookkeeping,
         my_worker_id=WORKER,
         my_worker_graphs=[worker_graph],
         all_wg_ids_to_graph_walks={WG_ID: {WALK}},
@@ -81,19 +82,19 @@ def _worker(is_tp_follower=False) -> Worker:
         node_to_partition={NODE: "default"},
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
     )
-    w.request_state = RequestStateManager(node_to_partition={NODE: "default"})
-    w.engine_manager = SimpleNamespace(
-        add_request=lambda rid, cfgs: None,
-        remove_request=lambda rid: None,
-    )
-    w.wire_rids_cleared = []
-    w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid, rid_str: None,
-        clear_wire_rid=w.wire_rids_cleared.append,
-        fail_rids=lambda rids: None,
-        note_arrival=lambda rid: None,
-        pending_tp_follow_count={},
-        last_consumed_tp_seq=-1,
+    w = make_worker(
+        worker_id=WORKER, is_tp_follower=is_tp_follower, tensor_manager=tensor_manager,
+        _graph_runtime=runtime,
+        request_state=RequestStateManager(node_to_partition={NODE: "default"}),
+        engine_manager=SimpleNamespace(
+            add_request=lambda rid, cfgs, info: None,
+            remove_request=lambda rid: None,
+        ),
+        scheduler=SimpleNamespace(
+            clear_rid=lambda rid: None,
+            fail_rids=lambda rids: None,
+            note_arrival=lambda rid: None,
+        ),
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.communicator = SimpleNamespace(send=lambda *a, **k: None)
@@ -158,6 +159,10 @@ def _stop_loops(rid: str) -> WorkerMessage:
     ))
 
 
+def _follow(rid: str) -> ScheduleTPNode:
+    return ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=[rid])
+
+
 def _parked(w: Worker) -> int:
     return sum(len(v) for v in w._unprocessed_messages.values())
 
@@ -180,13 +185,13 @@ def test_leader_remove_then_conductor_remove_goes_through_remove_request():
     wire-keyed TP-follow count, instead of being parked."""
     w = _worker(is_tp_follower=True)
     w._process_message_list([_new("tp#1")])
-    w._process_message_list([
-        _remove("tp#1", source=MessageSource.TP_RANK_0),
-        _remove("tp#1", source=MessageSource.CONDUCTOR),
-    ])
+    w._process_message_list([_remove("tp#1", source=MessageSource.TP_RANK_0)])
+    w.lockstep.enqueue_follow(_follow("tp#1"))
+    assert w.lockstep.pending_follow_count("tp#1") == 1
+    w._process_message_list([_remove("tp#1", source=MessageSource.CONDUCTOR)])
     assert w._rid("tp#1") is None
     assert not w._unprocessed_messages
-    assert w.wire_rids_cleared == ["tp#1"]
+    assert w.lockstep.pending_follow_count("tp#1") == 0
 
 
 def test_conductor_remove_for_a_request_never_admitted_drops_what_was_parked():
@@ -196,12 +201,14 @@ def test_conductor_remove_for_a_request_never_admitted_drops_what_was_parked():
     w = _worker()
     w._process_message_list([_drain("D#1"), _signals("D#1", 3), _new("D#1")])
     assert w._rid("D#1") is None and _parked(w) == 1
+    w.lockstep.enqueue_follow(_follow("D#1"))
+    assert w.lockstep.pending_follow_count("D#1") == 1
 
     w._process_message_list([_remove("D#1")])
     assert not w._unprocessed_messages
     assert w.tensor_manager.acked == [3]
     assert "D#1" not in w._draining_rids and "D#1" not in w._reads_done_sent
-    assert w.wire_rids_cleared == ["D#1"]
+    assert w.lockstep.pending_follow_count("D#1") == 0
 
 
 def test_a_remove_replayed_from_the_parking_lot_acks_what_trailed_it_once():

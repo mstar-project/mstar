@@ -45,7 +45,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 from mstar.testing_utils.worker import make_worker
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
-from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.scheduled_batch import ScheduledBatch  # noqa: E402
 
 PAGE = 4
 WALK = "decode"
@@ -1135,24 +1135,30 @@ def _offload_engine(resources, planner):
 
 
 def _refused_worker(engine, line):
-    """The real handler and the real victim search over a real engine."""
-    worker = make_worker()
-    worker.pushed = []
-    worker.held = []
-    worker._apply_removes_whose_step_landed = lambda: None
-    worker._apply_pending_removes_safe_to_drop = lambda rids: None
-    worker._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, graphs: worker.pushed.append(rids))
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    worker.eviction_policy = SimpleNamespace(value="last_in_line")
-    worker.scheduler = SimpleNamespace(
-        arrival=list(line), hold_requests=worker.held.extend, could_refill=lambda *a: False,
-        last_in_line=lambda node, walk, rids: max(rids, key=line.index),
+    """The real handler and the real victim search over a real engine, with
+    ``line`` the requests in the order a step reaches them."""
+    pushed = []
+    worker = make_worker(
+        _graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        scheduler=SimpleNamespace(
+            arrival=list(line), could_refill=lambda *a: False,
+            last_in_line=lambda node, walk, rids: max(rids, key=line.index),
+        ),
     )
+    worker.pushed = pushed
     return worker
 
 
+def _refused(batch, outcome_reason, failed_resource):
+    return SimpleNamespace(
+        node_name=batch.node_name, admit_error=outcome_reason, failed_resource=failed_resource,
+        request_ids=list(batch.request_to_worker_graph), cached_rids=set(),
+    )
+
+
 def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
-    """Through the worker's refusal path: the KV pool refuses, `_handle_allocation_failure`
+    """Through the worker's refusal path: the KV pool refuses, `_handle_admit_failure`
     offloads the row furthest from a step, its slot goes with it, the retry runs, and the
     victim's reload is written whole at its own lengths."""
     from mstar.engine.resources.runner import StepRunner
@@ -1182,10 +1188,8 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
 
     worker = _refused_worker(engine, line=[1, 2, 3])
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
-    worker._handle_allocation_failure(batch, SimpleNamespace(
-        node_name="n", admit_error=outcome.reason, failed_resource=outcome.failed_resource,
-    ))
-    assert worker.pushed == [[1, 2]] and worker.held == [3]
+    worker._handle_admit_failure(batch, _refused(batch, outcome.reason, outcome.failed_resource))
+    assert worker.pushed == [[1, 2]] and list(worker.admission.held_until) == [3]
     assert engine.residency("n", 3) is Residency.ON_HOST
     assert planner.slot_of(3) is None and 3 not in planner._stale
 
@@ -1228,11 +1232,9 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
     engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
     worker = _refused_worker(engine, line=[1, 2])
     batch = ScheduledBatch(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
-    worker._handle_allocation_failure(batch, SimpleNamespace(
-        node_name="n", admit_error=outcome.reason, failed_resource="pool",
-    ))
+    worker._handle_admit_failure(batch, _refused(batch, outcome.reason, "pool"))
     assert worker.pushed == [[2]]
-    assert worker.held == [2]
+    assert list(worker.admission.held_until) == [2]
     assert engine.residency("n", 1) is Residency.RESIDENT
 
 

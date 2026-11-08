@@ -89,7 +89,7 @@ TRIGGER_S = 2.0
 # past this hung.
 DEADLINE_S = 30.0
 # Per-rank setup a fix adds to Worker.__init__ (see the module docstring).
-_DESIGN_SETUP = ("_setup_read_gate", "_setup_tp_read_check")
+_DESIGN_SETUP = ("_setup_read_gate",)
 
 # What each request reads. A grid prompt is Qwen3.5's prefill_vision row: the
 # whole prompt, text, image and text, its image of grid (t, h, w) expanded to
@@ -659,18 +659,15 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.testing_utils.worker import make_worker
     from mstar.utils.containers import RecentSet
+    from mstar.worker.admission import Admission
+    from mstar.worker.lockstep import Lockstep
     from mstar.worker.micro_scheduler import MicroScheduler
+    from mstar.worker.rebuild import Rebuilds
+    from mstar.worker.services import WorkerLayout, WorkerServices
     from mstar.worker.stream_buffers import StreamBufferManager
     from mstar.worker.worker import _REMOVED_RIDS_KEEP
 
-    w = make_worker(worker_id=WORKERS[rank], device=torch.device("cpu"))
-    w.enable_nvtx = w.enable_prof = False
-    w._launch_wait_s = 1.0
-    w._max_consecutive_spec = 1
-    w._device_loopback = {}
-    w._host_rows_slot = 0
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w.parallel_groups = SimpleNamespace(
+    parallel_groups = SimpleNamespace(
         barrier_all=dist.barrier,
         restore_default_timeout=lambda: None,
         get_tp_config_for_node=lambda node: group,
@@ -679,27 +676,38 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
         get_instance_rank_for_node=lambda node: rank,
         get_instance_world_size_for_node=lambda node: 2,
     )
-    w.communicator = comm
-    w.wakeup_event = SimpleNamespace(drain=lambda: None, register_future=lambda f: None)
-    w.tensor_manager = tm
-    w._graph_runtime = graph
-    w.engine_manager = SimpleNamespace(
+    engine_manager = SimpleNamespace(
         get_engine=lambda node: engine, warmup_all=lambda: None,
         remove_request=engine.remove_request,
     )
-    w.request_state = graph
-    w.parallel_nodes = {NODE}
-    w.parallel_leader_nodes = {NODE} if rank == 0 else set()
-    w.is_tp_follower = rank != 0
-    w.tp_async_sched, w.tp_async_nodes = False, None
-    w._tp_broadcast_seq = 0
-    w._tp_nospec = RecentSet(64)
-    w._tp_leader_gap_warned = False
-    w.scheduler = MicroScheduler(engine_manager=w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)
-    w.scheduler.runtime = graph
+    services = WorkerServices(
+        worker_id=WORKERS[rank], device=torch.device("cpu"), graph_runtime=graph,
+        engine_manager=engine_manager, tensor_manager=tm, request_state=graph,
+        communicator=comm, parallel_groups=parallel_groups, rebuilds=Rebuilds({}, {}),
+    )
+    layout = WorkerLayout(
+        parallel_nodes=frozenset({NODE}), parallel_leader_nodes=frozenset({NODE} if rank == 0 else ()),
+        is_tp_follower=rank != 0,
+    )
+    admission = Admission(services=services, layout=layout)
+    lockstep = Lockstep(services=services, layout=layout, admission=admission)
+    w = make_worker(
+        worker_id=WORKERS[rank], device=torch.device("cpu"), communicator=comm, tensor_manager=tm,
+        _graph_runtime=graph, engine_manager=engine_manager, request_state=graph,
+        parallel_groups=parallel_groups, layout=layout, admission=admission, lockstep=lockstep,
+        scheduler=MicroScheduler(services=services, layout=layout, lockstep=lockstep, admission=admission),
+        parallel_nodes={NODE}, parallel_leader_nodes=set(layout.parallel_leader_nodes),
+        is_tp_follower=rank != 0,
+    )
+    w.enable_nvtx = w.enable_prof = False
+    w._launch_wait_s = 1.0
+    w._max_consecutive_spec = 1
+    w._device_loopback = {}
+    w._host_rows_slot = 0
+    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
+    w.wakeup_event = SimpleNamespace(drain=lambda: None, register_future=lambda f: None)
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(_REMOVED_RIDS_KEEP)
-    w._hold_logged = {}
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._removes_awaiting_step = {}
