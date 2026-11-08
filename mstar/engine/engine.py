@@ -3046,7 +3046,7 @@ class Engine:
         merged in its ``get_input_sequence_len`` over the inputs it was popped
         with. None when a row has no answer, rebuilds, or runs a walk the
         prefix cache keys, whose span ``prepare_inputs`` decides when it
-        probes the cache and applies what it finds."""
+        looks the row up in the cache and applies what it finds."""
         node = batch.node_name
         ctx = batch.step_context
         if ctx.rebuild_rids:

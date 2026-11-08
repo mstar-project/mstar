@@ -1030,7 +1030,7 @@ class Worker:
         Waits on batch N's ``commit_done`` — its resource state has to be
         committed before N+1 can admit and plan against it — and nothing else.
         The batch is not prepared yet, so the plan runs against the capture
-        config's shape for the batch size, or, for a step leased by token
+        config's rows for the batch size, or, for a step leased by token
         count, against the spans ``_plan_spans`` fixed. See
         ``Engine.pre_plan_for_batch``.
 

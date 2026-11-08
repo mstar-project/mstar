@@ -253,7 +253,7 @@ def test_planned_spans_leave_a_step_to_plan_inline(case):
     engine, *_ = _engine()
     batch = _batch({1: "decode", 3: "prefill_text"}, tensors={3: _prompt(514)})
     if case == "keyed":
-        # the prefix cache decides this row's span when prepare probes it
+        # the prefix cache decides this row's span when prepare looks it up
         engine._keyed_walks = {"LLM": ("prefill_text",)}
     elif case == "rebuild":
         batch.step_context.rebuild_rids = frozenset({3})
