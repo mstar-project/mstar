@@ -297,13 +297,14 @@ class TestEras(unittest.TestCase):
                                                   ("k3", "live-pr-6-1-1"))]
         names = {"i-1": "live-pr-7-1-1", "i-2": "live-pr-9-1-1", "i-3": "live-pr-8-1-1"}
         binds = {"i-1": ["k1"], "i-2": ["k1"], "i-3": ["k3"]}  # i-2 reuses the key launch 7 registered
+        status = {"i-1": "releasing", "i-2": "active", "i-3": "active"}
 
         def eras(method, path, body=None, params=None):
             calls.append((method, path))
             if method == "DELETE" and in_use:
                 raise GPU["ApiError"](409, {"code": "resource_in_use", "message": "In use."})
             if path == "/instances":  # ended instances aren't listed
-                return {"items": [{"id": i, "name": names[i], "status": "active", "mode": "standalone",
+                return {"items": [{"id": i, "name": names[i], "status": status[i], "mode": "standalone",
                                    "standalone": {"current_run": {"status": "running", "bindings": {
                                        "secrets": {"authorized-keys": {"ssh_key_ids": ids}}, "volumes": {}}}}}
                                   for i, ids in binds.items()], "next_page_token": None, "total": len(binds)}
@@ -327,9 +328,9 @@ class TestEras(unittest.TestCase):
         in_use = False
         self.assertEqual(terminate("i-1", names["i-1"]), [],
                          "the box still binding the key would lose ssh access")
-        del binds["i-2"]
+        status["i-2"] = "releasing"
         self.assertEqual(terminate("i-1", names["i-1"]), ["/ssh-keys/k1"],
-                         "each launch would leave its ssh key in the organization")
+                         "a key whose other binders are going away would never be deleted")
         del binds["i-3"]
         self.assertEqual(terminate("i-3", names["i-3"]), [],
                          "a launch would delete a key it reused, which another launch or a person registered")

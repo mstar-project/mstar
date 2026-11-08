@@ -271,12 +271,10 @@ def cmd_cleanup(a):
             print(f"slurm: {err}")
     if state["enabled"](cfg, "eras"):
         name = state["job_name"](cfg, "eras", a.pr, a.tag)
-        mine = [i for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []
-                if i.get("name") == name]
-        for i in mine:
-            if i.get("status") not in ("ended", "releasing"):
+        for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []:
+            if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
-        state["eras_delete_key"](name, {i["id"] for i in mine})
+        state["eras_delete_key"](name)
 
 
 # ---------------------------------------------------------------- approval

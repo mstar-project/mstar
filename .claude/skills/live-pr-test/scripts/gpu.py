@@ -848,15 +848,15 @@ def terminate(key: str, e: dict) -> None:
     with ledger_txn() as d:
         d.pop(key, None)
     if e["provider"] == "eras":
-        eras_delete_key(e["name"], {e["instance_id"]})
+        eras_delete_key(e["name"])
     hours = (time.time() - e["launched_at"]) / 3600
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
 
 
-def eras_delete_key(name: str, released: set[str]) -> None:
+def eras_delete_key(name: str) -> None:
     """Best effort: delete the ssh key the launch `name` registered (named after it), now that its
-    instances, `released`, are released, unless another instance not ended binds it: a deleted key
-    leaves the authorized_keys of every box that binds it. A key the launch reused stays."""
+    instances are released, unless an instance not releasing binds it in a run not finished: a deleted
+    key leaves the authorized_keys of every box that binds it. A key the launch reused stays."""
     try:
         keys = eras("GET", "/ssh-keys", params={"filter": json.dumps({"field": "name", "op": "=", "value": name})})
         bound, token = set(), None
@@ -865,7 +865,7 @@ def eras_delete_key(name: str, released: set[str]) -> None:
             for i in page.get("items") or []:
                 run = (i.get("standalone") or {}).get("current_run") or {}
                 secrets = (run.get("bindings") or {}).get("secrets") or {}
-                if i["id"] not in released:
+                if i.get("status") != "releasing" and run.get("status") not in ("succeeded", "failed", "stopped"):
                     bound.update(k for b in secrets.values() for k in b.get("ssh_key_ids") or [])
             if not (token := page.get("next_page_token")):
                 break
