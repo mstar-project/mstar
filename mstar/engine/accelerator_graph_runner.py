@@ -798,13 +798,13 @@ class AcceleratorGraphRunner:
 
     def _recompile_limit(self) -> int | None:
         """The dynamo recompile limit this node's compiled calls run under, None where the
-        engine's holds: an entry per compiled capture's token count
-        (``compiled_entries_per_shape`` of them), and some for the engine's compiled forward,
-        which shares the code objects. A capture past the limit would run uncompiled inside
-        its graph."""
+        engine's holds: ``compiled_entries_per_shape`` entries per compiled bucket the runner
+        captures (each batch size, token count and key traces apart; a LoRA node's base-only
+        twin is a key), and some for the engine's compiled forward, which shares the code
+        objects. A capture past the limit would run uncompiled inside its graph."""
         shapes = {
-            (idx, n) for idx, config in enumerate(self._capture_configs) if config.compile
-            for bs in self._batch_sizes(config) for n in config.get_total_tokens(bs)
+            (spec.config_idx, spec.bs, spec.num_tokens, spec.bucket.cg_key_info)
+            for spec in self._get_slot_specs() if spec.config.compile
         }
         need = self._submodule.compiled_entries_per_shape * len(shapes) + 16
         return need if need > recompile_limit() else None

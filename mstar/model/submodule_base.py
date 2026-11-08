@@ -826,8 +826,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # engines skip compiling such submodules (CUDA-graph capture is unaffected).
     disable_torch_compile: bool = False
 
-    # Entries dynamo keeps per code object of the compiled forward for each token count a
-    # compiled capture takes, e.g. one per kind of layer a frame is traced for. The runner
+    # Entries dynamo keeps per code object of the compiled forward for each bucket (batch
+    # size and token count) a compiled capture takes, e.g. one per kind of layer a frame is
+    # traced for. The runner
     # raises the recompile limit around this node's compiled calls to hold every capture
     # (`AcceleratorGraphRunner.recompile_limit`).
     compiled_entries_per_shape: int = 1

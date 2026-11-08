@@ -1474,9 +1474,9 @@ methods are:
    dimension that varies with ``torch._dynamo.mark_dynamic`` in ``prepare_inputs`` sets
    ``marks_dynamic_dims = True`` and compiles as any other submodule. The engine raises
    the recompile limit around a node's compiled calls, past ``MSTAR_RECOMPILE_LIMIT``, to
-   hold an entry per token count its compiled captures take; a submodule whose frames keep
-   several entries per token count (GLM-5.2's decoder layers are traced once per layer
-   kind) declares how many as ``compiled_entries_per_shape``. Keep the compiled
+   hold an entry per bucket its compiled captures take (each batch size and token count);
+   a submodule whose frames keep several entries per bucket (GLM-5.2's decoder layers are
+   traced once per layer kind) declares how many as ``compiled_entries_per_shape``. Keep the compiled
    paths compile-friendly. If a helper must not be traced, because it uses
    data-dependent Python control flow or forces a host synchronization, exclude it
    explicitly with ``@torch.compiler.disable``. A submodule that disables the

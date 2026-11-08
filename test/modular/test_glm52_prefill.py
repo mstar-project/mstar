@@ -315,21 +315,30 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     torch.testing.assert_close(logits[1], logits[0], rtol=1e-5, atol=1e-5)
 
 
+def _recompile_limit(ladders):
+    """The recompile limit the capture runner of an LLM capturing prefill at batch sizes 1,
+    4 and 16 asks for under the serving config's ``ladders``."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    return AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=_submodule(Glm52ModelConfig(prefill_capture_batch_sizes=[1, 4, 16])),
+        resources={}, step_runner=None, device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1, token_ladders=ladders,
+    ).recompile_limit
+
+
 def test_the_runner_sizes_the_recompile_limit_for_a_config_s_ladder():
     """Every captured token count costs a decoder layer's frames up to three entries; the
     runner counts the serving config's ladder, not the model's default."""
-    from mstar.engine import recompile_limit
-    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-
-    def runner(ladders):
-        return AcceleratorGraphRunner(
-            submodule_name="LLM", submodule=_submodule(Glm52ModelConfig(prefill_capture_batch_sizes=[1, 4, 16])),
-            resources={}, step_runner=None, device=torch.device("cpu"), autocast_dtype=None,
-            joint_comm_group=SimpleNamespace(world_size=1), num_slots=1, token_ladders=ladders,
-        )
-
-    assert runner({}).recompile_limit is None  # the default buckets fit the engine's limit
     # past dynamo's default 256 entries per code object, which the wrapper raises too
     buckets = list(range(64, 4097, 32))
     shapes = len(buckets) + 7  # + the decode batch sizes
-    assert runner({"prefill": buckets}).recompile_limit >= 3 * shapes > 256
+    assert _recompile_limit({"prefill": buckets}) >= 3 * shapes > 256
+
+
+def test_a_token_count_captured_at_several_batch_sizes_costs_entries_at_each():
+    """A frame is traced per captured batch size too (the last layer runs on a row per
+    request), so one request's ladder and a batch's each count at every batch size."""
+    fine, coarse = list(range(64, 1025, 64)), list(range(256, 2049, 256))
+    shapes = len(fine) + 2 * len(coarse) + 7  # bs 1 on the fine ladder, 4 and 16 on the coarse
+    assert _recompile_limit({"prefill": {1: fine, 2: coarse}}) >= 3 * shapes
