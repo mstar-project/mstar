@@ -1397,7 +1397,10 @@ meanwhile.
 
 A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
 out per request, while each SP rank holds a shard of the tokens, so building the pool
-refuses the deployment.
+refuses the deployment. A tensor-parallel node that the async TP scheduler runs cannot
+serve LoRA yet either: deployment validation refuses it until that scheduler fences a
+teardown between a step's broadcast and its admit (#1082); under the serial protocol
+(``tp_async_sched: false``) the paragraph above holds.
 
 Adapters loaded and unloaded at runtime (``/v1/load_lora_adapter``) reach each worker as
 a control message from the conductor, which each rank applies whenever it arrives rather
