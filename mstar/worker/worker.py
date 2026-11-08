@@ -1030,9 +1030,9 @@ class Worker:
         Waits on batch N's ``commit_done`` — its resource state has to be
         committed before N+1 can admit and plan against it — and nothing else.
         The batch is not prepared yet, so the plan runs against the capture
-        config's shape for the batch size; only a batched capture can serve
-        that. See ``Engine.pre_plan_for_batch`` for what moving
-        ``prepare_inputs`` ahead of the forward would take (and unlock).
+        config's shape for the batch size, or, for a step leased by token
+        count, against the spans ``_plan_spans`` fixed. See
+        ``Engine.pre_plan_for_batch``.
 
         Returns True when the batch was pre-planned; False means ``exec``
         plans it inline, which is always correct, just slower.
@@ -1073,6 +1073,19 @@ class Worker:
         finally:
             if self.timer.period:
                 set_step_key(None)
+
+    def _plan_spans(self, pending: PendingBatch | None, speculation: Speculation) -> None:
+        """Fix the spans a step leased by token count (a mixed step) is
+        planned ahead with, as it was scheduled. Here, on the main thread,
+        which built the batch: once the plan thread runs, this thread threads
+        N's outputs into the same batch."""
+        batch = speculation.node_batch
+        engine = self.engine_manager.get_engine(batch.node_name)
+        if engine.plans_by_spans(batch.node_name, batch.graph_walk):
+            batch.planned_spans = engine.planned_spans(
+                batch, speculation.continuing_rids,
+                None if pending is None else pending.node_batch,
+            )
 
     def _continuing_seq_lens(
         self, pending: PendingBatch, node_name: str, graph_walk: str,
@@ -3607,6 +3620,7 @@ class Worker:
             # while the main thread sits in await_gpu with the GIL
             # released and N's kernels are still running.
             if plan_executor is not None and self._plans_ahead(spec):
+                self._plan_spans(pending, spec)
                 spec.plan_future = plan_executor.submit(
                     self._preplan_spec, pending, spec,
                 )

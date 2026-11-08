@@ -774,6 +774,8 @@ class AcceleratorGraphRunner:
         # Per-bucket template rows for declare-only calls; see
         # `declare_inputs_for`.
         self._declare_inputs: dict[BucketKey, list[NodeInputs]] = {}
+        # packed config -> span -> its declare-only row (``declare_rows_for``)
+        self._span_rows: dict[int, dict[int, NodeInputs]] = {}
 
         self.max_bs = max(
             (max(self._batch_sizes(config)) for config in self._capture_configs),
@@ -1420,6 +1422,15 @@ class AcceleratorGraphRunner:
                 best = key
         return best
 
+    def batched_capture_for(self, graph_walk: str) -> bool:
+        """Whether a batched capture replays this walk, so a step of it can
+        be leased before its inputs are built (``select_batched_bucket``)."""
+        return any(
+            graph_walk in config.replay_graph_walks
+            and config.get_config_type() == AcceleratorGraphConfigType.BASIC_BATCHED
+            for config in self._capture_configs
+        )
+
     def captures_walk(self, graph_walk: str) -> bool:
         """Whether any capture replays this walk."""
         return any(
@@ -1513,6 +1524,25 @@ class AcceleratorGraphRunner:
                 )
             )
         return cached
+
+    def declare_rows_for(self, lease: SlotLease, spans: Sequence[int]) -> list[NodeInputs]:
+        """Declare-only rows of a packed bucket, one per span then its padding,
+        for a step planned before its inputs are built, made by the config's
+        ``make_node_input``. As ``declare_inputs_for``, a row may be shared and
+        must reach nothing but ``declare_step``: the one- and zero-token rows
+        (decode rows, padding) are made once per config, a prompt's per step,
+        since its spans take any value."""
+        config = self._buckets[lease.bucket].config
+        rows = self._span_rows.setdefault(id(config), {})
+        out = []
+        for n in (*spans, *[0] * (lease.bucket.bs - len(spans))):
+            row = rows.get(n)
+            if row is None:
+                row = config.make_node_input(n)
+                if n <= 1:
+                    rows[n] = row
+            out.append(row)
+        return out
 
     def pad_inputs(
         self, lease: SlotLease, inputs: list[NodeInputs], uniform: NodeInputs | None = None,

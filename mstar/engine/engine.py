@@ -350,6 +350,15 @@ class ExecutingBatch:
     # ``request_ids`` (a request dropped while threading outputs or preparing).
     preplanned_rids: tuple[int, ...] | None = None
 
+    # Each row's span as the step was scheduled, in ``request_ids`` order, for
+    # a step planned ahead of ``prepare_inputs`` whose capture is leased by
+    # token count (a mixed step); see ``Engine.planned_spans``.
+    planned_spans: tuple[int, ...] | None = None
+    # The spans the slot was leased by, and a stage declared over, when that
+    # was done before ``prepare_inputs``: both hold only while the prepared
+    # rows run these spans.
+    lease_spans: tuple[int, ...] | None = None
+
     # Declared once for the batch (pre-plan declares it first when it runs)
     # and driven from here on
     step: SubmoduleStep | None = None
@@ -582,6 +591,8 @@ class Engine:
         # node -> the event after its plan stream's latest pre-plan; see
         # ``_order_after_pre_plans``
         self._pre_plan_done: dict[str, Any] = {}
+        # (node, walk) -> whether its steps are planned ahead by span; see ``plans_by_spans``
+        self._plans_by_spans: dict[tuple[str, str], bool] = {}
         self._graph_runtime = graph_runtime
         # chunked prefill: per-walk policies and budgets, and rows mid-prefill
         self._chunking = ChunkingManagement(self._submodules)
@@ -1625,6 +1636,10 @@ class Engine:
                 node_name=batch.node_name,
             ):
                 laps = PhaseLaps("engine.exec.")
+                if self._spans_moved(batch):
+                    # leased ahead with no stage left on it (a stale one is
+                    # reset before exec), by spans prepare did not keep
+                    self._drop_span_lease(batch)
                 # a caller that pre-planned already reserved one; otherwise take it here
                 lease = batch.step_context.slot_lease or self.reserve_replay_slot(batch)
                 laps.lap("reserve_slot")
@@ -1937,18 +1952,11 @@ class Engine:
             # there is nothing to admit, and the forward still runs
             return ADMIT_OK, None
         if batch.chunk_ranges:
-            walk_of = batch.step_context.walk_of
-            ctx.chunk_tokens_after = {
+            self._set_chunk_context(batch, ctx, {
                 rid: inp.chunk_total - inp.chunk_start - inp.input_seq_len
                 for rid, inp in zip(rids, inputs, strict=True)
                 if not inp.is_final_chunk
-            }
-            ctx.reserve_whole_prefill = PerReqSetting.over(
-                ctx.chunk_tokens_after,
-                lambda rid: self._chunking.policy(
-                    batch.node_name, walk_of(rid),
-                ).reserve_whole_prefill,
-            )
+            })
         # admit reads the step's ctx, so bind it before the sweep rather than
         # in `_drive_step`
         step.set_ctx(ctx)
@@ -1973,6 +1981,18 @@ class Engine:
             for rid in batch.first_chunk_rids:
                 self._chunking.release(rid, batch.node_name)
         return admit_outcome, step
+
+    def _set_chunk_context(
+        self, batch: ExecutingBatch, ctx: StepContext, tokens_after: dict[int, int],
+    ) -> None:
+        """The tokens each row mid-prefill has left after this step's chunk,
+        and whether its walk reserves them now; admit reads both."""
+        walk_of = ctx.walk_of
+        ctx.chunk_tokens_after = tokens_after
+        ctx.reserve_whole_prefill = PerReqSetting.over(
+            tokens_after,
+            lambda rid: self._chunking.policy(batch.node_name, walk_of(rid)).reserve_whole_prefill,
+        )
 
     def _check_follower_refusal(
         self, batch: ExecutingBatch, outcome: FullAdmitOutcome,
@@ -2909,7 +2929,8 @@ class Engine:
 
         A batch that hasn't been through ``prepare_inputs`` has no token count
         yet, so only a batched capture can serve it — see
-        ``CudaGraphRunner.select_batched_bucket``.
+        ``CudaGraphRunner.select_batched_bucket`` — unless it carries
+        ``planned_spans``, whose sum leases a packed capture.
         """
         submodule_mgmt = self._submodules[batch.node_name]
 
@@ -2928,10 +2949,12 @@ class Engine:
             batch.step_context.graph_walk, batch.per_request_info_wrapped,
             per_request_input_metadata=batch.per_request_input_metadata,
         )
-        num_tokens = (
-            None if batch.inputs is None
-            else sum(inp.input_seq_len for inp in batch.inputs)
-        )
+        if batch.inputs is not None:
+            num_tokens = sum(inp.input_seq_len for inp in batch.inputs)
+        elif batch.planned_spans is not None:
+            num_tokens = sum(batch.planned_spans)
+        else:
+            num_tokens = None
         lease = None
         pools = submodule_mgmt.lora_pools
         if pools and not any(pool.runs_adapters(batch.request_ids) for pool in pools):
@@ -2955,7 +2978,26 @@ class Engine:
         if lease is not None:
             batch.lease_slot(lease)
             ctx.force_prefill = cg_runner.is_packed(lease)
+        batch.lease_spans = batch.planned_spans if lease is not None and batch.inputs is None else None
         return lease
+
+    def _spans_moved(self, batch: ExecutingBatch) -> bool:
+        """Whether the slot was leased by spans the prepared rows don't run."""
+        spans = batch.lease_spans
+        return spans is not None and (
+            batch.inputs is None
+            or spans != tuple(inp.input_seq_len for inp in batch.inputs)
+        )
+
+    def _drop_span_lease(self, batch: ExecutingBatch) -> None:
+        """Give back a slot leased by ``lease_spans``, so exec leases again by
+        the prepared token count."""
+        lease = batch.step_context.slot_lease
+        cg_runner = self._submodules[batch.node_name].accelerator_graph_runner
+        if lease is not None and cg_runner is not None:
+            cg_runner.release(lease, len(batch.request_ids))
+        batch.step_context.slot_lease = None
+        batch.lease_spans = None
 
     def can_pre_plan(self, node_name: str) -> bool:
         """Whether pre-planning this node could stage anything at all.
@@ -2978,6 +3020,64 @@ class Engine:
             graph_walk, fwd_info, prev_seq_len,
         )
 
+    def plans_by_spans(self, node_name: str, graph_walk: str) -> bool:
+        """Whether a step of ``graph_walk`` replays only packed captures, so
+        planning it ahead needs its rows' spans (``planned_spans``). Cached:
+        the captures are fixed once the engine is up."""
+        key = (node_name, graph_walk)
+        packed = self._plans_by_spans.get(key)
+        if packed is None:
+            mgmt = self._submodules.get(node_name)
+            cg_runner = None if mgmt is None else mgmt.accelerator_graph_runner
+            packed = self._plans_by_spans[key] = (
+                cg_runner is not None and self.can_pre_plan(node_name)
+                and cg_runner.captures_walk(graph_walk)
+                and not cg_runner.batched_capture_for(graph_walk)
+            )
+        return packed
+
+    def planned_spans(
+        self, batch: ExecutingBatch, continuing: Collection[int],
+        prev: ExecutingBatch | None = None,
+    ) -> tuple[int, ...] | None:
+        """Each row's span as the step was scheduled, before ``prepare_inputs``:
+        a chunked row runs its chunk, a row continuing from ``prev`` (the step
+        in flight) the submodule's ``speculative_input_seq_len``, and a row
+        merged in its ``get_input_sequence_len`` over the inputs it was popped
+        with. None when a row has no answer, rebuilds, or runs a walk the
+        prefix cache keys, whose span ``prepare_inputs`` decides when it
+        probes the cache and applies what it finds."""
+        node = batch.node_name
+        ctx = batch.step_context
+        if ctx.rebuild_rids:
+            return None
+        submodule = self._submodules[node].submodule
+        keyed = self._keyed_walks.get(node, ())
+        walk_of = ctx.walk_of
+        chunks = batch.chunk_ranges
+        tensors = batch.per_request_input_tensors
+        infos = batch.per_request_info
+        same_node = prev is not None and prev.node_name == node
+        spans = []
+        for rid in batch.request_ids:
+            walk = walk_of(rid)
+            if walk in keyed:
+                return None
+            chunk = chunks.get(rid)
+            if chunk is not None:
+                span = chunk.end - chunk.start
+            elif rid in continuing:
+                span = submodule.speculative_input_seq_len(
+                    walk, infos[rid], prev.seq_len_of(rid) if same_node else -1,
+                )
+            else:
+                info = submodule.get_input_sequence_len(walk, infos[rid], tensors.get(rid, {}))
+                span = None if info is None else info.seq_len
+            if not span or span < 0:
+                return None
+            spans.append(span)
+        return tuple(spans)
+
     def pre_plan_for_batch(self, batch: ExecutingBatch) -> bool:
         """Admit and plan the pre-planning resources a step ahead.
 
@@ -2989,15 +3089,18 @@ class Engine:
 
         An unprepared batch declares its step over the capture config's inputs
         for the leased bucket, which is why the lease had to come from a
-        batched capture. That step is not cached: ``exec`` re-declares it over
-        the real inputs.
+        batched capture. A batch with ``planned_spans`` (a mixed step: its
+        decode rows' one token and its prompt rows' chunks, as scheduled) is
+        declared over rows of those spans instead, on the packed capture they
+        lease. Either way the step is not cached: ``exec`` re-declares it over
+        the real inputs, and the runner promotes the stage only if that
+        declaration is the same step. Spans that differ once prepared drop the
+        stage and its lease first (``preplan_is_stale``).
 
-        TODO: pre-planning a packed capture (and chunked prefill) needs the
-        real token counts here, i.e. ``prepare_inputs`` run ahead of the
-        forward. That needs every submodule's ``prepare_inputs`` to be
-        async-safe — no ``.item()`` on a tensor the in-flight step is still
-        producing — which some are not (e.g. qwen3_tts).
-        ``ExecutingBatch.outputs_ready`` is the hook for it.
+        ``prepare_inputs`` itself still runs on the GPU thread: run ahead of
+        the forward it would read the inputs the main thread threads in from
+        the step in flight, and a keyed walk's prepare applies a cached prefix
+        to the resources, so ``planned_spans`` leaves such rows out.
 
         Returns False when nothing was planned ahead, in which case ``exec``
         plans inline.
@@ -3023,11 +3126,14 @@ class Engine:
         laps = PhaseLaps("engine.pre_plan.")
         # Declare-only, so the unprepared case takes the bucket's shared
         # template rows rather than cloning a fresh set per pre-plan.
-        inputs = (
-            cg_runner.declare_inputs_for(lease)
-            if batch.inputs is None
-            else cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
-        )
+        spans = None
+        if batch.inputs is not None:
+            inputs = cg_runner.pad_inputs(lease, batch.inputs, uniform=batch.uniform_inputs)
+        elif batch.lease_spans is not None and cg_runner.is_packed(lease):
+            spans = batch.lease_spans
+            inputs = cg_runner.declare_rows_for(lease, spans)
+        else:
+            inputs = cg_runner.declare_inputs_for(lease)
         batch.step_context.set_padded_rids(
             cg_runner.step_ids(lease, batch.request_ids)
         )
@@ -3056,6 +3162,13 @@ class Engine:
 
         batch.step_context.is_preplan = True
         step.set_ctx(batch.step_context)
+        if spans is not None and batch.chunk_ranges:
+            # what `_declare_and_admit` reads off a chunked row's prepared
+            # input; admit reserves by it, so the stage has to see it too
+            self._set_chunk_context(batch, batch.step_context, {
+                rid: chunk.total - chunk.end
+                for rid, chunk in batch.chunk_ranges.items() if not chunk.is_final
+            })
         try:
             t0 = phase_start()
             admit_outcome = self._runner.pre_admit(step)
@@ -3108,10 +3221,12 @@ class Engine:
                 stream.wait_event(event)
 
     def preplan_is_stale(self, batch: ExecutingBatch) -> bool:
-        """Whether the staged plan no longer describes this batch."""
-        return (
-            batch.preplanned_rids is not None
-            and batch.preplanned_rids != tuple(batch.request_ids)
+        """Whether the staged plan no longer describes this batch: a row
+        left it, or, for a stage declared over ``lease_spans``, a prepared row
+        runs another span (a chunk cut differently, a prompt that came out
+        another length), which also moves the token count it was leased by."""
+        return batch.preplanned_rids is not None and (
+            batch.preplanned_rids != tuple(batch.request_ids) or self._spans_moved(batch)
         )
 
     def reset_pre_plan_for_batch(self, batch: ExecutingBatch | None = None) -> None:
@@ -3139,6 +3254,11 @@ class Engine:
             cg_runner = self._submodules[batch.node_name].accelerator_graph_runner
             if lease is not None and cg_runner is not None:
                 cg_runner.release(lease, len(batch.request_ids))
+            if batch.lease_spans is not None:
+                # leased by the spans the stage was declared over; exec leases
+                # again by the prepared token count
+                batch.step_context.slot_lease = None
+                batch.lease_spans = None
         # through the runner, so its record of the staged step goes too
         self._runner.clear_preplan()
 
