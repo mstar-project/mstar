@@ -771,8 +771,7 @@ of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be no
 [-1, 1].
 
 A model that supports speculative decoding (drafting several tokens and verifying them in
-one target pass) turns it on with a ``draft`` block; without one it decodes as usual. No shipped
-model declares a drafter yet; a block looks like this:
+one target pass) turns it on with a ``draft`` block; without one it decodes as usual:
 
 .. code-block:: yaml
 
@@ -789,6 +788,8 @@ otherwise, logging why; ``asynchronous`` refuses to start where it can't run. Th
 refuses unknown keys, and a block on a model that serves none. Requests on such a
 deployment can't ask for ``repetition_penalty`` other than 1, ``repetition_window``,
 ``min_tokens``, ``return_logprobs`` or ``penalize_prompt: false`` (see :doc:`clients`).
+
+Qwen3.5's drafter is the checkpoint's own head: ``method: mtp``, with no ``model``.
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
 client instead — see :doc:`clients`. A ``seed`` fixes a request's random stream whatever

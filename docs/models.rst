@@ -578,6 +578,23 @@ refused and the MTP head is skipped. The chat template's new
 request gets the template's defaults (``xhigh`` and preserved), whatever the
 client sends.
 
+**Speculative decoding with the MTP head.** ``configs/qwen3_5_9b_mtp.yaml`` and
+``qwen3_5_2b_mtp.yaml`` set ``model_kwargs.draft: {method: mtp, num_draft_tokens: 3}``: the
+checkpoint's one MTP layer (``mtp.*``) drafts ``k`` tokens a decode step and the target
+verifies them in the same forward. Greedy replies are the target's; sampled ones verify by
+speculative sampling. The head's K/V is one more layer of the full-attention KV pool, and its
+hidden vector crosses steps as the sampler's ``draft_carry`` state; a verify step's rejected
+tokens are undone in the GDN state by a rerun in the graph, on FlashInfer's multi-token GDN
+kernel, from the slot itself: the forward leaves both the state and the short-conv window in
+place, and the settle rebuilds the window from the slot and the kept inputs; the GDN state
+must be float32. Prompts still prefill
+in chunks, and text and image prompts are served; a video prompt is a 400 on such a node for
+now. Also on it: no mixed prompt-plus-decode steps, no ``repetition_penalty`` other than 1, no
+preemption rebuild (a request under KV pressure is offloaded or evicted, never dropped and
+rebuilt), one rank (no tensor parallelism yet), and ``mode: auto`` runs asynchronously where
+FlashAttention-3 serves the verify attention (Hopper). No Qwen3.8 config
+drafts yet.
+
 Command A+ (``command_a_plus``)
 -------------------------------
 

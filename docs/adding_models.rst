@@ -1441,7 +1441,8 @@ What the model writes, and nothing more:
   ``DrafterNeeds(target_hidden=True)``; ``target`` then returns ``(logits, hidden)``.
 - A node that prefills prompts in chunks needs a drafter that declares its rule at a chunk
   boundary (``DrafterNeeds.chunk_boundary``): ``NONE`` when its state at a row depends on that
-  row alone (DSpark).
+  row alone (DSpark), ``READS_NEXT_TOKEN`` when row ``p`` reads token ``p + 1`` (MTP), which
+  the model's ``split_inputs`` hands a chunk's last row from the prompt.
 
 **Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
 ``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention
@@ -1482,6 +1483,10 @@ are KDA and Mamba-2, mixed splits, more than one label and a pool without a sink
 tile path, which the batch size picks: the resource compiles every one a verify step can reach
 when the walk binds, at startup. Either mode works: a resident verify step gathers each row's slot
 off the pool's table in the graph, and replays the rerun its capture recorded.
+
+``mstar/model/qwen3_5`` adds a carrying drafter on a hybrid node: the checkpoint's MTP head
+(``components/mtp.py``) as layer set ``"mtp"``, one more layer of the target's KV pool, on the
+target's own attention plan, with GDN state undone by the recurrent resources above.
 
 Every resource on the node states whether it can verify (``NodeResourceSpec.verify_refusal``;
 the base refuses, so an unchecked resource is never assumed safe) and whether it can be
