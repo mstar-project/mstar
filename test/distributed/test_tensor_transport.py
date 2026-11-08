@@ -244,25 +244,26 @@ def test_fanin_buffers_partial_then_completes(make_manager, protocol):
 
 
 def _receiving_worker(manager, sharding_config: ShardingConfig) -> Worker:
-    """The real ``Worker._add_new_request`` over ``manager``, the rest cut down."""
+    """The real ``InputIngest._add_new_request`` over ``manager``, the rest cut down."""
     rids = RidTable()
+    request_state = RequestStateManager()
     w = make_worker(
         worker_id=manager.my_entity_id,
         _graph_runtime=SimpleNamespace(
-        add_request=lambda request_id, **kw: rids.intern(request_id),
-        get_rid_handle=rids.handle,
-        get_sharding_config=lambda rid: sharding_config,
-        register_stop_limits=lambda rid, info: None,
-    ),
-        request_state=RequestStateManager(),
-        scheduler=SimpleNamespace(note_arrival=lambda rid: None),
+            add_request=lambda request_id, **kw: rids.intern(request_id),
+            get_rid_handle=rids.handle,
+            get_sharding_config=lambda rid: sharding_config,
+            register_stop_limits=lambda rid, info: None,
+        ),
+        request_state=request_state,
         tensor_manager=manager,
         engine_manager=SimpleNamespace(
-        engine=SimpleNamespace(publisher_nodes={}), add_request=lambda rid, configs, info: None,
-    ),
+            engine=SimpleNamespace(publisher_nodes={}), add_request=lambda rid, configs, info: None,
+        ),
+        streams=StreamBufferManager(request_state, manager, []),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
-    w.streams = StreamBufferManager(w.request_state, manager, [])
-    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    w.rids = rids
     return w
 
 
@@ -295,8 +296,8 @@ def test_a_second_partition_keeps_a_partial_fanin(make_manager, protocol):
     for m in (sender0, sender1):
         m.register_request("req1", cfg)
     worker = _receiving_worker(receiver, cfg)
-    worker._add_new_request(_new_request("req1", "P0"))
-    rid = worker._rid("req1")
+    worker.ingest._add_new_request(_new_request("req1", "P0"))
+    rid = worker.rids.handle("req1")
 
     shard0 = torch.randn(3, 4)
     shard1 = torch.randn(3, 4)
@@ -305,7 +306,7 @@ def test_a_second_partition_keeps_a_partial_fanin(make_manager, protocol):
     _drain_reads(receiver, rid, [deepcopy(edge0)], graph_walk="decode")
     assert receiver.get_ready_tensors(graph_walk="decode").get(rid, []) == []
 
-    worker._add_new_request(_new_request("req1", "P1"))
+    worker.ingest._add_new_request(_new_request("req1", "P1"))
 
     _drain_reads(receiver, rid, [deepcopy(edge1)], graph_walk="decode")
     ready = receiver.get_ready_tensors(graph_walk="decode")
