@@ -990,7 +990,7 @@ jobs:
           elif [ -s "$lt/comment.md" ]; then cp "$lt/comment.md" post.md
           elif [ -s "$lt/unavailable.md" ]; then { echo "<!-- claude-live-test sha=$HEAD_SHA verdict=unavailable -->"; cat "$lt/unavailable.md"; } > post.md
           else   # the review chose `none` and it stood: its reason is model text, so it can't open a comment
-            printf '<!-- claude-live-test-carried -->\nNo GPU run: %s\n' \
+            printf '<!-- claude-live-test-none -->\nNo GPU run: %s\n' \
               "$(jq -r '.live_test.reason // ""' review.json | sed 's/<!--/\&lt;!--/g')" > post.md
           fi
           if [ "$APPROVAL" = "approve" ]; then

@@ -232,8 +232,7 @@ def cmd_start(a):
         findings["earlier_report"] = Path(a.earlier_report).read_text()
     (out / "findings.json").write_text(json.dumps(findings, indent=1))
     (out / "run.json").write_text(json.dumps({"repo": REPO, "pr": a.pr, "sha": a.sha, "main_sha": a.main_sha,
-                                              "checks": a.checks, "model": a.model, "turns": a.turns,
-                                              "claude": a.claude_version}))
+                                              "model": a.model, "turns": a.turns, "claude": a.claude_version}))
     cfg = gpu_py()["load_config"]()
     listing = json.loads(gpu("offers", "--gpus", str(a.gpus), "--json").stdout)
     cap = listing["max_usd_per_hour"]

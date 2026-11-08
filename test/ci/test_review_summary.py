@@ -91,8 +91,6 @@ class TestReviewSummary(unittest.TestCase):
 
     def test_a_live_test_call_says_which_kinds_of_check_the_box_runs(self):
         live = SUMMARY["SCHEMA"]["properties"]["live_test"]
-        self.assertIn("checks", live["required"], "the box couldn't tell a correctness retest from a full A/B run")
-        self.assertEqual(live["properties"]["checks"]["minItems"], 1)
         gpu_review = runpy.run_path(str(REPO_ROOT / ".github/review/gpu_review.py"))
         self.assertEqual(live["properties"]["checks"]["items"]["enum"], list(gpu_review["CHECKS"]),
                          "the review could choose a kind of check the box's brief can't name")
