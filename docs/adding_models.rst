@@ -666,9 +666,8 @@ per row, ``Value(name, nodes=, layers={0}, entry=Entry({"tail": TensorType((8, 3
 "count": TensorType((), dtype=torch.int64)}))``, where a shape of ``()`` is one scalar per entry.
 ``h.read(layer).fields[f]`` is ``[rows, *shape]`` in the step's row order, padding rows included, in
 tensors the caller owns, so a captured forward may write them in place. A row with nothing written
-yet, at span 0 or that pads the step reads ``start``: ``h.read(layer, start={f: tensor})`` takes
-tensors of one entry's shape, made at load, and zeros stand in for a field it doesn't name. Every
-read of a handle passes the same ones, since a captured read keeps their address.
+yet, at span 0 or that pads the step reads its start: ``h.set_start({f: tensor})`` in ``bind_state``
+takes tensors of one entry's shape, made at load, and zeros stand in for a field it doesn't name.
 ``h.write(layer, **fields)`` sets the step's rows' entries at its commit. In a step, a layer's reads
 come before its write, a field takes one write, and each row at span 1 or more gets every field
 from the step's own write. Such a ``Value`` takes no ``keep=False`` and sits on no node with prefix

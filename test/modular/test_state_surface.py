@@ -266,7 +266,6 @@ HANDLE_SNAPSHOT = {
         ["self", "POSITIONAL_OR_KEYWORD", None],
         ["layer", "POSITIONAL_OR_KEYWORD", None],
         ["q", "POSITIONAL_OR_KEYWORD", "None"],
-        ["start", "KEYWORD_ONLY", "None"],
         ["mask_args", "VAR_KEYWORD", None],
     ],
     "write": [

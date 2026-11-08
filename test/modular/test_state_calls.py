@@ -993,10 +993,10 @@ def test_row_offsets_count_one_entry_per_row():
 
 def test_fresh_and_span_zero_rows_read_start_per_field_and_zeros_for_the_rest():
     h, pool = _plain_value()
+    h.set_start({"x": torch.full((2, 3), 7.0)})
     _commit_written(h, pool)
-    start = {"x": torch.full((2, 3), 7.0)}
     step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 0)])
-    reached = h.read(0, start=start)
+    reached = h.read(0)
     assert reached.fields["x"].equal(torch.full((2, 2, 3), 7.0)), "row 2 holds state, and span 0 still reads the start"
     assert reached.fields["n"].tolist() == [0, 0], "a field start doesn't name reads zeros"
     h.end_step(step)
@@ -1004,10 +1004,11 @@ def test_fresh_and_span_zero_rows_read_start_per_field_and_zeros_for_the_rest():
 
 def test_a_written_row_reads_its_entry_and_not_start():
     h, pool = _plain_value()
-    _commit_written(h, pool)
     start = {"x": torch.full((2, 3), 7.0)}
+    h.set_start(start)
+    _commit_written(h, pool)
     step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
-    x = h.read(0, start=start).fields["x"]
+    x = h.read(0).fields["x"]
     assert x[0].equal(start["x"]) and x[1].equal(torch.full((2, 3), 4.0)), "a written row kept its entry"
     h.end_step(step)
 
@@ -1093,17 +1094,13 @@ def test_a_read_after_an_update_of_the_layer_is_refused():
 
 
 @pytest.mark.parametrize("call, cause", [
-    (lambda h: h.read(0, torch.ones(1)), r"a Value's read takes start and no other keyword, and got \['q'\]"),
-    (lambda h: h.read(0, bias=1), r"a Value's read takes start and no other keyword, and got \['bias'\]"),
-    (lambda h: h.read(0, start={"y": torch.ones(1)}), r"start names fields \['y'\], of \['n', 'x'\]"),
-    (lambda h: h.read(0, start={"x": torch.ones(2, 4)}), r"start of field 'x' on layer 0 is \(2, 4\)"),
-    (lambda h: h.read(0, start={"x": torch.ones(2, 3).double()}), r"start of field 'x' on layer 0 is .*float64"),
+    (lambda h: h.read(0, torch.ones(1)), r"a Value's read takes no q and no keyword, and got \['q'\]"),
+    (lambda h: h.read(0, bias=1), r"a Value's read takes no q and no keyword, and got \['bias'\]"),
     (lambda h: h.read(1), r"read on layer 1, which the array doesn't declare"),
     (lambda h: h.write(0, y=torch.ones(1)), r"no field 'y' on layer 0"),
     (lambda h: h.write(0, x=torch.ones(1, 2, 4)), r"write of field 'x' on layer 0 is \(2, 4\)"),
     (lambda h: h.write(0, n=torch.ones(1).long().float()), r"write of field 'n' on layer 0 is \(\) of torch.float32"),
-], ids=["q", "a mask keyword", "an undeclared start", "a start's shape", "a start's dtype", "an undeclared layer",
-        "an undeclared write", "a write's shape", "a write's dtype"])
+], ids=["q", "a mask keyword", "an undeclared layer", "an undeclared write", "a write's shape", "a write's dtype"])
 def test_a_values_calls_refuse_what_the_field_cant_hold(call, cause):
     h, pool = _plain_value()
     step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
@@ -1122,22 +1119,9 @@ def test_a_read_on_a_value_with_only_host_fields_is_refused():
     _refused(r"Array 'host': read on a Value with no tensor fields", lambda: h.read(0))
 
 
-def test_start_on_an_array_that_isnt_a_value_is_refused_on_both_handles():
-    start = {"k": torch.ones(1)}
-    _refused(r"Array 'kv': start, on an array that isn't a Value", lambda: _kv_handle().read(0, start=start))
-    _refused(r"Array 'kv': start, on an array that isn't a Value", lambda: _within_handle().read(0, start=start))
-
-
-def test_a_read_with_another_start_than_the_first_is_refused():
-    """A captured read keeps the tensors its capture saw, so a read with others would differ from its own replay."""
-    h, pool = _plain_value()
-    first = {"x": torch.full((2, 3), 7.0)}
-    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
-    h.read(0, start=first)
-    h.read(0, start=dict(first))
-    _refused(r"Array 'state': a read passes another start", lambda: h.read(0, start={"x": first["x"].clone()}))
-    _refused(r"Array 'state': a read passes another start", lambda: h.read(0))
-    h.end_step(step)
+def test_set_start_on_an_array_that_isnt_a_value_is_refused():
+    _refused(r"Array 'kv': set_start on an array that isn't a Value with tensor fields",
+             lambda: _kv_handle().set_start({"k": torch.ones(1)}))
 
 
 def test_keep_false_on_a_plain_value_is_refused():

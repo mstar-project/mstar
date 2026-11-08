@@ -88,6 +88,7 @@ class TransducerSubmodule(NodeSubmodule):
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.state = handles[TRANSDUCER_STATE]
+        self.state.set_start(self._start)
 
     def _bucket(self, num_frames: int | None) -> int | None:
         """The narrowest capture that holds ``num_frames``; None past the widest."""
@@ -224,7 +225,7 @@ class TransducerSubmodule(NodeSubmodule):
         self, encoder_states: torch.Tensor, lengths: torch.Tensor, prompt_ids: torch.Tensor | None = None,
     ) -> BatchedModelOutput:
         # A fresh slot and a padding row on the sink read the start state, and the steps update the copy in place.
-        state = self.state.read(0, start=self._start).fields
+        state = self.state.read(0).fields
         tokens, active = self.head.advance(encoder_states, lengths, state, self.chunk, self._step, prompt_ids)
         self.state.write(0, **state)
         # tokens are -1 where a step emitted none

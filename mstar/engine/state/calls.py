@@ -72,7 +72,6 @@ class ArrayHandle(StepHandle):
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
         # `_kept` holds the layers whose kept add has run, `_scratch` those with a scratch add, `_read` those read,
         # `_updated` the update calls run, and `_written` the fields each layer's write set.
-        # `_start` is what the handle's first read of a Value passed as ``start``, kept across steps.
         self._open = False
         self._keep = True
         self._capturing = False
@@ -83,7 +82,9 @@ class ArrayHandle(StepHandle):
         self._read: set[int] = set()
         self._updated: set[tuple[str, int]] = set()
         self._written: dict[int, set[str]] = {}
-        self._start: Mapping[str, torch.Tensor] | None = None
+        # each layer's start state from `set_start`, in the pool's layout, fixed from the handle's first step on
+        self._start: dict[int, dict[str, torch.Tensor]] = {}
+        self._stepped = False
 
     def _refusal(self, cause: str) -> ValueError:
         return ValueError(f"Array {self.name!r}: {cause}")
@@ -104,6 +105,7 @@ class ArrayHandle(StepHandle):
         if self._open:
             raise self._refusal("a step began while another is open")
         self._open = True
+        self._stepped = True
         declared: ArrayStep = step.state[self.name]
         segments = declared.segments or step.segments
         if segments:
@@ -269,20 +271,16 @@ class ArrayHandle(StepHandle):
 
     @torch.compiler.disable
     def read(
-        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, *,
-        start: Mapping[str, torch.Tensor] | None = None, **mask_args: Any,
+        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any,
     ) -> torch.Tensor | Reached:
         """Attend ``q`` through the read declared for ``layer``: kept entries from earlier steps, plus this layer's
         latest add, at the positions its mask reaches.
 
         A Value takes no ``q`` and returns its fields as `Reached`. A row with nothing written yet, with span 0 or that
-        pads the step reads ``start``, zeros for a field it doesn't name. ``start`` holds tensors of one entry's shape
-        on this rank, made at load and never written, since a captured read keeps their address.
+        pads the step reads the start `set_start` gave, zeros for a field it doesn't name.
         """
         if is_value(self.array):
-            return self._read_value(self._layer_id(layer), q, start, mask_args)
-        if start is not None:
-            raise self._refusal("start, on an array that isn't a Value")
+            return self._read_value(self._layer_id(layer), q, mask_args)
         if q is None:
             raise self._no_layout("a read with no op")
         if mask_args:
@@ -294,39 +292,39 @@ class ArrayHandle(StepHandle):
             q, label=self.label, kv_cache_layer=self._views[layer], k=k, v=v, layer_idx=self._pool_layer[layer],
         )
 
-    def _read_value(
-        self, layer: int, q: torch.Tensor | None, start: Mapping[str, torch.Tensor] | None, mask_args: Mapping,
-    ) -> Reached:
+    def _read_value(self, layer: int, q: torch.Tensor | None, mask_args: Mapping) -> Reached:
         if self._pool is None:
             raise self._refusal("read on a Value with no tensor fields; host() reads its host fields")
         if q is not None or mask_args:
             given = sorted({*mask_args, *(("q",) if q is not None else ())})
-            raise self._refusal(f"a Value's read takes start and no other keyword, and got {given}")
+            raise self._refusal(f"a Value's read takes no q and no keyword, and got {given}")
         self._record_read(layer)
         if layer in self._written or any(updated == layer for _, updated in self._updated):
             raise self._refusal(f"a read of layer {layer} after its write or update in this step")
-        start = self._same_start(start)
+        start = self._start.get(layer, EMPTY)
         fields = {}
         for field in self.array.entry.tensors:
-            given = start.get(field)
-            if given is not None:
-                given = self._stored(field, layer, given, given.shape, "start")
-            read = self._pool.gather(field, self._pool_layer[layer], label=self.label, start=given)
+            read = self._pool.gather(field, self._pool_layer[layer], label=self.label, start=start.get(field))
             fields[field] = self._declared(field, read)
         rows = next(iter(fields.values()))
         return Reached(fields, row_offsets=torch.arange(rows.shape[0] + 1, dtype=torch.int32, device=rows.device))
 
-    def _same_start(self, start: Mapping[str, torch.Tensor] | None) -> Mapping[str, torch.Tensor]:
-        start = EMPTY if start is None else start
+    def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
+        """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
+        for each field it names, of one entry's shape on this rank, and zeros for the rest. The tensors are made at load
+        and never written, since a captured read keeps their address."""
+        if self._pool is None:
+            raise self._refusal("set_start on an array that isn't a Value with tensor fields")
+        if self._stepped:
+            raise self._refusal("set_start after the handle's first step, whose captured reads keep the start "
+                                "they read")
         undeclared = start.keys() - self.array.entry.tensors.keys()
         if undeclared:
             raise self._refusal(f"start names fields {sorted(undeclared)}, of {sorted(self.array.entry.tensors)}")
-        if self._start is None:
-            self._start = dict(start)
-        elif start.keys() != self._start.keys() or any(start[field] is not self._start[field] for field in start):
-            raise self._refusal("a read passes another start than the handle's first read, whose tensors a captured "
-                                "read keeps")
-        return start
+        self._start = {
+            layer: {field: self._stored(field, layer, value, value.shape, "start") for field, value in start.items()}
+            for layer in self.array.layers
+        }
 
     def _k_last(self, field: str) -> bool:
         """Whether ``field`` is the state a declared `GatedDeltaNet` reads, stored K-last as `_state_block` lays it."""

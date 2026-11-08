@@ -430,7 +430,7 @@ def test_qwen3_asr_region_step_equals_the_hand_written_one(seq_lens):
 @pytest.mark.parametrize("bucket", [512, 2048, 8192, None], ids=["512", "2048", "8192", "eager"])
 def test_parakeet_iteration_step_equals_the_hand_written_one(name, bucket):
     build, _ = MODELS[name]
-    node = _bind(_node(TransducerSubmodule), build(), "transducer")
+    node = _bind(_node(TransducerSubmodule, _start={}), build(), "transducer")
     inputs = [NodeInputs(input_seq_len=1, resource_step_info=bucket) for _ in range(2)]
     step = engine_step(node, "transcribe", [1, 2], inputs)
     _assert_steps_equal(step, _reference_step(
@@ -439,7 +439,7 @@ def test_parakeet_iteration_step_equals_the_hand_written_one(name, bucket):
 
 
 def test_parakeet_mixed_buckets_declare_no_key_as_they_did():
-    node = _bind(_node(TransducerSubmodule), _parakeet(), "transducer")
+    node = _bind(_node(TransducerSubmodule, _start={}), _parakeet(), "transducer")
     inputs = [NodeInputs(input_seq_len=1, resource_step_info=bucket) for bucket in (512, 2048)]
     assert engine_step(node, "transcribe", [1, 2], inputs).cg_key_info is None
 

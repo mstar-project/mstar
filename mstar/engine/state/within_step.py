@@ -94,14 +94,9 @@ class WithinStepHandle(ArrayHandle):
             self._record_add(self._held_layer, keep)
         self._held = fields["k"], fields["v"]
 
-    def read(
-        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, *,
-        start: Mapping[str, torch.Tensor] | None = None, **mask_args: Any,
-    ) -> torch.Tensor:
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
         """Attend ``q`` over this layer's latest add, within each row's segment. ``q`` is (tokens, heads, head_dim), or
         (rows, len, heads, head_dim) for rows of one length, which is the view an exchange and SDPA take."""
-        if start is not None:
-            raise self._refusal("start, on an array that isn't a Value")
         if q is None:
             raise self._no_layout("a read with no op")
         if mask_args:
