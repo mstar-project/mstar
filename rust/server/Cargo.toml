@@ -26,6 +26,8 @@ form_urlencoded = "1"
 uuid = { version = "1", features = ["v4"] }
 serde_bytes = "0.11"
 tower-http = { version = "0.5", features = ["cors"] }
+# dlopen of the libsndfile soundfile ships (src/sndfile.rs); already in the tree through tokio.
+libc = "0.2"
 # Names the limit error of a bounded body read; already in the tree through axum.
 http-body-util = "0.1"
 # Rewrites MSTAR_ROOT_PATH before routing; already in the tree through axum.

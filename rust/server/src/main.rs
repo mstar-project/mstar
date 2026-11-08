@@ -32,6 +32,7 @@ mod media;
 mod protocol;
 mod refusals;
 mod serving;
+mod sndfile;
 mod speech_chunking;
 mod tokenizer;
 mod unicode_marks;
@@ -148,6 +149,7 @@ async fn main() {
         );
     }
 
+    sndfile::init();
     let voices = std::env::var("MSTAR_VOICES")
         .ok()
         .filter(|s| !s.is_empty())
@@ -815,7 +817,7 @@ async fn audio_speech(
     let stream = req.stream.unwrap_or(false);
     // Before the request is translated, as in `create_speech`: a format this
     // frontend cannot produce is the client's error.
-    let fmt = match media::check_audio_format(&req.response_format, stream) {
+    let fmt = match media::check_audio_format(&req.response_format, stream, st.sample_rate) {
         Ok(fmt) => fmt,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
@@ -902,7 +904,11 @@ async fn audio_speech(
             }
         }
     }
-    let (bytes, mime) = media::pcm16_to_container(&pcm, st.sample_rate, &fmt);
+    let sample_rate = st.sample_rate;
+    let (bytes, mime) = match blocking(move || media::pcm16_to_container(&pcm, sample_rate, &fmt)).await {
+        Ok(encoded) => encoded,
+        Err(e) => return error(500, &e, "server_error"),
+    };
     Response::builder()
         .header("content-type", mime)
         .body(Body::from(bytes))

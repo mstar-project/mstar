@@ -45,3 +45,13 @@ def test_the_voice_list_is_the_models_and_never_an_inherited_one(launched, monke
     rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u", voices=voices)
     import json
     assert json.loads(launched["env"]["MSTAR_VOICES"]) == voices
+
+
+def test_mstar_server_gets_the_libsndfile_soundfile_loaded(launched, monkeypatch):
+    monkeypatch.setenv("MSTAR_LIBSNDFILE", "/stale/libsndfile.so")
+    monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: None)
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
+    assert "MSTAR_LIBSNDFILE" not in launched["env"]
+    monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: "/sf/libsndfile_x86_64.so")
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
+    assert launched["env"]["MSTAR_LIBSNDFILE"] == "/sf/libsndfile_x86_64.so"

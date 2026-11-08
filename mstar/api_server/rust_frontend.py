@@ -170,6 +170,21 @@ REQUEST_TIMEOUT_ENV = "MSTAR_REQUEST_TIMEOUT_S"
 SAMPLE_RATE_ENV = "MSTAR_SAMPLE_RATE"
 #: ``GET /v1/audio/voices``' body as JSON (``serving_speech.list_voices``).
 VOICES_ENV = "MSTAR_VOICES"
+#: The libsndfile ``soundfile`` loaded, which mstar-server opens for mp3/flac/opus.
+LIBSNDFILE_ENV = "MSTAR_LIBSNDFILE"
+
+
+def soundfile_library() -> str | None:
+    """The libsndfile that ``soundfile`` loaded (the copy its wheel bundles, else the
+    system one it found), for ``mstar-server`` to encode the compressed speech formats
+    with the same library; ``None`` without soundfile, which leaves only wav and pcm
+    on both frontends (``media_io.audio_formats``). These are soundfile's own module
+    attributes, which it sets as it loads the library."""
+    try:
+        import soundfile
+    except (ImportError, OSError):
+        return None
+    return getattr(soundfile, "_full_path", None) or getattr(soundfile, "_libname", None)
 
 
 def launch_rust_server(binary: str, model_name: str, port: int,
@@ -193,6 +208,9 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(VOICES_ENV, None)
     if voices is not None:
         env[VOICES_ENV] = json.dumps(voices)
+    env.pop(LIBSNDFILE_ENV, None)
+    if (libsndfile := soundfile_library()) is not None:
+        env[LIBSNDFILE_ENV] = libsndfile
     env[OPENAI_ADAPTER_ENV] = openai_adapter_class(model_name)
     proc = subprocess.Popen([binary, model_name, str(port), bridge_dir,
                              upload_dir], env=env)

@@ -30,6 +30,7 @@ from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai import serving_speech
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.openai.protocol import SpeechRequest
+from mstar.api_server.rust_frontend import LIBSNDFILE_ENV, soundfile_library
 from mstar.api_server.served_models import ServedModels
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
@@ -229,15 +230,59 @@ def test_both_frontends_refuse_a_speech_with_the_same_status_and_text(case, tmp_
 
 
 def test_what_only_the_rust_frontend_refuses():
-    """It has no audio decoder and no compressed-audio encoder, so a clip to
-    clone and a non-streamed mp3 are 400s that point at the Python frontend."""
+    """It has no audio decoder, so a clip to clone is a 400 that points at the
+    Python frontend."""
     stub = _RustSpeechStub()
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         clone = _post(port, "/v1/audio/speech", {"input": "Hi.", "ref_audio": "data:audio/wav;base64,UklGRg=="})
-        mp3 = _post(port, "/v1/audio/speech", {"input": "Hi.", "response_format": "mp3"})
     assert clone[0] == 400 and "serve without --rust-frontend" in json.loads(clone[1])["error"]["message"]
-    assert mp3[0] == 400 and "run the Python frontend" in json.loads(mp3[1])["error"]["message"]
     assert stub.submitted == []
+
+
+def test_without_libsndfile_a_compressed_format_is_refused_as_python_refuses_it_without_soundfile():
+    stub = _RustSpeechStub()
+    with _model_stack("qwen3_tts_1p7b", stub, env={LIBSNDFILE_ENV: ""}) as (port, _upload):
+        mp3 = _post(port, "/v1/audio/speech", {"input": "Hi.", "response_format": "mp3"})
+    message = "response_format 'mp3' cannot be produced by this server; use one of: wav, pcm"
+    assert (mp3[0], json.loads(mp3[1])["error"]["message"]) == (400, message)
+    assert stub.submitted == []
+
+
+def _without_ogg_serial(data: bytes) -> bytes:
+    """An Ogg file with each page's stream serial and CRC zeroed. libsndfile
+    picks the serial at random, so two Python encodes of one clip differ there
+    and nowhere else."""
+    pages, i = [], 0
+    while i < len(data):
+        assert data[i:i + 4] == b"OggS", f"no Ogg page at byte {i}"
+        segments = data[i + 27:i + 27 + data[i + 26]]
+        page = bytearray(data[i:i + 27 + len(segments) + sum(segments)])
+        page[14:18] = page[22:26] = b"\0\0\0\0"
+        pages.append(bytes(page))
+        i += len(page)
+    return b"".join(pages)
+
+
+@pytest.mark.parametrize("fmt", ["mp3", "flac", "opus", "MP3"])
+@pytest.mark.parametrize("case", ["benchmark", "chunked"])
+def test_a_compressed_speech_is_the_python_routes_bytes(case, fmt, tmp_path, monkeypatch):
+    """mstar-server encodes with the libsndfile soundfile loaded, called as
+    ``soundfile.write`` calls it, so the file is byte for byte the Python
+    route's, headers and submits included; an Ogg stream's random serial aside."""
+    libsndfile = soundfile_library()
+    if libsndfile is None:
+        pytest.skip("soundfile is not installed")
+    model = "qwen3_tts_1p7b"
+    body = {**SPEECH_CASES[case], "response_format": fmt, "stream": False}
+    stub = _RustSpeechStub()
+    with _model_stack(model, stub, env={LIBSNDFILE_ENV: libsndfile}) as (port, _upload):
+        rust = _rust_answer(port, stub, body)
+    python = _python_answer(model, body, tmp_path, monkeypatch)
+    assert rust[0] == 200, rust
+    if fmt == "opus":
+        rust = (*rust[:3], _without_ogg_serial(rust[3]), *rust[4:])
+        python = (*python[:3], _without_ogg_serial(python[3]), *python[4:])
+    assert rust == python
 
 
 async def _python_pieces(model, body, tmp_path):

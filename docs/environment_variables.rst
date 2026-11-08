@@ -367,6 +367,17 @@ Read by the ``mstar-server`` binary and its bridge
      - Sample rate stamped on the Rust frontend's WAV output.
        ``mstar serve --rust-frontend`` sets it to the model's
        ``get_output_sample_rate("audio")``, as the Python frontend reads it.
+   * - ``MSTAR_LIBSNDFILE``
+     - unset
+     - The libsndfile the Rust frontend opens at startup to encode ``mp3``,
+       ``flac`` and ``opus`` speech (``rust/server/src/sndfile.rs``), called as
+       ``soundfile.write`` calls it, so the files are the Python frontend's
+       byte for byte (an Ogg stream's random serial aside). Unset, only ``wav``
+       and ``pcm`` are produced, as on the Python frontend without
+       ``soundfile``. ``launch_rust_server`` sets it to the library
+       ``soundfile`` loaded (``soundfile_library``) and drops an inherited
+       value; it is opened at run time, never linked, as its LAME encoder is
+       LGPL.
    * - ``MSTAR_VOICES``
      - unset
      - The Rust frontend's ``GET /v1/audio/voices`` body, as JSON; unset
@@ -441,13 +452,9 @@ The Rust frontend serves no ``/generate/ws``, so a model's live client input
 (appends to a running request, see :doc:`clients`) needs the Python frontend;
 over ``/generate`` such a model's input ends when the request is submitted.
 
-It also carries no audio encoder or media muxer (the Python frontend
-uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
+It also carries no audio decoder or media muxer (the Python frontend uses
+``soundfile`` / ``ffmpeg``), so two surfaces degrade:
 
-* ``/v1/audio/speech`` produces only ``wav`` and ``pcm``. Any other
-  ``response_format`` (``mp3``, ``opus``, ``flac``, …) is rejected with a 400
-  rather than silently returned as WAV. Run the Python frontend for compressed
-  containers.
 * ``/v1/audio/speech`` refuses ``ref_audio`` (Qwen3-TTS voice cloning) with a
   400: the Python frontend decodes the clip and checks its length before
   submitting it, and the Rust frontend has no decoder to do that with.
