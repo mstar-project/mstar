@@ -1224,34 +1224,41 @@ class Worker:
         # REMOVE_REQUEST once every reader has confirmed drained (READS_DONE) —
         # on the abort/fail path via a prior DrainRequest, on the happy path
         # once the api server finished reading the outputs.
-        laps = PhaseLaps("worker.msg.remove_request.")
-        self._mark_removed(body.request_id)
-        freed = self.engine_manager.remove_request(request_id)
-        if freed:
-            self.scheduler.lift_batch_caps(freed)
-        laps.lap("engine")
-        if self._lockstep_led:
-            self._lockstep_unread.pop(request_id, None)
-        self.streams.remove_request(request_id)
-        self.request_state.remove_request(request_id)
-        self.tensor_manager.force_cleanup_request(request_id)
-        laps.lap("worker_state_tensors")
-        self.profile_info.pop_request(request_id)
-        self.streaming_buffers.pop(request_id, None)
-        self.scheduler.clear_rid(request_id, body.request_id)
-        self._pending_removes.pop(request_id, None)
+        try:
+            laps = PhaseLaps("worker.msg.remove_request.")
+            self._mark_removed(body.request_id)
+            freed = self.engine_manager.remove_request(request_id)
+            if freed:
+                self.scheduler.lift_batch_caps(freed)
+            laps.lap("engine")
+            if self._lockstep_led:
+                self._lockstep_unread.pop(request_id, None)
+            self.streams.remove_request(request_id)
+            self.request_state.remove_request(request_id)
+            self.tensor_manager.force_cleanup_request(request_id)
+            laps.lap("worker_state_tensors")
+            self.profile_info.pop_request(request_id)
+            self.streaming_buffers.pop(request_id, None)
+            self.scheduler.clear_rid(request_id, body.request_id)
+            self._pending_removes.pop(request_id, None)
 
-        self._rebuilds.remove_request(request_id)
-        laps.lap("misc")
-        # DEBUG: once per request on the main thread, it cost as much as the
-        # engine's own removal (test/waypoint/serve_rollout.py, which waits on
-        # it, runs the server at DEBUG)
-        logger.debug("Request cleanup complete: %s", body.request_id)
-        laps.lap("log")
+            self._rebuilds.remove_request(request_id)
+            laps.lap("misc")
+            # DEBUG: once per request on the main thread, it cost as much as the
+            # engine's own removal (test/waypoint/serve_rollout.py, which waits on
+            # it, runs the server at DEBUG)
+            logger.debug("Request cleanup complete: %s", body.request_id)
+            laps.lap("log")
 
-        # Last: frees the handle for reuse, so nothing above may run after it.
-        self._graph_runtime.remove_request(request_id)
-        laps.lap("runtime")
+            # Last: frees the handle for reuse, so nothing above may run after it.
+            self._graph_runtime.remove_request(request_id)
+            laps.lap("runtime")
+        except Exception as exc:
+            # A partially released resource cannot be retried or handed to a
+            # reused handle. The conductor handles this worker's exit.
+            raise SystemExit(
+                f"Worker {self.worker_id}: request cleanup failed for {body.request_id} ({exc!r})"
+            ) from exc
 
     def _drop(self, request_id: int, node_name: str) -> int:
         """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return

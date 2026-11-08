@@ -1,7 +1,5 @@
 model: "cosmos3"
-# Sequence-length hint for the scheduler. The conductor only asserts its
-# presence; the real per-request capacity is the KV pool below.
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 # KV pool sizing. The default (max_num_pages 2048 x page_size 128) pre-allocates
 # ~38 GB of paged K/V for the 36-layer DiT regardless of the workload, which
 # OOMs larger video on an 80 GB card. A bs=1 720p x 189-frame request needs only

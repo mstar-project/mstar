@@ -131,3 +131,20 @@ def test_a_pool_with_no_layers_takes_a_per_layer_block_with_an_empty_axis():
     """Qwen3.5 with every layer full attention and a kernel of 1 declares this pool."""
     config = _pool(num_layers=0, blocks=_delta_net_blocks(1))
     assert config.blocks["conv"].shape == (64, 0), "no layer reads this block, so nothing fails on the empty axis"
+
+
+@pytest.mark.parametrize("limit", [32, None, 0, True, "32"])
+def test_deployment_context_default_and_resource_override(limit):
+    from mstar.engine.resources.kv.config import KVSpec
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    first = KVSpec(resource_key="first", nodes={"node"}, config=_paged())
+    second = KVSpec(resource_key="second", nodes={"node"}, config=_paged())
+    config = {"max_seq_len": limit, "resources": {"second": {"max_seq_len": 128}}}
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        with pytest.raises(ValueError, match="max_seq_len"):
+            apply_yaml_overrides([first, second], config)
+    else:
+        apply_yaml_overrides([first, second], config)
+        assert first.config.max_seq_len == (64 if limit is None else limit)
+        assert second.config.max_seq_len == 128

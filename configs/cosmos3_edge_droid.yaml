@@ -1,6 +1,5 @@
 model: "cosmos3_edge_droid"
-# Sequence-length hint for the scheduler (see cosmos3_edge.yaml).
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 # The policy checkpoint serves action requests (and the Edge video paths);
 # the pool matches cosmos3_edge.yaml.
 resources:

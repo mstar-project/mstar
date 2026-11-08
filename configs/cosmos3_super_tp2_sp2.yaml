@@ -1,6 +1,5 @@
 model: "cosmos3_super"
-# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 # Per-rank KV pool. With 2D tp*sp = 4 each rank holds num_kv_heads / 4 heads, so
 # the cache is half the per-page memory of the TP=2 config; 384 pages cover t2i
 # plus 256p/480p video with headroom for activations.

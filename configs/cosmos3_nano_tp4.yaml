@@ -1,6 +1,5 @@
 model: "cosmos3"
-# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 # Per-rank KV pool. Tensor parallelism shards the attention heads (each rank
 # holds num_kv_heads / tp_size heads -> 2 of 8), so the cache is light; 1024
 # pages leave ample headroom.

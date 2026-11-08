@@ -1,6 +1,5 @@
 model: "cosmos3_super_i2v_4step"
-# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 # Per-rank KV pool, as for Super at TP=2 (see cosmos3_super_tp2.yaml).
 resources:
   kv:

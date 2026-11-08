@@ -705,3 +705,23 @@ def test_cancelled_producers_missing_file_does_not_drop_an_innocent_message(tmp_
     assert reads == ["innocent"]
     assert w.failed == {"X"} and w._in_flight_rids == {"innocent"}
     assert set(w.sent[0][1].body.errors) == {"X"}
+
+
+@pytest.mark.parametrize("stage", ["engine", "tensors"])
+def test_partial_cleanup_stops_worker_without_reusing_handle(stage):
+    w = _worker(known_rids=("X", "Y"), in_flight=("Y",))
+    freed = []
+    w._graph_runtime.remove_request = freed.append
+
+    def fail(rid):
+        raise ValueError("partial cleanup")
+
+    if stage == "engine":
+        w.engine_manager.remove_request = fail
+    else:
+        w.tensor_manager.force_cleanup_request = fail
+    with pytest.raises(SystemExit, match="request cleanup failed"):
+        Worker._remove_request(w, RemoveRequest(request_id="X"))
+    assert freed == []
+    assert not w.failed
+    assert w._in_flight_rids == {"Y"}

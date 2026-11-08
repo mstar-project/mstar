@@ -1,6 +1,5 @@
 model: "cosmos3_super"
-# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 # Per-rank KV pool. Super is 64 layers (vs Nano's 36) but the KV heads (8) shard
 # across the 4 TP ranks, so per-rank KV stays modest; 1024 pages is ample on the
 # 143 GB H200s.

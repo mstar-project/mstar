@@ -1181,7 +1181,7 @@ class Qwen3OmniModel(Model):
     # -----------------------------------------------------------------------
 
     def load_video(
-        self, filepath: str, device: str
+        self, filepath: str, device: str, *, model_kwargs=None, input_modalities=None, output_modalities=None
     ) -> TensorAndMetadata:
         # TODO: support audio in video
         from qwen_omni_utils.v2_5.vision_process import VIDEO_READER_BACKENDS, fetch_video, smart_nframes

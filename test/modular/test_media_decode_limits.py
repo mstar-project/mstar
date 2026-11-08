@@ -374,17 +374,17 @@ def test_probe_reads_the_header(tmp_path, monkeypatch):
     assert 9 <= frames <= 11
 
 
-def test_cosmos3_pyav_fallback_stops_at_the_budget(tmp_path, monkeypatch):
+def test_cosmos3_selection_still_counts_the_whole_source(tmp_path, monkeypatch):
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 
     path = _mp4(tmp_path / "clip.mp4", frames=10)
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)  # take the PyAV path
-    model = object.__new__(Cosmos3Model)
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
     monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 4))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
-        model.load_video(path, "cpu")
+        model.load_video(path, "cpu", model_kwargs={"width": 64, "height": 64})
     monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 10))
-    assert model.load_video(path, "cpu").data.shape[0] == 10
+    assert model.load_video(path, "cpu", model_kwargs={"width": 64, "height": 64}).data.shape[0] == 5
 
 
 def test_a_tiny_frame_counts_as_the_minimum(monkeypatch):
@@ -401,7 +401,7 @@ def test_a_tiny_frame_counts_as_the_minimum(monkeypatch):
         budget.add(64, 64)
 
 
-def test_cosmos3_pyav_fallback_counts_tiny_frames(tmp_path, monkeypatch):
+def test_cosmos3_selection_counts_tiny_frames(tmp_path, monkeypatch):
     from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 
     path = _mp4(tmp_path / "tiny.mp4", frames=30, side=16)
@@ -769,3 +769,50 @@ def test_base_video_decode_failure_is_a_client_error(monkeypatch, failure):
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", types.SimpleNamespace(VideoDecoder=decode))
     with pytest.raises(ValueError, match="video"):
         Model.load_video(None, "bad.mp4", "cpu")
+
+
+@pytest.mark.parametrize("mode", ["first", "last", "reasoner"])
+def test_cosmos_video_load_selects_before_retaining_frames(tmp_path, mode):
+    import av
+    import numpy as np
+
+    from mstar.model.cosmos3.components.reasoner import preprocess_video
+    from mstar.model.cosmos3.config import Cosmos3ReasonerConfig
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    path = str(tmp_path / "varying.mp4")
+    rng = np.random.default_rng(7)
+    with av.open(path, "w") as out:
+        stream = out.add_stream("mpeg4", rate=30)
+        stream.width = stream.height = 64
+        stream.pix_fmt = "yuv420p"
+        for _ in range(12):
+            frame = av.VideoFrame.from_ndarray(rng.integers(0, 256, (64, 64, 3), dtype=np.uint8), format="rgb24")
+            out.mux(stream.encode(frame))
+        out.mux(stream.encode())
+    with av.open(path) as source:
+        original = torch.stack([
+            torch.from_numpy(f.to_ndarray(format="rgb24")).permute(2, 0, 1)
+            for f in source.decode(video=0)
+        ])
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    if mode == "reasoner":
+        model.config.reasoner = Cosmos3ReasonerConfig()
+        cfg = model.config.reasoner.video_processor
+        cfg.min_pixels, cfg.max_pixels = 1024, 4096
+        loaded = model.load_video(path, "cpu", output_modalities=["text"], model_kwargs={"video_num_frames": 4})
+        expected, grid = preprocess_video(original, cfg, 30, num_frames=4)
+        actual, loaded_grid = preprocess_video(
+            loaded.data, cfg, 30, sampled_frame_indices=loaded.metadata["sampled_frame_indices"],
+        )
+        assert loaded.data.shape == (4, 3, 32, 32)
+        assert loaded_grid == grid
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        loaded = model.load_video(path, "cpu", output_modalities=["video"], model_kwargs={
+            "width": 32, "height": 48, "num_frames": 9, "condition_video_keep": mode,
+        })
+        selected = original[:5] if mode == "first" else original[-5:]
+        expected = torch.nn.functional.interpolate(selected.float().div_(255), size=(48, 32), mode="nearest")
+        assert loaded.data.shape == (5, 3, 48, 32)
+        torch.testing.assert_close(loaded.data, expected, rtol=0, atol=0)

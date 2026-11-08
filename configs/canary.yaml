@@ -8,6 +8,7 @@ resources:
   kv_cache:
     max_num_pages: 513
   cross_kv_cache:
+    max_seq_len: 512  # encoder context for the 40.96-second input limit
     max_num_pages: 257
 node_groups:
   - node_names: [audio_encoder, decoder]

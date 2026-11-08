@@ -1,7 +1,5 @@
 model: "cosmos3"
-# Sequence-length hint for the scheduler. The conductor only asserts its
-# presence; the real per-request capacity is the KV pool below.
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 resources:
   kv:
     max_num_pages: 1024

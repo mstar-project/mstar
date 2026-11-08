@@ -3,7 +3,7 @@ model: "cosmos3"
 # replicated on both and each request runs end to end on one of them (the
 # conductor sends it to the replica serving fewer requests). For one request's
 # latency, cosmos3_nano_sp2.yaml splits the DiT over both GPUs instead.
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 resources:
   kv:
     max_num_pages: 1024

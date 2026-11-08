@@ -89,7 +89,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.cosmos3 import constants
@@ -1054,6 +1054,7 @@ class Cosmos3Model(Model):
             pv, grid = preprocess_video(
                 video.cpu(), reasoner.video_processor, source_fps,
                 num_frames=model_kwargs.get("video_num_frames"), fps=model_kwargs.get("video_fps"),
+                sampled_frame_indices=meta.get("sampled_frame_indices"),
             )
             patches.append(pv)
             video_grids.append(grid)
@@ -1098,40 +1099,86 @@ class Cosmos3Model(Model):
         )
         return ProcessPromptOutput(out, {"kv_layout": {KV_CACHE: {REASONER_LABEL: main, UNCOND_LABEL: LabelLayout()}}})
 
-    def load_video(self, filepath: str, device: str):
-        """Decode a conditioning / reasoner video to ``[T, C, H, W]`` in [0, 1].
+    def load_video(
+        self, filepath: str, device: str, *, model_kwargs=None, input_modalities=None, output_modalities=None,
+    ):
+        """Decode only the request's selected frames into its processing size.
 
-        torchcodec (the base implementation) needs system FFmpeg shared
-        libraries; where they are absent, PyAV — which ships its own — decodes
-        the same frames. The metadata carries the frame rate under
-        ``average_fps`` either way (the reasoner's frame sampling and
-        timestamps read it)."""
-        from mstar.model.base import TensorAndMetadata
-
-        try:
-            return super().load_video(filepath, device)
-        except (ImportError, RuntimeError, OSError) as exc:
-            reason = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
-            logger.warning("torchcodec video decode unavailable (%s); decoding %s with PyAV.", reason, filepath)
+        Count through EOF first: container frame counts can be missing or wrong.
+        Both passes retain at most one source frame. The returned clip holds only
+        the selected, resized frames; timestamps still refer to the source clip.
+        """
         import av
+        from torchvision.transforms.v2 import InterpolationMode
+        from torchvision.transforms.v2 import functional as tvF
+
+        from mstar.model.cosmos3.components.reasoner import sample_frame_indices, smart_resize
 
         budget = VideoBudget()
-        frames = []
+        total = 0
         with av.open(filepath) as container:
             stream = container.streams.video[0]
             rate = stream.average_rate or stream.guessed_rate or stream.base_rate
             fps = float(rate) if rate else None
             for frame in container.decode(stream):
                 budget.add(frame.height, frame.width)
-                frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
-        if not frames:
-            raise ValueError(f"no video frames decoded from {filepath}")
-        video = torch.stack(frames).to(device).float().div_(255.0)
+                height, width = frame.height, frame.width
+                total += 1
+        if not total:
+            raise ValueError("video upload has no frames")
+        del frame
+        mk = model_kwargs or {}
+        reasoner = "text" in (output_modalities or [])
+        if reasoner:
+            cfg = self.config.reasoner.video_processor
+            indices = sample_frame_indices(
+                total, fps, cfg, num_frames=mk.get("video_num_frames"), fps=mk.get("video_fps"),
+            )
+            height, width = smart_resize(
+                len(indices), height, width, cfg.temporal_patch_size, cfg.patch_size * cfg.merge_size,
+                cfg.min_pixels, cfg.max_pixels,
+            )
+        else:
+            params = self._resolve_gen_params(mk, input_modalities or ["video"], output_modalities or ["video"])
+            count = params["num_frames"]
+            if not params.get("action_mode"):
+                count = min(
+                    count, max(params["condition_frame_indexes_vision"]) * self.config.vae.scale_factor_temporal + 1,
+                )
+            count = min(count, total)
+            start = total - count if params.get("condition_video_keep") == "last" else 0
+            indices = list(range(start, start + count))
+            scale = self.config.vae.scale_factor_spatial
+            height, width = params["height"] // scale * scale, params["width"] // scale * scale
+        # Apply the same request budget to retained output too (including upscales).
+        VideoBudget().add(height, width, len(indices))
+        wanted = set(indices)
+        frames = []
+        with av.open(filepath) as container:
+            for i, frame in enumerate(container.decode(video=0)):
+                if i in wanted:
+                    pixels = torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1)
+                    if reasoner:
+                        pixels = tvF.resize(
+                            pixels, [height, width], interpolation=InterpolationMode.BICUBIC, antialias=True,
+                        )
+                    else:
+                        pixels = torch.nn.functional.interpolate(
+                            pixels.unsqueeze(0).float().div_(255), size=(height, width), mode="nearest",
+                        ).squeeze(0)
+                    frames.append(pixels)
+                if i >= indices[-1]:
+                    break
+        if len(frames) != len(indices):
+            raise ValueError("video changed while decoding")
+        video = torch.stack(frames).to(device)
         metadata = {
-            "num_frames": len(frames), "average_fps": fps,
-            "duration_seconds": (len(frames) / fps) if fps else None,
-            "height": int(video.shape[-2]), "width": int(video.shape[-1]),
+            "num_frames": total, "average_fps": fps,
+            "duration_seconds": total / fps if fps else None,
+            "height": height, "width": width,
         }
+        if reasoner:
+            metadata["sampled_frame_indices"] = indices
         return TensorAndMetadata(data=video, metadata=metadata)
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:

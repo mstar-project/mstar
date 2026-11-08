@@ -294,7 +294,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         """
         return TensorAndMetadata(read_image(filepath, rgb=True).to(device))
 
-    def load_video(self, filepath: str, device: str) -> TensorAndMetadata:
+    def load_video(
+        self, filepath: str, device: str, *, model_kwargs=None, input_modalities=None, output_modalities=None,
+    ) -> TensorAndMetadata:
         """Only the frames the video processor samples, on the host whatever
         ``device`` is (see `sample_video`)."""
         video = sample_video(filepath, self.video_processor)

@@ -161,6 +161,7 @@ def sample_frame_indices(
 def preprocess_video(
     video: torch.Tensor, cfg: Cosmos3MediaProcessorConfig, source_fps: float | None,
     num_frames: int | None = None, fps: float | None = None,
+    sampled_frame_indices: list[int] | None = None,
 ) -> tuple[torch.Tensor, MediaGrid]:
     """A decoded ``[T, C, H, W]`` clip -> packed patches ``[T' * gh * gw, ...]``
     over the sampled frames and its grid with per-frame timestamps."""
@@ -168,13 +169,19 @@ def preprocess_video(
         raise ValueError(f"expected a [T, C, H, W] video, got {tuple(video.shape)}")
     if video.shape[1] == 4:
         video = video[:, :3]
-    indices = sample_frame_indices(video.shape[0], source_fps, cfg, num_frames=num_frames, fps=fps)
-    frames = video[indices]
-    factor = cfg.patch_size * cfg.merge_size
-    h, w = smart_resize(
-        frames.shape[0], frames.shape[-2], frames.shape[-1], cfg.temporal_patch_size, factor,
-        cfg.min_pixels, cfg.max_pixels,
-    )
+    if sampled_frame_indices is None:
+        indices = sample_frame_indices(video.shape[0], source_fps, cfg, num_frames=num_frames, fps=fps)
+        frames = video[indices]
+        factor = cfg.patch_size * cfg.merge_size
+        h, w = smart_resize(
+            frames.shape[0], frames.shape[-2], frames.shape[-1], cfg.temporal_patch_size, factor,
+            cfg.min_pixels, cfg.max_pixels,
+        )
+    else:
+        # The file loader already selected and resized these frames, but their
+        # time coordinates are indices into the original clip.
+        indices, frames = sampled_frame_indices, video
+        h, w = frames.shape[-2:]
     frames = _resize_normalize(_to_uint8(frames), h, w, cfg)
     timestamps = tuple(i / (source_fps or 24.0) for i in indices)
     grid = MediaGrid(frames.shape[0], h // cfg.patch_size, w // cfg.patch_size, timestamps)

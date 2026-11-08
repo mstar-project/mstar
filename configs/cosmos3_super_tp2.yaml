@@ -1,6 +1,5 @@
 model: "cosmos3_super"
-# Sequence-length hint for the scheduler (see cosmos3_nano.yaml).
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 # Per-rank KV pool. Super is 64 layers and ~64 GB of weights/rank already sit on
 # each 80 GB card at TP=2, so the KV pool must stay small or init OOMs (1024
 # pages = 16 GB/rank here, which OOMs). 384 pages (~6 GB/rank) covers t2i plus

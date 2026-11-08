@@ -1,7 +1,5 @@
 model: "cosmos3_edge"
-# Sequence-length hint for the scheduler. The conductor only asserts its
-# presence; the real per-request capacity is the KV pool below.
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 # KV pool sizing. Edge is 28 layers x 8 KV heads x 128 (half of Nano's per-page
 # footprint); one pool serves both the DiT's frozen text prefixes (a few pages
 # per guidance branch) and the reasoner's chat context (up to 131k tokens per

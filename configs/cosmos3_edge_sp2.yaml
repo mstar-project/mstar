@@ -4,7 +4,7 @@ model: "cosmos3_edge"
 # Ulysses sequence-parallel over both (see cosmos3_nano_sp2.yaml). The reasoner
 # is not sequence-parallel and shares the DiT's transformer, so this deployment
 # serves generation only; cosmos3_edge_dp2.yaml keeps chat.
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 resources:
   kv:
     max_num_pages: 1024

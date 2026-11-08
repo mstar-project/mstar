@@ -12,6 +12,7 @@ resources:
   kv_cache:
     cpu_offload_pages: 128
   cross_kv_cache:
+    max_seq_len: 1500  # fixed encoder context; independent of the decoder token limit
     cpu_offload_pages: 128
 node_groups:
   - node_names: [audio_encoder]

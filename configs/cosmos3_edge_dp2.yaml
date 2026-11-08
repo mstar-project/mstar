@@ -2,7 +2,7 @@ model: "cosmos3_edge"
 # See cosmos3_edge.yaml for what each setting does; this file differs only in
 # node_groups. Two GPUs, throughput-oriented: a whole replica per GPU, and the
 # conductor sends each request to the replica serving fewer requests.
-max_seq_len: 8192
+max_seq_len: null  # retain the model's context limit for chat and video latents
 resources:
   kv:
     max_num_pages: 1024

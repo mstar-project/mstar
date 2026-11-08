@@ -1077,7 +1077,10 @@ class Model(ABC):
             raise ValueError("audio upload is empty")
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
-    def load_video(self, filepath: str, device: str):
+    def load_video(
+        self, filepath: str, device: str, *, model_kwargs=None, input_modalities=None, output_modalities=None,
+    ):
+        """Load video with the request context available for bounded frame selection."""
         from torchcodec.decoders import VideoDecoder
 
         budget = VideoBudget()
