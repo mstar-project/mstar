@@ -32,13 +32,26 @@ from mstar.engine.resources.step import Segment, SlotLease, StepContext
 def resolve_ragged_attn_backend(
     backend: RaggedAttnBackend, device: torch.device,
 ) -> RaggedAttnBackend:
-    """Ragged counterpart of ``attn.base.resolve_attn_backend``."""
+    """Ragged counterpart of ``attn.base.resolve_attn_backend``. ``AUTO`` is
+    FlashInfer's manager; for self-attention, the ``ragged_attention`` kernel
+    table then picks the kernel it runs (``kernels``)."""
     if backend is RaggedAttnBackend.AUTO:
         return RaggedAttnBackend.FLASHINFER
     return backend
 
 
-def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
+def _without_cudnn(backend: RaggedAttnBackend, what: str) -> RaggedAttnBackend:
+    if backend is RaggedAttnBackend.CUDNN:
+        from mstar.engine.resources.attn.ragged.dense import _warn_ragged_cudnn_fallback
+
+        _warn_ragged_cudnn_fallback(what)
+        return RaggedAttnBackend.FLASHINFER
+    return backend
+
+
+def _build_ragged(spec, info: EngineResourceInfo, manager_cls, kernel_table: bool = False, **kwargs):
+    """``kernel_table``: read the ``ragged_attention`` rows for the rank's head
+    geometry (``kernels.kernel_rows``) and hand them to the manager."""
     config = spec.config
     joint = info.joint_comm_group
     if config.shard_over_sp or joint is None:
@@ -52,9 +65,20 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
             "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
             "(the engine has no KV dtype to fall back on)."
         )
+    if kernel_table:
+        from mstar.engine.resources.attn.ragged.kernels import kernel_rows
+
+        rows = kernel_rows(config.num_qo_heads, config.num_kv_heads, config.head_dim, dtype, info.device)
+        if rows is not None:
+            kwargs["kernel_rows"] = rows
     return manager_cls(
         device=info.device, dtype=dtype, config=config, key=spec.resource_key, **kwargs,
     )
+
+
+def _uses_kernel_table(config: RaggedAttentionConfig) -> bool:
+    """A resource that names neither a backend nor a FlashInfer kernel runs the table's."""
+    return config.backend is RaggedAttnBackend.AUTO and config.flashinfer_backend == "auto"
 
 
 def dense_or_flashinfer(device: torch.device, dense, flashinfer, what: str):
@@ -95,6 +119,11 @@ class RaggedAttnManager(AttentionResource):
             return _build_dense_or_flashinfer(
                 spec, info, DenseRaggedManager, FlashInferRaggedManager,
             )
+        if backend is RaggedAttnBackend.CUDNN:
+            from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
+            from mstar.kernels import Choice
+
+            return _build_ragged(spec, info, FlashInferRaggedManager, kernel_rows=((None, Choice("cudnn")),))
         if backend is RaggedAttnBackend.FLASHINFER:
             # Deferred so naming the spec does not load FlashInfer, and because
             # `flashinfer` imports this class back.
@@ -102,7 +131,7 @@ class RaggedAttnManager(AttentionResource):
                 FlashInferRaggedManager,
             )
 
-            return _build_ragged(spec, info, FlashInferRaggedManager)
+            return _build_ragged(spec, info, FlashInferRaggedManager, kernel_table=_uses_kernel_table(spec.config))
         raise ValueError(f"Unknown ragged attention backend {backend!r}")
 
 
@@ -114,7 +143,7 @@ class RaggedCrossAttnManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: RaggedCrossAttentionSpec, info: EngineResourceInfo):
-        backend = resolve_ragged_attn_backend(spec.config.backend, info.device)
+        backend = _without_cudnn(resolve_ragged_attn_backend(spec.config.backend, info.device), "cross-attention")
         if backend is RaggedAttnBackend.DENSE:
             from mstar.engine.resources.attn.ragged.dense import DenseRaggedCrossManager
             from mstar.engine.resources.attn.ragged.flashinfer import (
@@ -141,7 +170,7 @@ class RaggedBlockCausalAttnManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: RaggedBlockCausalAttentionSpec, info: EngineResourceInfo):
-        backend = resolve_ragged_attn_backend(spec.config.backend, info.device)
+        backend = _without_cudnn(resolve_ragged_attn_backend(spec.config.backend, info.device), "block-causal")
         if backend is RaggedAttnBackend.DENSE:
             from mstar.engine.resources.attn.ragged.dense import _warn_ragged_dense_fallback
 
@@ -246,12 +275,15 @@ class _RaggedManagerBase:
         # plan H2Ds each layout into static buffers that a captured replay reads
         return True
 
-    def _build_wrapper(self, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
-        """A new wrapper for one (label, slot); ``graph_kwargs`` size a captured one."""
+    def _build_wrapper(
+        self, label: str, slot: int, cu_seqlens: torch.Tensor | None = None, **graph_kwargs,
+    ) -> _RaggedPrefillBase:
+        """A new wrapper for one (label, slot); ``graph_kwargs`` size a captured one.
+        ``cu_seqlens`` is the layout it is about to be planned with."""
         return self.wrapper_class(**self._kwargs, **graph_kwargs)
 
     def _cg_wrapper(
-        self, lease: SlotLease, label: str,
+        self, lease: SlotLease, label: str, cu_seqlens: torch.Tensor | None = None,
     ) -> _RaggedPrefillBase:
         """The captured-graph wrapper for one (bucket, slot, label).
 
@@ -275,7 +307,7 @@ class _RaggedManagerBase:
             bucket.num_tokens, self._config.max_tokens_for(bucket.bs) or 0
         )
         wrapper = self._build_wrapper(
-            label, lease.slot,
+            label, lease.slot, cu_seqlens,
             accelerator_graph=True,
             max_num_segments=max_segments,
             max_total_tokens=max_tokens,
@@ -283,7 +315,9 @@ class _RaggedManagerBase:
         self._cg_plan_states[key] = wrapper
         return wrapper
 
-    def _eager_wrapper(self, label: str, slot: int) -> _RaggedPrefillBase:
+    def _eager_wrapper(
+        self, label: str, slot: int, cu_seqlens: torch.Tensor | None = None,
+    ) -> _RaggedPrefillBase:
         """The persistent eager wrapper for one (label, slot).
 
         Slotted for the same reason the captured ones are, and on the same
@@ -292,7 +326,7 @@ class _RaggedManagerBase:
         key = EagerSlotKey(label=label, slot=slot)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            wrapper = self._eager_plan_states[key] = self._build_wrapper(label, slot)
+            wrapper = self._eager_plan_states[key] = self._build_wrapper(label, slot, cu_seqlens)
         return wrapper
 
     @property
@@ -322,10 +356,12 @@ class _RaggedManagerBase:
             cu.append(cu[-1] + seg.span)
         return torch.tensor(cu, dtype=torch.int32, pin_memory=torch.cuda.is_available())
 
-    def _wrapper_for(self, lease: SlotLease | None, slot: int, label: str) -> _RaggedPrefillBase:
+    def _wrapper_for(
+        self, lease: SlotLease | None, slot: int, label: str, cu_seqlens: torch.Tensor | None = None,
+    ) -> _RaggedPrefillBase:
         if lease is not None:
-            return self._cg_wrapper(lease, label)
-        return self._eager_wrapper(label, slot)
+            return self._cg_wrapper(lease, label, cu_seqlens)
+        return self._eager_wrapper(label, slot, cu_seqlens)
 
     def plan(self, step, ctx: StepContext):
         self.reset_default_cursors()
@@ -426,8 +462,9 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
 
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
-            wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
-            wrapper.plan(cu_seqlens=self._cu_seqlens(segments), causal=step.causal)
+            cu_seqlens = self._cu_seqlens(segments)
+            wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label, cu_seqlens)
+            wrapper.plan(cu_seqlens=cu_seqlens, causal=step.causal)
             plan_states[label] = wrapper
 
 

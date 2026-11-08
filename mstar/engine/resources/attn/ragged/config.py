@@ -29,6 +29,9 @@ class RaggedAttnBackend(Enum):
     FLASHINFER = "flashinfer"
     # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
     DENSE = "dense"
+    # torch's cuDNN SDPA over equal-length segments, FlashInfer for any other
+    # layout; self-attention only
+    CUDNN = "cudnn"
 
 
 @dataclass(frozen=True)

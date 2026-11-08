@@ -1,4 +1,8 @@
-"""Cacheless varlen attention through FlashInfer's ragged prefill wrapper."""
+"""Cacheless varlen attention through FlashInfer's ragged prefill wrapper, or
+the kernel a ``ragged_attention`` table row names for the layout."""
+
+import functools
+import logging
 
 import torch
 
@@ -11,6 +15,7 @@ from mstar.engine.resources.attn.ragged.base import (
 )
 from mstar.engine.resources.attn.ragged.block_causal import RaggedBlockCausalWrapper
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig
+from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper, uniform_segments
 from mstar.engine.resources.attn.ragged.wrappers import (
     FlashInferRaggedCrossPrefillWrapper,
     FlashInferRaggedPrefillWrapper,
@@ -19,6 +24,10 @@ from mstar.engine.resources.attn.ragged.wrappers import (
 )
 from mstar.engine.resources.attn.workspace import WorkspacePool
 from mstar.engine.resources.step import StepContext
+from mstar.kernels.registry import describe_rows
+from mstar.kernels.table import Rows
+
+logger = logging.getLogger(__name__)
 
 
 class _FlashInferRaggedManagerBase(_RaggedManagerBase):
@@ -36,9 +45,11 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
         self._workspaces = WorkspacePool(device, config.workspace_mb, owner=key)
         self._kwargs["backend"] = config.flashinfer_backend
 
-    def _build_wrapper(self, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
+    def _build_wrapper(
+        self, label: str, slot: int, cu_seqlens: torch.Tensor | None = None, **graph_kwargs,
+    ) -> _RaggedPrefillBase:
         return super()._build_wrapper(
-            label, slot, workspace_buffer=self._workspaces.get(label, slot), **graph_kwargs,
+            label, slot, cu_seqlens, workspace_buffer=self._workspaces.get(label, slot), **graph_kwargs,
         )
 
     def run(
@@ -59,7 +70,52 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
 
 
 class FlashInferRaggedManager(_FlashInferRaggedManagerBase, _RaggedSelfManagerBase):
+    """With ``kernel_rows`` (a ``ragged_attention`` table's, or the ``cudnn``
+    backend's one row), each wrapper runs the row its first layout's longest
+    query segment falls in, for its lifetime: a captured graph can't switch
+    kernels, and an eager wrapper keeps the captured ones' rule. A ``cudnn``
+    row needs equal-length segments; a first layout of unequal ones runs on
+    FlashInfer instead."""
+
     wrapper_class = FlashInferRaggedPrefillWrapper
+
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        config: RaggedAttentionConfig,
+        key: str,
+        kernel_rows: Rows | None = None,
+    ):
+        super().__init__(device=device, dtype=dtype, config=config, key=key)
+        self._kernel_rows = kernel_rows
+        if kernel_rows is not None:
+            logger.info("ragged attention %r (%d/%d heads, head dim %d, %s): %s", key, config.num_qo_heads,
+                        config.num_kv_heads, config.head_dim, str(dtype).removeprefix("torch."),
+                        describe_rows(kernel_rows))
+
+    def _build_wrapper(
+        self, label: str, slot: int, cu_seqlens: torch.Tensor | None = None, **graph_kwargs,
+    ) -> _RaggedPrefillBase:
+        if self._kernel_rows is None or cu_seqlens is None:
+            return super()._build_wrapper(label, slot, cu_seqlens, **graph_kwargs)
+        from mstar.engine.resources.attn.ragged.kernels import choice_for
+
+        seq_len = int(torch.diff(cu_seqlens.to(device="cpu", dtype=torch.int64)).max()) if cu_seqlens.numel() > 1 else 0
+        choice = choice_for(self._kernel_rows, seq_len)
+        if choice.impl == "cudnn" and uniform_segments(cu_seqlens) is not None:
+            fallback = None if graph_kwargs else functools.partial(super()._build_wrapper, label, slot)
+            return CudnnRaggedPrefillWrapper(
+                num_qo_heads=self._config.num_qo_heads, num_kv_heads=self._config.num_kv_heads,
+                head_dim=self._config.head_dim, device=self._device, sm_scale=self._config.sm_scale,
+                q_data_type=self._dtype, fallback=fallback, **graph_kwargs,
+            )
+        backend = (choice.config or {}).get("backend") if choice.impl == "flashinfer" else None
+        if backend is None:
+            return super()._build_wrapper(label, slot, cu_seqlens, **graph_kwargs)
+        return self.wrapper_class(
+            **{**self._kwargs, "backend": backend}, workspace_buffer=self._workspaces.get(label, slot), **graph_kwargs,
+        )
 
 
 class FlashInferRaggedCrossManager(_FlashInferRaggedManagerBase, _RaggedCrossManagerBase):
