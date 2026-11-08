@@ -425,7 +425,6 @@ jobs:
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
-          PREV: ${{ steps.prev.outputs.dir }}
         run: python3 .github/review/bot.py post
 
       # Hide the earlier summaries as outdated, so the PR shows only the latest
