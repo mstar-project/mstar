@@ -8,12 +8,23 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import yaml
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUMMARY = runpy.run_path(str(REPO_ROOT / ".github/review/render_summary.py"))
 render, open_findings, read_state = SUMMARY["render"], SUMMARY["open_findings"], SUMMARY["read_state"]
-WORKFLOW = yaml.safe_load((REPO_ROOT / ".github/workflows/claude-review.yml").read_text())
+WORKFLOW = (REPO_ROOT / ".github/workflows/claude-review.yml").read_text().splitlines()
+
+
+def step_script(step_id):
+    """The `run: |` script of the workflow step with this id, read as text: CI's test/ci job has no YAML parser."""
+    start = WORKFLOW.index(f"        id: {step_id}")
+    head = next(i for i in range(start, len(WORKFLOW)) if WORKFLOW[i].strip() == "run: |")
+    indent = len(WORKFLOW[head + 1]) - len(WORKFLOW[head + 1].lstrip())
+    script = []
+    for line in WORKFLOW[head + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        script.append(line[indent:])
+    return "\n".join(script).rstrip("\n") + "\n"
 
 
 def review(skipped=(), prior=()):
@@ -29,7 +40,6 @@ def threads(*nodes):
 def preflight(command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR"):
     """The review job's preflight step run as the workflow runs it, for `command` (the word its COMMAND env
     maps the comment to), with `gh` answering each login's permission from `perms`. Returns its outputs."""
-    step = next(s for s in WORKFLOW["jobs"]["review"]["steps"] if s.get("id") == "pre")
     with tempfile.TemporaryDirectory() as d:
         gh = Path(d, "gh")
         gh.write_text("#!/bin/sh\ncase \"$2\" in\n" + "".join(
@@ -40,8 +50,8 @@ def preflight(command, perms, actor="an-author", author="an-author", assoc="CONT
         env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(out), "REPO": "o/r",
                "KEY_SET": "true", "COMMAND": command, "ACTOR": actor, "AUTHOR": author, "ASSOC": assoc,
                "SKIP_LABEL": "false"}
-        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step["run"]], env=env, check=True,
-                       capture_output=True)
+        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script("pre")], env=env,
+                       check=True, capture_output=True)
         return dict(line.split("=", 1) for line in out.read_text().splitlines())
 
 
