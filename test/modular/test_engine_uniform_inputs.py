@@ -2184,7 +2184,7 @@ def test_stream_parent_replaces_one_complete_unit_while_its_sibling_runs(device_
 
     if device_name == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA connected-unit membership")
-    device = torch.device(device_name)
+    device = torch.device("cuda", torch.cuda.current_device()) if device_name == "cuda" else torch.device("cpu")
     width = 12 if device_name == "cuda" else 6
     sibling_count = width - 1
     eng, group, _ = _connected_engine(device=device)
