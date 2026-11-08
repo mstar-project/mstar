@@ -74,8 +74,9 @@ def make_scheduler(
     )
     admission = Admission(services=services, layout=layout)
     lockstep = Lockstep(services=services, layout=layout, admission=admission, async_sched=async_sched)
+    lifecycle = RequestLifecycle(layout=layout, graph_runtime=graph_runtime)
     return MicroScheduler(
-        services=services, layout=layout, lifecycle=RequestLifecycle(layout=layout), lockstep=lockstep,
+        services=services, layout=layout, lifecycle=lifecycle, lockstep=lockstep,
         admission=admission, model_config=model_config, **scheduler_kwargs,
     )
 
@@ -152,7 +153,7 @@ def make_worker(
         given = named.get(name, getattr(under_scheduler, name, None))
         setattr(worker, name, given if given is not None else build())
 
-    component("lifecycle", lambda: RequestLifecycle(layout=layout))
+    component("lifecycle", lambda: RequestLifecycle(layout=layout, graph_runtime=services.graph_runtime))
     component("admission", lambda: Admission(services=services, layout=layout))
     component("lockstep", lambda: Lockstep(
         services=services, layout=layout, admission=worker.admission, async_sched=async_sched,

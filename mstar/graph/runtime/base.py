@@ -892,8 +892,8 @@ class GraphRuntime(PhasedPostprocess, ABC):
     # Handles are worker-internal. Messages carry the string, so the only
     # translations are: de-intern at each send site, intern at each receive
     # handler. In the worker the receive handlers are InputIngest's and
-    # Lockstep's; sends take the string from RequestLifecycle (wire_of, or its
-    # wire-keyed drain sets) or get_rid_string; step outputs leave through the
+    # Lockstep's; sends take the string from get_rid_string, or from
+    # RequestLifecycle's wire-keyed drain sets; step outputs leave through the
     # runtime.
 
     @abstractmethod

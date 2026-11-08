@@ -331,7 +331,7 @@ class Worker:
             rebuilds=self._rebuilds,
             streams=self.streams,
         )
-        self.lifecycle = RequestLifecycle(layout=layout)
+        self.lifecycle = RequestLifecycle(layout=layout, graph_runtime=services.graph_runtime)
         self.admission = Admission(services=services, layout=layout)
         # TP async scheduling: the leader speculates N+1 during forward N and
         # broadcasts it at once; followers rebuild it during their own N.

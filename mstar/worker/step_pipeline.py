@@ -786,7 +786,7 @@ class StepPipeline:
         errors = self.lifecycle.take_failures()
         if not errors:
             return
-        wire_errors = {self.lifecycle.wire_of(rid): msg for rid, msg in errors.items()}
+        wire_errors = {self._graph_runtime.get_rid_string(rid): msg for rid, msg in errors.items()}
         for wire_rid, msg in wire_errors.items():
             logger.error("Worker %s failing request %s: %s", self.worker_id, wire_rid, msg)
         self.scheduler.drop_backlogged(errors)
@@ -811,7 +811,7 @@ class StepPipeline:
     def _tear_down_request(self, rid: int) -> None:
         # Rank 0 fans its removes out so that a follower tears down in the same
         # gap between steps, and can't tear down state rank 0 is still reading.
-        wire_rid = self.lifecycle.wire_of(rid)
+        wire_rid = self._graph_runtime.get_rid_string(rid)
         self.lockstep.forward_teardown(rid, WorkerMessage(
             message_type=WorkerMessageType.REMOVE_REQUEST,
             body=RemoveRequest(

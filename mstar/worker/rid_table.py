@@ -10,8 +10,7 @@ be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless -- the string never recurred -- but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 RequestLifecycle.{failed_rids, arrivals, pending_removes, _removes_awaiting_step,
-_wires, _unreported}
-(purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
+_unreported} (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
 cached_prefix} (purged by clear_rid), Admission.{admit_errors, held_until,
 parked} (purged by clear), Lockstep.read_failed_rids (purged by clear),
 Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info, _fwd_by_partition}
