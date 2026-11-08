@@ -37,6 +37,7 @@ from mstar.engine.resources import (
     PositionConfig,
     PositionSpec,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
@@ -92,6 +93,24 @@ class HiggsAudioModel(MultimodalDecoderModel):
     # -------------------------------------------------------------------
     # Resources
     # -------------------------------------------------------------------
+
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """Per-request adapters on the LLM: every linear of the Qwen3 stack and the text
+        head (one row per request: the last token's), placed as the weight loader places
+        the checkpoint's own tensors. The embedding takes none: ``prefill_audio`` embeds
+        its ChatML text in ``prepare_inputs``, outside the step. Adapters saved on a
+        ``Qwen3ForCausalLM`` layout (``model.layers.*``) are read as the flat checkpoint's."""
+        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
+
+        return [module_lora_spec(
+            meta_root(self.build_llm), resource_key=LORA_RESOURCE_KEY, nodes={"LLM"}, root_path="model",
+            # Qwen3DenseLM.load_weights' rules, over the names _llm_remap gives it
+            rules=CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=self._llm_remap),
+            adapter_roots=[("model.", "")],
+            rows={"lm_head": PER_SEGMENT},
+        )]
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """LLM paged KV + attention/positions/sampler. audio_encoder is
@@ -266,20 +285,25 @@ class HiggsAudioModel(MultimodalDecoderModel):
             return None
         return name
 
+    def build_llm(self, comm_group) -> torch.nn.Module:
+        """The LLM, unloaded. The checkpoint's flat layout (embed_tokens.*,
+        layers.N.*, norm.*) is Qwen3DenseLM's; only the text head is renamed
+        (`_llm_remap`)."""
+        from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
+
+        return Qwen3DenseLM(
+            Qwen3LMConfig.from_hf(asdict(self.config)),
+            attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=comm_group,
+        )
+
     def _create_llm_submodule(
         self, device: str, tp_group, dtype: torch.dtype,
     ) -> NodeSubmodule:
-        from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
         from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
         from mstar.model.loader.iterators import iter_safetensors_shards
 
-        # the checkpoint's flat layout (embed_tokens.*, layers.N.*, norm.*) is
-        # Qwen3DenseLM's; only the text head is renamed
         with torch.device("meta"):
-            llm = Qwen3DenseLM(
-                Qwen3LMConfig.from_hf(asdict(self.config)),
-                attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=tp_group,
-            )
+            llm = self.build_llm(tp_group)
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
         llm = llm.to(dtype)

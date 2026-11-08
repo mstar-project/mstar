@@ -43,7 +43,7 @@ class Qwen3Attention(ParallelAttention):
         super().bind_resources(resources)
         # the kernel is plain non-interleaved RoPE over the whole head dim;
         # anything else the position resource would apply stays unfused
-        self._rope_theta = self.pos.fusable_rope_theta(self.head_dim)
+        self._rope_theta = None if self.pos is None else self.pos.fusable_rope_theta(self.head_dim)
         self._fuse_qk = (
             self._rope_theta is not None and self.q_norm is not None and self.rope_scale == 1.0
         )
