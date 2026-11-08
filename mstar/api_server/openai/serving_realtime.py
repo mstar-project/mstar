@@ -995,8 +995,8 @@ class RealtimeConversation:
         model = api.model
         self.output_rate = model.get_output_sample_rate("audio")
         self.voice = model.get_default_voice()
-        self.idle_steps = getattr(model, "turn_idle_steps", None)
-        self.silence_rms = getattr(model, "turn_silence_rms", 0.005)
+        self.idle_steps = model.turn_idle_steps
+        self.silence_rms = model.turn_silence_rms
         self.session_id = f"sess_{uuid.uuid4().hex[:16]}"
         self.instructions = ""
         self.turn_detection = "server_vad"
