@@ -91,7 +91,7 @@ DEFAULT_CONFIGS.update({
 DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
 # Qwen3.8-27B runs on the Qwen3.5 code; TP4 like the 3.5 27B
 DEFAULT_CONFIGS["qwen3_8_27b"] = "qwen3_8_27b_tp4.yaml"
-# dense Qwen3: 8B; other sizes take --config
+# dense Qwen3: 8B plain (configs/qwen3_8b_dspark.yaml adds the DSpark drafter); other sizes take --config
 DEFAULT_CONFIGS["qwen3_8b"] = "qwen3_8b.yaml"
 
 

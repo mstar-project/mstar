@@ -214,7 +214,8 @@ HF_MODELS.update({
     f"qwen3_5_{size}b": {"model_path_hf": f"Qwen/Qwen3.5-{size}B"} \
         for size in qwen_3_5_dense_sizes
 })
-# dense Qwen3, 8B only (the size with a shipped config and a parity run): text only
+# dense Qwen3, 8B only (the size with a shipped config and a parity run): text only;
+# `model_kwargs.draft` adds a DSpark drafter (configs/qwen3_8b_dspark.yaml)
 MODEL_REGISTRY["qwen3_8b"] = ("mstar.model.qwen3.qwen3_model", "Qwen3Model")
 HF_MODELS["qwen3_8b"] = {"model_path_hf": "Qwen/Qwen3-8B"}
 # Qwen3.8-27B is the Qwen3.5 architecture (same config.json geometry)

@@ -1,5 +1,5 @@
 model: "qwen3_8b"
-# Qwen/Qwen3-8B, bf16.
+# Qwen/Qwen3-8B, bf16, plain decoding. configs/qwen3_8b_dspark.yaml adds a DSpark drafter.
 max_seq_len: 32768
 model_kwargs:
   max_seq_len: 32768
