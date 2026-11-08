@@ -417,7 +417,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``knobs``
      - *(optional)* Engine knobs for this deployment, by name: ``device_loopback``,
        ``sampler_ingraph_scatter``, ``sampler_slots``, ``ingraph_decode_rope``,
-       ``kv_chain_lazy_steps``, ``kv_plan_cache``, ``kv_pinned_indptrs``,
+       ``kv_chain_lazy_steps``, ``kv_pinned_indptrs``,
        ``gc_gen0_threshold``, ``pre_plan``, ``step_thread_core``, ``idle_hold``,
        ``compile_deterministic`` and ``resident_planning`` (``true``/``false`` or an integer;
        ``step_thread_core`` takes ``auto``, the default, ``off``, ``always``, ``siblings`` or a CPU number,
@@ -426,7 +426,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        Qwen3.5's text walks and no other model (see :doc:`models`). Each one's environment variable
        (``MSTAR_DEVICE_LOOPBACK`` and so on; see
        :doc:`environment_variables`) overrides it when set, and an unknown name
-       fails at startup. For example ``knobs: {kv_plan_cache: 1,
+       fails at startup. For example ``knobs: {kv_chain_lazy_steps: 4,
        kv_pinned_indptrs: true}``, or ``knobs: {pre_plan: false}``
        (``whisper_large_v3_turbo.yaml``).
 

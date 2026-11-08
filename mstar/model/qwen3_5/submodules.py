@@ -53,10 +53,10 @@ from mstar.utils.profiler import PhaseLaps
 logger = logging.getLogger(__name__)
 
 
-def _mixed_token_buckets(prefill_buckets) -> list[int]:
-    """The prefill ladder up to 2176, then its powers of two (see
+def _mixed_token_buckets(prefill_buckets, slack: int) -> list[int]:
+    """The prefill ladder's powers of two and ``slack`` (see
     ``LLMSubmodule.MIXED_TOKEN_BUCKETS``)."""
-    return [b for b in prefill_buckets if b <= 2176 or b & (b - 1) == 0]
+    return [b for b in prefill_buckets if b & (b - 1) == 0 or b == slack]
 
 
 class LLMSubmodule(SampledTokenDecoder):
@@ -64,18 +64,24 @@ class LLMSubmodule(SampledTokenDecoder):
 
     # An eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
     # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
-    # ladder runs past 8192. The powers of two stay, since a batch of prompts
-    # up to a power of two long fills one exactly. 2176, 4352 and 8704 add 1/16
-    # above them for the decode rows a mixed step carries beside four prompts
-    # and for batches a few tokens over, which would otherwise pad to twice the
-    # width. A deployment sets its own with `model_kwargs.prefill_token_buckets`
-    # (static buffers are sized by the largest bucket).
-    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176, 4096, 4352, 8192, 8704]
-    # Four prompts and their decode rows reach 2176, the only slack bucket a
-    # mixed step needs. Every (rows, tokens) pair here is one more recompile of
-    # the forward all these captures share, and past Dynamo's limit the buckets
-    # compiled last run uncompiled inside their graphs.
-    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS)
+    # ladder runs to 8192. The powers of two stay, since a batch of prompts up
+    # to a power of two long fills one exactly, and 2176 is slack for a step a
+    # few tokens over the 2048-token step budget. 1152-1792 hold a prompt a
+    # little past 1024 tokens (1024 plus its chat template) without padding it
+    # to 2048. Only a text-prefill step, one with no decode rows beside it,
+    # uses them; a mixed step doesn't capture them. Under the default step
+    # budget no step passes 2176. 4096 and 8192 stay for a deployment that
+    # raises `max_batch_tokens` or turns chunking off, which fills them
+    # exactly. The ladder leaves out slack rungs above them (4352, 8704), since
+    # each bucket is one more compile against Dynamo's recompile limit: such a
+    # deployment adds them to its own `model_kwargs.prefill_token_buckets`, and
+    # without them a step just past a power of two pads to the next and one
+    # past 8192 runs eagerly. Its added rungs serve text-prefill steps only; a
+    # mixed step's slack stays MIXED_SLACK_TOKENS. Static buffers are sized by
+    # the largest bucket.
+    PREFILL_TOKEN_BUCKETS = [
+        32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048, 2176, 4096, 8192,
+    ]
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -98,6 +104,15 @@ class LLMSubmodule(SampledTokenDecoder):
     # 4096 gives back most of the short-prompt TTFT gain and doubles decode
     # ITL p99 at c48
     MAX_BATCH_TOKENS = 2048
+    # A mixed step captures only the ladder's powers of two and one slack
+    # bucket, a decode batch's width above the default budget, for a step a few
+    # tokens over it (2176). Every (rows, tokens) pair here is one more recompile of the
+    # forward all these captures share, and past Dynamo's limit the buckets
+    # compiled last run uncompiled inside their graphs. The slack reads the
+    # scaffold's MIXED_CAPTURE_BATCH_SIZES by name (an inherited name isn't in
+    # scope in a class body), so a class that sets its own sets this too.
+    MIXED_SLACK_TOKENS = MAX_BATCH_TOKENS + SampledTokenDecoder.MIXED_CAPTURE_BATCH_SIZES[-1]
+    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS, MIXED_SLACK_TOKENS)
 
     def __init__(
         self,
@@ -114,7 +129,13 @@ class LLMSubmodule(SampledTokenDecoder):
                 "with `model_kwargs.prefill_token_buckets` in the serving config",
             )
         # follows a deployment's own prefill ladder
-        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
+        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS, self.MIXED_SLACK_TOKENS)
+        if not self.MIXED_TOKEN_BUCKETS:
+            raise ValueError(
+                f"prefill_token_buckets {self.PREFILL_TOKEN_BUCKETS} leaves a mixed step no captured bucket, "
+                "so every mixed step would run eagerly: it captures only the ladder's powers of two and "
+                f"{self.MIXED_SLACK_TOKENS}, so add one (e.g. 2048)"
+            )
         # patches per merged token along each axis, for the MRoPE grids
         self._merge_size = vision_config.spatial_merge_size if vision_config is not None else None
 

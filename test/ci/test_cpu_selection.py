@@ -193,6 +193,7 @@ RETIRED = {
     "test/modular/test_send_prep_entries.py": (
         "tested the send stage's stream-consumption report, dropped with stream_tokens_consumed"
     ),
+    "test/modular/test_kv_decode_plan_cache.py": "tested the KV decode-plan cache, deleted with it",
 }
 
 
