@@ -308,18 +308,18 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        the server at startup.
    * - ``ws_per_message_deflate``
      - *(optional, default true)* Whether the server offers per-message deflate on its
-       WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.
+       WebSocket routes; it applies to every route.
        Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
        event loop, not the network, is the bottleneck.
    * - ``ws_max_message_mb``
-     - *(optional, default 16)* The largest WebSocket message the server reads, in MiB,
-       on every WebSocket route. A larger one closes its socket with ``1009`` before any
-       handler sees it, so the client gets no error frame. Raise it for clients that send
-       big uncompressed frames, such as several raw camera images in one openpi
-       observation.
+     - *(optional)* The largest WebSocket message the server reads, in MiB, on every
+       WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
+       closes its socket with ``1009`` before any handler sees it, so the client gets no
+       error frame. Raise it for clients that send big uncompressed frames, such as several
+       raw camera images in one openpi observation.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
@@ -688,8 +688,8 @@ one whole instance:
    max_seq_len: 512
    node_groups:
      - {node_names: [text_encoder, vae_encoder, vae_decoder], ranks: [0]}
-     # one guidance branch per rank
-     - {node_names: [dit], ranks: [0, 1], cfg_size: 2}
+     # one guidance branch per pair of ranks, each branch's tokens split over its pair
+     - {node_names: [dit], ranks: [0, 1, 2, 3], cfg_size: 2, sp_size: 2}
 
 Several lockstep-parallel nodes can share GPUs when, on each worker, they are in the same
 groups on every axis, each declared parallel on those axes by the model. The ranks then run
@@ -771,9 +771,16 @@ of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be no
 [-1, 1].
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`. A ``seed`` fixes a request's random stream whatever
-it is batched with, so requests sent with the same seed and settings sample the same
-tokens; give each request its own seed for independent samples.
+client instead — see :doc:`clients`. Give each request its own ``seed`` for independent
+samples. A seed fixes a request's tokens whatever it is batched with only where M\* draws
+with one kernel that reads each row's own seed: on CUDA, a sampler whose vocabulary is at
+most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),
+with none of ``min_p``, the windowed penalty, ``min_tokens``, ``top_p_first`` or processed
+log-probs enabled on its node, on eager and captured steps alike. Every other sampler (every
+text LLM, and Fish S2 Pro's 4,097-token semantic head) draws through FlashInfer, which
+reads the first row's seed for the whole batch and folds each row's batch position into
+its random stream, so there the same seed and settings sample the same tokens only in the
+same batch, such as a request sent alone.
 
 Restarts and the compile cache
 ------------------------------

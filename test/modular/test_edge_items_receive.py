@@ -133,6 +133,17 @@ def test_a_frame_starts_its_reads_in_one_call():
     ]
 
 
+def test_a_frame_whose_reads_raise_fails_their_requests():
+    """A raise starting the frame's reads (a CUDA OOM, say) fails the requests
+    it was reading for, rather than escaping the message loop."""
+    w = _worker()
+    w.tensor_manager.start_read_tensors_multi = lambda reads: (_ for _ in ()).throw(
+        RuntimeError("CUDA out of memory"),
+    )
+    w.ingest._process_edge_items(_frame())
+    assert sorted(w.lifecycle.take_failures()) == [1, 2]
+
+
 @pytest.mark.parametrize("failed", [True, False])
 def test_a_known_request_with_no_stream_buffer_is_acked_unread(failed, caplog):
     """A request whose ingest failed here is known but has no stream buffer:

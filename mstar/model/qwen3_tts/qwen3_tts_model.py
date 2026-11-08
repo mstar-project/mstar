@@ -160,8 +160,13 @@ def _adapt_tokenizer_module(module) -> None:
 
     The decoder config asks for the ``default`` RoPE (dropped from
     ``ROPE_INIT_FUNCTIONS``), and the mask builders renamed ``input_embeds``
-    to ``inputs_embeds`` and dropped ``cache_position``.
+    to ``inputs_embeds`` and dropped ``cache_position``. transformers 5.21
+    made ``MimiModel.upsample`` and ``decoder_transformer`` read-only
+    properties, which the encoder sets to ``None``; plain class attributes
+    let it.
     """
+    module.Qwen3TTSTokenizerV2Encoder.upsample = None
+    module.Qwen3TTSTokenizerV2Encoder.decoder_transformer = None
     rope = module.ROPE_INIT_FUNCTIONS
     if "default" not in rope:
         def default_rope(config, device=None, seq_len=None, layer_type=None):
@@ -191,6 +196,14 @@ def _adapt_tokenizer_module(module) -> None:
 #: qwen-tts pins transformers==4.57.3, which most environments with other
 #: extras cannot satisfy; only its source files are used, so its pins are skipped.
 QWEN_TTS_INSTALL = 'uv pip install --no-deps "qwen-tts==0.1.1"'
+
+#: Where transformers 5.21+ puts the flat Mimi checkpoint's encoder half (its
+#: ``conversion_mapping`` for ``MimiModel``); the quantizer keeps its names.
+_MIMI_NESTED_ENCODER = {
+    "encoder.layers.": "encoder.encoder_seanet.layers.",
+    "encoder_transformer.": "encoder.encoder_transformer.",
+    "downsample.": "encoder.downsample.",
+}
 
 
 @lru_cache(maxsize=1)
@@ -1364,15 +1377,22 @@ class Qwen3TTSModel(Model):
         codec_encoder = encoder_cls(MimiConfig(**self.config.codec.encoder_config)).to(device=device)
         codec_dir = Path(self.local_dir) / "speech_tokenizer"
         encoder_prefix = "encoder."
+        # The checkpoint keeps Mimi's flat layout; transformers 5.21+ nests the encoder half.
+        nested = hasattr(codec_encoder.encoder, "encoder_seanet")
+
+        def module_key(name: str) -> str:
+            for flat, moved in _MIMI_NESTED_ENCODER.items():
+                if nested and name.startswith(flat):
+                    return moved + name.removeprefix(flat)
+            return name
 
         def encoder_weights():
             for name, tensor in iter_safetensors_shards(codec_dir, device=device, prefix=encoder_prefix):
-                yield name.removeprefix(encoder_prefix), tensor
+                yield module_key(name.removeprefix(encoder_prefix)), tensor
 
         loaded = load_hf_weights(codec_encoder, encoder_weights()) | _load_buffers(codec_encoder, encoder_weights())
-        _verify_checkpoint_coverage(
-            codec_encoder, loaded, _checkpoint_keys(codec_dir, encoder_prefix), "Qwen3-TTS codec encoder"
-        )
+        checkpoint_keys = {module_key(key) for key in _checkpoint_keys(codec_dir, encoder_prefix)}
+        _verify_checkpoint_coverage(codec_encoder, loaded, checkpoint_keys, "Qwen3-TTS codec encoder")
         codec_encoder.eval()
         return RefEncoderSubmodule(
             speaker_encoder,
