@@ -59,10 +59,11 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
 # A run's record, base64 JSON, in a ledger comment: one comment per attempt of a run, so concurrent runs can't lose
 # updates.
 SPEND = re.compile(r"<!-- review-spend ([A-Za-z0-9+/=]+) -->")
-# USD the bot may spend per UTC week (Monday 00:00 UTC on) on review tokens and Eras GPU time, a change to main
-# like the approval rule. Slurm GPUs are free.
+# USD the bot may spend on Claude per UTC week (Monday 00:00 UTC on): the review's tokens and the box's session, a
+# change to main like the approval rule. Eras GPU time is bounded by the Eras wallet and limits, not here.
 WEEKLY_CAP = 10_000
-ISSUES = {"ledger": ("Review bot spend ledger", "The review bot's spend, one comment per run attempt. Read by code."),
+ISSUES = {"ledger": ("Review bot spend ledger",
+                     "The review bot's Claude spend, one comment per run attempt. Read by code."),
           "status": ("Review bot status", "The review bot's status: a daily report in this body, alerts as comments.")}
 EJECTIONS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
@@ -246,8 +247,9 @@ def ledger(repo, since):
     """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments from every ledger
     issue, once per run, attempt of its review and attempt of its live test. Re-running only a run's spend job
     keeps the attempts its usage and live test came from, so it adds nothing; re-running all its jobs spends again,
-    and re-running only its live test counts its GPUs and box on top of the review already counted, even at the
-    same or no cost, and keeps its approval. A failed read raises."""
+    and re-running only its live test counts its box session on top of the review already counted, even at the
+    same or no cost, and keeps its approval. A record's `usd` comes back as Claude spend alone: an older record
+    held its GPU cost too, in `usd` and `gpu_usd`, and only the latter is taken off. A failed read raises."""
     records, seen = [], set()
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
@@ -262,15 +264,16 @@ def ledger(repo, since):
             live_key = (*run_key, record.get("live_attempt"))
             if live_key in seen:
                 continue
-            if run_key in seen:  # the live test ran again: new GPU and box cost, the review's tokens already counted
-                record = {**record, "usd": round(finite_usd(record, "gpu_usd") + finite_usd(record, "box_usd"), 4)}
+            usd = round(max(0, finite_usd(record) - finite_usd(record, "gpu_usd")), 4)
+            if run_key in seen:  # the live test ran again: a new box session, the review's tokens already counted
+                usd = finite_usd(record, "box_usd")
             seen |= {run_key, live_key}
-            records.append((c["created_at"], record))
+            records.append((c["created_at"], {**record, "usd": usd}))
     return records
 
 
 def spend(repo, now):
-    """USD spent so far in `now`'s UTC week, which starts Monday 00:00 UTC."""
+    """Claude USD spent so far in `now`'s UTC week, which starts Monday 00:00 UTC."""
     monday = (now - datetime.timedelta(days=now.weekday())).strftime("%Y-%m-%dT00:00:00Z")
     return sum(finite_usd(record) for created, record in ledger(repo, monday) if created >= monday)
 
@@ -292,8 +295,8 @@ def over_cap(repo):
         return "The review bot couldn't read its spend ledger, so no new review or GPU run starts; try again later."
     if used < WEEKLY_CAP:
         return None
-    why = (f"The review bot's weekly spend cap (${used:,.0f} of ${WEEKLY_CAP:,}) is reached; it resets Monday at "
-           "00:00 UTC. No new review or GPU run starts until then.")
+    why = (f"The review bot's weekly Claude spend cap (${used:,.0f} of ${WEEKLY_CAP:,}) is reached; it resets Monday "
+           "at 00:00 UTC. No new review or GPU run starts until then.")
     alert(repo, f"week-{now.strftime('%G-W%V')}", why)
     return why
 
@@ -935,22 +938,22 @@ def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_conti
 
 # ---------------------------------------------------------------- spend job
 
-def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="", box_usd="", approval="",
+def record(out, repo, pr, github_run_id, github_run_attempt, usage="", box_usd="", approval="",
            live_attempt=""):
     """Append one record for this run to the ledger issue (`spend` job, after the review and the live test),
-    so the cap and the monitor read what each run cost: the review's tokens and the live test's GPUs and
-    box session. Nothing spent, nothing written."""
+    so the cap and the monitor read what each run cost in Claude: the review's tokens and the live test's box
+    session. Nothing spent, nothing written."""
     try:
         review = json.loads(usage) if usage else {}
     except ValueError:
         review = {}
-    gpu, box = float(gpu_usd or 0), float(box_usd or 0)
-    if not review and not gpu and not box:
+    box = float(box_usd or 0)
+    if not review and not box:
         return
     cost = review.get("total_cost_usd")
-    usd = round((cost if isinstance(cost, (int, float)) else 0) + gpu + box, 4)
+    usd = round((cost if isinstance(cost, (int, float)) else 0) + box, 4)
     entry = {"pr": pr, "head": review.get("head_sha"), "mode": review.get("mode"), "run": github_run_id,
-             "attempt": github_run_attempt, "usage": review, "gpu_usd": gpu, "box_usd": box, "approval": approval,
+             "attempt": github_run_attempt, "usage": review, "box_usd": box, "approval": approval,
              "live_attempt": live_attempt, "usd": usd}
     b64 = base64.b64encode(json.dumps(entry).encode()).decode()
     what = f"PR `#{pr}`" if pr else "Weekly improvement run"
@@ -1146,7 +1149,7 @@ def monitor(out, repo, approvals=""):
     current = {s["key"]: s for s in signals}
     fresh = [current[k]["text"] for k in sorted(current) if k not in reported]
     head = [issue_marker("status"), "### Review bot status", f"Updated {now.strftime('%Y-%m-%d %H:%M')} UTC.", "",
-            f"Spend this week: ${used:,.0f} of ${WEEKLY_CAP:,}. "
+            f"Claude spend this week: ${used:,.0f} of ${WEEKLY_CAP:,}. "
             f"Approvals: **{'on' if approvals == 'on' else 'off'}** (`REVIEW_APPROVALS`).", "",
             f"#### PRs the bot approved, last {MONITOR_DAYS} days", "| PR | State | Signals |", "| --- | --- | --- |"]
     tail = ["", f"New PRs since the last report: {len(new_prs)}.",
@@ -1205,7 +1208,7 @@ def pr_evidence(repo, pr, since, records):
 
     runs = [{"mode": r.get("mode"), "outcome": (r.get("usage") or {}).get("outcome"),
              "subtype": (r.get("usage") or {}).get("subtype"), "turns": (r.get("usage") or {}).get("num_turns"),
-             "usd": r.get("usd"), "gpu_usd": r.get("gpu_usd"), "box_usd": r.get("box_usd"),
+             "usd": r.get("usd"), "box_usd": r.get("box_usd"),
              "approval": r.get("approval"), "url": f"https://github.com/{repo}/actions/runs/{r.get('run')}"}
             for created, r in records if created >= since and str(r.get("pr")) == str(pr)]
     moot = [{"ref": scrub(f.get("ref")), "why": scrub(f.get("why")), "url": c["url"]}

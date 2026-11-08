@@ -1,6 +1,6 @@
 name: Review bot monitor
 
-# A daily report on the PRs the review bot approved, and the spend it has used. Reviews
+# A daily report on the PRs the review bot approved, and the Claude spend it has used. Reviews
 # nothing and runs no model: every step reads GitHub and git and writes the status issue
 # (bot.py, monitor). Run it by hand once as setup: it creates the status issue, and the
 # first run that spends creates the ledger issue. The status issue's body has one writer:

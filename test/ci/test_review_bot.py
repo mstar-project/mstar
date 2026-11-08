@@ -173,13 +173,17 @@ class TestSpend(unittest.TestCase):
                          "re-running only a run's spend job would count its costs twice")
         self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "2"})]), 2,
                          "re-running all a run's jobs spends again, and that would go uncounted")
-        live = {"usage": {"run_attempt": "1"}, "gpu_usd": 2, "box_usd": 1, "live_attempt": "1"}
-        rerun = {**live, "gpu_usd": 5, "live_attempt": "2"}
-        self.assertEqual(self.spend([spent(13, **live), spent(16, attempt="2", **rerun),
-                                     spent(16, attempt="3", **rerun)]), 19,
-                         "re-running only the live test spends GPUs again, its review tokens are already counted, "
-                         "and re-running only the spend job after that adds nothing")
-        free = {"usage": {"run_attempt": "1"}, "gpu_usd": 0.0, "box_usd": 0.0}
+        live = {"usage": {"run_attempt": "1"}, "box_usd": 1, "live_attempt": "1"}
+        rerun = {**live, "box_usd": 3, "live_attempt": "2"}
+        self.assertEqual(self.spend([spent(11, **live), spent(13, attempt="2", **rerun),
+                                     spent(13, attempt="3", **rerun)]), 14,
+                         "re-running only the live test starts a new box session, its review tokens are already "
+                         "counted, and re-running only the spend job after that adds nothing")
+        old = {**live, "gpu_usd": 2}
+        old_rerun = {**old, "gpu_usd": 5, "live_attempt": "2"}
+        self.assertEqual(self.spend([spent(13, **old), spent(16, attempt="2", **old_rerun)]), 12,
+                         "a record from when the cap counted GPUs would still count them")
+        free = {"usage": {"run_attempt": "1"}, "box_usd": 0.0}
         comments = [spent(1, **free, live_attempt="1", approval="approve"),
                     spent(1, attempt="2", **free, live_attempt="2", approval="approve"),
                     spent(1, attempt="3", **free, live_attempt="2", approval="approve")]
@@ -224,7 +228,7 @@ class TestSpend(unittest.TestCase):
         with self.assertRaises(RuntimeError, msg="the step would pass, with the spend lost"):
             step(bot.record, {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/2/comments*": [],
                               "issue comment": comment}, repo="o/r", pr="7", github_run_id="9",
-                 github_run_attempt="1", gpu_usd="3")
+                 github_run_attempt="1", box_usd="3")
         self.assertEqual(len(comments), 2, "the ledger write and its alert")
         self.assertIn("ledger", comments[1], "a lost ledger write would pass silently")
 
@@ -238,11 +242,11 @@ class TestSpend(unittest.TestCase):
         usage = json.dumps({"total_cost_usd": 2.5, "tokens_from": "result", "pr": "7", "head_sha": HEAD, "mode": "full",
                             "run_id": "9", "run_attempt": "1"})
         out, fake = step(bot.record, {"GET repos/o/r/issues[?]*": [LEDGER], "issue comment": comment}, repo="o/r",
-                         pr="7", github_run_id="9", github_run_attempt="1", usage=usage, gpu_usd="3", box_usd="1.5",
+                         pr="7", github_run_id="9", github_run_attempt="1", usage=usage, box_usd="1.5",
                          approval="approve")
         self.assertEqual(self.spend([{"user": {"login": "github-actions[bot]"}, "created_at": "2026-11-08T01:00:00Z",
-                                      "body": recorded["body"]}]), 7.0,
-                         "a run's GPU and box cost would not count toward the cap")
+                                      "body": recorded["body"]}]), 4.0,
+                         "a run's box session would not count toward the cap")
         self.assertEqual(self.spend_of(recorded["body"]).get("approval"), "approve")
         self.assertTrue(all(recorded["body"] not in arg for argv, _ in fake.calls for arg in argv),
                         "the record would reach gh's command line")
@@ -267,7 +271,7 @@ class TestCaps(unittest.TestCase):
         self.assertEqual(out, {"run": "false"}, "a review would start past the week's cap")
         said = dict(writes)
         self.assertEqual(sorted(said), ["issue comment", "pr comment"])
-        self.assertIn("weekly spend cap ($10,000 of $10,000)", said["pr comment"])
+        self.assertIn("weekly Claude spend cap ($10,000 of $10,000)", said["pr comment"])
         self.assertIn("resets Monday at 00:00 UTC", said["pr comment"])
         marker = said["issue comment"].split("\n")[0]
         again = [{"user": {"login": "github-actions[bot]"}, "body": f"{marker}\nalready"}]

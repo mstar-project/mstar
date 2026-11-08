@@ -105,7 +105,7 @@ name: Claude Review
 #
 # Every run that reaches Claude records its API calls, tokens, turns and cost
 # in the job summary and in one comment on the spend ledger issue (bot.py,
-# record), read by the preflight and the live test to enforce the spend cap.
+# record), read by the preflight and the live test to enforce the Claude spend cap.
 
 on:
   issue_comment:
@@ -509,8 +509,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     outputs:
-      # What the GPUs and the box's session cost, and what was decided, for the ledger.
-      gpu_usd: ${{ steps.release.outputs.gpu_usd }}
+      # What the box's session cost, and what was decided, for the ledger.
       box_usd: ${{ steps.release.outputs.box_usd }}
       approval: ${{ steps.approve.outputs.approval }}
       # A re-run of only the spend job keeps this; a re-run of the live test changes it. The ledger's key.
@@ -753,7 +752,6 @@ jobs:
         continue-on-error: true
         env:
           USAGE: ${{ needs.review.outputs.usage }}
-          GPU_USD: ${{ needs.live-test.outputs.gpu_usd }}
           BOX_USD: ${{ needs.live-test.outputs.box_usd }}
           APPROVAL: ${{ needs.live-test.outputs.approval }}
           LIVE_ATTEMPT: ${{ needs.live-test.outputs.live_attempt }}

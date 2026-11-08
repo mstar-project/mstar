@@ -389,8 +389,6 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
     if o:
         (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])
         (lt / "offer.json").write_text(json.dumps(o))
-        # gpu.py drops its entry when it terminates the instance; this copy prices the run (run_cost).
-        (lt / "entry.json").write_text(json.dumps(gpu_py.entry(r.stdout.strip().splitlines()[-1])))
         print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
         return
     everything = json.loads(gpu("offers", "--gpus", str(gpus), "--json", "--all-regions", check=False).stdout)
@@ -488,30 +486,23 @@ def wait(out, runner_temp, start_timeout="30"):
     print(f"collected: {sorted(p.name for p in results.iterdir())}")
 
 
-def run_cost(lt, now):
-    """(GPU, box session) USD of this run: the hours from launch to now or the deadline, whichever came
-    first, at the offer's price (Slurm's is $0), and the box's own Claude Code total, believed only up to
-    MAX_BOX_USD."""
-    gpu_usd = 0.0
-    if (lt / "entry.json").is_file():
-        e = json.loads((lt / "entry.json").read_text())
-        gpu_usd = max(0.0, e["usd_per_hour"] * (min(now, e["deadline"]) - e["launched_at"]) / 3600)
+def box_cost(lt):
+    """USD of the box's own Claude Code session, believed only up to MAX_BOX_USD."""
     try:
         box_usd = float(json.loads((lt / "results/claude.json").read_text()).get("total_cost_usd") or 0)
     except (OSError, ValueError, AttributeError, TypeError, OverflowError, RecursionError):
         box_usd = 0.0
     if not 0 <= box_usd <= MAX_BOX_USD:  # NaN fails this too
         box_usd = 0.0
-    return gpu_usd, box_usd
+    return box_usd
 
 
 def cleanup(out, pr, tag, runner_temp):
     """Release whatever this run launched, from the ledger and by name, for a run cancelled mid-launch;
-    and first what the run's GPUs and box session cost, for the ledger, so a failed release can't lose
-    it."""
+    and first what the box's session cost, for the ledger, so a failed release can't lose it."""
     pr = int(pr)
     try:  # nothing here may stop the release below
-        out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
+        out["box_usd"] = str(box_cost(Path(runner_temp, "lt")))
     except Exception as e:
         print(f"::warning::Couldn't read the run's cost: {type(e).__name__}: {e}")
     print(gpu("list", check=False).stdout)
