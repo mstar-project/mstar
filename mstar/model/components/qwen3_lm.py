@@ -31,31 +31,36 @@ from mstar.model.components.norm import RMSNorm
 from mstar.model.components.qk_norm_rope import norm_rotate, rope_cos_sin
 
 
-def _norm_rope_add(
+def _norm_rope_attend(
     kv, layer, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
     pos_ids: torch.Tensor, theta: float, q_eps: float, k_eps: float,
-) -> None:
+) -> torch.Tensor:
     cos, sin = rope_cos_sin(pos_ids[: q.shape[0]], q.shape[-1], theta)
     cos, sin = cos[:, None], sin[:, None]
     # the angles are fp32, and a backend that takes K/V at its read refuses a k of another dtype than its v
     rotated_k = norm_rotate(k, k_weight, k_eps, cos, sin).to(k.dtype)
     q.copy_(norm_rotate(q, q_weight, q_eps, cos, sin))
     kv.add(layer, k=rotated_k, v=v)
+    return kv.read(layer, q)
 
 
 # The kernel is CUDA's, so any other device takes the reference.
-@state_op(adds=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_norm_rope_add)
-def qk_norm_rope_kv_write(
+@state_op(
+    adds=("kv",), reads=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_norm_rope_attend,
+)
+def qk_norm_rope_attend(
     kv, layer, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
     pos_ids: torch.Tensor, theta: float, q_eps: float, k_eps: float, *, target: PagedNHDTarget,
-) -> None:
-    """Per-head q/k norm and plain RoPE at ``pos_ids``, in place on ``q``, and this layer's K/V write, in one launch."""
+) -> torch.Tensor:
+    """Per-head q/k norm and plain RoPE at ``pos_ids``, in place on ``q``, and this layer's K/V write, in one launch,
+    then the layer's read."""
     from mstar.utils import attention
 
     attention.qk_norm_rope_kv_write(
         q, k, v, q_weight, k_weight, pos_ids, target.cache, target.page_of_token, target.slot_of_token,
         min(target.count, q.shape[0]), q_eps, k_eps, theta,
     )
+    return kv.read(layer, q)
 
 
 def _plain_theta(rope, head_dim: int) -> float | None:
@@ -85,11 +90,10 @@ class Qwen3Attention(ParallelAttention):
             return super().forward(hidden_states)
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
-        qk_norm_rope_kv_write(
+        out = qk_norm_rope_attend(
             self.state, self.layer, q, k, v, self.q_norm.weight, self.k_norm.weight, positions(self.state),
             self._theta, float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon),
         )
-        out = self.state.read(self.layer, q)
         return self.o_proj(out.reshape(num_tokens, self.num_heads * self.head_dim))
 
 

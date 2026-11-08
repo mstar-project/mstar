@@ -788,7 +788,7 @@ A model that hasn't moved declares today's `ResourceStep` objects under `steps`,
 
 Only a model that hasn't moved writes `KVStep(combined_labels=...)`. On the contract, a step's calls cover all of its rows in segment order.
 
-**Writing K/V yourself.** A layer that hasn't moved and writes its K/V inside a fused kernel of its own, rather than through `write_kv`, asks the KV resource where the step's tokens go: `kv.write_target(layer_idx, label)` returns `(layer cache, page of each token, slot in page of each token, number of tokens to write)` for the current plan (NHD layout only). Tokens past that number are the plan's padding and must not be written. A layer on the contract gets the same through a `@state_op`'s `target`, as `qk_norm_rope_kv_write` in `mstar/model/components/qwen3_lm.py` does.
+**Writing K/V yourself.** A layer that hasn't moved and writes its K/V inside a fused kernel of its own, rather than through `write_kv`, asks the KV resource where the step's tokens go: `kv.write_target(layer_idx, label)` returns `(layer cache, page of each token, slot in page of each token, number of tokens to write)` for the current plan (NHD layout only). Tokens past that number are the plan's padding and must not be written. A layer on the contract gets the same through a `@state_op`'s `target`, as `qk_norm_rope_attend` in `mstar/model/components/qwen3_lm.py` does.
 
 **Testing.** `declare_step` performs only host-side bookkeeping, so you can unit-test it on CPU without model weights. `test/modular/test_state_ports.py` compares both ports' steps against hand-written ones, and `test/modular/test_resource_runner.py` tests the runner's lifecycle directly.
 

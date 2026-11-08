@@ -1931,7 +1931,7 @@ of its own, rather than through ``write_kv``, asks the KV resource where the ste
 ``kv.write_target(layer_idx, label)`` returns ``(layer cache, page of each token, slot in
 page of each token, number of tokens to write)`` for the current plan (NHD layout only).
 Tokens past that number are the plan's padding and must not be written. A layer on the
-contract gets the same through a ``@state_op``'s ``target``, as ``qk_norm_rope_kv_write`` in
+contract gets the same through a ``@state_op``'s ``target``, as ``qk_norm_rope_attend`` in
 ``mstar/model/components/qwen3_lm.py`` does.
 
 **Testing.** ``declare_step`` performs only host-side bookkeeping, so you can unit-test it
