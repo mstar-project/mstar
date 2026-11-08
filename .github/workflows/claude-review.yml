@@ -927,8 +927,8 @@ jobs:
           repositories: ${{ vars.REVIEW_MEDIA_REPO }}
           permission-contents: write
 
-      # The gallery keeps the newest 30 runs, as a single commit, so neither the site nor the
-      # repository grows without bound. A push that loses a race with another run fails rather
+      # The gallery keeps the newest runs that fit in 900 MB, under Pages' 1 GB site limit, as a
+      # single commit, so neither the site nor the repository grows without bound. A push that loses a race with another run fails rather
       # than overwrite it. The comment links the gallery only once the push went through.
       - name: Publish the media
         if: steps.media-app.outcome == 'success'
@@ -942,9 +942,13 @@ jobs:
           cd "$RUNNER_TEMP/media"
           branch=$(git symbolic-ref --short HEAD); old=$(git rev-parse -q --verify HEAD || true)
           mkdir -p "pr-$PR/$TAG" && cp -r "$RUNNER_TEMP/site/." "pr-$PR/$TAG/"
-          ls -d pr-*/*/ | sort -t/ -k2 -n | head -n -30 | xargs -r rm -rf
+          total=0
+          for run in $(ls -d pr-*/*/ | sort -t/ -k2 -nr); do   # newest first: tags start with the run id
+            total=$((total + $(du -sb "$run" | cut -f1)))
+            [ "$total" -le 900000000 ] || rm -rf "$run"
+          done
           git checkout -q --orphan gallery && git add -A
-          git -c user.name=mstar-review -c user.email=mstar-review@users.noreply.github.com commit -qm "Live-test media, the newest 30 runs"
+          git -c user.name=mstar-review -c user.email=mstar-review@users.noreply.github.com commit -qm "Live-test media, the newest runs"
           git push -q --force-with-lease="$branch:$old" origin "HEAD:$branch"
           cd "$GITHUB_WORKSPACE"
           python3 .github/review/gpu_review.py comment --pr "$PR" --sha "$HEAD_SHA" --out "$RUNNER_TEMP/lt" \
