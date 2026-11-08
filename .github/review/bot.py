@@ -312,9 +312,11 @@ def stacked_above(repo, pull, head_sha):
 
 
 def diff_files(diff):
-    """{"diff --git" line: [its header lines, [its hunks, each a list of lines]]} of a unified diff."""
+    """{"diff --git" line: [its header lines, [its hunks, each a list of lines]]} of a unified diff. Lines
+    end only at \\n: a form feed or U+2028 inside a source line (str.splitlines breaks on those) could
+    fake a header and hide the code around it."""
     files, current = {}, None
-    for line in diff.splitlines(keepends=True):
+    for line in re.findall(r".*\n|.+", diff):
         if line.startswith("diff --git "):
             current = files[line] = [[line], []]
         elif current is None:
@@ -330,18 +332,23 @@ def diff_files(diff):
 
 def changes(hunk):
     """What a hunk changes: its runs of added and removed lines, each with the function on its `@@` line
-    and the context line on either side, so a change moved elsewhere in a file counts. The line numbers
-    stay out: a rebase shifts them."""
-    section, runs, run, above = hunk[0].split("@@", 2)[-1], [], [], ""
+    and the nearest non-blank context line on either side within the hunk, so a change moved elsewhere
+    in a file counts. The line numbers stay out: a rebase shifts them."""
+    section, runs, run, above, open_runs = hunk[0].split("@@", 2)[-1], [], [], "", []
     for line in hunk[1:]:
         if line.startswith(("+", "-", "\\")):
             run.append(line)
-        else:
-            if run:
-                runs.append((section, above, tuple(run), line))
-                run = []
+            continue
+        if run:
+            open_runs.append((section, above, tuple(run)))
+            run = []
+        if line.strip():
+            runs += [(*r, line) for r in open_runs]
+            open_runs = []
             above = line
-    return runs + [(section, above, tuple(run), "")] if run else runs
+    if run:
+        open_runs.append((section, above, tuple(run)))
+    return runs + [(*r, "") for r in open_runs]
 
 
 def header_change(head, hunks):
@@ -365,7 +372,8 @@ def not_in(files, others):
                 kept.append(h)
             else:
                 made -= runs
-        if kept or header_change(head, hunks) != header_change(other_head, other_hunks):
+        mine = header_change(head, hunks)
+        if kept or mine and mine != header_change(other_head, other_hunks):
             parts += head + [line for h in kept for line in h]
     return parts
 
