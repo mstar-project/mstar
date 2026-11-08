@@ -56,9 +56,9 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
         self._layout: tuple[int, int, bool] | None = None
 
     def _plan_kernel(self, cu: torch.Tensor, kv_cu: torch.Tensor, total_tokens: int, causal: bool) -> None:
-        shape = uniform_segments(cu)
+        segments = uniform_segments(cu)
         if self.accelerator_graph:
-            layout = None if shape is None else (*shape, causal)
+            layout = None if segments is None else (*segments, causal)
             if self._layout is not None and layout != self._layout:
                 raise ValueError(
                     f"{type(self).__name__}: a captured graph replays the {self._layout[0]} segments of "
@@ -68,7 +68,7 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
                 raise ValueError(f"{type(self).__name__} needs equal-length segments, got {self._describe(cu)}")
             self._layout = layout
             return
-        if shape is None:
+        if segments is None:
             if self._make_fallback is None:
                 raise ValueError(f"{type(self).__name__} needs equal-length segments, got {self._describe(cu)}")
             if self._fallback is None:
@@ -77,7 +77,7 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
             self._on_fallback = True
             return
         self._on_fallback = False
-        self._layout = (*shape, causal)
+        self._layout = (*segments, causal)
 
     @staticmethod
     def _describe(cu: torch.Tensor) -> str:

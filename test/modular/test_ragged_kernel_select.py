@@ -111,7 +111,7 @@ def test_a_geometry_without_an_entry_keeps_flashinfer(gpu):
 
 
 def test_the_table_is_read_for_the_ranks_heads(gpu):
-    """The shape key is one rank's slice: 48 heads over 2 ranks is the 24-head entry."""
+    """The table key is one rank's slice: 48 heads over 2 ranks is the 24-head entry."""
     gpu(B300)
     s = spec(heads=48)
     two_ranks = SimpleNamespace(tp_group=SimpleNamespace(world_size=2), sp_group=SimpleNamespace(world_size=1))
