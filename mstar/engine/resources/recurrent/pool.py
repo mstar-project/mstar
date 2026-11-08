@@ -79,6 +79,13 @@ class SlotState:
     generation: int = 0
     # tokens the state has taken in, which places its page boundaries
     tokens: int = 0
+    # under speculative decoding, the slots after `index` that hold the state
+    # after each further token of a verify row
+    extra: tuple[int, ...] = ()
+
+    @property
+    def group(self) -> tuple[int, ...]:
+        return (self.index, *self.extra)
 
 
 class SnapshotLease(NamedTuple):
@@ -137,6 +144,9 @@ class RecurrentAddressing:
     snapshot_every: int = 0
     # scatter_'s int64 copy of slot_indices, keyed by whether a graph capture made it
     scatter_index: dict[bool, torch.Tensor] = field(default_factory=dict, compare=False, repr=False)
+    # Under speculative decoding, each row's slots in token order (its
+    # `slot_indices` entry first), `pad_index` throughout for a row with none
+    host_slot_groups: Sequence[tuple[int, ...]] | None = None
 
 
 class RecurrentStatePool(Resource):
@@ -184,7 +194,7 @@ class RecurrentStatePool(Resource):
         self._blocks: dict[str, torch.Tensor] = {
             name: torch.zeros(
                 (*((config.num_layers,) if block.per_layer else ()),
-                 config.max_slots + config.prefix_slots, *block.shape),
+                 config.max_slots + config.prefix_slots, *block.storage_shape(config.spec_tokens)),
                 dtype=block.resolved_dtype(kv_dtype),
                 device=device,
             )
@@ -212,7 +222,8 @@ class RecurrentStatePool(Resource):
         # Admission, as `KVManager` decides it: only at one rank, since a
         # reservation held on rank 0 alone would make the ranks refuse different
         # allocations. `_reserved` holds, per admitted request, the slots kept
-        # for labels it hasn't taken yet, and `_kept` their sum.
+        # for labels it hasn't taken yet (`slots_per_request` each), and `_kept`
+        # their sum.
         self._decides = world_size == 1
         self._reserved: dict[str, int] = {}
         self._kept = 0
@@ -405,9 +416,10 @@ class RecurrentStatePool(Resource):
             if not labels:
                 return
             for slot in labels.values():
-                self._zero_slot(slot.index)
-                if free:
-                    self._free.append(slot.index)
+                for index in slot.group:
+                    self._zero_slot(index)
+                    if free:
+                        self._free.append(index)
             if free:
                 labels.clear()
             else:
@@ -441,19 +453,22 @@ class RecurrentStatePool(Resource):
             if slot is not None:
                 return slot
             kept = self._reserved.get(rid, 0)
-            if label not in self.config.labels or len(self._free) - self._kept + bool(kept) <= 0:
+            need = self.config.slots_per_request
+            if label not in self.config.labels or len(self._free) - self._kept + (need if kept else 0) < need:
                 # an undeclared label, or every free slot is kept for an admitted request
                 return None
             if kept:
-                self._kept -= 1
-                if kept == 1:
+                self._kept -= need
+                if kept == need:
                     del self._reserved[rid]
                 else:
-                    self._reserved[rid] = kept - 1
+                    self._reserved[rid] = kept - need
             # Slot ids must be unique across the batch: kernels assume it rather
             # than check, and a scatter with two rows on one slot is
             # nondeterministic. The free list guarantees it.
-            slot = labels[label] = SlotState(index=self._free.pop())
+            index = self._free.pop()
+            extra = tuple(self._free.pop() for _ in range(need - 1))
+            slot = labels[label] = SlotState(index=index, extra=extra)
             self._admit_taken[(rid, label)] = (slot.index, bool(kept))
             self._version += 1
             return slot
@@ -478,7 +493,8 @@ class RecurrentStatePool(Resource):
 
     def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
         with self._lock:
-            need, room = len(self.config.labels), len(self._free) - self._kept
+            need = len(self.config.labels) * self.config.slots_per_request
+            room = len(self._free) - self._kept
             if need > room:
                 return room
             self._reserved[rid] = need
@@ -570,11 +586,13 @@ class RecurrentStatePool(Resource):
             if slot is None or slot.index != index:
                 continue  # reset or removed under us; the slot went with it
             del labels[label]
-            self._zero_slot(index)
-            self._free.append(index)
+            for taken_index in slot.group:
+                self._zero_slot(taken_index)
+                self._free.append(taken_index)
             if reserved:
-                self._reserved[rid] = self._reserved.get(rid, 0) + 1
-                self._kept += 1
+                need = self.config.slots_per_request
+                self._reserved[rid] = self._reserved.get(rid, 0) + need
+                self._kept += need
             self._version += 1
 
     def _refused(self, rid: str, label: str) -> AdmitOutcome:
@@ -1098,10 +1116,13 @@ class RecurrentStatePool(Resource):
             )
             memo = self._addressing_memo.get(label)
             if memo is not None and memo[0] == memo_key:
-                return self._stage_addressing(label, segments, ctx, memo[1], memo[2])
+                return self._stage_addressing(label, segments, ctx, memo[1], memo[2], memo[3])
         pending_forks = pending_forks or {}
         indices = []
         has_state = []
+        spec = self.config.spec_tokens > 0
+        groups = [] if spec else None
+        pad_group = (pad,) * self.config.slots_per_request
         for seg in segments:
             slot = (
                 None if ctx.capture or ctx.is_padding_row(seg.request_id)
@@ -1112,18 +1133,22 @@ class RecurrentStatePool(Resource):
                 # sink (or the sentinel), which nothing reads back
                 indices.append(pad)
                 has_state.append(False)
+                if spec:
+                    groups.append(pad_group)
             else:
                 indices.append(slot.index)
                 has_state.append(
                     pending_forks.get((seg.request_id, label), slot.has_state)
                 )
+                if spec:
+                    groups.append(slot.group)
         if memo_key is not None:
-            self._addressing_memo[label] = (memo_key, indices, has_state)
-        return self._stage_addressing(label, segments, ctx, indices, has_state)
+            self._addressing_memo[label] = (memo_key, indices, has_state, groups)
+        return self._stage_addressing(label, segments, ctx, indices, has_state, groups)
 
     def _stage_addressing(
         self, label: str, segments: list[Segment], ctx: StepContext,
-        indices: list[int], has_state: list[bool],
+        indices: list[int], has_state: list[bool], groups: list[tuple[int, ...]] | None = None,
     ) -> RecurrentAddressing:
         pad = self.pad_index
         snapshots = ()
@@ -1163,6 +1188,7 @@ class RecurrentStatePool(Resource):
                 self._checkpoint_every(segments, ctx) if snapshots
                 else self._kv.config.tokens_per_page if self._kv is not None else 0
             ),
+            host_slot_groups=groups,
         )
 
     def _addressing_buffers(

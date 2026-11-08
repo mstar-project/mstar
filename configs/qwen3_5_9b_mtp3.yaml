@@ -1,0 +1,24 @@
+model: "qwen3_5_9b"
+max_seq_len: 32768
+node_groups:
+  # Speculative decoding is checked on text prompts; images still prefill
+  # through the encoder, unwarmed.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+model_kwargs:
+  # Speculative decoding: the checkpoint's MTP head drafts 3 tokens a step
+  # and each decode step verifies them (see SpecDecodeResource).
+  num_draft_tokens: 3
+  # drafts read an fp8 copy of lm_head (see Fp8DraftHead), the verify the checkpoint's
+  draft_head: fp8
+platform_overrides:
+  rocm:
+    # No step budget on AMD GPUs: AITER's chunked GDN prefill runs eagerly past 512 tokens at a
+    # near-flat cost there, so prompts run whole in pure prefill steps instead of chunked beside
+    # decode (the MI325X numbers are under "Chunked prefill budgets" in docs/serving.rst).
+    max_batch_tokens: {LLM: null}
+resources:
+  gdn_state:
+    # A request holds num_draft_tokens + 1 state slots: 64 requests, plus the sink.
+    max_slots: 257
+    # state_dtype: bfloat16  # default: the checkpoint's mamba_ssm_dtype (float32)
