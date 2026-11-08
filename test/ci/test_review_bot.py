@@ -18,10 +18,10 @@ import bot  # noqa: E402
 
 
 class Fail:
-    """A `gh` call that fails, as GitHub's errors do."""
+    """A call that fails, as GitHub's errors do, with exit status `code`."""
 
-    def __init__(self, stderr="HTTP 502"):
-        self.stderr = stderr
+    def __init__(self, stderr="HTTP 502", code=1):
+        self.stderr, self.code = stderr, code
 
 
 class FakeGh:
@@ -77,7 +77,7 @@ class FakeGh:
         if isinstance(answer, Fail):
             if check:
                 raise RuntimeError(f"{key}: {answer.stderr}")
-            return subprocess.CompletedProcess(argv, 1, "", answer.stderr)
+            return subprocess.CompletedProcess(argv, answer.code, "", answer.stderr)
         if not isinstance(answer, str):
             answer = json.dumps([answer] if "--slurp" in argv else answer)
         return subprocess.CompletedProcess(argv, 0, answer, "")

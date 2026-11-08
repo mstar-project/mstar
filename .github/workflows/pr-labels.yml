@@ -53,9 +53,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
-        run: |
-          python3 .github/review/gpu_review.py dismiss --pr "$PR" \
-            --message "New commits or a new base since the review bot approved; comment /review for a new review."
+        run: python3 .github/review/gpu_review.py dismiss
 
   label:
     concurrency:

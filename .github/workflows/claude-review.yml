@@ -32,11 +32,11 @@ name: Claude Review
 #      model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
-#   6. Every step that isn't an action runs main's .github/review/bot.py, never
-#      bash. Untrusted text reaches it through env vars and files, never a
-#      shell; a command line gets only values checked against a fixed pattern
-#      (a branch name, a label from the fixed list), and what it posts goes to
-#      gh on stdin.
+#   6. Every step that isn't an action runs main's .github/review/bot.py (or,
+#      in the live-test job, gpu_review.py), never bash. Untrusted text reaches
+#      it through env vars and files, never a shell; a command line gets only
+#      values checked against a fixed pattern (a branch name, a label from the
+#      fixed list), and what it posts goes to gh on stdin.
 #
 # `/review` (full mode) adds a second job, live-test, that runs no model and no PR code
 # here either: it rents GPUs (the team's Slurm nodes, else an open Eras listing),
@@ -109,15 +109,6 @@ permissions: {}
 env:
   # No __pycache__ in the tree the model reads.
   PYTHONDONTWRITEBYTECODE: 1
-  # Credential-shaped strings, removed (sed -E "$REDACT") from everything
-  # the workflow posts or saves.
-  REDACT: |
-    s/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g
-    s/(gh[opsur]_|github_pat_)[A-Za-z0-9_]{20,}/[REDACTED]/g
-    s/hf_[A-Za-z0-9]{20,}/[REDACTED]/g
-    s/AKIA[0-9A-Z]{16}/[REDACTED]/g
-    s/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/[REDACTED]/g
-
 
 jobs:
   # Decides whether a comment starts a review, in which mode and with which
@@ -530,55 +521,42 @@ jobs:
       # gpu.py's settings, from repository variables; the Slurm nodes' key from a secret, and
       # each node's host and pinned host key from REVIEW_SLURM_NODES. Nothing here reaches the box.
       - name: Configure the GPUs
-        id: cfg
         env:
           SLURM_KEY: ${{ secrets.REVIEW_SLURM_SSH_KEY }}
           SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
-          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS || '4' }}
-          HOURS: ${{ vars.REVIEW_GPU_HOURS || '4' }}
-          MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
-          MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS || '2' }}
+          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
+          HOURS: ${{ vars.REVIEW_GPU_HOURS }}
+          MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
+          MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS }}
           ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
+        run: python3 .github/review/gpu_review.py configure
+
+      # The review's fields as files for the steps below, whether the PR's author has write access
+      # (the live test runs the PR's code: only then), and the box's size.
+      - name: Read the review
+        id: cfg
+        env:
           RESULT: ${{ needs.review.outputs.result }}
           ABOVE: ${{ needs.review.outputs.above }}
-        run: |
-          # gpu.py's ledger, for this run only. Set here: a job's env can't read `runner`.
-          echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/live-pr"
-          python3 .github/review/gpu_review.py configure
-          printf '%s' "$RESULT" > review.json
-          [ -z "$ABOVE" ] || printf '%s' "$ABOVE" > stacked-above.json
-          # The live test runs the PR's code: only for an author with write access, checked
-          # against their permission (author_association can't tell write from read).
-          gh api "repos/$REPO/pulls/$PR" > pr.json
-          author=$(jq -r .user.login pr.json)
-          perm=$(gh api "repos/$REPO/collaborators/$author/permission" --jq .permission 2> /dev/null || echo none)
-          case "$perm" in admin|maintain|write) echo "trusted=true" >> "$GITHUB_OUTPUT" ;; esac
-          gpus=$(jq -r --argjson cap "$MAX_GPUS" '[.live_test.gpus // 1, $cap] | min' review.json)
-          { echo "gpus=$gpus"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
+          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
+          HOURS: ${{ vars.REVIEW_GPU_HOURS }}
+        run: python3 .github/review/gpu_review.py inputs
 
       # Nothing runs while the review left an open P0–P2 finding (counted as the approval rule counts
-      # them) or a skipped file (`gated`; the reasons go to gate.txt, as they hold
-      # model text): the comment says what to fix first. Otherwise the review's call stands unless the
-      # PR's last live test didn't pass on an ancestor of this head, or a re-review's `targeted`, or
-      # its `none` on runtime code, has no live test before it (gpu_review.py carry):
-      # then the live test runs in full, every kind of check, so a failure is never hidden. After a
-      # pass on an ancestor, a `targeted` run is told that commit and given that report. A `none`
-      # that stands runs nothing (verdict `skipped`), and counts as a pass for approval after that
-      # pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
-      # test, so the next run still checks against the last real one. A failed read of the PR's
-      # comments fails this step.
+      # them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
+      # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
+      # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
+      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry). A
+      # `none` that stands runs nothing (verdict `skipped`), and counts as a pass for approval after
+      # that pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
+      # test, so the next run still checks against the last real one. A failed read of the PR's comments
+      # fails this step.
       - name: Check the last live test
         if: steps.cfg.outputs.trusted == 'true'
         id: carry
         env:
           REREVIEW: ${{ needs.review.outputs.rereview }}
-        run: |
-          set -o pipefail  # an error in the decision fails this step, rather than tee's exit 0 hiding it
-          python3 .github/review/gpu_review.py carry --pr "$PR" --sha "$HEAD_SHA" --review review.json \
-            --earlier-report earlier-live-test.md --above stacked-above.json --gate "$RUNNER_TEMP/gate.txt" \
-            ${REREVIEW:+--rereview} | tee carry.log
-          grep '^[a-z_]*=' carry.log >> "$GITHUB_OUTPUT"
+        run: python3 .github/review/gpu_review.py carry
 
       - name: Get GPUs and start the live test
         if: steps.carry.outputs.run == 'full' || steps.carry.outputs.run == 'targeted'
@@ -588,39 +566,27 @@ jobs:
           # The box's own key, never the review's: the box runs PR code with a shell.
           LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
+          GPUS: ${{ steps.cfg.outputs.gpus }}
+          HOURS: ${{ steps.cfg.outputs.hours }}
           RUN: ${{ steps.carry.outputs.run }}
           CHECKS: ${{ steps.carry.outputs.checks }}
           SINCE: ${{ steps.carry.outputs.since }}
           FORCED: ${{ steps.carry.outputs.forced }}
           ASKED: ${{ steps.carry.outputs.asked }}
           ASKED_CHECKS: ${{ steps.carry.outputs.asked_checks }}
-        run: |
-          set +e
-          python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
-            --base "$BASE" \
-            --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
-            --run "$RUN" --checks "$CHECKS" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
-            ${FORCED:+--forced "$FORCED" --asked "$ASKED" --asked-checks "$ASKED_CHECKS"} \
-            --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
-          code=$?
-          [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
-          exit $code
+          TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM }}
+        run: python3 .github/review/gpu_review.py start
 
       - name: Wait for the live test
         if: steps.start.outcome == 'success'
         id: wait
         continue-on-error: true
         timeout-minutes: 340
-        run: |
-          set +e
-          python3 .github/review/gpu_review.py wait --out "$RUNNER_TEMP/lt"
-          code=$?
-          [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
-          exit $code
+        run: python3 .github/review/gpu_review.py wait
 
-      # What the box and the providers wrote, redacted in place before anything reads it, so
-      # the comment, the kept report and the artifact all get the redacted copy: the patterns
-      # above and the exact values of the secrets and hosts this job holds.
+      # What the box and the providers wrote, redacted in place before anything reads it, so the
+      # comment, the kept report and the artifact all get the redacted copy: bot.py's patterns and
+      # the exact values of the secrets and hosts this job holds.
       - name: Redact the live test's output
         if: always() && steps.cfg.outcome == 'success'
         id: redact
@@ -630,16 +596,7 @@ jobs:
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
           NODES: ${{ vars.REVIEW_SLURM_NODES }}
-        run: |
-          # Each node's host, as configured (user@host) and bare, as ssh's errors print it.
-          mapfile -t hosts < <(jq -r '.[].host // empty | ., (split("@") | last)' <<< "${NODES:-[]}")
-          for f in "$RUNNER_TEMP/lt/results/report.md" "$RUNNER_TEMP/lt/results/result.json" "$RUNNER_TEMP/lt/unavailable.md"; do
-            [ -f "$f" ] || continue
-            for v in "$S1" "$S2" "$S3" "${hosts[@]}"; do
-              [ -z "$v" ] || python3 -c 'import sys; p, v = sys.argv[1:]; s = open(p).read().replace(v, "[REDACTED]"); open(p, "w").write(s)' "$f" "$v"
-            done
-            sed -E -i "$REDACT" "$f"
-          done
+        run: python3 .github/review/gpu_review.py redact
 
       # The media go to the gallery repository (GitHub Pages), never into this
       # repository, whose every clone would carry them. Only audio, images and
@@ -648,11 +605,7 @@ jobs:
         if: steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
         id: render
         continue-on-error: true
-        run: |
-          python3 .github/review/gpu_review.py comment --pr "$PR" --sha "$HEAD_SHA" --out "$RUNNER_TEMP/lt" \
-            --site "$RUNNER_TEMP/site"
-          echo "verdict=$(cat "$RUNNER_TEMP/lt/verdict")" >> "$GITHUB_OUTPUT"
-          [ -e "$RUNNER_TEMP/site/index.html" ] && echo "media=true" >> "$GITHUB_OUTPUT" || true
+        run: python3 .github/review/gpu_review.py comment
 
       - name: Mint a token for the media repository
         if: steps.render.outputs.media == 'true' && vars.REVIEW_MEDIA_REPO != ''
@@ -666,9 +619,8 @@ jobs:
           repositories: ${{ vars.REVIEW_MEDIA_REPO }}
           permission-contents: write
 
-      # The gallery keeps the newest runs that fit in 900 MB, under Pages' 1 GB site limit, as a
-      # single commit, so neither the site nor the repository grows without bound. A push that loses a race with another run fails rather
-      # than overwrite it. The comment links the gallery only once the push went through.
+      # The newest runs that fit in 900 MB, as one commit; a push that loses a race fails rather
+      # than overwrite it, and the comment links the gallery only once the push went through.
       - name: Publish the media
         if: steps.media-app.outcome == 'success'
         continue-on-error: true
@@ -676,22 +628,7 @@ jobs:
           MEDIA_REPO: ${{ vars.REVIEW_MEDIA_REPO }}
           MEDIA_TOKEN: ${{ steps.media-app.outputs.token }}
           OWNER: ${{ github.repository_owner }}
-        run: |
-          git clone -q --depth 1 "https://x-access-token:$MEDIA_TOKEN@github.com/$OWNER/$MEDIA_REPO.git" "$RUNNER_TEMP/media"
-          cd "$RUNNER_TEMP/media"
-          branch=$(git symbolic-ref --short HEAD); old=$(git rev-parse -q --verify HEAD || true)
-          mkdir -p "pr-$PR/$TAG" && cp -r "$RUNNER_TEMP/site/." "pr-$PR/$TAG/"
-          total=0
-          for run in $(ls -d pr-*/*/ | sort -t/ -k2 -nr); do   # newest first: tags start with the run id
-            total=$((total + $(du -sb "$run" | cut -f1)))
-            [ "$total" -le 900000000 ] || rm -rf "$run"
-          done
-          git checkout -q --orphan gallery && git add -A
-          git -c user.name=mstar-review -c user.email=mstar-review@users.noreply.github.com commit -qm "Live-test media, the newest runs"
-          git push -q --force-with-lease="$branch:$old" origin "HEAD:$branch"
-          cd "$GITHUB_WORKSPACE"
-          python3 .github/review/gpu_review.py comment --pr "$PR" --sha "$HEAD_SHA" --out "$RUNNER_TEMP/lt" \
-            --media-url "https://${OWNER,,}.github.io/$MEDIA_REPO/pr-$PR/$TAG"
+        run: python3 .github/review/gpu_review.py publish
 
       # Minted here, after the live test, since the app's token lasts an hour:
       # everything below that posts or approves uses it.
@@ -715,12 +652,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
           SINCE: ${{ steps.carry.outputs.since }}
-        run: |
-          set -o pipefail  # an error in the rule fails this step, rather than tee's exit 0 hiding it
-          python3 .github/review/gpu_review.py approve --pr "$PR" --sha "$HEAD_SHA" --review review.json \
-            --complete true --verdict "$VERDICT" ${SINCE:+--since "$SINCE"} --above stacked-above.json \
-            --why "$RUNNER_TEMP/why.txt" | tee approve.log
-          grep '^approval=' approve.log >> "$GITHUB_OUTPUT" || true
+        run: python3 .github/review/gpu_review.py approve
 
       # Model output from untrusted input, posted only from the redacted copies.
       - name: Post the live test
@@ -737,30 +669,7 @@ jobs:
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
           GATED: ${{ steps.carry.outputs.gated }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          lt="$RUNNER_TEMP/lt"
-          if [ "$TRUSTED" != "true" ]; then
-            echo "The live test runs only on a PR whose author has write access; this review stands without it." > post.md
-          elif [ "$GATED" = "true" ]; then   # the reasons hold model text, so they can't open a comment
-            printf 'No live test yet: fix what the review left open first (%s), then comment `/review` again.\n' \
-              "$(sed 's/<!--/\&lt;!--/g' "$RUNNER_TEMP/gate.txt")" > post.md
-          elif [ -s "$lt/comment.md" ]; then cp "$lt/comment.md" post.md
-          elif [ -s "$lt/unavailable.md" ]; then { echo "<!-- claude-live-test sha=$HEAD_SHA verdict=unavailable -->"; cat "$lt/unavailable.md"; } > post.md
-          else   # the review chose `none` and it stood: its reason is model text, so it can't open a comment
-            printf '<!-- claude-live-test-none -->\nNo GPU run: %s\n' \
-              "$(jq -r '.live_test.reason // ""' review.json | sed 's/<!--/\&lt;!--/g')" > post.md
-          fi
-          if [ "$APPROVAL" = "approve" ]; then
-            printf '\n**Approved** on `%s` by the rule in `.github/review/gpu_review.py`.\n' "${HEAD_SHA:0:7}" >> post.md
-          elif [ "$APPROVAL" = "comment" ]; then
-            printf '\n**Would approve** `%s` by the rule in `.github/review/gpu_review.py`; doesn'"'"'t count toward required reviews: touches area/engine or area/resources.\n' "${HEAD_SHA:0:7}" >> post.md
-          elif [ -s "$RUNNER_TEMP/why.txt" ]; then
-            printf '\nNot approved: %s.\n' "$(cat "$RUNNER_TEMP/why.txt")" >> post.md
-          elif [ "$APPROVE_OUTCOME" = "failure" ]; then
-            printf '\nNot approved: the approval check failed. [Log](%s).\n' "$RUN_URL" >> post.md
-          fi
-          sed -E -i "$REDACT" post.md
-          gh pr comment "$PR" --repo "$REPO" --body-file post.md
+        run: python3 .github/review/gpu_review.py post
 
       - name: Keep the report
         if: always() && steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
@@ -778,7 +687,7 @@ jobs:
       - name: Release the GPUs
         if: always() && steps.cfg.outcome == 'success'
         continue-on-error: true
-        run: python3 .github/review/gpu_review.py cleanup --pr "$PR" --tag "$TAG"
+        run: python3 .github/review/gpu_review.py cleanup
 
       - name: Report a live test that didn't complete
         if: >-
@@ -790,6 +699,4 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          gh pr comment "$PR" --repo "$REPO" \
-            --body "The live test didn't complete. [Log]($RUN_URL). Comment \`/review\` to retry."
+        run: python3 .github/review/gpu_review.py incomplete
