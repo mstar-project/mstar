@@ -29,4 +29,4 @@ Rules:
 - Raise only what the evidence supports. Return an empty list when nothing is worth raising. No padding, no general advice, no praise.
 - No personal names or logins, and no quotes of people's comments: say what happened in your own words.
 - Plain text only: no links, images or `#` references in `title`, `change` or `where`.
-- Never propose weakening the trust boundary, the spend caps or the approval rule.
+- Never propose weakening the trust boundary, the spend cap or the approval rule.

@@ -9,7 +9,7 @@ decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config `configure` writes: the team's
 Slurm node with the most GPUs free, else any open Eras listing under the hourly cap. The live
 test's files are in $RUNNER_TEMP/lt; `start` and `wait` exit 3, with `unavailable` set, when no GPUs
-are free, the bot has REVIEW_GPU_MAX_RUNS runs going or it is past a spend cap, after writing lt/unavailable.md.
+are free, the bot has REVIEW_GPU_MAX_RUNS runs going or it is past the spend cap, after writing lt/unavailable.md.
 """
 import fnmatch
 import html
@@ -299,7 +299,7 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
           since: commit = "", forced="", asked="", asked_checks: check_kinds = (), turns: int = 2000):
     """Get GPUs and start the live-test session on them: the brief (fixed text, the commits and carry's
     call), the review's notes (findings.json) and the PR's title and description (pr-body.md) as data,
-    and the box's own Anthropic key. Exits 3, with `unavailable` set, when the bot is past a spend cap,
+    and the box's own Anthropic key. Exits 3, with `unavailable` set, when the bot is past the spend cap,
     no GPUs are free or it has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md."""
     if run not in ("full", "targeted") or forced not in ("", *FORCED) or asked not in ("", "none", "targeted", "full"):
         raise ValueError(f"unexpected run {run!r}, forced {forced!r} or asked {asked!r}")

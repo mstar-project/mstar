@@ -282,10 +282,10 @@ class TestStart(unittest.TestCase):
                       "the PR would read that there were no GPUs")
 
     def test_past_a_spend_cap_no_box_starts_and_the_pr_is_told(self):
-        with unittest.mock.patch.object(bot, "over_cap", lambda repo: "The review bot's daily spend cap is reached."):
+        with unittest.mock.patch.object(bot, "over_cap", lambda repo: "The review bot's weekly spend cap is reached."):
             out, launched = self.start("sk-test", {"eras": {"run_secret_id": "s"}})
         self.assertEqual(launched, [], "a live test would start past the cap")
-        self.assertIn("daily spend cap", (out / "unavailable.md").read_text(), "the PR wouldn't be told why")
+        self.assertIn("weekly spend cap", (out / "unavailable.md").read_text(), "the PR wouldn't be told why")
 
     def test_a_stacked_pr_is_tested_against_its_base_branch(self):
         self.assertIn("--base joe/cp-stack-1", gpu_review.brief(7, "0123456789", "abcdef", "joe/cp-stack-1", "full",
