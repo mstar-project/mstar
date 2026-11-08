@@ -466,7 +466,8 @@ def _chatterbox() -> ModelSpec:
     return ModelSpec(
         "T3", lambda model: _random_ids(model.config.t3.speech_vocab_size - 10), run, declare,
         config="configs/chatterbox.yaml",
-        request={"output_modalities": "audio", "model_kwargs": {"temperature": 0.0}},
+        # a fixed seed: S3Gen draws its flow noise from the request's seed, fresh per request without one
+        request={"output_modalities": "audio", "model_kwargs": {"temperature": 0.0, "seed": 0}},
         hf=hf,
     )
 
