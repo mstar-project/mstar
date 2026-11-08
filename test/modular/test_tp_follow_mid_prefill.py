@@ -55,7 +55,6 @@ def _follower(head: ScheduleTPNode) -> Worker:
     )
     worker.request_state = SimpleNamespace(per_request_info={})
     worker._in_flight_rids = set()
-    worker._poll_stream_buffers_for_speculation = lambda rid, node: []
     worker.assembled = {}
 
     # no connections: nothing to poll, and the step's edges read as they are

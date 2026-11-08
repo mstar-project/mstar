@@ -707,8 +707,6 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w.partition_topology = None
     w._my_consumer_connections = []
     w._streaming_edge_names = set()
-    w._consumer_node_cache = {}
-    w._stream_partition = {}
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._innermost_loop_by_node = {}
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides

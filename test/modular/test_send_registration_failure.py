@@ -203,7 +203,6 @@ def _postprocess_worker(refuse, follower=False):
     )
     w._inline_emit_values = lambda *a: (None, None)
     w._count_new_tokens = lambda *a: {}
-    w._stream_consumption_batch = lambda rids: []
 
     def check_stop(node_batch, cpu_outputs, host_rows=None):
         w.log.stop_checked.append(list(node_batch.request_ids))
