@@ -18,7 +18,7 @@ scheduler tick, the data worker):
 - launch-bound loops of tiny kernels;
 - Python on the critical path per token or step, per-request objects built every step (invariant 6);
 - memory that shrinks the KV pool or the batch size. The PR's peak memory is measured, not
-  assumed: a peak nobody measured is a regression finding until a measurement shows none;
+  assumed: a peak nobody measured joins the evidence and scope finding (SKILL.md §2);
 - memory a step allocates that warmup and the capture plan never saw (a workspace made on first use
   of a shape, a buffer that grows with batch size): the pools were sized without it, so serving
   OOMs later. That is a cliff (SKILL.md §4.2).
