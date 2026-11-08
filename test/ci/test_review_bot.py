@@ -243,6 +243,103 @@ class TestCaps(unittest.TestCase):
         self.assertIn("couldn't read its spend ledger", fake.writes()[0][1], "a blind bot could spend past its cap")
 
 
+class TestMonitor(unittest.TestCase):
+    def test_a_revert_is_found_by_its_message_after_the_merge_only(self):
+        commits = [{"sha": "c" * 40, "subject": 'Revert "Faster decode (#7)"', "body": ""},
+                   {"sha": "e" * 40, "subject": "Unrelated", "body": f"This reverts commit {'a' * 40}."},
+                   {"sha": "d" * 40, "subject": "M", "body": ""},
+                   {"sha": "f" * 40, "subject": "Older", "body": f"This reverts commit {'a' * 40}."}]
+        hits = bot.reverted(commits, {"d" * 40, "a" * 40}, 7, "d" * 40)
+        self.assertEqual([c["sha"] for c in hits], ["c" * 40, "e" * 40],
+                         "a revert before the merge, or one of another PR's commit, would be blamed on this PR")
+
+    def test_timeline_cross_references_are_signals_only_when_they_report_or_fix_a_bug(self):
+        def ref(number, labels=(), pr=False, body=""):
+            issue = {"number": number, "title": "t", "labels": [{"name": n} for n in labels], "body": body}
+            return {"event": "cross-referenced", "source": {"issue": {**issue, **({"pull_request": {}} if pr else {})}}}
+
+        timeline = [ref(10, ["bug"]), ref(11, ["enhancement"]), ref(12, pr=True, body="Fixes #7"),
+                    ref(13, ["type/bug"], pr=True), ref(14, pr=True, body="Fixes #70"),
+                    {"event": "labeled"}]
+        signals, mentions = bot.referenced(timeline, 7)
+        self.assertEqual({int(s["key"].split(":")[-1]) for s in signals}, {10, 12, 13})
+        self.assertEqual(len(mentions), 2, "an unrelated mention would be reported as a bug")
+
+    def test_a_fix_that_changes_a_prs_lines_is_blamed_on_it(self):
+        with workspace() as ws:
+            def git(*a):
+                return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            git("init", "-q")
+            (ws / "a.py").write_text("one\ntwo\nthree\n")
+            git("add", "a.py")
+            git("commit", "-qm", "base")
+            (ws / "a.py").write_text("one\nTWO\nthree\n")
+            git("commit", "-qam", "the PR (#7)")
+            pr_sha = git("rev-parse", "HEAD")
+            (ws / "a.py").write_text("one\nTWO fixed\nthree\n")
+            git("commit", "-qam", "Fix a crash (#9)")
+            fix = git("rev-parse", "HEAD")
+            hits = bot.szz([{"sha": fix, "subject": "Fix a crash (#9)", "body": ""}], {pr_sha}, 7, {"a.py"})
+        self.assertEqual([s["text"] for s in hits], ["#9 changed lines #7 wrote at `a.py:2`"],
+                         "a fix of the PR's lines would go unseen")
+
+    def test_an_open_approved_pr_the_merge_queue_threw_out_is_a_signal(self):
+        nodes = [{"createdAt": "2026-11-07T00:00:00Z", "reason": "FAILED_CHECKS"}]
+        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues/8/timeline*": [], "POST graphql": {
+                "data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}}})):
+            signals, _ = bot.pr_signals("o/r", {"number": 8, "state": "open"}, [], set())
+        self.assertEqual(signals, [{"key": "8:ejected:2026-11-07T00:00:00Z",
+                                    "text": "#8 removed from the merge queue (FAILED_CHECKS)"}])
+
+    def run_monitor(self, body, bug_title="crash in decode"):
+        calls = {"body": None}
+
+        def issue_status(argv, stdin):
+            return {"number": 2, "body": calls["body"] or body, "user": {"login": "github-actions[bot]"}}
+
+        def patch(argv, stdin):
+            calls["body"] = json.loads(stdin)["body"]
+            return {}
+
+        routes = {
+            "GET repos/o/r/issues[?]state=all&creator=*": [LEDGER, STATUS],
+            "GET repos/o/r/issues/1/comments*": [spent(3.0, run="1", approval="approve", pr="7")],
+            "GET repos/o/r/issues/2": issue_status, "PATCH repos/o/r/issues/2": patch, "issue comment": "",
+            "GET repos/o/r/pulls/7": {"number": 7, "title": "Faster decode @someone", "state": "closed",
+                                      "merged_at": "t", "merge_commit_sha": "d" * 40},
+            "GET repos/o/r/pulls/7/reviews*": [{"state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
+            "GET repos/o/r/pulls/7/commits*": [{"sha": "a" * 40}],
+            "GET repos/o/r/issues/7/timeline*": [],
+            "GET repos/o/r/commits/*/check-runs*": {"check_runs": []},
+            "GET repos/o/r/issues[?]state=all&labels=bug*": [{"number": 30, "title": bug_title,
+                                                               "created_at": "2026-11-08T00:00:00Z"}],
+            "GET repos/o/r/issues[?]state=closed&labels=type*": [],
+            "GET repos/o/r/pulls[?]*": [],
+            "git log": (f'{"c" * 40}\x1f{"d" * 40}\x1fRevert "Faster decode (#7)"\x1f\x1e\n'
+                        f'{"d" * 40}\x1f{"b" * 40}\x1fFaster decode (#7)\x1f\x1e\n'),
+            "git diff": "a.py\n", "git show": "", "git blame": "",
+        }
+        with mock.patch.object(bot, "utcnow", lambda: NOW):
+            out, fake = step(bot.monitor, routes, repo="o/r", approvals="on")
+        return calls["body"], fake
+
+    def test_new_signals_reach_subscribers_once_and_the_body_is_safe(self):
+        body, fake = self.run_monitor(STATUS["body"], bug_title="crash @someone <!-- x")
+        self.assertTrue(body.startswith(bot.issue_marker("status")), "the next run couldn't find the status issue")
+        self.assertIn("$3 of $10,000", body)
+        self.assertIn("Approvals: **on**", body)
+        comments = [s for k, s in fake.writes() if k == "issue comment"]
+        self.assertEqual(len(comments), 1, "a new signal would not notify subscribers")
+        self.assertIn("reverted", comments[0])
+        self.assertNotIn("@someone", body + comments[0], "a PR's title could ping someone from the status issue")
+        self.assertNotIn("<!-- x", body, "a title could open an HTML comment")
+        _, fake = self.run_monitor(body)
+        self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
+                         "a signal already reported would notify subscribers every day")
+
+
 class TestRestore(unittest.TestCase):
     def restore(self, meta, non_write="", path=".github/workflows/claude-review.yml"):
         """/review continue finding one stopped review whose saved handoff has `meta`."""
