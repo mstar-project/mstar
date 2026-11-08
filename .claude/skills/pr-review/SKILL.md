@@ -448,7 +448,10 @@ does; read it.
 The rating says whether a human must make a design or direction decision before this merges. It is
 not about correctness: findings and, in gpu mode, the live test own that. Rate the PR `low`,
 `medium` or `high`, with one sentence of reason. Touching a shared layer is not by itself `medium`
-or `high`; what counts is whether the PR decides something the team hasn't.
+or `high`; what counts is whether the PR decides something the team hasn't. The exception is
+security: a change to security-relevant or trust-boundary code (auth, API keys and secrets
+handling, redaction, what untrusted input reaches) is at least `medium`, since a human owns security
+decisions.
 
 - **`low`:** follows the existing design and patterns: no new abstraction and no change to how a
   shared layer is structured; no new public API, config key, CLI flag, env var or wire format; no
