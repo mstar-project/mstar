@@ -63,7 +63,12 @@ SCHEMA = {
         "risk": {"type": "object", "properties": {
             "level": {"type": "string", "enum": ["low", "medium", "high"]},
             "reason": {"type": "string"},
-        }, "required": ["level", "reason"]},
+            # Where a human reviewer should look, when the risk isn't low: each place and why.
+            "look_at": {"type": "array", "items": {"type": "object", "properties": {
+                "location": {"type": "string", "description": "path:line, or a function or class"},
+                "why": {"type": "string"},
+            }, "required": ["location", "why"]}},
+        }, "required": ["level", "reason", "look_at"]},
         "live_test": {"type": "object", "properties": {
             "run": {"type": "string", "enum": ["none", "targeted", "full"]},
             "reason": {"type": "string"},
@@ -134,6 +139,7 @@ def render(review, pages, head, mode):
         ("Description", review["description_problems"]),
         ("Questions", review["questions"]),
         ("Design", review.get("design", [])),
+        ("Where to look", [f"`{p['location']}`: {p['why']}" for p in (review.get("risk") or {}).get("look_at", [])]),
     ]
     for title, items in sections:
         if items:

@@ -792,25 +792,13 @@ jobs:
           HOURS: ${{ vars.REVIEW_GPU_HOURS || '4' }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
           ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
+          ERAS_CACHE_VOLUMES: ${{ vars.ERAS_CACHE_VOLUMES }}
           RESULT: ${{ needs.review.outputs.result }}
         run: |
           # gpu.py's ledger, for this run only. Set here: a job's env can't read `runner`.
           echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
-          mkdir -p ~/.ssh "$RUNNER_TEMP/live-pr"
-          ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/live_pr   # Eras boxes: this run's key, registered by gpu.py
-          slurm='{}'
-          if [ -n "$SLURM_KEY" ] && [ -n "$SLURM_HOST" ]; then
-            (umask 077; printf '%s\n' "$SLURM_KEY" > ~/.ssh/review_slurm)
-            slurm=$(jq -n --arg h "$SLURM_HOST" --argjson p "$SLURM_PORT" --arg k "$SLURM_HOST_KEY" \
-              --arg part "$SLURM_PARTITION" --argjson g "$MAX_GPUS" '{host: $h, port: $p, host_key: $k,
-              identity_file: "~/.ssh/review_slurm", partition: $part, nice: 100, max_gpus: $g,
-              job_prefix: "review-bot", workdir: "/workspace/review-bot", gpu: "H200", vram_gb: 141}')
-          fi
-          jq -n --argjson s "$slurm" --argjson usd "$MAX_USD" --argjson h "$HOURS" --arg sec "$ERAS_SECRET" '{
-            mode: "cloud", results_dir: "results", ssh_public_key: "~/.ssh/live_pr.pub", identity_file: "~/.ssh/live_pr",
-            budget: {max_usd_per_hour: $usd, max_hours: $h, max_concurrent_instances: 1, max_total_usd: ($usd * $h)},
-            slurm: $s, eras: ({} + (if $sec != "" then {run_secret_id: $sec} else {} end)),
-            runpod: {enabled: false}, lambda: {enabled: false}}' > .claude/skills/live-pr-test/config.local.json
+          mkdir -p "$RUNNER_TEMP/live-pr"
+          python3 .github/review/gpu_review.py configure
           printf '%s' "$RESULT" > review.json
           # The live test runs the PR's code: only for an author with write access, checked
           # against their permission (author_association can't tell write from read).

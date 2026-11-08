@@ -13,7 +13,7 @@ render, open_findings, read_state = SUMMARY["render"], SUMMARY["open_findings"],
 def review(skipped=(), prior=()):
     return {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
             "skipped": list(skipped), "types": ["bug"], "prior_findings": list(prior), "design": [],
-            "risk": {"level": "low", "reason": "docs only"}}
+            "risk": {"level": "low", "reason": "docs only", "look_at": []}}
 
 
 def threads(*nodes):

@@ -71,6 +71,35 @@ def gh_json(path):
 
 # ---------------------------------------------------------------- GPUs
 
+def cmd_configure(a):
+    """gpu.py's config.local.json from the workflow's variables and secrets (env), and the ssh keys.
+    The Slurm node only with its key and host; Eras only with ERAS_API_KEY (gpu.py checks)."""
+    env = os.environ.get
+    ssh = Path.home() / ".ssh"
+    ssh.mkdir(mode=0o700, exist_ok=True)
+    if not (ssh / "live_pr").exists():  # Eras boxes: this run's key, which gpu.py registers
+        run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "live_pr"))
+    slurm = {}
+    if env("SLURM_KEY") and env("SLURM_HOST"):
+        key = ssh / "review_slurm"
+        key.touch(mode=0o600)
+        key.write_text(env("SLURM_KEY").strip() + "\n")
+        slurm = {"host": env("SLURM_HOST"), "port": int(env("SLURM_PORT") or 22), "host_key": env("SLURM_HOST_KEY", ""),
+                 "identity_file": str(key), "partition": env("SLURM_PARTITION") or "background", "nice": 100,
+                 "max_gpus": int(env("MAX_GPUS") or 4), "job_prefix": "review-bot", "workdir": "/workspace/review-bot",
+                 "gpu": "H200", "vram_gb": 141, "hf_home": env("SLURM_HF_HOME") or "/workspace/shared/hf"}
+    usd, hours = float(env("MAX_USD") or 30), float(env("HOURS") or 4)
+    eras = {"cache_volume_ids": (env("ERAS_CACHE_VOLUMES") or "").split()}
+    if env("ERAS_SECRET"):
+        eras["run_secret_id"] = env("ERAS_SECRET")
+    cfg = {"mode": "cloud", "results_dir": "results", "ssh_public_key": str(ssh / "live_pr.pub"),
+           "identity_file": str(ssh / "live_pr"),
+           "budget": {"max_usd_per_hour": usd, "max_hours": hours, "max_concurrent_instances": 1,
+                      "max_total_usd": usd * hours},
+           "slurm": slurm, "eras": eras, "runpod": {"enabled": False}, "lambda": {"enabled": False}}
+    (GPU.parent.parent / "config.local.json").write_text(json.dumps(cfg, indent=1))
+
+
 def branch(name):
     """A branch name safe to put in the brief and on a shell command line."""
     if not re.fullmatch(r"[A-Za-z0-9._/-]+", name) or name.startswith("-"):
@@ -291,7 +320,8 @@ def reasons_not_to_approve(a, review):
     if a.verdict != "pass":
         why.append(f"the live test's verdict is {a.verdict}")
     if (review.get("risk") or {}).get("level") != "low":
-        why.append(f"the review rated the risk {(review.get('risk') or {}).get('level', 'unrated')}")
+        level = (review.get("risk") or {}).get("level", "unrated")
+        why.append(f"the review rated the risk {level} (its summary's \"Where to look\" lists what to read)")
     if review.get("questions"):
         why.append(f"{len(review['questions'])} open question(s)")
     if review.get("skipped"):
@@ -414,6 +444,7 @@ def cmd_comment(a):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("configure")
     p = sub.add_parser("start")
     for name in ("--sha", "--main-sha", "--review", "--out", "--tag"):
         p.add_argument(name, required=True)
@@ -448,7 +479,7 @@ def main():
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--media-url", default="")
     a = ap.parse_args()
-    {"start": cmd_start, "wait": cmd_wait, "cleanup": cmd_cleanup, "approve": cmd_approve,
+    {"configure": cmd_configure, "start": cmd_start, "wait": cmd_wait, "cleanup": cmd_cleanup, "approve": cmd_approve,
      "dismiss": cmd_dismiss, "comment": cmd_comment}[a.cmd](a)
 
 

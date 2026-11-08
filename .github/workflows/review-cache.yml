@@ -1,0 +1,82 @@
+name: Review bot cache
+
+# Fills the review bot's Eras cache volumes (ERAS_CACHE_VOLUMES) with model weights and compile
+# caches from main, so a `/review gpu` live test on Eras starts warm. Run by hand (it takes write
+# access to dispatch) after models are added or main's kernels change. It runs only main's code,
+# with the volumes read-write; live tests mount them read-only. See .github/review/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Models to warm: `all` (every name in mstar serve's registry) or names, space-separated"
+        default: all
+      skip:
+        description: Names to leave out (checkpoints too big for the volumes)
+        default: glm52 glm5_next
+      gpus:
+        description: GPUs for the box (the largest default config needs 8)
+        default: "8"
+      hours:
+        description: The box's deadline, in hours
+        default: "10"
+
+permissions: {}
+
+concurrency:
+  group: review-cache
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    env:
+      ERAS_API_KEY: ${{ secrets.ERAS_API_KEY }}
+      ERAS_CACHE_VOLUMES: ${{ vars.ERAS_CACHE_VOLUMES }}
+      MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
+      TAG: cache-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Start the refresh on an Eras box
+        env:
+          MODELS: ${{ inputs.models }}
+          SKIP: ${{ inputs.skip }}
+          GPUS: ${{ inputs.gpus }}
+          HOURS: ${{ inputs.hours }}
+        run: |
+          [ -n "$ERAS_API_KEY" ] && [ -n "$ERAS_CACHE_VOLUMES" ] || { echo "::error::Set ERAS_API_KEY and ERAS_CACHE_VOLUMES."; exit 1; }
+          echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
+          export LIVE_PR_STATE=$RUNNER_TEMP/live-pr
+          python3 .github/review/gpu_review.py configure
+          out="$RUNNER_TEMP/cache" && mkdir -p "$out"
+          jq -n --arg r "$GITHUB_REPOSITORY" --arg s "$(git rev-parse HEAD)" --arg m "$MODELS" --arg k "$SKIP" \
+            '{repo: $r, main_sha: $s, models: $m, skip: $k}' > "$out/run.json"
+          S=.claude/skills/live-pr-test/scripts/gpu.py
+          offer=$(python3 "$S" offers --gpus "$GPUS" --json | jq -r --argjson cap "$MAX_USD" \
+            '[.offers[] | select(.provider == "eras" and .availability == "now" and .usd_per_hour <= ($cap * 2))][0].id // empty')
+          [ -n "$offer" ] || { echo "::error::No Eras listing with $GPUS GPUs free now."; exit 1; }
+          python3 "$S" launch "$offer" --pr 0 --hours "$HOURS" --tag "$TAG" --cache rw --allow-over-budget \
+            --run .github/review/refresh_cache_box.sh --input "$out/run.json" | tail -n 1 > "$out/instance"
+
+      - name: Wait for it
+        timeout-minutes: 700
+        run: python3 .github/review/gpu_review.py wait --out "$RUNNER_TEMP/cache"
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: review-cache-${{ github.run_id }}
+          path: ${{ runner.temp }}/cache/results/refresh.log
+          if-no-files-found: ignore
+
+      - name: Release the box
+        if: always()
+        run: python3 .github/review/gpu_review.py cleanup --pr 0 --tag "$TAG"

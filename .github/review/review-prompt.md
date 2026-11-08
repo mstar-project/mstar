@@ -82,7 +82,7 @@ Keep the body to one short paragraph that names the triggering inputs or state; 
 - `checked`: the paths and claims you traced and found sound, one line each, so a review with few or no findings shows its evidence. The comment shows them collapsed.
 - `skipped`: the files you didn't review, on a diff too large to cover. Empty otherwise.
 - `design`: thorough and gpu, the skill's design verdict, a few lines. Empty in light mode.
-- `risk`: `level` (`low`, `medium` or `high`) and `reason`, by the skill's §6.
+- `risk`: `level` (`low`, `medium` or `high`), `reason`, and `look_at`, by the skill's §6: when the risk isn't low, every place a human reviewer should read before merging, each with why. Empty when it is low.
 - `live_test`: gpu mode, `run` (`none`, `targeted` or `full`), `reason`, `confirm` (the "how to confirm" lines of open P0–P2 findings, for the live test to settle) and `gpus`, the fewest GPUs the largest config the live test needs runs on (the workflow caps it). Omit it in other modes.
 
 **Types.** Return the `types` field too: the kinds of change the PR is, main one first, one to three of them, which the workflow applies as `type/*` labels. Judge from the code, not the title.

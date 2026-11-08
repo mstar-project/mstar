@@ -458,6 +458,15 @@ not the review's confidence. A part of the diff the review did not read or skipp
   review could not read all of it.
 - **`medium`:** everything else.
 
+**When the risk isn't low, say where to look.** A human now has to approve it, so list every place
+they should read before merging: `path:line` (or the function or class) and, in a sentence, what
+could go wrong there and on which path. Name the risk, not the diff: "this early return skips the
+rank-0 broadcast on the failure path" rather than "changes the scheduler". For a risk in the
+abstractions or the architecture, spell the design out: the choice the PR made, the alternatives
+(including the one Phase A derived), what the PR's choice does well, what would be better and what
+it would cost to change. Each of these is also a finding or a question if it is a defect or
+undecided; `look_at` is the reading list, not a second home for findings.
+
 ## 7. Live test (gpu mode)
 
 The live test is a second session that runs after the review, on the GPU box, with a shell there and
