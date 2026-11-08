@@ -17,6 +17,7 @@ Slurm node when it has them free, else any open Eras listing under the hourly ca
 `start` exits 3 when no GPUs are free, after writing DIR/unavailable.md.
 """
 import argparse
+import fnmatch
 import html
 import json
 import os
@@ -35,9 +36,12 @@ SUMMARY = runpy.run_path(str(Path(__file__).with_name("render_summary.py")))
 BOX = Path(__file__).with_name("gpu_review_box.sh")
 REPO = os.environ.get("REPO", "mstar-project/mstar")
 WRITE = ("admin", "maintain", "write")
-# Never approved, whatever the review says: the bot's own rules and the dependencies.
-NEVER_DIRS = (".github/", ".claude/")
-NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py")
+# Never approved, whatever the review says: the bot's own rules, CI, and the dependencies and toolchains.
+NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/ci/")
+NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py", "Cargo.toml", "rust-toolchain.toml",
+               "requirements*.txt")
+# Approved only as a comment that doesn't count toward required reviews.
+NO_COUNT_AREAS = {"area/engine", "area/resources"}
 ERAS_OUT = "/workspace/live-pr/out"
 MEDIA_CAP = 100 * 2**20  # media per run: the gallery is one GitHub Pages site, 1 GB in all
 MEDIA = {".png": "img", ".jpg": "img", ".jpeg": "img", ".gif": "img", ".webp": "img",
@@ -305,13 +309,14 @@ def blocking(review, pages):
 
 
 def file_gate(files, repo_root):
-    """(blocked, engine): the files that rule out any approval (the bot's rules, dependencies and
-    lockfiles), and those in area/engine, whose approval the bot posts as a comment that doesn't
-    count toward required reviews."""
+    """(blocked, engine): the files that rule out any approval (the bot's rules, CI, dependencies,
+    toolchains and lockfiles), and those in area/engine or area/resources, whose approval the bot
+    posts as a comment that doesn't count toward required reviews."""
     labels = runpy.run_path(str(ROOT / ".github/labels/label_prs.py"))
     aliases = labels["model_aliases"](str(repo_root), [{"filename": f} for f in files])
-    blocked = [f for f in files if f.startswith(NEVER_DIRS) or Path(f).name in NEVER_FILES or f.endswith(".lock")]
-    engine = [f for f in files if f not in blocked and "area/engine" in labels["areas_of"](f, aliases)]
+    blocked = [f for f in files if f.startswith(NEVER_DIRS) or f.endswith(".lock")
+               or any(fnmatch.fnmatchcase(Path(f).name, name) for name in NEVER_FILES)]
+    engine = [f for f in files if f not in blocked and NO_COUNT_AREAS & set(labels["areas_of"](f, aliases))]
     return blocked, engine
 
 
@@ -361,7 +366,7 @@ def cmd_approve(a):
         return
     if engine:  # a comment, not an approval, so it can't count toward required reviews
         body = (f"The review bot would approve `{a.sha[:7]}`: low risk, no open P0–P2 finding, and the live test "
-                "passed on it. This doesn't count toward required reviews, because the change touches area/engine ("
+                "passed on it. This doesn't count toward required reviews, because the change touches area/engine or area/resources ("
                 + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else "") + ").")
         gh("api", "-X", "POST", f"repos/{REPO}/pulls/{a.pr}/reviews", "-f", f"commit_id={a.sha}",
            "-f", "event=COMMENT", "-f", f"body={body}")

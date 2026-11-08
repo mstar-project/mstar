@@ -1003,7 +1003,7 @@ jobs:
           if [ "$APPROVED" = "true" ]; then
             printf '\n**Approved** on `%s` by the rule in `.github/review/gpu_review.py`.\n' "${HEAD_SHA:0:7}" >> post.md
           elif [ "$APPROVED" = "engine" ]; then
-            printf '\n**Would approve** `%s` by the rule in `.github/review/gpu_review.py`; doesn'"'"'t count toward required reviews: touches area/engine.\n' "${HEAD_SHA:0:7}" >> post.md
+            printf '\n**Would approve** `%s` by the rule in `.github/review/gpu_review.py`; doesn'"'"'t count toward required reviews: touches area/engine or area/resources.\n' "${HEAD_SHA:0:7}" >> post.md
           elif [ -s "$RUNNER_TEMP/why.txt" ]; then
             printf '\nNot approved: %s.\n' "$(cat "$RUNNER_TEMP/why.txt")" >> post.md
           elif [ "$APPROVE_OUTCOME" = "failure" ]; then

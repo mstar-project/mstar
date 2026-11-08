@@ -62,9 +62,12 @@ class TestApproval(unittest.TestCase):
 
     def test_rules_and_dependencies_never_approve_and_engine_approvals_dont_count(self):
         for path in (".github/review/review-prompt.md", ".claude/skills/pr-review/SKILL.md", "AGENTS.md",
-                     "CLAUDE.md", "uv.lock", "rust/server/Cargo.lock", "pyproject.toml", "setup.py"):
+                     "CLAUDE.md", "uv.lock", "rust/server/Cargo.lock", "pyproject.toml", "setup.py",
+                     "rust/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", "docs/requirements.txt",
+                     "scripts/ci/check.sh"):
             self.assertTrue(file_gate([path], REPO_ROOT)[0], f"a change to {path} could be approved")
-        self.assertEqual(file_gate(["mstar/engine/engine.py"], REPO_ROOT), ([], ["mstar/engine/engine.py"]),
+        engine = ["mstar/engine/engine.py", "mstar/engine/resources/kv_cache.py"]
+        self.assertEqual(file_gate(engine, REPO_ROOT), ([], engine),
                          "an engine change's approval would count toward required reviews")
         self.assertEqual(file_gate(["mstar/worker/worker.py", "mstar/model/kokoro/model.py",
                                     "mstar/model/orpheus/model.py", "docs/models.rst"], REPO_ROOT), ([], []),
