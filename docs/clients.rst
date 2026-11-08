@@ -527,7 +527,7 @@ Per-model notes:
   between; audio between replies is silence and is not sent. A reply ends at the
   model's end mark, where the next reply starts, or, for a model that declares
   ``turn_idle_steps``, once its text has been only padding that long (Nemotron: 2 s,
-  since it often sends no end mark). ``turn_detection``
+  since it often sends no end mark); text after that opens the next reply. ``turn_detection``
   ``server_vad`` and ``semantic_vad`` both mean "the model decides", and their knobs are
   not used; null, or ``create_response`` / ``interrupt_response`` false, are refused.
   ``input_audio_buffer.commit`` is acknowledged and flushes nothing; ``clear`` drops only
