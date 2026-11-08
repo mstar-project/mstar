@@ -75,13 +75,15 @@ class LLMSubmodule(SampledTokenDecoder):
     # little past 1024 tokens (1024 plus its chat template) without padding it
     # to 2048. Only a text-prefill step, one with no decode rows beside it,
     # uses them; a mixed step doesn't capture them. Under the default step
-    # budget no step passes 2176. The default keeps 4096 and 8192, the powers
-    # of two a deployment that raises `max_batch_tokens` or turns chunking off
-    # fills exactly, and leaves it the slack rungs above them, since each
-    # bucket is one more compile against Dynamo's recompile limit: there a step
-    # just past a power of two pads to the next, and past 8192 runs eagerly,
-    # unless `model_kwargs.prefill_token_buckets` adds them (static buffers are
-    # sized by the largest bucket).
+    # budget no step passes 2176. 4096 and 8192 stay for a deployment that
+    # raises `max_batch_tokens` or turns chunking off, which fills them
+    # exactly. The ladder leaves out slack rungs above them (4352, 8704), since
+    # each bucket is one more compile against Dynamo's recompile limit: such a
+    # deployment adds them to its own `model_kwargs.prefill_token_buckets`, and
+    # without them a step just past a power of two pads to the next and one
+    # past 8192 runs eagerly. Its added rungs serve text-prefill steps only; a
+    # mixed step's slack stays MIXED_SLACK_TOKENS. Static buffers are sized by
+    # the largest bucket.
     PREFILL_TOKEN_BUCKETS = [
         32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048, 2176, 4096, 8192,
     ]
@@ -111,8 +113,9 @@ class LLMSubmodule(SampledTokenDecoder):
     # bucket, a decode batch's width above the default budget, for a step a few
     # tokens over it (2176). Every (rows, tokens) pair here is one more recompile of the
     # forward all these captures share, and past Dynamo's limit the buckets
-    # compiled last run uncompiled inside their graphs.
-    # the scaffold's mixed capture sizes: a class that sets its own sets this too
+    # compiled last run uncompiled inside their graphs. The slack reads the
+    # scaffold's MIXED_CAPTURE_BATCH_SIZES by name (an inherited name isn't in
+    # scope in a class body), so a class that sets its own sets this too.
     MIXED_SLACK_TOKENS = MAX_BATCH_TOKENS + SampledTokenDecoder.MIXED_CAPTURE_BATCH_SIZES[-1]
     MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS, MIXED_SLACK_TOKENS)
 
