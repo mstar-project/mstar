@@ -478,8 +478,9 @@ to test, and the review's findings.
 
 **The review decides whether and what the live test runs**, on every review and re-review, from
 what the change can affect, and says why. "The change" is what changed since the PR's last passing
-live test: the commits `since-live-test-commits.txt` lists when it is present, else the whole PR
-(`pr.diff`). On a re-review that can be more than the commits since the last review.
+live test: `since-live-test.diff` when it is present (`since-live-test-commits.txt` lists its
+commits), else the whole PR (`pr.diff`). On a re-review that can be more than the commits since
+the last review.
 - `run`:
   - `full`: plan the live test over the whole change;
   - `targeted`: only the checks the change reaches, plus the "how to confirm" lines of open P0–P2
