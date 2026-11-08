@@ -25,7 +25,7 @@ they run:
 
 Pass (exit 0): every check above, and ``failed == 0`` for the base traffic. Results:
 ``runtime_load.json`` and ``server_runtime_load.log`` under ``--out`` (suffixed
-``_tp<N>_async<0|1>`` under ``--tp``).
+``_tp<N>_async0`` under ``--tp``; async 1 is refused with LoRA until #1082).
 
 Qwen3.5 keys no prefix-cache stream, so no adapter gets a prefix-cache root here; that a
 reload of the same weights keeps its root is covered on CPU
@@ -314,7 +314,8 @@ def main() -> int:
     p.add_argument("--settle-s", type=float, default=10.0,
                    help="base traffic alone before the first load")
     p.add_argument("--tp", type=int, default=1, help="the LLM node's TP size (that many GPUs)")
-    p.add_argument("--async-sched", default="0", help="MSTAR_TP_ASYNC_SCHED under --tp")
+    p.add_argument("--async-sched", default="0",
+                   help="MSTAR_TP_ASYNC_SCHED under --tp (1, the async scheduler, is refused with LoRA until #1082)")
     args = p.parse_args()
     args.adapters = dict(a.split("=", 1) for a in args.adapter) or DEFAULT_ADAPTERS.get(args.model)
     if not args.adapters:
