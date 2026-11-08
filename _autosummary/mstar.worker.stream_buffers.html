@@ -711,6 +711,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.add_request"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.add_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.assign_consumer_walks"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.assign_consumer_walks()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.chunks_for"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.chunks_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.consumption()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption_batch"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.consumption_batch()</span></code></a></li>
@@ -742,10 +743,13 @@
                   
   <section id="module-mstar.worker.stream_buffers">
 <span id="mstar-worker-stream-buffers"></span><h1>mstar.worker.stream_buffers<a class="headerlink" href="#module-mstar.worker.stream_buffers" title="Link to this heading">#</a></h1>
-<p>The consumer side of streaming edges on one worker.</p>
-<p>Each request’s <a href="#id1"><span class="problematic" id="id2">``</span></a>StreamBuffer``s live on its per-request info; this object
-creates them, turns their ready chunks into graph edges, takes back the
-chunks a step did not keep, and settles which streams a step ends.</p>
+<p>Streaming edges on one worker, both sides.</p>
+<p>On the consumer side, each request’s <code class="docutils literal notranslate"><span class="pre">StreamBuffer``s</span> <span class="pre">live</span> <span class="pre">on</span> <span class="pre">its</span> <span class="pre">per-request</span> <span class="pre">info;</span> <span class="pre">this</span> <span class="pre">object</span>
+<span class="pre">creates</span> <span class="pre">them,</span> <span class="pre">turns</span> <span class="pre">their</span> <span class="pre">ready</span> <span class="pre">chunks</span> <span class="pre">into</span> <span class="pre">graph</span> <span class="pre">edges,</span> <span class="pre">takes</span> <span class="pre">back</span> <span class="pre">the</span>
+<span class="pre">chunks</span> <span class="pre">a</span> <span class="pre">step</span> <span class="pre">did</span> <span class="pre">not</span> <span class="pre">keep,</span> <span class="pre">and</span> <span class="pre">settles</span> <span class="pre">which</span> <span class="pre">streams</span> <span class="pre">a</span> <span class="pre">step</span> <span class="pre">ends.</span> <span class="pre">On</span> <span class="pre">the</span>
+<span class="pre">producer</span> <span class="pre">side,</span> <span class="pre">``assign_consumer_walks</span></code> stamps each walk-driven send with the
+consumer walk it drives, from tables that also cover connections consumed on
+other workers.</p>
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -759,17 +763,18 @@ chunks a step did not keep, and settles which streams a step ends.</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.worker.stream_buffers.StreamBufferManager" title="mstar.worker.stream_buffers.StreamBufferManager"><code class="xref py py-obj docutils literal notranslate"><span class="pre">StreamBufferManager</span></code></a>(request_state, ...[, ...])</p></td>
-<td><p>The stream buffers of this worker's requests, for the connections whose consumer runs here.</p></td>
+<td><p>The stream buffers of this worker's requests, for the connections whose consumer runs here, and the walk-driver tables this worker stamps its sends with as a producer.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.stream_buffers.StreamBufferManager">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.stream_buffers.</span></span><span class="sig-name descname"><span class="pre">StreamBufferManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_state</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tensor_manager</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">connections</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_runtime</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_driven_edges</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/stream_buffers.html#StreamBufferManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.stream_buffers.StreamBufferManager" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.stream_buffers.</span></span><span class="sig-name descname"><span class="pre">StreamBufferManager</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_state</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tensor_manager</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">connections</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_runtime</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">topology</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/stream_buffers.html#StreamBufferManager"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.stream_buffers.StreamBufferManager" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>The stream buffers of this worker’s requests, for the connections whose
-consumer runs here.</p>
+consumer runs here, and the walk-driver tables this worker stamps its sends
+with as a producer.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -777,7 +782,7 @@ consumer runs here.</p>
 <li><p><strong>tensor_manager</strong> (<a class="reference internal" href="mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager" title="mstar.communication.tensors.TensorCommunicationManager"><em>TensorCommunicationManager</em></a>)</p></li>
 <li><p><strong>connections</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="mstar.streaming.topology.html#mstar.streaming.topology.Connection" title="mstar.streaming.topology.Connection"><em>Connection</em></a><em>]</em>)</p></li>
 <li><p><strong>walks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.graph.base.html#mstar.graph.base.GraphSection" title="mstar.graph.base.GraphSection"><em>GraphSection</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
-<li><p><strong>walk_driven_edges</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>topology</strong> (<a class="reference internal" href="mstar.streaming.topology.html#mstar.streaming.topology.PartitionTopology" title="mstar.streaming.topology.PartitionTopology"><em>PartitionTopology</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -793,6 +798,21 @@ kept (it may already hold items).</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.worker.stream_buffers.StreamBufferManager.assign_consumer_walks">
+<span class="sig-name descname"><span class="pre">assign_consumer_walks</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">batch_N</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/stream_buffers.html#StreamBufferManager.assign_consumer_walks"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.stream_buffers.StreamBufferManager.assign_consumer_walks" title="Link to this definition">#</a></dt>
+<dd><p>Decide the consumer walk of this pass’s streamed items, per rid and
+producer-triggered consumer partition, and stamp it on the fwd_info
+that rides with the remote sends. Asked per real walk: a mixed step’s
+combined label is no walk of the graph’s. Runs on every emitting step,
+so it allocates nothing per row.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1128,6 +1148,7 @@ streamed edge would be missed, and its chunks routed to <code class="docutils li
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.add_request"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.add_request()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.assign_consumer_walks"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.assign_consumer_walks()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.chunks_for"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.chunks_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.consumption()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption_batch"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.consumption_batch()</span></code></a></li>

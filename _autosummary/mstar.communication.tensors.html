@@ -1563,7 +1563,8 @@ identity on strings.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors">
 <span class="sig-name descname"><span class="pre">ack_unread_tensors</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_edges</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/tensors.html#TensorCommunicationManager.ack_unread_tensors"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors" title="Link to this definition">#</a></dt>
-<dd><p>Ack tensors for an already-removed request without reading them.</p>
+<dd><p>Ack tensors without reading them, for edges nothing here will consume: a
+removed request, one with a remove pending, or a stream with no buffer here.</p>
 <p>The producer holds these buffers until it gets the TENSOR_RECEIVED ack;
 emit it here so it can reclaim them.</p>
 <dl class="field-list simple">

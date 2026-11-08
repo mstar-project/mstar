@@ -738,10 +738,12 @@ string goes back on the wire at each send site.</p>
 be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless – the string never recurred – but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
-MicroScheduler.{failed_rids, backlog, last_ran, arrival, chunk_started,
+RequestLifecycle.{failed_rids, arrivals, pending_removes, _removes_awaiting_step,
+_wires, _unreported}
+(purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
 cached_prefix} (purged by clear_rid), Admission.{admit_errors, held_until,
-parked} and Lockstep.{_unread, read_failed_rids} (purged by clear),
-Worker._pending_removes, Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info,
+parked} (purged by clear), Lockstep.read_failed_rids (purged by clear),
+Worker._pending_loop_stops, Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info,
 _fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the engine’s and
 tensor manager’s per-request state (including ChunkingManagement.prepared,
 Glm52LLMSubmodule’s MTP maps, cleared by its cleanup_request, and
@@ -752,7 +754,7 @@ _admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
 release), SamplerCells._cells (purged by the sampler’s remove_request), and
 WorkerProfileInfo.</p>
-<p>Lockstep._follow_count is the one deliberate exception: a
+<p>Lockstep’s follow count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
 stays keyed by the wire string and is purged by clear_wire_rid.</p>
 <p class="rubric">Classes</p>

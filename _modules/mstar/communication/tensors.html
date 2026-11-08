@@ -2772,7 +2772,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="TensorCommunicationManager.ack_unread_tensors">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">ack_unread_tensors</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_edges</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]):</span>
-<span class="w">        </span><span class="sd">"""Ack tensors for an already-removed request without reading them.</span>
+<span class="w">        </span><span class="sd">"""Ack tensors without reading them, for edges nothing here will consume: a</span>
+<span class="sd">        removed request, one with a remove pending, or a stream with no buffer here.</span>
 
 <span class="sd">        The producer holds these buffers until it gets the TENSOR_RECEIVED ack;</span>
 <span class="sd">        emit it here so it can reclaim them.</span>

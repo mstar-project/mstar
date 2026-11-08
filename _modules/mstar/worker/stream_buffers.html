@@ -1000,11 +1000,14 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.worker.stream_buffers</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""The consumer side of streaming edges on one worker.</span>
+<span></span><span class="sd">"""Streaming edges on one worker, both sides.</span>
 
-<span class="sd">Each request's ``StreamBuffer``s live on its per-request info; this object</span>
+<span class="sd">On the consumer side, each request's ``StreamBuffer``s live on its per-request info; this object</span>
 <span class="sd">creates them, turns their ready chunks into graph edges, takes back the</span>
-<span class="sd">chunks a step did not keep, and settles which streams a step ends.</span>
+<span class="sd">chunks a step did not keep, and settles which streams a step ends. On the</span>
+<span class="sd">producer side, ``assign_consumer_walks`` stamps each walk-driven send with the</span>
+<span class="sd">consumer walk it drives, from tables that also cover connections consumed on</span>
+<span class="sd">other workers.</span>
 <span class="sd">"""</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
@@ -1017,7 +1020,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">GraphSection</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.runtime.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ColumnarEdgeSpecs</span><span class="p">,</span> <span class="n">EdgeSpec</span><span class="p">,</span> <span class="n">InputTensors</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.stream_buffer</span><span class="w"> </span><span class="kn">import</span> <span class="n">StreamBuffer</span><span class="p">,</span> <span class="n">StreamChunkInfo</span><span class="p">,</span> <span class="n">StreamingEdge</span><span class="p">,</span> <span class="n">collate</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.topology</span><span class="w"> </span><span class="kn">import</span> <span class="n">Connection</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.topology</span><span class="w"> </span><span class="kn">import</span> <span class="n">Connection</span><span class="p">,</span> <span class="n">PartitionTopology</span><span class="p">,</span> <span class="n">ProducerWalkCtx</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.worker.node_manager_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">RequestStateManager</span>
 
 
@@ -1048,7 +1051,8 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.worker.stream_buffers.html#mstar.worker.stream_buffers.StreamBufferManager">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">StreamBufferManager</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The stream buffers of this worker's requests, for the connections whose</span>
-<span class="sd">    consumer runs here."""</span>
+<span class="sd">    consumer runs here, and the walk-driver tables this worker stamps its sends</span>
+<span class="sd">    with as a producer."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -1058,13 +1062,27 @@ window.runMermaid = runMermaid;</script>
         <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="o">*</span><span class="p">,</span>
         <span class="n">graph_runtime</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">walk_driven_edges</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">topology</span><span class="p">:</span> <span class="n">PartitionTopology</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_request_state</span> <span class="o">=</span> <span class="n">request_state</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_tensor_manager</span> <span class="o">=</span> <span class="n">tensor_manager</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_graph_runtime</span> <span class="o">=</span> <span class="n">graph_runtime</span>
-        <span class="c1"># walk-driven edge here -&gt; the producer-triggered partition it feeds</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_walk_driven_edges</span> <span class="o">=</span> <span class="n">walk_driven_edges</span> <span class="ow">or</span> <span class="p">{}</span>
+        <span class="c1"># producer-triggered partition -&gt; the connection that decides its walk</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_walk_drivers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Connection</span><span class="p">]</span> <span class="o">=</span> <span class="n">topology</span><span class="o">.</span><span class="n">walk_drivers</span><span class="p">()</span> <span class="k">if</span> <span class="n">topology</span> <span class="k">else</span> <span class="p">{}</span>
+        <span class="c1"># consumer side: walk-driven edge here -&gt; its consumer partition</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">walk_driven_edges</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="p">:</span> <span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span> <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="n">connections</span>
+            <span class="k">if</span> <span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_drivers</span>
+        <span class="p">}</span>
+        <span class="c1"># producer side: streamed signal -&gt; its consumer partition, and</span>
+        <span class="c1"># (node, walk) -&gt; the walk drivers it emits for</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_signal_consumer</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="n">conn</span><span class="o">.</span><span class="n">edge_name</span><span class="p">:</span> <span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span>
+            <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="p">(</span><span class="n">topology</span><span class="o">.</span><span class="n">connections</span> <span class="k">if</span> <span class="n">topology</span> <span class="k">else</span> <span class="p">[])</span>
+        <span class="p">}</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_emitted_walk_drivers</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="n">Connection</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># refilled for every walk-hook call rather than built per request per step</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_walk_ctx</span> <span class="o">=</span> <span class="n">ProducerWalkCtx</span><span class="p">()</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">connections</span> <span class="o">=</span> <span class="n">connections</span>
         <span class="c1"># edge name -&gt; the node that consumes it</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">consumer_node</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
@@ -1139,6 +1157,52 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">_rids</span><span class="o">.</span><span class="n">discard</span><span class="p">(</span><span class="n">request_id</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="StreamBufferManager.assign_consumer_walks">
+<a class="viewcode-back" href="../../../_autosummary/mstar.worker.stream_buffers.html#mstar.worker.stream_buffers.StreamBufferManager.assign_consumer_walks">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">assign_consumer_walks</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">batch_N</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Decide the consumer walk of this pass's streamed items, per rid and</span>
+<span class="sd">        producer-triggered consumer partition, and stamp it on the fwd_info</span>
+<span class="sd">        that rides with the remote sends. Asked per real walk: a mixed step's</span>
+<span class="sd">        combined label is no walk of the graph's. Runs on every emitting step,</span>
+<span class="sd">        so it allocates nothing per row."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_drivers</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">ctx</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">input_metadata</span> <span class="o">=</span> <span class="n">batch_N</span><span class="o">.</span><span class="n">node_batch</span><span class="o">.</span><span class="n">per_request_input_metadata</span>
+        <span class="k">for</span> <span class="n">walk</span><span class="p">,</span> <span class="n">walk_rids</span> <span class="ow">in</span> <span class="n">batch_N</span><span class="o">.</span><span class="n">batch</span><span class="o">.</span><span class="n">rids_by_walk</span><span class="p">()</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">batch_N</span><span class="o">.</span><span class="n">node_name</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span>
+            <span class="n">drivers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_emitted_walk_drivers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">drivers</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">consumers</span> <span class="o">=</span> <span class="p">{</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_signal_consumer</span><span class="p">[</span><span class="n">signal</span><span class="p">]</span>
+                    <span class="k">for</span> <span class="n">signal</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_runtime</span><span class="o">.</span><span class="n">get_output_signals</span><span class="p">(</span><span class="o">*</span><span class="n">key</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="n">signal</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_signal_consumer</span>
+                <span class="p">}</span>
+                <span class="n">drivers</span> <span class="o">=</span> <span class="p">[</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">_walk_drivers</span><span class="p">[</span><span class="n">partition</span><span class="p">]</span> <span class="k">for</span> <span class="n">partition</span> <span class="ow">in</span> <span class="n">consumers</span>
+                    <span class="k">if</span> <span class="n">partition</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_drivers</span>
+                <span class="p">]</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_emitted_walk_drivers</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">drivers</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">drivers</span><span class="p">:</span>
+                <span class="k">continue</span>
+            <span class="n">ctx</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_ctx</span>
+            <span class="n">ctx</span><span class="o">.</span><span class="n">producer_walk</span> <span class="o">=</span> <span class="n">walk</span>
+            <span class="n">ctx</span><span class="o">.</span><span class="n">node</span> <span class="o">=</span> <span class="n">batch_N</span><span class="o">.</span><span class="n">node_name</span>
+            <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">walk_rids</span><span class="p">:</span>
+                <span class="n">req_info</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_request_state</span><span class="o">.</span><span class="n">per_request_info</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">req_info</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="k">continue</span>
+                <span class="n">fwd_info</span> <span class="o">=</span> <span class="n">req_info</span><span class="o">.</span><span class="n">per_partition_info</span><span class="p">[</span><span class="n">batch_N</span><span class="o">.</span><span class="n">partition</span><span class="p">]</span><span class="o">.</span><span class="n">current_fwd_info</span>
+                <span class="n">meta</span> <span class="o">=</span> <span class="n">input_metadata</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+                <span class="n">ctx</span><span class="o">.</span><span class="n">loop_iters</span> <span class="o">=</span> <span class="n">meta</span><span class="o">.</span><span class="n">dynamic_loop_iter_counts</span> <span class="k">if</span> <span class="n">meta</span> <span class="k">else</span> <span class="p">{}</span>
+                <span class="n">ctx</span><span class="o">.</span><span class="n">fwd_info</span> <span class="o">=</span> <span class="n">fwd_info</span>
+                <span class="k">for</span> <span class="n">conn</span> <span class="ow">in</span> <span class="n">drivers</span><span class="p">:</span>
+                    <span class="n">fwd_info</span><span class="o">.</span><span class="n">stream_consumer_walks</span><span class="p">[</span><span class="n">conn</span><span class="o">.</span><span class="n">to_partition</span><span class="p">]</span> <span class="o">=</span> <span class="n">conn</span><span class="o">.</span><span class="n">consumer_walk</span><span class="p">(</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">ctx</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">ctx</span><span class="o">.</span><span class="n">fwd_info</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="n">ctx</span><span class="o">.</span><span class="n">loop_iters</span> <span class="o">=</span> <span class="p">{}</span></div>
+
+
     <span class="c1"># -- items in, chunks out -------------------------------------------------</span>
 
 <div class="viewcode-block" id="StreamBufferManager.route_tensor">
@@ -1169,7 +1233,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">walk</span> <span class="o">=</span> <span class="n">sbuf</span><span class="o">.</span><span class="n">peek_walk</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">walk</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">True</span>
-        <span class="n">partition</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_driven_edges</span><span class="p">[</span><span class="n">edge_name</span><span class="p">]</span>
+        <span class="n">partition</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk_driven_edges</span><span class="p">[</span><span class="n">edge_name</span><span class="p">]</span>
         <span class="k">if</span> <span class="n">walk</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">_partition_walk</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">partition</span><span class="p">):</span>
             <span class="k">return</span> <span class="kc">True</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">allow_walk_change</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_graph_runtime</span><span class="o">.</span><span class="n">is_partition_idle</span><span class="p">(</span>
@@ -1195,7 +1259,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">waiting</span> <span class="o">=</span> <span class="n">sbuf</span><span class="o">.</span><span class="n">pop_waiting_edge</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">waiting</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">waiting</span>
-        <span class="n">partition</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_walk_driven_edges</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">edge_name</span><span class="p">)</span>
+        <span class="n">partition</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk_driven_edges</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">edge_name</span><span class="p">)</span>
         <span class="n">consumer_walk</span> <span class="o">=</span> <span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_partition_walk</span><span class="p">(</span><span class="n">request_id</span><span class="p">,</span> <span class="n">partition</span><span class="p">)</span> <span class="k">if</span> <span class="n">partition</span> <span class="k">else</span> <span class="kc">None</span>
         <span class="p">)</span>
