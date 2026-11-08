@@ -102,8 +102,7 @@ def _clean(request: dict) -> dict:
 
 def _image_body(request: dict) -> dict:
     """NvCreateImageRequest -> body for the native image request model."""
-    if request.get("response_format") == "url":
-        raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
+    check_inline_result(request.get("response_format"))  # n is served, as on the native route
     body = _clean(request)
     for key in _IMAGE_NVEXT_KEYS:
         value = (request.get("nvext") or {}).get(key)
@@ -114,8 +113,7 @@ def _image_body(request: dict) -> dict:
 
 def _video_body(request: dict) -> dict:
     """NvCreateVideoRequest -> body for the native video request model."""
-    if request.get("response_format") == "url":
-        raise ValueError("response_format 'url' needs a media store; use 'b64_json'")
+    check_inline_result(request.get("response_format"), request.get("n"))
     if request.get("output_format") not in (None, "mp4"):
         raise ValueError(f"unsupported output_format {request['output_format']!r}; only 'mp4'")
     body = _clean(request)

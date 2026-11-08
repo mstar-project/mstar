@@ -62,7 +62,7 @@ def test_image_body_flattens_nvext_and_rejects_url():
         "nvext": {"seed": 3, "guidance_scale": 5.0},
     })
     assert body["seed"] == 3 and body["guidance_scale"] == 5.0 and body["size"] == "512x512"
-    with pytest.raises(ValueError, match="media store"):
+    with pytest.raises(ValueError, match="b64_json"):
         _image_body({"prompt": "x", "response_format": "url"})
 
 
@@ -88,8 +88,11 @@ def test_video_body_reference_and_no_leakage():
     })
     assert body["image"] == PNG_1X1
     assert not {"input_reference", "stream", "output_format", "user"} & body.keys()
-    with pytest.raises(ValueError, match="media store"):
+    with pytest.raises(ValueError, match="b64_json"):
         _video_body({"prompt": "x", "response_format": "url"})
+    # one engine request, one video, as the native route refuses an n it would drop
+    with pytest.raises(ValueError, match="one result"):
+        _video_body({"prompt": "x", "n": 2})
     with pytest.raises(ValueError, match="output_format"):
         _video_body({"prompt": "x", "output_format": "mjpeg"})
 
