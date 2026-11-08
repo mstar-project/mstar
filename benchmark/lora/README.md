@@ -256,7 +256,7 @@ Loads and unloads reach each rank of the instance on its own, at whatever step i
 the pool is built so that this cannot change a slot decision (`LoraAdapterPool`'s
 docstring). A hang (requests time out at 300 s and count as failed), a failed base
 request or a parity failure here is the sign it can. Results are suffixed
-`_tp2_async<0|1>`.
+`_tp2_async0`.
 
 ## 7. Against vLLM and SGLang: per-request multi-LoRA serving (about 3.5 hours, GPU 0 only)
 
