@@ -328,3 +328,18 @@ def test_its_resources_resolve_a_dtype_under_its_own_precision(mla_absorb):
     assert {s.resource_key for s in declared} >= {"kv", "attn"}
     for spec in declared:
         assert info.resolve_dtype(spec.config.dtype, spec.resource_key) == torch.bfloat16, spec.resource_key
+
+
+def test_fp8_tensor_rows_dont_set_each_others_scale():
+    """The dense FFN of nvidia/GLM-5.3-NVFP4 is fp8 per tensor. A captured bucket's padding rows hold whatever the
+    buffer last held: a row of huge values (or NaN) beside the live rows must leave their outputs as they are."""
+    from mstar.model.components.quant_linear import linear_format
+
+    fmt = linear_format("fp8_tensor")
+    torch.manual_seed(5)
+    buffers = fmt.quantize_weight((torch.randn(64, 128) * 0.05).bfloat16(), None)
+    live = torch.randn(3, 128).bfloat16()
+    alone = fmt.linear(live, buffers["weight"], buffers["weight_scale"])
+    for pad in (torch.full((1, 128), 3e4), torch.full((1, 128), float("nan"))):
+        batch = torch.cat([live, pad.bfloat16()])
+        assert torch.equal(fmt.linear(batch, buffers["weight"], buffers["weight_scale"])[:3], alone)
