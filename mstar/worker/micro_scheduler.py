@@ -153,7 +153,7 @@ class MicroScheduler:
         self.cached_prefix: dict[tuple[int, str], int] = {}
         self.sched_type = sched_type
 
-        # lockstep-parallel (TP / SP instance) scheduling
+        # lockstep-parallel (TP / SP / CFG instance) scheduling
         self.parallel_leader_nodes = layout.parallel_leader_nodes
         self.num_consec_tp_follower_batches = 0
         self.max_consec_tp_follower_batches = max_consec_tp_follower_batches
