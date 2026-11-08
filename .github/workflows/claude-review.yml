@@ -876,20 +876,37 @@ jobs:
           [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
           exit $code
 
-      # The media go to the gallery repository (GitHub Pages), never into this
-      # repository, whose every clone would carry them.
-      - name: Render the report and the media gallery
-        if: steps.wait.outcome == 'success'
-        id: render
+      # What the box and the providers wrote, redacted in place before anything reads it, so
+      # the comment, the kept report and the artifact all get the redacted copy: the patterns
+      # above and the exact values of the secrets and hosts this job holds.
+      - name: Redact the live test's output
+        if: always() && steps.cfg.outcome == 'success'
+        id: redact
         continue-on-error: true
         env:
-          MEDIA_REPO: ${{ vars.REVIEW_MEDIA_REPO }}
-          OWNER: ${{ github.repository_owner }}
+          S1: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
+          S2: ${{ secrets.ANTHROPIC_API_KEY }}
+          S3: ${{ secrets.ERAS_API_KEY }}
+          S4: ${{ vars.REVIEW_SLURM_HOST }}
         run: |
-          url=""
-          [ -z "$MEDIA_REPO" ] || url="https://${OWNER,,}.github.io/$MEDIA_REPO/pr-$PR/$TAG"
+          for f in "$RUNNER_TEMP/lt/results/report.md" "$RUNNER_TEMP/lt/results/result.json" "$RUNNER_TEMP/lt/unavailable.md"; do
+            [ -f "$f" ] || continue
+            for v in "$S1" "$S2" "$S3" "$S4"; do
+              [ -z "$v" ] || python3 -c 'import sys; p, v = sys.argv[1:]; s = open(p).read().replace(v, "[REDACTED]"); open(p, "w").write(s)' "$f" "$v"
+            done
+            sed -E -i "$REDACT" "$f"
+          done
+
+      # The media go to the gallery repository (GitHub Pages), never into this
+      # repository, whose every clone would carry them. Only audio, images and
+      # video, up to 100 MB a run (gpu_review.py, published_media).
+      - name: Render the report and the media gallery
+        if: steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
+        id: render
+        continue-on-error: true
+        run: |
           python3 .github/review/gpu_review.py comment --pr "$PR" --sha "$HEAD_SHA" --out "$RUNNER_TEMP/lt" \
-            --site "$RUNNER_TEMP/site" --media-url "$url"
+            --site "$RUNNER_TEMP/site"
           echo "verdict=$(cat "$RUNNER_TEMP/lt/verdict")" >> "$GITHUB_OUTPUT"
           [ -e "$RUNNER_TEMP/site/index.html" ] && echo "media=true" >> "$GITHUB_OUTPUT" || true
 
@@ -905,6 +922,9 @@ jobs:
           repositories: ${{ vars.REVIEW_MEDIA_REPO }}
           permission-contents: write
 
+      # The gallery keeps the newest 30 runs, as a single commit, so neither the site nor the
+      # repository grows without bound. A push that loses a race with another run fails rather
+      # than overwrite it. The comment links the gallery only once the push went through.
       - name: Publish the media
         if: steps.media-app.outcome == 'success'
         continue-on-error: true
@@ -914,12 +934,16 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           git clone -q --depth 1 "https://x-access-token:$MEDIA_TOKEN@github.com/$OWNER/$MEDIA_REPO.git" "$RUNNER_TEMP/media"
-          dest="$RUNNER_TEMP/media/pr-$PR/$TAG"
-          mkdir -p "$dest" && cp -rL "$RUNNER_TEMP/site/." "$dest/"
           cd "$RUNNER_TEMP/media"
-          git -c user.name=mstar-review -c user.email=mstar-review@users.noreply.github.com add -A
-          git -c user.name=mstar-review -c user.email=mstar-review@users.noreply.github.com commit -qm "PR #$PR live test $TAG"
-          git push -q
+          branch=$(git symbolic-ref --short HEAD); old=$(git rev-parse -q --verify HEAD || true)
+          mkdir -p "pr-$PR/$TAG" && cp -r "$RUNNER_TEMP/site/." "pr-$PR/$TAG/"
+          ls -d pr-*/*/ | sort -t/ -k2 -n | head -n -30 | xargs -r rm -rf
+          git checkout -q --orphan gallery && git add -A
+          git -c user.name=mstar-review -c user.email=mstar-review@users.noreply.github.com commit -qm "Live-test media, the newest 30 runs"
+          git push -q --force-with-lease="$branch:$old" origin "HEAD:$branch"
+          cd "$GITHUB_WORKSPACE"
+          python3 .github/review/gpu_review.py comment --pr "$PR" --sha "$HEAD_SHA" --out "$RUNNER_TEMP/lt" \
+            --media-url "https://${OWNER,,}.github.io/$MEDIA_REPO/pr-$PR/$TAG"
 
       - name: Decide approval
         if: always() && (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '')
@@ -933,11 +957,10 @@ jobs:
             --complete true --verdict "$VERDICT" --why "$RUNNER_TEMP/why.txt" | tee approve.log
           grep -q '^approved' approve.log && echo "approved=true" >> "$GITHUB_OUTPUT" || true
 
-      # Model output from untrusted input, posted after redaction: the patterns
-      # above and the exact values of the secrets and hosts this job holds.
+      # Model output from untrusted input, posted only from the redacted copies.
       - name: Post the live test
         if: >-
-          always() && steps.cfg.outcome == 'success' &&
+          always() && steps.cfg.outcome == 'success' && steps.redact.outcome == 'success' &&
           (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '' || steps.cfg.outputs.trusted != 'true' ||
            steps.start.outputs.unavailable == 'true' || steps.wait.outputs.unavailable == 'true')
         continue-on-error: true
@@ -946,10 +969,6 @@ jobs:
           NOTE: ${{ steps.carry.outputs.note }}
           APPROVED: ${{ steps.approve.outputs.approved }}
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
-          S1: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
-          S2: ${{ secrets.ANTHROPIC_API_KEY }}
-          S3: ${{ secrets.ERAS_API_KEY }}
-          S4: ${{ vars.REVIEW_SLURM_HOST }}
         run: |
           lt="$RUNNER_TEMP/lt"
           if [ "$TRUSTED" != "true" ]; then
@@ -963,14 +982,11 @@ jobs:
           elif [ -s "$RUNNER_TEMP/why.txt" ]; then
             printf '\nNot approved: %s.\n' "$(cat "$RUNNER_TEMP/why.txt")" >> post.md
           fi
-          for v in "$S1" "$S2" "$S3" "$S4"; do
-            [ -z "$v" ] || python3 -c 'import sys; p, v = sys.argv[1:]; s = open(p).read().replace(v, "[REDACTED]"); open(p, "w").write(s)' post.md "$v"
-          done
           sed -E -i "$REDACT" post.md
           gh pr comment "$PR" --repo "$REPO" --body-file post.md
 
       - name: Keep the report
-        if: always() && steps.wait.outcome == 'success'
+        if: always() && steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
         continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -990,7 +1006,8 @@ jobs:
       - name: Report a live test that didn't complete
         if: >-
           failure() || (always() &&
-            ((steps.start.outcome == 'failure' && steps.start.outputs.unavailable != 'true') ||
+            (steps.redact.outcome == 'failure' ||
+             (steps.start.outcome == 'failure' && steps.start.outputs.unavailable != 'true') ||
              (steps.wait.outcome == 'failure' && steps.wait.outputs.unavailable != 'true')))
         continue-on-error: true
         env:

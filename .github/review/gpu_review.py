@@ -12,7 +12,7 @@ Slurm node when it has them free, else any open Eras listing under the hourly ca
     gpu_review.py wait     --out DIR [--start-timeout MIN]
     gpu_review.py cleanup  --pr N --tag T
     gpu_review.py approve  --pr N --sha SHA --review review.json --complete true|false --verdict pass|...
-    gpu_review.py comment  --pr N --sha SHA --out DIR --media-url URL --site SITE
+    gpu_review.py comment  --pr N --sha SHA --out DIR [--site SITE] [--media-url URL]
 
 `start` exits 3 when no GPUs are free, after writing DIR/unavailable.md.
 """
@@ -23,6 +23,7 @@ import os
 import re
 import runpy
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -39,6 +40,7 @@ WRITE = ("admin", "maintain", "write")
 LOW_AREAS = {"area/tests", "area/docs", "area/benchmark"}
 NEVER_LOW = (".github/", ".claude/", "AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py", "uv.lock")
 ERAS_OUT = "/workspace/live-pr/out"
+MEDIA_CAP = 100 * 2**20  # media per run: the gallery is one GitHub Pages site, 1 GB in all
 MEDIA = {".png": "img", ".jpg": "img", ".jpeg": "img", ".gif": "img", ".webp": "img",
          ".mp4": "video", ".webm": "video", ".wav": "audio", ".mp3": "audio", ".ogg": "audio", ".opus": "audio",
          ".flac": "audio"}
@@ -336,22 +338,34 @@ def cmd_dismiss(a):
 
 # ---------------------------------------------------------------- what gets posted
 
+def published_media(results):
+    """The media files the gallery serves: audio, images and video only (an .html or .svg would run
+    script on the Pages origin), in name order, up to MEDIA_CAP in all."""
+    files, total = [], 0
+    for p in sorted((results / "media").rglob("*")) if (results / "media").exists() else []:
+        if p.is_file() and p.suffix.lower() in MEDIA and total + p.stat().st_size <= MEDIA_CAP:
+            files.append(p)
+            total += p.stat().st_size
+    return files
+
+
 def cmd_comment(a):
-    """comment.md for the PR, and SITE/index.html with players for every media file."""
-    results, site = Path(a.out) / "results", Path(a.site)
+    """comment.md for the PR, and with --site, SITE/ with the media and an index.html of players."""
+    results = Path(a.out) / "results"
     report = (results / "report.md").read_text() if (results / "report.md").exists() else ""
     result = json.loads((results / "result.json").read_text()) if (results / "result.json").exists() else {}
-    files = sorted(p for p in (results / "media").rglob("*") if p.is_file()) if (results / "media").exists() else []
-    site.mkdir(parents=True, exist_ok=True)
-    if files:
-        (site / "media").symlink_to((results / "media").resolve(), target_is_directory=True)
+    files = published_media(results)
+    rels = {p.relative_to(results).as_posix() for p in files}
+    if files and a.site:
+        site = Path(a.site)
         rows = []
         for p in files:
             rel = p.relative_to(results).as_posix()
-            kind = MEDIA.get(p.suffix.lower())
+            (site / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(p, site / rel)
+            kind = MEDIA[p.suffix.lower()]
             tag = (f'<img src="{html.escape(rel)}" loading="lazy">' if kind == "img"
-                   else f'<{kind} controls preload="none" src="{html.escape(rel)}"></{kind}>' if kind
-                   else f'<a href="{html.escape(rel)}">open</a>')
+                   else f'<{kind} controls preload="none" src="{html.escape(rel)}"></{kind}>')
             rows.append(f"<section><h3>{html.escape(rel)}</h3>{tag}</section>")
         (site / "index.html").write_text(
             "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
@@ -360,9 +374,9 @@ def cmd_comment(a):
             "img,video{max-width:100%}audio{width:100%}</style>"
             f"<h1>PR #{a.pr}, live test of {a.sha[:7]}</h1>" + "".join(rows))
 
-    def link(m):  # links to media/... point at the gallery's copy; images show inline
+    def link(m):  # links to the gallery's media point at its copy; images show inline
         bang, text, rel = m[1], m[2], m[3]
-        if not rel.startswith("media/") or not a.media_url:
+        if rel not in rels or not a.media_url:
             return m[0]
         url = f"{a.media_url.rstrip('/')}/{rel}"
         image = bang or MEDIA.get(Path(rel).suffix.lower()) == "img"
@@ -416,8 +430,9 @@ def main():
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--message", required=True)
     p = sub.add_parser("comment")
-    for name in ("--sha", "--out", "--site"):
+    for name in ("--sha", "--out"):
         p.add_argument(name, required=True)
+    p.add_argument("--site", help="write the media gallery here")
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--media-url", default="")
     a = ap.parse_args()

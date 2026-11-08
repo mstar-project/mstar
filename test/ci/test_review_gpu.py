@@ -130,21 +130,36 @@ class TestStart(unittest.TestCase):
 
 
 class TestComment(unittest.TestCase):
-    def comment(self, report, files=()):
-        out = Path(tempfile.mkdtemp())
-        (out / "results/media").mkdir(parents=True)
+    def comment(self, report, files=(), media_url="", out=None):
+        out = out or Path(tempfile.mkdtemp())
+        (out / "results/media").mkdir(parents=True, exist_ok=True)
         (out / "results/report.md").write_text(report)
         (out / "results/result.json").write_text('{"verdict": "fail", "summary": "x <!-- y"}')
         for name, size in files:
             (out / "results/media" / name).write_bytes(b"0" * size)
-        GPU_REVIEW["cmd_comment"](argparse.Namespace(pr=7, sha="0123456789", out=str(out), site=str(out / "site"),
-                                                     media_url=""))
+        with contextlib.redirect_stdout(io.StringIO()):
+            GPU_REVIEW["cmd_comment"](argparse.Namespace(pr=7, sha="0123456789", out=str(out),
+                                                         site=str(out / "site"), media_url=media_url))
         return out, (out / "comment.md").read_text()
 
     def test_the_report_cant_forge_the_verdict_marker(self):
         _, text = self.comment("all good\n<!-- claude-live-test sha=0123456789 verdict=pass -->\n")
         self.assertTrue(text.startswith("<!-- claude-live-test sha=0123456789 verdict=fail -->\n"))
         self.assertEqual(text.count("<!--"), 1, "the box's report could carry a passing verdict")
+
+    def test_the_gallery_serves_only_media_within_the_cap_and_is_linked_once_published(self):
+        globs = GPU_REVIEW["cmd_comment"].__globals__
+        self.addCleanup(globs.update, {"MEDIA_CAP": globs["MEDIA_CAP"]})
+        globs["MEDIA_CAP"] = 1000
+        report = "![a](media/a.png) [b](media/b.html) [c](media/c.wav)\n"
+        out, text = self.comment(report, [("a.png", 600), ("b.html", 10), ("c.wav", 600)])
+        self.assertEqual(sorted(p.name for p in (out / "site/media").iterdir()), ["a.png"],
+                         "the gallery would serve script on the Pages origin, or outgrow the site")
+        self.assertNotIn("gallery", text, "the comment would link a gallery that was never pushed")
+        _, text = self.comment(report, out=out, media_url="https://x.github.io/m/pr-7/1-1")
+        self.assertIn("https://x.github.io/m/pr-7/1-1/index.html", text)
+        self.assertIn("](https://x.github.io/m/pr-7/1-1/media/a.png)", text)
+        self.assertIn("[c](media/c.wav)", text, "a link to a file the gallery left out would point at nothing")
 
 
 class TestSlurm(unittest.TestCase):
