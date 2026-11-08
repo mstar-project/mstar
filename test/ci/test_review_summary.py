@@ -93,7 +93,8 @@ class TestReviewSummary(unittest.TestCase):
         text = render(r, threads(thread("P1", comment_id=7)), "0123456789", "light", [12])
         self.assertIn("🟢 **No open findings; 2 fixed above**", text,
                       "a fix that lands with the PR above would block this one")
-        self.assertEqual(text.count("Fixed in #12 above"), 2, "the finding would vanish from the summary")
+        self.assertEqual(text.count("Fixed in #12 above"), 4,
+                         "the finding would vanish from the summary or from what a person is told to check")
         still = [{**above[0], "status": "open"}]
         self.assertEqual(open_findings(review(prior=still), threads(thread("P1", comment_id=7)), [12]),
                          [("inline 7", "P1", "`step` drops the last token")],

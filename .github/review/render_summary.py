@@ -234,8 +234,8 @@ def latent(bug):
 
 def checklist(review, pages, stacked, extra=()):
     """The "What's left for you" list: what a human must decide before approving, most important first,
-    one line each with its place: open P0/P1, then `extra` (what the live-test job's rule found), the
-    design decisions, questions, open P2s and skipped files. P3s and latent bugs aren't decisions. Past
+    one line each with its place: open P0/P1, findings a PR above fixes (merge together), then `extra`
+    (what the live-test job's rule found), the design decisions, questions, open P2s and skipped files. P3s and latent bugs aren't decisions. Past
     ten lines the rest fold away, so a question or decision, whose only home this is, is never lost."""
     found = open_findings(review, pages, stacked)
     review = judged(review, stacked)
@@ -246,7 +246,12 @@ def checklist(review, pages, stacked, extra=()):
     def findings(*priorities):
         return [f"**[{p}]** `{w}`: {what}" for wanted in priorities for w, p, what in found if p == wanted]
 
-    items = [*findings("P0", "P1"), *extra,
+    items = [*findings("P0", "P1"),
+             *[f"**[{f['priority']}]** {f['ref']}: {above(f)}" for f in review["prior_findings"]
+               if f["status"] == "fixed_above"],
+             *[f"**[{f['priority']}]** `{f['location']}`: {above(f)}" for f in review["outside_diff"]
+               if f.get("fixed_in")],
+             *extra,
              *[f"{where(d)}: {d['why']}" for d in (review.get("risk") or {}).get("look_at", [])],
              *[f"{where(q)}: {q['text']}" for q in review["questions"]],
              *findings("P2"), *[f"Not reviewed: `{path}`" for path in review["skipped"]]]
