@@ -439,7 +439,9 @@ unless the checkpoint's generation_config sets a ``min_p``, which turns the
 sampler's min-p filter on. ``reasoning_effort`` (``low``, ``medium``, ``high``,
 ``xhigh``; default ``high``) sets the template's reasoning strength, and
 ``enable_thinking: false`` means ``low``, as the template has no off: the model
-still reasons, at the template's lowest strength. The reply
+still reasons, at the template's lowest strength. Either, or the template's own
+``reasoning_strength`` and ``current_date``, may also come in
+``chat_template_kwargs``; a flat key wins. The reply
 is the model's channel stream as generated: reasoning addressed ``to=self``,
 then the answer ``to=user``. Tool calls are refused for now. Images resize with the
 reference's antialiased Lanczos, which torchvision has from 0.27 (torch 2.12); an older
@@ -550,7 +552,8 @@ c=4 up it makes no difference.
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``top_k``, ``min_p``, ``repetition_penalty``, ``penalize_prompt`` and
 ``enable_thinking`` (default true; the template opens a ``<think>`` block;
-``chat_template_kwargs.enable_thinking`` also works) are read by the model but are not OpenAI fields — pass them via ``extra_body``.
+``chat_template_kwargs.enable_thinking`` also works) are read by the model but
+are not OpenAI fields — pass them via ``extra_body``.
 Sampling defaults to the checkpoint's generation_config, under whatever the
 request sets. Qwen3.5-27B's sets temperature 0.6, top_k 20 and top_p 0.95,
 and Qwen3.8-27B's temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
