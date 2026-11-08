@@ -119,7 +119,7 @@ class FlashInferManager(AttentionManager):
             step.reads_tables = True
             return
         step.host_planned = True
-        if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.schedules_alone and not stream.reads:
+        if wrapper is not None and wrapper.supports_gather_resident and not stream.reads:
             # the paged arrays come off the tables; the host plans the schedule alone
             table = step.block_tables[pool]
             wrapper.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)

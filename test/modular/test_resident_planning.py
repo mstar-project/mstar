@@ -1581,6 +1581,8 @@ def test_capture_refuses_two_labels_on_one_resource():
 class _Fmha:
     """A captured fmha decode wrapper's gather, recorded."""
 
+    supports_gather_resident = True
+
     def __init__(self):
         self.calls = []
 

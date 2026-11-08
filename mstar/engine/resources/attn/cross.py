@@ -156,7 +156,7 @@ class FlashInferCrossManager(CrossAttentionManager):
         step.host_planned = True
         pool, query = self._kv_cache_name, step.streams[self._query_kv_cache_name]
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=query.label))
-        if isinstance(wrapper, FlashInferDecodeWrapper) and wrapper.schedules_alone:
+        if wrapper is not None and wrapper.supports_gather_resident:
             # the context's paged arrays come off the tables
             table = step.block_tables[pool]
             wrapper.gather_resident(
