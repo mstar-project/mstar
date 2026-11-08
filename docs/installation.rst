@@ -559,7 +559,11 @@ Optional: the Rust HTTP frontend
 
 ``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. A Linux wheel that carries
+keeping preprocessing and the conductor protocol. It is replacing the Python
+HTTP frontend, which is being retired: new routes and adapters land in both
+(see "API surfaces land in the Rust frontend" in ``AGENTS.md``), and
+``mstar serve`` will use the Rust frontend for every model once it serves
+everything the Python one does. A Linux wheel that carries
 the extension also installs the binary next to ``mstar-serve``; otherwise build
 it. Then opt in:
 
