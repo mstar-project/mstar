@@ -3206,6 +3206,12 @@ class Cosmos3VisionEncoderSubmodule(PackedBlockLoopEncoder):
     MAX_BATCH_SIZE = 8
     # Per-request shapes vary; the block loop's capture is the accelerator.
     disable_torch_compile = True
+    # The tower is bf16 already. Under autocast each LayerNorm upcasts its input
+    # and its fp32 output is cast back once per projection reading it, ~18% of
+    # the block loop's GPU time for the same rounding (the norm accumulates in
+    # fp32 either way).
+    disable_autocast = True
+    BLOCK_LOOP_DTYPE = torch.bfloat16
     # Resized position tables kept, one per frame grid seen.
     POSITION_TABLES_KEPT = 64
 

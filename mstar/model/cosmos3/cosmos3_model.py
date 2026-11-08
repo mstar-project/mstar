@@ -78,7 +78,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec, RaggedAttnBackend
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
@@ -395,6 +395,10 @@ class Cosmos3Model(Model):
                 num_kv_heads=vision.num_attention_heads,
                 head_dim=vision.hidden_size // vision.num_attention_heads,
                 max_segments_per_step=Cosmos3VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // max(min_patches, 1),
+                # FA3 varlen takes head_dim 72 as it is; FlashInfer pads it to 128
+                # (three pads, a zero fill and a slice a layer). Falls back to
+                # FlashInfer where FA3 can't load.
+                backend=RaggedAttnBackend.DENSE,
             ),
         )
 

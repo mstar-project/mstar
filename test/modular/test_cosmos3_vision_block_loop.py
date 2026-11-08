@@ -85,3 +85,34 @@ def test_the_node_plans_a_segment_per_layout_run():
         assert "39 pixel patches for the layout's 40" in str(e)
     else:
         raise AssertionError("a patch count off the layout was accepted")
+
+
+def test_the_block_loop_runs_in_bf16_without_autocast():
+    """The node opts out of autocast, so the engine hands it no autocast
+    dtype: the block loop's replay buffers must still be bf16, the tower's
+    own dtype, not the fp32 a bare ``torch.zeros`` would make."""
+    from mstar.engine.accelerator_graph_config import PiecewiseCaptureShape
+    from mstar.engine.node_dtype import resolve_node_dtype
+    from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
+
+    model = _tower().to(torch.bfloat16)
+    node = Cosmos3VisionEncoderSubmodule(model, SimpleNamespace(reasoner=model.config))
+    dtype = resolve_node_dtype(node, torch.bfloat16)
+    assert dtype is None
+    (config,) = node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), dtype).values()
+    buffers = config.make_static_inputs(PiecewiseCaptureShape(bs=1, seq_lens=[16], total_tokens=16))
+    assert {t.dtype for t in buffers.values()} == {torch.bfloat16}
+
+
+def test_the_vision_attention_declares_fa3():
+    """head_dim 72 runs unpadded on FA3 varlen; FlashInfer would pad it to 128."""
+    from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    model = Cosmos3Model.__new__(Cosmos3Model)
+    model.config = SimpleNamespace(reasoner=SimpleNamespace(
+        vision=SimpleNamespace(num_attention_heads=16, hidden_size=1152, patch_size=16),
+        image_processor=SimpleNamespace(min_pixels=65536), video_processor=SimpleNamespace(min_pixels=4096),
+    ))
+    spec = model._vision_attention_spec()
+    assert spec.config.head_dim == 72 and spec.config.backend is RaggedAttnBackend.DENSE
