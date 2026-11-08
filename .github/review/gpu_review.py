@@ -76,7 +76,7 @@ def slurm_allowed(pr, slurm_authors):
     return bool(slurm_authors.split()) and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in slurm_authors.split()
 
 
-def configure(out, runner_temp, pr: int, slurm_key="", slurm_nodes="", slurm_authors="", max_gpus="4", hours="4",
+def configure(out, runner_temp, pr: int = 0, slurm_key="", slurm_nodes="", slurm_authors="", max_gpus="4", hours="4",
               max_usd="30", max_runs="2", eras_secret=""):
     """gpu.py's config.local.json from the workflow's variables and secrets, and the ssh keys. The Slurm
     nodes only with their key (one for all of them) and for an author `slurm_allowed` lets use them; Eras
