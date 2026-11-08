@@ -17,7 +17,6 @@ import json
 import os
 import re
 import runpy
-import shlex
 import shutil
 import subprocess
 import sys
@@ -314,10 +313,11 @@ def unavailable(out, lt, text):
 
 
 def pending_ahead(cfg, offer):
-    """How many jobs are pending in a Slurm offer's partition (0 when its queue can't be read: the offer stands)."""
+    """How many jobs are pending on a Slurm offer's node, in any partition: a pending `main` job outranks the
+    bot's preemptible one too (0 when its queue can't be read: the offer stands)."""
     node = gpu_py.slurm_node(cfg, offer["region"])
     try:
-        out = gpu_py.slurm_run(node, f"squeue -h -t PD -p {shlex.quote(node.get('partition', 'main'))} -o %i")
+        out = gpu_py.slurm_run(node, "squeue -h -t PD -o %i")
     except (gpu_py.ApiError, subprocess.TimeoutExpired):
         return 0
     return len(out.split())
@@ -360,7 +360,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
     for o in [o for o in free if o["provider"] == "slurm"]:  # `sinfo` counts free GPUs, not the queue for them
         if ahead := pending_ahead(cfg, o):
             free.remove(o)
-            tried.append(f"{o['id']}: {ahead} job(s) already pending in its partition")
+            tried.append(f"{o['id']}: {ahead} job(s) already pending on its node")
     def launch(o):
         inputs = [x for f in ("brief.md", "findings.json", "pr-body.md", "run.json") for x in ("--input", str(lt / f))]
         inputs += ["--input", str(BOX_COMMON)]
