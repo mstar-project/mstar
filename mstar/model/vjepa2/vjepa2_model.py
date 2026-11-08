@@ -743,8 +743,9 @@ class VJepa2Model(Model):
             # in process_prompt so the client gets a clear error before any
             # forward pass runs.  Sliced per-iter inside the rollout submodule
             # (see ``VJepa2ACRolloutPredictorSubmodule._rollout_step``).
-            rollout_horizon = int(kwargs.get("rollout_horizon", 0) or 0)
-            if rollout_horizon > 1:
+            if int(kwargs.get("rollout_horizon", 0) or 0) > 1:
+                # the loop's cap: the rollout runs no more iterations than that
+                rollout_horizon = self._rollout_horizon(kwargs)
                 t_ctx = 1
                 required = t_ctx + rollout_horizon - 1
                 act_tensor = out["actions"][0]

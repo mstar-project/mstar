@@ -613,14 +613,12 @@ def test_vjepa2_s_plan_is_the_routed_walk_and_needs_the_video(kind):
 @pytest.mark.parametrize("horizon", [2, 5, 10_000])
 def test_vjepa2_s_cap_alone_ends_the_rollout_at_its_horizon(horizon):
     """No stop check ends the rollout, so its cap is every frame a request gets. Each
-    iteration reads the next action, so a trajectory shorter than the horizon is refused
-    before the loop could index past it."""
-    import torch
-
+    iteration reads the next action, so a trajectory shorter than the cap is refused
+    before the loop could read past it."""
     model = _vjepa2()
-    caps = model.get_loop_caps(rollout_horizon=horizon)
-    assert caps[model.ROLLOUT_LOOP_NAME] == min(horizon, model.config.max_rollout_horizon)
-    trajectory = torch.zeros(horizon, 7)
+    cap = model.get_loop_caps(rollout_horizon=horizon)[model.ROLLOUT_LOOP_NAME]
+    assert cap == min(horizon, model.config.max_rollout_horizon)
+    trajectory = torch.zeros(cap, 7)
     model.process_prompt(None, [], ["video"], {}, rollout_horizon=horizon, actions=trajectory, states=trajectory)
     with pytest.raises(ValueError, match="trajectory length"):
         short = trajectory[:-1]
