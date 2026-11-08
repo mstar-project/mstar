@@ -739,25 +739,29 @@ def test_a_ladder_reaches_the_capture_of_a_model_that_plumbs_none():
 def test_rungs_past_the_first_that_holds_the_step_budget_are_dropped():
     """Qwen3.5's ``prefill_text`` capture replays only ``prefill_text`` steps,
     which run inside ``mixed`` and are scheduled under its budget (4096 here),
-    not the walk's own 2048. With chunking off nothing is dropped."""
+    not the walk's own 2048. With chunking off nothing is dropped, nor where
+    only the walk's is off: a prompt that cannot be cut runs whole."""
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     walks, combined = {"prefill_text", "decode"}, {("LLM", "prefill_text"): "mixed", ("LLM", "decode"): "mixed"}
     llm = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)))
     ladder = {"prefill_text": [1024, 2048, 3000, 4096, 8192]}
 
-    def buckets(budgets):
+    def buckets(budgets, walk="prefill_text", override_mixed=()):
         engine = _budgeted_engine()
         engine.set_chunking_policies({
             ("LLM", "prefill_text"): ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=2048),
             ("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=2048),
         })
-        engine.set_token_budgets(budgets, walks, combined)
-        return _captured_buckets(llm, "prefill_text", ladder, engine)
+        engine.set_token_budgets(budgets, walks, combined, override_mixed=override_mixed)
+        bs = llm.MIXED_CAPTURE_BATCH_SIZES[0] if walk == "mixed" else 1
+        return _captured_buckets(llm, walk, {walk: ladder["prefill_text"]}, engine, bs=bs)
 
     assert buckets({"LLM": {"mixed": 4096}}) == [1024, 2048, 3000, 4096]
     assert buckets({"LLM": {"mixed": 2500}}) == [1024, 2048, 3000]
     assert buckets({"LLM": None}) == [1024, 2048, 3000, 4096, 8192]
+    for walk in ("prefill_text", "mixed"):
+        assert buckets({"LLM": {"prefill_text": None}}, walk, {"LLM"}) == [1024, 2048, 3000, 4096, 8192]
 
 
 def test_a_mixed_ladder_keeps_the_rung_a_prompt_beside_decode_rows_runs_past_the_budget():

@@ -116,7 +116,19 @@ class ChunkingManagement:
         runs relabelled to it, `ScheduledBatch.relabel_if_uniform`, and still
         ran under the combined walk's budget). Or more, by what the step's
         speculated rows, one-token decode rows, take of ``min_chunk_tokens``
-        (`batch_builder.most_step_tokens`)."""
+        (`batch_builder.most_step_tokens`).
+
+        None too where the step may hold a prompt of a walk whose chunking
+        the serving config turned off: it runs whole, however long."""
+        members = [
+            walk for (node, walk), combined in self._combined_walk_of.items()
+            if node == node_name and combined == graph_walk
+        ]
+        if any(
+            self.policy(node_name, walk).chunkable and not self.chunkable(node_name, walk)
+            for walk in members or [graph_walk]
+        ):
+            return None
         walk = self._combined_walk_of.get((node_name, graph_walk), graph_walk)
         budget = self.max_batch_tokens(node_name, walk)
         if budget is None:

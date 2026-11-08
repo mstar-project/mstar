@@ -302,10 +302,9 @@ def apply_token_ladders(
     A ladder runs to the first rung that holds the most tokens the scheduler
     gives a step its capture replays (``step_tokens`` of each replay walk and
     the capture's widest batch: its token budget, or a little past it beside
-    decode rows; none where any walk has no budget): a rung beyond would never
-    replay. A
-    larger batch size's ladder also runs at least as far as a smaller one's,
-    which share its static buffers.
+    decode rows; none where any walk's steps have no bound): a rung beyond
+    would never replay. A larger batch size's ladder also runs at least as far
+    as a smaller one's, which share its static buffers.
 
     A walk whose steps only replay another walk's capture is refused, naming
     that walk, as is one the node captures by batch size alone. A walk the
