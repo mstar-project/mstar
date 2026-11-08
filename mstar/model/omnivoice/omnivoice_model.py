@@ -157,8 +157,6 @@ class OmniVoiceModel(Model):
         self.config = OmniVoiceConfig()
         if "backbone_graphs" in kwargs:
             self.config.backbone_graphs = bool(kwargs["backbone_graphs"])
-        if "backbone_token_buckets" in kwargs:
-            self.config.backbone_token_buckets = sorted(int(n) for n in kwargs["backbone_token_buckets"])
         self.skip_weight_loading = skip_weight_loading
 
         # Loaded lazily on the data worker so construction never hits the

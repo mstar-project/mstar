@@ -17,6 +17,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine import with_recompile_limit
+from mstar.engine.accelerator_graph_config import apply_region_ladders
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
@@ -197,8 +198,10 @@ class SubmoduleManagement:
     fp32_precision: Fp32Precision | None = None
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
-    # the serving config's prefill_token_buckets for the node: capture walk -> ladder
+    # the serving config's prefill_token_buckets for the node: capture walk -> ladder,
+    # and piecewise region label -> ladder
     token_ladders: Mapping[str, Any] = field(default_factory=dict)
+    region_ladders: Mapping[str, list[int]] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -612,9 +615,11 @@ class Engine:
         kv_cache_type=None,
         model: "Model | None" = None,
         token_ladders: Mapping[str, Any] | None = None,
+        region_ladders: Mapping[str, Any] | None = None,
     ):
-        """``token_ladders``: the serving config's ``prefill_token_buckets``,
-        node -> capture walk -> ladder, which the node's captures take at warmup."""
+        """``token_ladders`` and ``region_ladders``: the serving config's
+        ``prefill_token_buckets``, node -> capture walk -> ladder and node ->
+        piecewise region label -> ladder, which the node's captures take at warmup."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -707,6 +712,7 @@ class Engine:
                 node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
                 token_ladders=(token_ladders or {}).get(node_name) or {},
+                region_ladders=(region_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
             self._submodules[node_name].lora_pools = tuple(
@@ -1067,7 +1073,8 @@ class Engine:
     def _build_piecewise_runners(
         self, node_name: str, submodule_mgmt: SubmoduleManagement, capture_stream: Any = None,
     ) -> dict[str, PiecewiseAcceleratorGraphRunner]:
-        """One runner per region the submodule declares, not yet captured.
+        """One runner per region the submodule declares, on the ladder the
+        serving config names by its label, not yet captured.
 
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
@@ -1079,6 +1086,7 @@ class Engine:
             node_dtype or torch.float32,
             submodule_mgmt.joint_comm_group.world_size,
         )
+        apply_region_ladders(node_name, configs, submodule_mgmt.region_ladders, submodule_mgmt.token_ladders)
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         # One graph memory pool for all of the node's regions (see
         # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes

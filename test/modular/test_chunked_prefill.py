@@ -815,6 +815,8 @@ def _graph_model():
     ({"prefill_token_buckets": {"LLM": {"prefill": {1: [64, 4096], 2: [64, 2048]}}}}, "at least as far"),
     # a walk of the model, but another node's
     ({"prefill_token_buckets": {"LLM": {"encode": [64]}}}, "does not run"),
+    # no walk, so a piecewise region's, which takes one ladder
+    ({"prefill_token_buckets": {"LLM": {"layers": {1: [64]}}}}, "piecewise region"),
 ])
 def test_a_serving_config_ladder_that_cannot_apply_is_refused_before_loading(model_config, match):
     """EngineManager.build refuses it from the config and the model's graph, before any
@@ -835,6 +837,24 @@ def test_a_serving_config_ladder_that_cannot_apply_is_refused_before_loading(mod
             transfer_engine_info=TransferEngineInfo(my_entity_id="t", my_session_id="t", transfer_engine=None),
             model=_graph_model(), graph_runtime=types.SimpleNamespace(),
         )
+
+
+def test_a_name_that_is_no_walk_sets_the_piecewise_region_it_labels():
+    """OmniVoice's backbone layer loop, by its label; a label it doesn't declare is refused."""
+    from mstar.model.omnivoice.config import OmniVoiceConfig
+    from mstar.model.omnivoice.submodules import BACKBONE_LAYERS, OmniVoiceBackboneSubmodule
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    backbone = OmniVoiceBackboneSubmodule(torch.nn.Module(), OmniVoiceConfig())
+
+    def regions(ladders):
+        mgmt = make_mgmt(backbone, joint_comm_group=SimpleNamespace(world_size=1), region_ladders=ladders)
+        return make_engine(_submodules={"backbone": mgmt})._build_piecewise_runners("backbone", mgmt)
+
+    (runner,) = regions({BACKBONE_LAYERS: [512, 256]}).values()
+    assert runner._config.total_tokens == [256, 512]
+    with pytest.raises(ValueError, match="neither"):
+        regions({"backbone_layer": [256]})
 
 
 # ── sampler: a non-final chunk's token is not kept ────────────────────

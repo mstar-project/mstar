@@ -264,8 +264,9 @@ OmniVoice notes
   and each residual add folds into the next RMSNorm (flashinfer
   ``fused_add_rmsnorm``), so logits match the reference to half-precision
   rounding rather than bit for bit. ``model_kwargs: {backbone_graphs: false}``
-  runs the same layer loop eagerly, and ``backbone_token_buckets`` sets the
-  packed-token buckets (256 to 4096 by default).
+  runs the same layer loop eagerly, and the serving config's
+  ``prefill_token_buckets: {backbone: {backbone_layers: [...]}}`` sets the
+  packed-token buckets (see :doc:`serving`).
 - ``configs/omnivoice_split.yaml`` runs code2wav (the codec decode) on a
   second worker sharing GPU 0, so the unmask loop no longer stops for each
   finished request's decode; the silence trim and the rest of the output

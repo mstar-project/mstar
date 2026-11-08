@@ -892,7 +892,7 @@ def get_cuda_graph_configs(self, device, tp_world_size=1):
     ]
 ```
 
-A deployment replaces a packed capture's `capture_token_lengths` with the serving config's `prefill_token_buckets` (node -> capture walk -> ladder, see [Serving](/serving)). The engine applies it to the configs `get_accelerator_graph_configs` returns, so a model plumbs nothing.
+A deployment replaces a packed capture's `capture_token_lengths` with the serving config's `prefill_token_buckets` (node -> capture walk -> ladder, see [Serving](/serving)). The engine applies it to the configs `get_accelerator_graph_configs` returns, so a model plumbs nothing. A `PiecewisePackedConfig` region's `total_tokens` takes the ladder its label names the same way.
 
 BAGEL shows the case of two captures for one walk. It captures `decode` twice, once with `additional_key_info=False` and once with `additional_key_info=True`. A decode step with guidance enabled and a decode step with guidance disabled declare different segments over the same token count. BAGEL's `cg_key_info` reports which of the two a batch is.
 

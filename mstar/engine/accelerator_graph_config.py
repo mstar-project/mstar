@@ -339,6 +339,45 @@ def apply_token_ladders(
             config.capture_token_lengths = trimmed
 
 
+def apply_region_ladders(
+    node: str, configs: Mapping[str, "PiecewiseAcceleratorGraphConfig"],
+    ladders: Mapping[str, list[int]], walk_ladders: Mapping[str, Any],
+) -> None:
+    """Take a serving config's ``prefill_token_buckets`` for ``node`` that name
+    no walk of it (`EngineManager` split them off) as the ``total_tokens`` of
+    its piecewise packed regions, by label.
+
+    A name that is neither a walk nor a region of the node is refused, as is a
+    region the config also names as a walk, or one captured by batch size
+    alone. A node that declares no region at this deployment logs and skips.
+    """
+    both = sorted(set(configs) & set(walk_ladders))
+    if both:
+        raise ValueError(
+            f"prefill_token_buckets names {both} for {node}, each both a walk and a piecewise "
+            "region of it"
+        )
+    for label, ladder in ladders.items():
+        config = configs.get(label)
+        if config is None and not configs:
+            logger.warning(
+                "%s: no piecewise region at this deployment, so prefill_token_buckets for %r "
+                "does nothing", node, label,
+            )
+        elif config is None:
+            raise ValueError(
+                f"prefill_token_buckets names {label!r} for {node}, neither one of its walks nor "
+                f"one of its piecewise regions {sorted(configs)}"
+            )
+        elif not isinstance(config, PiecewisePackedConfig):
+            raise ValueError(
+                f"prefill_token_buckets names piecewise region {label!r} of {node}, which "
+                "captures by batch size, not tokens"
+            )
+        else:
+            config.total_tokens = sorted(ladder)
+
+
 class PiecewiseConfigType(Enum):
     BATCHED = "batched"
     PACKED = "packed"

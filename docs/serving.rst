@@ -335,24 +335,33 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        mapping of walk -> budget; null turns a walk's chunking off. Overrides the
        model's defaults. See *Chunked prefill budgets* below.
    * - ``prefill_token_buckets``
-     - *(optional)* Per node, a mapping of walk -> the token counts its packed graph
-       captures are taken at (the model's ``capture_token_lengths``), in place of the
-       model's ladder. The walk is the one a packed capture is captured on (Orpheus's
-       ``mixed`` steps replay its ``prefill`` capture, so name ``prefill``); a step
-       pads to the smallest rung that holds it, and a longer one runs eagerly. A
-       ladder is a list, or a mapping of min batch size -> list for a ladder per
-       range of batch sizes: ``{1: [...], 2: [...]}`` captures one request on the
-       first and every larger batch on the second (a larger batch size's ladder
-       must reach at least as far). A ladder runs to the first rung that holds the
-       token budget of the steps its capture replays (``max_batch_tokens``; a walk
-       inside a combined walk runs under the combined walk's), and the rungs past
-       it, which no step would reach, are dropped and logged. Each rung adds
-       captures, graph memory and startup time. Loading fails, before any weights
-       load, if the setting is not a mapping of node -> walk -> ladder, names a node
-       in no node group or a walk that does not run the node (one the node is in,
-       or a combined walk of it), or a ladder is not a non-empty list of distinct
-       positive ints. Warmup fails on a walk whose steps replay another walk's
-       capture, naming that walk; a walk the node captures nothing for at this
+     - *(optional)* Per node, a mapping of name -> ladder: the token counts a packed
+       graph capture is taken at, in place of the model's. A name is a walk the
+       node runs, for its packed captures on that walk (the model's
+       ``capture_token_lengths``; Orpheus's ``mixed`` steps replay its ``prefill``
+       capture, so name ``prefill``), or the label of one of its piecewise packed
+       regions, for that region's ``total_tokens`` (BAGEL's ``vit_block_loop``,
+       OmniVoice's ``backbone_layers``). A step pads to the smallest rung that
+       holds it, and a longer one runs eagerly. A walk's ladder is a list, or a
+       mapping of min batch size -> list for a ladder per range of batch sizes:
+       ``{1: [...], 2: [...]}`` captures one request on the first and every larger
+       batch on the second (a larger batch size's ladder must reach at least as
+       far). A walk's ladder runs to the first rung that holds the token budget of
+       the steps its capture replays (``max_batch_tokens``; a walk inside a
+       combined walk runs under the combined walk's), and the rungs past it, which
+       no step would reach, are dropped and logged; a region takes its ladder
+       whole. A region whose attention resource is sized from the model's top
+       rung (a vision tower's ``max_segments_per_step``) needs that raised under
+       ``resources`` with a longer ladder, or its captures past it fail. Each
+       rung adds captures, graph memory and startup time. Loading
+       fails, before any weights load, if the setting is not a mapping of node ->
+       name -> ladder, names a node in no node group or a walk of the model that
+       does not run the node (a node runs the walks it is in and its combined
+       walks), a ladder is not a non-empty list of distinct positive ints, or a
+       name that is no walk has a mapping. Warmup fails on a walk whose steps
+       replay another walk's capture, naming that walk, on a name that is neither
+       a walk nor a region of the node or is both, and on a region captured by
+       batch size alone; a walk or region the node captures nothing for at this
        deployment (a model that turns its captures off, such as GLM-5.2 with
        ``dsa_long_context``) is logged and skipped. The key replaces
        ``model_kwargs.prefill_token_buckets``, which fails loading.

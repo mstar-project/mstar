@@ -2143,7 +2143,8 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
 A deployment replaces a packed capture's ``capture_token_lengths`` with the serving
 config's ``prefill_token_buckets`` (node -> capture walk -> ladder, see :doc:`serving`).
 The engine applies it to the configs ``get_accelerator_graph_configs`` returns, so a
-model plumbs nothing.
+model plumbs nothing. A ``PiecewisePackedConfig`` region's ``total_tokens`` takes the
+ladder its label names the same way.
 
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
 ``additional_key_info=False`` and once with ``additional_key_info=True``. A decode step

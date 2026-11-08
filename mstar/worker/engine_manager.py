@@ -24,9 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 def _prefill_token_buckets(model_config: dict) -> Mapping:
-    """The serving config's ``prefill_token_buckets``: node -> capture walk ->
-    ladder, which each node's captures take at warmup (`apply_token_ladders`).
-    `_check_token_ladders` checks the walks and ladders."""
+    """The serving config's ``prefill_token_buckets``: node -> capture walk or
+    piecewise region -> ladder (`_split_token_ladders`)."""
     if "prefill_token_buckets" in (model_config.get("model_kwargs") or {}):
         raise ValueError(
             "model_kwargs.prefill_token_buckets moved to the top level of the serving config, "
@@ -42,21 +41,40 @@ def _prefill_token_buckets(model_config: dict) -> Mapping:
     return ladders
 
 
-def _check_token_ladders(ladders: Mapping[str, Mapping], model: Model) -> None:
-    """Refuse, from the config and the model's graph alone, a ladder that is not
-    one or a walk that does not run its node: a walk the node is in, or a
-    combined walk of it."""
+def _split_token_ladders(
+    ladders: Mapping[str, Mapping], model: Model,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Each node's ladders by walk (a walk the node is in, or a combined walk
+    of it), which its packed captures take (`apply_token_ladders`), and by
+    any other name, which can only be a piecewise region's label
+    (`Engine._build_piecewise_runners` checks that, once the node declares
+    its regions). Refuses, from the config and the model's graph alone, a
+    ladder that is not one, a region's that is not a list, and a walk of the
+    model that does not run the node."""
     graphs = model.get_graph_walk_graphs()
     combined = model.get_combined_graph_walks()
+    every_walk = set(graphs) | {name for walks in combined.values() for name in walks}
+    by_walk: dict[str, dict] = {}
+    by_region: dict[str, dict] = {}
     for node, named in ladders.items():
         walks = {walk for walk, graph in graphs.items() if node in graph.get_nodes()} | set(combined.get(node, {}))
-        for walk, ladder in named.items():
-            check_token_ladder(f"{node}/{walk}", ladder)
-            if walk not in walks:
+        for name, ladder in named.items():
+            check_token_ladder(f"{node}/{name}", ladder)
+            if name in walks:
+                by_walk.setdefault(node, {})[name] = ladder
+            elif name in every_walk:
                 raise ValueError(
-                    f"prefill_token_buckets names walk {walk!r} for {node}, which it does not run; "
+                    f"prefill_token_buckets names walk {name!r} for {node}, which it does not run; "
                     f"its walks are {sorted(walks)}"
                 )
+            elif isinstance(ladder, Mapping):
+                raise ValueError(
+                    f"prefill_token_buckets names {name!r} for {node}, not one of its walks {sorted(walks)}, "
+                    f"so a piecewise region, which takes one ladder for every batch size, got {ladder!r}"
+                )
+            else:
+                by_region.setdefault(node, {})[name] = ladder
+    return by_walk, by_region
 
 
 def _unchunkable_nodes(
@@ -318,7 +336,7 @@ class EngineManager:
             unknown = sorted(set(setting) - known)
             if unknown:
                 raise ValueError(f"{key} names nodes {unknown} that no node group serves")
-        _check_token_ladders(ladders, model)
+        walk_ladders, region_ladders = _split_token_ladders(ladders, model)
         specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
@@ -381,7 +399,8 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
-            token_ladders=ladders,
+            token_ladders=walk_ladders,
+            region_ladders=region_ladders,
         )
         if not all(isinstance(flag, bool) for flag in override_mixed.values()):
             raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")

@@ -213,11 +213,12 @@ def test_a_shipped_config_s_ladders_reach_their_batch_sizes(name):
     import yaml
 
     from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
-    from mstar.worker.engine_manager import _check_token_ladders, _prefill_token_buckets
+    from mstar.worker.engine_manager import _prefill_token_buckets, _split_token_ladders
 
     config = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs" / name).read_text())
     model = Glm52Model("", tokenizer_mode="byte", config_variant="full", **config["model_kwargs"])
-    _check_token_ladders(_prefill_token_buckets(config), model)
+    walks, regions = _split_token_ladders(_prefill_token_buckets(config), model)
+    assert (walks, regions) == (config["prefill_token_buckets"], {})
     runner = AcceleratorGraphRunner(
         submodule_name="LLM", submodule=_submodule(model.config), resources={}, step_runner=None,
         device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),

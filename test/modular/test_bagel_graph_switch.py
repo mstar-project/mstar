@@ -119,7 +119,6 @@ def test_model_graph_switch_gates_optional_vit_capture(
 ):
     monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH", str(int(vit_enabled)))
     monkeypatch.setenv("MSTAR_VIT_BATCHING", str(int(batching)))
-    monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS", "1024,512")
     monkeypatch.setenv("MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES", "4,1,2")
     model = model_factory(accelerator_graph=enabled)
     model.vit_model = nn.Identity()
@@ -136,5 +135,4 @@ def test_model_graph_switch_gates_optional_vit_capture(
     assert bool(configs) is (enabled and vit_enabled)
     if configs:
         config = next(iter(configs.values()))
-        assert config.total_tokens == [512, 1024]
         assert config.capture_batch_sizes == ([1, 2, 4] if batching else [1])
