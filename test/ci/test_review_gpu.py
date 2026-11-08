@@ -242,7 +242,8 @@ class TestStart(unittest.TestCase):
         lt = Path(tempfile.mkdtemp())
         config = types.SimpleNamespace(load_config=lambda: cfg, ApiError=RuntimeError,
                                        slurm_node=lambda cfg, name: {"partition": "background"},
-                                       slurm_run=lambda sl, cmd: pending)
+                                       # The pending jobs are in another partition, as a person's `main` job is.
+                                       slurm_run=lambda sl, cmd: "" if " -p " in cmd else pending)
         with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", config), \
                 unittest.mock.patch.dict(os.environ, env | ({"LIVE_TEST_ANTHROPIC_KEY": env_key} if env_key else {}),
                                          clear=True), contextlib.redirect_stdout(io.StringIO()):
