@@ -97,7 +97,6 @@ SCHEMA = {
         "live_test": {"type": "object", "properties": {
             "run": {"type": "string", "enum": ["none", "targeted", "full"]},
             "reason": {"type": "string"},
-            "confirm": STRINGS,
             # The kinds of check the box runs; ignored for `none`.
             "checks": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": True,
                        "items": {"type": "string", "enum": ["correctness", "performance"]}},
@@ -108,7 +107,7 @@ SCHEMA = {
                                                           "the change only shows on"},
                 "why": {"type": "string", "description": "one line"},
             }, "required": ["what", "why"]}},
-        }, "required": ["run", "reason", "confirm", "checks", "gpus", "focus"]},
+        }, "required": ["run", "reason", "checks", "gpus", "focus"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "latent", "risk"],

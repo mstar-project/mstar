@@ -69,7 +69,7 @@ class TestApproval(unittest.TestCase):
                          gh_json=lambda path: compare if "/compare/" in path else pr, review_threads=lambda pr: [])
             r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": list(skipped),
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
-                 "live_test": {"run": run, "reason": "docs only", "confirm": [], "checks": ["correctness"], "gpus": 1}}
+                 "live_test": {"run": run, "reason": "docs only", "checks": ["correctness"], "gpus": 1}}
             a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict, since=since,
                                    above="stacked-above.json")
             return GPU_REVIEW["reasons_not_to_approve"](a, r)[0]
@@ -203,7 +203,7 @@ class TestStart(unittest.TestCase):
     def start(self, env_key, cfg, launch_code=0, **args):
         out = Path(tempfile.mkdtemp())
         (out / "review.json").write_text(json.dumps({"live_test": {
-            "run": "full", "reason": self.INJECTED, "confirm": [self.INJECTED], "checks": ["correctness"],
+            "run": "full", "reason": self.INJECTED, "checks": ["correctness"],
             "gpus": 1, "focus": [{"what": self.INJECTED, "why": "the PR's own path"}]}}))
         offers = [{"id": "slurm:node1:1", "provider": "slurm", "gpu": "H200", "count": 1, "usd_per_hour": 0.0,
                    "availability": "8 free"},
