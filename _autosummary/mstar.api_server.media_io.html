@@ -716,6 +716,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RefAudioTooLongError"><code class="docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RemoteFetchError"><code class="docutils literal notranslate"><span class="pre">RemoteFetchError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler"><code class="docutils literal notranslate"><span class="pre">StreamResampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.flush"><code class="docutils literal notranslate"><span class="pre">StreamResampler.flush()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.held"><code class="docutils literal notranslate"><span class="pre">StreamResampler.held()</span></code></a></li>
@@ -878,6 +879,9 @@ the base install stays slim.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.media_io.RefAudioTooLongError" title="mstar.api_server.media_io.RefAudioTooLongError"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a></p></td>
 <td><p>A clip that opens as audio but runs past <code class="docutils literal notranslate"><span class="pre">MAX_REF_AUDIO_SECONDS</span></code>.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.media_io.RemoteFetchError" title="mstar.api_server.media_io.RemoteFetchError"><code class="xref py py-obj docutils literal notranslate"><span class="pre">RemoteFetchError</span></code></a></p></td>
+<td><p>A remote media fetch was refused or failed; the message is safe to return to the client.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -911,6 +915,13 @@ callers re-raise it rather than fall back to another decoder.</p>
 <span class="property"><span class="k"><span class="pre">exception</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">RefAudioTooLongError</span></span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#RefAudioTooLongError"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.RefAudioTooLongError" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#ValueError" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ValueError</span></code></a></p>
 <p>A clip that opens as audio but runs past <code class="docutils literal notranslate"><span class="pre">MAX_REF_AUDIO_SECONDS</span></code>.</p>
+</dd></dl>
+
+<dl class="py exception">
+<dt class="sig sig-object py" id="mstar.api_server.media_io.RemoteFetchError">
+<span class="property"><span class="k"><span class="pre">exception</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">RemoteFetchError</span></span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#RemoteFetchError"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.RemoteFetchError" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/exceptions.html#ValueError" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">ValueError</span></code></a></p>
+<p>A remote media fetch was refused or failed; the message is safe to return to the client.</p>
 </dd></dl>
 
 <dl class="py class">
@@ -1352,8 +1363,14 @@ tell them apart; the decoder can. A clip that is audio but too long raises
 <dt class="sig sig-object py" id="mstar.api_server.media_io.save_remote_url">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.media_io.</span></span><span class="sig-name descname"><span class="pre">save_remote_url</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">url</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">30.0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/media_io.html#save_remote_url"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.media_io.save_remote_url" title="Link to this definition">#</a></dt>
 <dd><p>Download an <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> URL into <code class="docutils literal notranslate"><span class="pre">upload_dir</span></code>. Returns (modality, path).</p>
-<p>Note: fetching arbitrary URLs has SSRF surface. Callers exposing this
-publicly should allowlist hosts or disable remote fetch (data-URL only).</p>
+<p>With <code class="docutils literal notranslate"><span class="pre">MSTAR_REMOTE_ALLOWED_HOSTS</span></code> set (comma-separated hosts and
+<code class="docutils literal notranslate"><span class="pre">*.suffix</span></code> patterns) only those hosts are fetched. A host that is not
+allowlisted is also refused when it resolves to a blocked address, and the
+connection goes to the vetted address. Every redirect hop is checked again
+(at most <code class="docutils literal notranslate"><span class="pre">REMOTE_MAX_REDIRECTS</span></code>), the body is streamed to disk and capped
+at <code class="docutils literal notranslate"><span class="pre">MSTAR_REMOTE_MAX_BYTES</span></code>, and <code class="docutils literal notranslate"><span class="pre">timeout</span></code> bounds the whole fetch
+(name resolution aside). Failures raise <a class="reference internal" href="#mstar.api_server.media_io.RemoteFetchError" title="mstar.api_server.media_io.RemoteFetchError"><code class="xref py py-class docutils literal notranslate"><span class="pre">RemoteFetchError</span></code></a> with a
+short message; the details are logged server-side only.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1546,6 +1563,7 @@ sample.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RefAudioTooLongError"><code class="docutils literal notranslate"><span class="pre">RefAudioTooLongError</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.RemoteFetchError"><code class="docutils literal notranslate"><span class="pre">RemoteFetchError</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler"><code class="docutils literal notranslate"><span class="pre">StreamResampler</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.flush"><code class="docutils literal notranslate"><span class="pre">StreamResampler.flush()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.media_io.StreamResampler.held"><code class="docutils literal notranslate"><span class="pre">StreamResampler.held()</span></code></a></li>

@@ -60,6 +60,7 @@ mstar.api\_server.media\_io
       AudioRefusedError
       AudioTooLongError
       RefAudioTooLongError
+      RemoteFetchError
    
    
 

@@ -1163,8 +1163,38 @@ an error and the request is aborted in the backend.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ALLOW_REMOTE</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
-<td><p>Allow <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> media URLs in requests (fetched server-side,
-30 s timeout). Off by default.</p></td>
+<td><p>Allow <code class="docutils literal notranslate"><span class="pre">http(s)</span></code> media URLs in requests, fetched server-side by both
+frontends (<code class="docutils literal notranslate"><span class="pre">media_io.save_remote_url</span></code> and <code class="docutils literal notranslate"><span class="pre">save_remote_url</span></code> in
+<code class="docutils literal notranslate"><span class="pre">rust/server/src/media.rs</span></code>). Off by default. A fetch follows at
+most 3 redirects and takes at most 30 s; proxy variables are not
+used, so the connection goes to the address that was checked. A host
+that resolves to a loopback, private, link-local, multicast or
+reserved address (cloud metadata included) is refused unless
+allowlisted; an IPv6 address that carries an IPv4 one (IPv4-mapped,
+NAT64 <code class="docutils literal notranslate"><span class="pre">64:ff9b::/96</span></code>, 6to4 <code class="docutils literal notranslate"><span class="pre">2002::/16</span></code>, IPv4-compatible) is
+judged by that IPv4 address. Failures return a 400 with a short
+message; the details are only logged. HTTPS certificates are checked
+against the system trust store on the Python frontend and against
+the bundled Mozilla roots (<code class="docutils literal notranslate"><span class="pre">webpki-roots</span></code>) on the Rust frontend,
+so a private CA added to the system store is trusted by Python only.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REMOTE_ALLOWED_HOSTS</span></code></p></td>
+<td><p>unset</p></td>
+<td><p>Comma-separated hosts and <code class="docutils literal notranslate"><span class="pre">*.suffix</span></code> patterns (<code class="docutils literal notranslate"><span class="pre">*.example.com</span></code>
+matches its subdomains, not <code class="docutils literal notranslate"><span class="pre">example.com</span></code>). When set, only these
+hosts are fetched, on every redirect hop; listed hosts skip the
+address check. An entry matches only a host the URL spells in
+canonical form (an ASCII name, dotted-decimal IPv4, compressed IPv6
+such as <code class="docutils literal notranslate"><span class="pre">[::1]</span></code>); other spellings of an address (<code class="docutils literal notranslate"><span class="pre">2130706433</span></code>,
+<code class="docutils literal notranslate"><span class="pre">0x7f000001</span></code>, <code class="docutils literal notranslate"><span class="pre">127.1</span></code>, <code class="docutils literal notranslate"><span class="pre">[0:0:0:0:0:0:0:1]</span></code>) never match. Read
+by the same two functions; the Rust frontend reads it once at
+startup.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REMOTE_MAX_BYTES</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">67108864</span></code></p></td>
+<td><p>Largest remote media file fetched (64 MiB), checked against
+<code class="docutils literal notranslate"><span class="pre">Content-Length</span></code> and while streaming. Read like
+<code class="docutils literal notranslate"><span class="pre">MSTAR_REMOTE_ALLOWED_HOSTS</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONCURRENT_REQUESTS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">256</span></code></p></td>
