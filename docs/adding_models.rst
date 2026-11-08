@@ -596,9 +596,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   the one read declared for its layer and walk, and loading refuses two reads over one
   layer and walk. ``Causal()`` sees every entry up to the query's own, ``Window(size)`` the
   last ``size`` of them, its own included, and ``Bidirectional()`` every entry the row keeps and
-  every entry this step adds for it. A walk a chunking policy splits can't read through
-  ``Bidirectional()`` or ``Block()``, since splitting a row's adds across steps would change what
-  its tokens see. ``Attend(q_heads=)`` is attention with the model's query heads, a multiple of
+  every entry this step adds for it. A walk can't read through ``Bidirectional()`` or ``Block()``
+  on a node where a chunking policy splits it, a label's ``PrefixKeys`` key it, or a rebuild
+  policy runs it again, since each regroups a row's adds across steps and would change what its
+  tokens see. ``Attend(q_heads=)`` is attention with the model's query heads, a multiple of
   the entry's heads.
 - ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
   as a recurrent state. ``updates`` names the kernels that read and write one of its fields
@@ -652,8 +653,9 @@ segments in this step, and each request's k-th segment on one pairs with its k-t
 It takes a mask that uses no query position: ``Block()`` on an array with ``max_len=0``, and
 ``Bidirectional()`` on one that keeps entries, whose context is added on the walk that carries it
 and listed at span 0 afterwards. A cross read on an array that keeps entries is that array's one
-read, over one label, and its queries come from an append-only array that keeps entries. Separate
-token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
+read, over one label, and its queries come from an append-only array that keeps entries. A
+``max_len=0`` cross read's queries come from an array of one label, and ``queries`` never names the
+read's own array. Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
 each under its own label.
 
 An array whose calls carry each rank's share of its tokens under sequence parallelism declares
@@ -1963,7 +1965,8 @@ and each row's label comes from the step's segments, so there are no cursors:
   per layer per step, and it is the layer's last add. Scratch adds can repeat, and last until
   the next add or the end of the step. ``keep=None`` takes the step's ``keep``. The resources keep
   or drop a step's adds as a whole, so a step that keeps needs each layer to end on a kept add,
-  and a step with ``keep=False`` refuses ``keep=True``.
+  unless every row it lists has span 0 or is a placeholder, and a step with ``keep=False``
+  refuses ``keep=True``.
 - ``read`` sees kept entries from earlier steps, plus this layer's latest add, at the
   positions its mask reaches. It runs the op the declaration names for the layer.
 - ``write`` overwrites entries in place.

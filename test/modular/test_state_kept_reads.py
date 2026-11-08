@@ -23,7 +23,8 @@ from mstar.engine.resources.attn.config import AttentionStep, CrossAttentionConf
 from mstar.engine.resources.attn.cross import FlashInferCrossManager
 from mstar.engine.resources.attn.dense import DenseAttentionManager
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
-from mstar.engine.resources.attn.ragged.config import RaggedCrossAttentionStep
+from mstar.engine.resources.attn.ragged.base import _RaggedCrossManagerBase
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedCrossAttentionStep
 from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper
 from mstar.engine.resources.kv import manager as kv_manager_module
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig
@@ -43,7 +44,7 @@ from mstar.engine.state import (
     Window,
     at_last_token,
 )
-from mstar.engine.state.adapters import build_specs, state_steps
+from mstar.engine.state.adapters import build_specs, node_handles, state_steps
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.contract import Entry
 from mstar.engine.state.within_step import WithinStepHandle
@@ -186,7 +187,7 @@ def test_a_kept_cross_read_builds_todays_spec_over_its_arrays_one_label():
                 "own": Read(mask=Causal(), op=Attend(q_heads=HEADS), layers={1}),
             },
         )],
-        "a handle's queried array is per array",
+        "a cross read's array takes no other read yet",
     ),
     (
         [
@@ -232,6 +233,66 @@ def test_a_max_len_0_read_over_a_kept_array_plans_todays_cross_step():
         segments=queries, state={"kv": ArrayStep(), "text": ArrayStep(segments=context)},
     ), handles)
     assert step.steps["text_attn"] == RaggedCrossAttentionStep(segments=(*queries, *context), pairs=(("main", "text"),))
+
+
+class _PlannedWrapper:
+    """Takes the plan the ragged manager makes and returns q, so a read runs on the CPU."""
+
+    def __init__(self, **kwargs):
+        pass
+
+    def plan(self, q_cu, kv_cu):
+        pass
+
+    def run(self, q, k, v):
+        return q
+
+
+class _CpuRaggedCross(_RaggedCrossManagerBase):
+    """The ragged cross manager's planning and label lookup, over a wrapper that runs nothing."""
+
+    wrapper_class = _PlannedWrapper
+
+
+def _form_b(labels=frozenset({"main"})) -> list[Array]:
+    """A max_len 0 cross read whose queries are a kept array's segments, as LingBot's text read."""
+    chunk = Array("kv", nodes={"n"}, layers=LAYERS, entry=ENTRY, max_len=64, labels=labels,
+                  reads={"attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
+    text = Array("text", nodes={"n"}, layers=LAYERS, entry=ENTRY, max_len=0, labels={"text"},
+                 reads={"text_attn": Read(mask=Block(), op=Attend(q_heads=HEADS), queries="kv")})
+    return [chunk, text]
+
+
+def test_a_max_len_0_read_over_a_kept_array_reads_through_node_handles():
+    """The handle fixes its plan label at bind, and the step's plan holds the same one."""
+    arrays = _form_b()
+    config = RaggedAttentionConfig(num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=DIM)
+    ragged = _CpuRaggedCross(torch.device("cpu"), torch.float32, config, "text_attn")
+    resources = {"kv": _StubKV(), "attn": _StubSelfRead(), "text_attn": ragged}
+    assert {spec.resource_key for spec in build_specs(arrays)} == set(resources)
+    handles = node_handles(SimpleNamespace(declare_state=lambda: arrays), "n", resources)
+    step = state_steps(SubmoduleStep(
+        segments=[Segment("a", "main", 3), Segment("b", "main", 2)],
+        state={"kv": ArrayStep(), "text": ArrayStep(segments=(Segment("a", "text", 4), Segment("b", "text", 4)))},
+    ), handles)
+    ctx = _ctx()
+    ragged.plan(step.steps["text_attn"], ctx)
+    step.set_ctx(ctx)
+    step.begin_calls()
+    for layer in sorted(LAYERS):
+        _add_and_read(handles["kv"], layer, tokens=5)
+        handles["text"].add(layer, k=torch.zeros(8, HEADS, DIM), v=torch.zeros(8, HEADS, DIM))
+        out = handles["text"].read(layer, torch.ones(5, HEADS, DIM))
+        assert out.shape == (5, HEADS, DIM), "the read should find the plan the step made"
+    step.check_calls()
+    step.end_calls()
+
+
+def test_a_max_len_0_read_over_queries_on_two_labels_has_no_layout_yet():
+    """A step on the second label would plan a label the handle never reads."""
+    with pytest.raises(ValueError, match=r"Array 'text': no layout yet: reads\['text_attn'\] reads the queries of "
+                                         r"'kv', which has labels \['cond', 'uncond'\]"):
+        build_specs(_form_b(labels=frozenset({"cond", "uncond"})))
 
 
 # The handle's cross read

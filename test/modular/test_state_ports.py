@@ -745,9 +745,11 @@ def _qwen3_5_open_step(llm) -> SubmoduleStep:
 
 
 def test_a_qwen3_5_step_that_never_samples_through_its_handle_is_refused():
-    step = _qwen3_5_open_step(_qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"])))
+    llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]))
+    step = _qwen3_5_open_step(llm)
+    # no forward runs, so only the sampler's count is checked: the arrays would refuse a step with no adds
     with pytest.raises(ValueError, match=r"Sampler 'sampler': a step listing it sampled 0 times, and draws is 1"):
-        step.check_calls()
+        llm.sampler.check_step(step)
     step.end_calls()
 
 
@@ -756,7 +758,7 @@ def test_a_qwen3_5_step_counts_the_scaffolds_draw_through_its_handle():
     llm.sampler.resource = SimpleNamespace(sample=lambda rows, logits: logits)
     step = _qwen3_5_open_step(llm)
     llm.sample_tokens(None, torch.zeros(1, 4))
-    step.check_calls()
+    llm.sampler.check_step(step)
     assert llm.sampler._drawn == 1, "the scaffold's forward should sample through the handle"
     step.end_calls()
 

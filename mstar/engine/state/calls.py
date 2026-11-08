@@ -66,10 +66,12 @@ class ArrayHandle(StepHandle):
         # This step's calls, checked in eager steps and at capture.
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
         # `_kept` holds the layers whose kept add has run, `_scratch` those with a scratch add, `_read` those read,
-        # and `_updated` the update calls run.
+        # and `_updated` the update calls run. `_grows` says whether `check_step` needs an add, for a step that lists
+        # a row on the pages at span above 0.
         self._open = False
         self._keep = True
         self._capturing = False
+        self._grows = False
         self._held: tuple[torch.Tensor, torch.Tensor] | None = None
         self._held_layer: int | None = None
         self._kept: set[int] = set()
@@ -111,6 +113,11 @@ class ArrayHandle(StepHandle):
         if step.ctx.replays:
             return
         self._check_step(declared, segments or (), step.ctx)
+        # a capture opens the handles once around `preprocess`, where `eager_add` adds run, and again around the forward
+        self._grows = self._kv is not None and not (declared.eager_add and step.ctx.capture) and any(
+            segment.span and (segment.request_id, segment.label) not in declared.placeholders
+            for segment in segments or ()
+        )
         if self.queried is None:
             return
         queries = step.state[self.queried.name].segments or step.segments or ()
@@ -130,6 +137,9 @@ class ArrayHandle(StepHandle):
         if self._kept and self._kept != self.array.layers:
             raise self._refusal(f"layers {sorted(self.array.layers - self._kept)} have no add in a step that keeps "
                                 "adds on others, and every layer stays the same length")
+        if self._grows and not self._kept:
+            raise self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages "
+                                "would keep entries no add wrote; list those rows at span 0")
 
     def commit_step(self, step) -> None:
         if self.host_fields is not None:

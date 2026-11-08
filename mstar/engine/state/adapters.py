@@ -133,9 +133,8 @@ def _kv_specs(array: Array, by_name: Mapping[str, Array]) -> list[NodeResourceSp
             raise _no_layout(array, f"a cross read's array declares one label, CrossAttentionConfig's one "
                                     f"context_label, and it has {sorted(array.labels)}")
         if len(array.reads) != 1:
-            raise _no_layout(array, f"reads[{key!r}] reads another array's queries, and the array declares other "
-                                    "reads; a handle's queried array is per array, so they would route through the "
-                                    "cross read")
+            raise _no_layout(array, f"reads[{key!r}] reads another array's queries, and a cross read's array takes no "
+                                    "other read yet; declare that read on an array of its own")
         queried = by_name[read.queries]
         if queried.rewritable or not queried.max_len:
             raise _no_layout(array, f"reads[{key!r}] keeps entries and reads the queries of {read.queries!r}, which "
@@ -186,6 +185,9 @@ def _within_step_specs(arrays: Sequence[Array]) -> dict[str, NodeResourceSpec]:
             continue
         (key, read), heads, head_dim, dtype = _within_step_read(array)
         queried = by_name.get(read.queries, array)
+        if read.queries is not None and len(queried.labels) != 1:
+            raise _no_layout(array, f"reads[{key!r}] reads the queries of {read.queries!r}, which has labels "
+                                    f"{sorted(queried.labels)}, and a max_len 0 read plans the queries of one label")
         config = RaggedAttentionConfig(
             num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
             # the heads narrow by SP only where the exchange runs over them
