@@ -45,8 +45,16 @@ A review's cost is its turns times its context: every turn re-reads everything r
   reader of Z": one precise grep each, several per message, then read only the lines a finding will
   cite. Every cited line is read, not inferred from a grep hit.
 - **Defects first.** After Phase A (§3, which must precede the diff), run the passes in §4's order,
-  so a review that runs out of turns has its defects. In light mode on a diff over about 4,000 lines, review the files most likely to hold
-  a defect and list the rest as skipped.
+  so a review that runs out of turns has its defects.
+- **A big PR is reviewed like a stack.** Over about 4,000 changed lines, or across more than three
+  layers, split the diff into slices that can be reviewed on their own: a layer or a feature each,
+  tests with the code they test, a shared type or contract with its first user. Give each slice to
+  an independent subagent with this skill, the slice's files, the base tree, and the contracts it
+  relies on from other slices. Then verify every finding they return yourself, merge duplicates, and
+  review what crosses slices (a caller in one and a callee in another, state one writes and another
+  reads): those are the defects no slice sees. Phase A and the big picture stay yours. On a small
+  turn budget (a contributor's own light review), review the files most likely to hold a defect
+  instead and list the rest as skipped.
 - **Nothing runs in light or thorough mode.** No tests, scripts, servers or reproductions: findings
   are traced (§5). In gpu mode the live test runs afterwards, in its own session on
   the GPU box (§7).
@@ -513,4 +521,5 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
   here is also a finding or a question.
 - **Skipped:** files not reviewed, on a diff too large to cover.
 - **Risk:** the rating and its sentence (§6).
-- **Live test** (gpu): `full`, `targeted` or `none`, with the reason (§7).
+- **Live test** (gpu): `full`, `targeted` or `none`, with the reason, and the fewest GPUs the largest
+  config it needs runs on (§7).

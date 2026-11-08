@@ -89,7 +89,7 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 ## Posting to the PR
 
-Only when explicitly asked. Then post the report body (without local paths; media links don't resolve on GitHub, so say "media available on request") under this header:
+Only when explicitly asked. Then post the report body (without local paths; media links don't resolve on GitHub, so say "media available on request", unless the review bot publishes them: it posts its own runs with a link to the media gallery) under this header:
 
 ```markdown
 > 🤖 **Automated live test, AI-generated** (Claude Code). Not checked line by line by a human. Numbers come from one allocation, so treat small deltas as provisional.

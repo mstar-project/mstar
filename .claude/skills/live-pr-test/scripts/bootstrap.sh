@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Prepare a GPU box to live-test one PR: a clone + venv + Rust extension per arm.
 #
-# usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--no-main]
+# usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--ref SHA] [--no-main]
+#
+#   --ref SHA pins the PR arm to that commit rather than whatever the PR's head is now.
 #
 #   $WORKDIR/pr     PR head (refs/pull/<n>/head), its own venv and mstar_rust build
 #   $WORKDIR/main   the PR's base (origin/main, or --base for a stacked PR), likewise (skipped with --no-main)
@@ -16,17 +18,19 @@
 # Runs on the box, not on your laptop. Idempotent: rerunning updates both arms.
 set -euo pipefail
 
-PR=${1:?usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--no-main]}
+PR=${1:?usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--ref SHA] [--no-main]}
 shift
 WORKDIR=$HOME/live-pr
 HF=${HF_HOME:-}
 WITH_MAIN=1
 BASE=main
+REF=
 while [ $# -gt 0 ]; do
   case $1 in
     --workdir) WORKDIR=$2; shift 2;;
     --hf-home) HF=$2; shift 2;;
     --base) BASE=$2; shift 2;;
+    --ref) REF=$2; shift 2;;
     --no-main) WITH_MAIN=0; shift;;
     *) echo "bootstrap.sh: unknown option $1" >&2; exit 1;;
   esac
@@ -111,7 +115,7 @@ build_arm() {  # build_arm <dir>
   )
 }
 
-checkout "$WORKDIR/pr" FETCH_HEAD "pull/$PR/head"
+if [ -n "$REF" ]; then checkout "$WORKDIR/pr" "$REF" "$REF"; else checkout "$WORKDIR/pr" FETCH_HEAD "pull/$PR/head"; fi
 build_arm "$WORKDIR/pr"
 if [ "$WITH_MAIN" = 1 ]; then
   checkout "$WORKDIR/main" FETCH_HEAD "$BASE"

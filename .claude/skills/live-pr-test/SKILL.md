@@ -1,6 +1,6 @@
 ---
 name: live-pr-test
-description: Live-test an M* pull request on real GPUs — read the PR, size the cheapest Hopper-or-newer box for it, provision it on RunPod or Lambda (or use the persistent cluster), test the PR's claims plus regressions against main, copy media back, tear the box down, and report in markdown. Use when asked to live-test, GPU-test, smoke-test or benchmark a PR, or to "run the PR on a real box".
+description: Live-test an M* pull request on real GPUs — read the PR, size the cheapest Hopper-or-newer box for it, provision it on the team's Slurm node, Eras Cloud, RunPod or Lambda (or use the persistent cluster), test the PR's claims plus regressions against main, copy media back, tear the box down, and report in markdown. Use when asked to live-test, GPU-test, smoke-test or benchmark a PR, or to "run the PR on a real box".
 ---
 
 # Live-testing a PR
@@ -27,7 +27,7 @@ Read alongside this:
 - **cloud** (default): provision with `scripts/gpu.py`, work over ssh, copy results back with scp, terminate.
 - **cluster** (`cluster` in the request, or `mode: cluster` in the config): no provisioning, ssh or scp. Run on the cluster directly and write results to `cluster.results_dir/pr-<n>-<timestamp>/`, which the requester opens in VS Code. Everything else is the same.
 
-Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY` and `LAMBDA_API_KEY` in the environment. Never print them, write them to the box, or put them in a command line that gets logged.
+Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY`, `LAMBDA_API_KEY` and `ERAS_API_KEY` in the environment; the Slurm node is reached over ssh (`slurm` in the config). `offers` lists a Slurm node first when it has the GPUs free: there an instance is a batch job holding them, `gpu.py ssh` runs inside it, and servers start with `mserve`, never `--gpus`. Never print them, write them to the box, or put them in a command line that gets logged.
 
 ## Several PRs at once
 
@@ -57,7 +57,7 @@ gh pr diff <n>
   - Put the risk map in the plan, one line per risk: path → what could break → the test. [test-matrix.md](references/test-matrix.md) lists, by layer, the probes that have found bugs.
 - **Reach before results.** Before trusting a pass, show that the test reached the changed code: a log line, a counter, a probe hit, or an injected fault firing there. A pass on a setup that never takes the changed branch is ➖, not ✅. On #440 the bug was on the default Rust runtime and we ran only Python. On #557 the race needs the two stages on different workers.
 - **Never CPU tests alone.** Unless the PR changes only tests, docs or comments, it gets a served run with a real checkpoint that goes through the changed code. CPU suites are a gate, not a verdict. Code that only non-CUDA workers or the API server run still gets a served run that reaches it.
-- **Both runtimes when they apply, Rust otherwise.** When the change touches code that has both a Python and a Rust implementation (graph runtime, control transport, wire codec, API server frontend), run every functional and risk check on both. That means `MSTAR_RUST_GRAPH`/`MSTAR_RUST_ZMQ` at their default and at `0`, and `mstar-serve` with and without `--rust-frontend` (AGENTS.md invariant 5). Otherwise run the default Rust runtime and confirm in the server log that it ran. `MSTAR_RUST_GRAPH=0` is never the only arm.
+- **Both frontends when they apply.** There is one graph runtime and one control transport, in `rust/` (AGENTS.md invariant 5); confirm in the server log that it ran. When the change touches the API server, run every functional and risk check through both frontends: `mstar serve` with and without `--rust-frontend`.
 - **Real checkpoints only.** Use the real released weights for every served check: no dummy-mode models, random weights, or edited and truncated copies of a checkpoint. If the PR's case only exists in a checkpoint no one ships, say so in the plan and ask. On #658, the real checkpoint already showed the bug that we had built an artificial copy to show.
 - **Test on the merged tree too.** Run the CPU gate and the risk checks once more on the PR merged into the current base, and on top of its stacked neighbours when it has them. Bugs on #346 and #519 only showed up there. Label each row with the tree it came from.
 - Map touched files to regression suites with the test matrix.

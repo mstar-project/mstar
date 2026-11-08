@@ -4,7 +4,8 @@
 usage:
   gpu.py check                                   keys, persistent storage, budget
   gpu.py offers --gpus N [--min-vram GB] [--all-regions] [--allow-arm] [--json]
-  gpu.py launch <offer-id> --pr N [--hours H] [--allow-over-budget] [--dry-run]
+  gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]]
+               [--allow-over-budget] [--dry-run]
   gpu.py wait <instance>                         until ssh answers; prints how to reach it
   gpu.py ssh <instance> [command ...]            run a command (or a shell) on it
   gpu.py push <instance> <local> <remote>        scp -r to the box
@@ -21,8 +22,14 @@ a "no availability" report. Prices are USD/hr for the whole box.
 A Slurm node (`slurm` in the config) is offered first when it has the GPUs free now: an
 "instance" there is a batch job that holds them, every command runs inside it with
 `srun --overlap`, and Slurm's `--time` ends it at the deadline. Serve with `mserve` there,
-never `--gpus`. An Eras instance gets the GPU notebook template's Pod, an ssh key the run
-registers, and a timer in the Pod that ends its run, and so releases it, at the deadline.
+never `--gpus`. An Eras instance runs sshd as root in a Pod that Kubernetes stops at the
+deadline (`activeDeadlineSeconds`, `restartPolicy: Never`); a run that ends releases it.
+
+`launch --run SCRIPT` makes the script the work itself rather than holding the GPUs for ssh:
+the Slurm job runs it (in its own directory under slurm.workdir, with the --input files
+beside it), and on Eras it is the Pod's command, with the inputs in /run/live-pr and sshd
+up beside it for copying results back; the instance is released 15 minutes after it exits.
+Either way the GPUs go when the script ends, whether or not whoever launched it is still there.
 
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
 its deadline (budget.max_hours by default), even if the session that launched it is gone.
@@ -143,7 +150,8 @@ _eras_org: str | None = None
 def eras(method, path, body=None, params=None):
     """Eras Cloud, under the key's default organization."""
     global _eras_org
-    call = lambda m, u, b=None, q=None: http(m, ERAS + u, "ERAS_API_KEY", b, q, "x-api-key", "")
+    def call(m, url, b=None, q=None):
+        return http(m, ERAS + url, "ERAS_API_KEY", b, q, "x-api-key", "")
     _eras_org = _eras_org or call("GET", "/v1/me")["default_organization"]["id"]
     return call(method, f"/v1/org/{_eras_org}{path}", body, params)
 
@@ -152,7 +160,7 @@ def slurm_run(cfg: dict, command: str, check: bool = True) -> str:
     """One shell command on the Slurm login host; stdout."""
     r = subprocess.run(slurm_ssh(cfg) + [command], capture_output=True, text=True, check=False, timeout=120)
     if check and r.returncode != 0:
-        raise ApiError(r.returncode, f"slurm: {command.split()[0]}: {(r.stderr or r.stdout).strip()[-400:]}")
+        raise ApiError(r.returncode, f"slurm: {command.split(maxsplit=1)[0]}: {(r.stderr or r.stdout).strip()[-400:]}")
     return r.stdout
 
 
@@ -160,8 +168,13 @@ def slurm_ssh(cfg: dict, scp: bool = False) -> list[str]:
     sl = cfg["slurm"]
     known = STATE / f"slurm_{re.sub(r'[^A-Za-z0-9.]', '_', sl['host'])}.known_hosts"
     STATE.mkdir(parents=True, exist_ok=True)
+    if sl.get("host_key"):  # pinned: the node's ngrok port is reused across machines
+        host = sl["host"].split("@")[-1]
+        hostport = host if sl.get("port", 22) == 22 else f"[{host}]:{sl['port']}"
+        known.write_text(f"{hostport} {sl['host_key']}\n")
     cmd = ["scp" if scp else "ssh", "-P" if scp else "-p", str(sl.get("port", 22)),
-           "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={known}",
+           "-o", f"StrictHostKeyChecking={'yes' if sl.get('host_key') else 'accept-new'}",
+           "-o", f"UserKnownHostsFile={known}",
            "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=20", "-o", "BatchMode=yes"]
     if sl.get("identity_file"):
         cmd += ["-i", str(Path(sl["identity_file"]).expanduser())]
@@ -307,18 +320,23 @@ def eras_offers(cfg, gpus, min_vram, all_regions) -> list[dict]:
     return offers
 
 
+def gres_gpus(gres: str) -> int:
+    """The GPU count in "gpu:8(S:0-1)" or "gpu:(null):5(IDX:0-3,6)": drop the parentheses, then it is last."""
+    m = re.search(r"gpu:(?:[^:,]*:)?(\d+)", re.sub(r"\([^)]*\)", "", gres))
+    return int(m[1]) if m else 0
+
+
 def slurm_offers(cfg, gpus, min_vram, all_regions) -> list[dict]:
     """A node with `gpus` free now. Never more than slurm.max_gpus: the node is shared."""
     sl = cfg["slurm"]
     if gpus > sl.get("max_gpus", 4):
         return []
     offers = []
-    out = slurm_run(cfg, f"sinfo -h -N -p {shlex.quote(sl.get('partition', 'main'))} -O 'NodeHost:40,Gres:40,GresUsed:60,StateLong:20'")
+    partition = shlex.quote(sl.get("partition", "main"))
+    out = slurm_run(cfg, f"sinfo -h -N -p {partition} -O 'NodeHost:40,Gres:40,GresUsed:60,StateLong:20'")
     for line in out.splitlines():
         host, gres, used, state = (line.split() + ["", "", "", ""])[:4]
-        # "gpu:8(S:0-1)" and "gpu:(null):5(IDX:0-3,6)": drop the parentheses, then the count is last
-        count = lambda g: int((re.search(r"gpu:(?:[^:,]*:)?(\d+)", re.sub(r"\([^)]*\)", "", g)) or [0, 0])[1])
-        total, busy = count(gres), count(used)
+        total, busy = gres_gpus(gres), gres_gpus(used)
         free = 0 if any(s in state for s in ("drain", "down", "fail")) else total - busy
         if free >= gpus or (all_regions and total >= gpus):
             offers.append({
@@ -440,19 +458,23 @@ def cmd_launch(args, cfg):
     if hours > cfg["budget"]["max_hours"] and not args.allow_over_budget:
         die(f"{hours} h is over the {cfg['budget']['max_hours']} h cap; ask before passing --allow-over-budget")
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
-    name = f"live-pr-{args.pr}-{time.strftime('%m%d-%H%M')}"
+    prefix = cfg.get("slurm", {}).get("job_prefix", "live-pr") if o["provider"] == "slurm" else "live-pr"
+    name = f"{prefix}-{args.pr}-{args.tag or time.strftime('%m%d-%H%M')}"
     max_instances = cfg["budget"].get("max_concurrent_instances", 1)
     max_total = cfg["budget"].get("max_total_usd")
 
     if o["provider"] == "slurm":
         sl, n = cfg["slurm"], o["count"]
+        jobdir = f"{sl.get('workdir', '/workspace/live-pr')}/{name}"
         body = " ".join(["sbatch", "--parsable", "-p", shlex.quote(sl.get("partition", "main")),
                          f"--gres=gpu:{n}", f"-c {sl.get('cpus_per_gpu', 24) * n}",
                          f"--mem={sl.get('mem_gb_per_gpu', 180) * n}G", f"--time={max(1, int(hours * 60))}",
-                         f"--nice={sl.get('nice', 100)}", f"-J {shlex.quote(sl.get('job_prefix', 'live-pr') + f'-{args.pr}')}",
-                         "-o /dev/null", "--wrap 'sleep infinity'"])
+                         f"--nice={sl.get('nice', 100)}", "--no-requeue", f"-J {shlex.quote(name)}",
+                         *([f"--chdir={shlex.quote(jobdir)}", f"-o {shlex.quote(jobdir)}/job.log",
+                            shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
+                           else ["-o /dev/null", "--wrap 'sleep infinity'"])])
     elif o["provider"] == "eras":
-        body = eras_launch_body(cfg, o, name, pubkey, hours)
+        body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input)
     elif o["provider"] == "runpod":
         rp = cfg["runpod"]
         vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
@@ -491,6 +513,11 @@ def cmd_launch(args, cfg):
                 f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
         try:
             if o["provider"] == "slurm":
+                if args.run:  # the job's directory, script and inputs exist before it can start
+                    slurm_run(cfg, f"umask 077 && mkdir -p {shlex.quote(jobdir)}")
+                    for f in [args.run, *args.input]:  # scp keeps the mode, so a 0600 key file stays 0600
+                        subprocess.run(slurm_ssh(cfg, scp=True) + ["-p", f, f"{sl['host']}:{jobdir}/"], check=True,
+                                       capture_output=True, timeout=300)
                 iid = slurm_run(cfg, body).strip().split(";")[0]
             elif o["provider"] == "eras":
                 iid = eras_create(body)
@@ -505,6 +532,7 @@ def cmd_launch(args, cfg):
         key = f"{o['provider']}:{iid}"
         now = time.time()
         d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
+              "run": bool(args.run), "dir": jobdir if o["provider"] == "slurm" and args.run else None,
               "usd_per_hour": o["usd_per_hour"], "gpu": o["gpu"], "count": o["count"], "region": o["region"],
               "launched_at": now, "deadline": now + hours * 3600,
               "user": "ubuntu" if o["provider"] == "lambda" else "root",
@@ -533,25 +561,47 @@ def eras_ssh_key_id(pubkey: str) -> str:
     return eras("POST", "/ssh-keys", {"name": "live-pr-test", "public_key": pubkey})["id"]
 
 
-def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float) -> dict:
-    """The GPU notebook template's Pod with a big /dev/shm, every GPU of the listing, and a
-    timer that stops the Pod at the deadline. A run that ends releases the instance
-    (`release_when`), so the box goes even if nothing that launched it is left to."""
+def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float,
+                     run: str | None = None, inputs: list[str] = ()) -> dict:
+    """The GPU notebook template's container and image, with sshd as root, every GPU of the
+    listing and a big /dev/shm. Kubernetes stops the Pod at the deadline and never restarts
+    it, and a run that ends releases the instance, so the box goes even if nothing that
+    launched it is left to. With `run`, the script is the Pod's work and its inputs are a
+    ConfigMap at /run/live-pr; the instance stays 15 minutes after it exits, for copying back."""
     er = cfg.get("eras", {})
     tpl = eras("GET", f"/templates/{er.get('template_id', ERAS_GPU_NOTEBOOK)}")
     pod = tpl["pod"]
     box = next(c for c in pod["containers"] if (c.get("resources") or {}).get("limits", {}).get("nvidia.com/gpu"))
     box["resources"]["limits"]["nvidia.com/gpu"] = str(o["count"])
-    box["args"][-1] = f"(sleep {int(hours * 3600)}; kill -TERM 1) &\n" + box["args"][-1]
+    box.pop("readinessProbe", None)  # it probes Jupyter, which this Pod doesn't run
+    box["ports"] = [p for p in box.get("ports") or [] if p.get("name") == "ssh"]
+    box["env"] = [v for v in box.get("env") or [] if not v["name"].startswith("ERAS_JUPYTER")]
+    sshd = "/usr/sbin/sshd -D -e -o StrictModes=no -o 'AuthorizedKeysFile /etc/ssh/keys/authorized_keys'"
+    box["args"] = ["set -e\ninstall -d -m 0700 /root/.ssh /run/sshd\n"
+                   + (f"{sshd} &\nexec bash /run/live-pr/{Path(run).name}\n" if run else f"exec {sshd}\n")]
+    pod["restartPolicy"] = "Never"
+    pod["activeDeadlineSeconds"] = int(hours * 3600)
     for v in pod.get("volumes") or []:
         if v["name"] == "shm":
-            v["emptyDir"]["sizeLimit"] = er.get("shm", "256Gi")
+            v["emptyDir"]["sizeLimit"] = er.get("shm", "64Gi")  # the most Eras allows
+    config_maps = None
+    if run:
+        pod["volumes"].append({"name": "live-pr", "configMap": {"name": "live-pr"}})
+        box["volumeMounts"].append({"mountPath": "/run/live-pr", "name": "live-pr", "readOnly": True})
+        config_maps = {"live-pr": {"data": {Path(f).name: Path(f).read_text() for f in [run, *inputs]}}}
+        if er.get("run_secret_id"):  # a saved Eras secret (an API key, say), at /run/live-pr-key/value
+            pod["volumes"].append({"name": "live-pr-key", "secret": {"secretName": "live-pr-key",
+                                                                      "items": [{"key": "value", "path": "value"}]}})
+            box["volumeMounts"].append({"mountPath": "/run/live-pr-key", "name": "live-pr-key", "readOnly": True})
+    keep = 900 if run else 0
     return {
         "listing_id": o["id"].split(":", 1)[1], "name": name, "idempotency_key": name,
-        "run": {"pod": pod, "endpoints": tpl.get("endpoints"),
-                "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [eras_ssh_key_id(pubkey)]}},
+        "run": {"pod": pod, "endpoints": {"ssh": tpl["endpoints"]["ssh"]}, "config_maps": config_maps,
+                "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [eras_ssh_key_id(pubkey)]},
+                                         **({"live-pr-key": {"secret_id": er["run_secret_id"]}}
+                                            if run and er.get("run_secret_id") else {})},
                              "volumes": {"workspace": "emptyDir"}},
-                "release_when": {"after_success_seconds": 0, "after_failure_seconds": 0}},
+                "release_when": {"after_success_seconds": keep, "after_failure_seconds": keep}},
     }
 
 
@@ -584,12 +634,14 @@ def status(e: dict, cfg: dict | None = None) -> tuple[str, str | None, int]:
     """(status, host, ssh port)."""
     if e["provider"] == "slurm":
         st = slurm_run(cfg or load_config(), f"squeue -h -j {e['instance_id']} -o %T", check=False).strip()
-        return (st or "ended").lower(), ("slurm" if st == "RUNNING" else None), 0
+        return (st or "ended").lower(), ("slurm" if st == "RUNNING" or (st == "" and e.get("run")) else None), 0
     if e["provider"] == "eras":
         i = eras("GET", f"/instances/{e['instance_id']}")
         ssh = next((p for p in (i.get("standalone") or {}).get("endpoints") or []
                     if p.get("name") == "ssh" and p.get("ready")), None)
-        return i.get("status", "?"), ssh and ssh.get("host"), int((ssh or {}).get("port") or 22)
+        run = ((i.get("standalone") or {}).get("current_run") or {}).get("status")
+        st = f"run {run}" if e.get("run") and run in ("succeeded", "failed", "stopped") else i.get("status", "?")
+        return st, ssh and ssh.get("host"), int((ssh or {}).get("port") or 22)
     if e["provider"] == "runpod":
         p = runpod("GET", f"/pods/{e['instance_id']}")
         direct = (p.get("ssh") or {}).get("direct") or {}
@@ -609,7 +661,8 @@ def remote(e: dict, cfg: dict, command: list[str] | str, tty: bool = False) -> l
     """The ssh command line that runs `command` on the box (inside the job, on Slurm)."""
     cmd = command if isinstance(command, str) else " ".join(command)
     if e["provider"] == "slurm":
-        inner = f"srun --jobid={e['instance_id']} --overlap" + (" --pty bash -l" if not cmd else f" bash -lc {shlex.quote(cmd)}")
+        shell = f"bash -lc {shlex.quote(cmd)}" if cmd else "--pty bash -l"
+        inner = f"srun --jobid={e['instance_id']} --overlap {shell}"
         return slurm_ssh(cfg)[:1] + (["-t"] if tty or not cmd else []) + slurm_ssh(cfg)[1:] + [inner]
     return ssh_base(e) + [f"{e['user']}@{e['host']}"] + ([cmd] if cmd else [])
 
@@ -642,7 +695,7 @@ def cmd_wait(args, cfg):
 
 def reachable(key: str) -> dict:
     e = entry(key)
-    if not e.get("host"):
+    if not e.get("host") and e["provider"] != "slurm":  # a Slurm job is reached through the login host
         die(f"run `gpu.py wait {key}` first")
     return e
 
@@ -654,8 +707,9 @@ def cmd_ssh(args, cfg):
 
 def cmd_copy(args, cfg):
     e = reachable(args.instance)
-    if e["provider"] == "slurm":  # the job's files are the login host's files
-        target, scp = f"{cfg['slurm']['host']}:{args.remote}", slurm_ssh(cfg, scp=True)
+    if e["provider"] == "slurm":  # the job's files are the login host's files; relative to its directory
+        rel = args.remote if args.remote.startswith(("/", "~")) or not e.get("dir") else f"{e['dir']}/{args.remote}"
+        target, scp = f"{cfg['slurm']['host']}:{rel}", slurm_ssh(cfg, scp=True)
     else:
         target, scp = f"{e['user']}@{e['host']}:{args.remote}", ssh_base(e, scp=True)
     src, dst = (args.local, target) if args.cmd == "push" else (target, args.local)
@@ -790,6 +844,9 @@ def main():
     p.add_argument("offer")
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--hours", type=float)
+    p.add_argument("--tag", help="names the instance <prefix>-<pr>-<tag> (and makes an Eras launch idempotent)")
+    p.add_argument("--run", help="a script that is the work itself; the GPUs go when it ends")
+    p.add_argument("--input", action="append", default=[], help="a file the --run script finds beside it")
     p.add_argument("--allow-over-budget", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("wait")

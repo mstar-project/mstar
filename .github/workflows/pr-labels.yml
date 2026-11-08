@@ -9,10 +9,14 @@ name: PR labels
 # out only the default branch: the script reads the PR's file list through the
 # API and never runs its code. Run it by hand (workflow_dispatch) to relabel
 # every open PR, e.g. after changing the rules.
+#
+# It also dismisses the review bot's approval (claude-review.yml, `/review gpu`)
+# when the PR gets new commits or a new base, since the approval was for the
+# commit it tested.
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
   workflow_dispatch:
 
 permissions: {}
@@ -48,6 +52,7 @@ jobs:
           permission-contents: read
           permission-pull-requests: write
       - name: Label
+        if: github.event.action != 'edited' || github.event.changes.base
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
@@ -57,3 +62,12 @@ jobs:
           else
             python3 .github/labels/label_prs.py --repo "$GITHUB_REPOSITORY" --all
           fi
+      - name: Dismiss the review bot's approval
+        if: github.event.action == 'synchronize' || (github.event.action == 'edited' && github.event.changes.base)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          python3 .github/review/gpu_review.py dismiss --pr "$PR" \
+            --message "New commits or a new base since the review bot approved; comment /review gpu for a new review."
