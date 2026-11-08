@@ -12,7 +12,8 @@ layers' K/V; they attend it through a windowed attention resource, the full
 ones through an unwindowed one.
 
 TP shards by head. The post-norms sit between each row-parallel projection and
-its residual add, so those projections reduce their own outputs.
+its residual add, so each reduces its projection's partial sums in one fused
+all-reduce + norm kernel.
 """
 from __future__ import annotations
 
@@ -66,7 +67,7 @@ class RippleAttention(nn.Module):
         self.v_proj = ColumnParallelLinear(comm_group, config.hidden_size, kv_width, bias=False)
         self.o_proj = RowParallelLinear(
             comm_group=comm_group, input_size=q_width, output_size=config.hidden_size,
-            bias=False, input_is_parallel=True, reduce_results=True,
+            bias=False, input_is_parallel=True,
         )
         self.q_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
@@ -121,6 +122,11 @@ class RippleTextModel(nn.Module):
         self.embed_scale = config.embed_scale
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, comm_group=comm_group)
         self.layers = nn.ModuleList(RippleDecoderLayer(config, s, comm_group) for s in sliding)
+        # `forward` reduces both row-parallel projections in their post-norms,
+        # one fused all-reduce + norm kernel each, so they return partial sums
+        for layer in self.layers:
+            layer.self_attn.o_proj.reduce_results = False
+            layer.mlp.down_proj.reduce_results = False
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # a layer of each kind, to bind the step's label on both attention resources
         self._bind_through = (sliding.index(True), sliding.index(False))
@@ -131,6 +137,7 @@ class RippleTextModel(nn.Module):
     def forward(self, embeds: torch.Tensor, *, label: str) -> torch.Tensor:
         for idx in self._bind_through:
             self.layers[idx].self_attn.attend.bind_step(label)
+        cg = self.comm_group
         # every layer's values read ``embeds``, and the residual stream is updated in place
         residual = embeds.clone()
         h = self.layers[0].input_layernorm(embeds)
@@ -140,9 +147,9 @@ class RippleTextModel(nn.Module):
                 h, residual = layer.input_layernorm.forward_residual(out, residual)
             # every layer is a layer of the one cache, so its stack index
             layer.self_attn.attend.set_layer_idx(i)
-            a = layer.post_attention_layernorm(layer.self_attn(h, embeds))
+            a = layer.post_attention_layernorm(layer.self_attn(h, embeds), cg)
             h, residual = layer.pre_feedforward_layernorm.forward_residual(a, residual)
-            out = layer.post_feedforward_layernorm(layer.mlp(h))
+            out = layer.post_feedforward_layernorm(layer.mlp(h), cg)
         normed, _ = self.norm.forward_residual(out, residual)
         return normed
 

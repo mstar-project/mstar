@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed import RowParallelLinear
 from mstar.model.registry import get_model_class
 from mstar.model.ripple.config import ATTN_FULL, ATTN_SLIDING, KV_CACHE, ROPE, RippleConfig
 from mstar.model.ripple.language_model import RippleForCausalLM
@@ -120,10 +121,37 @@ def _reference_logits(model: RippleForCausalLM, ids: torch.Tensor, cfg: RippleCo
     return _norm(h, lm.norm.weight, eps) @ model.lm_head.weight.T
 
 
-def test_the_text_stack_matches_the_reference_layer(model_dir):
+class _SumOfOneGroup(CommGroup):
+    """Two ranks whose partial sums are this one's and zeros: the reduce is the
+    identity, and each call is counted, the norm-fused ones apart."""
+
+    def __init__(self):
+        super().__init__(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+        self.reduces = 0
+        self.norm_reduces = 0
+
+    def all_reduce(self, input_):
+        self.reduces += 1
+        return input_
+
+    def allreduce_rmsnorm(self, *args, **kwargs):
+        self.norm_reduces += 1
+        return super().allreduce_rmsnorm(*args, **kwargs)
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_the_text_stack_matches_the_reference_layer(model_dir, tp):
     torch.manual_seed(0)
     cfg = RippleConfig.from_dict(RAW)
     model = RippleForCausalLM(cfg).double()
+    group = _SumOfOneGroup() if tp == 2 else None
+    if group is not None:
+        # every reduce goes through the group: the post-norms' and any the
+        # row-parallel projections would make themselves
+        model.model.comm_group = group
+        for m in model.modules():
+            if isinstance(m, RowParallelLinear):
+                m.comm_group, m.tp_size = group, group.world_size
     # the stand-ins take the window and theta the model declares, so a wrong one fails against the reference
     ripple = get_model_class("ripple_65b")(str(model_dir))
     specs = {spec.resource_key: spec for spec in ripple.get_node_resources()}
@@ -142,6 +170,9 @@ def test_the_text_stack_matches_the_reference_layer(model_dir):
     ref = _reference_logits(model, ids, cfg)
     # the gate's sigmoid and the norms compute in fp32; the rest is fp64
     assert torch.allclose(ours, ref, atol=1e-4, rtol=1e-4), (ours - ref).abs().max()
+    if group is not None:
+        # once a projection: in its post-norm, where the fused kernel runs, not also in the linear
+        assert group.norm_reduces == group.reduces == 2 * cfg.num_hidden_layers
 
 
 @pytest.mark.parametrize("change", [

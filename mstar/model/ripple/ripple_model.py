@@ -13,6 +13,7 @@ from mstar.model.loader.base import StackedParamRule, load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_shards
 from mstar.model.multimodal import PromptPart, chat_turns
 from mstar.model.multimodal_decoder import MIXED_SPLIT, MultimodalDecoderModel
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.ripple.config import ATTN_FULL, ATTN_SLIDING, KV_CACHE, ROPE, RippleConfig
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
@@ -47,6 +48,10 @@ class RippleModel(MultimodalDecoderModel):
         self.sampling_defaults = {"temperature": 1.0, **self.sampling_defaults}
         # config.json's auto_map would otherwise stop a server at a prompt to run the repo's code
         self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir, local_files_only=True, trust_remote_code=False)
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # not yet dropped: no drop and rebuild has run through its sliding-window KV pool
+        return {}
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         cfg = self.config
@@ -107,16 +112,14 @@ class RippleModel(MultimodalDecoderModel):
         return torch.tensor(encode_ids(self.tokenizer, text), dtype=torch.long)
 
     def _create_submodule(
-        self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
         from mstar.model.ripple.language_model import RippleForCausalLM
         from mstar.model.ripple.submodules import RippleLLMSubmodule
 
         if node_name != "LLM":
             return None
-        model = self._build(
-            lambda: RippleForCausalLM(self.config, tp_group), autocast_dtype or torch.bfloat16, device,
-        )
+        model = self._build(lambda: RippleForCausalLM(self.config, tp_group), dtype, device)
         load_weights_into(
             model, iter_safetensors_shards(Path(self._resolve_weights()), device=device),
             stacked_params=_STACKED_PARAMS, strict=True,
