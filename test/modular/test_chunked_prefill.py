@@ -760,10 +760,15 @@ def test_rungs_past_the_first_that_holds_the_step_budget_are_dropped():
     assert buckets({"LLM": None}) == [1024, 2048, 3000, 4096, 8192]
 
 
-def test_a_walk_that_only_replays_another_s_capture_is_refused_naming_it():
+@pytest.mark.parametrize("walk, match", [
     # Orpheus's ``mixed`` steps replay its ``prefill`` capture
-    with pytest.raises(ValueError, match="'prefill'"):
-        _orpheus_prefill_buckets({"mixed": [64]})
+    ("mixed", "'prefill'"),
+    # and its ``decode`` capture takes a batch size, one token a row
+    ("decode", "batch size, not tokens"),
+])
+def test_a_walk_with_no_token_ladder_to_set_is_refused(walk, match):
+    with pytest.raises(ValueError, match=match):
+        _orpheus_prefill_buckets({walk: [64]})
 
 
 def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog):

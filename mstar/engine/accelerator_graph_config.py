@@ -303,7 +303,8 @@ def apply_token_ladders(
     as a smaller one's, which share its static buffers.
 
     A walk whose steps only replay another walk's capture is refused, naming
-    that walk. A walk the node captures nothing for here, as a model that turns
+    that walk, as is one the node captures by batch size alone. A walk the
+    node captures nothing for here, as a model that turns
     its captures off at runtime does, is logged and skipped: its steps run
     eagerly whatever the ladder.
     """
@@ -316,6 +317,11 @@ def apply_token_ladders(
                 raise ValueError(
                     f"prefill_token_buckets names walk {walk!r} of {node}, whose steps replay the "
                     f"captures of {replayed_on}; name that walk"
+                )
+            if any(walk == c.capture_graph_walk or walk in c.replay_graph_walks for c in configs):
+                raise ValueError(
+                    f"prefill_token_buckets names walk {walk!r} of {node}, whose capture captures by "
+                    "batch size, not tokens"
                 )
             logger.warning(
                 "%s: no packed capture of walk %r at this deployment, so prefill_token_buckets "
