@@ -20,32 +20,48 @@ from triton.language.extra import libdevice
 
 
 @triton.jit
-def _qk_norm_rope_kernel(QKV, W, COS, SIN, OUT, HEAD_OFFSET, eps, row_stride, table_stride, out_row_stride,
-                         H: tl.constexpr, D: tl.constexpr, HALF: tl.constexpr, ROT: tl.constexpr,
-                         HB: tl.constexpr, SCATTER: tl.constexpr):
+def _qk_norm_rope_kernel(QKV, W, COS, SIN, OUT, HEAD_OFFSET, HEAD_INDEX, num_heads, eps, row_stride, table_stride,
+                         out_row_stride, H: tl.constexpr, D: tl.constexpr, HALF: tl.constexpr, ROT: tl.constexpr,
+                         HB: tl.constexpr, SCATTER: tl.constexpr, SUBSET: tl.constexpr):
     row = tl.program_id(0)
     block = tl.program_id(1)
-    heads = block * HB + tl.arange(0, HB)  # q heads 0..H-1, then k heads; q and k lie that way in QKV
-    which = (block * HB) // H  # 0 q, 1 k: HB divides H
     d = tl.arange(0, D)
     partner = tl.where(d < HALF, d + HALF, tl.where(d < ROT, d - HALF, d))
-    base = QKV + row * row_stride + heads[:, None] * D
-    x = tl.load(base + d[None, :]).to(tl.float32)
-    xp = tl.load(base + partner[None, :]).to(tl.float32)
-    w = tl.load(W + which * D + d).to(tl.float32)
-    wp = tl.load(W + which * D + partner).to(tl.float32)
+    if SUBSET:  # the heads HEAD_INDEX lists (q's 0..H-1, k's H..2H-1), in any mix
+        slot = block * HB + tl.arange(0, HB)
+        valid = slot < num_heads
+        heads = tl.load(HEAD_INDEX + slot, mask=valid, other=0)
+        base = QKV + row * row_stride + heads[:, None] * D
+        x = tl.load(base + d[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+        xp = tl.load(base + partner[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
+        which = (heads // H)[:, None] * D
+        w = tl.load(W + which + d[None, :]).to(tl.float32)
+        wp = tl.load(W + which + partner[None, :]).to(tl.float32)
+    else:
+        heads = block * HB + tl.arange(0, HB)  # q heads 0..H-1, then k heads; q and k lie that way in QKV
+        which = (block * HB) // H  # 0 q, 1 k: HB divides H
+        base = QKV + row * row_stride + heads[:, None] * D
+        x = tl.load(base + d[None, :]).to(tl.float32)
+        xp = tl.load(base + partner[None, :]).to(tl.float32)
+        w = tl.load(W + which * D + d).to(tl.float32)[None, :]
+        wp = tl.load(W + which * D + partner).to(tl.float32)[None, :]
     rstd = libdevice.rsqrt(tl.sum(x * x, axis=1) / D + eps)
-    n = (x * rstd[:, None] * w[None, :]).to(tl.bfloat16).to(tl.float32)
-    n_partner = (xp * rstd[:, None] * wp[None, :]).to(tl.bfloat16).to(tl.float32)
+    n = (x * rstd[:, None] * w).to(tl.bfloat16).to(tl.float32)
+    n_partner = (xp * rstd[:, None] * wp).to(tl.bfloat16).to(tl.float32)
     cos = tl.load(COS + row * table_stride + d).to(tl.float32)
     sin = tl.load(SIN + row * table_stride + d).to(tl.float32)
     a = (n * cos[None, :]).to(tl.bfloat16).to(tl.float32)
     b = (n_partner * sin[None, :]).to(tl.bfloat16).to(tl.float32)
-    if SCATTER:  # head h's row r at OUT + HEAD_OFFSET[h] + r * out_row_stride
-        offset = tl.load(HEAD_OFFSET + heads)
-    else:  # [S, 2 * H, D]
-        offset = heads.to(tl.int64) * D
-    tl.store(OUT + row.to(tl.int64) * out_row_stride + offset[:, None] + d[None, :], (a + b).to(tl.bfloat16))
+    out = (a + b).to(tl.bfloat16)
+    if SUBSET:  # the i-th listed head's row r at OUT + HEAD_OFFSET[i] + r * out_row_stride
+        offset = tl.load(HEAD_OFFSET + slot, mask=valid, other=0)
+        tl.store(OUT + row.to(tl.int64) * out_row_stride + offset[:, None] + d[None, :], out, mask=valid[:, None])
+    else:
+        if SCATTER:  # head h's row r at OUT + HEAD_OFFSET[h] + r * out_row_stride
+            offset = tl.load(HEAD_OFFSET + heads)
+        else:  # [S, 2 * H, D]
+            offset = heads.to(tl.int64) * D
+        tl.store(OUT + row.to(tl.int64) * out_row_stride + offset[:, None] + d[None, :], out)
 
 
 @torch.library.custom_op("mstar::h3_qk_norm_rope", mutates_args=())
@@ -56,18 +72,20 @@ def qk_norm_rope(qkv: torch.Tensor, weights: torch.Tensor, cos: torch.Tensor, si
     rows, d = qkv.shape[0], weights.shape[1]
     out = qkv.new_empty(rows, 2 * heads, d)
     _check_heads(heads)
-    _launch(qkv, weights, cos, sin, eps, heads, rotary_dim, out, None, 2 * heads * d)
+    _launch(qkv, weights, cos, sin, eps, heads, rotary_dim, out, None, None, 2 * heads * d)
     return out
 
 
 _BLOCK = 8
 
 
-def _launch(qkv, weights, cos, sin, eps, heads, rotary_dim, out, head_offset, out_row_stride):
-    _qk_norm_rope_kernel[(qkv.shape[0], 2 * heads // _BLOCK)](
-        qkv, weights, cos, sin, out, out if head_offset is None else head_offset, eps, qkv.stride(0), cos.stride(0),
-        out_row_stride, H=heads, D=weights.shape[1], HALF=rotary_dim // 2, ROT=rotary_dim, HB=_BLOCK,
-        SCATTER=head_offset is not None, num_warps=4, enable_fp_fusion=False,
+def _launch(qkv, weights, cos, sin, eps, heads, rotary_dim, out, head_offset, head_index, out_row_stride):
+    listed = 2 * heads if head_index is None else head_index.numel()
+    _qk_norm_rope_kernel[(qkv.shape[0], triton.cdiv(listed, _BLOCK))](
+        qkv, weights, cos, sin, out, out if head_offset is None else head_offset,
+        out if head_index is None else head_index, listed, eps, qkv.stride(0), cos.stride(0), out_row_stride,
+        H=heads, D=weights.shape[1], HALF=rotary_dim // 2, ROT=rotary_dim, HB=_BLOCK,
+        SCATTER=head_offset is not None, SUBSET=head_index is not None, num_warps=4, enable_fp_fusion=False,
     )
 
 
@@ -100,9 +118,12 @@ class QKNormRope(NamedTuple):
         qk = qk_norm_rope(*self)
         return qk[:, :self.heads], qk[:, self.heads:]
 
-    def into(self, out: torch.Tensor, head_offset: torch.Tensor, row_stride: int) -> None:
+    def into(self, out: torch.Tensor, head_offset: torch.Tensor, row_stride: int,
+             head_index: torch.Tensor | None = None) -> None:
         """Row r of head h (q's heads, then k's) to ``out.view(-1)[head_offset[h] + r * row_stride:][:D]``;
-        ``head_offset`` int64 on the device."""
-        _check_heads(self.heads)
+        with ``head_index`` (int32), only the heads it lists, the i-th to ``head_offset[i]``. Offsets int64, both
+        on the device."""
+        if head_index is None:
+            _check_heads(self.heads)
         _launch(self.qkv, self.weights, self.cos, self.sin, self.eps, self.heads, self.rotary_dim, out,
-                head_offset, row_stride)
+                head_offset, head_index, row_stride)

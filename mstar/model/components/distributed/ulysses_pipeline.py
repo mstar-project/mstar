@@ -34,10 +34,11 @@ AttendGroup = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 class FillQK(Protocol):
-    """Computes q and k into the pipeline's buffers in place of handing them over: row r of head h (q's heads,
-    then k's) goes to ``out.view(-1)[head_offset[h] + r * row_stride:]``."""
+    """Computes q and k into the pipeline's buffers in place of handing them over: the heads ``head_index`` lists
+    (q's ``0..heads-1``, then k's), row r of the i-th to ``out.view(-1)[head_offset[i] + r * row_stride:]``."""
 
-    def into(self, out: torch.Tensor, head_offset: torch.Tensor, row_stride: int) -> None: ...
+    def into(self, out: torch.Tensor, head_offset: torch.Tensor, row_stride: int, head_index: torch.Tensor) -> None:
+        ...
 
 _CU_MEMORYTYPE_DEVICE = 2
 
@@ -179,7 +180,7 @@ class UlyssesPipeline:
         self._verdict: dict[tuple[_Shape, bool], bool] = {}  # (shape, q/k filled in) -> kept
         self._copy_in = self._copy_out = None
         self._copy_rows = None
-        self._head_offset: dict[int, torch.Tensor] = {}  # rows -> where a fill writes each q / k head
+        self._fill_plan: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}  # rows -> per-group fill tables
 
     def group_heads(self, heads: int) -> int:
         return heads // (self.group.world_size * self.groups)
@@ -255,26 +256,33 @@ class UlyssesPipeline:
                         need / 2**30, tuple(shape))
             return False
         self._pool = None
-        self._head_offset.clear()
+        self._fill_plan.clear()
         self._pool = _Pool(self.group, shape, self.groups)
         return True
 
-    def _fill_offsets(self, rows: int, heads: int, head_dim: int) -> torch.Tensor:
-        """Where a fill writes row 0 of each q head, then each k head, in this rank's ``inb``: this rank's heads
+    def _fill_tables(self, rows: int, heads: int, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per head group g, its q and k heads of every destination (``[groups, 2 * world * group_heads]``, q's
+        then k's, int32) and where a fill writes row 0 of each in this rank's ``inb`` (int64): this rank's heads
         into its own slots at its rows, a peer's into that (peer, group)'s staging block. Built once per row count."""
-        offsets = self._head_offset.get(rows)
-        if offsets is None:
+        plan = self._fill_plan.get(rows)
+        if plan is None:
             world, r, groups = self.group.world_size, self.group.rank, self.groups
             hg = self.group_heads(heads)
             width = hg * head_dim
             slot_numel = world * rows * width
-            h = torch.arange(heads, dtype=torch.int64)
-            p, g, j = h // (heads // world), h % (heads // world) // hg, h % hg
-            own = [(g * 3 + part) * slot_numel + r * rows * width for part in (0, 1)]
-            staged = [groups * 3 * slot_numel + ((p * groups + g) * 2 + part) * rows * width for part in (0, 1)]
-            offsets = torch.cat([torch.where(p == r, own[part], staged[part]) + j * head_dim for part in (0, 1)])
-            offsets = self._head_offset[rows] = offsets.cuda()
-        return offsets
+            g, p, j = (t.reshape(-1, 1) for t in torch.meshgrid(  # [groups * world * hg, 1] each, g slowest
+                torch.arange(groups), torch.arange(world), torch.arange(hg), indexing="ij"))
+            head = (p * groups + g) * hg + j
+            index, offset = [], []
+            for part in (0, 1):
+                own = (g * 3 + part) * slot_numel + r * rows * width
+                staged = groups * 3 * slot_numel + ((p * groups + g) * 2 + part) * rows * width
+                index.append((head + part * heads).view(groups, -1))
+                offset.append((torch.where(p == r, own, staged) + j * head_dim).view(groups, -1))
+            # [groups, q's then k's]
+            index, offset = (torch.stack(t, 1).reshape(groups, -1) for t in (index, offset))
+            plan = self._fill_plan[rows] = (index.to(torch.int32).cuda(), offset.to(torch.int64).cuda())
+        return plan
 
     def _run(self, q, k, v, attend_group: AttendGroup, buf: _Pool, fill: FillQK | None) -> torch.Tensor:
         group, ops, groups, copy_rows = self.group, self._ops, self.groups, self._copy_rows
@@ -305,15 +313,21 @@ class UlyssesPipeline:
         # this rank's own rows on the SMs, before the first attention: a same-device copy queued behind a
         # running attention would wait for it, and hold up the peer copies behind it. One pass a part, every group.
         own = buf.inb[r]
-        if fill is not None:
-            fill.into(own, self._fill_offsets(rows, heads, head_dim), width)
-            filled = main.record_event()
         sent = [(2, v)] if fill is not None else [(0, q), (1, k), (2, v)]  # (part, rows) the copies move
         for part, t in sent:
             copy_rows(own.as_strided((groups, rows, width), (3 * slot_numel, width, 1),
                                      own.storage_offset() + part * slot_numel + r * rows * width),
                       t.as_strided((groups, rows, width), (width, t.stride(0), 1),
                                    t.storage_offset() + head0(r, 0) * head_dim))
+        filled = []
+        if fill is not None:
+            # q and k a head group at a time: group g's are written, and sent, while group g - 1 attends
+            index, offset = self._fill_tables(rows, heads, head_dim)
+            for g in range(groups):
+                fill.into(own, offset[g], width, index[g])
+                filled.append(main.record_event())
+        else:
+            placed = main.record_event()
         self._copy_in.wait_event(ready)
         for g in range(groups):
             for p in peers:
@@ -321,8 +335,7 @@ class UlyssesPipeline:
                     ops.copy2d(self._copy_in, slot_addr(p, g, part), row_bytes,
                                t.data_ptr() + head0(p, g) * head_bytes, t.stride(0) * esz, row_bytes, rows)
             if fill is not None:
-                if g == 0:
-                    self._copy_in.wait_event(filled)
+                self._copy_in.wait_event(filled[g])
                 for p in peers:
                     # q's block, then k's, both contiguous: one copy into the q and k slots, a slot apart
                     staged = inb[r] + (groups * 3 * slot_numel + (p * groups + g) * 2 * rows * width) * esz
@@ -336,11 +349,10 @@ class UlyssesPipeline:
         if self.group_streams:
             while len(self._streams) < groups:
                 self._streams.append(torch.cuda.Stream())
-            placed = main.record_event()
         for g in range(groups):
             stream = self._streams[g] if self.group_streams else main
             if stream is not main:
-                stream.wait_event(placed)
+                stream.wait_event(filled[g] if fill is not None else placed)
             with torch.cuda.stream(stream):
                 for p in peers:
                     ops.wait(stream, fin + 4 * p, base + g + 1)
