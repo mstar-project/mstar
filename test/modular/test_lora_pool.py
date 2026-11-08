@@ -34,6 +34,7 @@ from mstar.engine.resources.step import (  # noqa: E402
 )
 from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
 from mstar.model.loader.base import CheckpointRules, StackedParamRule  # noqa: E402
+from mstar.testing_utils.model import make_model
 
 HIDDEN, Q_OUT, KV_OUT, LAYERS = 16, 16, 8, 2
 QKV = LoraTarget(
@@ -468,22 +469,26 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
     import logging
     from types import SimpleNamespace
 
-    from mstar.worker.worker import Worker
+    from mstar.testing_utils.worker import make_worker
 
-    w = Worker.__new__(Worker)
     asked = []
     engine = SimpleNamespace(
         evictable=lambda node, resources=None: resources is None or "kv" in resources,
         reclaimable=lambda *a, **k: asked.append(a) or 0, residency=lambda *a: Residency.RESIDENT,
     )
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    w.scheduler = SimpleNamespace(arrival={1: 0})
+    w = make_worker(engine_manager=SimpleNamespace(get_engine=lambda node: engine))
+
+    def evict(resource):
+        return w.admission._evict(
+            "LLM", {1}, {1: 0}, last_in_line=max, affected_resources={resource},
+        )
+
     with caplog.at_level(logging.WARNING):
-        assert w._try_offload_cold_request("LLM", "decode", {1}, affected_resources={"lora"}) is None
+        assert evict("lora") is None
     assert asked == [] and "No eviction candidate" not in caplog.text
     # control: a KV refusal with nothing reclaimable looks for a victim and warns
     with caplog.at_level(logging.WARNING):
-        assert w._try_offload_cold_request("LLM", "decode", {1}, affected_resources={"kv"}) is None
+        assert evict("kv") is None
     assert asked and "No eviction candidate" in caplog.text
 
 
@@ -495,7 +500,7 @@ def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
     _, paths = adapters
 
     def build(sp_group):
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=sp_group)
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=sp_group, instance=sp_group)
         return LoraAdapterPool.build(make_spec(paths), EngineResourceInfo(device=CPU, joint_comm_group=groups))
 
     with pytest.raises(ValueError, match=r"sequence parallelism \(SP=2\)"):
@@ -506,13 +511,12 @@ def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
 def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
     """The conductor keeps only the targets the configured adapters touch and every
     worker builds just those."""
-    from types import SimpleNamespace
 
     from mstar.conductor.conductor import Conductor
     from mstar.model.base import serving_resources
 
     _, paths = adapters
-    model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({})])
+    model = make_model(get_lora_specs=lambda: [make_spec({})])
     config = {"resources": {"lora": {"adapters": {"a3": paths["a3"]}, "max_slots": 2}}}
     conductor = Conductor.__new__(Conductor)
     conductor.model, conductor.model_config = model, config
@@ -531,7 +535,6 @@ def test_a_lora_deployment_still_has_its_kv_pools_checked_against_its_cap(adapte
     """The `lora:` block is the LoRA specs' own, so the KV-fit check (which reads the
     specs as a server builds them) still refuses a cap the cache cannot hold."""
     import logging
-    from types import SimpleNamespace
 
     from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
     from mstar.model.utils import check_kv_pools_fit
@@ -540,7 +543,7 @@ def test_a_lora_deployment_still_has_its_kv_pools_checked_against_its_cap(adapte
     kv = KVSpec(resource_key="kv", nodes={"LLM"}, config=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=4, page_size=16,
     ))
-    model = SimpleNamespace(get_node_resources=lambda: [kv], get_lora_specs=lambda: [make_spec({})])
+    model = make_model(get_node_resources=lambda: [kv], get_lora_specs=lambda: [make_spec({})])
     config = {"max_concurrent_requests": 8, "resources": {"lora": {"adapters": {"a3": paths["a3"]}}}}
     with pytest.raises(ValueError, match="max_concurrent_requests"):
         check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__))
@@ -551,12 +554,11 @@ def test_a_bad_key_in_the_lora_block_is_a_config_error_on_every_lora_spec():
     spec takes is reported there as the overrides report one: a ValueError, which the
     checks that read the serving specs leave to validation."""
     from dataclasses import replace
-    from types import SimpleNamespace
 
     from mstar.model.base import serving_resources
 
     vit = replace(make_spec({}), resource_key="lora_vit", nodes={"ViT"})
-    model = SimpleNamespace(get_node_resources=lambda: [], get_lora_specs=lambda: [make_spec({}), vit])
+    model = make_model(get_lora_specs=lambda: [make_spec({}), vit])
     with pytest.raises(ValueError, match="resources.lora"):
         serving_resources(model, {"resources": {"lora": {"max_slot": 2}}})
 

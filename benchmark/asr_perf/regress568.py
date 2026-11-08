@@ -74,7 +74,7 @@ def start(arm: str, model: str, name: str, out: Path, env_extra: dict | None = N
     ts = int(time.time())
     cmd = [str(VENV_BIN / "mstar"), "serve", *MODELS[model], "--gpus", "0", "--port", str(PORT),
            "--socket-path-prefix", f"/tmp/rg_{name}_{ts}/", "--upload-dir", f"/tmp/rgu_{name}_{ts}/"]
-    env = {**os.environ, "PYTHONPATH": str(tree), "MSTAR_SHM_ARENA": "1",
+    env = {**os.environ, "PYTHONPATH": str(tree),
            "PATH": f"{VENV_BIN}:{os.environ.get('PATH', '')}", **(env_extra or {})}
     logf = open(out / "servers" / f"{name}.log", "w")
     p = subprocess.Popen(cmd, cwd=tree, env=env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)

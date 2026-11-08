@@ -14,7 +14,6 @@ still tracks, and an orphaned worker can unlink its own files too (#767).
 """
 
 import contextlib
-import importlib.util
 import multiprocessing as mp
 import os
 import signal
@@ -39,15 +38,30 @@ from mstar.distributed.base import ShardingConfig
 
 N_IN_FLIGHT = 9
 ARENA_SPILLS = 3  # of 6 tensors of 300 KB, one 1 MiB segment holds three
+# The workers here get one 1 MiB segment, so which sends spill to tensor files
+# is up to the test: a 300 KB tensor fits three times, a 1.1 MB one never.
+SMALL_ARENA = {"MSTAR_SHM_ARENA_SEGMENT_MB": "1", "MSTAR_SHM_ARENA_MAX_SEGMENTS": "1",
+               "MSTAR_SHM_ARENA_SPILL_AFTER_S": "0.01"}
 TOKEN_ENV = "MSTAR_DEPLOYMENT_TOKEN"
 MINTED_ENV = "MSTAR_DEPLOYMENT_TOKEN_MINTED"
 
 
 @pytest.fixture(autouse=True)
-def _launch_token(monkeypatch):
+def _launch_token(monkeypatch, tmp_path):
     """Each test is one launch under an API server, which mints the token (an
     APIServer built earlier in this process may have left another)."""
     monkeypatch.setenv(TOKEN_ENV, "a1" * 8)
+    yield
+    # An arena also holds its namespace's lock in /dev/shm, which outlives the
+    # deployment until a later startup sweeps it.
+    for token in ("a1" * 8, "b2" * 8, None):
+        if token:
+            monkeypatch.setenv(TOKEN_ENV, token)
+        else:
+            monkeypatch.delenv(TOKEN_ENV, raising=False)
+        ns = _deployment_namespace(_DeploymentCommunicator(str(tmp_path / "ipc")))
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"/dev/shm/mstar_{ns}.lock")
 
 
 def _shutdown(p) -> None:
@@ -83,6 +97,11 @@ def _namespace_files(shm_dir, prefix) -> list[str]:
     return sorted(n for n in os.listdir(shm_dir) if n.startswith(f"mstar_{ns}_"))
 
 
+def _spills(i: int) -> torch.Tensor:
+    """Larger than a worker's one segment here, so it goes to a tensor file."""
+    return torch.full((1_100_000,), i, dtype=torch.uint8)
+
+
 def _send_unacked(mgr, n: int, make=lambda i: torch.tensor([i])) -> list[str]:
     """Send one tensor per request and never ack it, as a worker mid-decode
     holds them; returns the files' paths."""
@@ -100,16 +119,16 @@ def _send_unacked(mgr, n: int, make=lambda i: torch.tensor([i])) -> list[str]:
 
 
 class _InFlightWorker:
-    """Stands in for ``Worker``: a file-transport manager holding unacked
-    per-request tensors, and a ``run()`` that serves until stopped."""
+    """Stands in for ``Worker``: an SHM manager holding unacked per-request
+    tensors, and a ``run()`` that serves until stopped. With ``arena`` its one
+    segment holds half of six sends and the rest spill to tensor files;
+    without, all nine sends spill."""
 
     shm_dir = arena = ready = None
 
     def __init__(self, *, worker_id, socket_path_prefix, tensor_comm_protocol, **_):
         cls = type(self)
-        if cls.arena:
-            os.environ.update(MSTAR_SHM_ARENA="1", MSTAR_SHM_ARENA_SEGMENT_MB="1",
-                              MSTAR_SHM_ARENA_MAX_SEGMENTS="1", MSTAR_SHM_ARENA_SPILL_AFTER_S="0.01")
+        os.environ.update(SMALL_ARENA)
         self.tensor_manager = create_tensor_communication_manager(
             tensor_comm_protocol, my_entity_id=worker_id, hostname="localhost", device="cpu",
             communicator=_DeploymentCommunicator(socket_path_prefix), shm_dir=cls.shm_dir,
@@ -117,7 +136,7 @@ class _InFlightWorker:
         if cls.arena:
             _send_unacked(self.tensor_manager, 6, make=lambda i: torch.full((300_000,), i, dtype=torch.uint8))
         else:
-            _send_unacked(self.tensor_manager, N_IN_FLIGHT)
+            _send_unacked(self.tensor_manager, N_IN_FLIGHT, make=_spills)
 
     def run(self):
         type(self).ready.set()
@@ -174,11 +193,12 @@ def _conductor_stand_in(shm_dir: str, prefix: str, ready, worker_pid, *worker_ar
 def _restarted_worker(shm_dir: str, prefix: str, paths, done) -> None:
     """``worker_0`` of a server restarted on the same prefix: its uuid counter
     starts over, so it writes the uuids the old ``worker_0`` wrote."""
+    os.environ.update(SMALL_ARENA)
     mgr = create_tensor_communication_manager(
         CommProtocol.SHM, my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_DeploymentCommunicator(prefix), shm_dir=shm_dir,
     )
-    paths.put(_send_unacked(mgr, N_IN_FLIGHT))
+    paths.put(_send_unacked(mgr, N_IN_FLIGHT, make=_spills))
     done.wait(120)
 
 
@@ -209,9 +229,8 @@ def _wait_for(done, what: str, timeout_s: float = 30) -> None:
 
 
 @pytest.mark.parametrize("arena", [
-    False,
-    pytest.param(True, id="arena-spill", marks=pytest.mark.skipif(
-        importlib.util.find_spec("mstar_rust") is None, reason="needs mstar_rust")),
+    pytest.param(False, id="all-spill"),
+    pytest.param(True, id="arena-spill"),
 ])
 @pytest.mark.parametrize("how", ["shutdown", "ctrl-c"])
 def test_a_worker_stopped_with_requests_in_flight_leaves_no_tensor_files(tmp_path, how, arena):
@@ -230,11 +249,6 @@ def test_a_worker_stopped_with_requests_in_flight_leaves_no_tensor_files(tmp_pat
             os.kill(p.pid, signal.SIGINT)
     finally:
         _shutdown(p)
-        if arena:
-            # its segments' namespace lock, which outlives the deployment until a later startup sweeps it
-            ns = _deployment_namespace(_DeploymentCommunicator(prefix))
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(f"/dev/shm/mstar_{ns}.lock")
     assert _namespace_files(shm_dir, prefix) == []
 
 
@@ -507,7 +521,6 @@ class _HungTeardownWorker(_InFlightWorker):
         super().run()
 
 
-@pytest.mark.skipif(importlib.util.find_spec("mstar_rust") is None, reason="needs mstar_rust")
 def test_a_worker_killed_in_a_hung_teardown_leaves_no_arena_segments(tmp_path):
     shm_dir, prefix = _dirs(tmp_path)
     ns = _deployment_namespace(_DeploymentCommunicator(prefix))
@@ -530,8 +543,6 @@ def test_a_worker_killed_in_a_hung_teardown_leaves_no_arena_segments(tmp_path):
             p.kill()
         for n in _segments():
             os.unlink(f"/dev/shm/{n}")
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(f"/dev/shm/mstar_{ns}.lock")
     assert left == []
     assert _namespace_files(shm_dir, prefix) == []
 

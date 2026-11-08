@@ -2,13 +2,10 @@
 its resources took it, and leaves the request on none of them when one raises."""
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.chunking import ChunkingManagement
-from mstar.engine.engine import Engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 
 class _Runner:
@@ -36,15 +33,10 @@ class _Submodule:
 
 
 def _engine(*submodules):
-    engine = Engine.__new__(Engine)
     log = []
-    engine._runner = _Runner(log)
-    engine._resources = {}
-    engine._loopback_steps = {}
-    engine._chunking = ChunkingManagement({})
-    engine._submodules = {
-        name: SimpleNamespace(submodule=_Submodule(log, name, raises), resident=None) for name, raises in submodules
-    }
+    engine = make_engine(_runner=_Runner(log), _submodules={
+        name: make_mgmt(_Submodule(log, name, raises)) for name, raises in submodules
+    })
     return engine, log
 
 

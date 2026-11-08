@@ -22,8 +22,9 @@ from mstar.conductor.request_info import (  # noqa: E402
 )
 from mstar.graph.base import GraphEdge, GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
-from mstar.model.base import ForwardPassArgs, Model  # noqa: E402
+from mstar.model.base import ForwardPassArgs  # noqa: E402
 from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -49,12 +50,15 @@ class _StubComm:
     def poll_for_messages(self, timeout_ms):
         return bool(self.batches)
 
+    def flush(self):
+        return False  # every send above went out
+
 
 class _ScriptDoneError(Exception):
     pass
 
 
-class _ToyModel(Model):
+class _ToyModel(StubModel):
     """Graph, partitions and walk transitions come from the test."""
 
     def __init__(self, walks, initial_args, next_args=None, partitions=None):
@@ -62,9 +66,6 @@ class _ToyModel(Model):
         self._initial_args = initial_args
         self._next_args = next_args
         self._partitions = partitions
-
-    def get_node_resources(self):
-        return []
 
     def get_graph_walk_graphs(self):
         return self._walks
@@ -84,15 +85,6 @@ class _ToyModel(Model):
     def get_partition_forward_pass_args(self, partition_name, partition_metadata, persist_signals,
                                         incoming_connections=None):
         return self._next_args(partition_metadata, persist_signals)
-
-    def process_prompt(self, *a, **k):
-        return {}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
 
 
 def _conductor(model, node_groups, tmp_path, monkeypatch) -> Conductor:

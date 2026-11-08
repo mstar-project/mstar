@@ -1889,7 +1889,7 @@ class Engine:
                 except Exception as error:
                     # this rid fails alone, as in prepare_inputs, and keeps its
                     # admitted state (which queued kernels may still write) until
-                    # its REMOVE. Under TP/SP the ranks stay in step only if every
+                    # its REMOVE. Under TP/SP/CFG the ranks stay in step only if every
                     # rank raises here.
                     batch.register_failure(rid, error)
                 finally:
@@ -3308,7 +3308,7 @@ class Engine:
                 return False
             reloaded.append(resource)
         # Logged at the same level as the eviction in
-        # ``Worker._try_offload_cold_request`` and as a follower's replay, so
+        # ``Admission._evict`` and as a follower's replay, so
         # the two ranks' resident-set moves can be lined up side by side.
         # A reload only happens after an eviction, so this is not chatty.
         logger.info(

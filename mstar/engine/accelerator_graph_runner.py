@@ -903,8 +903,7 @@ class AcceleratorGraphRunner:
         for spec in self.prepare_for_capture():
             # the warm-up may hold collectives; every rank sizes these specs, in
             # config order, as it does the captures
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.instance.barrier()
             free = torch.cuda.mem_get_info(self._device)[0]
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
@@ -1009,8 +1008,7 @@ class AcceleratorGraphRunner:
                 continue
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.instance.barrier()
 
             try:
                 slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
@@ -1775,7 +1773,9 @@ class PiecewiseAcceleratorGraphRunner:
         self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
         self._graph_backend = self._device_capability.graph_backend
         self._autocast_dtype = autocast_dtype
-        self._comm_group = joint_comm_group or JointGroups(CommGroup.trivial(), CommGroup.trivial())
+        self._comm_group = joint_comm_group or JointGroups(
+            CommGroup.trivial(), CommGroup.trivial(), instance=CommGroup.trivial(),
+        )
         # scopes buffer allocation; `label` carries it but mangled with the region
         self._node_name = node_name
         self._prepared_shapes: list | None = None
@@ -1900,8 +1900,7 @@ class PiecewiseAcceleratorGraphRunner:
         captured: list[CaptureCost] = []
         for shape in shapes:
             for slot in range(self._num_slots):
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
+                self._comm_group.instance.barrier()
                 free = torch.cuda.mem_get_info(self._device)[0]
                 try:
                     with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
@@ -2018,8 +2017,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # rank still in pre-capture setup would mismatch one already in the
                 # warmup forward. Every rank walks all the slots even after a
                 # failure here, or the barrier counts diverge and they hang.
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
+                self._comm_group.instance.barrier()
                 try:
                     self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
                 except Exception:
@@ -2171,6 +2169,7 @@ class PiecewiseAcceleratorGraphRunner:
         self, request_ids: list[int], seq_lens: list[int],
         bucket: BucketKey, capture: bool, slot: int,
         real_bs: int | None = None,
+        label_seq_lens: dict[str, list[int]] | None = None,
     ):
         """The region's step over the padded batch, addressed at its slot.
 
@@ -2180,7 +2179,7 @@ class PiecewiseAcceleratorGraphRunner:
         ``ctx.request_ids``: counting the tail there makes it scatter padding
         rows back over real state.
         """
-        step = self._region_step(request_ids, seq_lens)
+        step = self._region_step(request_ids, seq_lens, label_seq_lens)
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -2196,10 +2195,15 @@ class PiecewiseAcceleratorGraphRunner:
         step.set_ctx(ctx)
         return step
 
-    def _region_step(self, request_ids: list[int], seq_lens: list[int]):
+    def _region_step(
+        self, request_ids: list[int], seq_lens: list[int],
+        label_seq_lens: dict[str, list[int]] | None = None,
+    ):
         """The config's step for the region, with the node's LoRA rows laid out from its
         own segments (``lora_rows``)."""
-        return lora_rows(self._config.region_step(list(request_ids), list(seq_lens)), self._lora_keys)
+        return lora_rows(
+            self._config.region_step(list(request_ids), list(seq_lens), label_seq_lens), self._lora_keys,
+        )
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:
@@ -2303,12 +2307,14 @@ class PiecewiseAcceleratorGraphRunner:
         request_ids: list[int] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
+        label_seq_lens: dict[str, list[int]] | None = None,
     ) -> PiecewiseOutput:
         """Replay the captured region for these real inputs.
 
         Copies each real input into the runner-owned buffer of the same name,
         declares and plans the region's step over the padded batch, replays,
         then commits and returns the padded buffers behind a real-length view.
+        An input its buffer may round is refused.
 
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
@@ -2317,6 +2323,11 @@ class PiecewiseAcceleratorGraphRunner:
         A ``one_row_per_step`` region replays the step as one row named by its
         first request, however many requests or segments it is passed, and base-only
         on a LoRA node (``can_lease``): no row may run an adapter.
+
+        ``label_seq_lens`` is for a region whose step plans several ragged
+        layouts over the same tokens (windows and whole frames): label ->
+        spans, padded as ``seq_lens`` is. Its total must be ``seq_lens``'s for
+        every label, so the bucket is the one ``seq_lens`` picked.
         """
         if self._config.one_row_per_step:
             if request_ids is not None and self._runs_adapters(request_ids):
@@ -2327,6 +2338,14 @@ class PiecewiseAcceleratorGraphRunner:
             real_bs = 1
             if request_ids is not None:
                 request_ids = request_ids[:1]
+        if label_seq_lens is not None and seq_lens is not None:
+            total = sum(seq_lens)
+            bad = {k: sum(v) for k, v in label_seq_lens.items() if sum(v) != total}
+            if bad:
+                raise ValueError(
+                    f"piecewise {self._label!r}: label_seq_lens totals {bad} differ from "
+                    f"seq_lens' {total}"
+                )
         if real_bs is None:
             if request_ids is not None:
                 real_bs = len(request_ids)
@@ -2351,6 +2370,18 @@ class PiecewiseAcceleratorGraphRunner:
             buffer = data.static_inputs.get(name)
             if buffer is None or not isinstance(value, torch.Tensor):
                 continue
+            # the copy casts silently: into a wider float or a wider int it is
+            # exact, but narrowing, or an integer into a float or complex, can round
+            if torch.promote_types(value.dtype, buffer.dtype) != buffer.dtype or (
+                (buffer.dtype.is_floating_point or buffer.dtype.is_complex)
+                and not (value.dtype.is_floating_point or value.dtype.is_complex)
+                and value.dtype != torch.bool
+            ):
+                raise ValueError(
+                    f"piecewise {self._label!r}: buffer {name!r} ({buffer.dtype}) would round "
+                    f"its {value.dtype} input; allocate it in the input's dtype in "
+                    "make_static_inputs"
+                )
             n = value.shape[0]
             # a pinned host input must not drain the stream; the copy is
             # stream-ordered ahead of the replay either way
@@ -2372,6 +2403,10 @@ class PiecewiseAcceleratorGraphRunner:
                 capture=False,
                 slot=self._current_slot,
                 real_bs=real_bs,
+                label_seq_lens=None if label_seq_lens is None else {
+                    label: self._config.replay_seq_lens(data.shape, spans, real_bs)
+                    for label, spans in label_seq_lens.items()
+                },
             )
         try:
             self._plan(step, data.shape)

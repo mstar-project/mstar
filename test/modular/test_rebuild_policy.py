@@ -28,6 +28,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
+from mstar.model.multimodal import vision_encoder
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
@@ -386,6 +387,20 @@ def test_a_prompt_with_images_records_its_ids_as_its_walk_read_them_and_its_imag
     assert torch.equal(record.inputs["embeds"][0], torch.zeros(6, 2)), "a rebuild row would leave out the image"
 
 
+def test_a_prompt_that_read_a_pad_id_at_each_image_slot_leaves_its_copies_no_slots_of_their_own():
+    """A VLM's media walk reads an id at every slot, a pad where the encoder's output goes in. Counting the image's
+    slots again for its copies made the rebuild write more slots than the KV held, so every drop refused it, and a log
+    with room for ids only at the ids spans overflowed its slice."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
+    _ingest(rebuilds, R, IMAGE_CHAT)
+    rows = {R: {"text_inputs": [torch.arange(11)], "embeds": [torch.zeros(6, 2)]}}
+
+    rebuilds.record(_ran(VISION, rows))
+    rebuilds._kept[NODE][R].sampled.append(6)
+
+    assert rebuilds.tokens(R, NODE, None) == 11, "the rebuild would write other slots than the prompt's KV holds"
+
+
 def _vision_step(rids, walks: dict, **fields) -> SimpleNamespace:
     infos = {rid: SimpleNamespace(graph_walk=walks.get(rid, VISION), step_metadata={"prefill_order": (rid,)})
              for rid in rids}
@@ -428,13 +443,12 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     total, so a failed pinned allocation failed every request in its step. The log takes one slice of the startup
     pool when a request arrives, sized by the policy's bytes per slot, so a request the pool can't hold is known
     before it is admitted and stays out of the drops."""
-    pool = HostPool(176, torch.device("cpu"))
+    pool = HostPool(256, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, node_dtypes=DTYPES)
 
-    # each text span's ids at 8 B, 24 and 16, and the image's six slots at two float32 values each
-    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == HostSlice(0, 40 + 48)
-    assert _ingest(rebuilds, A, IMAGE_CHAT)
-    assert not _ingest(rebuilds, B, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
+    # an id at 8 B for each of the eleven slots, and the image's six slots at two float32 values each
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == HostSlice(0, 88 + 48)
+    assert not _ingest(rebuilds, A, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
     step = _vision_step((R,), {}, completion_event=None)
     # the image's four rows, without its two sentinels
     step.per_request_input_tensors[R] = {
@@ -443,7 +457,9 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds.record(step)
     rebuilds.flush()
 
-    assert rebuilds._droppable[NODE][R].nbytes == 40 + 32, "the sentinels' room would stay taken for the request's life"
+    assert rebuilds._droppable[NODE][R].nbytes == 40 + 32, (
+        "the image's room for ids and its sentinels' room would stay taken for the request's life"
+    )
     assert rebuilds._kept[NODE][R].records[0].inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
 
 
@@ -592,7 +608,7 @@ def test_a_request_with_images_is_not_rebuildable_on_a_node_whose_dtype_is_unkno
 
 
 def test_a_request_removed_with_copies_queued_leaves_the_next_owner_of_its_slice_alone():
-    allowance, pool = StepAllowance(0), HostPool(128, torch.device("cpu"))
+    allowance, pool = StepAllowance(0), HostPool(256, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, allowance, node_dtypes=DTYPES)
     assert _ingest(rebuilds, R, IMAGE_CHAT)
     step = _vision_step((R,), {}, completion_event=None)
@@ -632,7 +648,7 @@ def test_a_rebuild_of_a_prompt_with_images_reads_its_copies_under_its_prefills_m
 def test_a_host_copy_lands_whole_before_its_request_can_be_dropped():
     rows = 1 << 22
     rebuilds = Rebuilds(
-        {NODE: MEDIA}, _graphs(), HostPool(4 * rows + (1 << 10), torch.device("cuda")), node_dtypes=DTYPES,
+        {NODE: MEDIA}, _graphs(), HostPool(8 * rows + (1 << 10), torch.device("cuda")), node_dtypes=DTYPES,
     )
     # an image of rows // 2 slots at the policy's two float32 values a slot holds the rows float32 embeds
     image = replace(IMAGE_CHAT[1], length=rows // 2)
@@ -706,6 +722,31 @@ def test_a_sample_of_more_than_one_id_is_refused(host):
             rebuilds.keep_samples(_batch((R,)), {}, HostRows((R,), {"new_token": codes}))
         else:
             rebuilds.keep_samples(_batch((R,)), {R: {"new_token": [codes[0]]}}, None)
+
+
+def test_a_request_that_samples_a_pad_id_is_never_dropped():
+    """A rebuild row's sampled ids run in the packed media step, where the nth pad reads the nth encoder row. A
+    sampled pad took the row of the next pad in the step, and every row after it read the wrong encoder rows."""
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    vars(model).update(
+        config=SimpleNamespace(max_position_embeddings=4096, hidden_size=2),
+        media=(SimpleNamespace(encoder=vision_encoder((90, 91))),),
+    )
+    pads = model.rebuild_policies()[NODE].pad_ids
+    pool = HostPool(1 << 10, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: replace(MEDIA, pad_ids=pads)}, _graphs(), pool, node_dtypes=DTYPES)
+    for rid in (R, A):
+        _ingest(rebuilds, rid, IMAGE_CHAT)
+    rebuilds.record(_ran(VISION, {
+        rid: {"text_inputs": [torch.arange(11)], "embeds": [torch.zeros(6, 2)]} for rid in (R, A)
+    }))
+
+    rebuilds.keep_samples(_batch((R, A)), {}, HostRows((R, A), {"new_token": torch.tensor([91, 5])}))
+
+    assert "keeps no log" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
+        "a rebuild row would carry the sampled pad, and the rows after it would read the wrong encoder rows"
+    )
+    assert list(rebuilds._kept[NODE][A].sampled) == [5], "a request that sampled text would stop being droppable"
 
 
 @pytest.mark.parametrize("why, node, walk, sampled, iters", [

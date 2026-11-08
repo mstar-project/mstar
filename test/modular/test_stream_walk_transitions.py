@@ -26,7 +26,6 @@ from mstar.utils.ipc_format import WorkerGraphsDone
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 
 def _buffer(chunk_size=1, tagged=True):
@@ -169,9 +168,10 @@ def _streams(idle=True):
         is_partition_idle=lambda rid, partition: idle,
         set_walk=lambda rid, partition, walk: walks.append(walk),
     )
+    connection = _conn("thinker_states")
     streams = StreamBufferManager(
-        request_state, None, [], graph_runtime=runtime,
-        walk_driven_edges={"thinker_states": "Talker"},
+        request_state, None, [connection], graph_runtime=runtime,
+        topology=PartitionTopology(partitions=["Thinker", "Talker"], connections=[connection]),
     )
     return streams, request_state, walks
 
@@ -212,20 +212,14 @@ def _producer():
         partitions=["Thinker", "Talker"],
         connections=[_conn("thinker_states"), _conn("thinker_mask")],
     )
-    w = Worker.__new__(Worker)
-    w.partition_topology = topology
-    w._walk_drivers = topology.walk_drivers()
-    w._signal_consumer = {c.edge_name: c.to_partition for c in topology.connections}
-    w._emitted_walk_drivers = {}
-    w._walk_ctx = ProducerWalkCtx()
-    w._graph_runtime = SimpleNamespace(
+    request_state = RequestStateManager()
+    runtime = SimpleNamespace(
         get_output_signals=lambda node, walk: (
             ["thinker_mask", "thinker_states"] if (node, walk) in _EMITS else ["audio_embeds"]
         ),
     )
-    w.request_state = RequestStateManager()
-    w.request_state.add_request(0, _fwd("prefill_text", partition="Thinker"))
-    return w
+    request_state.add_request(0, _fwd("prefill_text", partition="Thinker"))
+    return StreamBufferManager(request_state, None, [], graph_runtime=runtime, topology=topology)
 
 
 def _batch(node, rows):
@@ -248,9 +242,9 @@ def _batch(node, rows):
 
 def _pass(w, node, walk, loop_iters=None):
     """The Talker walk this pass's states were assigned, or None if it emitted none."""
-    fwd = w.request_state.get_fwd_info(0, "Thinker")
+    fwd = w._request_state.get_fwd_info(0, "Thinker")
     fwd.stream_consumer_walks.clear()
-    w._assign_consumer_walks(_batch(node, {0: (walk, loop_iters)}))
+    w.assign_consumer_walks(_batch(node, {0: (walk, loop_iters)}))
     return fwd.stream_consumer_walks.get("Talker")
 
 
@@ -281,7 +275,7 @@ def test_a_mixed_step_asks_each_row_under_its_own_walk():
     """Chunked prefill batches prefill and decode rows as ``thinker_mixed``,
     which no worker graph declares: each row's states take the walk it ran."""
     w = _producer()
-    w.request_state.add_request(1, _fwd("thinker_decode", partition="Thinker"))
+    w._request_state.add_request(1, _fwd("thinker_decode", partition="Thinker"))
     asked = []
     get_output_signals = w._graph_runtime.get_output_signals
 
@@ -291,12 +285,12 @@ def test_a_mixed_step_asks_each_row_under_its_own_walk():
         return get_output_signals(node, walk)
 
     w._graph_runtime.get_output_signals = signals
-    w._assign_consumer_walks(_batch("Thinker", {
+    w.assign_consumer_walks(_batch("Thinker", {
         0: ("prefill_text", None), 1: ("thinker_decode", _decode(4)),
     }))
     assert sorted(asked) == ["prefill_text", "thinker_decode"]
     walks = [
-        w.request_state.get_fwd_info(rid, "Thinker").stream_consumer_walks["Talker"]
+        w._request_state.get_fwd_info(rid, "Thinker").stream_consumer_walks["Talker"]
         for rid in (0, 1)
     ]
     assert walks == ["talker_prefill", "talker_decode"]
@@ -313,11 +307,10 @@ def test_the_hook_sees_the_pass_and_not_a_count_of_emissions():
         return "talker_decode"
 
     w = _producer()
-    for conn in w.partition_topology.connections:
+    for conn in w._walk_drivers.values():
         conn.consumer_walk = record
-    w._walk_drivers = w.partition_topology.walk_drivers()
     w._graph_runtime.get_output_signals = lambda node, walk: ["thinker_states"]
-    fwd = w.request_state.get_fwd_info(0, "Thinker")
+    fwd = w._request_state.get_fwd_info(0, "Thinker")
     fwd.step_metadata = {"is_last_prefill": True}
     _pass(w, "Thinker", "thinker_decode", _decode(3))
     _pass(w, "Projector", "thinker_decode", _decode(3))
@@ -332,11 +325,11 @@ def test_the_hook_sees_the_pass_and_not_a_count_of_emissions():
 
 def test_a_pass_allocates_nothing_per_row():
     w = _producer()
-    walks = w.request_state.get_fwd_info(0, "Thinker").stream_consumer_walks
+    walks = w._request_state.get_fwd_info(0, "Thinker").stream_consumer_walks
     ctx = w._walk_ctx
     _pass(w, "Thinker", "thinker_decode", _decode(0))
     _pass(w, "Thinker", "thinker_decode", _decode(1))
-    assert w.request_state.get_fwd_info(0, "Thinker").stream_consumer_walks is walks
+    assert w._request_state.get_fwd_info(0, "Thinker").stream_consumer_walks is walks
     assert w._walk_ctx is ctx
 
 
