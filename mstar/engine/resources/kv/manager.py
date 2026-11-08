@@ -4261,7 +4261,7 @@ class KVManager(AttentionResource):
         with self._lock:
             if self._host_copies:
                 self._land_host_copies()
-            chains = [] if self._index is None or self._returning(rid) else [
+            chains = [] if self._index is None or self._on_host(rid) else [
                 stream.chain for stream in self._streams[rid].values()
                 if stream.chain is not None and stream.chain.rooted is None
             ]
@@ -4334,18 +4334,13 @@ class KVManager(AttentionResource):
     def _need(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
     ) -> int:
-        """The pages ``rid``'s allotment would take now. Caller holds the lock.
-
-        A dropped request is charged every cache hit as a fresh page, since nothing is leased before its
-        rebuild. When the rebuild's probe hits a page another request holds, the hit costs nothing, so
-        that page of the allotment is left for the request's growth. No hit covers the shortage a request
-        that holds an allotment asks for.
-        """
+        """The pages ``rid``'s allotment would take now. Caller holds the lock. No hit covers the
+        shortage a request that holds an allotment asks for."""
         if rid in self._allotments:
             return self._asks[rid]
         dropped = self._dropped.get(rid)
         if dropped is not None:
-            return dropped.returns
+            return dropped.returns - self._lent_hits(rid, dropped)
         if self._on_host(rid):
             return self._reload_pages(rid) + self._return_pages(rid)
         whole, charged = self._hit(rid, node_name, graph_walk, published)
@@ -4354,9 +4349,19 @@ class KVManager(AttentionResource):
     def _on_host(self, rid: str) -> bool:
         return self._cpu_pool is not None and self._cpu_pool.is_offloaded(rid)
 
-    def _returning(self, rid: str) -> bool:
-        """Whether ``rid`` asks again after a drop or a move to the host."""
-        return rid in self._dropped or self._on_host(rid)
+    def _lent_hits(self, rid: str, dropped: Dropped) -> int:
+        """The pages of dropped ``rid``'s prompt that another request holds, up to the lease its rebuild's
+        probe can take (`_leased`). They can't be evicted, so the probe takes them for nothing, as a
+        prompt's does (`_hit`)."""
+        if self._index is None:
+            return 0
+        pages = max(dropped.held - 1, 0) // self.config.tokens_per_page
+        evictable = self._index.evictable()
+        return sum(
+            page not in evictable
+            for stream in self._streams[rid].values() if stream.chain is not None
+            for page in self._index.pages_for(stream.chain.rooted[:min(stream.chain.keyed_pages, pages)])
+        )
 
     def _index_counts(self) -> tuple[int, int]:
         """The pages the index has ever filed, and the pages requests have ever taken out of its
