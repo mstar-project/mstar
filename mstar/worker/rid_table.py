@@ -15,7 +15,7 @@ _wires, _unreported}
 cached_prefix} (purged by clear_rid), Admission.{admit_errors, held_until,
 parked} (purged by clear), Lockstep.read_failed_rids (purged by clear),
 Worker._pending_loop_stops, Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info,
-_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the engine's and
+_fwd_by_partition} and StreamBufferManager._open (purged by remove_request), the engine's and
 tensor manager's per-request state (including ChunkingManagement.prepared,
 Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and
 the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under

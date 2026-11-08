@@ -141,7 +141,7 @@ def _streams(rids, refuse=frozenset(), window=3, stride=2, items=5):
         )
     streams = _Ledger(SimpleNamespace(per_request_info=infos), tm, [])
     streams.consumer_node = {EDGE: NODE}
-    streams._rids = set(rids)
+    streams._open = {NODE: set(rids)}
     runtime = _Runtime(streams, set(refuse))
     return streams, runtime
 

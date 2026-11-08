@@ -31,12 +31,12 @@ def input_metadata_and_fwd_info(
     and the stream chunks it consumes."""
     meta = {}
     fwd_info = {}
-    possible = streams.possible()
+    consumes_stream = streams.consumes_stream(node_name)
     for rid, inputs in per_request_inputs.items():
         req_info = request_state.get_fwd_info(rid, batch_partition)
         fwd_info[rid] = req_info
         stream_chunks = {}
-        if possible and (chunks := streams.chunks_for(rid, node_name, inputs)):
+        if consumes_stream and (chunks := streams.chunks_for(rid, node_name, inputs)):
             stream_chunks = chunks
         meta[rid] = InputMetadata(
             stream_chunks=stream_chunks,

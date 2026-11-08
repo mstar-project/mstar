@@ -27,6 +27,8 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.topology import Connection
 from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import StepPick
@@ -43,6 +45,8 @@ WG, WALK, NODE, LOOP, SIG, PART, ME = 0, "decode", "LLM", "decode_loop", "text_i
 NODE_B, SIG_B = "head", "hidden"
 # a prefill walk on NODE (``mixed=True``), for a step whose rows mix walks
 WG_PRE, PRE, MIXED = 1, "prefill", "mixed"
+# a stream into NODE that continues past its end (``text=True``), as Qwen3-TTS's text
+TEXT = "text_in"
 
 pytest.importorskip("mstar_rust", reason="mstar_rust not built")
 
@@ -108,11 +112,13 @@ class _Scheduler:
         return batch
 
 
-def _runtime(max_iters: int, pair: bool = False, mixed: bool = False):
+def _runtime(max_iters: int, pair: bool = False, mixed: bool = False, text: bool = False):
     body = GraphNode(
-        name=NODE, input_names=[SIG],
+        name=NODE, input_names=[SIG, TEXT] if text else [SIG],
         outputs=[GraphEdge(next_node=NODE, name=SIG)],
     )
+    if text:
+        body._register_streaming({TEXT}, {TEXT})
     if pair:
         body = Sequential([
             GraphNode(name=NODE, input_names=[SIG], outputs=[GraphEdge(next_node=NODE_B, name=SIG_B)]),
@@ -146,9 +152,9 @@ def _runtime(max_iters: int, pair: bool = False, mixed: bool = False):
 
 def _worker(
     max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False,
-    connections=(), walks=None,
+    connections=(), walks=None, text: bool = False,
 ) -> Worker:
-    rt, tm = _runtime(max_iters, pair, mixed)
+    rt, tm = _runtime(max_iters, pair, mixed, text)
     request_state = RequestStateManager(node_to_partition={NODE: PART, NODE_B: PART})
     # every row ready, and no resource splits a walk, so a mixed step keeps its rows' order
     engine = SimpleNamespace(
@@ -365,6 +371,30 @@ def test_a_decode_loop_builds_the_same_steps(monkeypatch):
         # routing N moved the shared counters; the step's own copy did not
         assert w.request_state.get_fwd_info(rids[0], PART).dynamic_loop_iter_counts[LOOP] == k + 1
         assert dict(spec.node_batch.per_request_info_wrapped[rids[0]].dynamic_loop_iter_counts)[LOOP] == k + 1
+
+
+def test_a_loop_whose_continuing_stream_ended_speculates_as_columns(monkeypatch):
+    """Qwen3-TTS's Talker decode once its text stream ended: no row has a
+    stream into the node open, so it takes the columns, though every row
+    still owns a buffer (the Codec's, on the same worker)."""
+    conns = [
+        Connection(
+            from_partition="Text", to_partition=PART, edge_name=name,
+            chunk_policy_factory=lambda cont=name == TEXT: FixedChunkPolicy(1, continue_after_done=cont),
+        ) for name in (TEXT, "codec_tokens")
+    ]
+    w = _worker(connections=conns, text=True)
+    w.streams.consumer_node = {TEXT: NODE, "codec_tokens": "Codec"}
+    rids = _admit(w, 4)
+    for rid in rids:
+        w.streams.add_request(rid, SimpleNamespace(partition_name=PART, stream_lead_items={}))
+        w.request_state.per_request_info[rid].stream_buffers[TEXT].signal_done()
+    w.ingest.poll_stream_buffers()  # the end chunk
+    pending = _first_step(w, rids)
+    for _ in range(3):
+        spec = _step_both(w, pending, monkeypatch)
+        assert dict(spec.node_batch.per_request_input_tensors[rids[0]]) == {SIG: []}
+        pending = _advance(w, pending, spec)
 
 
 def test_a_two_node_loop_builds_the_same_steps(monkeypatch):
