@@ -83,6 +83,10 @@ def test_gen_params_and_step_metadata() -> None:
     p = model._resolve_gen_params({"size": "480x256"}, ["text"], ["image"])
     assert (p["width"], p["height"]) == (480, 256)
     assert p["num_frames"] == 1 and p["has_image_condition"] is False
+    # under one latent pixel (16 px) a side had no latent and failed mid-pipeline
+    for size in ({"width": 4}, {"size": "480x8"}):
+        with pytest.raises(ValueError, match="at least 16"):
+            model._resolve_gen_params(size, ["text"], ["image"])
 
     # The denoise loop's cap is per request, so a per-request
     # num_inference_steps is honored, clamped to [1, max_inference_steps];

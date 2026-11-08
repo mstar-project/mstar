@@ -1581,6 +1581,53 @@ def test_qwen3_tts_per_request_sampler_configs_drive_code_predictor():
     assert configs[CODE_PRED_SAMPLER].seed != 99
 
 
+def test_the_reference_audio_encoder_loads_the_flat_mimi_checkpoint(tmp_path):
+    """transformers 5.21 made the Mimi submodules qwen-tts' encoder sets to ``None`` read-only and
+    nested the encoder half's weights; the encoder still builds and takes the checkpoint's flat names."""
+    if importlib.util.find_spec("qwen_tts") is None:
+        pytest.skip("qwen-tts optional dependency is not installed")
+    from safetensors.torch import save_file
+    from transformers import MimiConfig
+
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder
+    from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
+    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, _load_qwen3_tts_codec_classes
+
+    encoder_config = {
+        "hidden_size": 32, "intermediate_size": 64, "num_hidden_layers": 1, "num_attention_heads": 2,
+        "num_key_value_heads": 2, "head_dim": 16, "num_filters": 4, "codebook_size": 16, "codebook_dim": 16,
+        "num_quantizers": 4, "upsample_groups": 32,
+    }
+    speaker_config = Qwen3TTSSpeakerEncoderConfig(
+        enc_dim=16, enc_channels=(16, 16, 16, 16, 48), enc_se_channels=8, enc_attention_channels=8,
+    )
+    torch.manual_seed(0)
+    _, _, encoder_cls = _load_qwen3_tts_codec_classes()
+    reference = encoder_cls(MimiConfig(**encoder_config)).state_dict()
+    flat_names = {"encoder.encoder_seanet.": "encoder.", "encoder.encoder_transformer.": "encoder_transformer.",
+                  "encoder.downsample.": "downsample."}
+    checkpoint = {}
+    for name, tensor in reference.items():
+        for nested, flat in flat_names.items():
+            name = name.replace(nested, flat)
+        checkpoint["encoder." + name] = tensor
+    (tmp_path / "speech_tokenizer").mkdir()
+    save_file(checkpoint, str(tmp_path / "speech_tokenizer" / "model.safetensors"))
+    speaker = Qwen3TTSSpeakerEncoder(speaker_config).state_dict()
+    save_file({"speaker_encoder." + k: v for k, v in speaker.items()}, str(tmp_path / "model.safetensors"))
+
+    config = SimpleNamespace(
+        supports_reference_audio=True, speaker_encoder=speaker_config,
+        codec=SimpleNamespace(encoder_config=encoder_config, num_quantizers=4),
+    )
+    submodule = Qwen3TTSModel._create_ref_encoder_submodule(
+        SimpleNamespace(config=config, local_dir=str(tmp_path)), "cpu",
+    )
+    loaded = submodule.codec_encoder.state_dict()
+    assert loaded.keys() == reference.keys()
+    assert all(torch.equal(loaded[name], tensor) for name, tensor in reference.items())
+
+
 def _tiny_decoder(config, seed: int = 0) -> torch.nn.Module:
     """The real 12 Hz decoder at ``config.codec``'s tiny widths, with weights that say something."""
     if importlib.util.find_spec("qwen_tts") is None:

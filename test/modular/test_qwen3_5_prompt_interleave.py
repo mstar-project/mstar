@@ -207,7 +207,7 @@ def test_a_chat_the_template_refuses_is_a_bad_request(model, tmp_path):
 def test_byte_patches_normalize_to_the_processors_pixels(model, size):
     """`process_prompt` ships un-normalized byte patches; the encoder's
     normalization must give the processor's own pixels exactly, resized or not."""
-    from mstar.model.qwen3_5.qwen3_5_model import _as_hwc_uint8
+    from mstar.model.multimodal import as_uint8_chw
     from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule
 
     torch.manual_seed(0)
@@ -219,5 +219,8 @@ def test_byte_patches_normalize_to_the_processors_pixels(model, size):
     assert patches.dtype == torch.uint8
     encoder = VisionEncoderSubmodule.__new__(VisionEncoderSubmodule)
     encoder._pixel_normalizer = model.pixel_normalizer()
-    reference = model.image_processor(images=[_as_hwc_uint8(image)], return_tensors="pt")
+    reference = model.image_processor(
+        images=[as_uint8_chw(image, truncate=True).permute(1, 2, 0).numpy()], return_tensors="pt",
+        input_data_format="channels_last",
+    )
     assert torch.equal(VisionEncoderSubmodule._normalize(encoder, patches), reference["pixel_values"])

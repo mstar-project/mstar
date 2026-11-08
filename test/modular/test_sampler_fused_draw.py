@@ -4,7 +4,10 @@ offsets commit persists have to equal what that many ``sample`` calls would give
 next step draws from random numbers it already used."""
 import pytest
 import torch
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
+from mstar.engine.resources.sampler.fused_draw import draw_row, layout
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.sampler.utils import SamplerBuffers, SamplingConfig, fused_sample
 
@@ -111,11 +114,6 @@ def test_a_step_without_filters_draws_with_them_off():
 
 @requires_hopper
 def test_draw_row_picks_the_tokens_fused_sample_picks():
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-
-    from mstar.engine.resources.sampler.fused_draw import draw_row, layout
-
     @gluon.jit
     def draw(L, T, K, P, S, O, out, V: gl.constexpr, LAY: gl.constexpr):
         r = gl.program_id(0)

@@ -33,6 +33,16 @@ def test_second_conductor_on_one_prefix_is_refused():
         del first
 
 
+def test_a_second_api_server_is_refused_before_it_binds_over_the_first():
+    """Its conductor, which would be refused, starts only after the API server
+    has bound its sockets in the first deployment's prefix."""
+    with tempfile.TemporaryDirectory() as prefix:
+        first = _comm(prefix, "api_server_preprocess_worker")
+        with pytest.raises(RuntimeError, match="already holds"):
+            _comm(prefix, "api_server_preprocess_worker")
+        del first
+
+
 def test_conductors_on_different_prefixes_both_start():
     with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
         ca = _comm(a, DEPLOYMENT_ANCHOR_ENTITY)
@@ -51,10 +61,9 @@ def test_the_lock_is_released_when_the_holder_exits():
         del first, second
 
 
-def test_only_the_anchor_entity_locks():
+def test_workers_do_not_lock():
     """One deployment has many workers on one prefix; they must not lock each
-    other out. The conductor is the one entity every deployment has exactly
-    one of, so it alone stands for the deployment."""
+    other out."""
     with tempfile.TemporaryDirectory() as prefix:
         a = _comm(prefix, "worker_0")
         b = _comm(prefix, "worker_1")

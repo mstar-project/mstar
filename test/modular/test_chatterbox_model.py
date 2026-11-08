@@ -1176,6 +1176,18 @@ def test_streaming_and_compile_knobs_reach_the_config():
     assert _make_model().config.s3gen_compile is False
 
 
+def test_a_first_stream_chunk_shorter_than_the_vocoder_cache_is_refused():
+    """Chunk 1 vocodes its tokens past the 3-token look-ahead, 2 mel frames each; under the 8-frame
+    vocoder cache, chunk 2's crossfade read a short tail and every streamed request failed there."""
+    with pytest.raises(ValueError, match="stream_first_chunk_tokens"):
+        ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=6)
+    ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=7)
+    # the offline decode has no first chunk
+    ChatterboxModel(
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=1, stream_chunk_tokens=0,
+    )
+
+
 def test_graph_and_precision_knobs_reach_the_config():
     model = ChatterboxModel(
         model_path_hf="ResembleAI/chatterbox", variant="chatterbox",

@@ -81,6 +81,7 @@ def _conductor(*ticks, requests):
         send=lambda entity, msg: c.sent.append((entity, msg)),
         get_all_new_messages=lambda: batches.pop(0) if batches else [],
         poll_for_messages=lambda timeout_ms: bool(batches),
+        flush=lambda: False,
     )
     c._walk_inputs = {"decode": ()}
     c._repeating_walks = frozenset()
