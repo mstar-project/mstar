@@ -79,7 +79,7 @@ from mstar.utils.generation_kwargs import normalize_generation_kwargs
 from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
-from mstar.utils.threads import Thread, pin_thread
+from mstar.utils.threads import Thread, hold_clock_from_knob, pin_thread, release_clock
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,7 @@ def _conductor_process_target(
     """Runs DummyConductor.run() in a spawned process. ``status_interval_s``
     turns on the conductor's status message (metrics on). ``lora_adapter_digests``
     are the API server's checked serving-config adapters (name -> hex digest)."""
+    release_clock()  # the API server's ``uclamp_min``, which spawn hands down
     logging.basicConfig(
         level=getattr(logging, log_level),
         format="%(asctime)s %(levelname)s [conductor] %(name)s: %(message)s",
@@ -511,6 +512,8 @@ class APIServer:
         self.takes_stream_input = bool(self.client_streams)
         self._model_config = model_config
         self._take_result_cpu()
+        # before this server starts its data worker's threads
+        hold_clock_from_knob("API server")
 
         # Before any tensor manager; the conductor and workers inherit it.
         ensure_deployment_token()

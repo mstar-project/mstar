@@ -7,6 +7,8 @@ conductor share, the startup failures, the pool sizes, the thread helpers
 in ``test_knobs``."""
 from __future__ import annotations
 
+import ctypes
+import errno
 import logging
 import os
 import shutil
@@ -1673,3 +1675,86 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     # no other thread of the process landed on a step CPU, the intra-op pool
     # the plan thread just used included (looked at while it was alive)
     assert seen["plan"][2] == []
+
+
+def _util_min() -> int:
+    """This thread's uclamp floor."""
+    attr = threads._SchedAttr()
+    libc = ctypes.CDLL(None, use_errno=True)
+    getattr_number = {"x86_64": 315, "aarch64": 275}[threads.platform.machine()]
+    assert libc.syscall(getattr_number, 0, ctypes.byref(attr), ctypes.sizeof(attr), 0) == 0
+    return attr.util_min
+
+
+def _in_a_thread(fn):
+    """A thread of its own, so ``hold_clock`` doesn't leave a floor on the test's."""
+    out = []
+    thread = threads.Thread(target=lambda: out.append(fn()))
+    thread.start()
+    thread.join()
+    return out[0]
+
+
+def test_threads_inherit_the_floor_until_it_is_released():
+    def held():
+        refused = threads.hold_clock(768)
+        mine, child = _util_min(), _in_a_thread(_util_min)
+        threads.release_clock()
+        return refused, mine, child, _util_min()
+
+    refused, mine, child, released = _in_a_thread(held)
+    if refused is not None:
+        pytest.skip(f"no uclamp here: {refused}")
+    assert (mine, child, released) == (768, 768, 0)
+
+
+@pytest.mark.parametrize(
+    ("cap", "says"), [("512", "caps it at 512"), ("not a number", "no uclamp"), (None, "no uclamp")],
+)
+def test_hold_clock_says_why_when_the_kernel_wont_do_it(monkeypatch, tmp_path, cap, says):
+    path = tmp_path / "cap"
+    if cap is not None:
+        path.write_text(cap)
+    monkeypatch.setattr(threads, "_UCLAMP_SYSTEM_CAP", str(path))
+    monkeypatch.setattr(threads.ctypes, "CDLL", lambda *a, **k: pytest.fail("asked the kernel"))
+    assert says in threads.hold_clock(1024)
+
+
+def test_hold_clock_says_why_on_an_unknown_machine(monkeypatch, tmp_path):
+    cap = tmp_path / "cap"
+    cap.write_text("1024")
+    monkeypatch.setattr(threads, "_UCLAMP_SYSTEM_CAP", str(cap))
+    monkeypatch.setattr(threads.platform, "machine", lambda: "riscv64")
+    assert "riscv64" in threads.hold_clock(1024)
+
+
+def test_hold_clock_reports_a_refused_call(monkeypatch, tmp_path):
+    class Libc:
+        @staticmethod
+        def syscall(*args):
+            ctypes.set_errno(errno.EPERM)
+            return -1
+
+    cap = tmp_path / "cap"
+    cap.write_text("1024")
+    monkeypatch.setattr(threads, "_UCLAMP_SYSTEM_CAP", str(cap))
+    monkeypatch.setattr(threads.ctypes, "CDLL", lambda *a, **k: Libc)
+    assert "sched_setattr failed" in threads.hold_clock(1024)
+
+
+@pytest.mark.parametrize(
+    ("floor", "refused", "asked", "says"),
+    [(0, None, [], ""), (1024, None, [1024], ""), (512, None, [512], ""), (1024, "no uclamp", [1024], "no uclamp")],
+)
+def test_a_process_applies_its_floor_or_carries_on(monkeypatch, caplog, floor, refused, asked, says):
+    from mstar.utils import knobs
+
+    knobs.configure({"uclamp_min": floor})
+    seen = []
+    monkeypatch.setattr(threads, "hold_clock", lambda value: seen.append(value) or refused)
+    with caplog.at_level(logging.WARNING):
+        threads.hold_clock_from_knob("Worker w")
+    knobs.configure(None)
+    assert seen == asked
+    assert says in caplog.text
+    assert bool(caplog.text) == bool(says)

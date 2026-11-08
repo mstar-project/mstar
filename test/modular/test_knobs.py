@@ -85,3 +85,24 @@ def test_idle_hold_from_the_config_and_the_environment(monkeypatch):
 def test_a_bad_idle_hold_fails_the_startup_check(value):
     with pytest.raises(ValueError, match="idle_hold"):
         knobs.check({"idle_hold": value})
+
+
+def test_uclamp_min_from_the_config_and_the_environment(monkeypatch):
+    assert knobs.uclamp_min() == 0
+    knobs.configure({"uclamp_min": 768})
+    assert knobs.uclamp_min() == 768
+    monkeypatch.setenv("MSTAR_UCLAMP_MIN", "1024")
+    assert knobs.uclamp_min() == 1024
+
+
+def test_a_bad_uclamp_min_variable_is_named_over_a_good_config(monkeypatch):
+    knobs.configure({"uclamp_min": 1024})
+    monkeypatch.setenv("MSTAR_UCLAMP_MIN", "on")
+    with pytest.raises(ValueError, match="MSTAR_UCLAMP_MIN must be 0 to 1024, got 'on'"):
+        knobs.uclamp_min()
+
+
+@pytest.mark.parametrize("value", [-1, 1025, True, "full"])
+def test_a_bad_uclamp_min_fails_the_startup_check(value):
+    with pytest.raises(ValueError, match="uclamp_min"):
+        knobs.check({"uclamp_min": value})

@@ -106,7 +106,7 @@ from mstar.utils.profiler import (
     range_push,
     set_step_key,
 )
-from mstar.utils.threads import ThreadPool, pin_thread
+from mstar.utils.threads import ThreadPool, hold_clock_from_knob, pin_thread
 from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
@@ -534,6 +534,8 @@ class Worker:
     ):
         # before anything below builds a resource or a submodule that reads one
         knobs.configure((model_config or {}).get("knobs"))
+        # before this worker starts its own threads
+        hold_clock_from_knob(f"Worker {worker_id}")
         self.worker_id = worker_id
         self.device = device
         self.enable_nvtx = nvtx_enabled(enable_nvtx, device)
