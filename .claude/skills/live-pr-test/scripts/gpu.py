@@ -25,10 +25,11 @@ A Slurm node (`slurm` in the config) is offered first when it has the GPUs free 
 never `--gpus`. An Eras instance runs sshd as root in a Pod that Kubernetes stops at the
 deadline (`activeDeadlineSeconds`, `restartPolicy: Never`); a run that ends releases it.
 
-`launch --run SCRIPT` makes the script the work itself rather than holding the GPUs for ssh:
-the Slurm job runs it (in its own directory under slurm.workdir, with the --input files
-beside it), and on Eras it is the Pod's command, with the inputs in /run/live-pr and sshd
-up beside it for copying results back; the instance is released 15 minutes after it exits.
+`launch --run SCRIPT` makes the script the work itself rather than holding the GPUs for ssh.
+The Slurm job runs Slurm's copy of it, in the job's own directory under slurm.workdir, which
+holds the --input files; terminate (and so the watchdog) deletes that directory, so pull what
+you need first. On Eras it is the Pod's command, with the inputs in /run/live-pr and sshd up
+beside it for copying results back; the instance is released 15 minutes after it exits.
 Either way the GPUs go when the script ends, whether or not whoever launched it is still there.
 
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
@@ -924,7 +925,8 @@ def main():
     p.add_argument("--hours", type=float)
     p.add_argument("--tag", help="names the instance <prefix>-<pr>-<tag> (and makes an Eras launch idempotent)")
     p.add_argument("--run", help="a script that is the work itself; the GPUs go when it ends")
-    p.add_argument("--input", action="append", default=[], help="a file the --run script finds beside it")
+    p.add_argument("--input", action="append", default=[],
+                   help="a file for the --run script: in its working directory on Slurm, in /run/live-pr on Eras")
     p.add_argument("--cache", choices=("ro", "rw", "none"), default="ro",
                    help="Eras: mount eras.cache_volume_ids read-only (default), read-write, or not at all")
     p.add_argument("--allow-over-budget", action="store_true")

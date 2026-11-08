@@ -27,7 +27,7 @@ Read alongside this:
 - **cloud** (default): provision with `scripts/gpu.py`, work over ssh, copy results back with scp, terminate.
 - **cluster** (`cluster` in the request, or `mode: cluster` in the config): no provisioning, ssh or scp. Run on the cluster directly and write results to `cluster.results_dir/pr-<n>-<timestamp>/`, which the requester opens in VS Code. Everything else is the same.
 
-Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY`, `LAMBDA_API_KEY` and `ERAS_API_KEY` in the environment; the Slurm node is reached over ssh (`slurm` in the config). `offers` lists a Slurm node first when it has the GPUs free: there an instance is a batch job holding them, `gpu.py ssh` runs inside it, and servers start with `mserve`, never `--gpus`. Never print them, write them to the box, or put them in a command line that gets logged.
+Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY`, `LAMBDA_API_KEY` and `ERAS_API_KEY` in the environment; the Slurm node is reached over ssh (`slurm` in the config). `offers` lists a Slurm node first when it has the GPUs free: there an instance is a batch job holding them, `gpu.py ssh` runs inside it, and servers start with `mserve`, never `--gpus`. `launch --run SCRIPT` makes a script the job itself, with its `--input` files in the job's working directory (on Eras, in `/run/live-pr`); on Slurm, `terminate` and the deadline watchdog delete that directory, so pull results first. Never print them, write them to the box, or put them in a command line that gets logged.
 
 ## Several PRs at once
 
