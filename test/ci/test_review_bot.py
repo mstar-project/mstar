@@ -65,7 +65,7 @@ class FakeGh:
     def writes(self):
         """(key, stdin) of every call that changes something on GitHub."""
         return [(self.key(argv), stdin) for argv, stdin in self.calls
-                if not self.key(argv).startswith(("GET ", "pr diff", "pr list", "issue list", "run download"))
+                if not self.key(argv).startswith(("GET ", "pr list", "issue list", "run download"))
                 and not (self.key(argv) == "POST graphql" and not any(a.startswith("query=mutation") for a in argv))]
 
     def __call__(self, argv, input=None, check=True, timeout=None):
@@ -194,7 +194,7 @@ def collect(mode="light", diff="diff --git a/a.py b/a.py\n", **routes):
         out, _ = step(bot.collect, {
             "GET repos/o/r/pulls/7": {"title": "T", "body": None, "head": {"sha": HEAD, "ref": "x", "repo": None},
                                       "base": {"ref": "main", "sha": BASE, "repo": {"full_name": "o/r"}}},
-            "pr diff": diff,
+            f"GET repos/o/r/compare/{BASE}...{HEAD}": diff,
             "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
             "GET repos/o/r/pulls/7/comments": [],
             "GET repos/o/r/issues/7/comments": [],
