@@ -112,8 +112,11 @@ env:
     s/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/[REDACTED]/g
 
 jobs:
-  review:
-    name: Review
+  # Decides whether a comment starts a review, in which mode and with which
+  # turn cap, and replies to a request it turns down. It has no concurrency
+  # group, so a refused or unrelated request never cancels a review in progress.
+  preflight:
+    name: Preflight
     # No repository pin: a fork with no ANTHROPIC_API_KEY exits green at the
     # preflight below, which is the same protection and visible in the log
     # rather than a silently skipped job. It also means a fork that *does* set
@@ -126,42 +129,25 @@ jobs:
        (((github.event.comment.body == '/review' || github.event.comment.body == '/review nogpu' ||
           github.event.comment.body == '/review light' || github.event.comment.body == '/review continue') &&
          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
-        ((github.event.comment.body == '/review' || github.event.comment.body == '/review light' ||
-          github.event.comment.body == '/review continue') &&
+        ((github.event.comment.body == '/review' || github.event.comment.body == '/review nogpu' ||
+          github.event.comment.body == '/review light' || github.event.comment.body == '/review continue') &&
          github.event.comment.user.login == github.event.issue.user.login &&
          !contains(github.event.issue.labels.*.name, 'skip-ai-review') &&
          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association))))
-    # Job-level, so an unrelated PR comment (which still starts a workflow run
-    # that this `if` skips) can never cancel a review in progress.
-    # A `/review` (full) has a group of its own, so a later `/review light` or
-    # `/review nogpu` can't cancel a paid live test, and the reverse.
-    concurrency:
-      group: claude-review-${{ github.event.issue.number }}${{ github.event.comment.body == '/review' && '-full' || '' }}
-      cancel-in-progress: true
     runs-on: ubuntu-latest
-    timeout-minutes: 330
-    outputs:
-      mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
-      head_sha: ${{ steps.pr.outputs.head_sha }}
-      main_sha: ${{ steps.base.outputs.commit }}
-      result: ${{ steps.review.outputs.structured_output }}
-      # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
-      rereview: ${{ steps.diff.outputs.rereview }}
-      # stacked-above.json, for the approval rule's count of findings fixed above.
-      above: ${{ steps.diff.outputs.above }}
-      # Finished and returned its summary itself: a salvaged or stopped review never approves.
-      complete: ${{ steps.review.outcome == 'success' && steps.post.outcome == 'success' }}
+    timeout-minutes: 5
     permissions:
-      # actions: read lists and downloads the saved handoff for /review continue.
-      actions: read
-      contents: read
-      # issues: read lists the open issues, for a latent bug that one already tracks.
-      issues: read
+      # The one-line reply to a refused request.
       pull-requests: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
       PR: ${{ github.event.issue.number }}
+    outputs:
+      run: ${{ steps.pre.outputs.run }}
+      mode: ${{ steps.pre.outputs.mode }}
+      non_write_user: ${{ steps.pre.outputs.non_write_user }}
+      turns: ${{ steps.pre.outputs.turns }}
     steps:
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
@@ -240,10 +226,10 @@ jobs:
               echo "turns=${SELF_TURNS:-40}"
             } >> "$GITHUB_OUTPUT"
           elif [ "$own" = "true" ]; then
-            echo "::notice::$ACTOR has '$perm' access, not write; \`/review\` and \`/review nogpu\` take write access."
+            echo "::notice::$ACTOR has '$perm' access, not write; this review needs write access."
             {
               echo "run=false"
-              echo "refuse=\`/review\` and \`/review nogpu\` take write access to this repository; on your own PR, comment \`/review light\`."
+              echo "refuse=This review needs write access; on your own PR, comment \`/review light\`."
             } >> "$GITHUB_OUTPUT"
           else
             echo "::notice::$ACTOR has '$perm' access, not write; only people with write access, or a contributor on their own PR with \`/review light\`, can request a review."
@@ -258,11 +244,47 @@ jobs:
           REFUSE: ${{ steps.pre.outputs.refuse }}
         run: gh pr comment "$PR" --repo "$REPO" --body "$REFUSE" > /dev/null
 
+  review:
+    name: Review
+    needs: preflight
+    if: needs.preflight.outputs.run == 'true'
+    # Job-level, and only for a request the preflight accepted, so no other
+    # comment can cancel a review in progress.
+    # A `/review` (full) has a group of its own, so a later `/review light` or
+    # `/review nogpu` can't cancel a paid live test, and the reverse.
+    concurrency:
+      group: claude-review-${{ github.event.issue.number }}${{ github.event.comment.body == '/review' && '-full' || '' }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    outputs:
+      mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+      main_sha: ${{ steps.base.outputs.commit }}
+      result: ${{ steps.review.outputs.structured_output }}
+      # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
+      rereview: ${{ steps.diff.outputs.rereview }}
+      # stacked-above.json, for the approval rule's count of findings fixed above.
+      above: ${{ steps.diff.outputs.above }}
+      # Finished and returned its summary itself: a salvaged or stopped review never approves.
+      complete: ${{ steps.review.outcome == 'success' && steps.post.outcome == 'success' }}
+    permissions:
+      # actions: read lists and downloads the saved handoff for /review continue.
+      actions: read
+      contents: read
+      # issues: read lists the open issues, for a latent bug that one already tracks.
+      issues: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.issue.number }}
+    steps:
       # The bot posts as the mstar-review GitHub App, with the M* logo, rather
       # than as github-actions. Until the app's client ID and key are set
       # (README), the steps below post with the job's own token instead.
       - name: Mint the review app's token
-        if: steps.pre.outputs.run == 'true' && vars.REVIEW_APP_CLIENT_ID != ''
+        if: vars.REVIEW_APP_CLIENT_ID != ''
         id: app
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -277,7 +299,6 @@ jobs:
       # Tell the commenter their /review was picked up; a comment-triggered run
       # is otherwise invisible from the PR.
       - name: Acknowledge the /review comment
-        if: steps.pre.outputs.run == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
@@ -287,14 +308,13 @@ jobs:
       # The PR's refs and title (an issue_comment event doesn't carry the PR's
       # head or base). The title is untrusted; it only ever reaches the prompt.
       - name: Resolve the PR
-        if: steps.pre.outputs.run == 'true'
         id: pr
         continue-on-error: true
         env:
-          MODE: ${{ steps.pre.outputs.mode }}
-          CONTINUE: ${{ steps.pre.outputs.mode == '' }}
+          MODE: ${{ needs.preflight.outputs.mode }}
+          CONTINUE: ${{ needs.preflight.outputs.mode == '' }}
           # Someone with write access: a timeout that only stops a runaway, like the turn cap.
-          TEAM: ${{ steps.pre.outputs.non_write_user == '' }}
+          TEAM: ${{ needs.preflight.outputs.non_write_user == '' }}
         run: |
           gh api "repos/$REPO/pulls/$PR" > pr.json
           if [ -z "$(jq -r '.head.repo.full_name // empty' pr.json)" ]; then
@@ -319,9 +339,20 @@ jobs:
             echo "title<<$delim"; jq -r .title pr.json; echo "$delim"
           } >> "$GITHUB_OUTPUT"
 
+      # Trusted: main's tip, pinned by name, never the PR's base branch or
+      # base.sha, which for a stacked or old PR would be stale rules.
+      # AGENTS.md and the review prompt come from here.
+      - name: Check out main
+        if: steps.pr.outcome == 'success'
+        id: base
+        continue-on-error: true
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
       # /review continue: fetch the handoff a stopped review saved (see "Write
-      # the handoff" below); the next step's checkout would delete it from the
-      # workspace, so it waits in $RUNNER_TEMP until the diff step. The newest
+      # the handoff" below); it waits in $RUNNER_TEMP until the diff step. The newest
       # unexpired artifact for this PR wins, and only from this workflow on a
       # trigger that runs the base repository's copy of it. The handoff's mode
       # is kept; a nogpu one needs write access to continue, like `/review
@@ -330,12 +361,12 @@ jobs:
       # still open: any later run that finishes rewrites that comment as
       # resolved, so a handoff it superseded is never used.
       - name: Restore the stopped review
-        if: steps.pr.outcome == 'success' && steps.pr.outputs.continue == 'true'
+        if: steps.base.outcome == 'success' && steps.pr.outputs.continue == 'true'
         id: prev
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          NON_WRITE: ${{ steps.pre.outputs.non_write_user }}
+          NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
         run: |
           name="claude-review-handoff-$PR"
           fail() { echo "why=$1" >> "$GITHUB_OUTPUT"; echo "::notice::$1"; exit 1; }
@@ -359,6 +390,8 @@ jobs:
             || fail "the saved handoff couldn't be downloaded; try \`/review continue\` again"
           meta="$dir/handoff.json"
           mode=$(jq -r '.mode // empty' "$meta" 2> /dev/null) || fail "the saved handoff is malformed"
+          # A handoff saved before the modes were renamed carries the old name.
+          mode=$(python3 -c 'import runpy, sys; print(runpy.run_path(".github/review/render_summary.py")["current_mode"](sys.argv[1]))' "$mode")
           [ -s "$dir/handoff.md" ] || fail "the saved handoff is malformed"
           [ "$(jq -r '.pr' "$meta")" = "$PR" ] || fail "the saved handoff is for another PR"
           [ "$(jq -r '.head_sha' "$meta")" = "$HEAD_SHA" ] \
@@ -377,22 +410,10 @@ jobs:
             echo "mode=$mode"; echo "effort=$effort"; echo "timeout=$timeout"
           } >> "$GITHUB_OUTPUT"
 
-      # Trusted: main's tip, pinned by name, never the PR's base branch or
-      # base.sha, which for a stacked or old PR would be stale rules.
-      # AGENTS.md and the review prompt come from here.
-      - name: Check out main
-        if: steps.pr.outcome == 'success' && steps.prev.outcome != 'failure'
-        id: base
-        continue-on-error: true
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-
       # Untrusted: the PR's tree, for reading changed files in full context.
       # Never executed.
       - name: Check out the PR into pr-head/
-        if: steps.base.outcome == 'success'
+        if: steps.base.outcome == 'success' && steps.prev.outcome != 'failure'
         id: head
         continue-on-error: true
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -554,11 +575,11 @@ jobs:
           # `id-token: write` and that app installed, and fails before reviewing.
           # A team run can outlast the app token's hour, so it posts its inline
           # comments with the job's token, which lasts as long as the job.
-          github_token: ${{ steps.pre.outputs.non_write_user == '' && secrets.GITHUB_TOKEN || steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          github_token: ${{ needs.preflight.outputs.non_write_user == '' && secrets.GITHUB_TOKEN || steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           # Empty for anyone with write access. Otherwise the PR author alone,
           # set by the preflight; the action then also scrubs secrets from any
           # subprocess environment.
-          allowed_non_write_users: ${{ steps.pre.outputs.non_write_user }}
+          allowed_non_write_users: ${{ needs.preflight.outputs.non_write_user }}
           # Reads stay inside the checkout (main at the root, the PR in pr-head/), so the model
           # can't read the runner's files, and with --permission-mode dontAsk below any call
           # that would otherwise prompt is refused.
@@ -572,7 +593,7 @@ jobs:
             PR #${{ env.PR }}: ${{ steps.pr.outputs.title }}
             Head commit (pass as commit_id on every inline comment): ${{ steps.pr.outputs.head_sha }}
             pr.diff is ${{ steps.diff.outputs.lines }} lines.
-            Turn cap: ${{ steps.pre.outputs.turns }}.
+            Turn cap: ${{ needs.preflight.outputs.turns }}.
             ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
             ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json, since.diff and since-commits.txt are present. Follow the prompt''s Re-review section.' || '' }}
           # No shell or edits; web reads only from the sites listed here (GitHub, the
@@ -588,7 +609,7 @@ jobs:
           claude_args: |
             --model claude-opus-5-5
             --effort ${{ steps.prev.outputs.effort || steps.pr.outputs.effort }}
-            --max-turns ${{ steps.pre.outputs.turns }}
+            --max-turns ${{ needs.preflight.outputs.turns }}
             --permission-mode dontAsk
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Task,Agent,WebSearch,WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com),WebFetch(domain:docs.vllm.ai),WebFetch(domain:docs.sglang.ai),WebFetch(domain:docs.sglang.io),WebFetch(domain:huggingface.co),WebFetch(domain:pytorch.org),WebFetch(domain:docs.pytorch.org),WebFetch(domain:arxiv.org)"
             --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,Skill
@@ -597,7 +618,7 @@ jobs:
       # The app's token lasts an hour and the review can take five: a fresh one
       # for everything posted from here on.
       - name: Mint the review app's token again
-        if: always() && steps.pre.outputs.run == 'true' && vars.REVIEW_APP_CLIENT_ID != ''
+        if: always() && vars.REVIEW_APP_CLIENT_ID != ''
         id: post-app
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -834,7 +855,7 @@ jobs:
       # still be continued by someone else).
       - name: Report a review that didn't complete
         if: >-
-          always() && steps.pre.outputs.run == 'true' && steps.salvage.outputs.billing != 'true' &&
+          always() && steps.salvage.outputs.billing != 'true' &&
           (steps.pr.outcome == 'failure' || steps.prev.outcome == 'failure' ||
            steps.base.outcome == 'failure' || steps.head.outcome == 'failure' ||
            steps.diff.outcome == 'failure' || steps.post.outcome == 'failure' ||

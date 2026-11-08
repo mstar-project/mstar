@@ -109,7 +109,7 @@ For every new reliance on something outside the diff, find where it is pinned an
   (#379 implemented `get_cuda_graph_configs` after `main` renamed the hook, so decode would have run
   eager). A finding that only `main`'s later commits cause is a post-rebase ask: report it at its
   priority and say the PR needs it once rebased. Don't report what the merge itself shows: a
-  conflict, an import error, a failing CI job.
+  conflict, an import error, a failing CI job (except as SKILL.md §2's reachability rule says).
 
 Coverage line: `assumptions → where pinned: <assumption> → <pin, holds | doesn't>; …; merge target: <removed symbols, flipped defaults, new callers, rules: none | list>`
 
