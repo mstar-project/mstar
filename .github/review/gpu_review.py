@@ -600,7 +600,7 @@ def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
                             "doesn't count toward required reviews: touches area/engine or area/resources.\n")
         return
     review_pr(pr, head_sha, "APPROVE", f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open "
-                                       f"P0–P2 finding, and {tested}. A push dismisses it.")
+                                       f"P0–P2 finding, and {tested}. It covers this commit only.")
     # A push between the check and the approval would leave it on a commit nobody tested; a failed read can't
     # rule one out.
     try:
