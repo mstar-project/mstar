@@ -133,8 +133,8 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
 - **A request field or input file that can crash or wedge a worker is P0**, however unlikely the
   input: one client takes the deployment down for everyone (mstar philosophy §12).
 - **A test that can fail under CI load, xdist or another order is at least P2** (behaviour lens 7).
-- **A shared-layer mechanism built beside an existing mstar primitive is P0** (a disguise-check hit,
-  §4.5), even though it may break nothing on `main` yet. It is the foundation later PRs build on, so
+- **A shared-layer mechanism built beside an existing mstar primitive is at most P1** (a disguise-check
+  hit, §4.5), even though it may break nothing on `main` yet. It is the foundation later PRs build on, so
   it is the most expensive thing to get wrong. Look hardest for loops: a node re-queued for
   the same request, a per-request cursor, outputs held until a last pass. (#365 built chunked
   prefill exactly that way, and its first review called the scattered state a cleanup.)
@@ -337,7 +337,7 @@ Set Phase A beside the code: one row per design area with what the derivation gi
 does, which is better and why, and the cost to converge. Every row where the derivation is better is
 a finding or folds into one; note where the PR beats it. Run the disguise, altitude and seam checks
 in [mstar-way.md](references/mstar-way.md) on the code; each hit is a finding naming the primitive,
-the altitude or the type it should be, and a disguise-check hit in a shared layer is P0 (§2).
+the altitude or the type it should be, and a disguise-check hit in a shared layer is at most P1 (§2).
 
 Then, for every piece of per-request state, computation, data path and batching or capture decision
 the PR adds, name the mstar abstraction that owns it and check the PR uses it:
@@ -373,7 +373,7 @@ the PR adds, name the mstar abstraction that owns it and check the PR uses it:
   and placement, not unused knobs. Where the PR chose the narrow version, it must say why.
 
 A misfit is a finding even if it works and is tested. **Priority:** P1 in a shared layer or public
-surface (P0 for a disguise-check hit there), when it hits invariant 1's "nothing under
+surface (the cap for a disguise-check hit there), when it hits invariant 1's "nothing under
 `mstar/model/` should" list, when it blocks a known optimization, or for a loop or stop decision in
 `forward` that blocks streaming or continuous batching for the model's family; P2 inside one model
 otherwise. When the right abstraction doesn't exist yet, the finding names the missing engine piece
