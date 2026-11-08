@@ -247,7 +247,7 @@ class TestMonitor(unittest.TestCase):
             "GET repos/o/r/pulls[?]*": [],
             "git log": (f'{"c" * 40}\x1f{"d" * 40}\x1fRevert "Faster decode (#7)"\x1f\x1e\n'
                         f'{"d" * 40}\x1f{"b" * 40}\x1fFaster decode (#7)\x1f\x1e\n'),
-            "git diff": "a.py\n", "git show": "", "git blame": "", **routes_over,
+            "git diff": "a.py\n", "git show": "", "git blame": "", "GET repos/o/r/labels/*": {}, **routes_over,
         }
         with mock.patch.object(bot, "utcnow", lambda: NOW):
             out, fake = step(bot.monitor, routes, repo="o/r", approvals="on")
@@ -267,13 +267,15 @@ class TestMonitor(unittest.TestCase):
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a signal already reported would notify subscribers every day")
 
-    def test_the_first_run_creates_the_status_issue(self):
+    def test_the_first_run_creates_the_status_issue_and_the_label(self):
         created = []
-        body, _ = self.run_monitor(STATUS["body"], **{
+        body, fake = self.run_monitor(STATUS["body"], **{
             "GET repos/o/r/issues[?]state=all&creator=*": [],
-            "POST repos/o/r/issues": lambda a, i: created.append(json.loads(i)) or {"number": 2}})
+            "POST repos/o/r/issues": lambda a, i: created.append(json.loads(i)) or {"number": 2},
+            "GET repos/o/r/labels/*": Fail(), "POST repos/o/r/labels": {}})
         self.assertTrue(created[0]["body"].startswith(bot.STATUS_ISSUE), "the next run couldn't find it")
         self.assertIn("Faster decode", body)
+        self.assertIn("POST repos/o/r/labels", [k for k, _ in fake.writes()], "skip-ai-review would be a setup step")
 
     def test_a_failed_post_leaves_the_state_unwritten_so_the_signal_goes_out_tomorrow(self):
         patched = []

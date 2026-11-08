@@ -207,6 +207,12 @@ def status_issue(repo):
     return None
 
 
+def ensure_label(repo, label):
+    """Create the label if the repository doesn't have it yet."""
+    if gh("api", f"repos/{repo}/labels/{label.replace('/', '%2F')}", check=False).returncode:
+        gh("api", "-X", "POST", f"repos/{repo}/labels", "-f", f"name={label}", "-f", "color=fbca04")
+
+
 def comment_on_issue(repo, number, body):
     """Post `body` as a comment on an issue, from stdin."""
     gh("issue", "comment", str(number), "--repo", repo, "--body-file", "-", input=body)
@@ -761,8 +767,7 @@ def labels(out, repo, pr, output):
         if old.startswith("type/") and old not in wanted:
             gh("api", "-X", "DELETE", f"repos/{repo}/issues/{pr}/labels/{old.replace('/', '%2F')}")
     for label in wanted:
-        if gh("api", f"repos/{repo}/labels/{label.replace('/', '%2F')}", check=False).returncode:
-            gh("api", "-X", "POST", f"repos/{repo}/labels", "-f", f"name={label}", "-f", "color=fbca04")
+        ensure_label(repo, label)
         gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels", "-f", f"labels[]={label}")
 
 
@@ -955,7 +960,8 @@ def monitor(out, repo, approvals=""):
     """The daily report (review-monitor.yml), with no model: what happened to the PRs merged in the last 60
     days with the bot's approval (GitHub's own record: an APPROVED review of the bot's), the kill switch and
     new bug reports, written to the status issue's body. Signals not reported before go out as one comment,
-    so subscribers get at most one notification a day. Untrusted titles go through `safe`, text reaches
+    so subscribers get at most one notification a day. Also makes the `skip-ai-review` label if it's missing,
+    so neither it nor the issue is a setup step. Untrusted titles go through `safe`, text reaches
     `gh` on stdin."""
     now = utcnow()
     window = (now - datetime.timedelta(days=MONITOR_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1019,6 +1025,7 @@ def monitor(out, repo, approvals=""):
                          + "\n".join(f"- {text}" for text in fresh) + "\n")
     gh("api", "-X", "PATCH", f"repos/{repo}/issues/{number}", "--input", "-",
        input=json.dumps({"body": "\n".join(head + (rows or ["| | none yet |"]) + tail) + "\n"}))
+    ensure_label(repo, "skip-ai-review")  # after the report: a failed write here must not cost the day's report
 
 
 # ---------------------------------------------------------------- improve (a weekly job)
