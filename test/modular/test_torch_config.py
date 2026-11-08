@@ -23,9 +23,14 @@ def test_executor_thread_gets_torch_config():
 
 def test_the_engine_threads_start_before_a_compiled_call_can_raise_the_limit():
     """Before torch 2.12 dynamo's config is process-wide: a thread whose initializer ran only at
-    its first job would set the engine's limit inside another thread's ``with_recompile_limit``."""
+    its first job would read and write the limit beside another thread's ``with_recompile_limit``,
+    so the pool's thread runs its initializer when the pool is built."""
     worker = make_worker(device=torch.device("cpu"))
+    started = []
+    init = worker._init_engine_thread
+    worker._init_engine_thread = lambda: (started.append(1), init())
     pool = worker._engine_thread_pool("mstar-plan")
+    assert started == [1], "the engine thread's initializer waited for its first job"
     try:
         with torch._dynamo.config.patch(recompile_limit=500):
             pool.submit(int).result()  # the first step's pre-plan
