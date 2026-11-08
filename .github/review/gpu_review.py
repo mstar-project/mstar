@@ -153,11 +153,16 @@ def last_live_test(pr):
     return last
 
 
+def pr_files(base_sha, sha):
+    """The files changed from BASE_SHA to SHA, or None when GitHub's list is too long to check (300 max)."""
+    files = gh_json(f"repos/{REPO}/compare/{base_sha}...{sha}").get("files")
+    return None if files is None or len(files) >= 300 else [f["filename"] for f in files]
+
+
 def touches_runtime(pr, sha):
     """Whether the PR at SHA changes runtime code, by file_gate; a file list too long to check does."""
-    base = gh_json(f"repos/{REPO}/pulls/{pr}")["base"]["sha"]
-    files = gh_json(f"repos/{REPO}/compare/{base}...{sha}").get("files")
-    return files is None or len(files) >= 300 or bool(file_gate([f["filename"] for f in files], ROOT)[2])
+    files = pr_files(gh_json(f"repos/{REPO}/pulls/{pr}")["base"]["sha"], sha)
+    return files is None or bool(file_gate(files, ROOT)[2])
 
 
 def cmd_carry(a):
@@ -421,11 +426,11 @@ def reasons_not_to_approve(a, review):
     open_ = blocking(review, review_threads(a.pr))
     if open_:
         why.append("open P0–P2 findings: " + ", ".join(open_))
-    cmp = gh_json(f"repos/{REPO}/compare/{pr['base']['sha']}...{a.sha}")
-    if cmp.get("files") is None or len(cmp["files"]) >= 300:
+    files = pr_files(pr["base"]["sha"], a.sha)
+    if files is None:
         why.append("the file list is too long to check")
     else:
-        blocked, engine, runtime = file_gate([f["filename"] for f in cmp["files"]], ROOT)
+        blocked, engine, runtime = file_gate(files, ROOT)
         if blocked:
             why.append("touches the review's rules or dependencies: " + ", ".join(blocked[:8])
                        + (" and more" if len(blocked) > 8 else ""))
