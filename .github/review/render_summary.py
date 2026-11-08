@@ -36,7 +36,7 @@ STILL_OPEN = ("open", "disputed")
 # What takes an earlier finding outside the diff out of the state (`carried`).
 CLEARS = ("fixed", "moot")
 # Handoffs saved before the modes were renamed carry the old names (current_mode).
-RENAMED_MODES = {"thorough": "nogpu", "gpu": "full"}
+RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
