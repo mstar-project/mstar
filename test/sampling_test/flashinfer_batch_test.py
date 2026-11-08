@@ -11,7 +11,7 @@ Two paths are checked:
     vocabulary (V <= ``FUSED_SAMPLE_MAX_VOCAB``) it is ``fused_sample``, one
     Triton kernel drawing from each row's own (seed, offset).
   - raw ``flashinfer...top_k_top_p_sampling_from_probs`` on **fixed pre-computed
-    probs**, which larger vocabularies (and the eager sampler) use.
+    probs**, which larger vocabularies use.
 
 FlashInfer folds the batch row index into philox, so the raw path is expected
 to be batch-variant; ``fused_sample`` is not.
