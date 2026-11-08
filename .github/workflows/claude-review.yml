@@ -1,7 +1,8 @@
 name: Claude Review
 
-# Advisory LLM review of PRs. Not a merge gate. Rules live in AGENTS.md;
-# the reviewer's operating instructions are in .github/review/review-prompt.md.
+# LLM review of PRs: advisory in light and thorough mode; `/review gpu` can approve by
+# the rule in gpu_review.py. Rules live in AGENTS.md; the reviewer's operating
+# instructions are in .github/review/review-prompt.md.
 #
 # Why issue_comment: a plain `pull_request` trigger withholds secrets from fork
 # PRs, so the reviewer could never review a fork's code. issue_comment runs with
@@ -447,7 +448,7 @@ jobs:
       - name: Review
         if: steps.diff.outcome == 'success'
         id: review
-        # Advisory: an API or action failure (bad key, outage, out of turns,
+        # Never red: an API or action failure (bad key, outage, out of turns,
         # timeout) never turns the PR's check red; the last step reports it.
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.prev.outputs.timeout || steps.pr.outputs.timeout || '25') }}
@@ -466,8 +467,8 @@ jobs:
           allowed_non_write_users: ${{ steps.pre.outputs.non_write_user }}
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
-            exactly. It defines your trust boundary, your method, your reporting bar and
-            your output format.
+            exactly. It defines your trust boundary, inputs and output format, and points
+            you to the method and its bar.
 
             Mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
             PR #${{ env.PR }}: ${{ steps.pr.outputs.title }}
@@ -483,7 +484,8 @@ jobs:
           # contributor's own review, CLAUDE_REVIEW_MAX_TURNS_TEAM (2000) when someone
           # with write access asked. The Skill tool is off: it could load a skill from
           # pr-head/; the prompt reads skills by path from the root instead. Subagents
-          # (Task/Agent) review slices of a big PR under the same restrictions.
+          # (Task/Agent) review slices of a big PR, and in thorough and gpu modes run
+          # the review-standard second pass, under the same restrictions.
           claude_args: |
             --model claude-opus-5-5
             --effort ${{ steps.prev.outputs.effort || steps.pr.outputs.effort }}

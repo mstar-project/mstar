@@ -58,7 +58,7 @@ On Oct 16 2026 #400's review parked its strict admission control as the way M* h
 
 32. **Per-step host work stays off the scheduling path, and nothing scans every live request on every step.** Data crossing the Python and Rust boundary goes columnar, bulk data travels as a tensor edge, and a backlogged row's derived facts are computed once and carried on the batch. *Status:* main (`AGENTS.md` invariant 6). Stating the cost against batch size, requests in flight and nodes is trial.
 33. **The only free host read is `check_stop`.** Any other host sync in the step path collapses the async pipeline. Moving GIL-holding work to another thread adds contention, so a host-bound step is fixed by deleting work. *Status:* main (`AGENTS.md` invariant 7).
-34. **Python and Rust runtimes behave the same.** A behavior change to the graph runtime, the wire format or edge semantics lands on both sides or is explicitly gated. *Status:* main (`AGENTS.md` invariant 5), and decided (review standard R8).
+34. **There is one graph runtime, in `rust/`.** A behavior change to the graph runtime, the wire format or edge semantics lands there with a `test/rust` case. *Status:* main (`AGENTS.md` invariant 5), and decided (review standard R8).
 
 ## State and lifecycle
 

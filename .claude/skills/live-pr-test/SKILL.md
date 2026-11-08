@@ -18,7 +18,7 @@ Read alongside this:
   - "The first request of a new shape pays compilation" (trap 2), and "Slow eager steps are often recompiles" (`TORCH_LOGS=recompiles`), before calling a tail or a stall a regression.
   - "CPU-bound or GPU-bound" via `benchmark.worker_phases`, whenever a throughput row moves.
   - "Match the configuration before comparing" for any reference or competitor arm: sampling defaults, state dtype, prefix caching.
-- [AGENTS.md](../../../AGENTS.md) for the invariants a PR can break: invariant 4 (one model's change must not degrade others) and invariant 5 (Python/Rust drift) drive most regression choices.
+- [AGENTS.md](../../../AGENTS.md) for the invariants a PR can break: invariant 4 (one model's change must not degrade others) and invariant 5 (one graph runtime, in `rust/`) drive most regression choices.
 - [references/test-matrix.md](references/test-matrix.md) for touched paths → suites, the worker A/B set, concurrency and sizing.
 - [references/report.md](references/report.md) for the report and the PR-comment rules.
 
@@ -46,23 +46,23 @@ gh api repos/mstar-project/mstar/pulls/<n> --jq .author_association
 gh pr diff <n>
 ```
 
-- **Trust check first.** The box runs the PR's code with the team's persistent storage mounted (HF cache, possibly an HF token). If `author_association` is not `OWNER`, `MEMBER` or `COLLABORATOR`, stop and ask before provisioning; mention anything in the diff that reaches the network, the filesystem outside the repo, or environment variables.
+- **Trust check first.** The box runs the PR's code with the team's persistent storage mounted (HF cache, possibly an HF token). If `author_association` is not `OWNER`, `MEMBER` or `COLLABORATOR`, stop and ask before provisioning; mention anything in the diff that reaches the network, the filesystem outside the repo, or environment variables. On the review bot's box, skip this: the workflow already checked that the author has write access.
 - A PR based on another feature branch (stacked) is compared against its base branch, not `main`. Say so in the plan.
 - Extract the claims: every behavior or number the description asserts. Each becomes a check. For each claimed number, note the GPU, harness and metric it came from, so the report can say when yours isn't comparable.
 - A case the description hands to another open PR is that PR's: test it there (or on both merged) if it matters, otherwise mark it "owned by #N" in the report.
 - **Map what could break, and test each risk directly.** The claims table checks what the author thought of. The risk map checks what they didn't, and it is where human reviewers found most of the bugs our runs missed. Read the whole diff, not the description.
-  - For every changed function, find its callers and the paths that reach it: eager and captured, TP leader and follower, the Python and Rust runtimes and frontends, streaming and not, the first request of a shape and steady state, and failure, abort and teardown.
+  - For every changed function, find its callers and the paths that reach it: eager and captured, TP leader and follower, both frontends, streaming and not, the first request of a shape and steady state, and failure, abort and teardown.
   - For each path, write down what would go wrong if the change were subtly wrong, and plan a test that fails if it is.
   - Run that test on a model, config and layout that actually take that path, with the input or fault that provokes it.
   - Put the risk map in the plan, one line per risk: path → what could break → the test. [test-matrix.md](references/test-matrix.md) lists, by layer, the probes that have found bugs.
 - **Reach before results.** Before trusting a pass, show that the test reached the changed code: a log line, a counter, a probe hit, or an injected fault firing there. A pass on a setup that never takes the changed branch is ➖, not ✅. On #440 the bug was on the default Rust runtime and we ran only Python. On #557 the race needs the two stages on different workers.
-- **Never CPU tests alone.** Unless the PR changes only tests, docs or comments, it gets a served run with a real checkpoint that goes through the changed code. CPU suites are a gate, not a verdict. Code that only non-CUDA workers or the API server run still gets a served run that reaches it.
+- **Never CPU tests alone.** Unless the PR changes only tests, docs, comments or benchmarks, it gets a served run with a real checkpoint that goes through the changed code. CPU suites are a gate, not a verdict. Code that only non-CUDA workers or the API server run still gets a served run that reaches it.
 - **Both frontends when they apply.** There is one graph runtime and one control transport, in `rust/` (AGENTS.md invariant 5); confirm in the server log that it ran. When the change touches the API server, run every functional and risk check through both frontends: `mstar serve` with and without `--rust-frontend`.
 - **Real checkpoints only.** Use the real released weights for every served check: no dummy-mode models, random weights, or edited and truncated copies of a checkpoint. If the PR's case only exists in a checkpoint no one ships, say so in the plan and ask. On #658, the real checkpoint already showed the bug that we had built an artificial copy to show.
 - **Test on the merged tree too.** Run the CPU gate and the risk checks once more on the PR merged into the current base, and on top of its stacked neighbours when it has them. Bugs on #346 and #519 only showed up there. Label each row with the tree it came from.
 - Map touched files to regression suites with the test matrix.
 - Size the box: GPU count from the largest config in the plan, 80 GB-class Hopper or newer. Prefer the GPU type the claimed numbers came from when it fits the budget. When the code branches on architecture (`has_cuda_capability`, sm80 paths, ROCm), list the architectures you couldn't run under "Not tested".
-- If the PR changes only docs, tests or comments and claims no number, say so and stop.
+- If the PR changes only docs, tests, comments or benchmarks and claims no number, say so and stop.
 - **Correctness is checked against the reference, never only against main.** A check that compares PR with main shows the outputs moved or didn't; it can't show that either side is right. #452 shipped noise because every check compared Orpheus with itself.
   - The reference is the official implementation (transformers, or the model's own package or `trust_remote_code` files), pinned, in its own venv.
   - Compare at the lowest level that both sides expose: logits or hidden states for the same inputs, then greedy tokens, then decoded output.

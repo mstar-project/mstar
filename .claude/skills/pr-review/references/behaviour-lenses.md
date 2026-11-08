@@ -90,7 +90,8 @@ For every new reliance on something outside the diff, find where it is pinned an
   plus `-S<symbol>` for each symbol the PR depends on).
 
   Do this for the PR's GPU-only files too: `benchmark/`, `test/integration/` and any harness the
-  description cites. CPU CI never imports them, so they rot unnoticed. Check each test fake or stub
+  description cites. CPU CI never imports them, so they rot unnoticed. Trace each assertion such a
+  harness makes through the code it hits on the merged tree. Check each test fake or stub
   against the real class it stands in for, since a fake that still has a method `main` removed hides
   the crash. (#822's harnesses called `enter_compute` and `prefix_key_streams` after `main` changed
   both; #948 called `get_sp_config_for_node` after `main` removed it, and a test stub hid that;
@@ -184,7 +185,8 @@ below it falls in, or "none":
   connect, import order, init (`init_process_group`, stores, servers), the operation, a failure on
   one side only, teardown (`destroy_process_group`, socket close, event-loop shutdown), interpreter
   exit. At each step ask what still runs in the background (gloo/NCCL threads, threadpool hops,
-  pending futures) and whether the test waits for it. Known triggers: an import of a module that
+  pending futures) and whether the test waits for it. For each object the test builds around a
+  group, ask whether it is freed before destroy. Known triggers: an import of a module that
   compiles or registers ops (`torch._dynamo`) moved to after a process group exists keeps gloo's
   threads alive past `destroy_process_group`, and the exit unwind hits `std::terminate` (#881:
   SIGABRT in about 2% of spawns under suite load, never alone); anything that still references the
