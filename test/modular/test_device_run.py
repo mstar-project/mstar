@@ -329,18 +329,21 @@ def test_each_replay_reads_its_column_of_an_iteration_input(monkeypatch):
 
 
 @pytest.mark.parametrize(("kinds", "why"), [
+    ([], None),
     ([0, 1], None),
     ([0, 3], "a host node"),
     ([10], "a memory alloc node"),
     ([7], "a event record node"),
     ([13], "a conditional node"),
-], ids=["kernels", "host", "alloc", "event", "if"])
+], ids=["empty", "kernels", "host", "alloc", "event", "if"])
 def test_a_step_graph_a_while_body_cant_hold_is_refused(kinds, why):
     import ctypes
 
     cuda = CudaWhile.__new__(CudaWhile)
 
     def get_nodes(graph, nodes, count):
+        if nodes is not None and count._obj.value == 0:
+            return 1  # CUDA refuses a non-null output array with zero capacity.
         count._obj.value = len(kinds)
         if nodes is not None:
             for i in range(len(kinds)):

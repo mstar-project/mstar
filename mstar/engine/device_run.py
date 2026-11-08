@@ -451,6 +451,8 @@ class CudaWhile:
         """Why a WHILE body can't hold ``step_graph``: what the child graph refuses."""
         count = ctypes.c_size_t()
         self._call("cudaGraphGetNodes", ctypes.c_void_p(step_graph), None, ctypes.byref(count))
+        if count.value == 0:
+            return None
         nodes = (ctypes.c_void_p * count.value)()
         self._call("cudaGraphGetNodes", ctypes.c_void_p(step_graph), nodes, ctypes.byref(count))
         for node in nodes:
