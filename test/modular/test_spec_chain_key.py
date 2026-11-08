@@ -23,7 +23,7 @@ def _speculator(target, other_ready=True, speculation=None, mid_prefill_walks=fr
             chunks=lambda node_name, graph_walk: budgeted,
         ),
     ).speculator
-    speculator._can_speculate = lambda batch: True
+    speculator.can_speculate = lambda batch: True
     speculator._choose_spec_target = lambda batch: target
     speculator._try_speculate_next = lambda pending, target: speculation
     return speculator, peeked, excluded

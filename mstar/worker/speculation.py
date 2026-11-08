@@ -518,7 +518,7 @@ class Speculator:
             for walk in batch.rids_by_walk()
         )
 
-    def _can_speculate(self, batch: ScheduledBatch) -> bool:
+    def can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):
             return False
         if batch.node_name in self.parallel_nodes:
@@ -543,7 +543,7 @@ class Speculator:
         return self.engine_manager.get_engine(node_name).prefix_cache_open(node_name)
 
     def is_tp_follow_pending(self, pending: PendingBatch) -> bool:
-        """The leader will send a head or a marker for ``pending``. Mirrors ``_can_speculate``."""
+        """The leader will send a head or a marker for ``pending``. Mirrors ``can_speculate``."""
         return self.lockstep.follows_async(pending.node_name) and self._async_schedulable(pending.batch)
 
     def settle(
@@ -1136,7 +1136,7 @@ class Speculator:
             and pending.node_batch.admit_error is not None
         )
 
-        if pending is not None and self._can_speculate(pending.batch):
+        if pending is not None and self.can_speculate(pending.batch):
             # Fairness check (peek-based, replaces the old iter-
             # counter cap): only break the spec chain when there's
             # another (node, walk) actually ready to schedule on

@@ -147,7 +147,7 @@ class StepPipeline:
                     for dropped in (pending, spec_pending if spec_pending is not pending else None):
                         if (
                             dropped is not None and dropped is not self._decided
-                            and self.speculator._can_speculate(dropped.batch)
+                            and self.speculator.can_speculate(dropped.batch)
                         ):
                             self.lockstep.maybe_broadcast_nospec(dropped, None)
                 # Clear the in-flight step: its rows are failed and its future
@@ -488,6 +488,28 @@ class StepPipeline:
                 speculation.plan_future = None
 
     # -- the side lane -----------------------------------------------------------
+    #
+    # The main loop runs one chain (``CHAIN_LANE``): step N on the device, N+1
+    # speculated behind it. A step on that chain costs a pass of the loop and
+    # holds the next step behind its kernels on the main stream, which is what a
+    # codec window does to the decode steps around it. A node whose node group
+    # sets ``side_stream: true`` runs its ``side_stream_walks`` on a lane of its
+    # own instead: the scheduler hands that lane only its keys
+    # (``MicroScheduler.lane_of``), its steps run on the GPU thread between two
+    # chain steps, and they land on a second stream while the chain carries on.
+    # Submit and postprocess are the chain's own (``StepExecutor.submit``,
+    # ``_finish_step``), keyed by lane.
+    #
+    # One step in flight at a time; windows that come ready meanwhile batch into
+    # the next one. ``EngineManager.build`` decides which node gets the lane and
+    # refuses what it can't serve: a step here is admitted and planned inline,
+    # never speculated, planned ahead or lockstep. Its graphs are captured on a
+    # stream of their own (``Engine._capture_stream_for``), which is what makes
+    # overlapping them safe.
+    #
+    # A resourced node, or a second side node, would each take a lane of their
+    # own with an id past this one: admit and plan on the lane's thread against
+    # its own stream, and the same submit, finish and scheduler filter.
 
     def _fail_side(self, batch: ScheduledBatch, exc: Exception) -> None:
         """Fail a side step's rows alone: the chain's rows in flight have nothing
