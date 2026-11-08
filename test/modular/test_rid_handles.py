@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -118,9 +119,7 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     """A worker whose graph runtime is only the rid table: the boundary is
     what these tests are about, and the runtime owns the table."""
     t = RidTable()
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w.is_tp_follower = False
+    w = make_worker()
     w.sent = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
     w.removed_in_runtime = []
@@ -169,7 +168,8 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w.streaming_buffers = {a: {}}
+    w._rebuilds._kept = {"n": {a: None, b: None}}
+    w._rebuilds._cursors[("n", a)] = None
     w.engine_manager = SimpleNamespace(remove_request=lambda h: None)
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
@@ -183,8 +183,9 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
 
     assert w.removed_in_runtime == [a]
     assert b in w.request_state.per_request_info
-    assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
+    assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
+    assert not w._rebuilds._cursors, "the next request would run this one's rebuild"
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
     assert t.intern("req-c") == a

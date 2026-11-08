@@ -56,6 +56,7 @@ from mstar.model.components.lora.modules import (  # noqa: E402
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
 from mstar.model.submodule_base import NodeSubmodule, engine_step  # noqa: E402
+from mstar.testing_utils.model import make_model
 
 HIDDEN = 8
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4)]
@@ -119,6 +120,9 @@ CASES = {
                       partial=("in_proj_z", "in_proj_b")),
     "fused_column": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
                          {"to_q": 8, "to_k": 4, "to_v": 4}, (1,), FUSED_RULES, bias=True, partial=("to_k",)),
+    # the same module, its adapter stored fused (no shard id), as Qwen3.5's ViT `qkv` adapters are
+    "fused_column_whole": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
+                               {"qkv": 16}, (1,), bias=True),
     # one row per segment (its last token's), each rank its vocab columns
     "lm_head": Case(lambda g: ColumnParallelLinear(g, HIDDEN, 32), "lm_head", {"lm_head": 32}, (1, 2, 4),
                     top=True, rows={"lm_head": PER_SEGMENT}),
@@ -368,7 +372,8 @@ def _old_embedding(self, input_):
 OLD = {
     "column": _old_column, "column_gather": _old_column, "merged": _old_column, "qkv": _old_column,
     "gdn_packs": _old_column, "lm_head": _old_column, "row": _old_row,
-    "fused_column": lambda self, x: F.linear(x, self.weight, self.bias), "embedding": _old_embedding,
+    "fused_column": lambda self, x: F.linear(x, self.weight, self.bias),
+    "fused_column_whole": lambda self, x: F.linear(x, self.weight, self.bias), "embedding": _old_embedding,
     "linear": nn.Linear.forward, "patch_conv": nn.Conv3d.forward,
 }
 
@@ -515,7 +520,7 @@ def test_the_engine_adds_each_pools_rows_to_a_bound_nodes_step(tmp_path):
 def test_a_lora_spec_not_built_by_module_lora_spec_is_refused_where_specs_are_declared():
     """Nothing would bind its nodes' modules: refused before any worker starts."""
     hand = replace(_spec(CASES["qkv"]), module_map=lambda m: None)
-    model = SimpleNamespace(get_lora_specs=lambda: [hand])
+    model = make_model(get_lora_specs=lambda: [hand])
     with pytest.raises(ValueError, match="module_lora_spec"):
         declared_lora_specs(model, {"resources": {"lora": {"adapters": {}}}})
 

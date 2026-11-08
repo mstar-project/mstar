@@ -1,5 +1,6 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
@@ -7,6 +8,9 @@ from mstar.model.multimodal import PromptPart
 from mstar.observability.recorders import MetricSnapshot
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -156,6 +160,10 @@ class PreprocessInput:
     client_request_id: str | None = None
     # the client streams the opening ends; the others stay open for appends
     ends: frozenset[str] = frozenset()
+    # Inputs the API server already holds decoded, by modality and in order,
+    # in place of that modality's files (an image is RGB uint8 ``[3, H, W]``):
+    # each goes to ``Model.load_decoded_<modality>``, with no file between.
+    raw_inputs: dict[str, list["torch.Tensor"]] | None = None
 
 
 @dataclass

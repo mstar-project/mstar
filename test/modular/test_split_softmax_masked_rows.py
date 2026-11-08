@@ -17,26 +17,29 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton ke
 def _run(logits, temperature, force_fused: bool):
     from mstar.engine.resources.sampler import utils as U
 
-    orig = U._split_count
+    orig = U._split_layout
     if force_fused:
-        U._split_count = lambda b, v, d: 1
+        U._split_layout = lambda b, v, d: (1, v)
     try:
         return U.fused_temperature_softmax(
             logits.clone(), temperature, include_greedy=True
         ).float()
     finally:
-        U._split_count = orig
+        U._split_layout = orig
 
 
+# 248,320 splits into 16 chunks of 15,520; 202,048 into 13 chunks of 15,552
+# with a ragged last one
+@pytest.mark.parametrize("vocab", [248320, 202048])
 @pytest.mark.parametrize("masked", [
-    (0, 16384),        # a whole leading chunk
+    (0, 16384),        # the first chunk and across its end boundary
     (0, 8192),         # the first block of the first chunk
-    (16384, 32768),    # a whole interior chunk
+    (16384, 32768),    # an interior region spanning a chunk boundary
     (100, 200),        # a few tokens mid-block
 ])
-def test_split_matches_fused_and_torch_with_masked_regions(masked):
+def test_split_matches_fused_and_torch_with_masked_regions(masked, vocab):
     torch.manual_seed(0)
-    B, V = 3, 248320
+    B, V = 3, vocab
     logits = torch.randn(B, V, device="cuda", dtype=torch.bfloat16)
     logits[:, masked[0]:masked[1]] = float("-inf")
     temperature = torch.tensor([1.0, 0.7, 0.0], device="cuda")  # last row greedy
