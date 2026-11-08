@@ -17,6 +17,8 @@ disagree still reduce in lockstep.
 from __future__ import annotations
 
 import logging
+import os
+import time
 from typing import NamedTuple
 
 import torch
@@ -35,9 +37,16 @@ MAJOR_K, BLOCK_MAJOR_K = 0, 2
 PROBE_TOLERANCE = 0.05
 PROBE_TOKENS = (8, 200)
 
+# The token counts FlashInfer profiles the kernel's tactics at, at load, keeping the fastest per count for the
+# process (vLLM's boot autotunes it too): the decode batches, so the first boot pays ~a minute, not ~5 for every
+# bucket; other counts keep the default tactic. Each is one of FlashInfer's own buckets, which calls look up.
+TUNE_TOKENS = (1, 2, 4, 8, 16, 32, 64)
+
 # (device, w13 shape, w2 shape, top_k) -> None where the probe passed, else why not
 _VERDICTS: dict[tuple, str | None] = {}
 _LOGGED: set[tuple] = set()
+# (device, w13 shape, top_k, tokens) -> the autotune's summary
+_TUNED: dict[tuple, str] = {}
 
 
 class ExpertWeights(NamedTuple):
@@ -202,6 +211,53 @@ def _probe(raw: ExpertWeights, packed: ExpertWeights, top_k: int) -> str | None:
     return None
 
 
+def _tune_cache_path(name: str, device: torch.device) -> str | None:
+    """One tactic file per GPU (its UUID) and kernel shape, under ``$XDG_CACHE_HOME/mstar/flashinfer_moe_tune``,
+    so a later boot on the same GPU loads the tactics instead of profiling them."""
+    if device.type != "cuda":
+        return None
+    import flashinfer
+
+    uuid = str(torch.cuda.get_device_properties(device).uuid)
+    major, minor = torch.cuda.get_device_capability(device)
+    root = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "mstar",
+                        "flashinfer_moe_tune")
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, f"fi{flashinfer.__version__}_sm{major}{minor}_{name}_{uuid}.json")
+
+
+def autotune(packed: ExpertWeights, hidden: int, top_k: int, device: torch.device,
+             tokens: tuple[int, ...] = TUNE_TOKENS) -> str:
+    """Profile the kernel's tactics at ``tokens`` inside ``flashinfer.autotune``: one call at the largest count
+    tunes every count, and the calls after it (CUDA graph captures included) look the tactics up. Once per process
+    and shape, the experts of a model's layers sharing it; the tactics persist per GPU (:func:`_tune_cache_path`).
+    Returns a summary for the log; a failure is logged and keeps the default tactics, never failing the load."""
+    e = packed.w13.shape[0]
+    key = (device, tuple(packed.w13.shape), top_k, tuple(tokens))
+    if key in _TUNED:
+        return _TUNED[key]
+    try:
+        from flashinfer.autotuner import autotune as fi_autotune
+
+        path = _tune_cache_path(f"fp8block_E{e}_I{packed.s2.shape[2] * BLOCK}_H{hidden}_K{top_k}", device)
+        gen = torch.Generator(device=device).manual_seed(0)
+        m = max(tokens)
+        x = torch.randn(m, hidden, device=device, generator=gen).to(torch.bfloat16)
+        w, ids = probe_routing(m, e, top_k, device, gen)
+        t = time.time()
+        with fi_autotune(True, cache=path, tuning_buckets=tuple(tokens)):
+            experts(x, packed, w, ids)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        summary = (f"tactics autotuned at {len(tokens)} token counts {tokens[0]}..{tokens[-1]} in "
+                   f"{time.time() - t:.0f} s")
+    except Exception as exc:  # noqa: BLE001 - the default tactics still serve
+        summary = f"autotune failed, default tactics: {type(exc).__name__}: {str(exc)[:200]}"
+        logger.warning("Blackwell fp8 MoE %s", summary)
+    _TUNED[key] = summary
+    return summary
+
+
 def take(raw: ExpertWeights, top_k: int, block_size) -> ExpertWeights | None:
     """``raw`` in the kernel's layout where the kernel serves it on this device, else None. The
     probe runs (and logs) once per device and expert shape; the caller swaps the result in for ``raw``."""
@@ -234,6 +290,7 @@ def take(raw: ExpertWeights, top_k: int, block_size) -> ExpertWeights | None:
         return None
     if key not in _LOGGED:
         _LOGGED.add(key)
+        tuned = autotune(packed, raw.w13.shape[2], top_k, device)
         logger.info("Blackwell fp8 MoE: flashinfer's trtllm kernel passed its probe on %s for experts %s; "
-                    "it runs the routed experts at every token count", device, key[1])
+                    "it runs the routed experts at every token count (%s)", device, key[1], tuned)
     return packed

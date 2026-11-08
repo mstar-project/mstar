@@ -94,6 +94,7 @@ def blackwell_stand_in(monkeypatch):
     monkeypatch.setattr(trtllm_fp8, "unavailable", lambda *a: None)
     monkeypatch.setattr(trtllm_fp8, "shuffle_rows", _rows)
     monkeypatch.setattr(trtllm_fp8, "_probe", lambda raw, packed, top_k: probes.append(top_k))
+    monkeypatch.setattr(trtllm_fp8, "autotune", lambda *a: "not tuned (CPU)")
     return probes
 
 
@@ -104,6 +105,36 @@ def test_the_probe_runs_once_per_device_and_shape(blackwell_stand_in):
     assert blackwell_stand_in == [2]
     assert trtllm_fp8.take(raw, 3, (128, 128)) is not None
     assert blackwell_stand_in == [2, 3]
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_autotune_profiles_the_decode_counts_once_per_shape(monkeypatch, caplog, fails):
+    """One call at the largest count inside flashinfer.autotune, with the tuning buckets; a second block of the
+    shape reuses the result; a failing tuner logs and keeps the default tactics."""
+    import contextlib
+    import sys
+
+    seen, calls = [], []
+
+    @contextlib.contextmanager
+    def fake_autotune(tune_mode, cache=None, tuning_buckets=None):
+        seen.append((tune_mode, cache, tuning_buckets))
+        if fails:
+            raise RuntimeError("no tactic profiled")
+        yield
+
+    monkeypatch.setitem(sys.modules, "flashinfer.autotuner", types.SimpleNamespace(autotune=fake_autotune))
+    monkeypatch.setattr(trtllm_fp8, "_TUNED", {})
+    monkeypatch.setattr(trtllm_fp8, "experts", lambda x, packed, w, ids: calls.append(tuple(x.shape)) or x)
+    packed = trtllm_fp8.ExpertWeights(torch.zeros(4, 2, 512, 128), None, None, torch.zeros(4, 2, 2))
+    with caplog.at_level(logging.WARNING, logger=trtllm_fp8.__name__):
+        first = trtllm_fp8.autotune(packed, 256, 2, torch.device("cpu"))
+        assert trtllm_fp8.autotune(packed, 256, 2, torch.device("cpu")) == first
+    assert seen == [(True, None, trtllm_fp8.TUNE_TOKENS)]
+    if fails:
+        assert first.startswith("autotune failed") and "no tactic profiled" in caplog.text and calls == []
+    else:
+        assert first.startswith("tactics autotuned at 7 token counts 1..64") and calls == [(64, 256)]
 
 
 @pytest.mark.parametrize("outcome", ["mismatch", "raises"])
