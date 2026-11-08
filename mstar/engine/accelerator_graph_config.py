@@ -344,10 +344,16 @@ def apply_token_ladders(
             config.capture_token_lengths = trimmed
 
 
+def _overrides(cls: type, hook: str) -> bool:
+    """Whether a submodule class declares its own ``hook``, which the base leaves empty."""
+    from mstar.model.submodule_base import NodeSubmodule
+
+    return getattr(cls, hook) is not getattr(NodeSubmodule, hook)
+
+
 def apply_region_ladders(
     node: str, configs: Mapping[str, "PiecewiseAcceleratorGraphConfig"],
-    ladders: Mapping[str, list[int]], walk_ladders: Mapping[str, Any], declares_regions: bool,
-    declares_captures: bool,
+    ladders: Mapping[str, list[int]], walk_ladders: Mapping[str, Any], submodule_cls: type,
 ) -> None:
     """Take a serving config's ``prefill_token_buckets`` for ``node`` that name
     no walk of it (`EngineManager` split them off) as the ``total_tokens`` of
@@ -355,14 +361,14 @@ def apply_region_ladders(
 
     A name that is neither a walk nor a region of the node is refused, as is a
     region the config also names as a walk, or one captured by batch size
-    alone. A node whose submodule ``declares_regions`` (overrides
+    alone. A node whose ``submodule_cls`` declares regions (overrides
     `NodeSubmodule.get_piecewise_accelerator_graph_configs`) but returned none
     at this deployment logs and skips. The node's ``walk_ladders`` are refused
-    here, naming its regions, where its submodule never ``declares_captures``
-    (overrides `NodeSubmodule.get_accelerator_graph_configs`);
+    here, naming its regions, where its class captures no walk at all (doesn't
+    override `NodeSubmodule.get_accelerator_graph_configs`);
     `apply_token_ladders` takes them otherwise.
     """
-    if walk_ladders and not declares_captures:
+    if walk_ladders and not _overrides(submodule_cls, "get_accelerator_graph_configs"):
         regions = f"; its piecewise regions are {sorted(configs)}" if configs else ""
         raise ValueError(
             f"prefill_token_buckets names walks {sorted(walk_ladders)} of {node}, which captures no "
@@ -376,7 +382,7 @@ def apply_region_ladders(
         )
     for label, ladder in ladders.items():
         config = configs.get(label)
-        if config is None and not configs and declares_regions:
+        if config is None and not configs and _overrides(submodule_cls, "get_piecewise_accelerator_graph_configs"):
             logger.warning(
                 "%s: no piecewise region at this deployment, so prefill_token_buckets for %r "
                 "does nothing", node, label,

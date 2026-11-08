@@ -1088,10 +1088,7 @@ class Engine:
         )
         apply_region_ladders(
             node_name, configs, submodule_mgmt.region_ladders, submodule_mgmt.token_ladders,
-            declares_regions=type(submodule_mgmt.submodule).get_piecewise_accelerator_graph_configs
-            is not NodeSubmodule.get_piecewise_accelerator_graph_configs,
-            declares_captures=type(submodule_mgmt.submodule).get_accelerator_graph_configs
-            is not NodeSubmodule.get_accelerator_graph_configs,
+            type(submodule_mgmt.submodule),
         )
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         # One graph memory pool for all of the node's regions (see

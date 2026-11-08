@@ -351,28 +351,27 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        combined walk runs under the combined walk's), and the rungs past it, which
        no step would reach, are dropped and logged; a region takes its ladder
        whole. A vision tower's ``vision_block_loop`` and an AuT encoder's
-       ``aut_encode`` (Qwen3-Omni, Qwen3-ASR) pack a step up to their ladder's
-       top; BAGEL's and OmniVoice's regions keep their own batch caps. A tower's
-       attention resource is sized from the model's own top rung, and a step
-       with more attention segments than it holds runs eagerly, so a ladder
-       past that rung replays its longer steps only with the resource raised
-       under ``resources``: ``vision_attn: {max_segments_per_step: N}`` for a
-       vision tower's ``vision_block_loop`` (Qwen3.5, Qwen3-Omni, Muse Glimmer;
-       N frames or windows a step), and ``audio_attn: {max_segments_per_request:
-       N}`` for Qwen3-Omni's ``aut_encode`` (N 8 s windows a clip). Each rung
-       adds captures, graph memory and startup time. Loading
-       fails, before any weights load, if the setting is not a mapping of node ->
-       name -> ladder, names a node in no node group or a walk of the model that
-       does not run the node (a node runs the walks it is in and its combined
-       walks), a ladder is not a non-empty list of distinct positive ints, or a
-       name that is no walk has a mapping. Warmup fails on a walk whose steps
-       replay another walk's capture, naming that walk, on a walk the node captures
-       by batch size alone (a ``decode`` capture), on a walk of a node whose
-       model declares no packed capture of any walk (a vision tower), naming its
-       regions, on a name that is neither a walk nor a region of the node or is
-       both (on a node whose model declares no region, every name that is no
-       walk), and on a region captured by batch size alone; a walk or region the node captures nothing for at this
-       deployment (a model that turns its captures off, such as GLM-5.2 with
+       ``aut_encode`` (Qwen3-Omni, Qwen3-ASR) pack a step up to their ladder's top;
+       every other region keeps its own batch cap. A tower's attention resource is
+       sized from the model's own top rung, and a batch with more attention segments
+       than it holds is split into its requests, a request still over it running
+       eagerly, so a ladder past that rung replays its longer steps only with the
+       resource raised under ``resources``: ``vision_attn: {max_segments_per_step: N}``
+       for a vision tower's ``vision_block_loop`` (Qwen3.5, Qwen3-Omni, Muse Glimmer; N
+       frames or windows a step), and ``audio_attn: {max_segments_per_request: N}`` for
+       Qwen3-Omni's ``aut_encode`` (N 8 s windows a clip). Each rung adds captures,
+       graph memory and startup time. Loading fails, before any weights load, if the
+       setting is not a mapping of node -> name -> ladder, names a node in no node
+       group or a walk of the model that does not run the node (a node runs the walks
+       it is in and its combined walks), a ladder is not a non-empty list of distinct
+       positive ints, or a name that is no walk has a mapping. Warmup fails on a walk
+       whose steps replay another walk's capture, naming that walk, on a walk the node
+       captures by batch size alone (a ``decode`` capture), on a walk of a node whose
+       model captures no walk at all (a vision tower, an AuT encoder), naming its
+       regions, on a name that is neither a walk nor a region of the node or is both
+       (on a node whose model declares no region, every name that is no walk), and on a
+       region captured by batch size alone; a walk or region the node captures nothing
+       for at this deployment (a model that turns its captures off, such as GLM-5.2 with
        ``dsa_long_context``) is logged and skipped. The key replaces
        ``model_kwargs.prefill_token_buckets``, which fails loading.
    * - ``can_override_mixed_max_tokens``
