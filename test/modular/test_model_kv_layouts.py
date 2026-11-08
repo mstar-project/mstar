@@ -11,7 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ForwardPassInfoWrapper
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.manager import SpanCursor
-from mstar.model.base import LabelLayout
+from mstar.model.base import LabelLayout, Span
 from mstar.model.submodule_base import InputMetadata
 
 NOT_EOS = 42
@@ -245,11 +245,17 @@ def test_bagel_runs_a_walk_for_each_span_of_its_layout(
 
 
 @pytest.mark.parametrize("max_tokens", [1, 2, 64])
-@pytest.mark.parametrize("model_name", ["canary", "canary_qwen"])
+@pytest.mark.parametrize("model_name", ["canary", "canary_qwen", "fish_s2_pro"])
 def test_canary_decode_cap_leaves_the_prefills_token_in_the_budget(model_name, max_tokens):
     """The prefill emits the first of max_output_tokens, so the decode loop's
     cap (which alone ends it, ``TokenStop``) is one fewer; a one-token budget
     ends at the prefill."""
+    if model_name == "fish_s2_pro":
+        from test_fish_s2_pro_model import tiny_ar, tiny_model
+
+        caps = tiny_model().get_loop_caps(max_output_tokens=max_tokens)
+        assert caps[tiny_ar().token_stop.loop] == max(1, max_tokens - 1)
+        return
     if model_name == "canary":
         from mstar.model.canary.canary_model import CanaryModel
 
@@ -396,25 +402,6 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
         assert laid_out.retention == dit._window_retention(state).get(label), f"{label}'s retention isn't the DiT's"
 
 
-@pytest.mark.parametrize("max_tokens", [1, 64])
-def test_fish_caps_decode_where_its_stop_check_ends_it(max_tokens):
-    from test_fish_s2_pro_model import tiny_ar, tiny_model
-
-    ar = tiny_ar()
-    outputs = {"new_token": [torch.tensor([4])]}
-    ar.request_state("r").add("generated_frames", 0)
-    ar.postprocess("r", None, outputs)
-    prefill = SimpleNamespace(step_metadata={}, max_tokens=max_tokens, resource_configs={})
-    ar.check_stop("r", prefill, outputs)
-
-    cap = tiny_model().get_loop_caps(max_output_tokens=max_tokens)["ar_decode_loop"]
-
-    assert cap == _stops_after(
-        ar.check_stop, "ar_decode_loop", "ar_decode", 4096, outputs,
-        max_tokens=max_tokens,
-    ), "the cap and the stop check end decode on different iterations"
-
-
 @pytest.mark.parametrize("clone", [False, True])
 def test_fish_lays_out_the_rows_its_prefill_builds(clone):
     from test_fish_s2_pro_model import tiny_ar, tiny_model
@@ -468,6 +455,36 @@ def test_higgs_lays_out_the_prefill_step_it_runs():
     audio = sum(model.config.encoder_output_length(n) for n in output.metadata["audio_feature_lens"])
     text = sum(ids.numel() for ids in tensors["text_inputs"])
     assert sum(span.length for span in layout.spans) == text + audio
+
+
+def _text_only_qwen3_5(tmp_path, monkeypatch):
+    """A checkpoint with no ``vision_config``, whose tokenizer still has the pad tokens."""
+    from mstar.model.qwen3_5 import qwen3_5_model
+
+    (tmp_path / "config.json").write_text("{}")
+    pads = {"<|image_pad|>": 5, "<|video_pad|>": 6}
+    tokenizer = SimpleNamespace(eos_token_id=None, unk_token_id=0, convert_tokens_to_ids=lambda t: pads.get(t, 0))
+    monkeypatch.setattr(qwen3_5_model.AutoTokenizer, "from_pretrained", lambda *a, **k: tokenizer)
+    monkeypatch.setattr(qwen3_5_model.Qwen3_5Config, "from_hf", lambda _: SimpleNamespace(max_position_embeddings=64))
+    return qwen3_5_model.Qwen3_5DenseModel(str(tmp_path))
+
+
+def test_a_text_only_qwen3_5_takes_no_media(tmp_path, monkeypatch):
+    model = _text_only_qwen3_5(tmp_path, monkeypatch)
+
+    assert not model.media and not model.encoders, "a media walk needs a vision_encoder node, which startup refuses"
+
+
+def test_a_text_only_qwen3_5_lays_out_a_text_prompt(tmp_path, monkeypatch):
+    from mstar.model.keys import KV_CACHE
+
+    model = _text_only_qwen3_5(tmp_path, monkeypatch)
+
+    layout = model.kv_layout({"offset": [], "tokens": [], "output": [], "grid": []}, 7)
+
+    assert layout[KV_CACHE]["main"] == LabelLayout(
+        spans=(Span("ids", "prefill_text", 7, 7, "text_inputs"),), growth=(("decode_loop", 1),),
+    ), "a text-only checkpoint lays out a text prompt as a vision checkpoint does"
 
 
 def _omni_submodule():

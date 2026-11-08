@@ -229,6 +229,7 @@ class SpeculationBuilder:
         fresh_final_edges: dict[int, set[str]],
         chunk_ranges: dict[int, ChunkRange] | None = None,
         incomplete_node_rids: set[int] | None = None,
+        rebuild_rids: frozenset[int] = frozenset(),
     ) -> Speculation:
         """The speculation from ``prep`` plus the fresh rows merged into its
         per-row dicts; ``other_walks`` maps the fresh rows of another walk (a
@@ -236,11 +237,11 @@ class SpeculationBuilder:
         final stream chunk was ingested before this step to its edges."""
         if (
             prep.rows_wg_id is not None and not other_walks and not fresh_final_edges
-            and not chunk_ranges
+            and not chunk_ranges and not rebuild_rids
         ):
             # the dicts hold only the fresh rows here; a fresh row's final
-            # stream chunk, or a cut chunk, takes the general assembly, which
-            # carries it
+            # stream chunk, a cut chunk, or a rebuild row's inputs from the log
+            # take the general assembly, which carries them
             return self.assemble_rows(
                 pending, spec_target, prep.ready_rids, prep.rows_wg_id,
                 fresh_request_to_worker_graph=prep.request_to_worker_graph,
@@ -264,6 +265,7 @@ class SpeculationBuilder:
                 **dict.fromkeys(request_to_worker_graph, spec_target.graph_walk), **other_walks,
             } if other_walks else None,
             chunk_ranges=chunk_ranges, incomplete_node_rids=incomplete_node_rids,
+            rebuild_rids=rebuild_rids,
         )
 
     def assemble(
@@ -282,6 +284,7 @@ class SpeculationBuilder:
         request_walks: dict[int, str] | None = None,
         chunk_ranges: dict[int, ChunkRange] | None = None,
         incomplete_node_rids: set[int] | None = None,
+        rebuild_rids: frozenset[int] = frozenset(),
     ) -> Speculation:
         """Package prepared rids (batch order, which ``make_executing_batch``
         reorders for a split walk) into the ``Speculation`` the main loop runs.
@@ -305,6 +308,7 @@ class SpeculationBuilder:
             request_walks=request_walks,
             chunk_ranges=dict(chunk_ranges) if chunk_ranges else {},
             incomplete_node_rids=set(incomplete_node_rids) if incomplete_node_rids else set(),
+            rebuild_rids=rebuild_rids,
             # Resolved here, on the main thread, so the GPU thread never asks
             # the runtime, which may be mid-call with the GIL released.
             walk_output_signals={
@@ -338,6 +342,7 @@ class SpeculationBuilder:
             request_walks=request_walks,
             engine=ctx.engine_manager.get_engine(spec_node) if request_walks else None,
             chunk_ranges=chunk_ranges,
+            rebuild_rids=rebuild_rids, rebuilds=ctx.scheduler.rebuilds,
         )
         return Speculation(
             scheduled_batch=spec_batch,

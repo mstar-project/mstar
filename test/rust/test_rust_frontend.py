@@ -415,7 +415,8 @@ def test_admission_permit_is_held_through_streaming_body():
             f"http://127.0.0.1:{port}/v1/chat/completions",
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
-        resp_a = urllib.request.urlopen(req_a, timeout=15)
+        # Bounds a hang only; a loaded runner can take over 15 s to the first delta.
+        resp_a = urllib.request.urlopen(req_a, timeout=60)
         # Not just any line: an SSE keep-alive comment would also be one.
         assert b"Hello" in resp_a.readline()  # first delta: A is being served
         # B: A holds the only permit, so B is refused with 503.
@@ -710,6 +711,42 @@ def test_video_conditioning_refuses_server_file_paths():
                 {"model": "cosmos3", "prompt": "x", "image": ref}).encode())
             assert status == 400, ref
     assert not stub.submitted
+
+
+def test_remote_media_failures_are_short_400s(monkeypatch):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    hits = []
+
+    class Forbidden(BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(403)
+            self.send_header("Content-Length", "26")
+            self.end_headers()
+            self.wfile.write(b"denied by db.internal.corp")
+
+        def log_message(self, *args):
+            pass
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Forbidden)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{upstream.server_address[1]}/a.png"
+    body = json.dumps({"model": "qwen3_omni", "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": url}}]}]}).encode()
+    stub = _StubAPIServer()
+    monkeypatch.setenv("MSTAR_ALLOW_REMOTE", "1")
+    try:
+        for allowed, reason in (("127.0.0.1", "upstream returned 403"), ("", "host not allowed")):
+            monkeypatch.setenv("MSTAR_REMOTE_ALLOWED_HOSTS", allowed)
+            with _model_stack("qwen3_omni", stub) as (port, _up):
+                status, out = _post_raw(port, "/v1/chat/completions", body)
+            assert status == 400, (status, out)
+            assert out["error"]["message"] == f"remote media fetch failed: {reason}"
+    finally:
+        upstream.shutdown()
+        upstream.server_close()
+    assert hits == ["/a.png"] and not stub.submitted
 
 
 class _ErrorChunkStub(_StubAPIServer):
@@ -1253,4 +1290,5 @@ def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkey
     monkeypatch.delenv("MSTAR_SERVER_BIN", raising=False)
     monkeypatch.setenv("PATH", str(elsewhere))
     monkeypatch.setattr(sysconfig, "get_path", lambda name: str(scripts))
-    assert find_server_binary() == str(scripts / "mstar-server")
+    # Not a checkout's rust/, so the empty stand-ins are not run.
+    assert find_server_binary(rust_dir=tmp_path) == str(scripts / "mstar-server")

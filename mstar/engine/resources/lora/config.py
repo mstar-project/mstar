@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -92,7 +92,8 @@ class LoraTarget:
     ``slice_packs`` names checkpoint modules that pack several slices into one tensor: a
     gated delta-net's ``in_proj_qkv`` is ``[q | k | v]``, three outputs the base shards
     across ranks on their own. Such a module has one A, which each of its slices takes,
-    and a B whose rows are those slices' in order.
+    and a B whose rows are those slices' in order. A pack named None is the module itself
+    as a checkpoint stores it fused, with no stacked-shard id.
 
     ``slice_align`` rounds each slice's rank-local width up to a multiple, for a base
     linear that pads its fused output per rank so the next slice starts aligned. The
@@ -116,7 +117,7 @@ class LoraTarget:
     parallel: Literal["column", "row", "none"] = "column"
     slice_names: tuple[str | int, ...] = ()
     slice_units: tuple[int, ...] | None = None
-    slice_packs: tuple[tuple[str | int, tuple[str | int, ...]], ...] | None = None
+    slice_packs: tuple[tuple[str | int | None, tuple[str | int, ...]], ...] | None = None
     slice_align: tuple[int, ...] | None = None
     layers: tuple[int, ...] | None = None
     kind: Literal["linear", "embedding"] = "linear"
@@ -331,7 +332,7 @@ class LoraSpec(NodeResourceSpec):
         super().__post_init__()
         if not self.targets:
             raise ValueError(f"LoRA resource {self.resource_key!r} declares no targets")
-        _check_sizes({name: getattr(self, name) for name in _SIZES})
+        check_sizes({name: getattr(self, name) for name in _SIZES})
 
     @property
     def num_slots(self) -> int:
@@ -367,7 +368,7 @@ class LoraSpec(NodeResourceSpec):
             for name, value in zip(_SIZES, (max_slots, max_rank, cpu_capacity), strict=True)
             if value is not None
         }
-        _check_sizes(sizes)
+        check_sizes(sizes)
         if adapters is not None:
             if not isinstance(adapters, dict) or not all(
                 isinstance(k, str) and isinstance(v, str) for k, v in adapters.items()
@@ -461,12 +462,6 @@ class LoraSpec(NodeResourceSpec):
 
 
 _SIZES = ("max_slots", "max_rank", "cpu_capacity")
-
-
-def _check_sizes(sizes: Mapping[str, Any]) -> None:
-    for name, value in sizes.items():
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise ValueError(f"{name} must be an integer >= 1; got {value!r}")
 
 
 def _some(items: tuple[str, ...], n: int = 5) -> str:

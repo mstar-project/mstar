@@ -560,6 +560,82 @@ def test_eager_rounding_is_live_while_tracing_and_does_not_leak(monkeypatch, tor
     assert _make_model(compile_eager_rounding=False).compile_eager_rounding is False
 
 
+def test_the_recompile_limit_reaches_torch_compile_only_where_it_exists(monkeypatch):
+    """``torch.compile`` takes ``recompile_limit`` from 2.12. CI's 2.10 and the H200 boxes' 2.11 raised a
+    TypeError on the keyword, which took klein, Z-Image and LTX-2.5 down at load. Without a limit nothing is
+    passed; with one, it is passed where it exists and raises the process-wide limit where it doesn't."""
+    import torch._dynamo.config as dynamo_config
+
+    from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+
+    calls = []
+
+    def old_compile(fn, *, fullgraph=False, dynamic=None, backend="inductor", mode=None, options=None,
+                    disable=False):
+        calls.append({"fullgraph": fullgraph, "dynamic": dynamic})
+        return fn
+
+    monkeypatch.setattr(torch, "compile", old_compile)
+    module = torch.nn.Linear(2, 2)
+    compile_transformer_forward(module)
+    assert calls[-1] == {"fullgraph": False, "dynamic": False}
+    before = dynamo_config.recompile_limit
+    # torch's own patch() restores by assignment. pytest's monkeypatch restores a module entry that is not in
+    # __dict__ by deleting it, which torch's config module turns into a hidden key for the rest of the session.
+    with dynamo_config.patch(recompile_limit=8):
+        compile_transformer_forward(module, recompile_limit=96)
+        assert dynamo_config.recompile_limit == 96
+        compile_transformer_forward(module, recompile_limit=10)
+        assert dynamo_config.recompile_limit == 96, "the process-wide limit never falls"
+    assert dynamo_config.recompile_limit == before
+
+    def new_compile(fn, *, fullgraph=False, dynamic=None, backend="inductor", mode=None, options=None,
+                    disable=False, recompile_limit=None):
+        calls.append({"recompile_limit": recompile_limit})
+        return fn
+
+    monkeypatch.setattr(torch, "compile", new_compile)
+    compile_transformer_forward(module, recompile_limit=96)
+    assert calls[-1]["recompile_limit"] == 96
+    compile_transformer_forward(module)
+    assert calls[-1]["recompile_limit"] is None
+
+
+def test_the_dit_recompile_limit_holds_on_an_executor_thread_started_after_warmup(monkeypatch):
+    """The worker's executor threads start after warmup and run ``apply_dynamo_config``. Before torch 2.12
+    that set the process-wide limit back to ``MSTAR_RECOMPILE_LIMIT``, so a shape first served there ran
+    uncompiled once the DiT held that many entries."""
+    import functools
+    from concurrent.futures import ThreadPoolExecutor
+
+    import torch._dynamo.config as dynamo_config
+
+    from mstar.engine import apply_dynamo_config
+    from mstar.model.components.diffusion.compile_utils import compile_transformer_forward
+
+    compiles, real_compile = [], torch.compile
+
+    @functools.wraps(real_compile)  # keeps torch.compile's signature, which decides whether the keyword is passed
+    def counting_compile(fn, **kw):
+        return real_compile(fn, backend=lambda gm, _: compiles.append(1) or gm, **kw)
+
+    monkeypatch.setattr(torch, "compile", counting_compile)
+    monkeypatch.setenv("MSTAR_RECOMPILE_LIMIT", "8")
+    module = torch.nn.Linear(2, 2)
+    # the compiled frame is Dynamo's shared wrap_inline wrapper: no other test's cache entries count
+    torch._dynamo.reset()
+    try:
+        with dynamo_config.patch(recompile_limit=8):  # restores by assignment (see the test above)
+            compile_transformer_forward(module, eager_rounding=False, recompile_limit=10)
+            for rows in range(1, 9):  # warmup fills the mstar limit
+                module(torch.randn(rows, 2))
+            with ThreadPoolExecutor(1, initializer=apply_dynamo_config) as serving:
+                serving.submit(module, torch.randn(9, 2)).result()
+        assert len(compiles) == 9
+    finally:
+        torch._dynamo.reset()
+
+
 def test_the_vae_decode_asks_for_its_own_rounding_instead_of_inheriting(monkeypatch, torch_flag):
     """It used to read whatever the transformer's compile left in the global config, so
     the decoder's kernels depended on which node was built first."""

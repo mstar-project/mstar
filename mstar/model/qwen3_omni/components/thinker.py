@@ -21,6 +21,8 @@ Weight name prefix: ``thinker.``
   - thinker.lm_head.weight
 """
 
+import functools
+import re
 from typing import Optional, Tuple
 
 import torch
@@ -35,8 +37,49 @@ from mstar.model.components import (
     instantiate_moe_block,
 )
 from mstar.model.components.distributed import ParallelGatedMLP
+from mstar.model.loader.base import CheckpointRules, StackedParamRule
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
 from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, Qwen3OmniModelConfig
+
+
+def thinker_remap(name: str) -> str | None:
+    """HF checkpoint names (after the ``thinker.`` prefix) as this model's parameters.
+
+    The ``block_sparse_moe`` -> ``mlp`` rename, and each expert's
+    ``experts.{N}.{gate,up,down}_proj.weight`` rewritten to
+    ``experts.{proj}.__expert{N}__.weight``, which ``thinker_stacked_params`` routes
+    into the fused expert tensors with a shard id naming the projection and expert.
+    """
+    if "rotary_emb" in name:
+        return None
+    name = name.replace("block_sparse_moe.", "mlp.")
+    m = re.match(r"(.*)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$", name)
+    if m:
+        prefix, expert_idx, proj = m.groups()
+        return f"{prefix}.experts.{proj}.__expert{expert_idx}__.weight"
+    return name
+
+
+@functools.cache
+def thinker_stacked_params(num_experts: int) -> tuple[StackedParamRule, ...]:
+    """The fused-parameter routing: per-expert projections into the packed expert
+    tensors (first: the dense ``.gate_proj`` suffix would also match a remapped expert
+    key, and the first matching rule wins), then dense gate/up and q/k/v."""
+    rules = []
+    for i in range(num_experts):
+        # the source suffix includes ".weight", so the target (a bare parameter, not a
+        # Linear) has none
+        rules.append(StackedParamRule(".experts.gate_up_proj", f".experts.gate_proj.__expert{i}__.weight", f"gate:{i}"))
+        rules.append(StackedParamRule(".experts.gate_up_proj", f".experts.up_proj.__expert{i}__.weight", f"up:{i}"))
+        rules.append(StackedParamRule(".experts.down_proj", f".experts.down_proj.__expert{i}__.weight", f"down:{i}"))
+    rules += [
+        StackedParamRule(".gate_up_proj", ".gate_proj", 0),
+        StackedParamRule(".gate_up_proj", ".up_proj", 1),
+        StackedParamRule(".qkv_proj", ".q_proj", "q"),
+        StackedParamRule(".qkv_proj", ".k_proj", "k"),
+        StackedParamRule(".qkv_proj", ".v_proj", "v"),
+    ]
+    return tuple(rules)
 
 
 class Qwen3OmniThinkerLayer(nn.Module):
@@ -191,6 +234,7 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
 
         self.hidden_size = tc.hidden_size
         self.num_layers = tc.num_hidden_layers
+        self.num_experts = tc.num_experts
         self.accept_hidden_layer = config.accept_hidden_layer
 
         self.model = Qwen3OmniThinkerTextModel(config, comm_group=comm_group, moe_parallel=moe_parallel)
@@ -198,6 +242,14 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
 
         self.init_moe_parallel(moe_parallel)
+
+    def checkpoint_rules(self) -> CheckpointRules:
+        """How the full model's checkpoint (``thinker.*``) lands here, and where LoRA
+        adapters land."""
+        return CheckpointRules(
+            stacked_params=thinker_stacked_params(self.num_experts), remap=thinker_remap,
+            prefix="thinker.",
+        )
 
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_embeds: torch.Tensor
@@ -215,7 +267,8 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         label: str = "main",
         num_valid_tokens: torch.Tensor | None = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        keep_states: bool = True,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             input_embeds: [tokens, hidden_size] -- pre-embedded input
@@ -229,18 +282,20 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
                 stored length and position counter advance when the runner
                 commits the declared step (vision prefill declares its
                 MRoPE 3D-grid span there).
+            keep_states: False skips the two states below, which only the
+                Talker reads.
 
         Returns:
             hidden_states: [tokens, hidden_size] -- final normed hidden states
             layer_0_embed: [tokens, hidden_size] -- input before any layers
             layer_n_hidden: [tokens, hidden_size] or None -- hidden states
-                after ``accept_hidden_layer`` (for Talker conditioning)
+                entering layer ``accept_hidden_layer`` (for Talker conditioning)
         """
         # The fused norms update the residual stream in place, so it starts from
         # a copy: ``input_embeds`` (a captured graph's static input) stays as
         # staged, and is the layer-0 input the Talker takes.
         hidden_states = input_embeds.clone()
-        layer_0_embed = input_embeds
+        layer_0_embed = input_embeds if keep_states else None
         layer_n_hidden = None
         token_valid = self.moe_token_valid(hidden_states, num_valid_tokens)
 
@@ -267,8 +322,9 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
                     deepstack_visual_embeds[layer_idx],
                 )
 
-            # Capture hidden states at the accept_hidden_layer for Talker
-            if layer_idx == self.accept_hidden_layer:
+            # The Talker takes transformers' hidden_states[accept_hidden_layer]: index 0 is
+            # the embeds, so index k is the stream leaving layer k - 1
+            if keep_states and layer_idx == self.accept_hidden_layer - 1:
                 layer_n_hidden = residual + hidden_states
 
         # Final layer norm

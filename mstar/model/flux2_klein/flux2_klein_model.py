@@ -31,6 +31,7 @@ with a log line, as in the reference pipeline.
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from collections.abc import Hashable
@@ -52,6 +53,14 @@ from mstar.model.components.diffusion.qwen3.submodule import (
     TEXT_LEN,
     Qwen3TextEncoderSubmodule,
 )
+from mstar.model.components.quant_linear import (
+    check_linear_dtype,
+    check_linear_dtype_steps,
+    check_linear_keep,
+    quantize_linears,
+    select_linears,
+)
+from mstar.model.flux2_klein.components.transformer import QUANTIZABLE_LINEARS
 from mstar.model.flux2_klein.config import (
     DENOISE_LOOP,
     DIT_ATTN,
@@ -68,7 +77,7 @@ from mstar.model.flux2_klein.submodules import (
     KleinVaeDecoderSubmodule,
     KleinVaeEncoderSubmodule,
 )
-from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
+from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -103,6 +112,9 @@ class Flux2KleinModel(Model):
         vae_compile: bool = False,
         async_scheduling: bool = True,
         lora: list | None = None,
+        linear_dtype: str = "bf16",
+        linear_keep_bf16: list[str] | None = None,
+        linear_dtype_steps: int | list[str] | None = None,
         **kwargs,
     ):
         if attention_backend not in ATTENTION_BACKENDS:
@@ -143,6 +155,12 @@ class Flux2KleinModel(Model):
         self.async_scheduling = bool(async_scheduling)
         # LoRA adapters folded into the transformer at load time (static merge).
         self.loras = [LoraFile.parse(item) for item in (lora or [])]
+        # The transformer's block linears in a low-precision format (mxfp8, nvfp4), with this deployment's extra
+        # bf16 patterns on top of the model's declaration, and optionally some denoise steps in bf16 on a twin.
+        # Trades image fidelity for speed; see docs/models.rst.
+        self.linear_dtype = check_linear_dtype(linear_dtype)
+        self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
+        self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype)
 
         self._snapshot = None
         self._config: Flux2KleinConfig | None = None
@@ -255,13 +273,12 @@ class Flux2KleinModel(Model):
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """Reference image with the pipeline's preprocessing: validity checks, LANCZOS
         shrink to at most ``ref_image_max_area`` pixels, floor of both sides to the 16-px
-        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``."""
+        token grid, center crop, RGB; returned as float ``[3, H, W]`` in ``[0, 1]``, upright by its EXIF
+        orientation as diffusers' ``load_image`` reads it."""
         from PIL import Image
 
         check_image_size(filepath, formats=PILLOW_IMAGE_FORMATS)
-        with Image.open(filepath, formats=PILLOW_IMAGE_FORMATS) as raw:
-            raw.load()
-            image = raw
+        with open_upright_image(filepath, formats=PILLOW_IMAGE_FORMATS) as image:
             width, height = image.size
             if width < 64 or height < 64:
                 raise ValueError(f"reference image too small: {width}x{height}; both sides must be >= 64 px")
@@ -489,6 +506,14 @@ class Flux2KleinModel(Model):
                 from mstar.model.flux2_klein.weight_loader import apply_transformer_loras
 
                 apply_transformer_loras(transformer, self.loras)
+            # after the adapters: those fold into the bf16 weights this quantizes
+            selection = select_linears(
+                transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16, "FLUX.2 klein transformer",
+            )
+            # a schedule's bf16 steps run a copy taken before quantizing; nothing quantized, every step is bf16
+            step_dtypes = self.step_dtypes if selection.names else None
+            bf16_transformer = copy.deepcopy(transformer) if step_dtypes is not None else None
+            quantize_linears(transformer, selection)
             return KleinDenoiseSubmodule(
                 transformer, self.config, loop_name=DENOISE_LOOP,
                 attn_resource_key=DIT_ATTN if self.attention_backend == "flashinfer" else None,
@@ -496,6 +521,7 @@ class Flux2KleinModel(Model):
                 compile_eager_rounding=self.compile_eager_rounding, compile_exact_ops=self.compile_exact_ops,
                 max_batch_size=self.max_batch_size,
                 capture_buckets=self.capture_buckets(), capture_batch_sizes=self.capture_batch_sizes,
+                step_dtypes=step_dtypes, bf16_transformer=bf16_transformer,
             )
         logger.warning("FLUX.2 klein has no submodule for node %r; running it dummy", node_name)
         return None

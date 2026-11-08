@@ -90,9 +90,11 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
+from mstar.model.components.video_encode import encode_mp4
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import (
     ACTION_MODE_FORWARD_DYNAMICS,
+    ACTION_MODE_INVERSE_DYNAMICS,
     ACTION_MODE_POLICY,
     ACTION_MODES,
     resolve_action_domain_id,
@@ -140,43 +142,13 @@ VISION_ENCODER_NODE = "vision_encoder"
 REASONER_NODE = "reasoner"
 
 
-
-def encode_mp4_pyav(frames: torch.Tensor, fps: float, crf: int = 18, preset: str = "ultrafast") -> bytes:
-    """H.264 mp4 bytes from uint8 frames ``[T, H, W, 3]`` through PyAV (its
-    wheel bundles FFmpeg + libx264), matching the torchcodec encoder's
-    CRF / preset / threading settings. Odd frame sizes are edge-padded to
-    even dimensions for yuv420p."""
-    import io
-    from fractions import Fraction
-
-    import av
-
-    _, h, w, _ = frames.shape
-    arr = frames.numpy()
-    if (w % 2) or (h % 2):
-        import numpy as np
-
-        arr = np.pad(arr, ((0, 0), (0, h % 2), (0, w % 2), (0, 0)), mode="edge")
-    buf = io.BytesIO()
-    with av.open(buf, mode="w", format="mp4") as container:
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1000))
-        stream.width, stream.height = arr.shape[2], arr.shape[1]
-        stream.pix_fmt = "yuv420p"
-        stream.options = {"crf": str(crf), "preset": preset, "threads": "0"}
-        for frame in arr:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
-    return buf.getvalue()
-
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
     PREPROCESS_ONLY_KWARGS = ("action", "robot_state")
     # The width of a policy request's robot_state, which process_prompt hands
     # the conductor (the values themselves ride the action_inputs edge).
-    INTERNAL_KWARGS = ("robot_state_dim",)
+    INTERNAL_KWARGS = ("robot_state_dim", "action_shape")
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -880,6 +852,13 @@ class Cosmos3Model(Model):
 
         negative_prompt = kwargs.get("negative_prompt")
         p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
+        video = (tensors or {}).get("video_inputs")
+        if p.get("action_mode") == ACTION_MODE_INVERSE_DYNAMICS and video and video[0].shape[0] < p["num_frames"]:
+            # the encoder takes the clip's first num_frames frames; a shorter one encodes too few latent frames
+            raise ValueError(
+                f"Cosmos3 inverse_dynamics needs a video of at least num_frames={p['num_frames']} frames, "
+                f"got {video[0].shape[0]}; send a smaller num_frames or action_chunk_size."
+            )
         # The chat system prompt and the resolution/duration metadata sentences
         # are opt-in, off by default: the model sees the bare user prompt, which
         # matches the reference serving pipeline (its system-prompt and
@@ -1233,7 +1212,11 @@ class Cosmos3Model(Model):
                         "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
-                data = encode_mp4_pyav(frames.permute(0, 2, 3, 1), fps=fps, crf=18, preset=preset)
+                data = encode_mp4(
+                    frames.permute(0, 2, 3, 1).numpy(), fps,
+                    options={"crf": "18", "preset": preset, "threads": "0"},
+                    rate_denominator=1000, pad_even=True,
+                )
             return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
@@ -1391,6 +1374,18 @@ class Cosmos3Model(Model):
                 1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
             ),
         }
+        latent_px = self.config.vae.scale_factor_spatial
+        if params["width"] < latent_px or params["height"] < latent_px:
+            raise ValueError(
+                f"Cosmos3 width and height must be at least {latent_px} px (one latent pixel), "
+                f"got {params['width']}x{params['height']}."
+            )
+        frames_per_latent = self.config.vae.scale_factor_temporal
+        if params["has_image_condition"] and action_mode is None and num_frames <= frames_per_latent:
+            # the image pins the first latent frame, so one latent frame leaves nothing to denoise
+            raise ValueError(
+                f"Cosmos3 image conditioning requires a video request (num_frames > {frames_per_latent})."
+            )
         # Video-to-video: a non-action video input pins clean conditioning
         # latent frames taken from the request video (reference recipe defaults:
         # indexes (0, 1), keep "first", flow_shift 10.0). Validated here so a
@@ -1459,18 +1454,23 @@ class Cosmos3Model(Model):
             domain_name = mk.get("domain_name")
             if domain_name is None and mk.get("domain_id") is None and action_mode == ACTION_MODE_POLICY:
                 domain_name = self.config.policy_domain_name
-            params["domain_id"] = resolve_action_domain_id(mk.get("domain_id"), domain_name)
+            params["domain_id"] = resolve_action_domain_id(
+                mk.get("domain_id"), domain_name, self.config.num_embodiment_domains
+            )
             raw_dim = mk.get("raw_action_dim")
             if raw_dim is None and state_dim:
                 raw_dim = state_dim
             is_fd = action_mode == ACTION_MODE_FORWARD_DYNAMICS
-            if raw_dim is None and is_fd and mk.get("action_shape"):
-                raw_dim = int(mk["action_shape"][-1])
-            if raw_dim is None and is_fd and mk.get("action") is not None:
+            fd_shape = None  # forward dynamics' action rows: [steps, width] or [1, steps, width]
+            if is_fd and mk.get("action_shape"):
+                fd_shape = list(mk["action_shape"])
+            elif is_fd and mk.get("action") is not None:
                 try:
-                    raw_dim = int(torch.as_tensor(mk["action"]).shape[-1])
+                    fd_shape = list(torch.as_tensor(mk["action"]).shape)
                 except (TypeError, ValueError, RuntimeError):
-                    raw_dim = None
+                    fd_shape = None
+            if raw_dim is None and fd_shape:
+                raw_dim = int(fd_shape[-1])
             if raw_dim is None:
                 raise ValueError(
                     "Cosmos3 action requests require 'raw_action_dim' (it may be left out when "
@@ -1483,6 +1483,14 @@ class Cosmos3Model(Model):
                     f"got {raw_dim}."
                 )
             params["raw_action_dim"] = raw_dim
+            if is_fd and not (
+                fd_shape and len(fd_shape) >= 2 and fd_shape[:-2] in ([], [1]) and fd_shape[-2] >= 1
+                and fd_shape[-1] >= raw_dim
+            ):
+                raise ValueError(
+                    f"Cosmos3 forward_dynamics requires an 'action' array of shape [steps, {raw_dim}] "
+                    f"with at least one step, got {fd_shape}."
+                )
             if state_dim:
                 if state_dim != raw_dim:
                     raise ValueError(

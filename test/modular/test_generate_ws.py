@@ -11,7 +11,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import multiprocessing as mp
+import os
+import signal
+import threading
 import time
+from pathlib import Path
 
 import msgpack
 import pytest
@@ -19,7 +24,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from mstar.api_server import entrypoint
+from mstar.api_server import entrypoint, ws_frames
 from mstar.api_server.request_types import ResultChunk
 
 
@@ -64,6 +69,26 @@ class _FakeServer:
                     data=message.encode(), metadata={"status": status},
                 )
                 return
+
+
+@pytest.fixture
+def frame_pool():
+    ws_frames.start()
+    yield
+    ws_frames.stop()
+
+
+def _every_frame_off_the_loop(monkeypatch):
+    monkeypatch.setattr(ws_frames, "OFF_LOOP_TEXT_BYTES", 0)
+    monkeypatch.setattr(ws_frames, "OFF_LOOP_BINARY_BYTES", 0)
+
+
+@pytest.fixture(params=[False, True], ids=["on the loop", "in the pool"])
+def off_loop(request, monkeypatch):
+    """The test twice: every frame parsed on the loop, then in the pool."""
+    if request.param:
+        request.getfixturevalue("frame_pool")
+        _every_frame_off_the_loop(monkeypatch)
 
 
 def _recv_until_finish(ws, binary):
@@ -154,7 +179,7 @@ def test_not_ready_closes(monkeypatch):
     assert info.value.code == 1013
 
 
-def test_undecodable_and_empty_frames_are_reported(monkeypatch, tmp_path):
+def test_undecodable_and_empty_frames_are_reported(monkeypatch, tmp_path, off_loop):
     fake = _FakeServer(tmp_path)
     monkeypatch.setattr(entrypoint, "api_server", fake)
     with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
@@ -242,9 +267,11 @@ def test_wrongly_typed_fields_are_rejected_by_name(monkeypatch, tmp_path, messag
     assert not fake.submitted
 
 
-def test_uploads_are_cleaned_up(monkeypatch, tmp_path):
+def test_uploads_are_cleaned_up(monkeypatch, tmp_path, off_loop):
     """Files a message carried are scheduled for deletion once the request is
-    done, as the HTTP route does; a message rejected halfway leaves none."""
+    done, as the HTTP route does; a message rejected halfway, or before its
+    files are taken, leaves none. Also for a frame parsed in the pool, which
+    saves its files as it parses."""
     fake = _FakeServer(tmp_path, chunks_per_request=1)
     scheduled = []
     monkeypatch.setattr(entrypoint, "_schedule_upload_cleanup", lambda paths, delay_s=60.0: scheduled.append(paths))
@@ -262,10 +289,241 @@ def test_uploads_are_cleaned_up(monkeypatch, tmp_path):
             "request_id": "half",
         }))
         err = json.loads(ws.receive_text())
+        ws.send_bytes(msgpack.packb({"files": [{"name": "d.png", "data": b"D"}], "request_id": 5}))
+        refused = msgpack.unpackb(ws.receive_bytes(), raw=False)
     assert "Cannot determine modality" in err["error"]
+    assert refused["error"] == "request_id must be a string"
     assert scheduled == [fake.submitted[0]["file_paths"]]
+    assert [open(p, "rb").read() for p in fake.submitted[0]["file_paths"]["image"]] == [b"A"]
     saved = sorted(f.name.split("_", 1)[1] for f in tmp_path.iterdir())
     assert saved == ["a.png", "b.wav"], saved
+
+
+async def _saved(task: asyncio.Task, upload_dir: Path) -> None:
+    """Until ``task``'s parse has saved its first file, ``a.png``."""
+    deadline = time.monotonic() + 30
+    while not any(p.name.endswith("_a.png") for p in upload_dir.iterdir()):
+        assert not task.done() and time.monotonic() < deadline, "the first file was never saved"
+        await asyncio.sleep(0.001)
+
+
+def test_a_large_frame_parses_while_the_loop_keeps_serving(frame_pool, tmp_path):
+    """json.loads and base64 decoding hold the GIL, so a thread can't take a
+    large frame off the loop: a 100 MiB message stalled every request for
+    about half a second. A frame past OFF_LOOP_TEXT_BYTES parses in the pool, and
+    the loop keeps running meanwhile."""
+    data = bytes(range(256)) * (24 << 12)  # 24 MiB of file, 32 MiB as base64
+    frame = json.dumps({"request_id": "r", "files": [{"name": "a.png", "data": base64.b64encode(data).decode()}]})
+
+    async def parse_beside_a_ticker():
+        ticks, done = 0, asyncio.Event()
+
+        async def tick():
+            nonlocal ticks
+            while not done.is_set():
+                await asyncio.sleep(0.001)
+                ticks += 1
+
+        ticker = asyncio.create_task(tick())
+        await asyncio.sleep(0.01)
+        ticks = 0
+        message = await ws_frames.parse_frame(frame, tmp_path)
+        done.set()
+        await ticker
+        return message, ticks
+
+    message, ticks = asyncio.run(parse_beside_a_ticker())
+    assert ticks >= 10, ticks  # on the loop this is 1: the parse is one blocking call
+    (entry,) = message["files"]
+    assert open(entry["data"].claim(), "rb").read() == data
+
+
+def test_a_frame_in_flight_when_a_parser_process_dies_fails_and_a_new_pool_takes_the_next(
+    frame_pool, monkeypatch, tmp_path,
+):
+    _every_frame_off_the_loop(monkeypatch)
+    frame = json.dumps({"files": [
+        {"name": "a.png", "data": "QUJD"},
+        {"name": "b.png", "data": base64.b64encode(bytes(64 << 20)).decode()},
+    ]})
+
+    async def kill_a_process_mid_parse():
+        broken = ws_frames._pool
+        task = asyncio.create_task(ws_frames.parse_frame(frame, tmp_path))
+        await _saved(task, tmp_path)
+        for process in broken._processes.values():
+            process.kill()
+        with pytest.raises(OSError, match="parser process died"):
+            await task
+        assert ws_frames._pool not in (None, broken)
+        return await ws_frames.parse_frame('{"text": "next"}', tmp_path)
+
+    assert asyncio.run(kill_a_process_mid_parse()) == {"text": "next"}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_frame_after_a_parser_process_died_idle_goes_to_a_new_pool(frame_pool, monkeypatch, tmp_path):
+    """The dead pool held nothing of this frame's, so it has no reason to fail."""
+    _every_frame_off_the_loop(monkeypatch)
+
+    async def kill_a_process_then_parse():
+        broken = ws_frames._pool
+        broken.submit(ws_frames.parse, b"\x80").result()  # a process is up
+        for process in broken._processes.values():
+            process.kill()
+        deadline = time.monotonic() + 30
+        while not broken._broken:
+            assert time.monotonic() < deadline, "the pool never saw its process die"
+            await asyncio.sleep(0.001)
+        message = await ws_frames.parse_frame('{"text": "next"}', tmp_path)
+        assert ws_frames._pool not in (None, broken)
+        return message
+
+    assert asyncio.run(kill_a_process_then_parse()) == {"text": "next"}
+
+
+def test_a_file_that_cannot_be_saved_refuses_its_message_and_leaves_nothing(monkeypatch, tmp_path, off_loop):
+    fake = _FakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"request_id": "r", "text": "x", "files": [
+            {"name": "a.png", "data": "QUJD"}, {"name": "b" * 300 + ".png", "data": "QUJD"},
+        ]}))
+        reply = json.loads(ws.receive_text())
+    assert reply["request_id"] == "r" and str(tmp_path) not in reply["error"]
+    assert list(tmp_path.iterdir()) == [] and not fake.submitted
+
+
+def test_a_message_the_pool_cannot_send_back_takes_its_saved_files_with_it(frame_pool, monkeypatch, tmp_path):
+    """Pickling the message can fail after its files are saved, on a nesting
+    json takes, where the worker can no longer remove them."""
+    _every_frame_off_the_loop(monkeypatch)
+    frame = '{"files": [{"name": "a.png", "data": "QUJD"}], "model_kwargs": ' + "[" * 8000 + "]" * 8000 + "}"
+
+    with pytest.raises(RecursionError):
+        asyncio.run(ws_frames.parse_frame(frame, tmp_path))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_parse_its_socket_stopped_waiting_for_still_takes_its_files_with_it(frame_pool, monkeypatch, tmp_path):
+    """The frame's task is cancelled once the worker has saved its first file,
+    and the worker then dies on the second: nothing is left."""
+    _every_frame_off_the_loop(monkeypatch)
+    frame = json.dumps({"files": [
+        {"name": "a.png", "data": "QUJD"},
+        {"name": "b.png", "data": base64.b64encode(bytes(64 << 20)).decode()},
+    ]})
+
+    async def cancel_once_saved():
+        task = asyncio.create_task(ws_frames.parse_frame(frame, tmp_path))
+        await _saved(task, tmp_path)
+        task.cancel()
+        for process in ws_frames._pool._processes.values():
+            process.kill()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_once_saved())
+    deadline = time.monotonic() + 10
+    while list(tmp_path.iterdir()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert list(tmp_path.iterdir()) == []
+
+
+def _stopped_while_saving(frame, upload_dir):
+    ws_frames._worker_init()
+
+    def stop_once_the_second_file_is_open():
+        while not any(p.name.endswith("_b.png") for p in Path(upload_dir).iterdir()):
+            time.sleep(0.0005)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=stop_once_the_second_file_is_open, daemon=True).start()
+    ws_frames._parse_saving_files(frame, False, upload_dir)
+    time.sleep(30)
+
+
+def test_a_pool_process_stopped_mid_frame_removes_what_it_saved(tmp_path):
+    """When one pool process dies the pool stops the others, whose frames'
+    futures have already failed and been swept; one still saving, the file it
+    is writing included, must not leave its files."""
+    frame = tmp_path / "f.wsframe"
+    frame.write_text(json.dumps({"files": [
+        {"name": "a.png", "data": "QUJD"},
+        {"name": "b.png", "data": base64.b64encode(bytes(128 << 20)).decode()},
+    ]}))
+    process = mp.get_context("spawn").Process(target=_stopped_while_saving, args=(str(frame), str(tmp_path)))
+    process.start()
+    process.join(60)
+    assert process.exitcode == 0
+    assert [p.name for p in tmp_path.iterdir() if p.suffix == ".png"] == []
+
+
+def test_a_frame_the_server_could_not_hand_off_gets_a_500_not_undecodable(monkeypatch, tmp_path):
+    fake = _FakeServer(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", fake)
+
+    async def fails(payload, upload_dir):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ws_frames, "parse_frame", fails)
+    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
+        ws.send_text(json.dumps({"text": "x", "request_id": "r"}))
+        reply = json.loads(ws.receive_text())
+    assert reply["status"] == 500 and "undecodable" not in reply["error"]
+
+
+def test_data_that_is_not_base64_does_not_travel_back_from_the_pool(frame_pool, monkeypatch, tmp_path):
+    """The request refuses it either way; carrying it back would put its bytes
+    through the loop again."""
+    _every_frame_off_the_loop(monkeypatch)
+    frame = json.dumps({"files": [{"name": "a.png", "data": "QUJD" * (1 << 18) + "\u00e9"}]})
+    message = asyncio.run(ws_frames.parse_frame(frame, tmp_path))
+    assert len(message["files"][0]["data"]) < 16
+
+
+def test_a_socket_closed_while_its_files_decode_leaves_none(monkeypatch, tmp_path):
+    """Closing the socket cancels the message's task while the threadpool is
+    still writing its files, which the task never got to schedule for
+    cleanup: they are removed once the write is done."""
+    monkeypatch.setattr(entrypoint, "api_server", _FakeServer(tmp_path))
+    decoding, closed, unlinked = threading.Event(), threading.Event(), threading.Event()
+    decode, unlink = entrypoint._decode_ws_files, entrypoint.unlink_files
+
+    def slow(files, upload_dir):
+        decoding.set()
+        closed.wait(10)  # the socket closes, and its task is cancelled, first
+        return decode(files, upload_dir)
+
+    def unlink_files(file_paths):
+        unlink(file_paths)
+        unlinked.set()
+
+    monkeypatch.setattr(entrypoint, "_decode_ws_files", slow)
+    monkeypatch.setattr(entrypoint, "unlink_files", unlink_files)
+
+    class _Socket:
+        def __init__(self):
+            self.frames = [{"type": "websocket.receive", "text": json.dumps(
+                {"text": "hi", "files": [_OBS], "request_id": "r"})}]
+
+        async def accept(self):
+            pass
+
+        async def receive(self):
+            if self.frames:
+                return self.frames.pop()
+            await asyncio.to_thread(decoding.wait)
+            return {"type": "websocket.disconnect"}
+
+    async def run():
+        await entrypoint.generate_ws(_Socket())
+        await asyncio.sleep(0)  # the task takes its cancel
+        closed.set()
+        assert await asyncio.to_thread(unlinked.wait, 10), "nothing removed the decoded files"
+
+    asyncio.run(run())
+    assert list(tmp_path.iterdir()) == []
 
 
 class _ListeningFakeServer(_FakeServer):

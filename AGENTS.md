@@ -102,7 +102,7 @@ See https://github.com/mstar-project/mstar/pull/368 for some sources of overhead
 
 By default the worker speculates step N+1 through the graph while step N is still running (`enable_async_scheduling`, [mstar/graph/base.py](mstar/graph/base.py#L240), default `True`). It pre-plans it on a separate thread and stream. The full stage order, thread by thread, is in [.claude/skills/async-worker/SKILL.md](.claude/skills/async-worker/SKILL.md) — **read it before changing the worker's main loop, the GPU thread, the plan thread, speculation or postprocess.**
 
-(Note: for lockstep-parallel (TP/SP) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `1`; set it to `0` to run those nodes serially)
+(Note: for lockstep-parallel (TP/SP/CFG) nodes this is gated off by `MSTAR_TP_ASYNC_SCHED`, which defaults to `1`; set it to `0` to run those nodes serially)
 
 There's no mechanical rule to follow here (e.g., no "every mutation on the normal follow path must also happen on the speculative one" -- the two paths have different logic on purpose), but it's worthwhile to understand the flow of the speculation path and keep it in mind. The invariant is that a change to this code is reasoned about in terms of the documented stage order, which thread it runs on, and what is still in flight at that point. Unsubstantiated guesses are likely to produce plausible, wrong conclusions.
 
@@ -119,6 +119,8 @@ Some additional information:
 To branch on the GPU vendor or architecture, ask `mstar.platforms.current_platform` (`is_rocm()`, `arch()`, `has_cuda_capability()`) rather than `torch.version.hip`, the `cuda` device type, or a raw compute capability. PyTorch's ROCm build calls AMD GPUs `cuda` devices and reports an MI300X as compute capability 9.4, so neither tells you the vendor. Checking `device.type == "cuda"` to ask "is this a GPU" is still fine.
 
 ### 9. Update the documentation
+
+**Sphinx and Mintlify**: `docs/*.rst` remains canonical during the migration. When changing a guide that has a counterpart in `docs/mintlify/`, update its `.rst` and `.mdx` files in the same PR. This applies to the model, resource, installation, and environment-variable documentation below. See [docs/mintlify/CONTRIBUTING.md](docs/mintlify/CONTRIBUTING.md) for preview and validation commands; the generated Python API reference remains on Sphinx.
 
 **Models and resources**: should be documented in docs/models.rst and docs/adding_models.rst, respectively.
 
@@ -149,7 +151,7 @@ Two things about what the number is for. **Don't optimize against one benchmark.
 
 ### 11. Ranks in a lockstep instance must stay in lockstep
 
-A node's TP×SP block is its **lockstep instance** ([mstar/distributed/communication.py](mstar/distributed/communication.py)). Every rank in it must execute the same sequence of collectives, in the same order, with the same shapes — including on failure paths.
+A node's TP×SP×CFG block is its **lockstep instance** ([mstar/distributed/communication.py](mstar/distributed/communication.py)). Every rank in it must execute the same sequence of collectives, in the same order, with the same shapes — including on failure paths.
 
 The failure mode that actually happens: a readiness scan, admission check, capture decision or early `return` that consults **per-rank** state, so one rank takes a branch the others don't and the instance deadlocks on the next collective. Anything that decides control flow for the instance must be derived from state all ranks agree on, or reduced across the group first — `accelerator_graph_runner.py` ANDs capture flags across the joint group for exactly this reason, and barriers once per spec whether it passed or failed.
 
@@ -187,12 +189,23 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 
 ```bash
 ruff check .                          # CI enforces this
-python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
-    test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
-                                      # the CPU Core CI job (CI adds -p xdist -n 4), no GPU or weights
+# the CPU Core CI job's tests, no GPU or weights; see "Running the CPU suite" below
+CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    python -m pytest test/modular test/distributed test/chatterbox test/kokoro \
+    test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases \
+    -q -p xdist -n 8 --dist worksteal --timeout=120 --basetemp=$(mktemp -d /tmp/s_XXXX)
 pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
+
+### Running the CPU suite
+
+It takes 4 to 5 minutes on 8 CPUs from a local disk, and about 10 in CI on 4. If it is taking much longer, something is wrong; don't wait it out.
+
+- **Run it from a local disk.** The same code on the same 8 CPUs took 4:15 from a local disk and 16:23 from a network volume, where file metadata calls were about 23x slower. The volume also added 9 failures, several at the per-test limit, in `test_tp_read_check.py`, `test_tp_read_failure_acceptance.py`, `test_shm_shutdown_cleanup.py` and `test_transport_microbench.py`. They read like transport bugs. If your checkout is on a network volume, make a worktree on local disk and run from there.
+- **While iterating, run the modules your change touches.** Save the full suite for a commit you intend to push.
+- **Keep the per-test limit.** `--timeout=120` (`pytest-timeout`) names a stuck test instead of letting it hold the run; CI's slowest test is about 85 s.
+- **Match CI's environment.** A visible GPU sends tests that check for one onto it.
 
 The CPU suites build a graph runtime and the Rust communicator, so they need the Rust extension: `maturin develop --release -m rust/Cargo.toml` once in a checkout.
 
@@ -202,7 +215,7 @@ CI has no GPU. A PR whose change runs on the GPU says which GPU tests it ran, on
 
 The modular tests exist because these are the parts that are easy to get wrong: `test_resource_runner.py` (the admit/plan/commit lifecycle from `declare_step`), `test_accelerator_graph_capture.py` (bucket keys, `cg_key_info`, `additional_key_info`), `test_micro_scheduler.py` (admission, failure, backpressure), `test_admit_failure_handling.py`, `test_kv_offload.py`.
 
-Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep. When a test needs a worker or engine method, build the smallest real object (`Worker.__new__(Worker)` plus the attributes the method reads) and call the real method rather than copying its body into a fake: a copy keeps passing after the real code changes. [#444](https://github.com/mstar-project/mstar/pull/444) (open PR) updates 14 tests whose hand-built stubs had drifted from main.
+Note that modular tests run models in **dummy mode**, where `get_submodule` returns `None`, and that several fakes stub worker internals **by name** — renaming a private on `Worker` can break them without any grep hit at the definition. Run the suite, don't just grep. When a test needs a worker method, build a real worker with `make_worker` ([mstar/testing_utils/](mstar/testing_utils/)), passing only the collaborators the method reaches; for an engine method, build the smallest real engine. Either way, call the real method rather than copying its body into a fake: a copy keeps passing after the real code changes. [#444](https://github.com/mstar-project/mstar/pull/444) (open PR) updates 14 tests whose hand-built stubs had drifted from main.
 
 If a bug only reproduces through a running server, write a standalone harness before the third attempt. A server restart can be minutes of compilation, while a harness that builds the resources directly, drives `admit`/`plan`/`commit` by hand, and captures and replays a graph runs in seconds — [test/modular/test_gdn_cuda_graph.py](test/modular/test_gdn_cuda_graph.py) is the shape to copy. Where the bug is inside a captured graph, intermediates are invisible after a replay; returning `torch.isfinite(x).all()` per layer as an extra graph output gives a flag tensor readable afterwards, which names the first bad kernel instead of the first place the damage shows.
 
@@ -212,9 +225,9 @@ Output-quality artifacts get the same check, against the reference implementatio
 
 When rebasing onto a `main` that moved, check each resolution for hunks that kept **both** sides. Two got through one rebase here: one reinstated a behaviour the commit existed to remove, and the other defeated a guard's fall-through so a step admitted with nothing reserved. Both read as plausible merges, and neither conflicted again afterwards — the modular tests caught them, which is the argument for running them per step rather than at the end.
 
-The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`. A stale build imports fine and then fails at request time (often as an unexpected-keyword `TypeError` from a runtime call), and tests that need it (e.g., `test_graph_runtime_factory.py`) fail in a checkout where it isn't built. Rebuild before believing either.
+The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`; so does `mstar-server` (`rust/server/`, behind `--rust-frontend`). In a checkout, a stale extension is refused wherever a graph runtime or tensor store is built (`require_rust_extension`), and `find_server_binary` skips a stale `mstar-server` (one named by `MSTAR_SERVER_BIN` or `--rust-frontend-bin` only gets a warning), so a stale build stops the server at startup and fails the tests that need it. Run the rebuild command the refusal prints as given: its `touch` is what makes cargo rebuild sources copied in with old mtimes (`git archive | tar x`, `rsync -a`, `cp -p`). Code that calls `mstar_rust` directly is not checked; there a stale build still imports fine and fails at call time, often as an unexpected-keyword `TypeError`.
 
-Unix-socket paths are limited to about 107 characters, so a long `--basetemp` or `TMPDIR` makes the ZMQ-based Rust tests fail with `File name too long`, which reads like a real failure. Use a short `--basetemp`.
+Unix-socket paths are limited to about 107 characters, so a long `--basetemp` or `TMPDIR` makes the ZMQ-based Rust tests fail with `File name too long`, which reads like a real failure. Use a short `--basetemp`, and a different one per run: pytest empties an existing `--basetemp` at startup, which fails any run already using it.
 
 ## Splitting work across PRs
 

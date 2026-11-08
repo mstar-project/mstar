@@ -290,13 +290,32 @@ class Qwen3_5ForCausalLM(nn.Module):
             gather_output=True,
         )
         if config.tie_word_embeddings:
+            # PEFT adapts the head and the embedding apart even when they share a weight
             self.lm_head.weight = self.model.embed_tokens.weight
 
+    def checkpoint_rules(self):
+        """How the checkpoint's text tower lands here (the MTP head and the vision tower
+        dropped), for its weight loader and for LoRA adapters."""
+        from mstar.model.loader import CheckpointRules
+        from mstar.model.qwen3_5.weight_loader import _STACKED_PARAMS, qwen3_5_name_remapper
+
+        return CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=qwen3_5_name_remapper)
+
+    # The decoder contract `SampledTokenDecoder` drives (as `Qwen3DenseLM`).
+
+    @property
+    def embed_dtype(self) -> torch.dtype:
+        return self.model.embed_tokens.weight.dtype
+
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+
     def forward(
-        self, input_ids: torch.Tensor, *, label: str,
+        self, input_embeds: torch.Tensor, *, label: str,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        hidden = self.model(
-            self.model.embed_tokens(input_ids), label=label, cos_sin=cos_sin,
-        )
+        """``(tokens, hidden)`` in, the stack's normed output out."""
+        return self.model(input_embeds, label=label, cos_sin=cos_sin)
+
+    def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

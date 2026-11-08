@@ -18,9 +18,9 @@ from test_output_failure_teardown import _Model, _TensorManager, _thread
 from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.engine.engine import ExecutingBatch
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ConductorMessageType
-from mstar.worker.micro_scheduler import MicroScheduler
-from mstar.worker.worker import Worker
+from mstar.worker.micro_scheduler import CHAIN_LANE
 
 USER = getpass.getuser()
 ERROR_ID = re.compile(r"error id ([0-9a-f]{12})\)")
@@ -106,20 +106,19 @@ def test_an_arena_io_error_reaches_the_client_as_an_error_id(caplog):
 
 
 def _worker(rids=("r1",)):
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w.sent = []
-    w.communicator = SimpleNamespace(send=lambda entity, msg: w.sent.append(msg))
-    w.request_state = SimpleNamespace(per_request_info={rid: object() for rid in rids})
-    w._graph_runtime = SimpleNamespace(
-        get_rid_string=lambda h: h, set_in_flight=lambda *args: None,
+    sent = []
+    request_state = SimpleNamespace(per_request_info={rid: object() for rid in rids})
+    runtime = SimpleNamespace(get_rid_string=lambda h: h, set_in_flight=lambda *args: None)
+    scheduler = make_scheduler(request_state=request_state, graph_runtime=runtime)
+    w = make_worker(
+        communicator=SimpleNamespace(send=lambda entity, msg: sent.append(msg)),
+        request_state=request_state, _graph_runtime=runtime,
+        scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
-    w.scheduler = MicroScheduler.__new__(MicroScheduler)
-    w.scheduler.failed_rids = set()
-    w.scheduler.held_until = {}
-    w.scheduler.admit_errors = {}
-    w.scheduler.backlog = {}
-    w._in_flight_rids = set(rids)
+    w.sent = sent
+    for rid in rids:
+        w.lifecycle.add(rid, rid)
+    w._hold_rows(CHAIN_LANE, rids)
     return w
 
 
@@ -243,12 +242,14 @@ def test_scrub_paths_cuts_absolute_paths_to_base_names(raw, scrubbed):
 def test_a_failed_kv_retrieve_reaches_the_client_without_its_path(caplog):
     from concurrent.futures import Future
 
+    from mstar.engine.resources.kv.arena import new_page_arena
     from mstar.engine.resources.kv.manager import CacheStream, KVManager
 
     snapshot = "/srv/private/alice/kv-worker-12345.pt"
     future = Future()
     future.set_exception(FileNotFoundError(2, "No such file or directory", snapshot))
-    manager = SimpleNamespace(_streams={"r1": {"main": CacheStream(read_pending=True, read_future=future)}})
+    stream = CacheStream(page_indices=new_page_arena(1).new_stream(), read_pending=True, read_future=future)
+    manager = SimpleNamespace(_streams={"r1": {"main": stream}})
     with caplog.at_level("ERROR"):
         reasons = [KVManager._check_ready(manager, "r1", "main") for _ in range(2)]
     assert [ready for ready, _ in reasons] == [False, False]

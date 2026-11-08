@@ -10,7 +10,7 @@ import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine import engine as engine_mod
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.kv import manager as manager_mod
@@ -21,6 +21,7 @@ from mstar.engine.resources.position.manager import (
     RopeManager,
 )
 from mstar.engine.resources.step import ADMIT_OK, Segment, StepContext
+from mstar.testing_utils.engine import make_engine
 
 OWN_HANDLE = ("own", 0)
 
@@ -190,9 +191,7 @@ def test_runner_snapshot_and_finish_equal_publish_and_skip_the_silent():
 
 
 def _engine_with(runner):
-    eng = Engine.__new__(Engine)
-    eng._runner = runner
-    eng._enable_nvtx = False
+    eng = make_engine(_runner=runner)
     return eng
 
 

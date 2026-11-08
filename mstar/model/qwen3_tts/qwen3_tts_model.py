@@ -13,10 +13,10 @@ registry key.
 Architecture (two asynchronous partitions):
     Talker     - text/voice prefill, then autoregressive 16-group codec frames
     RefEncoder - (Base) reference clip -> x-vector + codec frames, feeds the prefill
-    Codec      - stateless speech-tokenizer decoder producing PCM chunks
+    Codec      - speech-tokenizer decoder producing PCM chunks, its state kept per stream
 
 Streaming topology:
-    Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((1, 3, 8, 16), 25, 72)]--> Codec
+    Talker --[codec_tokens, ScheduledLeftContextChunkPolicy((1, 3, 8, 16), 25, 0)]--> Codec
 
 Request state machine:
     Talker: talker_prefill | talker_prefill_clone -> talker_decode loop -> done on EOS/token limit
@@ -58,6 +58,8 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
+from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -73,12 +75,14 @@ from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
     CODE_PRED_SAMPLER,
+    CODEC_STATE,
     LANGUAGE_ID_KEY,
     PROMPT_LAYOUT_KEY,
     REF_CLIP_KEY,
     SPEAKER_ID_KEY,
     TALKER_ATTN,
     TALKER_KV,
+    TALKER_MIXED,
     TALKER_POS,
     TALKER_SAMPLER,
     Qwen3TTSModelConfig,
@@ -156,8 +160,13 @@ def _adapt_tokenizer_module(module) -> None:
 
     The decoder config asks for the ``default`` RoPE (dropped from
     ``ROPE_INIT_FUNCTIONS``), and the mask builders renamed ``input_embeds``
-    to ``inputs_embeds`` and dropped ``cache_position``.
+    to ``inputs_embeds`` and dropped ``cache_position``. transformers 5.21
+    made ``MimiModel.upsample`` and ``decoder_transformer`` read-only
+    properties, which the encoder sets to ``None``; plain class attributes
+    let it.
     """
+    module.Qwen3TTSTokenizerV2Encoder.upsample = None
+    module.Qwen3TTSTokenizerV2Encoder.decoder_transformer = None
     rope = module.ROPE_INIT_FUNCTIONS
     if "default" not in rope:
         def default_rope(config, device=None, seq_len=None, layer_type=None):
@@ -187,6 +196,14 @@ def _adapt_tokenizer_module(module) -> None:
 #: qwen-tts pins transformers==4.57.3, which most environments with other
 #: extras cannot satisfy; only its source files are used, so its pins are skipped.
 QWEN_TTS_INSTALL = 'uv pip install --no-deps "qwen-tts==0.1.1"'
+
+#: Where transformers 5.21+ puts the flat Mimi checkpoint's encoder half (its
+#: ``conversion_mapping`` for ``MimiModel``); the quantizer keeps its names.
+_MIMI_NESTED_ENCODER = {
+    "encoder.layers.": "encoder.encoder_seanet.layers.",
+    "encoder_transformer.": "encoder.encoder_transformer.",
+    "downsample.": "encoder.downsample.",
+}
 
 
 @lru_cache(maxsize=1)
@@ -390,6 +407,10 @@ class Qwen3TTSModel(Model):
     prompt processing, configuration, and output encoding.
     """
 
+    # Streams the codec state pool holds (about 5 MiB each in float32); a
+    # deployment sizes it with ``resources: {codec_state: {max_slots: ...}}``.
+    MAX_CODEC_STREAMS = 256
+
     def __init__(
         self,
         model_path_hf: str,
@@ -409,12 +430,28 @@ class Qwen3TTSModel(Model):
         self.audio_watermark = AudioWatermarkConfig.parse(kwargs.get("audio_watermark"))
         if self.audio_watermark.enabled:
             import_audioseal()
+        # Server-init knob: the 1.7B CodePredictor's depth loop as one persistent kernel on Hopper
+        # (``mstar.model.qwen3_tts.components.depth_frame``). Its codes can differ from the loop's in the last bits.
+        self.depth_kernel = bool(kwargs.get("depth_kernel", False))
 
         # The lightweight API-side object needs config and tokenizer only.
         self.local_dir = _resolve_model_metadata(model_path_hf, cache_dir)
         # Rejects unknown ``tts_model_type`` values; every supported variant
         # is handled below through the config's capability properties.
         self.config = Qwen3TTSModelConfig.from_pretrained(self.local_dir)
+        # Server-init knobs: the codec's chunk ramp and steady chunk, in frames
+        # (a bigger first chunk gives a client more audio to play while the
+        # next one is made; a smaller one, earlier first audio).
+        codec = self.config.codec
+        if kwargs.get("codec_chunk_schedule") is not None:
+            codec.chunk_schedule = tuple(int(n) for n in kwargs["codec_chunk_schedule"])
+        if kwargs.get("codec_chunk_frames") is not None:
+            codec.chunk_frames = int(kwargs["codec_chunk_frames"])
+        if not codec.chunk_schedule or min(*codec.chunk_schedule, codec.chunk_frames) < 1:
+            raise ValueError(
+                f"codec_chunk_schedule {codec.chunk_schedule} and codec_chunk_frames {codec.chunk_frames} "
+                "must be positive frame counts"
+            )
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.local_dir,
@@ -446,11 +483,31 @@ class Qwen3TTSModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """Per-request adapters on the Talker: every linear of its stack and the
+        codec-group-0 head (one row per request: the last token's), named as the
+        checkpoint does (``talker.*``) or as the Talker alone does. The text projection
+        takes none: it runs in ``prepare_inputs``, outside the step. The CodePredictor's
+        depth loop and the speaker / codec models are not served."""
+        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
+
+        root = meta_root(lambda group: Qwen3TTSTalkerModel(self.config, comm_group=group))
+        return [module_lora_spec(
+            root, resource_key=LORA_RESOURCE_KEY, nodes={"Talker"}, root_path="model",
+            rows={"codec_head": PER_SEGMENT},
+            exclude={"text_projection": "runs in prepare_inputs, outside the planned step"},
+        )]
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Talker paged KV + attention/position/sampler resources.
+        """Talker paged KV + attention/position/sampler resources, and the
+        Codec's per-stream decoder state.
 
         The CodePredictor's frame-local KV scratch is not a resource; its
         ``DepthKV`` owns it (overwritten every step)."""
+        from mstar.model.qwen3_tts.components.incremental_codec import codec_state_blocks
+
         talker = self.config.talker
         cp = talker.code_predictor
         talker_kv = PagedKVConfig(
@@ -462,13 +519,15 @@ class Qwen3TTSModel(Model):
         )
         return [
             KVSpec(resource_key=TALKER_KV, nodes={"Talker"}, config=talker_kv),
+            # Every checkpoint has two query heads per KV head: the CUDA-core
+            # decode kernel wins, since the tensor-core one pads them to a tile
             AttentionSpec(
                 resource_key=TALKER_ATTN, nodes={"Talker"},
-                config=AttentionConfig(kv_cache=TALKER_KV),
+                config=AttentionConfig(kv_cache=TALKER_KV, decode_tensor_cores=False),
             ),
             PositionSpec(
                 resource_key=TALKER_POS, nodes={"Talker"},
-                config=PositionConfig(kv_cache=TALKER_KV),
+                config=PositionConfig(kv_cache=TALKER_KV, rope_theta=talker.rope_theta),
             ),
             SamplerSpec(
                 resource_key=TALKER_SAMPLER, nodes={"Talker"},
@@ -479,6 +538,16 @@ class Qwen3TTSModel(Model):
                 resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
                 vocab_size=cp.vocab_size,
                 enable_repetion_penalty=False,
+            ),
+            RecurrentStateSpec(
+                resource_key=CODEC_STATE, nodes={"Codec"},
+                config=RecurrentStateConfig(
+                    # the transformer's layers are named blocks
+                    num_layers=1,
+                    blocks=codec_state_blocks(self.config.codec, self.codec_dtype),
+                    # streams being decoded at once, + 1 for the pool's sink slot
+                    max_slots=self.MAX_CODEC_STREAMS + 1,
+                ),
             ),
         ]
 
@@ -573,6 +642,15 @@ class Qwen3TTSModel(Model):
             ])
         return walks
 
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        # A prefill is the decode forward over a longer row (both emit one
+        # frame per row), so a new prompt can ride the decode step instead of
+        # a step of its own that every decode row waits behind.
+        walks = {"talker_prefill", "talker_decode"}
+        if self.config.supports_reference_audio:
+            walks.add("talker_prefill_clone")
+        return {"Talker": {TALKER_MIXED: walks}}
+
     # -----------------------------------------------------------------------
     # Asynchronous partitions and stream buffering
     # -----------------------------------------------------------------------
@@ -599,14 +677,13 @@ class Qwen3TTSModel(Model):
         ]
 
     def get_partition_topology(self) -> PartitionTopology:
-        """Buffer codec frames in a ramp of chunks with left context.
+        """Buffer codec frames in a ramp of chunks of new frames.
 
         The first Codec invocation runs after ``chunk_schedule[0]`` frames so
-        audio starts flowing early; chunks then grow to ``chunk_frames``. Every
-        window after the first is preceded by up to ``left_context_frames``
-        already decoded frames to avoid boundary artifacts;
-        ``CodecSubmodule.postprocess`` removes the duplicated PCM prefix using
-        the context count the stream buffer reports for each window.
+        audio starts flowing early; chunks then grow to ``chunk_frames``. No
+        chunk repeats earlier frames: the codec keeps its decoder state per
+        stream (``CODEC_STATE``). Only an in-context clone's first chunk carries
+        context, the reference tail primed into the stream.
         """
         codec = self.config.codec
         return PartitionTopology(
@@ -619,7 +696,7 @@ class Qwen3TTSModel(Model):
                     chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(
                         schedule=codec.chunk_schedule,
                         chunk=codec.chunk_frames,
-                        left_context=codec.left_context_frames,
+                        left_context=0,
                     ),
                 ),
             ],
@@ -823,6 +900,9 @@ class Qwen3TTSModel(Model):
         how many reference frames lead the codec stream (context only, 0
         without an in-context clone; see ``get_initial_forward_pass_args``).
         """
+        # a leading newline would merge with the template's "assistant\n" into one token,
+        # changing the ChatML prefix the text span is sized from; it carries no speech
+        prompt = (prompt or "").lstrip()
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
         if "audio" in input_modalities and not self.config.supports_reference_audio:
@@ -871,7 +951,7 @@ class Qwen3TTSModel(Model):
             LANGUAGE_ID_KEY: language_id,
             # set in every mode (0 without an in-context clone): the data worker
             # lays this over the request's own kwargs
-            self.CODEC_STREAM_LEAD_KEY: min(ref_frames, self.config.codec.left_context_frames),
+            self.CODEC_STREAM_LEAD_KEY: min(ref_frames, self.config.codec.clone_lead_frames),
         }
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
@@ -963,7 +1043,7 @@ class Qwen3TTSModel(Model):
                 is_prefill=False,
             )
             # An in-context clone's stream leads with reference frames: they
-            # are the first window's context, never audio of their own.
+            # are the first chunk's context, never audio of their own.
             lead = int((model_kwargs or {}).get(self.CODEC_STREAM_LEAD_KEY, 0))
             return ForwardPassArgs(
                 full_metadata=metadata,
@@ -1021,9 +1101,6 @@ class Qwen3TTSModel(Model):
                 unpersist_tensors=[],
                 step_metadata={
                     "codec_chunk_frames": self.config.codec.chunk_frames,
-                    "codec_left_context_frames": (
-                        self.config.codec.left_context_frames
-                    ),
                     "codec_chunk_schedule": list(self.config.codec.chunk_schedule),
                 },
             )
@@ -1172,19 +1249,10 @@ class Qwen3TTSModel(Model):
         talker.to_empty(device=device)
 
         # The top-level checkpoint interleaves Talker and CodePredictor under
-        # ``talker.*``. Stream only the non-CodePredictor keys into this model.
-        def talker_weights():
-            for name, tensor in iter_safetensors_shards(
-                self.local_dir, device=device, prefix="talker."
-            ):
-                if not name.startswith("talker.code_predictor."):
-                    yield name.removeprefix("talker."), tensor
-
-        loaded = load_hf_weights(
-            talker,
-            talker_weights(),
-            stacked_params=LLAMA_STACKED_PARAMS,
-        )
+        # ``talker.*``; the Talker's rules drop the CodePredictor's keys.
+        rules = talker.checkpoint_rules()
+        weights = iter_safetensors_shards(self.local_dir, device=device, prefix=rules.prefix)
+        loaded = rules.load(talker, ((name.removeprefix(rules.prefix), t) for name, t in weights))
         cp_prefix = "talker.code_predictor."
         talker_keys = {
             key for key in _checkpoint_keys(self.local_dir, "talker.")
@@ -1222,11 +1290,10 @@ class Qwen3TTSModel(Model):
             _checkpoint_keys(self.local_dir, cp_prefix),
             "Qwen3-TTS CodePredictor",
         )
-        # The captured depth loop indexes all residual LM heads as one tensor;
-        # consolidate after the individual checkpoint heads are loaded.
+        # the depth loop reads the loaded weights folded and stacked
         code_predictor.consolidate_stacked_weights()
         code_predictor.eval()
-        return TalkerSubmodule(talker, code_predictor, self.config)
+        return TalkerSubmodule(talker, code_predictor, self.config, depth_kernel=self.depth_kernel)
 
     def _create_codec_submodule(self, device: str) -> NodeSubmodule:
         """Build the official speech-tokenizer decoder from its sub-checkpoint."""
@@ -1310,15 +1377,22 @@ class Qwen3TTSModel(Model):
         codec_encoder = encoder_cls(MimiConfig(**self.config.codec.encoder_config)).to(device=device)
         codec_dir = Path(self.local_dir) / "speech_tokenizer"
         encoder_prefix = "encoder."
+        # The checkpoint keeps Mimi's flat layout; transformers 5.21+ nests the encoder half.
+        nested = hasattr(codec_encoder.encoder, "encoder_seanet")
+
+        def module_key(name: str) -> str:
+            for flat, moved in _MIMI_NESTED_ENCODER.items():
+                if nested and name.startswith(flat):
+                    return moved + name.removeprefix(flat)
+            return name
 
         def encoder_weights():
             for name, tensor in iter_safetensors_shards(codec_dir, device=device, prefix=encoder_prefix):
-                yield name.removeprefix(encoder_prefix), tensor
+                yield module_key(name.removeprefix(encoder_prefix)), tensor
 
         loaded = load_hf_weights(codec_encoder, encoder_weights()) | _load_buffers(codec_encoder, encoder_weights())
-        _verify_checkpoint_coverage(
-            codec_encoder, loaded, _checkpoint_keys(codec_dir, encoder_prefix), "Qwen3-TTS codec encoder"
-        )
+        checkpoint_keys = {module_key(key) for key in _checkpoint_keys(codec_dir, encoder_prefix)}
+        _verify_checkpoint_coverage(codec_encoder, loaded, checkpoint_keys, "Qwen3-TTS codec encoder")
         codec_encoder.eval()
         return RefEncoderSubmodule(
             speaker_encoder,

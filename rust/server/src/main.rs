@@ -32,7 +32,9 @@ mod media;
 mod protocol;
 mod refusals;
 mod serving;
+mod speech_chunking;
 mod tokenizer;
+mod unicode_marks;
 mod utf8;
 
 use std::collections::BTreeMap;
@@ -68,11 +70,29 @@ use utf8::Utf8Stream;
 
 #[tokio::main]
 async fn main() {
-    const USAGE: &str =
-        "usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]";
-    let model_name = std::env::args().nth(1).expect(USAGE);
+    const USAGE: &str = concat!(
+        "usage: mstar-server <model_name> [port] [conductor_socket_dir] [upload_dir]\n",
+        "       mstar-server --source-hash",
+    );
+    // The content hashes of the rust/ and rust/server/ sources this binary was
+    // built from: the rlib's own, then build.rs's. find_server_binary reads
+    // them from the no-argument usage, since every mstar-server exits on no
+    // arguments while an older one would serve `--source-hash` as a model.
+    let sources = format!(
+        "{} {}",
+        mstar_rust::BUILD_SOURCE_HASH,
+        env!("MSTAR_SERVER_SOURCE_HASH")
+    );
+    let Some(model_name) = std::env::args().nth(1) else {
+        eprintln!("{USAGE}\nbuilt from sources {sources}");
+        std::process::exit(2);
+    };
     if model_name == "-h" || model_name == "--help" {
-        println!("{USAGE}");
+        println!("{USAGE}\nbuilt from sources {sources}");
+        return;
+    }
+    if model_name == "--source-hash" {
+        println!("{sources}");
         return;
     }
     let port: u16 = std::env::args()
@@ -700,47 +720,73 @@ async fn audio_speech(
         Ok(a) => a,
         Err(r) => return r,
     };
+    let stream = req.stream.unwrap_or(false);
+    // Before the request is translated, as in `create_speech`: a format this
+    // frontend cannot produce is the client's error.
+    let fmt = match media::check_audio_format(&req.response_format, stream) {
+        Ok(fmt) => fmt,
+        Err(e) => return error(400, &e, "invalid_request_error"),
+    };
     let args = match adapter.speech_to_request(&req) {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    let request_id = rid("speech");
-    let fmt = req.response_format.to_ascii_lowercase();
-    // Only wav / pcm are produced natively; unlike Python (soundfile encodes
-    // the real container), the Rust frontend has no compressed-audio encoder,
-    // so reject an unsupported format instead of silently returning WAV bytes
-    // under the requested container's name.
-    if !matches!(fmt.as_str(), "wav" | "pcm") {
-        return error(
-            400,
-            &format!(
-                "response_format {fmt:?} is not supported by the Rust frontend \
-                 (only 'wav' and 'pcm'); run the Python frontend for compressed \
-                 containers"
-            ),
-            "invalid_request_error",
-        );
-    }
+    let chunking = adapter.speech_chunking();
+    let pieces =
+        match speech_chunking::plan_chunks(req.extra.get("sentence_chunking"), &chunking, &req.input) {
+            Ok(pieces) => pieces,
+            Err(e) => return error(400, &e, "invalid_request_error"),
+        };
+    let n = pieces.len();
+    let submit = piece_submitter(st.clone(), args, pieces, rid("speech"), stream);
+    // Pieces in flight ahead of the one being read; dropping one unread aborts it.
+    let mut pending: std::collections::VecDeque<OutStream> =
+        (0..chunking.lookahead.clamp(1, n)).map(&*submit).collect();
+    let mut submitted = pending.len();
 
-    if req.stream.unwrap_or(false) {
-        let base = match open_stream(result_stream(&st, &args, &request_id, true)).await {
-            Ok(base) => base,
+    if stream {
+        let first = match open_stream(pending.pop_front().unwrap()).await {
+            Ok(first) => first,
             Err((status, message)) => return error(status, &message, error_type(status)),
         };
-        // Open-ended WAV (a streaming header, then PCM16 frames), or bare PCM.
-        // A later error aborts the body: the status is already sent, and a
-        // cleanly ended stream would pass for a complete answer.
-        let audio = base.filter_map(|item| async move {
-            match item {
-                Out::Chunk(c) if c.modality == "audio" && !c.data.is_empty() => {
-                    Some(Ok(Bytes::from(c.data)))
+        // The next piece generates while this one plays.
+        if submitted < n {
+            pending.push_back(submit(submitted));
+            submitted += 1;
+        }
+        // Open-ended WAV (a streaming header, then PCM16 frames), or bare PCM,
+        // the pieces' audio in order. A later error aborts the body: the status
+        // is already sent, and a cleanly ended stream would pass for a complete
+        // answer.
+        let playing = futures::stream::unfold(
+            Some((first, pending, submitted)),
+            move |state| {
+                let submit = submit.clone();
+                async move {
+                    let (mut cur, mut pending, mut submitted) = state?;
+                    loop {
+                        match cur.next().await {
+                            Some(Out::Chunk(c)) if c.modality == "audio" && !c.data.is_empty() => {
+                                return Some((Ok(Bytes::from(c.data)), Some((cur, pending, submitted))));
+                            }
+                            Some(Out::Chunk(_)) => {}
+                            Some(Out::Error { message, .. }) => {
+                                return Some((Err(std::io::Error::other(message)), None));
+                            }
+                            None => {
+                                cur = pending.pop_front()?;
+                                if submitted < n {
+                                    pending.push_back(submit(submitted));
+                                    submitted += 1;
+                                }
+                            }
+                        }
+                    }
                 }
-                Out::Chunk(_) => None,
-                Out::Error { message, .. } => Some(Err(std::io::Error::other(message))),
-            }
-        });
+            },
+        );
         let header = (fmt == "wav").then(|| Ok(Bytes::from(media::wav_stream_header(st.sample_rate, 1))));
-        let body = futures::stream::iter(header).chain(audio);
+        let body = futures::stream::iter(header).chain(playing);
         return Response::builder()
             .header("content-type", if fmt == "wav" { "audio/wav" } else { "audio/pcm" })
             .header("cache-control", "no-cache")
@@ -748,14 +794,20 @@ async fn audio_speech(
             .unwrap();
     }
 
-    let chunks = match collect(result_stream(&st, &args, &request_id, false)).await {
-        Ok(chunks) => chunks,
-        Err((status, msg)) => return error(status, &msg, error_type(status)),
-    };
     let mut pcm: Vec<u8> = Vec::new();
-    for c in &chunks {
-        if c.modality == "audio" {
-            pcm.extend_from_slice(&c.data);
+    for _ in 0..n {
+        if submitted < n {
+            pending.push_back(submit(submitted));
+            submitted += 1;
+        }
+        let chunks = match collect(pending.pop_front().unwrap()).await {
+            Ok(chunks) => chunks,
+            Err((status, msg)) => return error(status, &msg, error_type(status)),
+        };
+        for c in &chunks {
+            if c.modality == "audio" {
+                pcm.extend_from_slice(&c.data);
+            }
         }
     }
     let (bytes, mime) = media::pcm16_to_container(&pcm, st.sample_rate, &fmt);
@@ -763,6 +815,27 @@ async fn audio_speech(
         .header("content-type", mime)
         .body(Body::from(bytes))
         .unwrap()
+}
+
+/// Submits piece `i` of a speech request and returns its result stream. One
+/// piece goes out under the request's id; several under `<id>-<i>`, each with
+/// its own text and `chunk_kwargs`.
+fn piece_submitter(
+    st: AppState,
+    args: SubmitArgs,
+    pieces: Vec<String>,
+    request_id: String,
+    stream: bool,
+) -> Arc<dyn Fn(usize) -> OutStream + Send + Sync> {
+    Arc::new(move |i| {
+        let piece = SubmitArgs {
+            text: Some(pieces[i].clone()),
+            model_kwargs: speech_chunking::chunk_kwargs(&args.model_kwargs, i),
+            ..args.clone()
+        };
+        let id = if pieces.len() == 1 { request_id.clone() } else { format!("{request_id}-{i}") };
+        result_stream(&st, &piece, &id, stream)
+    })
 }
 
 // ---- POST /v1/images/generations, /v1/images/edits -----------------------

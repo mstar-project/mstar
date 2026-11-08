@@ -116,6 +116,12 @@ send the next observation before the current action chunk has returned — and t
 ``request_id`` tells the replies apart. Pipelined messages are submitted in the order
 they were sent, so of two under one ``request_id`` it is the later one that gets the
 ``409`` while the earlier one runs; their replies may interleave. Closing the socket aborts whatever is still in flight.
+A JSON message over 1 MiB, or a msgpack one over 32 MiB, is parsed and its files decoded
+and saved in a separate process rather than on the server's event loop. Taking the message
+in still runs on the loop, and every other request on the server waits for it: about
+2 ms per MiB as JSON and 1 as msgpack, and with deflate on about 9 and 2. Text and
+``model_kwargs`` come back through the loop, so only ``files`` should be large. A
+deployment taking large messages should turn ``ws_per_message_deflate`` off.
 
 .. code-block:: python
 
@@ -216,6 +222,56 @@ slowly (see :doc:`models`).
        "model_kwargs": {"gain": 2.0},  # what this model's hook reads, not a sampling setting
    }}))
    ws.send(msgpack.packb({"request_id": "call", "end_input": True}))
+
+openpi WebSocket ``/``
+----------------------
+
+A deployment whose config has an ``openpi:`` block (``configs/pi05_droid.yaml``) also
+serves openpi's policy protocol at the server's root, so robot clients written against
+openpi's ``openpi_client.WebsocketClientPolicy`` connect unchanged. Those include its
+DROID example and ``examples/simple_client --env DROID``. openpi's default port is 8000,
+as M*'s is. The protocol:
+
+* On connect the server sends one msgpack frame, the block's ``metadata`` (``{}`` by
+  default).
+* The client then sends one observation and waits for one reply, and repeats. Arrays
+  travel as ``openpi_client.msgpack_numpy`` encodes them, so camera frames arrive as raw
+  pixels and reach the model with no PNG and no file in between.
+* The reply is ``{"actions": float32 [H, action_dims], "server_timing": {"infer_ms",
+  "prev_total_ms"}}``. For ``pi05_droid`` that is ``(15, 8)``, as openpi's own
+  ``pi05_droid`` server returns. The DROID example's ``assert shape == (10, 8)`` was
+  written for pi0-FAST.
+* A call that fails is answered with a text frame holding the error, which the client
+  raises, and the socket closes with ``1011``.
+* An observation may carry ``seed`` (an int), which openpi does not have. It pins the
+  call's noise, as ``seed`` in ``/generate``'s ``model_kwargs`` does. Without it each call
+  gets a fresh seed.
+
+On a server with the block, ``GET /healthz`` answers ``OK`` without a key, as openpi's
+server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key <key>``
+(what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
+takes only ``Bearer``. A server without the block has none of this: it refuses the
+handshake and has no ``/healthz``. Only the Python frontend serves this route;
+``--rust-frontend`` logs a warning and serves without it.
+
+``openpi_client`` sets no size limit on its messages, but the server does:
+``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
+observation closes the socket with ``1009`` and no error frame, so a deployment whose robots
+send several raw high-resolution cameras raises it. An observation is parsed on the server's
+event loop, so a very large one holds up the server's other requests while it is parsed.
+
+.. code-block:: python
+
+   from openpi_client import websocket_client_policy
+
+   policy = websocket_client_policy.WebsocketClientPolicy("localhost", 8000)
+   actions = policy.infer({
+       "observation/exterior_image_1_left": exterior,  # uint8 [224, 224, 3]
+       "observation/wrist_image_left": wrist,
+       "observation/joint_position": joints,           # 7 floats
+       "observation/gripper_position": gripper,        # 1 float
+       "prompt": "put the marker in the cup",
+   })["actions"]                                       # float32 (15, 8)
 
 Python SDK
 ----------
@@ -321,7 +377,8 @@ Endpoints and model coverage:
      - Notes
    * - ``GET /v1/models``
      - all
-     - Lists the served model.
+     - Lists the served model, and any LoRA adapters it serves (each with ``parent``
+       naming the base model; see the Qwen3.5 notes in :doc:`models`).
    * - ``POST /v1/chat/completions``
      - ``bagel``, ``qwen3_omni``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.

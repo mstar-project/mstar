@@ -28,8 +28,8 @@ from jinja2 import TemplateError
 
 from mstar.api_server.openai.adapters import flatten_messages
 
-# Qwen3OmniModel's submodules import flashinfer at module level.
-pytest.importorskip("flashinfer")
+# Qwen3OmniModel imports transformers at module level.
+pytest.importorskip("transformers")
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel  # noqa: E402
 
 SYSTEM_PROMPT = (
@@ -404,3 +404,16 @@ def test_stub_matches_released_checkpoint(messages):
     assert real.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     ) == _StubProcessor().apply_chat_template(messages)
+
+
+@pytest.mark.parametrize("height", [1, 3, 4])
+def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, height):
+    """Handed HWC without a format, the processor guesses CHW when the first side is 1, 3 or 4."""
+    from transformers import Qwen2VLImageProcessor
+
+    model._processor.image_processor = Qwen2VLImageProcessor()
+    model._kv_layout = lambda *args: {}  # reads the checkpoint config; not what this checks
+    image = torch.randint(0, 256, (3, height, 128), dtype=torch.uint8)
+    out = model.process_prompt("Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [image]})
+    (_, rows, cols), = (g.tolist() for g in out.new_input_tensors["image_grid_thw"])
+    assert rows < cols, "a wide image's patch grid is wide"

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Collection
 from dataclasses import dataclass, field
 
 import torch
@@ -11,6 +12,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
 from mstar.model.submodule_base import NodeSubmodule
@@ -42,7 +44,7 @@ def _unchunkable_nodes(
                 f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
                 "report get_input_sequence_len"
             )
-        if parallel_groups.get_sp_config_for_node(node).world_size > 1:
+        if parallel_groups.get_joint_group_for_node(node).sp_group.world_size > 1:
             off.add(node)
     if off:
         logger.warning(
@@ -120,6 +122,86 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
+def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
+    """The nodes whose node groups set ``side_stream: true``. A node listed by
+    several groups, one per graph walk, must get the same answer from each."""
+    asked: dict[str, bool] = {}
+    for group in node_groups:
+        flag = group.get("side_stream", False)
+        if not isinstance(flag, bool):
+            raise ValueError(f"side_stream takes true or false, not {flag!r}")
+        for node in group["node_names"]:
+            if asked.setdefault(node, flag) != flag:
+                raise ValueError(f"node {node!r} gets different side_stream settings from two node_groups")
+    return frozenset(node for node, flag in asked.items() if flag)
+
+
+def _side_lane_keys(
+    submodules: dict, specs: list, model: Model, node_names: Collection[str], asked: Collection[str],
+    parallel_groups: WorkerParallelGroups, accelerator: bool,
+) -> tuple[tuple[str, str], ...]:
+    """The (node, walk) keys this worker runs beside its chain
+    (``mstar.worker.side_steps``): the ``side_stream_walks`` of the node whose
+    group sets ``side_stream: true``, or a ``ValueError`` naming why the lane
+    can't take it. Only nodes that ask are checked.
+
+    A side step is admitted and planned inline on the GPU thread, never
+    speculated or planned ahead, and lands between two chain steps, so the
+    lane takes a stream-fed walk of one node with no resources and no stop
+    check, beside another node's chain.
+    """
+    walks = model.get_graph_walk_graphs()
+    combined = model.combined_walk_of()
+    keys = []
+    for name in sorted(set(asked) & set(submodules)):
+        submodule = submodules[name]
+        side = submodule.side_stream_walks
+
+        def refuse(reason: str, name=name) -> ValueError:
+            return ValueError(f"{type(model).__name__}: {name!r} sets side_stream, but {reason}")
+
+        if not side:
+            raise refuse("its submodule declares no side_stream_walks")
+        if parallel_groups.get_instance_world_size_for_node(name) > 1:
+            raise refuse("it runs in a lockstep instance (TP, SP or CFG): when a side step lands "
+                         "is per rank, and every rank of the instance has to agree on it")
+        if set(node_names) <= {name}:
+            raise refuse("it is the only node on its worker, so there is no chain to run beside")
+        if not accelerator:
+            raise refuse("its device has no streams")
+        on_chain = sorted(w for w, graph in walks.items() if name in graph.get_nodes() and w not in side)
+        if on_chain:
+            raise refuse(f"it also runs {on_chain} on the chain, whose graphs would share its capture "
+                         "stream and pool with the side walks' and could run beside them")
+        held = sorted(spec.resource_key for spec in specs if name in spec.nodes)
+        if held:
+            raise refuse(f"it holds resources {held}, and the lane neither admits nor plans a step ahead")
+        for walk in sorted(side):
+            graph = walks.get(walk)
+            if not isinstance(graph, GraphNode) or graph.name != name:
+                raise refuse(f"side walk {walk!r} is not a walk of that one node")
+            if (name, walk) in combined:
+                raise refuse(f"side walk {walk!r} is part of combined walk {combined[name, walk]!r}, "
+                             "which the chain schedules")
+            if submodule.spanned_outputs(walk) or _stops_on_a_token(submodule, walk):
+                raise refuse(f"side walk {walk!r} has output spans or a stop check, whose host rows "
+                             "stage through a ring the chain's next steps reuse before a side step lands")
+            keys.append((name, walk))
+    if len({name for name, _ in keys}) > 1:
+        raise ValueError(f"{type(model).__name__}: side_stream is set on {sorted({n for n, _ in keys})}; "
+                         "a worker runs one side lane, for one node")
+    return tuple(keys)
+
+
+def _stops_on_a_token(submodule: NodeSubmodule, walk: str) -> bool:
+    """Whether ``walk``'s steps hand the worker row buffers for a stop check."""
+    stop = getattr(submodule, "token_stop", None)
+    loopback = getattr(submodule, "device_loopback", None)
+    return (
+        stop is not None and (stop.walk in (None, walk) or walk in stop.prefill_walks)
+    ) or (loopback is not None and loopback.walk == walk)
+
+
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
     """The TP group ``node`` runs ``walk`` in, from the static config; None
     when it has none or one of size 1."""
@@ -162,6 +244,9 @@ class EngineManager:
     """
     engine: Engine
     node_names: set[str] = field(default_factory=set)
+    # (node, walk) keys that run beside the chain, as ``build`` decided from
+    # the config's ``side_stream`` (see ``_side_lane_keys``)
+    side_keys: tuple[tuple[str, str], ...] = ()
 
     @classmethod
     def build(
@@ -199,19 +284,20 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # Sequence parallelism is opt-in per node; only forward the SP
-            # group when this node actually participates in one, so models
-            # that don't support SP keep their existing get_submodule call.
-            # Likewise ``moe_parallel``, only for a node group's ``ep_config``.
+            # Sequence and CFG parallelism are opt-in per node; only forward
+            # their groups when this node actually participates in one, so
+            # models that support neither keep their existing get_submodule
+            # call. Likewise ``moe_parallel``, only for a node group's
+            # ``ep_config``.
             extra = {}
-            node_sp_group = parallel_groups.get_sp_config_for_node(name)
-            if node_sp_group.world_size > 1:
-                extra["sp_group"] = node_sp_group
+            joint = parallel_groups.get_joint_group_for_node(name)
+            for key, group in (("sp_group", joint.sp_group), ("cfg_group", joint.cfg_group)):
+                if group.world_size > 1:
+                    extra[key] = group
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
-                name, device,
-                tp_group=parallel_groups.get_tp_config_for_node(name),
+                name, device, tp_group=joint.tp_group,
                 autocast_dtype=autocast_dtype, **extra,
             )
             if submodule is None:
@@ -223,6 +309,10 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
+        side_keys = _side_lane_keys(
+            submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),
+            parallel_groups, (device_capability or DeviceCapability.of(device)).is_accelerator,
+        )
         no_chunking = _unchunkable_nodes(submodules, model, parallel_groups)
 
         engine = Engine(
@@ -232,6 +322,7 @@ class EngineManager:
             enable_profile=enable_prof,
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
+            side_stream_nodes={name for name, _ in side_keys},
         )
         engine.load_model(
             submodules,
@@ -261,7 +352,7 @@ class EngineManager:
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(engine=engine, node_names=set(node_names))
+        return cls(engine=engine, node_names=set(node_names), side_keys=side_keys)
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

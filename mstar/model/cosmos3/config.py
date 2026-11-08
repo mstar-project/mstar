@@ -423,6 +423,12 @@ class Cosmos3Config:
     # ``session_timeout_s`` (capped at the max); ``end_session`` drops one early.
     session_timeout_s: float = 600.0
     session_timeout_max_s: float = 3600.0
+    # A generation step whose requests total more vision tokens than this runs
+    # request by request. Off by default: it is a per-GPU number. On an H100,
+    # two 832x480 Nano clips of 189 frames batched took 2.4x one's step time,
+    # and two 121-frame Edge clips were slower than serial too, so an H100
+    # deployment sets 16384 in its model_kwargs.
+    max_batched_vision_tokens: int | None = None
     video_temporal_causal: bool = False
     freeze_und: bool = False
 
@@ -531,9 +537,9 @@ class Cosmos3Config:
     # options (-O2: max-autotune).
     denoise_compile_mode: str = "deterministic"
     # Compile the cross-request denoise step (two or more requests in one
-    # forward) too, with the same mode: the video, image and sound steps; the
-    # action step (``denoise_step_action_batched``) runs eager. Eager, the
-    # norms, rotary and residuals cost about 80 ms of GPU per extra row at
+    # forward) too, with the same mode: the video, image, sound and action
+    # steps share one compiled layer stack. Eager, the norms, rotary and
+    # residuals cost about 80 ms of GPU per extra row at
     # 832x480x121 on a B300. Only its layer stack compiles, once, at startup,
     # with the pack length dynamic, so no batch size or mix of resolutions
     # compiles mid-traffic; the per-request patchify, rotary tables and
