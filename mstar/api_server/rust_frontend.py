@@ -252,11 +252,17 @@ class RustFrontendBridge:
                 request_id=rid,
             )
         except (ValueError, TypeError) as e:
-            # a refused input: an in-band error chunk carries its 400 to the client
-            logger.info("submit %s refused: %s", rid, e)
+            # a refused input: an in-band error chunk carries its 400 to the client.
+            # A TypeError may be a bug here instead (the two sides' PromptPart
+            # drifting), so it keeps its traceback, as on the router.
+            if isinstance(e, ValueError):
+                logger.info("submit %s refused: %s", rid, e)
+                text = str(e)
+            else:
+                text, _ = client_error_text(e, f"submit {rid} failed", log=logger, type_name=False)
             self._send({
                 "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
-                "data": str(e).encode("utf-8"), "metadata": {"status": 400},
+                "data": text.encode("utf-8"), "metadata": {"status": 400},
             })
             return
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop

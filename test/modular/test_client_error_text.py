@@ -220,6 +220,22 @@ def test_the_rust_frontend_bridge_answers_with_an_error_id(tmp_path, caplog):
         assert tensor_file in _logged(caplog, _error_id(message["msg"])).getMessage()
 
 
+def test_the_rust_frontend_bridge_logs_a_type_error_s_traceback(caplog):
+    """Still a 400, but maybe a bug in the bridge, so it keeps its stack, as on the router."""
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.sent = []
+    bridge._send = bridge.sent.append
+    bridge._keys = {}
+    bridge.server = _FailingServer(TypeError("PromptPart.__init__() got an unexpected keyword argument 'x'"))
+
+    bridge._submit({"rid": "r1", "text": "hi"})
+
+    [message] = bridge.sent
+    assert message["metadata"] == {"status": 400}
+    [record] = [r for r in caplog.records if "submit r1" in r.getMessage()]
+    assert record.exc_info is not None, "a TypeError from submit logged no traceback"
+
+
 @pytest.mark.parametrize("raw,scrubbed", [
     ("Error opening '/tmp/up_alice/9f_a.wav': Format not recognised.",
      "Error opening '9f_a.wav': Format not recognised."),
