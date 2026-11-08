@@ -702,7 +702,7 @@ def eras_create(body: dict) -> str:
         if reason in VOLUME_HELD:  # another box binds the cache volume (or it is being deleted)
             raise ApiError(409, {"code": reason, "message": detail})
         raise ApiError(409, f"capacity: {detail or reason}")
-    for w in preview.get("warnings") or []:
+    for w in (preview.get("run") or {}).get("warnings") or []:
         print(f"gpu.py: eras preview: {w.get('message')}", file=sys.stderr)
     body = dict(body, accepted_prices={i["usage_type"]: i["unit_price"] for i in preview["quote"]["line_items"]},
                 accepted_available_until=preview.get("available_until"))
