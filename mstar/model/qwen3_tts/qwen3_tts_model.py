@@ -46,19 +46,20 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
+    Value,
 )
-from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -68,8 +69,8 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.audio_watermark import AudioSealWatermarker, AudioWatermarkConfig, import_audioseal
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.audio_watermark import AudioWatermarkConfig
+from mstar.model.base import ForwardPassArgs, KVLabel, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
@@ -82,8 +83,8 @@ from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
     TALKER_KV,
     TALKER_MIXED,
-    TALKER_POS,
     TALKER_SAMPLER,
+    TALKER_TEXT,
     Qwen3TTSModelConfig,
 )
 from mstar.model.submodule_base import NodeSubmodule
@@ -410,12 +411,11 @@ class Qwen3TTSModel(Model):
         # bit for bit. bfloat16 is not faster on B300: cuDNN's heuristics run
         # several of its convs on a kernel without tensor cores.
         self.codec_dtype = codec_dtype(kwargs.get("codec_dtype", "float32"))
-        # Server-init knob: opt-in AudioSeal watermark on the codec's output
-        # (``mstar.model.audio_watermark``). Checked here so a missing package
-        # fails the server at startup, not at the first request.
-        self.audio_watermark = AudioWatermarkConfig.parse(kwargs.get("audio_watermark"))
-        if self.audio_watermark.enabled:
-            import_audioseal()
+        if AudioWatermarkConfig.parse(kwargs.get("audio_watermark")).enabled:
+            raise ValueError(
+                "audio_watermark.enabled: the watermark's per-stream state has no home a captured codec step can "
+                "write yet"
+            )
         # Server-init knob: the 1.7B CodePredictor's depth loop as one persistent kernel on Hopper
         # (``mstar.model.qwen3_tts.components.depth_frame``). Its codes can differ from the loop's in the last bits.
         self.depth_kernel = bool(kwargs.get("depth_kernel", False))
@@ -469,56 +469,40 @@ class Qwen3TTSModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Talker paged KV + attention/position/sampler resources, and the
-        Codec's per-stream decoder state.
+    def declare_state(self) -> list[Array | Sampler]:
+        """Talker paged KV with its read and positions, its two samplers, and the Codec's per-stream decoder state.
 
-        The CodePredictor's frame-local KV scratch is not a resource; its
-        ``DepthKV`` owns it (overwritten every step)."""
-        from mstar.model.qwen3_tts.components.incremental_codec import codec_state_blocks
+        The CodePredictor's frame-local KV scratch is its ``DepthKV``'s (overwritten every step)."""
+        from mstar.model.qwen3_tts.components.incremental_codec import codec_state_entry
 
         talker = self.config.talker
-        cp = talker.code_predictor
-        talker_kv = PagedKVConfig(
-            num_layers=talker.num_hidden_layers,
-            num_kv_heads=talker.num_key_value_heads,
-            head_dim=talker.head_dim,
-            max_seq_len=talker.max_position_embeddings,
-            num_qo_heads=talker.num_attention_heads,
-        )
         return [
-            KVSpec(resource_key=TALKER_KV, nodes={"Talker"}, config=talker_kv),
-            # Every checkpoint has two query heads per KV head: the CUDA-core
-            # decode kernel wins, since the tensor-core one pads them to a tile
-            AttentionSpec(
-                resource_key=TALKER_ATTN, nodes={"Talker"},
-                config=AttentionConfig(kv_cache=TALKER_KV, decode_tensor_cores=False),
+            Array(
+                TALKER_KV, nodes={"Talker"}, layers=frozenset(range(talker.num_hidden_layers)),
+                entry=KVEntry(heads=talker.num_key_value_heads, head_dim=talker.head_dim),
+                max_len=talker.max_position_embeddings, positions=Positions(rope=Rope(theta=talker.rope_theta)),
+                reads={TALKER_ATTN: Read(mask=Causal(), op=Attend(q_heads=talker.num_attention_heads))},
             ),
-            PositionSpec(
-                resource_key=TALKER_POS, nodes={"Talker"},
-                config=PositionConfig(kv_cache=TALKER_KV, rope_theta=talker.rope_theta),
+            Sampler(TALKER_SAMPLER, nodes={"Talker"}, vocab_size=talker.vocab_size, penalty=True),
+            # groups 1-15 of each frame, the depth loop's draws
+            Sampler(
+                CODE_PRED_SAMPLER, nodes={"Talker"}, vocab_size=talker.code_predictor.vocab_size, penalty=False,
+                draws=self.config.num_code_groups - 1,
             ),
-            SamplerSpec(
-                resource_key=TALKER_SAMPLER, nodes={"Talker"},
-                vocab_size=talker.vocab_size,
-                enable_repetion_penalty=True,
-            ),
-            SamplerSpec(
-                resource_key=CODE_PRED_SAMPLER, nodes={"Talker"},
-                vocab_size=cp.vocab_size,
-                enable_repetion_penalty=False,
-            ),
-            RecurrentStateSpec(
-                resource_key=CODEC_STATE, nodes={"Codec"},
-                config=RecurrentStateConfig(
-                    # the transformer's layers are named blocks
-                    num_layers=1,
-                    blocks=codec_state_blocks(self.config.codec, self.codec_dtype),
-                    # streams being decoded at once, + 1 for the pool's sink slot
-                    max_slots=self.MAX_CODEC_STREAMS + 1,
-                ),
+            Value(
+                CODEC_STATE, nodes={"Codec"}, layers=frozenset({0}),
+                entry=codec_state_entry(self.config.codec, self.codec_dtype),
             ),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {
+            # Every checkpoint has two query heads per KV head: the CUDA-core
+            # decode kernel wins, since the tensor-core one pads them to a tile
+            TALKER_ATTN: {"decode_tensor_cores": False},
+            # streams being decoded at once, + 1 for the pool's sink slot
+            CODEC_STATE: {"max_slots": self.MAX_CODEC_STREAMS + 1},
+        }
 
     # -----------------------------------------------------------------------
     # Model ABC: walk graph declaration
@@ -546,6 +530,7 @@ class Qwen3TTSModel(Model):
                         name="talker_input_embeds",
                         persist=True,
                     ),
+                    GraphEdge(next_node=EMPTY_DESTINATION, name=TALKER_TEXT, persist=True),
                     StreamingGraphEdge(
                         next_node="Codec",
                         name="codec_tokens",
@@ -575,7 +560,7 @@ class Qwen3TTSModel(Model):
             name="talker_decode_loop",
             section=GraphNode(
                 name="Talker",
-                input_names=["talker_input_embeds"],
+                input_names=["talker_input_embeds", TALKER_TEXT],
                 outputs=[
                     GraphEdge(
                         next_node="Talker",
@@ -930,7 +915,7 @@ class Qwen3TTSModel(Model):
         # a clone's x-vector takes the speaker row
         clone = "audio" in input_modalities
         rows = prefill_rows(metadata[PROMPT_LAYOUT_KEY], language_id, speaker_id >= 0 or clone)
-        metadata["kv_layout"] = {TALKER_KV: {"main": LabelLayout(
+        metadata["state_layout"] = {TALKER_KV: {"main": Layout(
             spans=(Span("rows", "talker_prefill_clone" if clone else "talker_prefill", rows, rows, "text_inputs"),),
             growth=(("talker_decode_loop", 1),),
         )}}
@@ -1042,12 +1027,14 @@ class Qwen3TTSModel(Model):
             if partition_metadata.graph_walk in ("talker_prefill", "talker_prefill_clone"):
                 partition_metadata.graph_walk = "talker_decode"
                 partition_metadata.is_prefill = False
-                edge = GraphEdge(next_node="Talker", name="talker_input_embeds")
-                edge.tensor_info = persist_signals.get("talker_input_embeds", [])
+                embeds = GraphEdge(next_node="Talker", name="talker_input_embeds")
+                embeds.tensor_info = persist_signals.get("talker_input_embeds", [])
+                text = GraphEdge(next_node="Talker", name=TALKER_TEXT)
+                text.tensor_info = persist_signals.get(TALKER_TEXT, [])
                 return ForwardPassArgs(
                     full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
+                    inputs=[embeds, text],
+                    unpersist_tensors=[*embeds.tensor_info, *text.tensor_info],
                     step_metadata=self._talker_step_metadata(partition_metadata),
                 )
             if partition_metadata.graph_walk == "talker_decode":
@@ -1082,7 +1069,7 @@ class Qwen3TTSModel(Model):
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         """Per-request sampling: Talker head (group 0) + CodePredictor (1-15).
 
         The CodePredictor's ``subtalker_*`` knobs drive its own sampler
@@ -1101,7 +1088,7 @@ class Qwen3TTSModel(Model):
             "subtalker_dosample", generation.subtalker_dosample
         )
         return {
-            TALKER_SAMPLER: SamplingReqConfig(
+            TALKER_SAMPLER: SampleSettings(
                 temperature=temperature,
                 top_k=model_kwargs.get("top_k", generation.top_k),
                 top_p=model_kwargs.get("top_p", generation.top_p),
@@ -1110,7 +1097,7 @@ class Qwen3TTSModel(Model):
                 ),
                 ignore_eos=model_kwargs.get("ignore_eos", False),
             ),
-            CODE_PRED_SAMPLER: SamplingReqConfig(
+            CODE_PRED_SAMPLER: SampleSettings(
                 temperature=(
                     model_kwargs.get(
                         "subtalker_temperature", generation.subtalker_temperature
@@ -1270,6 +1257,7 @@ class Qwen3TTSModel(Model):
         )
         # the depth loop reads the loaded weights folded and stacked
         code_predictor.consolidate_stacked_weights()
+        code_predictor.depth.make(next(code_predictor.parameters()).dtype, device)
         code_predictor.eval()
         return TalkerSubmodule(talker, code_predictor, self.config, depth_kernel=self.depth_kernel)
 
@@ -1308,9 +1296,7 @@ class Qwen3TTSModel(Model):
         decoder.eval()
         if self.codec_dtype != torch.float32:
             decoder.to(dtype=self.codec_dtype)
-        watermark = getattr(self, "audio_watermark", AudioWatermarkConfig())
-        watermarker = AudioSealWatermarker.build(watermark, device) if watermark.enabled else None
-        return CodecSubmodule(decoder, self.config, watermarker=watermarker)
+        return CodecSubmodule(decoder, self.config)
 
     def _create_ref_encoder_submodule(
         self, device: str, autocast_dtype: torch.dtype | None = None,

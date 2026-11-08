@@ -305,7 +305,7 @@ NO_LAYOUT = {
         "entry",
     ),
     "a value with a host field": ("gdn", lambda: [_kv(), _gdn(entry=_gdn_entry(host={"done": bool}))], "entry"),
-    "a value with no update": ("gdn", lambda: [_kv(), _gdn(updates={})], "GatedDeltaNet"),
+    "a value with no fields": ("gdn", lambda: [_gdn(entry=Entry({}), updates={})], "entry"),
     "a value with only a conv": ("gdn", lambda: [_kv(), _gdn(updates={"conv": CausalConv()})], "GatedDeltaNet"),
     "an update of another kernel": (
         "gdn", lambda: [_kv(), _gdn(updates={"delta": GatedDeltaNet(), "x": _OtherUpdate()})], "updates ['x']",
@@ -602,3 +602,69 @@ def test_validate_deployment_reports_a_state_with_no_declared_dtype_with_the_res
 def test_validate_deployment_refuses_kernel_settings_with_the_rest(tmp_path):
     problems = _validation_problems(_Declaring(_kv(), settings={"attn": {"backend": "sdpa"}}), tmp_path)
     assert len(problems) == 1 and "kernel_settings['attn']" in problems[0], problems
+
+
+def _plain(**overrides) -> Array:
+    return Value("state", **{
+        "nodes": {"llm"}, "layers": {0, 2}, "entry": Entry({
+            "h": TensorType((2, 8), dtype=torch.float32),
+            "count": TensorType((), dtype=torch.int64),
+            "conv": TensorType((4, 3), dtype=None),
+            "sharded": TensorType((4, 3), dtype=torch.float32, shard=0),
+        }), **overrides,
+    })
+
+
+def test_a_plain_value_builds_one_block_per_field_and_no_kernel():
+    specs = _by_key(_plain())
+    assert set(specs) == {"state"} and isinstance(specs["state"], RecurrentStateSpec), "it needs no KV or LinearAttn"
+    config = specs["state"].config
+    assert config.num_layers == 2 and config.kv_cache is None
+    assert list(config.blocks) == ["h", "count", "conv", "sharded"], "a pool's blocks keep the entry's order"
+    assert config.blocks["count"].shape == () and config.blocks["count"].dtype is torch.int64, "0-d reaches the pool"
+    assert config.blocks["conv"].dtype is None, "None is the compute dtype, resolved by the pool"
+    assert config.blocks["sharded"].shard_dims == (0,) and config.blocks["h"].shard_dims == ()
+
+
+def test_a_values_labels_reach_its_spec_on_both_paths():
+    plain = replace(_plain(), labels=frozenset({"main", "cfg"}))
+    gdn = replace(_gdn(), labels=frozenset({"main", "cfg"}))
+    assert _by_key(plain)["state"].config.labels == ("cfg", "main")
+    assert _by_key(_kv(), gdn)["gdn"].config.labels == ("cfg", "main")
+    assert _by_key(_kv(), _gdn())["gdn"].config.labels == ("main",), "a pool's default, as main's"
+
+
+def test_a_field_named_state_on_a_plain_value_is_an_ordinary_field():
+    entry = Entry({"state": TensorType((2, 8, 4), dtype=torch.float16)})
+    block = _by_key(_plain(entry=entry))["state"].config.blocks["state"]
+    assert block.shape == (2, 8, 4) and block.dtype is torch.float16, "only a GatedDeltaNet's state is stored K-last"
+
+
+def test_kernel_settings_sizes_a_plain_value_and_yaml_overrides_it():
+    (hooked,) = build_specs([_plain()], kernel_settings={"state": {"max_slots": 5}})
+    assert hooked.config.max_slots == 5, "the hook's size reaches a plain Value's pool"
+    apply_yaml_overrides([hooked], {"resources": {"state": {"max_slots": 9}}})
+    assert hooked.config.max_slots == 9, "YAML wins over the hook"
+
+
+@pytest.mark.parametrize("build, cause", [
+    (lambda: replace(_plain(), reads={"r": Read(mask=Causal())}), "reads must be empty"),
+    (lambda: replace(_plain(), seq_sharded=True), "seq_sharded"),
+])
+def test_a_plain_value_refuses_what_a_pool_cant_hold(build, cause):
+    with pytest.raises(ValueError, match=cause):
+        build_specs([build()])
+
+
+def test_kernel_settings_picks_a_kept_reads_decode_kernel_and_yaml_overrides_it():
+    specs = build_specs([_kv()], kernel_settings={"attn": {"decode_tensor_cores": False}})
+    assert specs[1].config.decode_tensor_cores is False, "Qwen3-TTS's two query heads per KV head want the CUDA kernel"
+    apply_yaml_overrides(specs, {"resources": {"attn": {"decode_tensor_cores": True}}})
+    assert specs[1].config.decode_tensor_cores is True, "YAML wins over the hook"
+
+
+def test_decode_tensor_cores_on_a_within_step_read_is_refused():
+    array = Array("a", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
+                  reads={"r": _read(mask=Block(), op=Attend(q_heads=4))})
+    with pytest.raises(ValueError, match=r"Array 'a': kernel_settings\['r'\] sets \['decode_tensor_cores'\]"):
+        build_specs([array], kernel_settings={"r": {"decode_tensor_cores": False}})

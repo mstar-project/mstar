@@ -177,11 +177,10 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - ``soundfile`` — only needed to return **non-WAV** audio containers (mp3/flac/…)
        from the OpenAI/SDK audio surfaces. WAV/PCM output works without it.
    * - ``.[audioseal]``
-     - ``audioseal`` (``>=0.2,<0.3``, MIT code and weights) for the opt-in AudioSeal
-       watermark on generated speech (Qwen3-TTS ``audio_watermark``, see the
-       Qwen3-TTS notes in :doc:`models`). Not part of ``.[all]``; a deployment that
-       enables the watermark without it fails at startup with this install hint.
-       The ``python -m mstar.model.audio_watermark detect`` CLI also needs ``.[audio]``.
+     - ``audioseal`` (``>=0.2,<0.3``, MIT code and weights) for the AudioSeal watermarker
+       and detector in ``mstar/model/audio_watermark.py`` (see the Qwen3-TTS notes in
+       :doc:`models`). Not part of ``.[all]``. The
+       ``python -m mstar.model.audio_watermark detect`` CLI also needs ``.[audio]``.
    * - ``.[metrics]``
      - ``prometheus-client`` for ``--enable-metrics`` (Prometheus metrics at
        ``/metrics``, see :ref:`serving-metrics`). A serving feature rather than a

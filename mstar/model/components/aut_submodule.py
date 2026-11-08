@@ -21,7 +21,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
 from mstar.engine.state import ArrayStep
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
@@ -57,12 +57,10 @@ class AuTEncoderSubmodule(NodeSubmodule):
         most this many full windows, and each request adds one partial."""
         return cls.ENCODE_TOKEN_BUCKETS[-1] // config.window_tokens + 1
 
-    def __init__(self, encoder: AuTEncoder, attn_key: str | None = None, array: str | None = None):
-        """``array`` is what the windows' attention reads on a model on the state contract, and ``attn_key`` the
-        resource a model still on resources names."""
+    def __init__(self, encoder: AuTEncoder, array: str):
+        """``array`` is what the windows' attention reads."""
         super().__init__()
         self.encoder = encoder
-        self.attn_key = attn_key
         self.array = array
 
     def _param_dtype(self) -> torch.dtype:
@@ -98,9 +96,7 @@ class AuTEncoderSubmodule(NodeSubmodule):
         return self._windows_step(segments)
 
     def _windows_step(self, segments: list[Segment]) -> SubmoduleStep:
-        if self.array is not None:
-            return SubmoduleStep(segments=segments, state={self.array: ArrayStep()})
-        return SubmoduleStep(segments=segments, steps={self.attn_key: AttentionStep(causal=False)})
+        return SubmoduleStep(segments=segments, state={self.array: ArrayStep()})
 
     def preprocess(
         self,

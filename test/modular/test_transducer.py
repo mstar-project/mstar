@@ -66,7 +66,7 @@ def _greedy(head: TransducerHead, states, lengths, prompt_ids=None) -> list[list
     """Each request's tokens from ``advance`` alone: the batch's state, from
     the start state, stepped a chunk at a time until no row is active."""
     rows = states.shape[0]
-    state = {name: start.expand(rows, *start.shape).clone() for name, start in head.initial_state().items()}
+    state = {name: start.expand(rows, *start.shape).clone() for name, start in head.initial_state("highest").items()}
     chunks = []
     for _ in range(head.config.decode_iterations(states.shape[1])):
         tokens, active = head.advance(states, lengths, state, prompt_ids=prompt_ids)
@@ -138,13 +138,13 @@ def test_prompt_changes_the_frames():
     assert batched == expected
 
 
-def test_the_start_state_fills_the_pool_blocks():
+def test_the_start_state_fills_the_values_fields():
     head = _head([0, 1, 2, 3, 4])
-    blocks = head.config.state_blocks()
-    start = head.initial_state()
-    assert start.keys() == blocks.keys()
-    for name, block in blocks.items():
-        assert start[name].shape == block.shape and start[name].dtype == block.dtype, name
+    fields = head.config.state_entry().tensors
+    start = head.initial_state("highest")
+    assert start.keys() == fields.keys()
+    for name, field in fields.items():
+        assert start[name].shape == field.shape and start[name].dtype == field.dtype, name
     zeros = torch.zeros(1, 2, 16)
     with torch.no_grad():
         out, h, c = head.decoder(torch.tensor([head.config.start_token_id]), zeros, zeros)

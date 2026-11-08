@@ -52,7 +52,7 @@ def _is_host_type(kind) -> bool:
 
 @dataclass(frozen=True)
 class TensorType:
-    shape: tuple[int, ...]       # global, before sharding
+    shape: tuple[int, ...]       # global, before sharding; () is one scalar per entry
     _: KW_ONLY
     dtype: torch.dtype | None    # math dtype, None is the engine's compute dtype
     shard: int | None = None     # axis split across TP ranks, None is replicated
@@ -252,10 +252,10 @@ class Array:
         least = 1 if self.layers or self.reads else 0
         for name, tensor in self.entry.tensors.items():
             where = f"Array {self.name!r}.entry.tensors[{name!r}]"
-            if not (isinstance(tensor.shape, tuple) and tensor.shape and all(
+            if not (isinstance(tensor.shape, tuple) and all(
                 type(axis) is int and axis >= least for axis in tensor.shape
             )):
-                raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {tensor.shape!r}")
+                raise ValueError(f"{where}.shape must be a tuple of ints >= {least}, got {tensor.shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
         if self.entry.host and not is_value(self):
@@ -323,7 +323,7 @@ class Sampler:
     penalty: bool = True
     min_p: bool = False
     eos_ids: tuple[int, ...] = ()    # the ids min_tokens bars
-    draws: int = 1                   # calls to sample in each step that lists it
+    draws: int = 1                   # draws in each step that lists it
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -409,6 +409,22 @@ class PagedNHD:
                 object.__setattr__(self, name, frozenset(getattr(self, name)))
 
 
+# The widest row `draw_row` draws as `sample` does: `fused_sample` launches 4 warps up to here, and 8 past it.
+FUSED_DRAW_MAX_VOCAB = 2048
+
+
+class FusedDrawArgs(NamedTuple):
+    """Not frozen yet, like the rest of the fused draw. Each row's sampling parameters, for a kernel in the forward
+    that draws its own tokens. Row r's i-th draw is ``draw_row(..., seed[r], offset[r] + i, ...)``, which consumes one
+    draw from the row's random stream, exactly as one `sample` call does."""
+
+    temperature: torch.Tensor    # [rows] float32
+    top_k: torch.Tensor          # [rows] int32, 0 is off
+    top_p: torch.Tensor          # [rows] float32
+    seed: torch.Tensor           # [rows] int64
+    offset: torch.Tensor         # [rows] int64, this kernel's first draw
+
+
 class PagedNHDTarget(NamedTuple):
     """Where a state op writes this step's entries on one layer of a `PagedNHD` array."""
 
@@ -418,8 +434,11 @@ class PagedNHDTarget(NamedTuple):
     count: int    # tokens to write
 
 
-class Reached(NamedTuple):
-    """What a read with no op returns: each field's reached entries packed by row, and where each row starts."""
+@dataclass(frozen=True)
+class Reached:
+    """What a read with no op returns, tensors the caller owns: writing them changes no state. Each field's reached
+    entries packed by row, and where each row starts. A Value's row r holds its one entry at index r."""
 
-    fields: Mapping[str, torch.Tensor]
-    row_offsets: torch.Tensor
+    fields: Mapping[str, torch.Tensor]    # field -> (entries, *shape on this rank), in the field's declared dtype
+    _: KW_ONLY
+    row_offsets: torch.Tensor             # (rows + 1,) int32 on the device

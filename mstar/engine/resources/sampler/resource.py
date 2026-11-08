@@ -17,7 +17,6 @@ from mstar.engine.resources.sampler.config import (
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
     AcceleratorGraphableSampler,
-    FusedDrawArgs,
     GenerationHistory,
     Sampler,
     SamplerBuffers,
@@ -25,6 +24,7 @@ from mstar.engine.resources.sampler.utils import (
     _rng_offset_stride,
 )
 from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
+from mstar.engine.state.contract import FusedDrawArgs
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
@@ -733,7 +733,7 @@ class SamplerResource(Resource):
     @torch.compiler.disable
     def fused_draw_args(self) -> FusedDrawArgs | None:
         """This step's per-row parameters, for a kernel in the forward that draws each row's tokens as `sample` would
-        on a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB``. Rows are the batch the forward runs on, as for
+        on a vocabulary of at most ``FUSED_DRAW_MAX_VOCAB``. Rows are the batch the forward runs on, as for
         `sample`. None when `sample` would draw any other way: an eager step, the penalty, a kept last token, or a
         filter, write or broadcast besides the draw. The kernel's caller advances the offsets with `advance_offsets`."""
         if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token:

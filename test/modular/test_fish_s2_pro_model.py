@@ -21,6 +21,8 @@ from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources.sampler.config import SamplingReqConfig
+from mstar.engine.state import Sampler
+from mstar.engine.state.calls import SamplerHandle
 from mstar.graph.base import TensorPointerInfo
 from mstar.model.fish_s2_pro.components.dac import apply_rotary_emb
 from mstar.model.fish_s2_pro.components.fast_ar import FishFastAR
@@ -480,15 +482,17 @@ def test_eos_is_not_sampled_on_the_prefill_frame_or_with_ignore_eos():
     assert [item.kwargs["suppress_eos"] for item in (prefill, decode, ignoring)] == [True, False, True]
 
     # EOS scores highest in every row; only the unsuppressed row may sample it
-    ar.slow_ar.forward = lambda embeds, label: embeds
+    ar.slow_ar.forward = lambda embeds: embeds
     rows = torch.zeros(3, ar.eos_code + 1, dtype=torch.float64)
     rows[:, ar.eos_code], rows[:, 7] = 2.0, 1.0
     ar.slow_ar.semantic_logits = lambda hidden: rows.clone()
-    sampler = SimpleNamespace(sample=lambda rids, logits: logits.argmax(-1))
-    engine_inputs = SimpleNamespace(request_ids=["p", "d", "i"], resources={AR_SAMPLER: sampler})
+    resource = SimpleNamespace(sample=lambda rids, logits: logits.argmax(-1))
+    ar.sampler = SamplerHandle(Sampler(AR_SAMPLER, nodes={"AR"}, vocab_size=ar.eos_code + 1), resource)
+    ar.sampler._open = True
+    engine_inputs = SimpleNamespace(request_ids=["p", "d", "i"], resources={})
     packed = ar.preprocess("ar_decode", engine_inputs, [ignoring, decode, ignoring])
     out = ar._run_frame(
-        engine_inputs, torch.zeros(3, dim, dtype=torch.float64), packed["last_token_indices"], packed["suppress_eos"]
+        torch.zeros(3, dim, dtype=torch.float64), packed["last_token_indices"], packed["suppress_eos"]
     )
     assert out["new_token"].tolist() == [7, ar.eos_code, 7]
 
@@ -604,12 +608,12 @@ def test_process_prompt_lays_out_clones_and_validates_requests():
     ids, prefix_len = model.build_prompt("hi", "r", 21)
     assert list(out.new_input_tensors) == ["prompt_ids"]
     assert out.new_input_tensors["prompt_ids"][0].tolist() == ids
-    assert {key: value for key, value in out.metadata.items() if key != "kv_layout"} == {
+    assert {key: value for key, value in out.metadata.items() if key != "state_layout"} == {
         "prompt_layout": [prefix_len, 21], "ref_clip_key": clip_digest(clip),
     }
 
     plain = model.process_prompt("hi", ["text"], ["audio"])
-    assert {key: value for key, value in plain.metadata.items() if key != "kv_layout"} == {"prompt_layout": [0, 0]}
+    assert {key: value for key, value in plain.metadata.items() if key != "state_layout"} == {"prompt_layout": [0, 0]}
     for prompt, inputs, outputs, tensors, match in [
         ("  ", ["text"], ["audio"], None, "non-empty"),
         ("hi", ["image"], ["audio"], None, "takes text input"),

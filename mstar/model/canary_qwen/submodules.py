@@ -10,10 +10,8 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerStep, Segment, SlotLease, SubmoduleStep
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.model.canary_qwen.config import ATTN, DECODE_LOOP, DECODE_WALK, KV_CACHE, ROPE, SAMPLER
+from mstar.engine.state import ArrayStep, SampleStep, Segment, SlotLease, SubmoduleStep, at_last_token, sample
+from mstar.model.canary_qwen.config import DECODE_LOOP, DECODE_WALK, KV_CACHE, SAMPLER
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.multimodal import splice_media
@@ -54,6 +52,10 @@ class CanaryQwenLLMSubmodule(TokenStepNode, ARNodeSubmodule):
             loop=self.DECODE_LOOP, buffer="new_token", stop_ids=frozenset(stop_token_ids),
             sampler=self.SAMPLER, prefill_walks=frozenset({self.PREFILL_WALK}),
         )
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
 
     def splice_audio(self, input_ids: torch.Tensor, audio_embeds: torch.Tensor) -> torch.Tensor:
         """Prompt embeddings with the k-th audio frame over the k-th
@@ -96,12 +98,7 @@ class CanaryQwenLLMSubmodule(TokenStepNode, ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                SAMPLER: SamplerStep(apply_penalty=False),
-                ROPE: PositionStep(),
-            },
+            state={KV_CACHE: ArrayStep(), SAMPLER: SampleStep(apply_penalty=False)},
         )
 
     def preprocess(
@@ -117,18 +114,15 @@ class CanaryQwenLLMSubmodule(TokenStepNode, ARNodeSubmodule):
     def _forward(
         self,
         graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
         input_ids: torch.Tensor | None,
         input_embeds: torch.Tensor | None,
     ) -> torch.Tensor:
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        attn: AttentionManager = engine_inputs.resources[ATTN]
         if input_embeds is None:
             input_embeds = self.model.embed(input_ids)
-        hidden = self.model(input_embeds, label="main")
+        hidden = self.model(input_embeds)
         if graph_walk != DECODE_WALK:
-            hidden = attn.select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+            hidden = at_last_token(self.kv, hidden)
+        return sample(self.sampler, self.model.logits(hidden))
 
     def forward(
         self,
@@ -138,7 +132,7 @@ class CanaryQwenLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": [self._forward(graph_walk, engine_inputs, input_ids, input_embeds)]}
+        return {"new_token": [self._forward(graph_walk, input_ids, input_embeds)]}
 
     def forward_batched(
         self,
@@ -148,7 +142,7 @@ class CanaryQwenLLMSubmodule(TokenStepNode, ARNodeSubmodule):
         input_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> BatchedModelOutput:
-        new_tokens = self._forward(graph_walk, engine_inputs, input_ids, input_embeds)
+        new_tokens = self._forward(graph_walk, input_ids, input_embeds)
         # row i is request i: one clone and one D2H copy per step, not per request
         return BatchedModelOutput(row_outputs={"new_token": new_tokens}, check_stop_buffers={"new_token": new_tokens})
 

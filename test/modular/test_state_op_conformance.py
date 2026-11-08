@@ -25,6 +25,7 @@ from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Causal, KVEntry, Read
 from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.state_op import STATE_OPS, bind_state_ops, conformance_problems
+from mstar.model.components import qwen3_lm
 from mstar.model.qwen3_omni.components import attention as omni_attention
 from mstar.model.qwen3_omni.components.rope import compute_3d_cos_sin, compute_rope_freqs
 
@@ -97,8 +98,25 @@ def _thinker_args(handle: ArrayHandle, layer: int, tokens: int) -> tuple:
     )
 
 
+def _plain_rope_args(handle: ArrayHandle, layer: int, tokens: int) -> tuple:
+    gen = torch.Generator("cuda").manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", generator=gen).to(torch.bfloat16)
+
+    # the positions run past the step's tokens, as a bucket's buffer does
+    pos_ids = torch.arange(700, 700 + tokens + 3, device="cuda", dtype=torch.int32)
+    return (
+        handle, layer, randn(tokens, HQ, D), randn(tokens, HKV, D), randn(tokens, HKV, D), randn(D), randn(D), pos_ids,
+        THETA, EPS, EPS,
+    )
+
+
 # How to call each op on a real handle.
-ARGUMENTS = {omni_attention.qk_norm_rope_table_kv_write: _thinker_args}
+ARGUMENTS = {
+    omni_attention.qk_norm_rope_table_kv_write: _thinker_args,
+    qwen3_lm.qk_norm_rope_kv_write: _plain_rope_args,
+}
 
 
 def test_every_op_in_the_tree_has_a_conformance_case():
@@ -133,3 +151,10 @@ def test_the_debug_check_passes_the_thinkers_kernel_on_real_pages(monkeypatch):
     monkeypatch.setattr(sys.modules["mstar.engine.state.state_op"], "_DEBUG_ASSERTS", True)
     handle = _opened_step(_manager(), {1: 3, 2: 4})
     omni_attention.qk_norm_rope_table_kv_write(*_thinker_args(handle, 1, 7))
+
+
+@needs_cuda
+def test_the_debug_check_passes_the_plain_rope_kernel_on_real_pages(monkeypatch):
+    monkeypatch.setattr(sys.modules["mstar.engine.state.state_op"], "_DEBUG_ASSERTS", True)
+    handle = _opened_step(_manager(), {1: 3, 2: 4})
+    qwen3_lm.qk_norm_rope_kv_write(*_plain_rope_args(handle, 1, 7))

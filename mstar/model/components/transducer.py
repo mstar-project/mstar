@@ -18,7 +18,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
+from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
+from mstar.engine.state import Entry, TensorType
 
 # greedy steps per decode iteration, one graph replay each. An iteration
 # costs every row the engine's and the worker's per-step work, which at 16
@@ -62,18 +63,17 @@ class TransducerConfig:
             prompt_intermediate_size=hf.get("prompt_intermediate_size", 0),
         )
 
-    def state_blocks(self) -> dict[str, RecurrentBlockConfig]:
-        """One request's decoding state between iterations, as recurrent pool
-        blocks: the LSTM state and output in fp32, the cursor and the tokens
-        emitted at its frame."""
+    def state_entry(self) -> Entry:
+        """One request's decoding state between iterations: the LSTM state and output in fp32, the cursor and the
+        tokens emitted at its frame."""
         layers = (self.num_layers, self.hidden_size)
-        return {
-            "h": RecurrentBlockConfig(layers, torch.float32),
-            "c": RecurrentBlockConfig(layers, torch.float32),
-            "dec_out": RecurrentBlockConfig((self.hidden_size,), torch.float32),
-            "cursor": RecurrentBlockConfig((), torch.int64),
-            "symbols": RecurrentBlockConfig((), torch.int64),
-        }
+        return Entry({
+            "h": TensorType(layers, dtype=torch.float32),
+            "c": TensorType(layers, dtype=torch.float32),
+            "dec_out": TensorType((self.hidden_size,), dtype=torch.float32),
+            "cursor": TensorType((), dtype=torch.int64),
+            "symbols": TensorType((), dtype=torch.int64),
+        })
 
     def decode_iterations(self, num_frames: int, chunk: int = CHUNK) -> int:
         """The most decode iterations of ``chunk`` steps a clip of ``num_frames``
@@ -166,14 +166,15 @@ class TransducerHead(nn.Module):
         return self.encoder_projector(encoder_states)
 
     @torch.no_grad()
-    def initial_state(self) -> dict[str, torch.Tensor]:
-        """A request's state before its first step, one tensor per
-        ``state_blocks`` entry: the prediction network after the start token,
-        the cursor at frame 0. The same for every request."""
+    def initial_state(self, matmul_precision: str) -> dict[str, torch.Tensor]:
+        """A request's state before its first step, one tensor per ``state_entry`` field: the prediction network after
+        the start token, the cursor at frame 0. The same for every request. ``matmul_precision`` is the one the node's
+        forward runs at, so these tensors are what its steps would have computed."""
         cfg = self.config
         device = self.encoder_projector.weight.device
         zeros = torch.zeros(1, cfg.num_layers, cfg.hidden_size, device=device)
-        dec_out, h, c = self.decoder(torch.tensor([cfg.start_token_id], device=device), zeros, zeros)
+        with fp32_precision_scope(Fp32Precision(matmul=matmul_precision, cudnn_allow_tf32=None)):
+            dec_out, h, c = self.decoder(torch.tensor([cfg.start_token_id], device=device), zeros, zeros)
         count = torch.zeros((), dtype=torch.long, device=device)
         return {"h": h[0], "c": c[0], "dec_out": dec_out[0], "cursor": count, "symbols": count.clone()}
 
@@ -238,7 +239,7 @@ class TransducerHead(nn.Module):
         """``chunk`` greedy steps (``step``, by default :meth:`step`) over the
         ``(B, T, encoder hidden)`` encoder output, per-row frame counts and,
         with a prompt projector, ``(B,)`` prompt ids, updating ``state``
-        (``state_blocks``' names, batch-first) in place -> the steps'
+        (``state_entry``'s fields, batch-first) in place -> the steps'
         ``(B, chunk)`` tokens and which rows are still decoding."""
         step = step or self.step
         s = {**state, "encoder_states": encoder_states, "lengths": lengths, "active": state["cursor"] < lengths}

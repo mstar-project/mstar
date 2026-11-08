@@ -37,7 +37,7 @@ from mstar.model.fish_s2_pro.config import (
 )
 from mstar.model.fish_s2_pro.fish_s2_pro_model import clip_digest
 from mstar.model.fish_s2_pro.submodules import CodecSubmodule, RefEncoderSubmodule
-from mstar.model.submodule_base import ARNodeInputs, InputMetadata, ModelInputsFromEngine
+from mstar.model.submodule_base import ARNodeInputs, InputMetadata, ModelInputsFromEngine, engine_step
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer, StreamChunkInfo
 
@@ -144,20 +144,24 @@ class CodecDriver:
 
     def __init__(self, submodule: CodecSubmodule, max_slots: int = 8):
         from mstar.engine.resources.base import EngineResourceInfo
-        from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
         from mstar.engine.resources.recurrent.pool import RecurrentStatePool
         from mstar.engine.resources.runner import StepRunner
-        from mstar.model.fish_s2_pro.components.incremental_dac import codec_state_blocks
+        from mstar.engine.state import Entry, TensorType, Value
+        from mstar.engine.state.adapters import build_specs
+        from mstar.engine.state.calls import ArrayHandle
+        from mstar.model.fish_s2_pro.components.incremental_dac import codec_state_entry
 
         self.node = submodule
-        blocks = {
-            name: type(block)(shape=block.shape, dtype=torch.float64 if block.dtype == torch.float32 else block.dtype)
-            for name, block in codec_state_blocks(submodule.codec).items()
-        }
-        spec = RecurrentStateSpec(CODEC_STATE, {"Codec"}, RecurrentStateConfig(
-            num_layers=1, blocks=blocks, max_slots=max_slots))
+        # the codec runs in fp64 here, for an exact comparison
+        array = Value(CODEC_STATE, nodes={"Codec"}, layers={0}, entry=Entry({
+            name: TensorType(field.shape, dtype=torch.float64 if field.dtype == torch.float32 else field.dtype)
+            for name, field in codec_state_entry(submodule.codec).tensors.items()
+        }))
+        (spec,) = build_specs([array], kernel_settings={CODEC_STATE: {"max_slots": max_slots}})
         self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
         self.runner = StepRunner({CODEC_STATE: self.pool})
+        self.handle = ArrayHandle(array, {CODEC_STATE: self.pool}, None)
+        self.node.bind_node_state({CODEC_STATE: self.handle})
         self.added: set[str] = set()
 
     def step(self, items: dict, captured: bool = False) -> dict:
@@ -179,15 +183,17 @@ class CodecDriver:
             if rid not in self.added:
                 self.pool.ingest_request(rid)
                 self.added.add(rid)
-        step = self.node.declare_step("codec_chunk", rows, inputs)
+        step = engine_step(self.node, "codec_chunk", rows, inputs)
         step.set_ctx(ctx)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
-        engine_inputs = ModelInputsFromEngine(request_ids=rows, per_request_info={},
-                                              resources={CODEC_STATE: self.pool}, step=step)
+        engine_inputs = ModelInputsFromEngine(request_ids=rows, per_request_info={}, resources={}, step=step)
         packed = self.node.preprocess("codec_chunk", engine_inputs, inputs)
+        step.begin_calls()
         with torch.no_grad():
             audio = self.node.forward_batched("codec_chunk", engine_inputs, **packed).row_outputs["audio_chunk"]
+        step.check_calls()
+        step.end_calls()
         self.runner.commit(step)
         out = {}
         for i, rid in enumerate(rids):
@@ -302,13 +308,11 @@ def test_streamed_chunks_stitch_into_the_whole_decode(config, decoder, num_frame
 def test_incremental_decode_stitches_into_the_whole_decode(config, decoder, chunks):
     """Chunk by chunk from carried state (each chunk zero-padded to the batch's
     width beside a longer row) is one decode of the whole stream."""
-    from mstar.model.fish_s2_pro.components.incremental_dac import IncrementalDACDecoder, codec_state_blocks
+    from mstar.model.fish_s2_pro.components.incremental_dac import IncrementalDACDecoder, codec_state_entry
 
     inc = IncrementalDACDecoder(decoder)
-    blocks = inc.state_blocks()
-    assert {n: (b.shape, b.dtype) for n, b in blocks.items()} == {
-        n: (b.shape, b.dtype) for n, b in codec_state_blocks(config.codec).items()
-    }
+    assert inc.state_entry() == codec_state_entry(config.codec)
+    blocks = inc.state_entry().tensors
     total = sum(chunks)
     codes = stream_codes(total, seed=7)
     other = stream_codes(total + 64, seed=8)
@@ -352,7 +356,8 @@ def test_compiled_incremental_decode_matches_eager_on_cuda(config):
     compiled = torch.compile(inc, dynamic=True)
 
     def stream(decode, chunks=(4, 8, 3)):
-        state = {n: torch.zeros(2, *b.shape, dtype=b.dtype, device="cuda") for n, b in inc.state_blocks().items()}
+        fields = inc.state_entry().tensors
+        state = {n: torch.zeros(2, *b.shape, dtype=b.dtype, device="cuda") for n, b in fields.items()}
         codes = stream_codes(sum(chunks) + 8, seed=3).t().cuda()
         out, start = [], 0
         with torch.no_grad():

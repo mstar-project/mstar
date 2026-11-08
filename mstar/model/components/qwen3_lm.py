@@ -5,7 +5,7 @@ MLP and plain RoPE (``rope_theta`` 1e6, no Llama-3 scaling). Several
 audio-LLM checkpoints ship one as their text decoder (Qwen3-ASR, Higgs-Audio,
 Qwen3-Omni's dense layers); this is the one place to build it from
 ``ParallelAttention`` / ``ParallelGatedMLP`` / ``RMSNorm``, bound to the
-KV, attention and position resources of the node that owns it.
+array of the node that owns it.
 
 Parameter paths mirror HF's ``Qwen3ForCausalLM`` with the ``model.`` prefix
 dropped (``embed_tokens.*``, ``layers.N.*``, ``norm.*``, ``lm_head.*``); a
@@ -19,7 +19,8 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.decoder_layer import DecoderLayer, run_layers
+from mstar.engine.state import PagedNHD, PagedNHDTarget, positions, state_op
+from mstar.model.components.decoder_layer import DecoderLayer, no_cursor, run_layers
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     ParallelAttention,
@@ -27,36 +28,69 @@ from mstar.model.components.distributed import (
     VocabParallelEmbedding,
 )
 from mstar.model.components.norm import RMSNorm
+from mstar.model.components.qk_norm_rope import norm_rotate, rope_cos_sin
+
+
+def _norm_rope_add(
+    kv, layer, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
+    pos_ids: torch.Tensor, theta: float, q_eps: float, k_eps: float,
+) -> None:
+    cos, sin = rope_cos_sin(pos_ids[: q.shape[0]], q.shape[-1], theta)
+    cos, sin = cos[:, None], sin[:, None]
+    # the angles are fp32, and a backend that takes K/V at its read refuses a k of another dtype than its v
+    rotated_k = norm_rotate(k, k_weight, k_eps, cos, sin).to(k.dtype)
+    q.copy_(norm_rotate(q, q_weight, q_eps, cos, sin))
+    kv.add(layer, k=rotated_k, v=v)
+
+
+# The kernel is CUDA's, so any other device takes the reference.
+@state_op(adds=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_norm_rope_add)
+def qk_norm_rope_kv_write(
+    kv, layer, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
+    pos_ids: torch.Tensor, theta: float, q_eps: float, k_eps: float, *, target: PagedNHDTarget,
+) -> None:
+    """Per-head q/k norm and plain RoPE at ``pos_ids``, in place on ``q``, and this layer's K/V write, in one launch."""
+    from mstar.utils import attention
+
+    attention.qk_norm_rope_kv_write(
+        q, k, v, q_weight, k_weight, pos_ids, target.cache, target.page_of_token, target.slot_of_token,
+        min(target.count, q.shape[0]), q_eps, k_eps, theta,
+    )
+
+
+def _plain_theta(rope, head_dim: int) -> float | None:
+    """The theta of a declared rope the fused kernel computes itself: rotate-half over the whole head, unscaled."""
+    plain = rope is not None and (
+        rope.scale == 1.0 and not rope.interleave and rope.rotary_dim in (None, head_dim)
+        and rope.low_freq_factor is None and rope.dtype is None and rope.table_dtype is None
+    )
+    return float(rope.theta) if plain else None
 
 
 class Qwen3Attention(ParallelAttention):
-    """``ParallelAttention`` with Qwen3's per-head q/k RMSNorm, its 1D RoPE and
-    the step's KV write in one Triton kernel, through
-    ``AttentionCallable.norm_rope_attend``. At decode width a step is a few
-    small kernels per layer, and the separate norm, RoPE and KV-write kernels
-    were a sizeable share of it. Falls back to the unfused path off CUDA or
-    without planned positions."""
+    """``ParallelAttention`` with Qwen3's per-head q/k RMSNorm. Where the array declares plain RoPE, the norm, the
+    rotation and the step's K/V write run in one kernel (`qk_norm_rope_kv_write`): at decode width a step is a few small
+    kernels per layer, and these three were a sizeable share of it. Anything else rotates through the array."""
 
-    _fuse_qk = False
+    _fuse = False
 
-    def bind_resources(self, resources: dict) -> None:
-        super().bind_resources(resources)
-        # the kernel is plain non-interleaved RoPE over the whole head dim;
-        # anything else the position resource would apply stays unfused
-        self._rope_theta = self.pos.fusable_rope_theta(self.head_dim)
-        self._fuse_qk = (
-            self._rope_theta is not None and self.q_norm is not None and self.rope_scale == 1.0
-        )
+    def bind_state(self, handles: dict) -> None:
+        super().bind_state(handles)
+        declared = None if self.state is None else self.state.array.positions
+        self._theta = None if declared is None else _plain_theta(declared.rope, self.head_dim)
+        self._fuse = self._theta is not None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        pos_ids = self.pos.pos_ids(self.attend.label) if self._fuse_qk else None
-        if pos_ids is None or not hidden_states.is_cuda:
+        if not self._fuse:
             return super().forward(hidden_states)
         num_tokens = hidden_states.shape[0]
         q, k, v = self._project_qkv(hidden_states)
-        attn_output = self.attend.norm_rope_attend(q, k, v, self.q_norm, self.k_norm, pos_ids, self._rope_theta)
-        attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
-        return self.o_proj(attn_output)
+        qk_norm_rope_kv_write(
+            self.state, self.layer, q, k, v, self.q_norm.weight, self.k_norm.weight, positions(self.state),
+            self._theta, float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon),
+        )
+        out = self.state.read(self.layer, q)
+        return self.o_proj(out.reshape(num_tokens, self.num_heads * self.head_dim))
 
 
 @dataclass
@@ -86,11 +120,10 @@ class Qwen3DenseLM(nn.Module):
         self,
         config: Qwen3LMConfig,
         *,
-        attn_key: str,
-        kv_key: str,
-        pos_key: str,
+        array: str,
         comm_group: CommGroup | None = None,
     ):
+        """``array`` is what the layers attend through."""
         super().__init__()
         self.config = config
         comm_group = comm_group or CommGroup.trivial()
@@ -109,11 +142,9 @@ class Qwen3DenseLM(nn.Module):
                     head_dim=config.head_dim,
                     qk_norm=True,
                     rms_norm_eps=config.rms_norm_eps,
-                    rope_theta=config.rope_theta,
                     input_hidden_size=config.hidden_size,
-                    attn_key=attn_key,
-                    kv_key=kv_key,
-                    pos_key=pos_key,
+                    kv_key=array,
+                    layer=i,
                 ),
                 mlp=ParallelGatedMLP(
                     comm_group=comm_group,
@@ -124,7 +155,7 @@ class Qwen3DenseLM(nn.Module):
                 input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                 post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
             )
-            for _ in range(config.num_hidden_layers)
+            for i in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = ColumnParallelLinear(
@@ -159,15 +190,9 @@ class Qwen3DenseLM(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
-        """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.
-
-        The label and layer index are cursors on the shared resources: bind
-        the label once, advance the index per layer. Passing them as
-        arguments instead would make inductor specialize on the int.
-        """
-        self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
+        """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm."""
+        return run_layers(self.layers, input_embeds, self.norm, no_cursor)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

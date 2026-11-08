@@ -42,27 +42,27 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
+    Value,
 )
-from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.fish_s2_pro.config import (
     ALLOWED_TEXT_SPECIAL_TOKENS,
     AR_ATTN,
     AR_KV,
-    AR_POS,
     AR_SAMPLER,
     CLONE_SPEECH_TEXT,
     CLONE_SYSTEM_TEXT,
@@ -161,53 +161,29 @@ class FishS2ProModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Slow AR paged KV, attention, interleaved bf16-table RoPE, semantic
-        sampler; the codec's per-stream decoder state.
-
-        The Fast AR's frame-local KV scratch is owned by the AR submodule.
-        """
-        from mstar.model.fish_s2_pro.components.incremental_dac import codec_state_blocks
+    def declare_state(self) -> list[Array | Sampler]:
+        """Slow AR paged KV with its read and interleaved RoPE, the semantic sampler, and the codec's per-stream decoder
+        state. The Fast AR's frame-local KV scratch is the AR submodule's."""
+        from mstar.model.fish_s2_pro.components.incremental_dac import codec_state_entry
 
         slow = self.config.slow_ar
-        kv = PagedKVConfig(
-            num_layers=slow.n_layer,
-            num_kv_heads=slow.n_local_heads,
-            head_dim=slow.head_dim,
-            max_seq_len=slow.max_seq_len,
-            num_qo_heads=slow.n_head,
-        )
         return [
-            KVSpec(resource_key=AR_KV, nodes={"AR"}, config=kv),
-            AttentionSpec(resource_key=AR_ATTN, nodes={"AR"}, config=AttentionConfig(kv_cache=AR_KV)),
-            PositionSpec(
-                resource_key=AR_POS,
-                nodes={"AR"},
-                config=PositionConfig(
-                    kv_cache=AR_KV,
-                    interleave=True,
-                    rope_theta=slow.rope_base,
-                    rotary_dim=slow.head_dim,
-                    rope_table_dtype=torch.bfloat16,
-                ),
+            Array(
+                AR_KV, nodes={"AR"}, layers=frozenset(range(slow.n_layer)),
+                entry=KVEntry(heads=slow.n_local_heads, head_dim=slow.head_dim), max_len=slow.max_seq_len,
+                # from a bfloat16-rounded table, as the checkpoint was trained
+                positions=Positions(rope=Rope(
+                    theta=slow.rope_base, rotary_dim=slow.head_dim, interleave=True, table_dtype=torch.bfloat16,
+                )),
+                reads={AR_ATTN: Read(mask=Causal(), op=Attend(q_heads=slow.n_head))},
             ),
-            SamplerSpec(
-                resource_key=AR_SAMPLER,
-                nodes={"AR"},
-                vocab_size=self.config.semantic_head_size,
-                enable_repetion_penalty=True,
-            ),
-            RecurrentStateSpec(
-                resource_key=CODEC_STATE,
-                nodes={"Codec"},
-                config=RecurrentStateConfig(
-                    num_layers=1,
-                    blocks=codec_state_blocks(self.config.codec),
-                    # streams being decoded at once, + 1 for the pool's sink slot
-                    max_slots=self.MAX_CODEC_STREAMS + 1,
-                ),
-            ),
+            Sampler(AR_SAMPLER, nodes={"AR"}, vocab_size=self.config.semantic_head_size, penalty=True),
+            Value(CODEC_STATE, nodes={"Codec"}, layers=frozenset({0}), entry=codec_state_entry(self.config.codec)),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # streams being decoded at once, + 1 for the pool's sink slot
+        return {CODEC_STATE: {"max_slots": self.MAX_CODEC_STREAMS + 1}}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the codec state pool cannot hold: a request takes
@@ -424,7 +400,7 @@ class FishS2ProModel(Model):
         rows = len(ids) + ref_frames
         walk = "ar_prefill_clone" if clone else "ar_prefill"
         prefill = Span("rows" if clone else "ids", walk, rows, rows, "prompt_ids")
-        metadata["kv_layout"] = {AR_KV: {"main": LabelLayout(spans=(prefill,), growth=(("ar_decode_loop", 1),))}}
+        metadata["state_layout"] = {AR_KV: {"main": Layout(spans=(prefill,), growth=(("ar_decode_loop", 1),))}}
         return ProcessPromptOutput({"prompt_ids": [torch.tensor(ids, dtype=torch.long)]}, metadata)
 
     # -----------------------------------------------------------------------
@@ -533,7 +509,7 @@ class FishS2ProModel(Model):
         self,
         partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         """Semantic-code sampling; ``do_sample=False`` is greedy. Residual codebooks are argmax."""
         del partition_fwd_args
         model_kwargs = model_kwargs or {}
@@ -542,7 +518,7 @@ class FishS2ProModel(Model):
         if not model_kwargs.get("do_sample", True):
             temperature = 0.0
         return {
-            AR_SAMPLER: SamplingReqConfig(
+            AR_SAMPLER: SampleSettings(
                 temperature=temperature,
                 top_k=model_kwargs.get("top_k", generation.top_k),
                 top_p=model_kwargs.get("top_p", generation.top_p),

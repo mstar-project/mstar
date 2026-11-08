@@ -21,15 +21,7 @@ import torch
 from mstar.distributed.communication import CommGroup
 from mstar.engine.state import PagedNHD, PagedNHDTarget, add_read, rope, state_op
 from mstar.model.components.distributed import ParallelAttention
-from mstar.model.components.norm import rms_norm
-
-
-def _norm_rotate(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, cos: torch.Tensor, sin: torch.Tensor,
-) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    normed = rms_norm(x.reshape(-1, x.shape[-1]), weight, eps).view(x.shape)
-    return normed * cos + torch.cat((-normed[..., half:], normed[..., :half]), dim=-1) * sin
+from mstar.model.components.qk_norm_rope import norm_rotate
 
 
 def _norm_rotate_add(
@@ -37,8 +29,8 @@ def _norm_rotate_add(
     cos: torch.Tensor, sin: torch.Tensor, q_eps: float, k_eps: float,
 ) -> None:
     cos, sin = cos[: q.shape[0], None], sin[: q.shape[0], None]
-    rotated_k = _norm_rotate(k, k_weight, k_eps, cos, sin)
-    q.copy_(_norm_rotate(q, q_weight, q_eps, cos, sin))
+    rotated_k = norm_rotate(k, k_weight, k_eps, cos, sin)
+    q.copy_(norm_rotate(q, q_weight, q_eps, cos, sin))
     kv.add(layer, k=rotated_k, v=v)
 
 

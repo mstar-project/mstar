@@ -66,7 +66,6 @@ def _holding(tensor: TensorType) -> Array:
 
 
 REFUSALS = {
-    "empty shape": (lambda: _holding(TensorType((), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "list shape": (lambda: _holding(TensorType([4, 8], dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "zero in shape": (lambda: _holding(TensorType((4, 0), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "bool in shape": (lambda: _holding(TensorType((True, 8), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
@@ -297,3 +296,17 @@ def test_a_fork_refuses_a_time_it_doesnt_have():
 def test_a_sampler_with_a_list_of_eos_ids_stays_hashable():
     sampler = Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=[1, 2])
     assert hash(sampler) == hash(Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=(1, 2)))
+
+
+def test_a_scalar_field_declares_an_empty_shape():
+    assert _value(entry=Entry({"count": TensorType((), dtype=torch.int64)})).entry.tensors["count"].shape == ()
+
+
+def test_a_scalar_field_has_no_axis_to_shard():
+    with pytest.raises(ValueError, match=r"shard must be None or an axis of shape \(\)"):
+        _value(entry=Entry({"count": TensorType((), dtype=torch.int64, shard=0)}))
+
+
+def test_a_scalar_field_has_no_kv_layout():
+    with pytest.raises(ValueError, match="Attend needs entry fields"):
+        _array(entry=_entry(TensorType((), dtype=None), TensorType((), dtype=None)), reads={"attn": _read()})

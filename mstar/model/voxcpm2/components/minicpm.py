@@ -148,7 +148,8 @@ class MiniCPMLM(nn.Module):
 
     ``forward`` maps packed ``[tokens, hidden]`` embeddings to normed hidden
     states. The label and layer index are resource cursors, bound once and
-    advanced per layer (see ``Qwen3DenseLM.forward``).
+    advanced per layer: passing them as arguments would make inductor
+    specialize on the int.
     """
 
     def __init__(
