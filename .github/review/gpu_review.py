@@ -36,8 +36,8 @@ os.environ.setdefault("LIVE_PR_STATE", str(Path(os.environ.get("RUNNER_TEMP", "/
 WRITE = bot.WRITE
 # Never approved, whatever the review says: the bot's own rules, CI, and the dependencies and toolchains.
 NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/", "docker/", "tools/", "packaging/")
-NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "MANIFEST.in", "pyproject.toml", "setup.py", "Cargo.toml", "rust-toolchain.toml",
-               "requirements*.txt")
+NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "MANIFEST.in", "pyproject.toml", "setup.py", "Cargo.toml",
+               "rust-toolchain.toml", "requirements*.txt")
 # Approved only as a comment that doesn't count toward required reviews.
 NO_COUNT_AREAS = {"area/engine", "area/resources"}
 # No runtime code: a review's `none` alone approves a change only to these.
@@ -272,6 +272,17 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 """
 
 
+def pending_ahead(cfg, offer):
+    """How many jobs are pending in a Slurm offer's partition (0 when its queue can't be read: the offer stands)."""
+    state = gpu_py()
+    node = state["slurm_node"](cfg, offer["region"])
+    try:
+        out = state["slurm_run"](node, f"squeue -h -t PD -p {shlex.quote(node.get('partition', 'main'))} -o %i")
+    except (state["ApiError"], subprocess.TimeoutExpired):
+        return 0
+    return len(out.split())
+
+
 def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hours: float, run, checks: check_kinds,
           since: commit = "", forced="", asked="", asked_checks: check_kinds = (), turns: int = 2000):
     """Get GPUs and start the live-test session on them: the brief (fixed text, the commits and carry's
@@ -310,6 +321,10 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
         ("slurm", os.environ.get("LIVE_TEST_ANTHROPIC_KEY"), "LIVE_TEST_ANTHROPIC_KEY is not set"),
         ("eras", cfg.get("eras", {}).get("run_secret_id"), "ERAS_RUN_SECRET_ID is not set")) if not ok}
     tried = [f"{p}: {why}" for p, why in keyless.items() if any(o["provider"] == p for o in free)]
+    for o in [o for o in free if o["provider"] == "slurm"]:  # `sinfo` counts free GPUs, not the queue for them
+        if ahead := pending_ahead(cfg, o):
+            free.remove(o)
+            tried.append(f"{o['id']}: {ahead} job(s) already pending in its partition")
     for o in [o for o in free if o["provider"] not in keyless]:
         inputs = [x for f in ("brief.md", "findings.json", "pr-body.md", "run.json") for x in ("--input", str(lt / f))]
         if o["provider"] == "slurm":
