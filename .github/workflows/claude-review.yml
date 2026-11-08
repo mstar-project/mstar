@@ -288,8 +288,10 @@ jobs:
           allowed_non_write_users: ${{ needs.preflight.outputs.non_write_user }}
           # Reads stay inside the checkout (main at the root, the PR in pr-head/), so the model
           # can't read the runner's files, and with --permission-mode dontAsk below any call
-          # that would otherwise prompt is refused.
-          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+          # that would otherwise prompt is refused. No .git: the action writes this job's token
+          # into the root checkout's .git/config. `.git` is the directory itself (Grep and Glob
+          # are checked against the directory they search), `//` an absolute path.
+          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true,"deny":["Read(.git)","Read(.git/**)","Read(//**/.git/**)"]}}'
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, inputs and output format, and points
