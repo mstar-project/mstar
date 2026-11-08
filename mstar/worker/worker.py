@@ -4434,9 +4434,9 @@ class Worker:
                 self._apply_pending_removes_safe_to_drop(
                     self._in_flight_rids
                 )
-                # Requests a resource declared unservable during last pass's
-                # readiness scans. They are in no batch, so nothing else would
-                # ever fail them.
+                # Requests a resource refused for good since last pass, in a
+                # readiness scan or in a step's admit (``Admission.requeue``).
+                # They fail here, one pass after the refusal.
                 self._fail_requests(self.admission.take_admit_errors())
                 self._apply_pending_drains(self._in_flight_rids)
                 laps.lap("teardown")
@@ -4536,7 +4536,7 @@ class Worker:
                         #   output is invalid, so the spec batch can't run.
                         #
                         # * Yield-away spec is independent of pending.
-                        #   But ``_handle_allocation_failure`` may have shifted
+                        #   But ``_handle_admit_failure`` may have shifted
                         #   the engine's KV-cache state (paused/offloaded rids),
                         #   so reset pre-plan.
                         if speculation is not None:

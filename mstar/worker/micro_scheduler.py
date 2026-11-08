@@ -376,7 +376,9 @@ class MicroScheduler:
 
     def note_follow_pop(self, key: tuple[str, str]) -> None:
         """The follow head of scheduling key ``key`` was popped, which counts for
-        round-robin order as a scheduled step does."""
+        round-robin order as a scheduled step does. The serial path counts every
+        built step; the async path (``Worker._try_follow_speculation``) counts
+        only a head with fresh rows."""
         self.batch_number += 1
         self.node_and_walk_to_last_batch_num[key] = self.batch_number
 

@@ -3,8 +3,10 @@
 Rank 0 of an instance decides what runs and broadcasts each step as a
 ``ScheduleTPNode``; every other rank keeps those in a FIFO and builds the same step
 from its own copy of the inputs (AGENTS.md invariant 11). This holds what that
-takes on each side, which is everything here except the choice between the
-follow head and a colocated node: that is ``MicroScheduler``'s.
+takes on each side, except the choice between the follow head and a
+colocated node, which is ``MicroScheduler``'s. ``build_follow_step`` opens the
+head on the serial path; ``Worker._try_follow_speculation`` repeats that
+sequence by hand on the async path, popping only the fresh rows.
 """
 from __future__ import annotations
 

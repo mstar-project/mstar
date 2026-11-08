@@ -1,9 +1,11 @@
 """Whether a row or a step fits the engine's resources now, and what happens
 when admit refuses one.
 
-Calls neither the scheduler nor the request bookkeeping. A refused step's caller
-passes in what only they know: the requests in arrival order, who is last in
-line, and whether other rows could refill the step.
+Doesn't import the scheduler. A refused step's caller passes in what only it
+knows: the requests in arrival order, who is last in line, and whether other
+rows could refill the step (the last two as callables into the scheduler).
+Reads the request bookkeeping only to unpark rows, and starts the rebuild of a
+row its engine dropped (``Rebuilds.start``).
 """
 from __future__ import annotations
 
