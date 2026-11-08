@@ -32,6 +32,7 @@ from mstar.engine.resources.kv.transfer import (
 )
 from mstar.engine.resources.lora.config import LoraReqConfig
 from mstar.engine.resources.position.manager import PublishedPositionInfo
+from mstar.engine.resources.request_pool.config import RequestPoolReqConfig
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.utils.ipc_format import (
@@ -108,6 +109,7 @@ _TYPES: dict[str, type] = {
     "kv_req_config": KVReqConfig,
     "sampling_req_config": SamplingReqConfig,
     "lora_req_config": LoraReqConfig,
+    "request_pool_req_config": RequestPoolReqConfig,
 }
 
 for _tag, _cls in _TYPES.items():

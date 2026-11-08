@@ -198,7 +198,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        chunk by chunk (Wan2.1-layout causal DiT, rolling KV cache, 4 distilled steps).
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
-       rows for up to the 4,077-frame maximum. One rollout per GPU. The DiT's attention runs
+       rows for up to the 4,077-frame maximum. One rollout at a time for now: the model
+       refuses any other ``max_concurrent_requests``. Each rollout's K/V and VAE caches
+       live in its request pool (``resources: dit_pool: pool_bytes``); its noise for the
+       whole rollout is still the model's. The DiT's attention runs
        through the engine's ragged attention resource, its blocks are compiled (Inductor's
        deterministic mode), the condition encode runs channels-last, and the VAE decode is
        channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).

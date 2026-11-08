@@ -649,6 +649,19 @@ The spec types are:
        reserved or released per step. ``attend`` takes an optional per-distance score
        term (``rel_bias``) for relative-position attention. Float32 by default (Triton
        kernels). See `Bounded (sink + window) caches`_.
+   * - ``RequestPoolSpec(config=RequestPoolConfig(...))``
+     - Per-request regions of a pool reserved at startup (``pool_bytes``), each holding the
+       named buffers its request declared when it opened (``RequestPoolReqConfig``) and
+       sized to them, so requests of different sizes share it. Storage only: the model
+       (``view``) or a resource that depends on the pool reaches a buffer through the step's
+       plan. See `Request pools`_.
+   * - ``RollingKVSpec(config=RollingKVConfig(...))``
+     - Sink + window rules over each request's K/V buffer in a request pool
+       (``RollingKVConfig.pool``), kept compacted in stream order, with no memory or
+       attention of its own: a step writes its tokens with ``write`` and hands ``window``
+       (one contiguous range) to whatever attention the model runs, a ragged one say. For
+       long chunks where that kernel's speed matters (a causal video DiT). See `Rolling
+       (compacted) caches`_.
    * - ``AttentionSpec(config=AttentionConfig(kv_cache=...))``
      - Self-attention planned over the named cache. ``backend`` selects
        ``AttnBackend.AUTO`` (the default, which lets the engine pick the platform's
@@ -1136,6 +1149,72 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 compute in it. The streaming FastConformer (``encoder_kv_config`` in
 ``mstar/model/components/fastconformer_stream.py``, Nemotron VoiceChat's ``ENCODER_KV``) is
 the per-query example.
+
+Request pools
+^^^^^^^^^^^^^
+
+A request pool (``RequestPoolSpec(config=RequestPoolConfig(pool_bytes=...))``) is storage
+only: one block of device memory reserved at startup, from which each request takes one
+contiguous region for as long as it runs. The region holds the named buffers the request
+declared when it opened: the model returns ``RequestPoolReqConfig.of({name: (shape, dtype),
+...})`` from ``get_request_resource_configs``, so the buffers can depend on the request
+(its output resolution, say), and a request it declares nothing for fails at its first
+step. Buffers start on 256-byte boundaries. A request waits in the engine's admission
+queue, in arrival order, until the pool has room for its region, which is then set aside
+for it, and one larger than the whole pool is a 400 at the conductor. Its first step takes
+a region of exactly that size (first fit), given back when the request ends, so requests of
+different sizes share the pool instead of each holding the largest. When no free gap holds
+a new request but the free bytes do, the resident regions slide left to join the gaps, a
+copy of what they hold, inside ``admit``; one that slides across a gap short next to it is
+copied through a 64 MiB staging block reserved with the pool rather than in many small
+copies.
+
+A step declares the pool with a ``RequestPoolStep`` naming its rows. The model reaches a
+row's buffer with ``view(name, row)``, a tensor into the pool that is good for that step
+only: a rearrange moves regions. A model that keeps views between steps, to save taking
+them again, checks each step that the region has not moved (a fresh view's address) and
+takes them again when it has. A resource that needs rules over a buffer depends on the pool (its
+spec's ``depends_on``) and reads the request's buffer directly in its own ``plan`` with
+``buffer(rid, name)``, not through the pool's plan: a region can hold many buffers and the
+resource needs one. Rolling K/V (below) is one. How many requests run at once is then the pool's to decide, as long as
+the model keeps no other per-request state outside it. A step that declares the pool runs
+eager (no capture yet), and the pool does not shard across ranks yet. A model whose forward
+runs in inference mode declares ``RequestPoolConfig(inference_tensors=True)``: the pool is
+allocated, viewed and written in inference mode (writes go through ``writing()``), so its
+views are inference tensors and pass to the model's compiled graphs as they are, since
+those guard on their inputs' dispatch keys. LingBot-World keeps each rollout's rolling K/V,
+text K/V and VAE encoder and decoder caches in one (``DIT_POOL``); both write their caches
+straight into it (``wan_vae.PoolFeatCache`` with ``wan_vae.encoder_saves_uncopied`` and
+``wan_vae.decoder_saves_uncopied``). Its noise for the whole rollout is still the model's,
+so it requires ``max_concurrent_requests: 1`` for now.
+
+Rolling (compacted) caches
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A causal video DiT that denoises chunk after chunk against a sink and a sliding window of
+earlier chunks (Self-Forcing's rolling cache; LingBot-World's ``DIT_KV``) declares a
+``RollingKVSpec``. Its chunks are thousands of queries over tens of thousands of keys, so
+the attention kernel dominates the step, and bounded KV's Triton kernel (built for short
+streaming steps) is several times slower there than the ragged FlashInfer one. The rolling
+window therefore runs no attention: it keeps the stream's first ``sink`` tokens and its
+last ``window`` (the step's included) in stream order, shifting the window left behind the
+sink when a step would overflow, so a step's keys are always one contiguous slice.
+
+Each step declares its rows' ``RollingPosition(written, sink, window)`` in tokens
+(``RollingKVStep``), so the retention can follow a request's own geometry. ``plan`` applies
+the shift, once per step even when planned twice; the model then calls ``write(layer, k,
+v)`` (as often as its denoise loop rewrites the chunk; the last write stays) and attends
+``window(layer)`` with its own kernel.
+
+The window owns no memory: each request's K/V live in a buffer of its region in a request
+pool (``RollingKVConfig.pool``), named after the window's resource key and shaped
+``[layers, 2, sink + window, heads, head_dim]``, which the model declares with the
+request's other buffers (``RollingKVConfig.buffer(sink + window)``). The pool admits the
+request, places and moves its region, and frees it; the window checks each step's position
+against what was committed and shifts the retained window inside the buffer. A shift across
+a distance short next to what the window keeps goes through a staging block of 512 tokens a
+layer (90 MiB at LingBot-World's geometry) rather than in many small copies. A step that
+declares the window runs eager (no capture yet), and it does not shard across ranks yet.
 
 Per-request LoRA adapters
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2433,6 +2512,8 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``RequestPoolSpec``
+     - ``pool_bytes``
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
