@@ -322,9 +322,10 @@ class TestEras(unittest.TestCase):
             GPU["terminate"]("eras:i-1", e)
         self.assertEqual(GPU["ledger"](), {}, "the watchdog would retry a released instance forever")
 
-    def eras_launch(self, write=None, max_running=None, held=("v1",)):
-        """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview refuses
-        those `held` (as the spec has it), as when another box took them in between; the calls it made."""
+    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview"):
+        """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview (or the
+        create, `refused_by`) refuses those `held` (as the spec has it), as when another box took them in
+        between; the calls it made."""
         key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
         key.write_text("ssh-ed25519 AAAA test")
         tpl = {"endpoints": {"ssh": {"port": 22}}, "pod": {"containers": [
@@ -332,8 +333,13 @@ class TestEras(unittest.TestCase):
 
         def eras(method, path, body=None, params=None):
             calls.append((method, path, body))
+            bound = method == "POST" and path.startswith("/instances") and \
+                (body["run"]["bindings"]["volumes"].get("cache") or {}).get("volume_id") in held
+            if path == "/instances" and bound and refused_by == "create":
+                raise GPU["ApiError"](409, {"code": "volume_bound", "message": "Another instance binds the volume.",
+                                            "timestamp": "2026-11-08T00:00:00Z"})
             if path == "/instances/preview":
-                bound = (body["run"]["bindings"]["volumes"].get("cache") or {}).get("volume_id") in held
+                bound = bound and refused_by == "preview"
                 return {"run": {"problems": []}, "is_available": not bound,
                         "unavailable_reason": "volume_bound" if bound else None,
                         "unavailable_detail": "Another instance binds the volume." if bound else None,
@@ -369,6 +375,15 @@ class TestEras(unittest.TestCase):
             self.assertEqual([[v["volume_id"] for k, v in b["run"]["bindings"]["volumes"].items() if k == "cache"]
                               for b in created], [bound],
                              "a live test would give up on Eras rather than take the next free volume or start cold")
+
+    def test_each_launch_attempt_has_its_own_idempotency_key(self):
+        def keys():
+            return [c[2]["idempotency_key"] for c in self.eras_launch(held=["v1", "v2"], refused_by="create")
+                    if c[:2] == ("POST", "/instances")]
+        first = keys()
+        self.assertEqual(len(set(first)), 3, "Eras refuses a key reused with another body (idempotency_key_reused), "
+                                             "so the next volume or a cold box would never launch")
+        self.assertEqual(keys(), first, "a rerun of the same launch would buy a second instance, not get the first")
 
     def test_a_launch_past_the_caps_registers_nothing(self):
         calls = self.eras_launch(max_running=0)

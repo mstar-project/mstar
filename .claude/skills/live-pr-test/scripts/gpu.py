@@ -654,7 +654,7 @@ def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float, r
         box["volumeMounts"].append({"mountPath": "/cache", "name": "cache", "readOnly": not rw})
     keep = 900 if run else 0
     return {
-        "listing_id": o["id"].split(":", 1)[1], "name": name, "idempotency_key": name,
+        "listing_id": o["id"].split(":", 1)[1], "name": name,
         "run": {"pod": pod, "endpoints": {"ssh": tpl["endpoints"]["ssh"]}, "config_maps": config_maps,
                 "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [eras_ssh_key_id(pubkey, name)]},
                                          **({"live-pr-key": {"secret_id": er["run_secret_id"]}}
@@ -692,7 +692,10 @@ def volume_refused(err: ApiError) -> bool:
 
 
 def eras_create(body: dict) -> str:
-    """Preview, accept the quoted prices, create; the instance id."""
+    """Preview, accept the quoted prices, create; the instance id. Eras refuses an idempotency key
+    reused with another request, so each attempt (listing, cache volume, ssh key) has its own, and
+    the same attempt sent again, after a timeout or by a rerun with the same --tag, keeps it."""
+    import hashlib
     preview = eras("POST", "/instances/preview", body)
     problems = (preview.get("run") or {}).get("problems") or []
     if problems:
@@ -704,8 +707,12 @@ def eras_create(body: dict) -> str:
         raise ApiError(409, f"capacity: {detail or reason}")
     for w in (preview.get("run") or {}).get("warnings") or []:
         print(f"gpu.py: eras preview: {w.get('message')}", file=sys.stderr)
+    binds = body["run"]["bindings"]
+    attempt = json.dumps([body["listing_id"], (binds["volumes"].get("cache") or {}).get("volume_id"),
+                          binds["secrets"]["authorized-keys"]["ssh_key_ids"]])
     body = dict(body, accepted_prices={i["usage_type"]: i["unit_price"] for i in preview["quote"]["line_items"]},
-                accepted_available_until=preview.get("available_until"))
+                accepted_available_until=preview.get("available_until"),
+                idempotency_key=f"{body['name']}-{hashlib.sha256(attempt.encode()).hexdigest()[:8]}")
     return eras("POST", "/instances", body)["id"]
 
 
