@@ -1,25 +1,18 @@
-#!/usr/bin/env python3
 """Render the review's summary comment from its structured output.
 
 The review returns the fields in SCHEMA rather than Markdown, so every summary
 has the same shape: a status line, then only the sections that have something
 in them. The status line counts the open findings (`open_findings`), so a finding
 from an earlier run counts until a later review judges it fixed, fixed above or moot, or a commit
-changes its lines. Run by claude-review.yml with the default branch checked out:
-
-    python3 .github/review/render_summary.py --schema     # for --json-schema
-    python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json \
-        --above stacked-above.json < output.json
-    python3 .github/review/render_summary.py --state --mode nogpu < summary-comment-body   # what a re-review reads
+changes its lines. bot.py passes SCHEMA to the review, posts what `render` makes of
+its fields, and starts a re-review from what `read_state` reads back.
 """
-import argparse
 import base64
 import json
 import re
-import sys
 from pathlib import Path
 
-# Lets the workflow find earlier summaries to hide as outdated.
+# Lets the bot find earlier summaries to hide as outdated.
 MARKER = "<!-- claude-review-summary -->"
 # What a re-review starts from (head, findings outside the diff, risk), base64 JSON,
 # so model text can't close the HTML comment. Read back only from the bot's own comments.
@@ -102,7 +95,7 @@ FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.
 
 def stacked_above(path):
     """The numbers of the PRs stacked above whose diffs the review was given: stacked-above.json, which
-    the workflow leaves out when a fetch failed. [] without it."""
+    bot.collect leaves out when a fetch failed. [] without it."""
     return [int(pr["number"]) for pr in json.loads(Path(path).read_text())] if path and Path(path).exists() else []
 
 
@@ -127,7 +120,7 @@ def open_findings(review, pages, stacked):
     open: only a later review that judged it fixed, fixed above or moot, or a commit that outdated it,
     clears it. An untagged bot thread counts as a P2, since its priority is unknown. A finding a PR
     stacked above fixes isn't open: it lands with that PR, when that PR is one of `stacked` (judged).
-    `pages` are the PR's review threads, from `gh api graphql --paginate --slurp`."""
+    `pages` are the pages of the PR's review threads (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
     cleared = {f["ref"] for f in prior if f["status"] != "open"}
@@ -243,28 +236,3 @@ def read_state(body, mode):
         return None
     return state
 
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--schema", action="store_true", help="print the fields the review returns, as a JSON schema")
-    ap.add_argument("--head")
-    ap.add_argument("--mode")
-    ap.add_argument("--threads", help="the PR's review threads, from `gh api graphql --paginate --slurp`")
-    ap.add_argument("--above", help="stacked-above.json: the PRs stacked above whose diffs the review was given; "
-                                    "none when the file is missing")
-    ap.add_argument("--state", action="store_true",
-                    help="print the state a summary comment (stdin) carries, for a re-review in --mode")
-    a = ap.parse_args()
-    if a.schema:
-        print(json.dumps(SCHEMA, separators=(",", ":")))
-    elif a.state:
-        state = read_state(sys.stdin.read(), a.mode)
-        print(json.dumps(state) if state else "")
-    else:
-        with open(a.threads) as f:
-            pages = json.load(f)
-        sys.stdout.write(render(json.load(sys.stdin), pages, a.head, a.mode, stacked_above(a.above)))
-
-
-if __name__ == "__main__":
-    main()

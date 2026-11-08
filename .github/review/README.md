@@ -32,7 +32,8 @@ Running out of turns is handled in two ways. A review that finished but went pas
 | [`../../AGENTS.md`](../../AGENTS.md) | **The substance.** Numbered invariants the reviewer checks and cites. Also read by contributors' own coding agents. |
 | [`review-prompt.md`](review-prompt.md) | The bot's inputs, trust boundary, re-review scope and output. The method and bar are in `pr-review`. |
 | [`../workflows/claude-review.yml`](../workflows/claude-review.yml) | The workflow, and the safety rules that come with running on `issue_comment`. |
-| [`render_summary.py`](render_summary.py) | The summary's fields (its `--schema`), and the comment they render to. |
+| [`bot.py`](bot.py) | Every step of the workflow that isn't an action, one function each, run as `python3 .github/review/bot.py <step>`: a step's parameters are its `env:`, its outputs a dict, and every call to `gh` goes through one function, which [`../../test/ci/test_review_bot.py`](../../test/ci/test_review_bot.py) replaces. |
+| [`render_summary.py`](render_summary.py) | The summary's fields (its `SCHEMA`), and the comment they render to. |
 | [`session.py`](session.py) | Reads a run's execution file and transcripts: the usage record, and the handoff for `/review continue`. |
 | [`replay.sh`](replay.sh) | Run the reviewer locally against a past PR, to tune before trusting it. |
 | [`../../.claude/skills/benchmarking/SKILL.md`](../../.claude/skills/benchmarking/SKILL.md) | Benchmarking methodology. The reviewer reads it to judge performance claims; contributors follow it to produce them. |

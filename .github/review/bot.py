@@ -21,6 +21,7 @@ import sys
 from pathlib import Path
 
 import render_summary
+import session
 
 # Credential-shaped strings, removed from everything the bot posts or saves.
 REDACT = [re.compile(p) for p in (
@@ -33,8 +34,14 @@ REDACT = [re.compile(p) for p in (
 WRITE = ("admin", "maintain", "write")
 # The bot's REST logins: the review app's, and github-actions', which it posted as before the app.
 BOT_USERS = [f"{b}[bot]" for b in render_summary.BOTS]
-# The marker of a stopped review's "didn't complete" comment.
+# The marker of a stopped review's "didn't complete" comment, of one a later run resolved, and of a refused
+# /review continue's.
 INCOMPLETE = "<!-- claude-review-incomplete -->"
+RESOLVED = "<!-- claude-review-incomplete-resolved -->"
+REFUSED = "<!-- claude-review-continue-refused -->"
+# What Claude Code wrote of the run: the action's execution file, and the session transcripts.
+EXECUTION = "claude-execution-output.json"
+TYPES = render_summary.TYPES
 # A branch name safe for the API path and the command line.
 BRANCH = re.compile(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*")
 THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
@@ -395,6 +402,203 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     out["schema"] = json.dumps(render_summary.SCHEMA, separators=(",", ":"))
 
 
+# ---------------------------------------------------------------- review job: after the review
+
+def salvage(out, repo, pr, runner_temp):
+    """The action fails a run that went past --max-turns even when Claude finished and returned its
+    summary, and on a real failure it still writes everything Claude said to its execution file. Read
+    the result from there: the summary to post anyway (`structured_output`), or why it stopped. Out of
+    API credit: a one-line answer instead of a "didn't complete" comment, since there's nothing to
+    retry or continue until it's topped up."""
+    f = Path(runner_temp, EXECUTION)
+    if not f.is_file() or not f.stat().st_size:
+        out["why"] = "it stopped before Claude Code returned (a timeout or a setup error)"
+        return
+    messages = json.loads(f.read_text())
+
+    def text(m):
+        return "".join(str(b.get("text")) for b in session.blocks(m) if b.get("type") == "text")
+
+    if any(m.get("type") == "assistant" and (m.get("error") == "billing_error"
+                                               or text(m).startswith("Credit balance is too low")) for m in messages):
+        print("::warning::The Anthropic API account is out of credit; skipping the review.")
+        out["billing"] = "true"
+        comment(repo, pr, "The review didn't run: the API account for the review bot is out of credit.")
+        return
+    result = ([m for m in messages if m.get("type") == "result"] or [{}])[-1]
+    turns = result.get("num_turns")
+    out["detail"] = f"{'?' if turns is None or turns is False else jq_text(turns)} turns"
+    output = result.get("structured_output")
+    if result.get("subtype") == "success" and result.get("is_error") in (None, False) and isinstance(output, dict):
+        out["structured_output"] = json.dumps(output, separators=(",", ":"), ensure_ascii=False)
+    else:
+        out["why"] = {"error_max_turns": "it ran out of turns",
+                      "error_during_execution": "Claude Code stopped on an error",
+                      "success": "it finished without returning a summary"}.get(
+            result.get("subtype"), "Claude Code ended without a result")
+
+
+def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, github_run_attempt,
+          github_step_summary, prev=""):
+    """What the run used, from the execution file or, after a timeout, the session transcript: a table in
+    the job summary, and a small record ($RUNNER_TEMP/usage/) to compare runs by. Never posted on the PR,
+    and never fails: a record that couldn't be read says why in its `error` field."""
+    record = {"pr": pr, "head_sha": head_sha, "mode": mode, "continue": prev != "", "run_id": github_run_id,
+              "run_attempt": github_run_attempt, "outcome": outcome}
+    try:
+        record.update(session.usage(session.load([Path(runner_temp, EXECUTION), Path(home, ".claude/projects")])))
+    except Exception as e:
+        record["error"] = f"{type(e).__name__}: {e}"
+        print(f"::warning::Couldn't read the review's usage: {record['error']}")
+    try:
+        path = Path(runner_temp, "usage", f"review-usage-{pr}-{github_run_id}-{github_run_attempt}.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=1) + "\n")
+        with open(github_step_summary, "a") as f:
+            f.write(session.usage_table(record))
+    except Exception as e:
+        print(f"::warning::Couldn't write the usage record: {e}")
+
+
+def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
+    """Post the summary, rendered from the review's fields by render_summary and redacted: model output from
+    untrusted input. Read the PR's threads after the review posted its inline comments, so the status line
+    counts them along with earlier ones still open. Each run posts its own summary comment, so a re-review
+    doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
+    point here, and loses its marker so a later failure starts a fresh one."""
+    pages = graphql(THREADS, repo, pr)
+    try:
+        text = render_summary.render(json.loads(output), pages, head_sha, mode,
+                                     render_summary.stacked_above("stacked-above.json"))
+    except Exception as e:
+        text = ""
+        print(f"::warning::The review's summary didn't render: {type(e).__name__}: {e}")
+    text = redact(text)
+    if not text.strip():
+        print("::warning::The review returned no summary to render.")
+        sys.exit(1)
+    if salvaged == "true":
+        text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
+                 "reported it as failed.</sub>\n")
+    url = comment(repo, pr, text)
+    out["id"] = url.rsplit("-", 1)[-1]
+    try:
+        stopped = marked(api_list(f"repos/{repo}/issues/{pr}/comments"), INCOMPLETE)
+    except (RuntimeError, ValueError):
+        stopped = []
+    for cid in stopped:
+        body = f"{RESOLVED}\nAn earlier review run didn't complete; a later run finished: {url}\n"
+        try:
+            gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{cid}", "--input", "-",
+               input=json.dumps({"body": body}))
+        except RuntimeError as e:
+            print(f"::warning::Couldn't mark comment {cid} resolved: {e}")
+
+
+def hide(out, repo, pr, new_id):
+    """Hide the earlier summaries as outdated, so the PR shows only the latest one and each earlier one
+    stays a click away. Summaries from before the marker start with the heading instead. Only GraphQL
+    says which comments are already hidden."""
+    query = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
+      repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
+        comments(first: 100, after: $endCursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes { id databaseId isMinimized author { login } body }
+        } } } }"""
+    for page in graphql(query, repo, pr):
+        for c in page["data"]["repository"]["pullRequest"]["comments"]["nodes"]:
+            if (c.get("author") or {}).get("login") in render_summary.BOTS and not c["isMinimized"] \
+                    and str(c["databaseId"]) != new_id \
+                    and (c["body"] or "").startswith((render_summary.MARKER, "### Automated review")):
+                gh("api", "graphql", "-f", "query=mutation($id: ID!) { minimizeComment(input: {subjectId: $id, "
+                   "classifier: OUTDATED}) { clientMutationId } }", "-f", f"id={c['id']}")
+
+
+def labels(out, repo, pr, output):
+    """The PR's type/* labels, from the review's structured output. Model output, so each is checked
+    against the fixed list before it reaches the API; type/* labels the review no longer returns are
+    removed. Area and size labels come from pr-labels.yml."""
+    try:
+        types = json.loads(output).get("types") or []
+    except (ValueError, AttributeError):
+        types = []
+    wanted = [f"type/{t}" for t in (types if isinstance(types, list) else []) if t in TYPES]
+    if not wanted:
+        print("::warning::The review returned no valid type; leaving the type labels alone.")
+        return
+    try:
+        current = [x["name"] for x in api(f"repos/{repo}/issues/{pr}/labels")]
+    except (RuntimeError, ValueError, KeyError, TypeError):
+        current = []
+    for old in current:
+        if old.startswith("type/") and old not in wanted:
+            gh("api", "-X", "DELETE", f"repos/{repo}/issues/{pr}/labels/{old.replace('/', '%2F')}")
+    for label in wanted:
+        if gh("api", f"repos/{repo}/labels/{label.replace('/', '%2F')}", check=False).returncode:
+            gh("api", "-X", "POST", f"repos/{repo}/labels", "-f", f"name={label}", "-f", "color=fbca04")
+        gh("api", "-X", "POST", f"repos/{repo}/issues/{pr}/labels", "-f", f"labels[]={label}")
+
+
+def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
+    """A review that stopped before it finished: the handoff a `/review continue` starts from
+    ($RUNNER_TEMP/handoff), from the execution file or, after a timeout, the transcript Claude Code writes
+    as it goes, and partial.md, what the "didn't complete" comment shows. A continued run that stops too
+    merges its handoff onto the one it started from (`prev`). Model notes on the PR's own content, so
+    redacted as the summary is; the artifact is public on a public repo."""
+    previous = None
+    if prev:
+        try:
+            previous = json.loads(Path(prev, "handoff.json").read_text())
+        except (OSError, ValueError) as e:
+            print(f"::warning::Couldn't read the earlier handoff, so this one starts afresh: {e}")
+    if not isinstance(previous, dict):
+        previous = None
+    diff = Path("pr.diff").read_text(errors="replace") if Path("pr.diff").is_file() else ""
+    # Tool paths are absolute, under the workspace this runs in.
+    h = session.handoff(session.load([Path(runner_temp, EXECUTION), Path(home, ".claude/projects")]), os.getcwd(),
+                        session.diff_paths(diff), previous)
+    # A continued run that stopped before Claude said anything still passes on the handoff it started
+    # from, which is still valid for this head.
+    if not h.pop("seen_assistant") and previous is None:
+        sys.exit("No Claude Code messages to hand off.")
+    saved = Path(runner_temp, "handoff")
+    saved.mkdir(parents=True, exist_ok=True)
+    (saved / "handoff.json").write_text(redact(json.dumps({"pr": pr, "head_sha": head_sha, "mode": mode, **h})))
+    (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode)))
+    Path("partial.md").write_text(redact(session.partial_md(h)))
+    out["dir"] = str(saved)
+
+
+def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_continue="false", refused="false"):
+    """Anything failed: say so on the PR rather than leaving silence, with what the run had so far
+    (partial.md). Repeated failures update one comment, found by its marker, so retries don't stack up
+    comments. A refused /review continue has a marker of its own, so it never writes over a stopped
+    review's comment (its partial results, and that it can still be continued by someone else)."""
+    if refused == "true":
+        # A /review continue that had nothing usable to continue from; `why` says what to do.
+        marker = REFUSED
+        text = f"{marker}\n`/review continue` didn't run: {why}. [Log]({run_url}).\n"
+    else:
+        marker = INCOMPLETE
+        then = ("Comment `/review continue` to continue from its notes in a fresh session (kept for 7 days), or the "
+                "same `/review` command to start over." if can_continue == "true"
+                else "Comment the same `/review` command to retry.")
+        text = (f"{marker}\nThe automated review didn't complete: {why}{f' ({detail})' if detail else ''}. "
+                f"[Log]({run_url}). {then}\n")
+    partial = Path("partial.md")
+    if partial.is_file() and partial.stat().st_size:
+        text += "\nWhat it had so far:\n\n" + partial.read_text()
+    try:
+        earlier = marked(api_list(f"repos/{repo}/issues/{pr}/comments"), marker)
+    except (RuntimeError, ValueError):
+        earlier = []
+    if earlier:
+        gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{earlier[-1]}", "--input", "-",
+           input=json.dumps({"body": text}))
+    else:
+        comment(repo, pr, text)
+
+
 # ---------------------------------------------------------------- dispatcher
 
 def main(steps):
@@ -424,7 +628,8 @@ def main(steps):
                     f.write(f"{key}={value}\n")
 
 
-STEPS = {"preflight": preflight, "resolve": resolve, "restore": restore, "collect": collect}
+STEPS = {"preflight": preflight, "resolve": resolve, "restore": restore, "collect": collect, "salvage": salvage,
+         "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete}
 
 if __name__ == "__main__":
     main(STEPS)
