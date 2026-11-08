@@ -456,8 +456,8 @@ class TestApprove(unittest.TestCase):
     def test_the_fixed_check_finds_hardware_words_and_leaves_ordinary_ones(self):
         for text, hit in (("amdsmi.gpu", True), ("if isAMD():", True), ("MI300A nodes", True), ("hipcc -c x", True),
                           ("torch.xpu", True), ("Intel Gaudi", True), ("TPU", True), ("Apple Silicon", True),
-                          ("tpu = PS // 2", False), ("amd64 builds", False), ("AuthenticAMD", False), ("hipster", False),
-                          ("test_bare_metal", False), ("bare-metal hosts", False), ("MPS on and off", False)):
+                          ("tpu = PS // 2", False), ("amd64 builds", False), ("AuthenticAMD", False),
+                          ("hipster", False), ("test_bare_metal", False), ("bare-metal hosts", False), ("MPS on and off", False)):
             with self.subTest(text):
                 self.assertEqual(bool(gpu_review.UNTESTABLE_HARDWARE.search(text)), hit)
 
