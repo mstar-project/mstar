@@ -49,7 +49,7 @@ def _raise(err):
 def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     """An engine that refuses the request, or a read that raises as it starts
     (a CUDA OOM in the H2D copy, say): the request fails, alone."""
-    registered, processed = [], []
+    registered, processed, reads = [], [], []
     parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
     w = make_worker(
         _graph_runtime=SimpleNamespace(
@@ -64,10 +64,11 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
         ),
         request_state=SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None),
         streams=SimpleNamespace(add_request=lambda rid, info: None),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
         tensor_manager=SimpleNamespace(
             register_request=lambda rid, sharding: registered.append(rid),
             start_read_tensors=lambda *a, **kw: (
-                _raise(RuntimeError("CUDA out of memory")) if raises_in == "input_read"
+                reads.append(a[0]) or _raise(RuntimeError("CUDA out of memory")) if raises_in == "input_read"
                 else pytest.fail("no reads for a failed request")
             ),
         ),
@@ -84,6 +85,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     w.ingest._add_new_request(body)
     failed = w.lifecycle.take_failures()
     assert registered == [5] and list(failed) == [5]
+    assert reads == ([5] if raises_in == "input_read" else [])  # the read itself raised
     assert failed[5].startswith("Error in worker: internal error (error id ")
     # messages parked before the NEW still go through (a parked REMOVE among them)
     assert processed == [parked] and "wire" not in w.lifecycle._parked

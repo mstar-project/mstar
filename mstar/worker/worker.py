@@ -3998,11 +3998,7 @@ class Worker:
                 # drain deferred behind it with them.
                 else:
                     for dropped in (pending, spec_pending if spec_pending is not pending else None):
-                        if (
-                            dropped is not None and dropped is not decided
-                            and self._can_speculate(dropped.batch)
-                            and self.lockstep.leads_async(dropped.node_name)
-                        ):
+                        if dropped is not None and dropped is not decided and self._can_speculate(dropped.batch):
                             self.lockstep.maybe_broadcast_nospec(dropped, None)
                 # Clear the in-flight step: its rows are failed and its future
                 # drained, and it must not be post-processed again.

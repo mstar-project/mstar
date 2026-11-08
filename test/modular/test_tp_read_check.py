@@ -363,13 +363,15 @@ def test_a_read_that_raises_as_it_starts_goes_to_the_check_and_fails_once():
     sched, manager = _follower_scheduler(ready=["r0"])
     sched.lifecycle.add("r1", "r1")
     manager.per_request_info["r1"] = SimpleNamespace(stream_buffers={"audio": None})
+    reads = []
     w = make_worker(
         worker_id="w1", scheduler=sched, lockstep=sched.lockstep, admission=sched.admission,
         request_state=manager,
         _graph_runtime=SimpleNamespace(get_rid_handle=lambda r: r, get_rid_string=lambda h: h),
-        tensor_manager=SimpleNamespace(start_read_tensors=lambda *a, **kw: (_ for _ in ()).throw(
+        tensor_manager=SimpleNamespace(start_read_tensors=lambda *a, **kw: reads.append(a[0]) or (_ for _ in ()).throw(
             RuntimeError("CUDA out of memory"),
         )),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
     edge = _input(18, "audio")
     edge.is_streaming = True
@@ -379,6 +381,7 @@ def test_a_read_that_raises_as_it_starts_goes_to_the_check_and_fails_once():
             request_id="r1", inputs=[edge], request_info=None, producer_done=set(),
         ))
         reported.append(list(w.lifecycle.take_failures()))
+    assert reads == ["r1", "r1"]  # the read itself raised, both times
     assert reported == [["r1"], []]
     assert sched.lockstep.read_failed_rids == {"r1"}
 
