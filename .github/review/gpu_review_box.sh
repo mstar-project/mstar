@@ -3,7 +3,7 @@
 # reviewed commit. gpu_review.py launches it with `gpu.py launch --run`, so the box (a Slurm job or
 # an Eras Pod) is this script, and its GPUs go when it ends.
 #
-# Its inputs are run.json (repo, PR, commits, model), brief.md (what to do), findings.json (the
+# Its inputs are box_common.sh, run.json (repo, PR, commits, model), brief.md (what to do), findings.json (the
 # review's notes for the run: model text, which the brief calls untrusted data), pr-body.md (the
 # PR's title and description, untrusted data too), and on Slurm
 # anthropic.key (mode 0600, removed once read). On Slurm they are in the job's directory, where
@@ -15,8 +15,9 @@ set -uo pipefail
 if [ -n "${SLURM_JOB_ID:-}" ]; then W=$PWD IN=$PWD; else W=/workspace/live-pr IN=/run/live-pr; fi
 OUT=$W/out
 mkdir -p "$OUT" "$W/home" "$W/tmux"
-field() { python3 -c "import json,sys; print(json.load(open('$IN/run.json'))['$1'])"; }
-REPO=$(field repo); MAIN_SHA=$(field main_sha)
+# shellcheck disable=SC1091
+source "$IN/box_common.sh"
+MAIN_SHA=$(field main_sha)
 
 # A fresh home and Claude config: on a shared node /root/.claude holds other people's settings,
 # hooks and credentials. tmux gets its own socket directory, so nothing joins a shared server.
@@ -54,10 +55,7 @@ mkdir -p "$TMPDIR"
 finish() {
   [ -s "$OUT/result.json" ] || printf '{"verdict": "unavailable", "summary": "%s"}\n' "$1" > "$OUT/result.json"
   touch "$OUT/done"
-  # On Eras the Pod is the only copy of the results: stay up until the runner has them (15 min at most).
-  if [ -z "${SLURM_JOB_ID:-}" ]; then
-    for _ in $(seq 90); do [ -e "$OUT/collected" ] && break; sleep 10; done
-  fi
+  [ -n "${SLURM_JOB_ID:-}" ] || await_collection
   exit 0
 }
 # Slurm preempts the job with a TERM: say so, rather than leaving no result at all. `wait`, below, lets
@@ -65,8 +63,7 @@ finish() {
 trap 'kill "${claude_pid:-}" 2> /dev/null; finish "preempted before the session finished"' TERM
 
 # Trusted: main's skills, AGENTS.md and scripts, at the commit the workflow read its rules from.
-git clone -q "https://github.com/$REPO.git" "$W/main" && git -C "$W/main" checkout -q "$MAIN_SHA" \
-  || finish "couldn't check out main"
+clone_main "$MAIN_SHA"
 curl -fsSL https://claude.ai/install.sh | bash -s "$(field claude)" > "$OUT/install.log" 2>&1 \
   || finish "couldn't install Claude Code"
 

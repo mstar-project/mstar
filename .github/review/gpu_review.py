@@ -31,6 +31,7 @@ import render_summary
 ROOT = Path(__file__).resolve().parents[2]
 GPU = ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"
 BOX = Path(__file__).with_name("gpu_review_box.sh")
+BOX_COMMON = Path(__file__).with_name("box_common.sh")  # passed to both box scripts with --input
 REPO = os.environ.get("REPO", "mstar-project/mstar")
 # gpu.py's ledger, for this run only.
 os.environ.setdefault("LIVE_PR_STATE", str(Path(os.environ.get("RUNNER_TEMP", "/tmp"), "live-pr")))
@@ -348,6 +349,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
             tried.append(f"{o['id']}: {ahead} job(s) already pending in its partition")
     for o in [o for o in free if o["provider"] not in keyless]:
         inputs = [x for f in ("brief.md", "findings.json", "pr-body.md", "run.json") for x in ("--input", str(lt / f))]
+        inputs += ["--input", str(BOX_COMMON)]
         if o["provider"] == "slurm":
             key = lt / "anthropic.key"
             key.touch(mode=0o600)

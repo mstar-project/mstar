@@ -10,20 +10,17 @@
 # deleted once its server exits. The compile caches are saved to the volume every 5 models and at
 # the end.
 #
-# Inputs in /run/live-pr: run.json (repo, main_sha, models: "all" or names, skip: names,
+# Inputs in /run/live-pr: box_common.sh, and run.json (repo, main_sha, models: "all" or names, skip: names,
 # weights: "true" or "false").
 set -uo pipefail
 
 W=/workspace/live-pr IN=/run/live-pr OUT=/workspace/live-pr/out
+# shellcheck disable=SC1091
+source "$IN/box_common.sh"
 mkdir -p "$OUT" "$W/home"
 export HOME=$W/home
 exec > >(tee -a "$OUT/refresh.log") 2>&1
-field() { python3 -c "import json; print(json.load(open('$IN/run.json'))['$1'])"; }
-finish() {  # the Pod is the only copy of the log: stay up until the runner has it (15 min at most)
-  echo "$1"; touch "$OUT/done"
-  for _ in $(seq 90); do [ -e "$OUT/collected" ] && break; sleep 10; done
-  exit 0
-}
+finish() { echo "$1"; touch "$OUT/done"; await_collection; exit 0; }
 mountpoint -q /cache || finish "cache volume not mounted"
 # huggingface_hub never resumes a partial download (each attempt writes its own
 # <etag>.<random>.incomplete), so those a deadline cut short would only take up room.
@@ -39,8 +36,7 @@ else
 fi
 
 MAIN_SHA=$(field main_sha)
-git clone -q "https://github.com/$(field repo).git" "$W/main" && git -C "$W/main" checkout -q "$MAIN_SHA" \
-  || finish "couldn't check out main"
+clone_main "$MAIN_SHA"
 bash "$W/main/.claude/skills/live-pr-test/scripts/bootstrap.sh" 0 --ref "$MAIN_SHA" --no-main \
   --workdir "$W/live-pr" --hf-home "$HF_HOME" || finish "bootstrap failed"
 # shellcheck disable=SC1091
