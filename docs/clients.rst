@@ -116,6 +116,12 @@ send the next observation before the current action chunk has returned — and t
 ``request_id`` tells the replies apart. Pipelined messages are submitted in the order
 they were sent, so of two under one ``request_id`` it is the later one that gets the
 ``409`` while the earlier one runs; their replies may interleave. Closing the socket aborts whatever is still in flight.
+A JSON message over 1 MiB, or a msgpack one over 32 MiB, is parsed and its files decoded
+and saved in a separate process rather than on the server's event loop. Taking the message
+in still runs on the loop, and every other request on the server waits for it: about
+2 ms per MiB as JSON and 1 as msgpack, and with deflate on about 9 and 2. Text and
+``model_kwargs`` come back through the loop, so only ``files`` should be large. A
+deployment taking large messages should turn ``ws_per_message_deflate`` off.
 
 .. code-block:: python
 
@@ -249,9 +255,10 @@ handshake and has no ``/healthz``. Only the Python frontend serves this route;
 ``--rust-frontend`` logs a warning and serves without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
-``ws_max_message_mb`` (16 MiB by default, see :doc:`serving`). A larger observation closes
-the socket with ``1009`` and no error frame, so a deployment whose robots send several
-raw high-resolution cameras raises it.
+``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
+observation closes the socket with ``1009`` and no error frame, so a deployment whose robots
+send several raw high-resolution cameras raises it. An observation is parsed on the server's
+event loop, so a very large one holds up the server's other requests while it is parsed.
 
 .. code-block:: python
 
@@ -370,7 +377,8 @@ Endpoints and model coverage:
      - Notes
    * - ``GET /v1/models``
      - all
-     - Lists the served model.
+     - Lists the served model, and any LoRA adapters it serves (each with ``parent``
+       naming the base model; see the Qwen3.5 notes in :doc:`models`).
    * - ``POST /v1/chat/completions``
      - ``bagel``, ``qwen3_omni``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.
@@ -450,17 +458,17 @@ Per-model notes:
   Higgs-Audio emits no timestamps, so its ``verbose_json`` / ``srt`` / ``vtt`` get
   one segment per window, timed to the windows. A
   streaming client receives only the spoken words. Uploads longer than the
-  model's clip (30 s for Whisper) are served as consecutive windows. By default
-  they run in order, openai-whisper style: each window gets the transcript so
-  far as ``initial_prompt`` and the first window's detected language, is decoded
-  with timestamps so the next window can start where its last closed segment
-  ended (no word is split by a boundary), and is decoded again when its text is
-  a repetition loop (gzip compression ratio above 2.4): first without the
-  conditioning text, then at rising temperatures — after which the transcript
-  so far stops conditioning later windows.
-  Leave ``temperature`` at 0 to get that fallback; a pinned temperature is used
-  as is. ``long_form="parallel"`` in ``extra_body`` submits fixed windows all at
-  once, each cut at the quietest moment before its boundary. Segment timestamps
+  model's clip (30 s for Whisper) are cut into fixed windows, each at the quietest
+  moment before its boundary, and submitted at once. ``long_form="sequential"`` in
+  ``extra_body`` runs them in order instead, openai-whisper style: each window gets
+  the transcript so far as ``initial_prompt`` and the first window's detected
+  language, is decoded with timestamps so the next window can start where its last
+  closed segment ended (no word is split by a boundary), and is decoded again when
+  its text is a repetition loop (gzip compression ratio above 2.4): first without
+  the conditioning text, then at rising temperatures, after which the transcript so
+  far stops conditioning later windows. Leave ``temperature`` at 0 to get that
+  fallback; a pinned temperature is used as is. It is several times slower, and only
+  it has that repetition guard. Segment timestamps
   are offset to the whole file. For Whisper, ``window_seconds`` in ``extra_body``
   (5 to 30) sets the window length for one request, and an upload longer than it
   is windowed. An upload, like any audio a request attaches, is refused once it

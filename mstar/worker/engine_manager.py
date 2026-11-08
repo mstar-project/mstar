@@ -104,7 +104,7 @@ def _unchunkable_nodes(
                 f"{type(model).__name__}: {node!r} chunks {walk!r} but does not "
                 "report get_input_sequence_len"
             )
-        if parallel_groups.get_sp_config_for_node(node).world_size > 1:
+        if parallel_groups.get_joint_group_for_node(node).sp_group.world_size > 1:
             off.add(node)
     if off:
         logger.warning(
@@ -201,7 +201,7 @@ def _side_lane_keys(
     parallel_groups: WorkerParallelGroups, accelerator: bool,
 ) -> tuple[tuple[str, str], ...]:
     """The (node, walk) keys this worker runs beside its chain
-    (``mstar.worker.side_steps``): the ``side_stream_walks`` of the node whose
+    (``StepPipeline._launch_side``): the ``side_stream_walks`` of the node whose
     group sets ``side_stream: true``, or a ``ValueError`` naming why the lane
     can't take it. Only nodes that ask are checked.
 
@@ -223,8 +223,8 @@ def _side_lane_keys(
         if not side:
             raise refuse("its submodule declares no side_stream_walks")
         if parallel_groups.get_instance_world_size_for_node(name) > 1:
-            raise refuse("it runs tensor or sequence parallel: when a side step lands is per rank, "
-                         "and every rank of a lockstep instance has to agree on it")
+            raise refuse("it runs in a lockstep instance (TP, SP or CFG): when a side step lands "
+                         "is per rank, and every rank of the instance has to agree on it")
         if set(node_names) <= {name}:
             raise refuse("it is the only node on its worker, so there is no chain to run beside")
         if not accelerator:
@@ -357,19 +357,20 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # Sequence parallelism is opt-in per node; only forward the SP
-            # group when this node actually participates in one, so models
-            # that don't support SP keep their existing get_submodule call.
-            # Likewise ``moe_parallel``, only for a node group's ``ep_config``.
+            # Sequence and CFG parallelism are opt-in per node; only forward
+            # their groups when this node actually participates in one, so
+            # models that support neither keep their existing get_submodule
+            # call. Likewise ``moe_parallel``, only for a node group's
+            # ``ep_config``.
             extra = {}
-            node_sp_group = parallel_groups.get_sp_config_for_node(name)
-            if node_sp_group.world_size > 1:
-                extra["sp_group"] = node_sp_group
+            joint = parallel_groups.get_joint_group_for_node(name)
+            for key, group in (("sp_group", joint.sp_group), ("cfg_group", joint.cfg_group)):
+                if group.world_size > 1:
+                    extra[key] = group
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
-                name, device,
-                tp_group=parallel_groups.get_tp_config_for_node(name),
+                name, device, tp_group=joint.tp_group,
                 autocast_dtype=autocast_dtype, **extra,
             )
             if submodule is None:

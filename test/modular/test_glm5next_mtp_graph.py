@@ -123,7 +123,7 @@ class _Engine:
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub = Glm5NextLLMSubmodule(self.lm, cfg)
         self.sub.bind_node_resources(self.resources)
-        trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         self.cg = AcceleratorGraphRunner(
             submodule_name="LLM", submodule=self.sub, resources=self.resources,
             step_runner=self.runner, device=DEV, autocast_dtype=None,

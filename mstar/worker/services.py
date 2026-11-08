@@ -43,7 +43,7 @@ class WorkerServices:
     tensor_manager: TensorCommunicationManager
     request_state: RequestStateManager
     communicator: BaseCommunicator
-    # TP, SP and joint process groups
+    # per-axis (TP, SP, CFG) and lockstep-instance process groups
     parallel_groups: WorkerParallelGroups
     # what this worker rebuilds a dropped request's KV from
     rebuilds: Rebuilds
@@ -64,10 +64,11 @@ class WorkerLayout:
     my_walks: frozenset[tuple[str, str]] = frozenset()
     node_to_partition: Mapping[str, str] = field(default_factory=_no_entries)
     chunk_loops: ChunkLoops = field(default_factory=ChunkLoops)
-    # nodes whose instance spans more than one rank, and the nodes this worker
-    # leads. Instance rank 0 is rank 0 in both its TP and SP groups: keying the
-    # leader off the TP rank alone would elect one per TP row of a tp2*sp2
-    # instance. Pure SP nodes count, as their all-to-all needs the whole instance.
+    # nodes whose instance spans more than one rank, on any axis, and the nodes
+    # this worker leads. Instance rank 0 is rank 0 on every axis: keying the
+    # leader off one axis's rank alone would elect one per row of the others
+    # (ranks 0 and 2 of a tp2*sp2 instance). Pure SP or CFG nodes count, as
+    # their all-to-alls and gathers need the whole instance.
     parallel_nodes: frozenset[str] = frozenset()
     parallel_leader_nodes: frozenset[str] = frozenset()
     # Every parallel node on a worker is in one instance (``validate_deployment``

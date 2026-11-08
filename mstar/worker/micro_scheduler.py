@@ -42,7 +42,7 @@ from mstar.worker.services import WorkerLayout, WorkerServices
 logger = logging.getLogger(__name__)
 
 # The lane of the worker's main chain of steps, and of the one side lane, which
-# runs its keys' steps beside it (``mstar.worker.side_steps``)
+# runs its keys' steps beside it (``StepPipeline._launch_side``)
 CHAIN_LANE = 0
 SIDE_LANE = 1
 
@@ -153,7 +153,7 @@ class MicroScheduler:
         self.cached_prefix: dict[tuple[int, str], int] = {}
         self.sched_type = sched_type
 
-        # lockstep-parallel (TP / SP instance) scheduling
+        # lockstep-parallel (TP / SP / CFG instance) scheduling
         self.parallel_leader_nodes = layout.parallel_leader_nodes
         self.num_consec_tp_follower_batches = 0
         self.max_consec_tp_follower_batches = max_consec_tp_follower_batches
@@ -333,8 +333,7 @@ class MicroScheduler:
             return True
         if any(row.request_id not in batch_rids for row in self._rebuild_rows(key)):
             return True
-        lifecycle = self.lifecycle
-        exclude = lifecycle.failed_rids.union(lifecycle.pending_removes, self.admission.held_until, batch_rids)
+        exclude = self.lifecycle.no_new_work(self.admission.held_until, batch_rids)
         engine = self.engine_manager.get_engine(node_name)
         return any(
             engine.residency(spec.node_name, rid) is Residency.RESIDENT
@@ -493,8 +492,7 @@ class MicroScheduler:
         # Do not schedule a request that was removed between scheduling
         # cycles, has its remove deferred for in-flight safety, is in OOM
         # backoff, or recently failed.
-        lifecycle = self.lifecycle
-        exclude = lifecycle.failed_rids.union(lifecycle.pending_removes, self.admission.held_until)
+        exclude = self.lifecycle.no_new_work(self.admission.held_until)
         check_ready = self.admission.check_ready
         # only rank 0 can initiate scheduling: a followed node's head is
         # served by _try_schedule_tp_follow
@@ -573,27 +571,46 @@ class MicroScheduler:
         yield-away from that walk) stay parked."""
         rebuilds = self._rebuild_rows(node_walk, skip_walk=skip_walk)
         backlogged = self.backlog.pop(node_walk, None)
-        live = [] if backlogged is None else self._backlog_candidates(
-            backlogged, skip_walk=skip_walk,
-        )
-        if rebuilds:
-            live = [row.request_id for row in rebuilds] + live
-        found = {entry.request_id for entry in entries}.union(row.request_id for row in rebuilds)
-        walk_of = None
-        if node_walk in self._walks_of_key:
-            walks = {entry.request_id: entry.graph_walk for entry in entries}
-            walks.update((row.request_id, row.graph_walk) for row in rebuilds)
-            walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
-        check = self._readiness(node_walk[0])
-        pick = self.batch_builder.pick(self._step_candidates(
-            node_walk, backlog=live,
-            queued=[entry.request_id for entry in entries],
-            walk_of=walk_of,
-            ready=lambda rid: rid in found or check(rid),
-        ))
-        fresh = self._assemble_batch(*node_walk, entries) \
-            if entries else None
-        return self._build_step(node_walk, backlogged, fresh or None, pick, rebuilds)
+        try:
+            live = [] if backlogged is None else self._backlog_candidates(
+                backlogged, skip_walk=skip_walk,
+            )
+            if rebuilds:
+                live = [row.request_id for row in rebuilds] + live
+            found = {entry.request_id for entry in entries}.union(row.request_id for row in rebuilds)
+            walk_of = None
+            if node_walk in self._walks_of_key:
+                walks = {entry.request_id: entry.graph_walk for entry in entries}
+                walks.update((row.request_id, row.graph_walk) for row in rebuilds)
+                walk_of = lambda rid: walks.get(rid) or backlogged.walk_of(rid)  # noqa: E731
+            check = self._readiness(node_walk[0])
+            pick = self.batch_builder.pick(self._step_candidates(
+                node_walk, backlog=live,
+                queued=[entry.request_id for entry in entries],
+                walk_of=walk_of,
+                ready=lambda rid: rid in found or check(rid),
+            ))
+            fresh = self._assemble_batch(*node_walk, entries) \
+                if entries else None
+            return self._build_step(node_walk, backlogged, fresh or None, pick, rebuilds)
+        except Exception:
+            self._fail_unscheduled(backlogged, entries, rebuilds)
+            raise
+
+    def _fail_unscheduled(
+        self, backlogged: ScheduledBatch | None, entries: list[ReadyNodeEntry],
+        rebuilds: Sequence[MidPrefillRow],
+    ) -> None:
+        """A scheduling pass raised with ``backlogged`` popped and ``entries``
+        popped too, or still queued. The popped rows are in no queue and no
+        step, so nothing else would ever schedule or fail them; the queued ones,
+        and ``rebuilds``, which the log offers until they run, would raise the
+        next pass again. They fail rather than go back, where a persistent raise
+        would loop. A rejection already recorded stands."""
+        lost = {entry.request_id for entry in entries}.union(row.request_id for row in rebuilds)
+        if backlogged is not None:
+            lost.update(backlogged.request_to_worker_graph)
+        self.lifecycle.fail(dict.fromkeys(lost, "Error in worker: scheduling failed (see the worker log)"))
 
     def _build_step(
         self, node_walk: tuple[str, str],
@@ -760,9 +777,8 @@ class MicroScheduler:
         specs = []
         # a chain holding every request here has nothing waiting on the queues
         if len(self.request_state.per_request_info) > len(continuing) + len(unpopped):
-            lifecycle = self.lifecycle
             # A rebuild's request also has its decode row on a queue, which the step mustn't pop.
-            exclude = lifecycle.failed_rids.union(lifecycle.pending_removes, self.admission.held_until, unpopped)
+            exclude = self.lifecycle.no_new_work(self.admission.held_until, unpopped)
             specs = [
                 spec for spec in self._rows_here(self._ready_specs(
                     exclude, target if own_walk is not None else key, None,
@@ -824,11 +840,15 @@ class MicroScheduler:
             self.backlog.pop(key)
         else:
             backlogged = None
-        fresh = self._assemble_batch(*key, entries) if entries else None
-        return self._build_step(
-            key, backlogged, fresh or None, chain.pick,
-            [*chain.mid_prefill, *chain.rebuilds], pre_existing_batch_size, pre_existing_seq_lens,
-        )
+        try:
+            fresh = self._assemble_batch(*key, entries) if entries else None
+            return self._build_step(
+                key, backlogged, fresh or None, chain.pick,
+                [*chain.mid_prefill, *chain.rebuilds], pre_existing_batch_size, pre_existing_seq_lens,
+            )
+        except Exception:
+            self._fail_unscheduled(backlogged, entries, chain.rebuilds)
+            raise
 
     def _step_candidates(
         self, key: tuple[str, str], *,
@@ -929,11 +949,10 @@ class MicroScheduler:
             return set()
         now = time.monotonic()
         held = self.admission.held_until
-        failed, removing = self.lifecycle.failed_rids, self.lifecycle.pending_removes
+        stopped = self.lifecycle.no_new_work()
         return {
             r for r in waiting.request_to_worker_graph
-            if r not in failed and r not in removing
-            and held.get(r, 0.0) <= now
+            if r not in stopped and held.get(r, 0.0) <= now
         }
 
     def _row_lens(
@@ -1033,10 +1052,10 @@ class MicroScheduler:
         # would OOM it again straight away.
         now = time.monotonic()
         held = self.admission.held_until
-        removing, failed = self.lifecycle.pending_removes, self.lifecycle.failed_rids
+        stopped = self.lifecycle.no_new_work()
         rows = [
             rid for rid in batch.request_to_worker_graph
-            if rid not in removing and rid not in failed and held.get(rid, 0.0) <= now
+            if rid not in stopped and held.get(rid, 0.0) <= now
         ]
         if batch.request_walks and (only_walk or skip_walk) is not None:
             rows = [
@@ -1050,11 +1069,9 @@ class MicroScheduler:
         """(node, rid, cursor) of each rebuild whose next chunk could run now: its request isn't held, failed,
         being removed, or in a step in flight."""
         now = time.monotonic()
-        held, removing, failed, in_flight = (
-            self.admission.held_until, self.lifecycle.pending_removes, self.lifecycle.failed_rids, self.in_flight_rids,
-        )
+        held, stopped, in_flight = self.admission.held_until, self.lifecycle.no_new_work(), self.in_flight_rids
         for (node, rid), cursor in self.rebuilds.cursors():
-            if rid not in in_flight and rid not in removing and rid not in failed and held.get(rid, 0.0) <= now:
+            if rid not in in_flight and rid not in stopped and held.get(rid, 0.0) <= now:
                 yield node, rid, cursor
 
     def _rebuild_rows(
@@ -1350,7 +1367,7 @@ class MicroScheduler:
         under ``exclude_target`` are outside it."""
         now = time.monotonic()
         held = self.admission.held_until
-        failed, removing = self.lifecycle.failed_rids, self.lifecycle.pending_removes
+        stopped = self.lifecycle.no_new_work()
         for node_walk, batch in self.backlog.items():
             if self._lane(node_walk) != CHAIN_LANE:
                 continue
@@ -1364,7 +1381,7 @@ class MicroScheduler:
             for rid in batch.request_to_worker_graph:
                 if only_other and batch.walk_of(rid) == exclude_walk:
                     continue
-                if rid in failed or rid in removing:
+                if rid in stopped:
                     continue
                 if held.get(rid, 0.0) > now:
                     continue
@@ -1458,7 +1475,7 @@ class MicroScheduler:
         graph-level (no engine readiness check, which can reload), so a held
         or not yet reloaded row counts; a failed or removed one does not.
         A rebuild counts while no step holds it."""
-        exclude = self.lifecycle.failed_rids.union(self.lifecycle.pending_removes)
+        exclude = self.lifecycle.no_new_work()
         rows: Counter[str] = Counter()
         for (node, _), waiting in self.backlog.items():
             rows[node] += sum(1 for rid in waiting.request_to_worker_graph if rid not in exclude)

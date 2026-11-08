@@ -60,10 +60,11 @@ def _worker(join_dim=None):
     })
     w = make_worker(
         worker_id="w1",
-        _graph_runtime=SimpleNamespace(get_rid_handle=HANDLES.get),
+        graph_runtime=SimpleNamespace(get_rid_handle=HANDLES.get),
         request_state=request_state,
         streams=StreamBufferManager(request_state, None, []),
         tensor_manager=SimpleNamespace(
+            get_tensor=None,
             start_read_tensors=start_read_tensors,
             start_read_tensors_multi=start_read_tensors_multi,
             ack_unread_tensors=lambda edges: acked.append(
@@ -131,6 +132,17 @@ def test_a_frame_starts_its_reads_in_one_call():
     assert [[(rid, [i.uuid for e in edges for i in e.tensor_info]) for rid, edges in c] for c in calls] == [
         [(1, [1, 2]), (2, [6])],
     ]
+
+
+def test_a_frame_whose_reads_raise_fails_their_requests():
+    """A raise starting the frame's reads (a CUDA OOM, say) fails the requests
+    it was reading for, rather than escaping the message loop."""
+    w = _worker()
+    w.tensor_manager.start_read_tensors_multi = lambda reads: (_ for _ in ()).throw(
+        RuntimeError("CUDA out of memory"),
+    )
+    w.ingest._process_edge_items(_frame())
+    assert sorted(w.lifecycle.take_failures()) == [1, 2]
 
 
 @pytest.mark.parametrize("failed", [True, False])

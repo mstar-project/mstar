@@ -94,10 +94,11 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         return media_grids(fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}, self.output)
 
     def _declare(
-        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]],
+        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
     ) -> SubmoduleStep:
         """The node's step: each row's spans under each label, all
-        non-causal on the one vision attention resource."""
+        non-causal on the one vision attention resource (none when not
+        ``attention``)."""
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=label, span=span)
@@ -105,7 +106,7 @@ class PackedBlockLoopEncoder(NodeSubmodule):
                 for label in self.SEGMENT_LABELS
                 for span in lengths[label]
             ],
-            steps={VISION_ATTN: AttentionStep(causal=False)},
+            steps={VISION_ATTN: AttentionStep(causal=False)} if attention else {},
         )
 
     def declare_step(
@@ -117,12 +118,19 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep | None:
         # Leased, the captured block loop declares, plans and commits the
-        # attention per replay, and that is the node's whole step.
-        if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
+        # attention per replay, and that is the node's whole step, unless the
+        # node serves LoRA: no row of a leased step runs an adapter (the
+        # base-only loop refuses them in `can_lease`), but the bound modules
+        # outside the loop (patch embed, projection) still need a planned step
+        # to run base-only against, so the spans are declared for the engine
+        # to add their LoRA rows (`lora_rows`).
+        leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
+        if leased and not self.lora_keys:
             return None
-        return self._declare([
-            (rid, inp.resource_step_info) for rid, inp in zip(request_ids, inputs, strict=True)
-        ])
+        return self._declare(
+            [(rid, inp.resource_step_info) for rid, inp in zip(request_ids, inputs, strict=True)],
+            attention=not leased,
+        )
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         # packed, the requests must fit one replay together. Applied with the

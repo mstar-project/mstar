@@ -65,17 +65,12 @@ def load_weights_from_file(
     # Temporary per-module state dicts
     state_dicts = [dict() for _ in modules]
 
-    # safetensors can't take cuda:0 etc
-    st_device = "cuda" if str(device).startswith("cuda") else device
-
-    with safe_open(safetensors_file, framework="pt", device=st_device) as f:
+    # straight to the node's device: safetensors' "cuda" is the current GPU, not cuda:N
+    with safe_open(safetensors_file, framework="pt", device=str(device)) as f:
         for k in f.keys():
             for i, (_mod, _prefix, key_map) in enumerate(module_key_maps):
                 if k in key_map:
-                    tensor = f.get_tensor(k)
-                    if device != st_device:
-                        tensor = tensor.to(device, non_blocking=True)
-                    state_dicts[i][key_map[k]] = tensor
+                    state_dicts[i][key_map[k]] = f.get_tensor(k)
                     break
 
     # Load modules
@@ -305,20 +300,17 @@ def load_weights_from_hf_shards(
         shard_to_hf_keys.setdefault(weight_map[k], []).append(k)
 
     hf_key_to_tensor = {}
-    st_device = "cuda" if str(device).startswith("cuda") else device
 
     # load in tensors to get {mod_key}
     for shard_file, keys_in_shard in shard_to_hf_keys.items():
         shard_path = str(repo_dir / shard_file)
         keys_set = set(keys_in_shard)
-        with safe_open(shard_path, framework="pt", device=st_device) as f:
+        # straight to the node's device: safetensors' "cuda" is the current GPU, not cuda:N
+        with safe_open(shard_path, framework="pt", device=str(device)) as f:
             for k in f.keys():
                 if k not in keys_set:
                     continue
-                tensor = f.get_tensor(k)
-                if device != st_device:
-                    tensor = tensor.to(device, non_blocking=True)
-                hf_key_to_tensor[k] = tensor
+                hf_key_to_tensor[k] = f.get_tensor(k)
 
     # Temporary per-module state dicts
     state_dicts: list[dict[str, torch.Tensor]] = [dict() for _ in modules]

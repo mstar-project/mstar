@@ -2185,7 +2185,7 @@ class KVManager(AttentionResource):
         self._drop_resident_stage()
         with self._lock:
             # No owner check: every rollback finishes before `commit_done` is
-            # released, and the only pre-admit (`Worker._preplan_spec`) waits on
+            # released, and the only pre-admit (`StepExecutor._preplan_spec`) waits on
             # it, so no other uncommitted step can hold marks on these streams.
             # `.get` as in `admit`: a refusal can come before a stream exists
             for segment in step.segments:
@@ -4017,7 +4017,8 @@ class KVManager(AttentionResource):
         )
 
     def post_warmup_validate(self):
-        """Assert ``num_free_pages`` is identical across every TP rank
+        """Assert ``num_free_pages`` is identical across every rank of the
+        instance
 
         Catches YAML drift (e.g. ``cpu_offload_pages`` set on one rank
         but not another), allocator-init bugs, and any future code path
@@ -4032,7 +4033,7 @@ class KVManager(AttentionResource):
         if lo != -neg_hi:
             raise RuntimeError(
                 f"KV cache {self.name!r} has asymmetric num_free_pages "
-                f"across TP ranks: min {lo}, max {-neg_hi}. v1 requires symmetric "
+                f"across the ranks of its instance: min {lo}, max {-neg_hi}. v1 requires symmetric "
                 "allocator state; check the YAML for per-rank-divergent "
                 "max_num_pages / cpu_offload_pages, and any model code "
                 "that calls add_request before warmup completes."
