@@ -694,6 +694,19 @@ class TestAfterTheReview(unittest.TestCase):
             out, fake = step(bot.salvage, {"pr comment": ""}, repo="o/r", pr="7", runner_temp=temp)
             self.assertEqual((out, len(fake.writes())), ({"billing": "true"}, 1))
 
+    def test_a_gpu_ask_above_the_cap_reaches_the_saved_review(self):
+        output = json.dumps({"outside_diff": [], "since_last": "", "description_problems": [], "questions": [],
+                             "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
+                             "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []},
+                             "live_test": {"run": "full", "reason": "r", "gpus": 8, "untestable": ""}})
+        with workspace():
+            out, _ = step(bot.post, {
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="full", salvaged="false", max_gpus="4")
+        self.assertEqual(json.loads(out["result"])["live_test"]["untestable"], "needs 8 GPUs, runs get 4")
+
     def test_the_summary_is_redacted_posted_from_stdin_and_resolves_a_stopped_review(self):
         token = "sk-ant-" + "x" * 30
         output = json.dumps({"outside_diff": [], "since_last": f"leaked {token}", "description_problems": [],

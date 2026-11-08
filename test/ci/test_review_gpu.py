@@ -178,6 +178,14 @@ class TestCarry(unittest.TestCase):
             earlier = ws / "earlier-live-test.md"
             return out, earlier.read_text() if earlier.exists() else None
 
+    def test_a_gpu_ask_above_the_cap_gets_the_cap(self):
+        routes = {f"GET repos/{R}/pulls/7": {"user": {"login": "an-author"}, "base": {"ref": "main"}},
+                  f"GET repos/{R}/collaborators/an-author/permission": {"permission": "write"}}
+        with workspace():
+            result = json.dumps({"live_test": {"gpus": 8}})
+            out, _ = step(gpu_review.inputs, routes, pr="7", result=result, max_gpus="4")
+        self.assertEqual(out["gpus"], 4)
+
     def test_a_re_review_that_cant_approve_isnt_made_full(self):
         for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
                              ("none", {"run": "none", "checks": "correctness", "verdict": "skipped"})):

@@ -68,6 +68,7 @@ class TestReviewSummary(unittest.TestCase):
             with self.subTest(gpus=gpus, named=named):
                 first = over_gpu_cap({"live_test": {"run": "full", "gpus": gpus, "untestable": named}}, "4")
                 self.assertEqual(first["live_test"]["untestable"], expected)
+                self.assertEqual(over_gpu_cap(first, "4")["live_test"]["untestable"], expected, "the note piles up")
                 again = over_gpu_cap({**review(), "live_test": {"run": "targeted", "gpus": 1, "untestable": ""}}, "4")
                 self.assertEqual(carried(again, first, False)["live_test"]["untestable"], expected,
                                  "a pass on a smaller box would approve what it couldn't run")

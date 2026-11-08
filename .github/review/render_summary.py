@@ -159,8 +159,9 @@ def over_gpu_cap(review, max_gpus):
     smaller box doesn't cover it. Before `carried`, so the saved state keeps it for later reviews."""
     live = review.get("live_test") or {}
     gpus, cap = live.get("gpus"), int(max_gpus)
-    if gpus and gpus > cap:
-        live["untestable"] = "; ".join(x for x in (live.get("untestable"), f"needs {gpus} GPUs, runs get {cap}") if x)
+    note = f"needs {gpus} GPUs, runs get {cap}"
+    if gpus and gpus > cap and note not in (live.get("untestable") or ""):
+        live["untestable"] = "; ".join(x for x in (live.get("untestable"), note) if x)
     return review
 
 
