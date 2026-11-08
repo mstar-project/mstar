@@ -2023,15 +2023,19 @@ calls, which any other format runs:
 
 .. code-block:: python
 
-   @state_op(adds=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_reference)
-   def write(kv, layer, q, k, v, *, target: PagedNHDTarget): ...
+   @state_op(adds=("kv",), reads=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),),
+             reference=_reference)
+   def attend(kv, layer, q, k, v, *, target: PagedNHDTarget):
+       ...                                      # write k and v at target, and change q in place
+       return kv.read(layer, q)
 
-   write(self.kv, self.layer, q, k, v)      # counts as the layer's add, and breaks the graph as add does
-   out = self.kv.read(self.layer, q)
+   out = attend(self.kv, self.layer, q, k, v)  # the layer's add, then its read, behind one break
 
-The engine picks the kernel or the reference at bind. ``target`` says where this step's entries go
-on the layer. A conformance test holds each kernel to its reference on each listed format, and
-``MSTAR_KV_DEBUG_ASSERTS=1`` checks that an eager call writes nothing outside the step's slots.
+``reads`` may name only the array in ``adds``, and the call refuses an array with ``max_len=0``,
+as ``add_read`` does. The engine picks the kernel or the reference at bind. ``target`` says where
+this step's entries go on the layer. A conformance test holds each kernel to its reference on each
+listed format, what it returns included, and ``MSTAR_KV_DEBUG_ASSERTS=1`` checks that an eager
+call writes nothing outside the step's slots.
 
 Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time
 and changes no output, and scratch buffers that it makes at load and that no step reads before
