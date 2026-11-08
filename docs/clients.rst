@@ -246,7 +246,7 @@ server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key
 (what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
 takes only ``Bearer``. A server without the block has none of this: it refuses the
 handshake and has no ``/healthz``. Only the Python frontend serves this route;
-``--rust-frontend`` logs a warning and serves without it.
+``--rust-frontend`` and the Dynamo worker log a warning and serve without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
 ``ws_max_message_mb`` (16 MiB by default, see :doc:`serving`). A larger observation closes

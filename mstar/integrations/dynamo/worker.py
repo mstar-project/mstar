@@ -73,6 +73,9 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    if config.get("openpi") is not None:
+        logger.warning("The openpi WebSocket (`openpi:` in the config) is served by mstar-serve's Python frontend "
+                       "only; the Dynamo worker serves without it")
     model_name = config.get("model", "dummy")
     yaml_model_kwargs = config.get("model_kwargs", {}) or {}
 
