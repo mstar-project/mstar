@@ -23,6 +23,7 @@ mstar.utils.threads
 
    .. autosummary::
    
+      InlineExecutor
       Thread
       ThreadPool
    

@@ -1023,7 +1023,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">ThreadPoolExecutor</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">concurrent.futures</span><span class="w"> </span><span class="kn">import</span> <span class="n">Future</span><span class="p">,</span> <span class="n">ThreadPoolExecutor</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.utils.cpus</span><span class="w"> </span><span class="kn">import</span> <span class="n">PINNABLE</span>
 
@@ -1109,6 +1109,32 @@ window.runMermaid = runMermaid;</script>
         <span class="n">initargs</span><span class="p">:</span> <span class="nb">tuple</span> <span class="o">=</span> <span class="p">(),</span>
     <span class="p">):</span>
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">max_workers</span><span class="p">,</span> <span class="n">thread_name_prefix</span><span class="p">,</span> <span class="n">_on_process_mask</span><span class="p">(</span><span class="n">initializer</span><span class="p">),</span> <span class="n">initargs</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="InlineExecutor">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.threads.html#mstar.utils.threads.InlineExecutor">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">InlineExecutor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Stands in for a one-thread pool (``knobs: step_threads: serial``): ``submit``</span>
+<span class="sd">    runs the call on the caller and returns its finished future, so the code</span>
+<span class="sd">    around it waits on the same futures and events and finds them set."""</span>
+
+<div class="viewcode-block" id="InlineExecutor.submit">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.threads.html#mstar.utils.threads.InlineExecutor.submit">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fn</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="nb">object</span><span class="p">],</span> <span class="o">/</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Future</span><span class="p">:</span>
+        <span class="n">future</span><span class="p">:</span> <span class="n">Future</span> <span class="o">=</span> <span class="n">Future</span><span class="p">()</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">future</span><span class="o">.</span><span class="n">set_result</span><span class="p">(</span><span class="n">fn</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">))</span>
+        <span class="k">except</span> <span class="ne">BaseException</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># as a pool's worker: the future carries it</span>
+            <span class="n">future</span><span class="o">.</span><span class="n">set_exception</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">future</span></div>
+
+
+<div class="viewcode-block" id="InlineExecutor.shutdown">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.threads.html#mstar.utils.threads.InlineExecutor.shutdown">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">shutdown</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">wait</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="o">*</span><span class="p">,</span> <span class="n">cancel_futures</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">pass</span></div>
+</div>
 
 </pre></div>
 

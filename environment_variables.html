@@ -1364,7 +1364,14 @@ thread, which Whisper turbo’s serve config sets: its 4-layer steps
 are too short to hide the planning in. Read by
 <code class="docutils literal notranslate"><span class="pre">knobs.pre_plan_enabled</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREAD_CORE</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREADS</span></code></p></td>
+<td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">step_threads</span></code>, else <code class="docutils literal notranslate"><span class="pre">threaded</span></code></p></td>
+<td><p>Where a worker runs a step’s host work. <code class="docutils literal notranslate"><span class="pre">threaded</span></code> runs admit, plan and
+the forward’s launch on its GPU thread, and the pre-plan on its plan
+thread. <code class="docutils literal notranslate"><span class="pre">serial</span></code> runs them on the main thread, so host work overlaps the
+GPU but not other host work. Read by <code class="docutils literal notranslate"><span class="pre">knobs.step_threads</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_THREAD_CORE</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">step_thread_core</span></code>, else <code class="docutils literal notranslate"><span class="pre">auto</span></code></p></td>
 <td><p>Pin each worker’s main, GPU and plan threads, and the API server’s
 message thread and Rust frontend bridge on a CPU of their own. A step
@@ -1439,7 +1446,7 @@ server log their CPUs and why. See <a class="reference internal" href="serving.h
 Read by <code class="docutils literal notranslate"><span class="pre">knobs.step_thread_core</span></code>; no effect where
 <code class="docutils literal notranslate"><span class="pre">os.sched_setaffinity</span></code> is missing (macOS, Windows).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_CORE_SET</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_STEP_CORE_SET</span></code></p></td>
 <td><p>set by the API server</p></td>
 <td><p>Which of the mask’s core sets the API server locked under
 <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> (<code class="docutils literal notranslate"><span class="pre">cpus.claim_cores</span></code>), for the conductor and
@@ -1447,7 +1454,7 @@ workers it starts: they build the same plan, but only the API server
 knows which set was free. Not meant to be set by hand. Read by
 <code class="docutils literal notranslate"><span class="pre">cpus.devices_plan</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_IDLE_HOLD</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_IDLE_HOLD</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">idle_hold</span></code>, else <code class="docutils literal notranslate"><span class="pre">off</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">qos</span></code> has the API server open <code class="docutils literal notranslate"><span class="pre">/dev/cpu_dma_latency</span></code>, write a
 10 µs latency and keep the fd open for its life, which keeps every CPU
@@ -1462,7 +1469,7 @@ stand-in where the device is hidden), one core’s hardware threads lost
 to no pin and three separate cores were level with it. Read by
 <code class="docutils literal notranslate"><span class="pre">knobs.idle_hold</span></code>, applied by <code class="docutils literal notranslate"><span class="pre">cpus.hold_idle</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1,2,4,8,16,32,48,64,96,128</span></code></p></td>
 <td><p>The decode batch sizes a model whose LLM node is a
 <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> captures as CUDA graphs, read at import in
@@ -1474,7 +1481,7 @@ the graph memory; narrow it (for example
 former ladder. <code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN35_DECODE_BUCKETS</span></code> overrides it for
 Qwen3.5 alone.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAZY_PUBLISH</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAZY_PUBLISH</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Publish resource state (KV pages, positions) only for the requests
 whose frame or completion carries it: <code class="docutils literal notranslate"><span class="pre">finalize_batch</span></code> keeps a
@@ -1483,13 +1490,13 @@ cheap per-request snapshot and the worker finishes it on demand.
 the old behaviour; it was a quarter of the GPU thread’s host time at
 batch 32 in a decode loop that never reads it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONSECUTIVE_SPEC_STEPS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONSECUTIVE_SPEC_STEPS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1024</span></code></p></td>
 <td><p>Cap on back-to-back speculative steps before the leader yields to
 other ready work. <code class="docutils literal notranslate"><span class="pre">0</span></code> turns speculation off. A value that is not an
 integer is ignored with a warning when the worker starts.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAUNCH_WAIT_MS</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAUNCH_WAIT_MS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">5</span></code></p></td>
 <td><p>Milliseconds the speculative submitter holds off the GIL waiting for
 the GPU thread to reach the launch before it carries on. A value that
@@ -1498,7 +1505,7 @@ is not a number, is <code class="docutils literal notranslate"><span class="pre"
 worker starts and <code class="docutils literal notranslate"><span class="pre">5</span></code> is used; a negative value is raised to <code class="docutils literal notranslate"><span class="pre">0</span></code>
 with a warning.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_CHAIN_LAZY_STEPS</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_chain_lazy_steps</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>How many decode steps of sampled ids the KV manager holds back before
 it extends the requests’ prefix chains (the per-page keys the prefix
@@ -1511,7 +1518,7 @@ page unindexed. The default <code class="docutils literal notranslate"><span cla
 measured as noise at c64/c128 on 0.8B (the extension is a small part
 of the stop check’s tail).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">512</span></code></p></td>
 <td><p>The size each FlashInfer attention workspace starts at, per (plan label, slot), read
 by <code class="docutils literal notranslate"><span class="pre">workspace_bytes</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/engine/resources/attn/workspace.py</span></code>). A floor: a plan
@@ -1522,7 +1529,7 @@ resource that declares <code class="docutils literal notranslate"><span class="p
 it: LTX-2.5’s twelve workspaces hold 1.5 GiB at its 128, and would hold 6 GiB at
 <code class="docutils literal notranslate"><span class="pre">512</span></code> and 24 GiB at <code class="docutils literal notranslate"><span class="pre">2048</span></code> if this applied.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_PINNED_INDPTRS</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">kv_pinned_indptrs</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The KV plan writes FlashInfer’s index arrays (qo_indptr, kv_indptr,
 kv_indices, last_page_len) into a ring of page-locked host buffers and
@@ -1533,7 +1540,7 @@ one and FlashInfer makes the indices copy blocking. No measurable gain
 at c32-c128 on 0.8B, so it is off by default. The cost is one CUDA
 event per plan, which a buffer set waits on before it is rewritten.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_GC_GEN0_THRESHOLD</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_GC_GEN0_THRESHOLD</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">gc_gen0_threshold</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>The generation-0 garbage-collection threshold a worker sets after
 warmup (<code class="docutils literal notranslate"><span class="pre">0</span></code> keeps CPython’s 700). A decode step at 128 rows keeps
@@ -1544,7 +1551,7 @@ allocating. <code class="docutils literal notranslate"><span class="pre">50000</
 shorter decode step), at the cost of holding at most that many young
 objects between collections. Read by <code class="docutils literal notranslate"><span class="pre">knobs.gc_gen0_threshold</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RESIDENT_PLANNING</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RESIDENT_PLANNING</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">resident_planning</span></code>, else <code class="docutils literal notranslate"><span class="pre">auto</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">auto</span></code> runs a node’s captured decode steps off per-request tables on
 the device where the submodule names resident walks
@@ -1558,7 +1565,7 @@ the least recently run one’s. A row has a cell per page of the KV pool’s
 not the config’s top-level key), at most the pool’s pages, plus a few, 8
 bytes each. Read by <code class="docutils literal notranslate"><span class="pre">knobs.resident_planning</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">device_loopback</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Whether a decode node may keep its loop-back token on the device:
 the sampler writes each request’s last token to a slot-addressed
@@ -1572,7 +1579,7 @@ buffers; the sampler keeps the masters for those nodes alone, so a
 node that takes its tokens on the host does not pay the eager-step
 master write. <code class="docutils literal notranslate"><span class="pre">0</span></code> keeps every node on the per-request tensor path.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_INGRAPH_DECODE_ROPE</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">ingraph_decode_rope</span></code>, else <code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p>A captured Qwen3.5 text prefill or mixed step builds its rotary tables
 inside the graph from the position resource’s planned positions instead
@@ -1580,7 +1587,7 @@ of building them before the replay (<code class="docutils literal notranslate"><
 captured decode step always does. Experiment knob, measured and gated
 on its own.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>The captured sampler gathers its RNG offsets from the slot masters
 and scatters the advanced offsets and the sampled tokens back inside
@@ -1597,31 +1604,31 @@ one. Only for a node that reads its tokens back on the device
 rank: above one, where admission doesn’t decide, the masters grow and
 the scatter runs after the replay, as with <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_slots</span></code>, else <code class="docutils literal notranslate"><span class="pre">4096</span></code></p></td>
 <td><p>Request rows of the sampler masters a captured graph indexes when
 <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_INGRAPH_SCATTER</span></code> is on (at least the node’s largest
 capture batch): the most requests admitted at once on such a node; the
 rest wait to be admitted. Read by <code class="docutils literal notranslate"><span class="pre">knobs.sampler_slots</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_SEND_TIMING</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_RUST_SEND_TIMING</span></code></p></td>
 <td><p>unset</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> makes the Rust runtime print, every 500 calls, how long the
 worker’s per-step send spends in its own work against the whole call
 (which includes taking the GIL back when the send had to release it).
 A diagnostic for the host-overhead work; off by default.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SPEC_PEEK_FOR_FAIRNESS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SPEC_PEEK_FOR_FAIRNESS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
 <td><p>Yield the speculation chain only when another (node, walk) is
 actually ready right now; <code class="docutils literal notranslate"><span class="pre">0</span></code> uses the consecutive-step cap alone.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PHASE_TIMING</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_PHASE_TIMING</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">N</span> <span class="pre">&gt;</span> <span class="pre">0</span></code>: every N iterations log per-phase p50/p95/mean of the
 worker main loop (speculate, await_gpu, submit_spec, …).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_KV_DEBUG_ASSERTS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">0</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code>: after every <code class="docutils literal notranslate"><span class="pre">admit</span></code>, <code class="docutils literal notranslate"><span class="pre">commit</span></code>, <code class="docutils literal notranslate"><span class="pre">reset_request</span></code>, <code class="docutils literal notranslate"><span class="pre">remove_request</span></code>
 and change to an admitted request’s pages, check the KV page bookkeeping against

@@ -711,6 +711,11 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.InlineExecutor"><code class="docutils literal notranslate"><span class="pre">InlineExecutor</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.InlineExecutor.shutdown"><code class="docutils literal notranslate"><span class="pre">InlineExecutor.shutdown()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.InlineExecutor.submit"><code class="docutils literal notranslate"><span class="pre">InlineExecutor.submit()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.Thread"><code class="docutils literal notranslate"><span class="pre">Thread</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.Thread.start"><code class="docutils literal notranslate"><span class="pre">Thread.start()</span></code></a></li>
 </ul>
@@ -755,15 +760,56 @@ theirs on the process mask; ruff refuses a bare <code class="docutils literal no
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.threads.Thread" title="mstar.utils.threads.Thread"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Thread</span></code></a>([group, target, name, args, kwargs, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.threads.InlineExecutor" title="mstar.utils.threads.InlineExecutor"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InlineExecutor</span></code></a>()</p></td>
+<td><p>Stands in for a one-thread pool (<code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">step_threads:</span> <span class="pre">serial</span></code>): <code class="docutils literal notranslate"><span class="pre">submit</span></code> runs the call on the caller and returns its finished future, so the code around it waits on the same futures and events and finds them set.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.threads.Thread" title="mstar.utils.threads.Thread"><code class="xref py py-obj docutils literal notranslate"><span class="pre">Thread</span></code></a>([group, target, name, args, kwargs, ...])</p></td>
 <td><p>A <code class="docutils literal notranslate"><span class="pre">threading.Thread</span></code> that runs on the process mask, whatever its creator's and whatever its <code class="docutils literal notranslate"><span class="pre">run</span></code> is: a target, an override that doesn't call <code class="docutils literal notranslate"><span class="pre">super().run()</span></code>, a mixin's.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.threads.ThreadPool" title="mstar.utils.threads.ThreadPool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ThreadPool</span></code></a>([max_workers, ...])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.threads.ThreadPool" title="mstar.utils.threads.ThreadPool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ThreadPool</span></code></a>([max_workers, ...])</p></td>
 <td><p>A <code class="docutils literal notranslate"><span class="pre">ThreadPoolExecutor</span></code> whose threads run on the process mask before <code class="docutils literal notranslate"><span class="pre">initializer</span></code>, whatever the mask of the thread that started them.</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.threads.InlineExecutor">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.threads.</span></span><span class="sig-name descname"><span class="pre">InlineExecutor</span></span><a class="reference internal" href="../_modules/mstar/utils/threads.html#InlineExecutor"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.threads.InlineExecutor" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>Stands in for a one-thread pool (<code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">step_threads:</span> <span class="pre">serial</span></code>): <code class="docutils literal notranslate"><span class="pre">submit</span></code>
+runs the call on the caller and returns its finished future, so the code
+around it waits on the same futures and events and finds them set.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.threads.InlineExecutor.shutdown">
+<span class="sig-name descname"><span class="pre">shutdown</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">wait</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">True</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">cancel_futures</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/threads.html#InlineExecutor.shutdown"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.threads.InlineExecutor.shutdown" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>wait</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>cancel_futures</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.utils.threads.InlineExecutor.submit">
+<span class="sig-name descname"><span class="pre">submit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">fn</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/threads.html#InlineExecutor.submit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.threads.InlineExecutor.submit" title="Link to this definition">#</a></dt>
+<dd><dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>fn</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><em>...</em><em>]</em><em>, </em><a class="reference internal" href="mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.object" title="mstar.api_server.openai.protocol.ModelCard.object"><em>object</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><em>Future</em></p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.utils.threads.Thread">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.threads.</span></span><span class="sig-name descname"><span class="pre">Thread</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">group</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">target</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">name</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">args</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">kwargs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">daemon</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/threads.html#Thread"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.threads.Thread" title="Link to this definition">#</a></dt>
@@ -878,6 +924,11 @@ pool there with one op as wide as the pool, and only then move.</p>
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.InlineExecutor"><code class="docutils literal notranslate"><span class="pre">InlineExecutor</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.InlineExecutor.shutdown"><code class="docutils literal notranslate"><span class="pre">InlineExecutor.shutdown()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.InlineExecutor.submit"><code class="docutils literal notranslate"><span class="pre">InlineExecutor.submit()</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.Thread"><code class="docutils literal notranslate"><span class="pre">Thread</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.threads.Thread.start"><code class="docutils literal notranslate"><span class="pre">Thread.start()</span></code></a></li>
 </ul>
