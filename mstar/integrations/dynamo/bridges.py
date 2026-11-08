@@ -100,9 +100,17 @@ def _clean(request: dict) -> dict:
     return {k: v for k, v in request.items() if k not in _STRIP_KEYS}
 
 
+def _inline_result(response_format, n=1) -> None:
+    """``check_inline_result``, refused as a client error."""
+    try:
+        check_inline_result(response_format, n)
+    except ValueError as exc:
+        raise _BadRequestError(str(exc)) from exc
+
+
 def _image_body(request: dict) -> dict:
     """NvCreateImageRequest -> body for the native image request model."""
-    check_inline_result(request.get("response_format"))  # n is served, as on the native route
+    _inline_result(request.get("response_format"))  # n is served, as on the native route
     body = _clean(request)
     for key in _IMAGE_NVEXT_KEYS:
         value = (request.get("nvext") or {}).get(key)
@@ -113,7 +121,7 @@ def _image_body(request: dict) -> dict:
 
 def _video_body(request: dict) -> dict:
     """NvCreateVideoRequest -> body for the native video request model."""
-    check_inline_result(request.get("response_format"), request.get("n"))
+    _inline_result(request.get("response_format"))
     if request.get("output_format") not in (None, "mp4"):
         raise ValueError(f"unsupported output_format {request['output_format']!r}; only 'mp4'")
     body = _clean(request)
@@ -263,10 +271,7 @@ class RequestBridge:
         if reference:
             from mstar.api_server import media_io
             # one engine request, as on the native route, which refuses an n it would drop
-            try:
-                check_inline_result(None, req.n)
-            except ValueError as exc:
-                raise _BadRequestError(str(exc)) from exc
+            _inline_result(None, req.n)
             _, path = media_io.resolve_media_ref(reference, self.server.upload_dir)
             extra = dict(req.model_extra or {})
             extra.pop("input_reference", None)
@@ -375,6 +380,7 @@ class RequestBridge:
         started = time.monotonic()
         body = _video_body(request)
         req = VideoGenerationRequest.model_validate(body)
+        _inline_result(req.response_format, req.n)  # one engine request, one video
         args = self.adapter.video_to_request(req, self.server.upload_dir)
 
         rid = self._submit(args, prefix="vid")

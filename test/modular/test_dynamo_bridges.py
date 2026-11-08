@@ -90,9 +90,6 @@ def test_video_body_reference_and_no_leakage():
     assert not {"input_reference", "stream", "output_format", "user"} & body.keys()
     with pytest.raises(ValueError, match="b64_json"):
         _video_body({"prompt": "x", "response_format": "url"})
-    # one engine request, one video, as the native route refuses an n it would drop
-    with pytest.raises(ValueError, match="one result"):
-        _video_body({"prompt": "x", "n": 2})
     with pytest.raises(ValueError, match="output_format"):
         _video_body({"prompt": "x", "output_format": "mjpeg"})
 
@@ -637,6 +634,19 @@ def test_images_edit_refuses_n_it_would_drop(tmp_path):
     assert (refused.value.code, refused.value.message) == (400, "n=2: this route returns one result per request")
     assert not server.submitted
     assert not list(tmp_path.iterdir())  # refused before the reference image is saved
+
+
+def test_videos_refuse_n_they_would_drop(tmp_path):
+    """A video request is one engine request, so n=2 came back as one video."""
+    server = _FakeRealtimeServer([_chunk("video", b"mp4")], tmp_path)
+    bridge = RequestBridge(server, ADAPTER_REGISTRY["ltx2_5"], "ltx2_5")
+    async def drain():
+        return [r async for r in bridge.videos({"prompt": "x", "model": "ltx2_5", "n": 2}, _Ctx())]
+
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(drain())
+    assert (refused.value.code, refused.value.message) == (400, "n=2: this route returns one result per request")
+    assert not server.submitted
 
 
 def test_videos_mux_the_audio_off_the_event_loop(tmp_path, monkeypatch):
