@@ -36,8 +36,9 @@ REDACT = [re.compile(p) for p in (
     r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+",
 )]
 WRITE = ("admin", "maintain", "write")
-# The bot's REST logins: the review app's, and github-actions', which it posted as before the app.
+# The bot's REST logins (render_summary.BOTS and POSTING_BOTS say whose count for what).
 BOT_USERS = [f"{b}[bot]" for b in render_summary.BOTS]
+POSTING_BOT_USERS = [f"{b}[bot]" for b in render_summary.POSTING_BOTS]
 # The marker of a stopped review's "didn't complete" comment, of one a later run resolved, and of a refused
 # /review continue's.
 INCOMPLETE = "<!-- claude-review-incomplete -->"
@@ -151,6 +152,13 @@ def marked(comments, marker):
     """The ids of the bot's own comments that start with `marker`."""
     return [c["id"] for c in comments
             if (c.get("user") or {}).get("login") in BOT_USERS and (c.get("body") or "").startswith(marker)]
+
+
+def last_state(conversation):
+    """The state of the bot's last summary among the PR's conversation comments, or None (read_state)."""
+    summaries = [c for c in conversation
+                 if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
+    return render_summary.read_state(summaries[-1]["body"]) if summaries else None
 
 
 def oneline(commits):
@@ -598,7 +606,7 @@ def discussion(repo, pr):
                          "path": c.get("path"), "line": c.get("line"), "side": c.get("side"),
                          "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
                          "created_at": c.get("created_at"), "url": c.get("html_url"),
-                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in BOT_USERS})
+                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in POSTING_BOT_USERS})
     # The conversation tab: replies to the summary, and the author's answers.
     conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"),
                      "user_type": (c.get("user") or {}).get("type"), "created_at": c.get("created_at"),
@@ -641,9 +649,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
     # (too large, say) means a full review, never an empty since.diff.
     if not prev:
-        summaries = [c for c in conversation
-                     if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
-        state = render_summary.read_state(summaries[-1]["body"]) if summaries else None
+        state = last_state(conversation)
         last = (state or {}).get("head")
         since = f"repos/{repo}/compare/{last}...{head_sha}"
         try:
@@ -777,7 +783,19 @@ def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, gi
         print(f"::warning::Couldn't write the job summary: {e}")
 
 
-def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
+def earlier_outside_diff(repo, pr, prev):
+    """The findings outside the diff of the review this run built on, which stay open until it judges them:
+    what last-review.json showed it, or the last summary's on a /review continue, which wasn't shown them."""
+    state = None
+    if Path("last-review.json").exists():
+        state = json.loads(Path("last-review.json").read_text())
+    elif prev:
+        state = last_state([{"user": (c.get("user") or {}).get("login"), "body": c.get("body")}
+                            for c in api_list(f"repos/{repo}/issues/{pr}/comments")])
+    return (state or {}).get("outside_diff") or []
+
+
+def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
     """Post the summary, rendered from the review's fields by render_summary and redacted: model output from
     untrusted input. Read the PR's threads after the review posted its inline comments, so the status line
     counts them along with earlier ones still open. Each run posts its own summary comment, so a re-review
@@ -785,8 +803,9 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
     point here, and loses its marker so a later failure starts a fresh one."""
     pages = graphql(THREADS, repo, pr)
     try:
-        text = render_summary.render(json.loads(output), pages, head_sha, mode,
-                                     render_summary.stacked_above("stacked-above.json"), salvaged == "true")
+        review = render_summary.carried(json.loads(output), earlier_outside_diff(repo, pr, prev))
+        text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
+                                     salvaged == "true")
     except Exception as e:
         text = ""
         print(f"::warning::The review's summary didn't render: {type(e).__name__}: {e}")

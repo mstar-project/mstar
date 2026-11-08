@@ -11,7 +11,7 @@ usage:
   gpu.py push <instance> <local> <remote>        scp -r to the box
   gpu.py pull <instance> <remote> <local>        scp -r from the box
   gpu.py list [--all]                            instances launched here (--all: by any session; all RunPod, Lambda)
-  gpu.py extend <instance> --hours H             move the watchdog deadline to now + H
+  gpu.py extend <instance> --hours H             move the watchdog deadline to now + H (Slurm, Eras: earlier only)
   gpu.py terminate <instance>
 
 Offers only cover regions where the team has persistent storage (a RunPod global volume
@@ -893,22 +893,28 @@ def terminate(key: str, e: dict) -> None:
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
 
 
+def eras_instances() -> list[dict]:
+    """Every instance in the organization, across all pages."""
+    items, token = [], None
+    while True:
+        page = eras("GET", "/instances", params={"page_size": 200, **({"page_token": token} if token else {})})
+        items += page.get("items") or []
+        if not (token := page.get("next_page_token")):
+            return items
+
+
 def eras_delete_key(name: str) -> None:
     """Best effort: delete the ssh key the launch `name` registered (named after it), now that its
     instances are released, unless an instance not releasing binds it in a run not finished: a deleted
     key leaves the authorized_keys of every box that binds it. A key the launch reused stays."""
     try:
         keys = eras("GET", "/ssh-keys", params={"filter": json.dumps({"field": "name", "op": "=", "value": name})})
-        bound, token = set(), None
-        while True:  # every page: a binding missed would cut a live box off
-            page = eras("GET", "/instances", params={"page_size": 200, **({"page_token": token} if token else {})})
-            for i in page.get("items") or []:
-                run = (i.get("standalone") or {}).get("current_run") or {}
-                secrets = (run.get("bindings") or {}).get("secrets") or {}
-                if i.get("status") != "releasing" and run.get("status") not in ("succeeded", "failed", "stopped"):
-                    bound.update(k for b in secrets.values() for k in b.get("ssh_key_ids") or [])
-            if not (token := page.get("next_page_token")):
-                break
+        bound = set()
+        for i in eras_instances():  # a binding missed would cut a live box off
+            run = (i.get("standalone") or {}).get("current_run") or {}
+            secrets = (run.get("bindings") or {}).get("secrets") or {}
+            if i.get("status") != "releasing" and run.get("status") not in ("succeeded", "failed", "stopped"):
+                bound.update(k for b in secrets.values() for k in b.get("ssh_key_ids") or [])
         for k in keys.get("items") or []:
             if k["id"] not in bound:
                 eras("DELETE", f"/ssh-keys/{k['id']}")
@@ -924,14 +930,20 @@ def cmd_extend(args, cfg):
     entry(args.instance)
     with ledger_txn() as d:
         e = d[args.instance]
-        e["deadline"] = time.time() + args.hours * 3600
+        deadline = time.time() + args.hours * 3600
+        if e["provider"] in ("slurm", "eras") and deadline > e["deadline"]:
+            die(f"{args.instance} can't run later than its current deadline: Slurm's --time and the Eras Pod's "
+                "deadline were fixed at launch, so it would still end then. Launch a new one for more time")
+        e["deadline"] = deadline
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
 
 def running(cfg: dict) -> tuple[list[str], dict[str, str]]:
     """This tool's jobs and instances up now on the Slurm nodes and Eras, from every session and
     machine (the ledger has only this machine's), one line each; and why a node or provider couldn't
-    be listed."""
+    be listed. "This tool's" goes by name, so every live-pr-* instance in the Eras organization
+    counts. budget.max_running reads this list, then launches: a soft cap, since two machines can both
+    see the last free slot."""
     up, errors = [], {}
     for sl in slurm_nodes(cfg):
         try:
@@ -941,7 +953,7 @@ def running(cfg: dict) -> tuple[list[str], dict[str, str]]:
             errors[f"slurm {sl['name']}"] = str(err)
     if enabled(cfg, "eras"):
         try:
-            items = eras("GET", "/instances", params={"page_size": 100}).get("items") or []
+            items = eras_instances()
         except (ApiError, subprocess.TimeoutExpired) as err:
             errors["eras"], items = str(err), []
         for i in items:

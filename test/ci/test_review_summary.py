@@ -45,11 +45,35 @@ class TestReviewSummary(unittest.TestCase):
                          "a finding posted as github-actions would drop out of the count")
 
     def test_a_resolved_thread_counts_until_a_re_review_clears_it(self):
-        pages = threads(thread("P1", resolved=True, comment_id=7), thread("P1", outdated=True, comment_id=8))
+        pages = threads(thread("P1", resolved=True, comment_id=7))
         self.assertEqual(open_findings(review(), pages, []), [("inline 7", "P1", "`step` drops the last token")],
                          "resolving a thread would clear a finding nobody fixed")
         fixed = [{"ref": "7", "priority": "P1", "status": "fixed", "why": "guard added"}]
         self.assertEqual(open_findings(review(prior=fixed), pages, []), [], "a fixed finding would keep the status red")
+
+    def test_a_finding_cleared_by_argument_alone_stays_open_for_a_person(self):
+        prior = [{"ref": "7", "priority": "P1", "status": "disputed", "why": "the author says it can't happen"}]
+        pages = threads(thread("P1", comment_id=7))
+        self.assertEqual(open_findings(review(prior=prior), pages, []),
+                         [("inline 7", "P1", "disputed, you decide: the author says it can't happen")],
+                         "an author's reply alone would clear a P1")
+        text = render(review(prior=prior), pages, "0123456789", "nogpu", [])
+        self.assertIn("\n🔴 **1 P1**", text)
+        self.assertIn("- [ ] **[P1]** `inline 7`: disputed, you decide:", text, "no person would be told to decide it")
+
+    def test_an_earlier_finding_this_run_left_out_stays_open(self):
+        carried = SUMMARY["carried"]
+        earlier = [{"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"},
+                   {"priority": "P2", "claim": "typo", "location": "b.py:2", "detail": "d"}]
+        pages = threads(thread("P1", outdated=True, comment_id=8))
+        r = carried(review(prior=[{"ref": "b.py:2", "priority": "P2", "status": "open", "why": "unchanged"}]), earlier)
+        self.assertEqual([f[:2] for f in open_findings(r, pages, [])],
+                         [("inline 8", "P1"), ("outside the diff, a.py:1", "P1"), ("outside the diff, b.py:2", "P2")],
+                         "a rebase, or a re-review leaving a finding out, would clear it unjudged")
+        state = read_state(render(r, pages, "0123456789", "nogpu", []))
+        self.assertEqual(len(state["outside_diff"]), 2, "the finding would be gone at the next re-review")
+        judged = [{"ref": "a.py:1", "priority": "P1", "status": "fixed", "why": "guard added"}]
+        self.assertEqual(carried(review(prior=judged), earlier)["outside_diff"], [earlier[1]])
 
     def test_a_finding_a_pr_above_fixes_is_reported_but_doesnt_block(self):
         above = [{"ref": "7", "priority": "P1", "status": "fixed_above", "fixed_in": 12, "why": "guard added"}]

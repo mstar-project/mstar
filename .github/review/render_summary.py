@@ -4,12 +4,13 @@ The review returns the fields in SCHEMA rather than Markdown, so every summary
 has the same shape: a status line, then only the sections that have something
 in them. The status line counts the open findings (`open_findings`, which the
 approval rule in gpu_review.py uses too), so a finding from an earlier run counts
-until a later review judges it fixed, fixed above or moot, or a commit changes its
-lines. bot.py passes SCHEMA to the review, posts what `render` makes of its fields,
-and starts a re-review from what `read_state` reads back.
+until a later review judges it fixed, fixed above or moot. bot.py passes SCHEMA to
+the review, posts what `render` makes of its fields, and starts a re-review from
+what `read_state` reads back.
 """
 import base64
 import json
+import os
 import re
 from pathlib import Path
 
@@ -18,13 +19,20 @@ MARKER = "<!-- claude-review-summary -->"
 # What a re-review starts from (head, findings outside the diff, risk, live-test call), base64 JSON,
 # so model text can't close the HTML comment. Read back only from the bot's own comments.
 STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
-# The bot's GraphQL logins: the review app's, and github-actions', which it posted as before the app.
-BOTS = ("mstar-review", "github-actions")
+# Every login the bot posts as: the app, and github-actions, the job's own token, for what the app token
+# can't reach (a team run's inline comments outlast its hour) and everything before the app. Enough for
+# something a forged post can only add to, such as an inline finding.
+POSTING_BOTS = ("mstar-review", "github-actions")
+# Whose summaries, state and markers count (GraphQL logins). With the app configured, only the app's: any
+# workflow on any branch posts as github-actions, so its comments could forge them. Forks have no app.
+BOTS = ("mstar-review",) if os.environ.get("REVIEW_APP_CLIENT_ID") else POSTING_BOTS
 TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
 # PR is one the review was given the diff of (stacked-above.json).
-STATUSES = ("fixed", "fixed_above", "open", "moot")
+STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
+# disputed: a P0-P2 the author argues against with no code change. It stays open, for a person to decide.
+STILL_OPEN = ("open", "disputed")
 # Summaries and handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu", "gpu": "full"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
@@ -135,33 +143,49 @@ def judged(review, stacked):
                                for f in review.get("prior_findings", [])]}
 
 
+def carried(review, earlier):
+    """`review` with the earlier findings outside the diff it hasn't cleared added to its own: `earlier` is
+    the last review's outside_diff. "A finding left out stays open", and stays in the state for the next
+    re-review to judge."""
+    cleared = {f["ref"] for f in review["prior_findings"] if f["status"] not in STILL_OPEN}
+    locations = {f["location"] for f in review["outside_diff"]}
+    return {**review, "outside_diff": [*review["outside_diff"], *[
+        f for f in earlier if f["location"] not in cleared and f["location"] not in locations]]}
+
+
 def open_findings(review, pages, stacked):
-    """(where, priority, what) of every open finding: the bot's inline threads, this run's findings outside
-    the diff, and the earlier findings a later review judged still open. A thread someone resolved stays
-    open: only a later review that judged it fixed, fixed above or moot, or a commit that outdated it,
-    clears it. An untagged bot thread counts as a P2, since its priority is unknown and it should still
-    block approval. A finding a PR stacked above fixes isn't open: it lands with that PR, when that PR
-    is one of `stacked` (judged). `pages` are the pages of the PR's review threads (GraphQL)."""
+    """(where, priority, what) of every open finding: the bot's inline threads, outdated ones too, this
+    run's findings outside the diff and the earlier ones `carried` added to them, and anything else a
+    later review judged still open. A thread someone resolved stays open: only a later review that judged
+    it fixed, fixed above or moot clears it. An untagged bot thread counts as a P2, since its priority is
+    unknown and it should still block approval. A finding a PR stacked above fixes isn't open: it lands
+    with that PR, when that PR is one of `stacked` (judged). `pages` are the pages of the PR's review
+    threads (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
-    cleared = {f["ref"] for f in prior if f["status"] != "open"}
-    found, counted = [], set()
+    cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
+    disputed = {f["ref"]: f["why"] for f in prior if f["status"] == "disputed"}
+
+    def what(ref, text):
+        return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
+
+    found, counted = [], {f["location"] for f in review["outside_diff"]}
     for page in pages:
         for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
             first = thread["comments"]["nodes"][0]
             ref = str(first.get("databaseId", ""))
-            if thread["isOutdated"] or ref in cleared or not (first["author"] and first["author"]["login"] in BOTS):
+            if ref in cleared or not (first["author"] and first["author"]["login"] in POSTING_BOTS):
                 continue
             match = TAG.match(first["body"])
             where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
             found.append((where, match[1] if match else "P2",
-                          first["body"][match.end() if match else 0:].strip().split("\n")[0]))
+                          what(ref, first["body"][match.end() if match else 0:].strip().split("\n")[0])))
             counted.add(ref)
-    found += [(f"outside the diff, {f['location']}", f["priority"], f["claim"]) for f in review["outside_diff"]
-              if not f.get("fixed_in")]
-    # Judged still open, though its thread went outdated or it was outside the diff.
-    found += [(f"earlier {f['ref']}", f["priority"], f["why"]) for f in prior
-              if f["status"] == "open" and f["ref"] not in counted]
+    found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
+              for f in review["outside_diff"] if not f.get("fixed_in")]
+    # Judged still open, with no thread or outside_diff item here to count it by.
+    found += [(f"earlier {f['ref']}", f["priority"], what(f["ref"], f["why"])) for f in prior
+              if f["status"] in STILL_OPEN and f["ref"] not in counted]
     return found
 
 
@@ -233,12 +257,15 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
+    outside = {f["location"] for f in review["outside_diff"]}
     if prior:
         tally = ", ".join(f"{sum(f['status'] == s for f in prior)} {s.replace('_', ' ')}" for s in STATUSES)
         parts.append(f"Earlier findings: {tally}.")
     sections = [
         ("Still open from earlier", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
-                                     for f in prior if f["status"] == "open"]),
+                                     for f in prior if f["status"] == "open" and f["ref"] not in outside]),
+        ("Disputed: a person decides", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
+                                        for f in prior if f["status"] == "disputed"]),
         ("Outside the diff", [f"**[{f['priority']}]** `{f['location']}`: {f['claim']}\n\n  {f['detail']}"
                               for f in review["outside_diff"] if not f.get("fixed_in")]),
         ("Fixed in a PR above", [f"**[{f['priority']}]** {f['ref']}: {f['why']} {above(f)}"
