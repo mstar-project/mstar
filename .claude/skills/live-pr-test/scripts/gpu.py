@@ -437,7 +437,7 @@ def cmd_launch(args, cfg):
             lost, iid = e, None
         key = pending if lost else f"{o['provider']}:{iid}"
         now = time.time()
-        d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
+        d[key] = fields = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
               "usd_per_hour": o["usd_per_hour"], "gpu": o["gpu"], "count": o["count"], "region": o["region"],
               "launched_at": now, "deadline": now + hours * 3600,
               "user": "root" if o["provider"] == "runpod" else "ubuntu",
@@ -454,7 +454,9 @@ def cmd_launch(args, cfg):
                 f"still terminates one by name at the deadline; `gpu.py terminate {pending}` does it now")
         with ledger_txn() as d:
             key = f"{o['provider']}:{iid}"
-            d[key] = {**d.pop(pending), "instance_id": iid}  # pending's watchdog sees it gone and exits
+            # recorded even if pending was terminated meanwhile: the pod was just found, so it gets a watchdog
+            d[key] = {**fields, "instance_id": iid}
+            d.pop(pending, None)  # pending's watchdog sees it gone and exits
         arm_watchdog(key)
     print(f"launched {key} ({o['count']}x {o['gpu']}, {o['region']}, ${o['usd_per_hour']}/hr); "
           f"watchdog terminates it at {time.strftime('%H:%M', time.localtime(now + hours * 3600))} ({hours} h)")
@@ -479,7 +481,7 @@ def adopt(provider: str, name: str, err: Exception) -> str | None:
     """The instance a create whose answer was lost made, found by its name, or None after 2 min."""
     for _ in range(12):  # a new instance can take a while to show in the listing
         if ids := named(provider, name):
-            print(f"the create's answer was lost ({err}); adopting {provider}:{ids[0]}, named {name}", file=sys.stderr)
+            print(f"{provider}:{ids[0]} is the instance named {name} ({err})", file=sys.stderr)
             return ids[0]
         time.sleep(10)
     return None
@@ -559,8 +561,12 @@ def cmd_copy(args, cfg):
 # ---------------------------------------------------------------- list / extend / terminate
 
 def terminate(key: str, e: dict) -> None:
-    # a lost create's entry (instance_id None) terminates whatever has its name, if anything does
-    for iid in [e["instance_id"]] if e["instance_id"] else named(e["provider"], e["name"]):
+    # A lost create's entry (instance_id None) terminates whatever has its name, waiting as long as
+    # launch would for it to be listed.
+    ids = [e["instance_id"]] if e["instance_id"] else [i for i in [adopt(e["provider"], e["name"], key)] if i]
+    if not ids and not e["instance_id"]:
+        print(f"no instance named {e['name']} was listed in 2 min; nothing to terminate", file=sys.stderr)
+    for iid in ids:
         try:
             if e["provider"] == "runpod":
                 runpod("DELETE", f"/pods/{iid}")

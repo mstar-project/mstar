@@ -109,17 +109,20 @@ class TestGpu(unittest.TestCase):
                       runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
         args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, allow_over_budget=False, dry_run=False)
         exited = False
-        with unittest.mock.patch("subprocess.Popen"), contextlib.redirect_stdout(io.StringIO()), \
+        with unittest.mock.patch("subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             try:
                 GPU["cmd_launch"](args, CFG)
             except SystemExit:
                 exited = True
+        self.watchdogs = [c.args[0][-1] for c in popen.call_args_list]
         return made, listed, deleted, exited
 
     def test_a_launch_whose_answer_was_lost_adopts_the_pod_it_made(self):
         # a 502, and a 503 whose page says "not available" (a proxy's, not RunPod's capacity answer)
-        for answer in (GPU["ApiError"](502, "bad gateway"), GPU["ApiError"](503, "Service not available")):
+        # and a 200 with no id in it
+        for answer in (GPU["ApiError"](502, "bad gateway"), GPU["ApiError"](503, "Service not available"),
+                       KeyError("id")):
             GPU["save_ledger"]({})
             self.launch(answer)
             self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"],
@@ -129,14 +132,21 @@ class TestGpu(unittest.TestCase):
         made, _, _, exited = self.launch(GPU["ApiError"](502, "bad gateway"), shows_up=False)
         (key,) = GPU["ledger"]()
         self.assertTrue(exited and key.startswith("pending:"), "the lost create's cost stopped counting")
+        self.assertEqual(self.watchdogs, [key], "nothing ends the lost create's pod if nobody acts")
         self.assertTrue(self.launch(GPU["ApiError"](502, "bad gateway"))[3], "a second launch got past the cap")
-        deleted = []  # the first pod appears after its launch gave up
-        self.g.update(runpod_list=lambda path, field, params=None: made,
-                      runpod=lambda method, path, *a, **k: deleted.append((method, path)) or {})
-        with contextlib.redirect_stdout(io.StringIO()):
-            GPU["cmd_terminate"](argparse.Namespace(instance=key), CFG)
-        self.assertEqual(deleted, [("DELETE", "/pods/p1")], "terminating the pending entry left its pod running")
-        self.assertEqual(GPU["ledger"](), {})
+        entry = GPU["ledger"]()[key]
+        for end in ("by hand", "at the deadline"):
+            GPU["save_ledger"]({key: {**entry, "deadline": time.time() - 1}})
+            deleted = []  # the first pod appears after its launch gave up
+            self.g.update(runpod_list=lambda path, field, params=None: made,
+                          runpod=lambda method, path, *a, deleted=deleted, **k: deleted.append((method, path)) or {})
+            with contextlib.redirect_stdout(io.StringIO()):
+                if end == "by hand":
+                    GPU["cmd_terminate"](argparse.Namespace(instance=key), CFG)
+                else:
+                    GPU["cmd_watchdog"](argparse.Namespace(instance=key), CFG)
+            self.assertEqual(deleted, [("DELETE", "/pods/p1")], f"ending the pending entry {end} left its pod up")
+            self.assertEqual(GPU["ledger"](), {})
 
     def test_a_create_refused_with_a_429_makes_nothing_to_look_for(self):
         made, listed, deleted, exited = self.launch(GPU["ApiError"](429, "slow down"))
@@ -158,6 +168,10 @@ class TestGpu(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             GPU["cmd_extend"](argparse.Namespace(instance="runpod:p1", hours=0, allow_over_budget=False), CFG)
         self.assertLess(GPU["ledger"]()["runpod:p1"]["deadline"], time.time() + 1)
+        # and for one already past its deadline, whose watchdog hasn't got to it yet
+        GPU["save_ledger"]({"runpod:p1": {**one, "launched_at": now - 5 * 3600, "deadline": now - 30}})
+        with contextlib.redirect_stdout(io.StringIO()):
+            GPU["cmd_extend"](argparse.Namespace(instance="runpod:p1", hours=0, allow_over_budget=False), CFG)
 
     def test_offers_with_a_provider_not_answering_is_not_no_availability(self):
         def erroring(*a, **k):
@@ -197,6 +211,10 @@ class TestBootstrap(unittest.TestCase):
                            env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)})
         self.assertIn(f"{home}/w/compile/inductor", r.stdout)
         self.assertIn("save_caches:", r.stderr)
+        rerun = subprocess.run(["bash", "-c", script.replace(" --untrusted", "")], capture_output=True, text=True,
+                               check=False, env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)})
+        self.assertIn(f"{home}/w/compile/inductor", rerun.stdout, "a rerun without --untrusted lost the flag")
+        self.assertIn("save_caches:", rerun.stderr)
         self.assertFalse((home / "vol/live-pr-compile-cache").exists(), "an untrusted run wrote the shared tarball")
 
 
