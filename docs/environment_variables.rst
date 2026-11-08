@@ -469,7 +469,8 @@ so attaching more files does not multiply them.
        header before decoding; over it, the request gets a 400. PNG, JPEG,
        WebP and GIF are read (FLUX.2 klein, which decodes with Pillow, also
        reads BMP and TIFF); other formats get a 400. A GIF or an animated
-       WebP is read as its first frame.
+       WebP is read as its first frame. Images are turned upright by their
+       EXIF orientation; a malformed EXIF block leaves one as stored.
    * - ``MSTAR_MAX_VIDEO_PIXELS``
      - ``1073741824``
      - Pixels a request's videos may decode to (see
