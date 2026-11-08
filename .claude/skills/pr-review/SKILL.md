@@ -476,15 +476,24 @@ nothing else: no GitHub token and no cloud keys. It follows `.claude/skills/live
 before results, reference parity, both frontends where they apply. It gets the PR, the head commit
 to test, and the review's findings.
 
-**The review decides what the live test runs**, and says why:
-- `full`: no earlier live test of this PR, or the change since it reaches most of what it exercised;
-- `targeted`: rerun only the checks whose code the new commits reach, and the "how to confirm" lines
-  of new or still-open P0–P2 findings;
-- `none`: nothing since the last passing live test reaches code it exercised (docs, tests,
-  comments, an unrelated file). Its result carries over to this head.
+**The review decides whether and what the live test runs**, on every review and re-review, from
+what the change can affect, and says why:
+- `run`:
+  - `full`: plan the live test over the whole change;
+  - `targeted`: only the checks the change reaches (on a re-review, the new commits), plus the "how
+    to confirm" lines of open P0–P2 findings;
+  - `none`: nothing in the change needs a GPU run to settle it; the reason says why in one sentence.
+- `checks`, the kinds of check: `correctness` (served output, parity, regressions) and/or
+  `performance` (throughput and latency A/Bs). Leave `performance` out when the change can't
+  plausibly move speed; leave `correctness` out only for a pure performance change whose outputs you
+  proved unchanged by reading the code. Give it with `none` too; it is ignored there.
 
-`targeted` and `none` build on the last live test, so they hold only when it passed on an ancestor
-of the head; otherwise the bot runs the live test in full.
+The bot holds one line of its own: when the PR's last live test didn't pass on an ancestor of the
+head (it failed, was partial or unavailable, or ran on a commit since rebased away), `targeted` and
+`none` run in full, with both kinds of check, so a failure is never hidden behind a narrower run.
+After a pass on an ancestor, a `targeted` run is told that commit and given its report. A `none`
+starts no box; the PR's comment says "No GPU run" with your reason, and it counts as a pass for
+approval.
 
 **GPUs are expensive; use as few as settle the question.** Size the box to the largest config the
 plan needs, not the largest the model supports; prefer the smallest model and layout that reaches
@@ -535,5 +544,5 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
   here is also a finding or a question.
 - **Skipped:** files not reviewed, on a diff too large to cover.
 - **Risk:** the design-risk rating, its sentence and, above low, the decisions (§6).
-- **Live test** (gpu): `full`, `targeted` or `none`, with the reason, and the fewest GPUs the largest
-  config it needs runs on (§7).
+- **Live test** (gpu): `full`, `targeted` or `none`, the kinds of check, the reason, and the fewest
+  GPUs the largest config it needs runs on (§7).

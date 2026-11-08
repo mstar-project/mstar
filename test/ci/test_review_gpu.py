@@ -57,6 +57,27 @@ class TestApproval(unittest.TestCase):
                                     "mstar/model/orpheus/model.py", "docs/models.rst"], REPO_ROOT), ([], []),
                          "a low-risk worker or model change couldn't get a counting approval")
 
+    def test_a_none_run_counts_as_a_pass_only_when_the_review_chose_none(self):
+        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "joe"}}
+        compare = {"files": [{"filename": "docs/models.rst"}]}
+        globs = GPU_REVIEW["reasons_not_to_approve"].__globals__
+        saved = {k: globs[k] for k in ("gh", "gh_json", "review_threads")}
+        self.addCleanup(globs.update, saved)
+        globs.update(gh=lambda *a, check=True: argparse.Namespace(stdout="write\n"),
+                     gh_json=lambda path: compare if "/compare/" in path else pr, review_threads=lambda pr: [])
+
+        def why(verdict, run):
+            r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": [],
+                 "risk": {"level": "low", "reason": "docs only", "look_at": []},
+                 "live_test": {"run": run, "reason": "docs only", "confirm": [], "checks": ["correctness"], "gpus": 1}}
+            a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict)
+            return GPU_REVIEW["reasons_not_to_approve"](a, r)[0]
+
+        self.assertEqual(why("pass", "full"), [])
+        self.assertEqual(why("skipped", "none"), [], "a change that needs no GPU run could never be approved")
+        self.assertEqual(why("skipped", "targeted"), ["the live test's verdict is skipped"],
+                         "a skipped run the review didn't choose would count as a pass")
+
 
 
 class TestStart(unittest.TestCase):
@@ -65,7 +86,8 @@ class TestStart(unittest.TestCase):
     def start(self, env_key, cfg, launch_code=0, **args):
         out = Path(tempfile.mkdtemp())
         (out / "review.json").write_text(json.dumps({"live_test": {
-            "run": "full", "reason": self.INJECTED, "confirm": [self.INJECTED], "gpus": 1}}))
+            "run": "full", "reason": self.INJECTED, "confirm": [self.INJECTED], "checks": ["correctness"],
+            "gpus": 1}}))
         offers = [{"id": "slurm:node1:1", "provider": "slurm", "gpu": "H200", "count": 1, "usd_per_hour": 0.0,
                    "availability": "8 free"},
                   {"id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1, "usd_per_hour": 3.0,
@@ -85,7 +107,8 @@ class TestStart(unittest.TestCase):
         globs.update(gpu=gpu, gpu_py=lambda: {"load_config": lambda: cfg})
         a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="main", gpus=1, hours=4.0,
                                run="full", review=str(out / "review.json"), out=str(out), tag="1-1",
-                               model="m", turns=10, claude_version="stable", since=None, earlier_report=None)
+                               model="m", turns=10, claude_version="stable", since=None, earlier_report=None,
+                               checks=["correctness", "performance"])
         vars(a).update(args)
         env = {k: v for k, v in os.environ.items() if k != "LIVE_TEST_ANTHROPIC_KEY"}
         with unittest.mock.patch.dict(os.environ, env | ({"LIVE_TEST_ANTHROPIC_KEY": env_key} if env_key else {}),
@@ -114,8 +137,22 @@ class TestStart(unittest.TestCase):
                       "the PR would read that there were no GPUs")
 
     def test_a_stacked_pr_is_tested_against_its_base_branch(self):
-        a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="joe/cp-stack-1", run="full", since=None)
+        a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="joe/cp-stack-1", run="full", since=None,
+                               checks=["correctness"])
         self.assertIn("--base joe/cp-stack-1", GPU_REVIEW["brief"](a), "the PR's arm would be compared with main")
+
+    def test_the_brief_says_which_kinds_of_check_to_run_and_only_those_words_get_in(self):
+        checks = GPU_REVIEW["checks"]
+        a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="main", run="targeted", since=None,
+                               checks=checks("correctness"))
+        self.assertIn("- Checks: correctness (served output, parity, regressions) only. Skip performance",
+                      GPU_REVIEW["brief"](a), "a change that can't move speed would still get throughput A/Bs")
+        a.checks = checks("performance,correctness")
+        self.assertIn("- Checks: correctness (served output, parity, regressions) and performance",
+                      GPU_REVIEW["brief"](a))
+        for bad in ("", "speed", "correctness,correctness", "correctness;id", "correctness,"):
+            with self.assertRaises(argparse.ArgumentTypeError, msg=f"{bad!r} would reach the brief"):
+                checks(bad)
 
     def test_a_targeted_run_knows_which_live_test_it_builds_on(self):
         earlier = Path(tempfile.mkdtemp()) / "earlier.md"

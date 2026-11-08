@@ -811,11 +811,19 @@ jobs:
           gpus=$(jq -r --argjson cap "$MAX_GPUS" '[.live_test.gpus // 1, $cap] | min' review.json)
           run=$(jq -r '.live_test.run // "full"' review.json)
           case "$run" in none|targeted|full) ;; *) run=full ;; esac   # model output: only the enum reaches a shell
-          { echo "gpus=$gpus"; echo "run=$run"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
+          # The kinds of check, likewise only the two words (gpu_review.py checks them again); both if none is left.
+          checks=$(jq -r '.live_test.checks // [] | if type == "array" then . else [] end
+            | map(select(. == "correctness" or . == "performance")) | unique | join(",")' review.json)
+          [ -n "$checks" ] || checks=correctness,performance
+          { echo "gpus=$gpus"; echo "run=$run"; echo "checks=$checks"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
-      # `none` and `targeted` build on the last live test: only when it passed, on a commit
-      # that is an ancestor of this head. Otherwise the live test runs in full. A `none` that
-      # holds carries that pass; a `targeted` one is told that commit and given that report.
+      # The review's `none` or `targeted` stands unless the PR's last live test didn't pass on an
+      # ancestor of this head (it failed, was partial or unavailable, or ran on a commit rebased
+      # away): then the live test runs in full, every kind of check, so a failure is never hidden.
+      # After a pass on an ancestor, a `targeted` run is told that commit and given that report;
+      # with no earlier live test it runs as it is. A `none` that stands runs nothing, and counts
+      # as a pass for approval (verdict `skipped`). It posts no live-test marker: it isn't a live
+      # test, so the next run still checks against the last real one.
       - name: Check the last live test
         if: steps.cfg.outputs.run != 'full' && steps.cfg.outputs.trusted == 'true'
         id: carry
@@ -832,17 +840,19 @@ jobs:
           marker=$(jq -r '.marker // empty' earlier.json)
           sha=$(sed -E 's/.*sha=([0-9a-f]*).*/\1/' <<< "$marker"); verdict=$(sed -E 's/.*verdict=([a-z]*).*/\1/' <<< "$marker")
           status=$( [ -n "$sha" ] && gh api "repos/$REPO/compare/$sha...$HEAD_SHA" --jq .status 2> /dev/null || true )
-          if [ "$verdict" != "pass" ] || { [ "$status" != "ahead" ] && [ "$status" != "identical" ]; }; then
+          passed=false
+          if [ "$verdict" = "pass" ] && { [ "$status" = "ahead" ] || [ "$status" = "identical" ]; }; then passed=true; fi
+          if [ -n "$marker" ] && [ "$passed" != "true" ]; then
             echo "::notice::The review asked for a $RUN live test, but the last one didn't pass on an ancestor; running it in full."
-            echo "run=full" >> "$GITHUB_OUTPUT"
+            { echo "run=full"; echo "checks=correctness,performance"; } >> "$GITHUB_OUTPUT"
           elif [ "$RUN" = "none" ]; then
-            echo "run=none" >> "$GITHUB_OUTPUT"
-            echo "verdict=pass" >> "$GITHUB_OUTPUT"
-            echo "note=No GPU run: nothing since the passing live test of \`${sha:0:7}\` reaches code it exercised." >> "$GITHUB_OUTPUT"
+            { echo "run=none"; echo "verdict=skipped"; } >> "$GITHUB_OUTPUT"
           else
             echo "run=targeted" >> "$GITHUB_OUTPUT"
-            echo "since=$sha" >> "$GITHUB_OUTPUT"
-            jq -r .body earlier.json > earlier-live-test.md
+            if [ "$passed" = "true" ]; then
+              echo "since=$sha" >> "$GITHUB_OUTPUT"
+              jq -r .body earlier.json > earlier-live-test.md
+            fi
           fi
 
       - name: Get GPUs and start the live test
@@ -856,13 +866,14 @@ jobs:
           LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
           RUN: ${{ steps.carry.outputs.run || steps.cfg.outputs.run }}
+          CHECKS: ${{ steps.carry.outputs.checks || steps.cfg.outputs.checks }}
           SINCE: ${{ steps.carry.outputs.since }}
         run: |
           set +e
           python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
             --base "$BASE" \
             --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
-            --run "$RUN" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
+            --run "$RUN" --checks "$CHECKS" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
             --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
           code=$?
           [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
@@ -989,7 +1000,6 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          NOTE: ${{ steps.carry.outputs.note }}
           APPROVAL: ${{ steps.approve.outputs.approval }}
           APPROVE_OUTCOME: ${{ steps.approve.outcome }}
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
@@ -1000,7 +1010,9 @@ jobs:
             echo "The live test runs only on a PR whose author has write access; this review stands without it." > post.md
           elif [ -s "$lt/comment.md" ]; then cp "$lt/comment.md" post.md
           elif [ -s "$lt/unavailable.md" ]; then { echo "<!-- claude-live-test sha=$HEAD_SHA verdict=unavailable -->"; cat "$lt/unavailable.md"; } > post.md
-          else printf '<!-- claude-live-test-carried -->\n%s\n' "$NOTE" > post.md
+          else   # the review chose `none` and it stood: its reason is model text, so it can't open a comment
+            printf '<!-- claude-live-test-carried -->\nNo GPU run: %s\n' \
+              "$(jq -r '.live_test.reason // ""' review.json | sed 's/<!--/\&lt;!--/g')" > post.md
           fi
           if [ "$APPROVAL" = "approve" ]; then
             printf '\n**Approved** on `%s` by the rule in `.github/review/gpu_review.py`.\n' "${HEAD_SHA:0:7}" >> post.md
