@@ -5,9 +5,10 @@
 # Only main's code runs here, never a PR's; live tests mount the volumes read-only.
 #
 # With weights, they download straight onto the volume (HF_HOME=/cache/hf), so a deadline keeps every
-# file that finished, and the next refresh downloads what is missing; without, they go to the box's
-# own disk and are lost with it. The compile caches are saved to the volume every 5 models and at
-# the end. No new model starts once the weights' disk has under 100 GB free.
+# file that finished, and the next refresh downloads what is missing, and no new model starts once
+# the volume has under 100 GB free; without, they go to the box's own disk and each model's are
+# deleted once its server exits. The compile caches are saved to the volume every 5 models and at
+# the end.
 #
 # Inputs in /run/live-pr: run.json (repo, main_sha, models: "all" or names, skip: names,
 # weights: "true" or "false").
@@ -29,7 +30,8 @@ mountpoint -q /cache || finish "cache volume not mounted"
 [ ! -d /cache/hf/hub ] || find /cache/hf/hub -name '*.incomplete' -delete
 # The compile caches go to bootstrap's CACHE_TAR, live-pr-compile-cache beside the HF home: on the
 # volume either way.
-if [ "$(field weights)" = true ]; then
+weights=$(field weights)
+if [ "$weights" = true ]; then
   export HF_HOME=/cache/hf
 else
   export HF_HOME=$W/hf
@@ -50,7 +52,9 @@ models=$(field models)
 n=0 left=""
 for m in $models; do
   case " $(field skip) " in *" $m "*) continue ;; esac
-  if [ "$(df --output=avail -BG "$HF_HOME" | tail -n 1 | tr -dc 0-9)" -lt 100 ]; then left="$left $m"; continue; fi
+  if [ "$weights" = true ] && [ "$(df --output=avail -BG "$HF_HOME" | tail -n 1 | tr -dc 0-9)" -lt 100 ]; then
+    left="$left $m"; continue
+  fi
   echo "== $m"
   timeout 2400 mstar serve "$m" --port 18000 > "$OUT/serve-$m.log" 2>&1 &
   pid=$!
@@ -60,10 +64,11 @@ for m in $models; do
     sleep 10
   done
   kill "$pid" 2> /dev/null; wait "$pid" 2> /dev/null
+  [ "$weights" = true ] || rm -rf "$HF_HOME"/hub/models--*  # the box's disk holds one model's at a time
   n=$((n + 1))
   [ $((n % 5)) -ne 0 ] || save_caches
 done
-[ -z "$left" ] || echo "left out, under 100 GB free for weights:$left"
+[ -z "$left" ] || echo "left out, under 100 GB free on the volume:$left"
 save_caches || finish "couldn't save the compile caches"
 df -h /cache
 finish "refresh done"
