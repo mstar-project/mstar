@@ -137,6 +137,9 @@ def test_bfl_layout_and_kohya_names_are_equivalent():
         "diffusion_model.img_in.lora_B.weight": b_in,
         "diffusion_model.final_layer.linear.lora_A.weight": a_out,
         "diffusion_model.final_layer.linear.lora_B.weight": b_out,
+        # a block's alpha was dropped, so the adapter merged at alpha = rank
+        "diffusion_model.double_blocks.0.img_attn.qkv.alpha": torch.tensor(RANK / 2),
+        "diffusion_model.single_blocks.0.linear1.alpha": torch.tensor(RANK * 2.0),
     }
     adapter = normalize_lora_state_dict(bfl, convert_keys=convert_bfl_lora_keys)
     expected_modules = {
@@ -148,6 +151,9 @@ def test_bfl_layout_and_kohya_names_are_equivalent():
     assert set(adapter.layers) == expected_modules
     assert torch.equal(adapter.layers["transformer_blocks.0.attn.to_k"][0], a_qkv)
     assert torch.equal(adapter.layers["transformer_blocks.0.attn.to_v"][1], b_qkv.chunk(3)[2])
+    assert [adapter.layers[m].alpha for m in ("transformer_blocks.0.attn.to_k", "transformer_blocks.1.attn.to_out.0",
+                                               "single_transformer_blocks.0.attn.to_qkv_mlp_proj")] == [
+        RANK / 2, RANK, RANK * 2]
     merge_lora(native, adapter, remap_transformer_key, _QKV_RULES_DIT)
     # reference: the converted (diffusers-naming) adapter applied to the diffusers module's weights
     with torch.no_grad():

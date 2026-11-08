@@ -380,6 +380,14 @@ def test_follower_ignores_conductor_drain():
     assert "X" in w.lifecycle.draining and len(_reads_done(w)) == 1
 
 
+def test_follower_honors_conductor_drain_of_a_request_it_never_admitted():
+    """The leader has no handle either, so it forwards nothing: without this the
+    teardown barrier waits out the drain TTL for this rank's READS_DONE."""
+    w = _worker(is_follower=True, known_rids=())
+    _drain(w, request_id="X")  # source=CONDUCTOR
+    assert "X" in w.lifecycle.draining and len(_reads_done(w)) == 1
+
+
 def test_drain_acks_only_once():
     w = _worker(inflight_reads=False)
     _drain(w, request_id="X")
