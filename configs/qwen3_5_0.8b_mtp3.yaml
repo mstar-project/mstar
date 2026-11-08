@@ -11,6 +11,12 @@ model_kwargs:
   num_draft_tokens: 3
   # drafts read an fp8 copy of lm_head (see Fp8DraftHead), the verify the checkpoint's
   draft_head: fp8
+platform_overrides:
+  rocm:
+    # No step budget on AMD GPUs: AITER's chunked GDN prefill runs eagerly past 512 tokens at a
+    # near-flat cost there, so prompts run whole in pure prefill steps instead of chunked beside
+    # decode (the MI325X numbers are under "Chunked prefill budgets" in docs/serving.rst).
+    max_batch_tokens: {LLM: null}
 resources:
   gdn_state:
     # A request holds num_draft_tokens + 1 state slots: 64 requests, plus the sink.

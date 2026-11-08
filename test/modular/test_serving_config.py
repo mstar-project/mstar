@@ -150,6 +150,8 @@ def test_z_image_serves_sdpa_on_cuda_and_the_ragged_resource_on_rocm(monkeypatch
 QWEN3_5_NO_STEP_BUDGET_ON_ROCM = [
     "qwen3_5_0.8b.yaml",
     "qwen3_5_0.8b_bf16state.yaml",
+    "qwen3_5_0.8b_mtp2.yaml",
+    "qwen3_5_0.8b_mtp3.yaml",
     "qwen3_5_27b_tp4.yaml",
     "qwen3_5_2b.yaml",
     "qwen3_5_2b_bf16state.yaml",
@@ -157,6 +159,8 @@ QWEN3_5_NO_STEP_BUDGET_ON_ROCM = [
     "qwen3_5_9b.yaml",
     "qwen3_5_9b_bf16state.yaml",
     "qwen3_5_9b_dp2.yaml",
+    "qwen3_5_9b_mtp2.yaml",
+    "qwen3_5_9b_mtp3.yaml",
     "qwen3_5_9b_tp2.yaml",
 ]
 
