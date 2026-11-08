@@ -134,6 +134,8 @@ class SeqRange(NamedTuple):
     counts: tuple[int, ...]
     # B of a [B, S, ...] layout split along S (axis 1); None for a packed label (axis 0)
     rows: int | None
+    # the step is a warm-up or capture, whose exchanges every replay repeats
+    captured: bool = False
 
     @property
     def start(self) -> int:
@@ -154,8 +156,6 @@ class SeqShardPlan(NamedTuple):
 
     split: bool
     ranges: Mapping[str, SeqRange]
-    # a warm-up or capture of this step, which every replay repeats
-    captured: bool = False
 
 
 COPIED = SeqShardPlan(False, {})
@@ -246,8 +246,6 @@ class SequenceShard(Resource):
             self._current, self._pending, self._preplanned = self._pending, None, False
             return self._current
         result = self._decide(step, ctx) if self.can_split else COPIED
-        if ctx.capture:
-            result = result._replace(captured=True)
         if ctx.is_preplan:
             self._pending, self._preplanned = result, True
         else:
@@ -309,7 +307,7 @@ class SequenceShard(Resource):
                 )
             if (min(label_spans) if self.axis == 1 else sum(label_spans)) < sp:
                 return COPIED
-        ranges = {label: self._range(label_spans) for label, label_spans in spans.items()}
+        ranges = {label: self._range(label_spans, ctx.capture) for label, label_spans in spans.items()}
         for sources, plan_label in step.combined_labels.items():
             listed = [source in self.labels for source in sources]
             if not any(listed):
@@ -324,21 +322,16 @@ class SequenceShard(Resource):
             if combined:
                 if self.axis == 1 and len(set(combined)) > 1:
                     raise ValueError(f"combined label {plan_label!r}'s rows must be one length; got {combined}")
-                ranges[plan_label] = self._range(combined)
+                ranges[plan_label] = self._range(combined, ctx.capture)
         return SeqShardPlan(True, ranges)
 
-    def _range(self, spans: list[int]) -> SeqRange:
+    def _range(self, spans: list[int], captured: bool) -> SeqRange:
         world = self.group.world_size
         if self.axis == 0:
-            return SeqRange(self.group, tuple(sp_seq_split(sum(spans), world)), None)
-        return SeqRange(self.group, tuple(sp_seq_split(spans[0], world)), len(spans))
+            return SeqRange(self.group, tuple(sp_seq_split(sum(spans), world)), None, captured)
+        return SeqRange(self.group, tuple(sp_seq_split(spans[0], world)), len(spans), captured)
 
     ### Submodule-level functionality
-
-    @property
-    def captured(self) -> bool:
-        """This step is a warm-up or capture, so the kernels its exchanges run are the ones its replays repeat."""
-        return self._current is not None and self._current.captured
 
     def split_range(self, label: str) -> SeqRange | None:
         """``label``'s ranges if this step splits it; None when copied, unlisted or outside a step."""
@@ -439,16 +432,16 @@ def _packed(x: torch.Tensor, r: SeqRange) -> torch.Tensor:
     return x if r.rows is None else x.flatten(0, 1)
 
 
-def ulysses(run: Callable, q, k, v, r: SeqRange, captured: bool = False):
+def ulysses(run: Callable, q, k, v, r: SeqRange):
     """Split tokens to split heads: one all-to-all of q, k and v (each ``[n, H, D]``, this rank's
     tokens) to ``[N, H / P, D]``, ``run``, and the output back.
 
-    A ``captured`` step compiles the all-to-all at its own shapes, once in the warm-up, so the graph
+    A captured step compiles the all-to-all at its own shapes, once in the warm-up, so the graph
     replays fused layout copies; ``dynamic=False`` because another bucket's token count would make
     that dim dynamic, a slower kernel than eager. Any other step stays eager: its token counts vary,
     so compiling would stall on each new one and gain nothing per step."""
     _check_entry(r, q, k, v)
-    all_to_all = compiled(CommGroup.all_to_all, dynamic=False) if captured else CommGroup.all_to_all
+    all_to_all = compiled(CommGroup.all_to_all, dynamic=False) if r.captured else CommGroup.all_to_all
     seq, head = (0, 1) if r.rows is None else (1, 2)
     parts = [x for x in (q, k, v) if x is not None]
     exchanged = all_to_all(

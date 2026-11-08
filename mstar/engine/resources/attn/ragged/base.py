@@ -503,7 +503,7 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
         r = self._shard.split_range(label)
         if r is not None:
             self._shard.check_scattered(label)
-            return functools.partial(ulysses, r=r, captured=self._shard.captured)
+            return functools.partial(ulysses, r=r)
         return functools.partial(head_slice, group=self._shard.group) if self._ulysses else None
 
 

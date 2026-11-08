@@ -162,7 +162,7 @@ def _split_exchanges(rank, world, total, rows, captured):
     one rank attending them all, and a write alone (``q=None``), with the same collectives on every
     rank."""
     group = _group(rank, world)
-    r = SeqRange(group, tuple(sp_seq_split(total, world)), rows)
+    r = SeqRange(group, tuple(sp_seq_split(total, world)), rows, captured)
     b = rows or 1
     gen = torch.Generator().manual_seed(0)
     q, k, v = (torch.randn(b * total, heads, 4, generator=gen) for heads in (HEADS, world, world))
@@ -185,11 +185,11 @@ def _split_exchanges(rank, world, total, rows, captured):
     communication._all_gather_into_tensor = record
     run = _rows_attention(b, causal=True)
     want = run(q, k, v)
-    torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r, captured), local(want))
+    torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r), local(want))
     if captured:
         # the capture itself, on what its warm-up above compiled
         with torch.compiler.set_stance("fail_on_recompile"):
-            torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r, captured), local(want))
+            torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r), local(want))
         assert _debug_get_cache_entry_list(CommGroup.all_to_all.__code__)
     torch.testing.assert_close(head_slice(run, q, k, v, group), want)
     # copied queries over this rank's keys
@@ -252,12 +252,11 @@ def _rows(label, span, n=2):
     return [(f"r{i}", label, span) for i in range(n)]
 
 
-@pytest.mark.parametrize("tokens", [10, 1], ids=["split", "copied"])
 @pytest.mark.parametrize("capture", [False, True], ids=["replayed", "capture"])
-def test_a_step_is_captured_only_when_the_runner_captures_it(tokens, capture):
+def test_a_range_is_captured_only_when_the_runner_captures_its_step(capture):
     shard = _shard()
-    _split(shard, [("r0", "main", tokens)], capture=capture)
-    assert shard.captured == capture
+    _split(shard, [("r0", "main", 10)], capture=capture)
+    assert shard.split_range("main").captured == capture
 
 
 @pytest.mark.parametrize("shard, step, ranges", [
