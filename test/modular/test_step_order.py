@@ -20,7 +20,7 @@ from mstar.model.cosmos3.submodules import (  # noqa: E402
 )
 from mstar.model.lingbot_world.submodules import ROLLOUT_WALK, LingBotDitSubmodule  # noqa: E402
 from mstar.model.wan22.submodules import Wan22DitSubmodule  # noqa: E402
-from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
+from mstar.testing_utils.worker import make_scheduler
 
 
 def _order_of(submodule_class: type[NodeSubmodule], walk: str) -> StepOrder:
@@ -28,7 +28,7 @@ def _order_of(submodule_class: type[NodeSubmodule], walk: str) -> StepOrder:
     the real ``Engine.get_step_order``. No weights: the hook reads no state."""
     submodule = submodule_class.__new__(submodule_class)
     engine = make_engine(_submodules={"node": make_mgmt(submodule=submodule)})
-    sched = MicroScheduler(engine_manager=SimpleNamespace(get_engine=lambda name: engine))
+    sched = make_scheduler(engine_manager=SimpleNamespace(get_engine=lambda name: engine))
     return sched._order_of(("node", walk))
 
 

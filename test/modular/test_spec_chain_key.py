@@ -6,30 +6,29 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
-from mstar.worker.phase_timer import PhaseTimer
-from mstar.worker.worker import SpeculationTarget, Worker, _SpecFairness
+from mstar.testing_utils.worker import make_worker
+from mstar.worker.chunk_loops import ChunkLoops
+from mstar.worker.worker import SpeculationTarget, _SpecFairness
 
 
 def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozenset(), budgeted=True):
     peeked, excluded = [], []
-    fake = SimpleNamespace(
+    worker = make_worker(
         _can_speculate=lambda batch: True,
-        chunk_loops=SimpleNamespace(speculated=mid_prefill_walks),
+        chunk_loops=ChunkLoops(mid_prefill_walks),
         _choose_spec_target=lambda batch: target,
         _try_speculate_next=lambda pending, target: speculation,
-        maybe_send_zmq_to_tp_followers=lambda node_batch, **kw: -1,
-        _tp_lead_needs_marker=lambda pending, speculation: False,
-        timer=PhaseTimer(period=0),
-        enable_nvtx=False,
-        request_state=None,
         scheduler=SimpleNamespace(
-            has_ready_excluding=lambda state, key: peeked.append(key) or other_ready,
-            get_next_batch=lambda state, exclude_target: excluded.append(exclude_target),
+            has_ready_excluding=lambda key: peeked.append(key) or other_ready,
+            next_batch=lambda exclude_target: excluded.append(exclude_target),  # noqa: PLW0108
             chunks=lambda node_name, graph_walk: budgeted,
         ),
     )
-    fake._build_speculation = Worker._build_speculation.__get__(fake)
-    return fake, peeked, excluded
+    return worker, peeked, excluded
+
+
+def _chain_step():
+    return SimpleNamespace(node_batch=SimpleNamespace(node_name="LLM"), tp_seq=-1, is_yield_away=False)
 
 
 def _pending():
@@ -81,7 +80,7 @@ def test_a_chains_first_step_that_cannot_continue_keeps_the_worker_busy_alone():
 
 def test_a_chains_first_step_that_continues_does_not_peek():
     worker, peeked, excluded = _worker(
-        _PROMPT, speculation=SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False),
+        _PROMPT, speculation=_chain_step(),
     )
 
     speculation, _ = worker._build_speculation(_pending(), 0, _SpecFairness(peek=True, max_consecutive=8))
@@ -92,7 +91,7 @@ def test_a_chains_first_step_that_continues_does_not_peek():
 def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_step():
     """Speculating a row's next chunk must not hold decode rows behind a second
     prompt step, so the peek runs before the chain's first speculation."""
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chain_step()
     worker, peeked, excluded = _worker(
         _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}),
     )
@@ -104,7 +103,7 @@ def test_a_prompt_chain_that_speculates_its_next_chunk_yields_from_its_first_ste
 
 
 def test_a_prompt_chain_alone_speculates_its_next_chunk():
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chain_step()
     worker, _, excluded = _worker(
         _PROMPT, other_ready=False, speculation=chunk,
         mid_prefill_walks=frozenset({("LLM", "prefill")}),
@@ -135,7 +134,7 @@ def test_a_step_with_no_token_budget_that_cannot_continue_keeps_mains_order():
 
 def test_a_prompt_chain_with_no_token_budget_does_not_yield_from_its_first_step():
     """Inside its chunk Loop but never cut: it speculates on as on main."""
-    chunk = SimpleNamespace(node_batch=None, tp_seq=-1, is_yield_away=False)
+    chunk = _chain_step()
     worker, peeked, excluded = _worker(
         _PROMPT, speculation=chunk, mid_prefill_walks=frozenset({("LLM", "prefill")}), budgeted=False,
     )

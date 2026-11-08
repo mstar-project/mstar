@@ -19,7 +19,7 @@ The worker does not run one batch at a time. While batch N's kernels are on the 
 | Side stream | D2H copies for `check_stop` pre-materialization |
 | `SideStepLane` stream | A side lane's steps (`side_stream: true` on a node group), launched from the GPU thread between two chain steps; its windows collate there on the main thread |
 
-Knobs: **`MSTAR_TP_ASYNC_SCHED` is `1`, so lockstep-parallel (TP/SP) nodes speculate too.** `0` runs them serially, which is still a supported path: a change that only works with speculation on needs testing with it off as well. It also takes a comma-separated node list. The worker `all_gather`s the value and raises if it disagrees across the ranks of an instance — an instance of invariant 11 made into a startup check.
+Knobs: **`MSTAR_TP_ASYNC_SCHED` is `1`, so lockstep-parallel (TP/SP/CFG) nodes speculate too.** `0` runs them serially, which is still a supported path: a change that only works with speculation on needs testing with it off as well. It also takes a comma-separated node list. The worker `all_gather`s the value and raises if it disagrees across the ranks of an instance — an instance of invariant 11 made into a startup check.
 
 The others: `MSTAR_PRE_PLAN_SPEC`, `MSTAR_MAX_CONSECUTIVE_SPEC_STEPS`, `MSTAR_SPEC_PEEK_FOR_FAIRNESS`, `MSTAR_LAUNCH_WAIT_MS`, `MSTAR_ENGINE_STEP_SYNC`, `MSTAR_FORWARD_SIDE_STREAM`. Defaults for all of these are in [docs/environment_variables.rst](../../../docs/environment_variables.rst); check it rather than assuming. Per-node opt-out from async scheduling entirely: `enable_async_scheduling=False` on the `GraphNode`.
 
@@ -27,7 +27,7 @@ The others: `MSTAR_PRE_PLAN_SPEC`, `MSTAR_MAX_CONSECUTIVE_SPEC_STEPS`, `MSTAR_SP
 
 The loop is circular, so this starts at an arbitrary point: **batch N is running on the GPU and postprocess for N-1 has just finished.** The code carries its own stage comments 1-3; the substages below are what they expand to.
 
-**0. Deferred teardown.** `_apply_pending_removes_safe_to_drop`, then `_fail_requests` on `scheduler.take_admit_errors()`, then `_apply_pending_drains`. The admit-error step matters: those are requests a resource declared unservable during *last* pass's readiness scans. They sit in no batch, so nothing else would ever fail them.
+**0. Deferred teardown.** `_apply_pending_removes_safe_to_drop`, then `_fail_requests` on `admission.take_admit_errors()`, then `_apply_pending_drains`. The admit-error step is where a terminal refusal fails: requests a resource refused for good since last pass, in a readiness scan or in a step's admit (`Admission.requeue`), fail here, one pass after the refusal.
 
 **1. CPU preamble — overlaps GPU(N).** `_process_messages` (ZMQ), `_check_ready_tensors` (read tensors in from other ranks), `_poll_stream_buffers`, request cleanup. Every NVTX range here uses `synchronize=False`, because a `torch.cuda.synchronize()` would drain the in-flight GPU work and destroy the overlap.
 
@@ -44,7 +44,7 @@ The loop is circular, so this starts at an arbitrary point: **batch N is running
 
 - `admit_error` — admit refused N, so no forward ran. `_handle_admit_failure` pushes the GraphNodes back to the scheduler queue and, on KV OOM, offloads or holds the failed rids.
 - `failed_requests` — a per-rid stage (`prepare_inputs`, a per-request forward, `postprocess`) blamed specific requests. The speculation was built from N's rids and may thread outputs the failed rids never produced, so it is dropped; the rest of the batch still post-processes and routes.
-- Clearing itself splits by kind. A **non-yield-away** speculation depended on N's outputs (the plan thread already threaded them in), so if N's output is invalid the spec batch cannot run. A **yield-away** speculation is independent of N — but `_handle_allocation_failure` may have shifted the engine's KV state (paused or offloaded rids), so its pre-plan is reset anyway.
+- Clearing itself splits by kind. A **non-yield-away** speculation depended on N's outputs (the plan thread already threaded them in), so if N's output is invalid the spec batch cannot run. A **yield-away** speculation is independent of N — but `_handle_admit_failure` (`Admission.relieve`) may have shifted the engine's KV state (paused or offloaded rids), so its pre-plan is reset anyway.
 
 **6. Launch N+1.** Submit to the GPU thread, which starts queuing kernels. The main thread then blocks on the step's `launch_started_event` (set at launch, or on completion by `_submit_gpu_step`; timeout `MSTAR_LAUNCH_WAIT_MS`) so it holds off the GIL until the GPU thread reaches the forward launch. Staleness is checked on the GPU thread, after the plan future resolves and after prepare. From submission on, the GPU thread owns the pre-plan.
 

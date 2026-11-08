@@ -40,7 +40,7 @@ from mstar.model.submodule_base import (
     lora_rows,
 )
 from mstar.platforms import current_platform
-from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.compile import deterministic_inductor_options, with_inductor_overrides
 from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
 
@@ -80,27 +80,6 @@ def compile_level() -> int:
         )
         return DEFAULT_COMPILE_LEVEL
     return level
-
-
-@cache
-def _has_deterministic_mode() -> bool:
-    import torch._inductor.config as inductor_config
-
-    if hasattr(inductor_config, "deterministic"):
-        return True
-    logger.warning(
-        "torch %s has no Inductor deterministic mode; compiles that ask for it time "
-        "their kernels instead, so their output can differ between server processes",
-        torch.__version__,
-    )
-    return False
-
-
-def deterministic_inductor_options() -> dict[str, Any]:
-    """Inductor options for its deterministic mode (see
-    ``DETERMINISTIC_COMPILE_MODE``), for a compile that sets its own options;
-    empty, with a warning, on a torch without the mode."""
-    return {"deterministic": True} if _has_deterministic_mode() else {}
 
 
 def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
@@ -903,8 +882,7 @@ class AcceleratorGraphRunner:
         for spec in self.prepare_for_capture():
             # the warm-up may hold collectives; every rank sizes these specs, in
             # config order, as it does the captures
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.instance.barrier()
             free = torch.cuda.mem_get_info(self._device)[0]
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
@@ -1009,8 +987,7 @@ class AcceleratorGraphRunner:
                 continue
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.instance.barrier()
 
             try:
                 slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
@@ -1775,7 +1752,9 @@ class PiecewiseAcceleratorGraphRunner:
         self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
         self._graph_backend = self._device_capability.graph_backend
         self._autocast_dtype = autocast_dtype
-        self._comm_group = joint_comm_group or JointGroups(CommGroup.trivial(), CommGroup.trivial())
+        self._comm_group = joint_comm_group or JointGroups(
+            CommGroup.trivial(), CommGroup.trivial(), instance=CommGroup.trivial(),
+        )
         # scopes buffer allocation; `label` carries it but mangled with the region
         self._node_name = node_name
         self._prepared_shapes: list | None = None
@@ -1900,8 +1879,7 @@ class PiecewiseAcceleratorGraphRunner:
         captured: list[CaptureCost] = []
         for shape in shapes:
             for slot in range(self._num_slots):
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
+                self._comm_group.instance.barrier()
                 free = torch.cuda.mem_get_info(self._device)[0]
                 try:
                     with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
@@ -2018,8 +1996,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # rank still in pre-capture setup would mismatch one already in the
                 # warmup forward. Every rank walks all the slots even after a
                 # failure here, or the barrier counts diverge and they hang.
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
+                self._comm_group.instance.barrier()
                 try:
                     self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
                 except Exception:
