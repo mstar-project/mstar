@@ -26,6 +26,7 @@ from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig,
 from mstar.engine.resources.kv.keys import chain
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import NewRequest
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.rid_table import RidTable
@@ -74,24 +75,23 @@ def _manager() -> KVManager:
 def _worker(runner: StepRunner) -> Worker:
     """The real ``_add_new_request``, with the engine cut down to its resources."""
     rids = RidTable()
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w._draining_rids, w._reads_done_sent, w._unprocessed_messages = set(), set(), {}
-    w._graph_runtime = SimpleNamespace(
+    w = make_worker(
+        _graph_runtime=SimpleNamespace(
         add_request=lambda request_id, **kw: rids.intern(request_id),
         get_rid_handle=rids.handle,
         get_sharding_config=lambda rid: None,
         register_stop_limits=lambda rid, info: None,
-    )
-    w.request_state = RequestStateManager()
-    w.scheduler = SimpleNamespace(note_arrival=lambda rid: None)
-    w.tensor_manager = SimpleNamespace(
+    ),
+        request_state=RequestStateManager(),
+        scheduler=SimpleNamespace(note_arrival=lambda rid: None),
+        tensor_manager=SimpleNamespace(
         register_request=lambda rid, sharding: None,
         start_read_tensors=lambda rid, edges, graph_walk=None: [],
-    )
-    w.engine_manager = SimpleNamespace(
+    ),
+        engine_manager=SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}),
         add_request=lambda rid, configs, info: runner.ingest_request(rid, configs),
+    ),
     )
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)

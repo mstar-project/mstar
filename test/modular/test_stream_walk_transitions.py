@@ -22,11 +22,11 @@ from mstar.graph.graph_io import WorkerGraphIO
 from mstar.streaming.chunk_policy import FixedChunkPolicy, LeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.streaming.topology import Connection, PartitionTopology, ProducerWalkCtx
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import WorkerGraphsDone
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 
 def _buffer(chunk_size=1, tagged=True):
@@ -212,18 +212,18 @@ def _producer():
         partitions=["Thinker", "Talker"],
         connections=[_conn("thinker_states"), _conn("thinker_mask")],
     )
-    w = Worker.__new__(Worker)
-    w.partition_topology = topology
-    w._walk_drivers = topology.walk_drivers()
-    w._signal_consumer = {c.edge_name: c.to_partition for c in topology.connections}
-    w._emitted_walk_drivers = {}
-    w._walk_ctx = ProducerWalkCtx()
-    w._graph_runtime = SimpleNamespace(
+    w = make_worker(
+        partition_topology=topology,
+        _walk_drivers=topology.walk_drivers(),
+        _signal_consumer={c.edge_name: c.to_partition for c in topology.connections},
+        _walk_ctx=ProducerWalkCtx(),
+        _graph_runtime=SimpleNamespace(
         get_output_signals=lambda node, walk: (
             ["thinker_mask", "thinker_states"] if (node, walk) in _EMITS else ["audio_embeds"]
         ),
+    ),
+        request_state=RequestStateManager(),
     )
-    w.request_state = RequestStateManager()
     w.request_state.add_request(0, _fwd("prefill_text", partition="Thinker"))
     return w
 

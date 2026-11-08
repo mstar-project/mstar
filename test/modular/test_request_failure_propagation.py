@@ -36,9 +36,10 @@ from mstar.api_server.request_types import (
 from mstar.communication.event import EventWakeup
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
 from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler, ScheduledBatch
-from mstar.worker.worker import PendingBatch, Worker
+from mstar.worker.worker import PendingBatch
 
 # ── worker ─────────────────────────────────────────────────────────────────
 
@@ -63,8 +64,7 @@ class _Runtime:
 
 
 def _worker(known_rids=("r1", "r2")):
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
+    w = make_worker()
     w.sent = []
     w.communicator = SimpleNamespace(
         send=lambda entity_id, msg: w.sent.append((entity_id, msg))
