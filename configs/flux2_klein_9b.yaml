@@ -5,7 +5,9 @@ model: "flux2_klein_9b"
 # not Apache-2.0; check the license before deploying.
 max_seq_len: 512
 
-model_kwargs:
+model_kwargs: &model_kwargs
+  # text_encoder_max_batch_size: prompts in one text encoder step, max_batch_size unless set. Default batched, 1 on AMD
+  # GPUs (platform_overrides below). Whether NVIDIA's text encoder depends on the batch size the same way is unmeasured
   # sdpa (cuDNN on H100) is the reference kernel; auto runs the DiT's joint attention on the
   # engine's ragged attention resource with the platform's default kernel (FlashInfer FA3 on
   # NVIDIA GPUs, AITER's asm flash attention on MI300X/MI325X, where torch's sdpa is AOTriton)
@@ -18,8 +20,9 @@ model_kwargs:
   # transformer was bit-exact with the eager one (measured while the q/k norms were graph breaks; the
   # activations add nothing but graph breaks), and with vae_compile: false so was every served image
   # (see compile_exact_ops in docs/models.rst)
-  # On AMD GPUs this is not applied (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M kernel choice
-  # keeps the output off the reference bit for bit either way. MI325X: 0.709 -> 0.660 s at B=1, 1.54 -> 1.68 images/s at c=16.
+  # On AMD GPUs the bf16 config does not apply this (`knobs: dit_exact_ops`, off there by default): hipBLASLt's per-M
+  # kernel choice keeps the output off the reference bit for bit either way. This file's AMD default runs fp8 steps,
+  # which need it, so the override at the end turns the knob on. MI325X: 0.709 -> 0.660 s at B=1, 1.54 -> 1.68 images/s at c=16.
   compile_exact_ops: [norms]
   accelerator_graph: true
   # [height, width]: 1024^2 and 1344x768, the two sizes of the image benchmark set; an uncaptured size compiles
@@ -36,7 +39,9 @@ model_kwargs:
   # server process (~64 dB apart). vae_compile: false for bit-exact, repeatable output
   vae_compile: true
   # linear_dtype: fp8 runs the DiT blocks' linears as fp8 GEMMs (MI300X/MI325X/MI355X, Hopper+): 1.34x images/s at
-  # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst)
+  # c=1 and 1.39x at c=16 on MI325X; median 23.1 vs 26.6 dB from diffusers, under the ROCm floor (docs/models.rst).
+  # Default bf16, flux2_klein_9b_fp8_keep.yaml serves fp8 on every step with the list below; the AMD default's schedule
+  # keeps the list on its fp8 steps too (see the override)
   # Under linear_dtype: fp8 these stay bf16: the text stream's linears (512 rows, no faster in fp8) and the linears
   # with the most image error per ms of fp8 saving on MI325X, about 40% of the saving (ignored under bf16). One-GPU
   # MI325X A/B: median 26.5 dB from diffusers, over the ROCm floor, at ~1.18x bf16 images/s; lists giving back
@@ -52,6 +57,9 @@ model_kwargs:
     - single_blocks.18.out
     - single_blocks.0.qkv_mlp
     - single_blocks.3.qkv_mlp
+  # linear_dtype_steps picks the dtype per denoise step (docs/models.rst): with this list, [bf16, bf16, fp8, fp8] loses
+  # 0.2 dB on the typical image against bf16 on MI325X, 1.3 dB with fp8 on every step, at about half of the speedup.
+  # Unset, except on AMD GPUs (platform_overrides at the end of this file)
   # async_scheduling (default true): the worker assembles the next denoise step while the current one runs and merges
   # newly ready requests into it; `false` = lockstep, within a few percent (see docs/models.rst)
 
@@ -62,3 +70,23 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+
+# On AMD GPUs the DiT runs the step schedule [bf16, bf16, fp8, fp8] with the keep list above on its fp8 steps and the norms on the
+# eager kernels, and each prompt encodes alone while the DiT and VAE keep batching. An entry replaces a top-level key whole, so
+# model_kwargs repeats the block above through the merge key. fp8 on every step with the keep list, flux2_klein_9b_fp8_keep.yaml,
+# is marginal against the 25.46 dB floor from diffusers once batched (1 of 10 cells under it at c=16 on MI325X).
+# flux2_klein_9b_bf16.yaml keeps bf16 on every platform.
+platform_overrides:
+  rocm:
+    model_kwargs:
+      <<: *model_kwargs
+      # AITER's asm flash attention through the ragged resource; torch's sdpa is AOTriton here
+      attention_backend: auto
+      # prompts encode one at a time: the batched encode's padding costs more than it saves here
+      text_encoder_max_batch_size: 1
+      linear_dtype: fp8
+      # two bf16 steps, then fp8 with the keep list above on both fp8 steps, the list the one-GPU A/B put over the floor
+      # (measured above: 0.2 dB from bf16 on the typical image for about half of the fp8 speedup)
+      linear_dtype_steps: [bf16, bf16, fp8, fp8]
+    knobs:
+      dit_exact_ops: true
