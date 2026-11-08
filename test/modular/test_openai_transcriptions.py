@@ -327,6 +327,33 @@ def test_transcription_stream_reports_in_band_error(client_and_stub, status, err
     assert lines[-1] == "data: [DONE]"
 
 
+@pytest.mark.parametrize("raises_in", ["cutting", "results"])
+def test_transcription_stream_reports_an_unexpected_error_in_band(client_and_stub, monkeypatch, raises_in):
+    """After the 200, an error the stream did not expect still ends it with an
+    error event and [DONE]: cutting the upload (a full upload dir), or mid-way
+    through a window's results."""
+    client, stub = client_and_stub
+    if raises_in == "cutting":
+        def fixed(self):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(serving_transcriptions.WindowPlanner, "fixed", fixed)
+    else:
+        async def iter_result_chunks(request_id):
+            yield _Chunk("text", b" Hello")
+            raise RuntimeError("boom")
+
+        stub.iter_result_chunks = iter_result_chunks
+    with client.stream(
+        "POST", "/v1/audio/transcriptions",
+        data={"model": "whisper_large", "stream": "true"},
+        files={"file": ("a.wav", b"RIFF", "audio/wav")},
+    ) as r:
+        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
+    assert json.loads(lines[-2][len("data: "):])["error"]["code"] == 500
+    assert lines[-1] == "data: [DONE]"
+
+
 def test_transcription_requires_a_file(client_and_stub):
     client, _ = client_and_stub
     r = client.post("/v1/audio/transcriptions", data={"model": "whisper_large"})
