@@ -133,17 +133,20 @@ class H3KeyframeEncoder(nn.Module):
     @torch.no_grad()
     def encode(self, frame: torch.Tensor, seed: int) -> torch.Tensor:
         """uint8 ``[3, H, W]`` on the device -> normalized latents ``[1, 24, 1, H / 16, W / 16]``
-        fp32 on the CPU (``encode_vae_condition``)."""
-        mean = torch.tensor(PIXEL_MEAN, device=frame.device).view(1, -1, 1, 1, 1)
-        std = torch.tensor(PIXEL_STD, device=frame.device).view(1, -1, 1, 1, 1)
+        fp32 on that device (``encode_vae_condition``)."""
+        device = frame.device
+        # every host constant moved before the encoder runs: a pageable copy waits for the stream
+        mean, std, latents_mean, latents_std = (
+            torch.tensor(values, device=device).view(1, -1, 1, 1, 1)
+            for values in (PIXEL_MEAN, PIXEL_STD, self.vae.latents_mean, self.vae.latents_std)
+        )
         pixels = (frame[None, :, None].to(torch.float32).div(255.0) - mean) / std
         moments = self.moments(pixels.to(self.quant_conv.weight.dtype))
-        # DiagonalGaussianDistribution.sample, its noise drawn on the CPU and moved over
+        # DiagonalGaussianDistribution.sample, its noise drawn on the CPU (pinned, so moving it
+        # doesn't wait for the encoder either)
         posterior_mean, logvar = moments.chunk(2, dim=1)
         posterior_std = torch.exp(0.5 * logvar.clamp(-30.0, 20.0))
-        noise = torch.randn(posterior_mean.shape, generator=torch.Generator().manual_seed(seed),
-                            dtype=moments.dtype).to(moments.device)
-        latents = (posterior_mean + posterior_std * noise).to(torch.float16).float().cpu()
-        latents_mean = torch.tensor(self.vae.latents_mean).view(1, -1, 1, 1, 1)
-        latents_std = torch.tensor(self.vae.latents_std).view(1, -1, 1, 1, 1)
+        noise = torch.randn(posterior_mean.shape, generator=torch.Generator().manual_seed(seed), dtype=moments.dtype,
+                            pin_memory=device.type != "cpu").to(device, non_blocking=True)
+        latents = (posterior_mean + posterior_std * noise).to(torch.float16).float()
         return (latents - latents_mean) / latents_std
