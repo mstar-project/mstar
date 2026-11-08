@@ -340,15 +340,19 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        model's ladder. The walk is the one a packed capture is captured on (Orpheus's
        ``mixed`` steps replay its ``prefill`` capture, so name ``prefill``); a step
        pads to the smallest rung that holds it, and a longer one runs eagerly. A
-       ladder runs to the first rung that holds the token budget of the steps its
-       capture replays (``max_batch_tokens``; a walk inside a combined walk runs
-       under the combined walk's), and the rungs past it, which no step would
-       reach, are dropped and logged. Each rung adds captures, graph memory and
-       startup time. Loading fails if the setting is not a mapping of nodes or
-       names a node in no node group; warmup fails if a node's value is not a
-       mapping of walk -> ladder, a ladder is not a non-empty list of distinct
-       positive ints, or the walk has no packed capture on the node. The key
-       replaces ``model_kwargs.prefill_token_buckets``, which fails loading.
+       ladder is a list, or a mapping of min batch size -> list for a ladder per
+       range of batch sizes: ``{1: [...], 2: [...]}`` captures one request on the
+       first and every larger batch on the second (a larger batch size's ladder
+       must reach at least as far). A ladder runs to the first rung that holds the
+       token budget of the steps its capture replays (``max_batch_tokens``; a walk
+       inside a combined walk runs under the combined walk's), and the rungs past
+       it, which no step would reach, are dropped and logged. Each rung adds
+       captures, graph memory and startup time. Loading fails if the setting is not
+       a mapping of nodes or names a node in no node group; warmup fails if a
+       node's value is not a mapping of walk -> ladder, a ladder is not a non-empty
+       list of distinct positive ints, or the walk has no packed capture on the
+       node. The key replaces ``model_kwargs.prefill_token_buckets``, which fails
+       loading.
    * - ``can_override_mixed_max_tokens``
      - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
        of its own under the step's. See *Chunked prefill budgets* below.

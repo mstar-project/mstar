@@ -149,9 +149,6 @@ class Glm52ModelConfig:
     # would otherwise fail every capture and serve eager.
     graph_compile: bool = True
 
-    # Token buckets for the prefill batch sizes above 1; None captures them at
-    # the submodule's PREFILL_TOKEN_BUCKETS too.
-    prefill_batched_token_buckets: list[int] | None = None
     prefill_capture_batch_sizes: list[int] | None = None
 
     # Derived MLA cache geometry: the paged cache stores one 576-dim latent

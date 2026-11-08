@@ -9,6 +9,7 @@ import torch
 
 from mstar.engine.resources import AttentionStep, Segment, SubmoduleStep
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs
+from mstar.model.utils import capture_ladder
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +192,9 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
     def __init__(
         self,
         capture_graph_walk: str,
-        capture_token_lengths: list[int],
+        # a ladder, or ``{min batch size: ladder}``: a batch size takes the
+        # ladder of the largest key at or below it, and none if every key is above
+        capture_token_lengths: list[int] | Mapping[int, list[int]],
         # seq len -> NodeInputs
         make_node_input: Callable[[int], NodeInputs],
         replay_graph_walks: list[str] | None = None,
@@ -234,12 +237,12 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         return AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
     def get_total_tokens(self, bs: int) -> list[int]:
+        ladder = self.capture_token_lengths
+        if isinstance(ladder, Mapping):
+            ladder = max(((k, v) for k, v in ladder.items() if k <= bs), default=(0, []))[1]
         # every real row carries a token, so a bucket with fewer tokens than
         # rows could never serve a step; capturing it would give rows of none
-        return [
-            n * self.total_tokens_multiplier for n in self.capture_token_lengths
-            if n >= bs
-        ]
+        return [n * self.total_tokens_multiplier for n in ladder if n >= bs]
 
     def get_node_inputs(self, bs: int, num_tokens: int):
         # ``num_tokens`` is the bucket's plan tokens; the rows get input tokens
@@ -249,18 +252,52 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         ]
 
 
+def check_token_ladder(where: str, ladder: Any) -> None:
+    """Refuse a ``prefill_token_buckets`` value that is not a ladder (a
+    non-empty list of distinct positive ints) or ``{min batch size: ladder}``
+    whose top rungs rise with the batch size: a capture's static buffers are
+    sized by its first, largest-batch bucket, so a smaller batch's ladder must
+    not reach past it."""
+    if not isinstance(ladder, Mapping):
+        capture_ladder(f"prefill_token_buckets for {where}", ladder)
+        return
+    if not ladder or not all(isinstance(k, int) and not isinstance(k, bool) and k > 0 for k in ladder):
+        raise ValueError(
+            f"prefill_token_buckets for {where} maps a min batch size (a positive int) to a "
+            f"ladder, got {ladder!r}"
+        )
+    tops = [max(capture_ladder(f"prefill_token_buckets for {where}/{k}", ladder[k])) for k in sorted(ladder)]
+    if tops != sorted(tops):
+        raise ValueError(
+            f"prefill_token_buckets for {where}: a larger batch size's ladder must reach at least as "
+            f"far as a smaller one's, got {ladder!r}"
+        )
+
+
+def _trim(ladder: list[int], budget: int | None, at_least: int = 0) -> list[int]:
+    """``ladder`` up to its first rung that holds ``budget`` and ``at_least``."""
+    rungs = sorted(ladder)
+    if budget is None:
+        return rungs
+    bound = max(budget, at_least)
+    held = next((i for i, n in enumerate(rungs) if n >= bound), len(rungs) - 1)
+    return rungs[:held + 1]
+
+
 def apply_token_ladders(
     node: str, configs: list[AcceleratorGraphConfig], ladders: Mapping[str, Any],
     step_budget: Callable[[str], int | None],
 ) -> None:
     """Take a serving config's ``prefill_token_buckets`` for ``node``
-    (capture walk -> ladder) as the ``capture_token_lengths`` of the node's
-    packed captures of that walk.
+    (capture walk -> ladder or ``{min batch size: ladder}``) as the
+    ``capture_token_lengths`` of the node's packed captures of that walk.
 
     A ladder runs to the first rung that holds the token budget of the steps
     its capture replays (``step_budget`` of each replay walk; none where any of
     them has none): the scheduler builds no step past it, so a rung beyond
-    would never replay. A walk with no packed capture on the node is refused.
+    would never replay. A larger batch size's ladder also runs at least as far
+    as a smaller one's, which share its static buffers. A walk with no packed
+    capture on the node is refused.
     """
     if not isinstance(ladders, Mapping):
         raise ValueError(
@@ -268,15 +305,7 @@ def apply_token_ladders(
         )
     packed = [c for c in configs if isinstance(c, PackedAcceleratorGraphConfig)]
     for walk, ladder in ladders.items():
-        if (
-            not isinstance(ladder, (list, tuple)) or not ladder
-            or not all(isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in ladder)
-            or len(set(ladder)) < len(ladder)
-        ):
-            raise ValueError(
-                f"prefill_token_buckets for {node}/{walk} must be a non-empty list of "
-                f"distinct positive token counts, got {ladder!r}"
-            )
+        check_token_ladder(f"{node}/{walk}", ladder)
         targets = [c for c in packed if c.capture_graph_walk == walk]
         if not targets:
             raise ValueError(
@@ -285,17 +314,22 @@ def apply_token_ladders(
             )
         for config in targets:
             budgets = [step_budget(w) for w in config.replay_graph_walks]
-            rungs = sorted(ladder)
-            if None not in budgets:
-                budget = max(budgets)
-                held = next((i for i, n in enumerate(rungs) if n >= budget), len(rungs) - 1)
-                if held + 1 < len(rungs):
-                    logger.info(
-                        "%s/%s: drops prefill_token_buckets %s, past the first that holds its "
-                        "%d-token step budget", node, walk, rungs[held + 1:], budget,
-                    )
-                rungs = rungs[:held + 1]
-            config.capture_token_lengths = rungs
+            budget = None if None in budgets else max(budgets)
+            if not isinstance(ladder, Mapping):
+                trimmed: list[int] | dict[int, list[int]] = _trim(ladder, budget)
+                dropped = sorted(set(ladder) - set(trimmed))
+            else:
+                trimmed, top, dropped = {}, 0, []
+                for k in sorted(ladder):
+                    trimmed[k] = _trim(ladder[k], budget, top)
+                    top = trimmed[k][-1]
+                    dropped += sorted(set(ladder[k]) - set(trimmed[k]))
+            if dropped:
+                logger.info(
+                    "%s/%s: drops prefill_token_buckets %s, past the first that holds its "
+                    "%d-token step budget", node, walk, dropped, budget,
+                )
+            config.capture_token_lengths = trimmed
 
 
 class PiecewiseConfigType(Enum):

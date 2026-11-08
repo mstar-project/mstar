@@ -1,6 +1,7 @@
 """GLM-5.2 prefill: capture batch sizes from model_kwargs, the router under autocast."""
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -42,8 +43,7 @@ def test_prefill_buckets_default_without_kwargs():
 
 @pytest.mark.parametrize("kwargs", [
     {"prefill_capture_batch_sizes": [0, 1]}, {"prefill_capture_batch_sizes": [-4, 1]},
-    {"prefill_capture_batch_sizes": []}, {"prefill_batched_token_buckets": [0, 256]},
-    {"prefill_batched_token_buckets": [256, 256]}, {"graph_compile": "false"},
+    {"prefill_capture_batch_sizes": []}, {"graph_compile": "false"},
     {"mtp_num_draft_tokens": True}, {"mtp_num_draft_tokens": 2.5}, {"mtp_num_draft_tokens": 1023},
 ])
 def test_a_bad_serving_knob_is_refused_at_load(kwargs):
@@ -205,15 +205,27 @@ def test_prefill_buckets_past_the_context_limit_skip_small_batches(monkeypatch):
     assert packed.get_total_tokens(4) == [1024, 2048, 3072, 4096]
 
 
-def test_batched_prefill_buckets_get_their_own_capture(monkeypatch):
-    monkeypatch.setattr(Glm52LLMSubmodule, "PREFILL_TOKEN_BUCKETS", [64, 128, 192])
-    model = Glm52Model("", tokenizer_mode="byte", config_variant="full",
-                       prefill_batched_token_buckets=[1024, 2048],
-                       prefill_capture_batch_sizes=[1, 4, 16])
-    prefill = [c for c in _submodule(model.config).get_accelerator_graph_configs(torch.device("cpu"))
-               if c.capture_graph_walk == "prefill"]
-    assert [(c.capture_batch_sizes, c.get_total_tokens(c.capture_batch_sizes[0]))
-            for c in prefill] == [([1], [64, 128, 192]), ([4, 16], [1024, 2048])]
+@pytest.mark.parametrize("name", ["glm52_tp8.yaml", "glm52_tp8_mtp.yaml"])
+def test_a_shipped_config_s_ladders_reach_their_batch_sizes(name):
+    """The YAML's ``prefill_token_buckets`` mapping, as the engine applies it:
+    one request's prefill on the fine ladder, a batch's on the coarse one."""
+    import yaml
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    config = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs" / name).read_text())
+    model = Glm52Model("", tokenizer_mode="byte", config_variant="full", **config["model_kwargs"])
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=_submodule(model.config), resources={}, step_runner=None,
+        device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
+        num_slots=1, token_ladders=config["prefill_token_buckets"]["LLM"],
+    )
+    ladders = config["prefill_token_buckets"]["LLM"]["prefill"]
+    captured = {}
+    for spec in runner._get_slot_specs():
+        if spec.bucket.graph_walk == "prefill":
+            captured.setdefault(spec.bucket.bs, []).append(spec.bucket.num_tokens)
+    assert captured == {1: ladders[1], 4: ladders[2], 16: ladders[2]}
 
 
 # ── the router's top-k kernel (kernels: auto) ──
@@ -305,12 +317,11 @@ def test_capture_configs_ask_for_the_recompile_limit_they_need(monkeypatch):
     default = _submodule(Glm52ModelConfig())
     default.get_accelerator_graph_configs(torch.device("cpu"))
     monkeypatch.setattr(Glm52LLMSubmodule, "PREFILL_TOKEN_BUCKETS", buckets)
-    cfg = Glm52ModelConfig(prefill_batched_token_buckets=[2304, 2560, 3072, 3584, 4096],
-                           prefill_capture_batch_sizes=[1, 4, 16])
+    cfg = Glm52ModelConfig(prefill_capture_batch_sizes=[1, 4, 16])
     before = torch._dynamo.config.recompile_limit
     sub = _submodule(cfg)
     sub.get_accelerator_graph_configs(torch.device("cpu"))
-    shapes = len(buckets) + 5 + 7  # + the decode batch sizes
+    shapes = len(buckets) + 7  # + the decode batch sizes
     assert sub.dynamo_recompile_limit() >= 3 * shapes
     assert torch._dynamo.config.recompile_limit == before  # the engine applies it, per call
     assert default.dynamo_recompile_limit() <= 84  # the default buckets fit

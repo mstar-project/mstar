@@ -64,8 +64,8 @@ class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
         self.max_row_tokens = max_row_tokens
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        return [n * self.total_tokens_multiplier for n in self.capture_token_lengths
-                if distribute_tokens(n, bs)[0] <= self.max_row_tokens]
+        return [n for n in super().get_total_tokens(bs)
+                if distribute_tokens(n // self.total_tokens_multiplier, bs)[0] <= self.max_row_tokens]
 
 
 class Glm52LLMSubmodule(ARNodeSubmodule):
@@ -282,12 +282,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             self.config.prefill_capture_batch_sizes or self.PREFILL_CAPTURE_BATCH_SIZES
         )
         flags = self._compile_flags()
-        groups = [(self.PREFILL_TOKEN_BUCKETS, prefill_batch_sizes)]
-        batched = self.config.prefill_batched_token_buckets
-        if batched:
-            # one request's buckets and a batch's apart, so each can be fine or coarse
-            groups = [(self.PREFILL_TOKEN_BUCKETS, [bs for bs in prefill_batch_sizes if bs == 1]),
-                      (batched, [bs for bs in prefill_batch_sizes if bs > 1])]
         configs = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
@@ -299,19 +293,16 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 capture_batch_sizes=self.MTP_CAPTURE_BATCH_SIZES if self.mtp_k else None,
                 **flags,
             ),
-            *(
-                _PackedPrefillConfig(
-                    max_row_tokens=self._context_limit(),
-                    capture_graph_walk="prefill",
-                    capture_token_lengths=list(buckets),
-                    make_node_input=lambda n: ARNodeInputs(
-                        input_ids=torch.zeros(n, dtype=torch.long, device=device),
-                        input_seq_len=n,
-                    ),
-                    capture_batch_sizes=list(sizes),
-                    **flags,
-                )
-                for buckets, sizes in groups if sizes
+            _PackedPrefillConfig(
+                max_row_tokens=self._context_limit(),
+                capture_graph_walk="prefill",
+                capture_token_lengths=list(self.PREFILL_TOKEN_BUCKETS),
+                make_node_input=lambda n: ARNodeInputs(
+                    input_ids=torch.zeros(n, dtype=torch.long, device=device),
+                    input_seq_len=n,
+                ),
+                capture_batch_sizes=list(prefill_batch_sizes),
+                **flags,
             ),
         ]
         self._fit_recompile_limit(configs)
