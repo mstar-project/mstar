@@ -3,13 +3,14 @@
 
 The review returns the fields in SCHEMA rather than Markdown, so every summary
 has the same shape: a status line, then only the sections that have something
-in them. The status line counts the open findings (`open_findings`), so a finding
-from an earlier run counts until a later review judges it fixed or moot or a commit
-changes its lines. Run by claude-review.yml with the default branch checked out:
+in them. The status line counts the open findings (`open_findings`, which the
+approval rule in gpu_review.py uses too), so a finding from an earlier run counts
+until a later review judges it fixed or moot or a commit changes its lines. Run by
+claude-review.yml with the default branch checked out:
 
     python3 .github/review/render_summary.py --schema     # for --json-schema
     python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json < output.json
-    python3 .github/review/render_summary.py --state --mode thorough < summary-comment-body   # what a re-review reads
+    python3 .github/review/render_summary.py --state --mode gpu < summary-comment-body   # what a re-review reads
 """
 import argparse
 import base64
@@ -19,7 +20,7 @@ import sys
 
 # Lets the workflow find earlier summaries to hide as outdated.
 MARKER = "<!-- claude-review-summary -->"
-# What a re-review starts from (head, findings outside the diff, risk), base64 JSON,
+# What a re-review starts from (head, findings outside the diff, risk, live-test call), base64 JSON,
 # so model text can't close the HTML comment. Read back only from the bot's own comments.
 STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
 # The bot's GraphQL logins: the review app's, and github-actions', which it posted as before the app.
@@ -68,6 +69,12 @@ SCHEMA = {
                 "why": {"type": "string"},
             }, "required": ["location", "why"]}},
         }, "required": ["level", "reason", "look_at"]},
+        "live_test": {"type": "object", "properties": {
+            "run": {"type": "string", "enum": ["none", "targeted", "full"]},
+            "reason": {"type": "string"},
+            "confirm": STRINGS,
+            "gpus": {"type": "integer", "minimum": 1, "maximum": 8},
+        }, "required": ["run", "reason", "confirm", "gpus"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "risk"],
@@ -79,8 +86,8 @@ def open_findings(review, pages):
     """(where, priority) of every open finding: the bot's inline threads, this run's findings outside
     the diff, and the earlier findings a later review judged still open. A thread someone resolved stays
     open: only a later review that judged it fixed or moot, or a commit that outdated it, clears it. An
-    untagged bot thread counts as a P2, since its priority is unknown. `pages` are the PR's review
-    threads, from `gh api graphql --paginate --slurp`."""
+    untagged bot thread counts as a P2, since its priority is unknown and it should still block
+    approval. `pages` are the PR's review threads, from `gh api graphql --paginate --slurp`."""
     prior = review.get("prior_findings", [])
     cleared = {f["ref"] for f in prior if f["status"] in ("fixed", "moot")}
     found, counted = [], set()
@@ -142,10 +149,13 @@ def render(review, pages, head, mode):
         parts.append(f"<details><summary>What the review checked</summary>\n\n{checked}\n\n</details>")
     if review["skipped"]:
         parts.append("Not reviewed: " + ", ".join(f"`{path}`" for path in review["skipped"]) + ".")
+    live = review.get("live_test")
+    if live and mode == "gpu":
+        parts.append(f"Live test: **{live['run']}**. {live['reason']}")
     parts.append(FOOTER)
     risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
-             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}}
+             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "live_test": live}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
     text = "\n\n".join(parts).replace("<!--", "&lt;!--")
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
@@ -153,8 +163,9 @@ def render(review, pages, head, mode):
 
 def read_state(body, mode):
     """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
-    None, and that run reviews the whole PR. None too when it doesn't decode, and for a thorough
-    review unless the earlier one was thorough and skipped nothing."""
+    None, and that run reviews the whole PR. None too when it doesn't decode, and for a thorough or
+    gpu review unless the earlier one was thorough or gpu and skipped nothing, since a gpu review's
+    result can approve and may build on a thorough one."""
     found = STATE.findall(body)
     try:
         state = json.loads(base64.b64decode(found[-1])) if found else None
@@ -163,7 +174,7 @@ def read_state(body, mode):
     if not isinstance(state, dict):
         return None
     # A state from before `skipped` was kept counts as having skipped files.
-    if mode == "thorough" and (state.get("mode") != "thorough" or state.get("skipped", [None])):
+    if mode in ("thorough", "gpu") and (state.get("mode") not in ("thorough", "gpu") or state.get("skipped", [None])):
         return None
     return state
 
