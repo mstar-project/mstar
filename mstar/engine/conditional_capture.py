@@ -25,14 +25,22 @@ def _check_targets(graph: torch.fx.GraphModule) -> None:
                 continue
             raise ValueError("conditional branch constants must be explicit tensor operands")
         if node.op == "call_method":
-            if hasattr(torch.Tensor, node.target) and not node.target.startswith("__"):
+            target = getattr(torch.ops.aten, node.target, None)
+            if isinstance(target, torch._ops.OpOverloadPacket):
+                if all(getattr(target, overload)._schema.returns for overload in target.overloads()):
+                    continue
+            elif node.target in ("float", "double", "half", "bfloat16", "long", "int", "bool",
+                                 "size", "dim", "numel", "stride", "element_size", "is_contiguous"):
                 continue
         if node.op == "call_function":
             target = node.target
             if target is torch.ops.higher_order.cond:
                 continue
             if isinstance(target, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):
-                if target.namespace == "aten":
+                overloads = (target,) if isinstance(target, torch._ops.OpOverload) else tuple(
+                    getattr(target, name) for name in target.overloads()
+                )
+                if target.namespace == "aten" and all(op._schema.returns for op in overloads):
                     if torch.Tag.nondeterministic_seeded in getattr(target, "tags", ()):
                         raise ValueError("conditional branches cannot draw random numbers")
                     continue

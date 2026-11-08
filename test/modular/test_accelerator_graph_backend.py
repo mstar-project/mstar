@@ -585,6 +585,15 @@ def test_conditional_warmup_checks_branches_before_priming(monkeypatch):
         actual = torch.cond(torch.tensor(True), lambda ids: embedding(ids).sin(),
                             lambda ids: embedding(ids).cos(), (ids,))
     torch.testing.assert_close(actual, embedding(ids).sin())
+    from mstar.engine.conditional_capture import _check_branches
+
+    graph = torch.fx.Graph()
+    value = graph.placeholder("value")
+    graph.call_function(torch.ops.aten._print.default, ("must not execute",))
+    result = graph.call_function(torch.ops.aten.sin.default, (value,))
+    graph.output(result)
+    with pytest.raises(ValueError, match="unsupported"):
+        _check_branches((torch.fx.GraphModule({}, graph),), (x,))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA tensor conditional capture")
