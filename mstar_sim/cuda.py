@@ -573,6 +573,7 @@ TORCH_C = {
     "_cuda_get_sync_debug_mode": _get_sync_debug_mode,
     "_cuda_sleep": _noop,  # a spin of N cycles; nothing to wait for
     "_cuda_getDevice": current_device,
+    "_cuda_canDeviceAccessPeer": lambda device, peer: True,  # the emulated GPUs share a node
     # a raw ``cudaStream_t``: the stream's id (no raw CUDA call takes it here, libcudart is refused)
     "_cuda_getCurrentRawStream": lambda device=None: current_stream(device).cuda_stream,
     "_cuda_beginAllocateToPool": _begin_allocate_to_pool,

@@ -43,6 +43,7 @@ def test_cuda_semantics():
     out = run_sim("""
         import itertools, subprocess, sys, torch, torch.distributed as dist
         assert torch.cuda.is_available() and torch.cuda.get_device_name().startswith("NVIDIA H100")
+        assert torch.cuda.can_device_access_peer(0, 1)  # two emulated GPUs of a node, as a TP test asks
         m = torch.nn.Linear(8, 4, device="meta").to_empty(device="cuda")
         x = torch.randn(3, 8, device="cuda")
         assert m(x).is_cuda and m.weight.device == torch.device("cuda", 0)
