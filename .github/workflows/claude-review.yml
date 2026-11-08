@@ -28,7 +28,7 @@ name: Claude Review
 #      as fields, which a workflow step renders, redacts and posts. In light
 #      and nogpu mode the worst case for a prompt injection is a bad
 #      comment. In full mode the live test runs the PR's code with a shell on
-#      the GPU box, as root on the shared Slurm node; see the README's threat
+#      the GPU box, as root on a shared Slurm node; see the README's threat
 #      model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
