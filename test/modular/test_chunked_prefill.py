@@ -760,18 +760,45 @@ def test_rungs_past_the_first_that_holds_the_step_budget_are_dropped():
     assert buckets({"LLM": None}) == [1024, 2048, 3000, 4096, 8192]
 
 
-@pytest.mark.parametrize("ladders, match", [
-    # ``mixed`` replays the ``prefill`` capture but has none of its own
-    ({"mixed": [64]}, "no packed capture"),
-    ([64, 128], "capture walk -> ladder"),
-    ({"prefill": []}, "distinct positive"),
-    ({"prefill": [64, 64]}, "distinct positive"),
-    ({"prefill": [0, 64]}, "distinct positive"),
-    ({"prefill": 2048}, "distinct positive"),
-])
-def test_a_ladder_that_cannot_apply_is_refused(ladders, match):
-    with pytest.raises(ValueError, match=match):
-        _orpheus_prefill_buckets(ladders)
+def test_a_walk_that_only_replays_another_s_capture_is_refused_naming_it():
+    # Orpheus's ``mixed`` steps replay its ``prefill`` capture
+    with pytest.raises(ValueError, match="'prefill'"):
+        _orpheus_prefill_buckets({"mixed": [64]})
+
+
+def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog):
+    """GLM-5.2 captures nothing under ``dsa_long_context``, and serves eagerly
+    whatever the ladder."""
+    import logging
+
+    from mstar.model.glm52.config import Glm52ModelConfig
+    from mstar.model.glm52.submodules import Glm52LLMSubmodule
+
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    glm = Glm52LLMSubmodule(language_model, Glm52ModelConfig(dsa_long_context=True, mla_absorb=True))
+    engine = _budgeted_engine()
+    with caplog.at_level(logging.WARNING):
+        assert _captured_buckets(glm, "prefill", {"prefill": [64]}, engine) == []
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def _graph_model():
+    """LLM runs prefill and decode, which it combines into mixed; ViT runs encode.
+    Loading a node raises."""
+    from mstar.testing_utils.model import make_model
+
+    def unloadable(*args, **kwargs):
+        raise AssertionError("loaded weights before checking the config")
+
+    return make_model(
+        get_graph_walk_graphs=lambda: {
+            walk: SimpleNamespace(get_nodes=lambda nodes=nodes: nodes)
+            for walk, nodes in {"prefill": ["LLM"], "decode": ["LLM"], "encode": ["ViT"]}.items()
+        },
+        get_combined_graph_walks=lambda: {"LLM": {"mixed": {"prefill", "decode"}}},
+        get_submodule=unloadable,
+    )
 
 
 @pytest.mark.parametrize("model_config, match", [
@@ -779,9 +806,19 @@ def test_a_ladder_that_cannot_apply_is_refused(ladders, match):
     ({"model_kwargs": {"prefill_token_buckets": [32, 64]}}, "moved to the top level"),
     ({"prefill_token_buckets": [32, 64]}, "node -> capture walk -> ladder"),
     ({"prefill_token_buckets": {"LLM": []}}, "node -> capture walk -> ladder"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": []}}}, "distinct positive"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": [64, 64]}}}, "distinct positive"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": [0, 64]}}}, "distinct positive"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": 2048}}}, "distinct positive"),
+    ({"prefill_token_buckets": {"LLM": {"prefill": {"1": [64]}}}}, "min batch size"),
+    # a batch's ladder short of one request's would outgrow the static buffers its capture sized
+    ({"prefill_token_buckets": {"LLM": {"prefill": {1: [64, 4096], 2: [64, 2048]}}}}, "at least as far"),
+    # a walk of the model, but another node's
+    ({"prefill_token_buckets": {"LLM": {"encode": [64]}}}, "does not run"),
 ])
-def test_a_serving_config_ladder_in_the_wrong_shape_or_place_is_refused_before_loading(model_config, match):
-    """EngineManager.build refuses it from the config alone, before any node's weights load."""
+def test_a_serving_config_ladder_that_cannot_apply_is_refused_before_loading(model_config, match):
+    """EngineManager.build refuses it from the config and the model's graph, before any
+    node's weights load."""
     import types
 
     import torch
@@ -790,20 +827,13 @@ def test_a_serving_config_ladder_in_the_wrong_shape_or_place_is_refused_before_l
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
     from mstar.worker.engine_manager import EngineManager
 
-    class Unloadable:
-        def get_submodule(self, *args, **kwargs):
-            raise AssertionError("loaded weights before checking the config")
-
-        def __getattr__(self, name):
-            raise AssertionError(f"read the model ({name}) before checking the config")
-
     with pytest.raises(ValueError, match=match):
         EngineManager.build(
             node_names={"LLM"}, device=torch.device("cpu"),
-            model_config={"node_groups": [{"node_names": ["LLM"], "ranks": [0]}], **model_config},
+            model_config={"node_groups": [{"node_names": ["LLM", "ViT"], "ranks": [0]}], **model_config},
             parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
             transfer_engine_info=TransferEngineInfo(my_entity_id="t", my_session_id="t", transfer_engine=None),
-            model=Unloadable(), graph_runtime=types.SimpleNamespace(),
+            model=_graph_model(), graph_runtime=types.SimpleNamespace(),
         )
 
 

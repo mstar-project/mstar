@@ -7,6 +7,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.accelerator_graph_config import check_token_ladder
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
@@ -24,7 +25,8 @@ logger = logging.getLogger(__name__)
 
 def _prefill_token_buckets(model_config: dict) -> Mapping:
     """The serving config's ``prefill_token_buckets``: node -> capture walk ->
-    ladder, which each node's captures take at warmup (`apply_token_ladders`)."""
+    ladder, which each node's captures take at warmup (`apply_token_ladders`).
+    `_check_token_ladders` checks the walks and ladders."""
     if "prefill_token_buckets" in (model_config.get("model_kwargs") or {}):
         raise ValueError(
             "model_kwargs.prefill_token_buckets moved to the top level of the serving config, "
@@ -38,6 +40,23 @@ def _prefill_token_buckets(model_config: dict) -> Mapping:
             f"prefill_token_buckets takes node -> capture walk -> ladder, got {ladders!r}"
         )
     return ladders
+
+
+def _check_token_ladders(ladders: Mapping[str, Mapping], model: Model) -> None:
+    """Refuse, from the config and the model's graph alone, a ladder that is not
+    one or a walk that does not run its node: a walk the node is in, or a
+    combined walk of it."""
+    graphs = model.get_graph_walk_graphs()
+    combined = model.get_combined_graph_walks()
+    for node, named in ladders.items():
+        walks = {walk for walk, graph in graphs.items() if node in graph.get_nodes()} | set(combined.get(node, {}))
+        for walk, ladder in named.items():
+            check_token_ladder(f"{node}/{walk}", ladder)
+            if walk not in walks:
+                raise ValueError(
+                    f"prefill_token_buckets names walk {walk!r} for {node}, which it does not run; "
+                    f"its walks are {sorted(walks)}"
+                )
 
 
 def _unchunkable_nodes(
@@ -299,6 +318,7 @@ class EngineManager:
             unknown = sorted(set(setting) - known)
             if unknown:
                 raise ValueError(f"{key} names nodes {unknown} that no node group serves")
+        _check_token_ladders(ladders, model)
         specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling

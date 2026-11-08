@@ -347,12 +347,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        token budget of the steps its capture replays (``max_batch_tokens``; a walk
        inside a combined walk runs under the combined walk's), and the rungs past
        it, which no step would reach, are dropped and logged. Each rung adds
-       captures, graph memory and startup time. Loading fails if the setting is not
-       a mapping of nodes or names a node in no node group; warmup fails if a
-       node's value is not a mapping of walk -> ladder, a ladder is not a non-empty
-       list of distinct positive ints, or the walk has no packed capture on the
-       node. The key replaces ``model_kwargs.prefill_token_buckets``, which fails
-       loading.
+       captures, graph memory and startup time. Loading fails, before any weights
+       load, if the setting is not a mapping of node -> walk -> ladder, names a node
+       in no node group or a walk that does not run the node (one the node is in,
+       or a combined walk of it), or a ladder is not a non-empty list of distinct
+       positive ints. Warmup fails on a walk whose steps replay another walk's
+       capture, naming that walk; a walk the node captures nothing for at this
+       deployment (a model that turns its captures off, such as GLM-5.2 with
+       ``dsa_long_context``) is logged and skipped. The key replaces
+       ``model_kwargs.prefill_token_buckets``, which fails loading.
    * - ``can_override_mixed_max_tokens``
      - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
        of its own under the step's. See *Chunked prefill budgets* below.

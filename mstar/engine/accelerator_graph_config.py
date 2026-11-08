@@ -288,30 +288,37 @@ def apply_token_ladders(
     node: str, configs: list[AcceleratorGraphConfig], ladders: Mapping[str, Any],
     step_budget: Callable[[str], int | None],
 ) -> None:
-    """Take a serving config's ``prefill_token_buckets`` for ``node``
-    (capture walk -> ladder or ``{min batch size: ladder}``) as the
-    ``capture_token_lengths`` of the node's packed captures of that walk.
+    """Take a serving config's ``prefill_token_buckets`` for ``node`` (capture
+    walk -> ladder or ``{min batch size: ladder}``, which `EngineManager`
+    checked) as the ``capture_token_lengths`` of the node's packed captures of
+    that walk.
 
     A ladder runs to the first rung that holds the token budget of the steps
     its capture replays (``step_budget`` of each replay walk; none where any of
     them has none): the scheduler builds no step past it, so a rung beyond
     would never replay. A larger batch size's ladder also runs at least as far
-    as a smaller one's, which share its static buffers. A walk with no packed
-    capture on the node is refused.
+    as a smaller one's, which share its static buffers.
+
+    A walk whose steps only replay another walk's capture is refused, naming
+    that walk. A walk the node captures nothing for here, as a model that turns
+    its captures off at runtime does, is logged and skipped: its steps run
+    eagerly whatever the ladder.
     """
-    if not isinstance(ladders, Mapping):
-        raise ValueError(
-            f"prefill_token_buckets for {node} takes capture walk -> ladder, got {ladders!r}"
-        )
     packed = [c for c in configs if isinstance(c, PackedAcceleratorGraphConfig)]
     for walk, ladder in ladders.items():
-        check_token_ladder(f"{node}/{walk}", ladder)
         targets = [c for c in packed if c.capture_graph_walk == walk]
         if not targets:
-            raise ValueError(
-                f"prefill_token_buckets names walk {walk!r} of {node}, which has no packed capture; "
-                f"its packed captures are {sorted({c.capture_graph_walk for c in packed})}"
+            replayed_on = sorted({c.capture_graph_walk for c in packed if walk in c.replay_graph_walks})
+            if replayed_on:
+                raise ValueError(
+                    f"prefill_token_buckets names walk {walk!r} of {node}, whose steps replay the "
+                    f"captures of {replayed_on}; name that walk"
+                )
+            logger.warning(
+                "%s: no packed capture of walk %r at this deployment, so prefill_token_buckets "
+                "for it does nothing", node, walk,
             )
+            continue
         for config in targets:
             budgets = [step_budget(w) for w in config.replay_graph_walks]
             budget = None if None in budgets else max(budgets)
