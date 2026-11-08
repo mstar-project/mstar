@@ -58,7 +58,7 @@ For `/review gpu`, also:
 5. **The Slurm node:** a deploy key for the bot (`REVIEW_SLURM_SSH_KEY` secret; add its public key to the node's `extra_authorized_keys`), `REVIEW_SLURM_HOST` (`root@<host>`), `REVIEW_SLURM_PORT` and `REVIEW_SLURM_HOST_KEY` (the node's `ssh-ed25519 …` line, so a reused ngrok port can't impersonate it). Optional: `REVIEW_SLURM_PARTITION` (default `background`).
 6. **Eras Cloud:** `ERAS_API_KEY`, from an organization or wallet used only by CI with automatic top-up off, since its balance is the real spending cap. Save the box's Anthropic key as an Eras secret and set `ERAS_RUN_SECRET_ID`; without it the bot skips Eras.
 7. **The box's Anthropic key:** `LIVE_TEST_ANTHROPIC_KEY`, a key of its own in a workspace with a spend limit, since the box runs PR code with a shell. It never falls back to `ANTHROPIC_API_KEY`; without it the bot skips the Slurm node.
-8. **Limits:** `REVIEW_GPU_MAX_GPUS` (4), `REVIEW_GPU_HOURS` (4), `REVIEW_GPU_MAX_USD_PER_HOUR` (30).
+8. **Limits:** `REVIEW_GPU_MAX_GPUS` (4), `REVIEW_GPU_HOURS` (4), `REVIEW_GPU_MAX_USD_PER_HOUR` (30), and `REVIEW_GPU_MAX_RUNS` (2), the most live tests the bot runs at once across all PRs, counted before each launch from its Slurm jobs and the live `live-pr-*` instances in the Eras organization (another reason that organization is the bot's alone).
 9. **Media:** a public repository under the same owner with GitHub Pages on, named in `REVIEW_MEDIA_REPO` (the name only), with the `mstar-review` app installed and given contents write there.
 
 Without the Slurm and Eras settings a `/review gpu` reviews and then reports that no GPUs are configured.
