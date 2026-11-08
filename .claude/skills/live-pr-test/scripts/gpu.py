@@ -627,7 +627,7 @@ def cmd_launch(args, cfg):
             elif o["provider"] == "eras":
                 for i, vid in enumerate(candidates):
                     try:
-                        iid = eras_create(eras_body(vid) if i else body, pubkey)
+                        iid = eras_create(eras_body(vid) if i else body)
                         break
                     except ApiError as err:  # another box took the cache volume since: the next free one, then cold
                         if not volume_refused(err) or vid is None:
@@ -731,8 +731,8 @@ ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Noteboo
 
 
 def eras_ssh_key_id(pubkey: str, name: str) -> str:
-    """The organization's id for this public key. A key it doesn't know yet is registered under the
-    instance's name, which makes it that launch's to delete (eras_delete_key)."""
+    """The organization's id for this public key, registering it the first time, under the launch's
+    name. It stays registered for later launches."""
     import base64
     import hashlib
     blob = base64.b64decode(pubkey.split()[1])
@@ -821,13 +821,11 @@ def volume_refused(err: ApiError) -> bool:
     return err.code() in VOLUME_HELD
 
 
-def eras_create(body: dict, pubkey: str) -> str:
+def eras_create(body: dict) -> str:
     """Preview, accept the quoted prices, create; the instance id. Eras refuses an idempotency key
-    reused with another request, so each attempt (listing, cache volume, ssh key) has its own. The
-    create is sent again only after a 429, with the same key; any other failure may have come after
-    Eras acted, so it goes to launch, which finds the instance by name. The ssh key the body binds
-    may be one an earlier launch registered, which that launch's terminate can delete before the
-    create: then the key is registered again, under this launch's name, once."""
+    reused with another request, so each attempt (listing, cache volume) has its own. The create is
+    sent again only after a 429, with the same key; any other failure may have come after Eras acted,
+    so it goes to launch, which finds the instance by name."""
     import hashlib
     preview = eras("POST", "/instances/preview", body)
     problems = (preview.get("run") or {}).get("problems") or []
@@ -842,18 +840,9 @@ def eras_create(body: dict, pubkey: str) -> str:
         print(f"gpu.py: eras preview: {w.get('message')}", file=sys.stderr)
     body = dict(body, accepted_prices={i["usage_type"]: i["unit_price"] for i in preview["quote"]["line_items"]},
                 accepted_available_until=preview.get("available_until"))
-    binds = body["run"]["bindings"]
-    keys = binds["secrets"]["authorized-keys"]["ssh_key_ids"]
-    for again in (False, True):
-        attempt = json.dumps([body["listing_id"], (binds["volumes"].get("cache") or {}).get("volume_id"), keys])
-        body["idempotency_key"] = f"{body['name']}-{hashlib.sha256(attempt.encode()).hexdigest()[:8]}"
-        try:
-            return eras("POST", "/instances", body, retry=False)["id"]
-        except ApiError as err:  # a key gone since the lookup: not found or not valid, by the spec's codes
-            if again or err.status not in (404, 422) or (key := eras_ssh_key_id(pubkey, body["name"])) in keys:
-                raise
-            print(f"gpu.py: ssh key {keys[0]} was deleted mid-launch; now bound as {key}", file=sys.stderr)
-            keys[:] = [key]
+    attempt = json.dumps([body["listing_id"], (body["run"]["bindings"]["volumes"].get("cache") or {}).get("volume_id")])
+    body["idempotency_key"] = f"{body['name']}-{hashlib.sha256(attempt.encode()).hexdigest()[:8]}"
+    return eras("POST", "/instances", body, retry=False)["id"]
 
 
 def hf_home(cfg, provider, region) -> str:
@@ -998,8 +987,6 @@ def terminate(key: str, e: dict) -> None:
                 raise
     with ledger_txn() as d:
         d.pop(key, None)
-    if e["provider"] == "eras":
-        eras_delete_key(e["name"])
     hours = (time.time() - e["launched_at"]) / 3600
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
 
@@ -1012,25 +999,6 @@ def eras_instances() -> list[dict]:
         items += page.get("items") or []
         if not (token := page.get("next_page_token")):
             return items
-
-
-def eras_delete_key(name: str) -> None:
-    """Best effort: delete the ssh key the launch `name` registered (named after it), now that its
-    instances are released, unless an instance not releasing binds it in a run not finished: a deleted
-    key leaves the authorized_keys of every box that binds it. A key the launch reused stays."""
-    try:
-        keys = eras("GET", "/ssh-keys", params={"filter": json.dumps({"field": "name", "op": "=", "value": name})})
-        bound = set()
-        for i in eras_instances():  # a binding missed would cut a live box off
-            run = (i.get("standalone") or {}).get("current_run") or {}
-            secrets = (run.get("bindings") or {}).get("secrets") or {}
-            if i.get("status") != "releasing" and run.get("status") not in ("succeeded", "failed", "stopped"):
-                bound.update(k for b in secrets.values() for k in b.get("ssh_key_ids") or [])
-        for k in keys.get("items") or []:
-            if k["id"] not in bound:
-                eras("DELETE", f"/ssh-keys/{k['id']}")
-    except ApiError as err:
-        print(f"gpu.py: ssh key {name} not deleted: {err}", file=sys.stderr)
 
 
 def cmd_terminate(args, cfg):
