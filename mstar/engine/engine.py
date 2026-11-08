@@ -296,7 +296,7 @@ class SubmoduleManagement:
 class ForwardPassInfoWrapper:
     """
     Stop-gap solution: the dynamic loop iters in CurrentForwardPassInfo may
-    be used in two places at once: in _postprocess_batch (for batch N), and
+    be used in two places at once: in ``StepExecutor.postprocess`` (for batch N), and
     in the forward pass for batch N+1, which require different iterations.
     The InputMetadata is built per executing batch, so its value is guaranteed
     to be up-to-date.
@@ -411,7 +411,7 @@ class ExecutingBatch:
     withheld_outputs: dict[int, tuple[str, ...]] = field(default_factory=dict)
     # A lockstep step whose rows' input reads every rank checks before
     # preparing it: the leader's rows in its order (see
-    # ``Worker._drop_rows_whose_read_failed``); None for no check
+    # ``Lockstep.drop_rows_whose_read_failed``); None for no check
     read_check_rids: tuple[int, ...] | None = None
 
     admit_error: AdmitFailedReason | None = None
@@ -2500,7 +2500,7 @@ class Engine:
             is NodeSubmodule.filter_batched_output
         ):
             # No clone either: the worker takes the host copy on this thread,
-            # on this stream, right behind the step (``_stage_host_rows``), so
+            # on this stream, right behind the step (``HostCopies.stage_host_rows``), so
             # a later replay cannot overwrite the rows first, and nothing else
             # reads them on the device. Padded rows past the real ones ride
             # along and are never read.
@@ -3074,7 +3074,7 @@ class Engine:
                 with stream if stream is not None else nullcontext():
                     self._order_after_pre_plans()
                     # A raise here takes what a raise from `pre_plan` below takes:
-                    # `Worker._preplan_spec` resets the pre-plan, whose reservation
+                    # `StepExecutor._preplan_spec` resets the pre-plan, whose reservation
                     # stays with its streams for exec's admit to find.
                     if ctx.resident is not None:
                         ctx.plan_phase = "res.pre_plan"

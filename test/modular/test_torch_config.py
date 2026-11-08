@@ -13,7 +13,7 @@ from mstar.testing_utils.worker import make_worker
 
 def test_executor_thread_gets_torch_config():
     worker = make_worker(device=torch.device("cpu"))
-    with ThreadPoolExecutor(1, initializer=worker._init_engine_thread) as ex:
+    with ThreadPoolExecutor(1, initializer=worker.executor._init_engine_thread) as ex:
         limit, unspec = ex.submit(lambda: (
             torch._dynamo.config.recompile_limit,
             torch._dynamo.config.allow_unspec_int_on_nn_module,
@@ -27,9 +27,9 @@ def test_the_engine_threads_start_before_a_compiled_call_can_raise_the_limit():
     so the pool's thread runs its initializer when the pool is built."""
     worker = make_worker(device=torch.device("cpu"))
     started = []
-    init = worker._init_engine_thread
-    worker._init_engine_thread = lambda: (started.append(1), init())
-    pool = worker._engine_thread_pool("mstar-plan")
+    init = worker.executor._init_engine_thread
+    worker.executor._init_engine_thread = lambda: (started.append(1), init())
+    pool = worker.executor._engine_thread_pool("mstar-plan")
     try:
         assert started == [1], "the engine thread's initializer waited for its first job"
     finally:

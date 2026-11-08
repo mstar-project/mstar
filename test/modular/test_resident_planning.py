@@ -949,8 +949,7 @@ def test_a_stream_wider_than_a_row_raises():
 # ---- what a raise in the plan leaves ----
 
 def _preplan_worker(engine):
-    worker = make_worker(worker_id="w", engine_manager=SimpleNamespace(get_engine=lambda node: engine))
-    return worker
+    return make_worker(worker_id="w", engine_manager=SimpleNamespace(get_engine=lambda node: engine))
 
 
 def _preplan_engine(res, planner):
@@ -1026,7 +1025,7 @@ def test_a_raise_in_the_preplan_leaves_the_reservation_for_exec(monkeypatch, rai
         raise RuntimeError("raised mid pre-plan")
 
     monkeypatch.setattr(target, name, boom)
-    assert _preplan_worker(engine)._preplan_spec(None, SimpleNamespace(node_batch=batch)) is False
+    assert _preplan_worker(engine).executor._preplan_spec(None, SimpleNamespace(node_batch=batch)) is False
     monkeypatch.setattr(target, name, real)
 
     assert batch.preplan_event is None and batch.preplanned_rids is None and batch.step is None
@@ -1121,7 +1120,7 @@ def _refused_worker(engine, line):
     ``line`` the requests in the order a step reaches them."""
     pushed = []
     worker = make_worker(
-        _graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
+        graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
         scheduler=SimpleNamespace(
             could_refill=lambda *a: False,
@@ -1172,7 +1171,7 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
 
     worker = _refused_worker(engine, line=[1, 2, 3])
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
-    worker._handle_admit_failure(batch, _refused(batch, outcome.reason, outcome.failed_resource))
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason, outcome.failed_resource))
     assert worker.pushed == [[1, 2]] and list(worker.admission.held_until) == [3]
     assert engine.residency("n", 3) is Residency.ON_HOST
     assert planner.slot_of(3) is None and 3 not in planner._stale
@@ -1216,7 +1215,7 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
     engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
     worker = _refused_worker(engine, line=[1, 2])
     batch = ScheduledBatch(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
-    worker._handle_admit_failure(batch, _refused(batch, outcome.reason, "pool"))
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason, "pool"))
     assert worker.pushed == [[2]]
     assert list(worker.admission.held_until) == [2]
     assert engine.residency("n", 1) is Residency.RESIDENT
