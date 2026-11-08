@@ -35,9 +35,9 @@ REPO = os.environ.get("REPO", "mstar-project/mstar")
 os.environ.setdefault("LIVE_PR_STATE", str(Path(os.environ.get("RUNNER_TEMP", "/tmp"), "live-pr")))
 WRITE = bot.WRITE
 # Never approved, whatever the review says: the bot's own rules, CI, and the dependencies and toolchains.
-NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/ci/")
-NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py", "Cargo.toml", "rust-toolchain.toml",
-               "requirements*.txt")
+NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/", "docker/", "tools/", "packaging/")
+NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "MANIFEST.in", "pyproject.toml", "setup.py", "Cargo.toml",
+               "rust-toolchain.toml", "requirements*.txt")
 # Approved only as a comment that doesn't count toward required reviews.
 NO_COUNT_AREAS = {"area/engine", "area/resources"}
 # No runtime code: a review's `none` alone approves a change only to these.
@@ -69,13 +69,20 @@ def gpu_py():
 
 # ---------------------------------------------------------------- GPUs
 
-def configure(out, runner_temp, slurm_key="", slurm_nodes="", max_gpus="4", hours="4", max_usd="30", max_runs="2",
-              eras_secret="", eras_cache_volumes=""):
+def slurm_allowed(pr, slurm_authors):
+    """Whether this PR's live test may use the Slurm nodes: only when its author is one of `slurm_authors`
+    (REVIEW_SLURM_AUTHORS, the people already on the nodes). Unset means no Slurm; everyone else with write
+    access still gets a live test, on Eras. The nodes have no job containers and the box runs PR code as root."""
+    return bool(slurm_authors.split()) and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in slurm_authors.split()
+
+
+def configure(out, runner_temp, pr: int = 0, slurm_key="", slurm_nodes="", slurm_authors="", max_gpus="4", hours="4",
+              max_usd="30", max_runs="2", eras_secret="", eras_cache_volumes=""):
     """gpu.py's config.local.json from the workflow's variables and secrets, and the ssh keys. The Slurm
-    nodes only with their key (one for all of them); Eras only with ERAS_API_KEY (gpu.py checks).
-    SLURM_NODES is a JSON list of nodes, each with its name, host, port and pinned host key, and
-    optionally any other field of gpu.py's node. ERAS_CACHE_VOLUMES: the Eras cache volumes' ids,
-    space-separated. Nothing here reaches the box."""
+    nodes only with their key (one for all of them) and for an author `slurm_allowed` lets use them; Eras
+    only with ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of nodes, each with its name, host,
+    port and pinned host key, and optionally any other field of gpu.py's node. ERAS_CACHE_VOLUMES: the Eras
+    cache volumes' ids, space-separated. Nothing here reaches the box."""
     Path(os.environ["LIVE_PR_STATE"]).mkdir(parents=True, exist_ok=True)
     ssh = Path.home() / ".ssh"
     ssh.mkdir(mode=0o700, exist_ok=True)
@@ -87,7 +94,7 @@ def configure(out, runner_temp, slurm_key="", slurm_nodes="", max_gpus="4", hour
             for n in nodes):
         raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]) and a host")
     slurm = []
-    if slurm_key and nodes:
+    if slurm_key and nodes and slurm_allowed(pr, slurm_authors):
         key = ssh / "review_slurm"
         key.touch(mode=0o600)
         key.write_text(slurm_key.strip() + "\n")
@@ -246,6 +253,8 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   The Skill tool is off; open skills by path.
 - GPUs: the ones in CUDA_VISIBLE_DEVICES. On a Slurm node (SLURM_JOB_ID is set) start servers with
   `mserve`, never `--gpus`. Don't start tmux or detached processes outside this session's job.
+  Another run can share the node: every server's `--port` comes from the 20 ports starting at
+  `$LIVE_PR_PORT`, and its `--socket-path-prefix` is `$LIVE_PR_SOCKET_PREFIX`. `$TMPDIR` is this run's own.
 - You have no GitHub token and post nothing. Write everything to `$LIVE_PR_OUT`:
   `report.md` (the report reference's format, media linked relatively under `media/`),
   `media/` (the test matrix's Media rules: small files, a stereo recording for duplex), and
@@ -262,6 +271,17 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
   checks whose code is unchanged, and stop when the plan is done.
 """
+
+
+def pending_ahead(cfg, offer):
+    """How many jobs are pending in a Slurm offer's partition (0 when its queue can't be read: the offer stands)."""
+    state = gpu_py()
+    node = state["slurm_node"](cfg, offer["region"])
+    try:
+        out = state["slurm_run"](node, f"squeue -h -t PD -p {shlex.quote(node.get('partition', 'main'))} -o %i")
+    except (state["ApiError"], subprocess.TimeoutExpired):
+        return 0
+    return len(out.split())
 
 
 def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hours: float, run, checks: check_kinds,
@@ -302,6 +322,10 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
         ("slurm", os.environ.get("LIVE_TEST_ANTHROPIC_KEY"), "LIVE_TEST_ANTHROPIC_KEY is not set"),
         ("eras", cfg.get("eras", {}).get("run_secret_id"), "ERAS_RUN_SECRET_ID is not set")) if not ok}
     tried = [f"{p}: {why}" for p, why in keyless.items() if any(o["provider"] == p for o in free)]
+    for o in [o for o in free if o["provider"] == "slurm"]:  # `sinfo` counts free GPUs, not the queue for them
+        if ahead := pending_ahead(cfg, o):
+            free.remove(o)
+            tried.append(f"{o['id']}: {ahead} job(s) already pending in its partition")
     for o in [o for o in free if o["provider"] not in keyless]:
         inputs = [x for f in ("brief.md", "findings.json", "pr-body.md", "run.json") for x in ("--input", str(lt / f))]
         if o["provider"] == "slurm":

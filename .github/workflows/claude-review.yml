@@ -116,6 +116,8 @@ permissions: {}
 env:
   # No __pycache__ in the tree the model reads.
   PYTHONDONTWRITEBYTECODE: 1
+  # When set, only the app's login counts as the bot (render_summary.BOTS).
+  REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
 
 jobs:
   # Decides whether a comment starts a review, in which mode and with which
@@ -196,6 +198,9 @@ jobs:
   review:
     name: Review
     needs: preflight
+    # issue_comment runs on the default branch, so the environment's branch rule passes; a branch's own
+    # workflow can't read these secrets.
+    environment: review-bot
     if: needs.preflight.outputs.run == 'true'
     # Job-level, and only for a request the preflight accepted, so no other
     # comment can cancel a review in progress.
@@ -210,7 +215,8 @@ jobs:
       mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       main_sha: ${{ steps.base.outputs.commit }}
-      result: ${{ steps.review.outputs.structured_output }}
+      # The summary's fields as `post` rendered them, with what it carried over from the earlier review.
+      result: ${{ steps.post.outputs.result }}
       # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
       rereview: ${{ steps.diff.outputs.rereview }}
       # stacked-above.json, for the approval rule's count of findings fixed above.
@@ -344,9 +350,9 @@ jobs:
             Turn cap: ${{ needs.preflight.outputs.turns }}.
             ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
             ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json is present, with since.diff and since-commits.txt or, after a force-push, rebase or merge of main, interdiff.diff. Follow the prompt''s Re-review section.' || '' }}
-          # No shell or edits; web reads only from the sites listed here (GitHub, the
+          # No shell or edits; page fetches only from the sites listed here (GitHub, the
           # vLLM and SGLang docs, Hugging Face, PyTorch, arXiv) and Claude Code's
-          # built-in documentation sites, so the review can read how other projects do it. The only write tool is the inline-
+          # built-in documentation sites, so the review can read how other projects do it; WebSearch has no domain list. The only write tool is the inline-
           # comment tool, which the action loads only when it is listed here and
           # which redacts secrets. The summary comes back as structured output.
           # The turn cap is the preflight's: CLAUDE_REVIEW_MAX_TURNS (40) for a
@@ -419,6 +425,7 @@ jobs:
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
+          PREV: ${{ steps.prev.outputs.dir }}
         run: python3 .github/review/bot.py post
 
       # Hide the earlier summaries as outdated, so the PR shows only the latest
@@ -496,6 +503,7 @@ jobs:
   live-test:
     name: Live test
     needs: review
+    environment: review-bot
     if: needs.review.outputs.mode == 'full' && needs.review.outputs.complete == 'true'
     concurrency:
       group: claude-live-test-${{ github.event.issue.number }}
@@ -534,6 +542,7 @@ jobs:
         env:
           SLURM_KEY: ${{ secrets.REVIEW_SLURM_SSH_KEY }}
           SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
+          SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}

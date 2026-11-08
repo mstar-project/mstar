@@ -34,6 +34,22 @@ ANTHROPIC_API_KEY=$(cat /run/live-pr-key/value 2> /dev/null || cat "$IN/anthropi
 export ANTHROPIC_API_KEY
 rm -f "$IN/anthropic.key"
 
+# bootstrap.sh keeps the compile-cache tarball beside the HF home, which on a Slurm node is one file every
+# live test restores, main arms included. So HF_HOME is a link in the job's directory: the session's
+# CACHE_TAR is the job's, seeded with links to the shared tarballs. They restore from there; save_caches
+# replaces the link in the job's directory and never reaches the shared file.
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+  ln -sfn "$HF_HOME" "$W/hf" && mkdir -p "$W/live-pr-compile-cache"
+  for t in "$(dirname "$HF_HOME")"/live-pr-compile-cache/*.tar; do [ ! -e "$t" ] || ln -sf "$t" "$W/live-pr-compile-cache/"; done
+  HF_HOME=$W/hf
+fi
+
+# Two runs can share a Slurm node (no job container, network namespace or private /tmp), so each takes a
+# port block, a ZMQ socket prefix and a TMPDIR of its own, from its job id; on Eras the box is its own.
+export LIVE_PR_PORT=$((10000 + ${SLURM_JOB_ID:-0} % 1100 * 20))
+export LIVE_PR_SOCKET_PREFIX=/tmp/mstar_${SLURM_JOB_ID:-pod} TMPDIR=$W/tmp
+mkdir -p "$TMPDIR"
+
 finish() {
   [ -s "$OUT/result.json" ] || printf '{"verdict": "unavailable", "summary": "%s"}\n' "$1" > "$OUT/result.json"
   touch "$OUT/done"
@@ -43,6 +59,9 @@ finish() {
   fi
   exit 0
 }
+# Slurm preempts the job with a TERM: say so, rather than leaving no result at all. `wait`, below, lets
+# the trap run at once instead of after the session has exited.
+trap 'kill "${claude_pid:-}" 2> /dev/null; finish "preempted before the session finished"' TERM
 
 # Trusted: main's skills, AGENTS.md and scripts, at the commit the workflow read its rules from.
 git clone -q "https://github.com/$REPO.git" "$W/main" && git -C "$W/main" checkout -q "$MAIN_SHA" \
@@ -54,5 +73,7 @@ cd "$W" || finish "no work directory"
 "$HOME/.local/bin/claude" -p "$(cat "$IN/brief.md")" \
   --model "$(field model)" --effort high --max-turns "$(field turns)" --output-format json \
   --allowedTools "Bash,Read,Write,Edit,Glob,Grep" --disallowedTools "Skill,WebSearch" \
-  > "$OUT/claude.json" 2> "$OUT/claude.err"
+  > "$OUT/claude.json" 2> "$OUT/claude.err" &
+claude_pid=$!
+wait "$claude_pid"
 finish "the session ended without a result (exit $?)"

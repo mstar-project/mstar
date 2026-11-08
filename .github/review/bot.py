@@ -36,8 +36,9 @@ REDACT = [re.compile(p) for p in (
     r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+",
 )]
 WRITE = ("admin", "maintain", "write")
-# The bot's REST logins: the review app's, and github-actions', which it posted as before the app.
+# The bot's REST logins (render_summary.BOTS and POSTING_BOTS say whose count for what).
 BOT_USERS = [f"{b}[bot]" for b in render_summary.BOTS]
+POSTING_BOT_USERS = [f"{b}[bot]" for b in render_summary.POSTING_BOTS]
 # The marker of a stopped review's "didn't complete" comment, of one a later run resolved, and of a refused
 # /review continue's.
 INCOMPLETE = "<!-- claude-review-incomplete -->"
@@ -153,6 +154,13 @@ def marked(comments, marker):
             if (c.get("user") or {}).get("login") in BOT_USERS and (c.get("body") or "").startswith(marker)]
 
 
+def last_state(conversation):
+    """The state of the bot's last summary among the PR's conversation comments, or None (read_state)."""
+    summaries = [c for c in conversation
+                 if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
+    return render_summary.read_state(summaries[-1]["body"]) if summaries else None
+
+
 def oneline(commits):
     """since-commits.txt and since-live-test-commits.txt: one line per commit, merges marked."""
     lines = []
@@ -199,10 +207,10 @@ def issues(repo, kind):
     with the kind's marker. Created in a race, or rolled over when one is full, several can exist; readers
     take them all, writers the lowest with room (`issue`)."""
     found = {}
-    for login in BOT_USERS:
+    for login in POSTING_BOT_USERS:  # the spend ledger and status issue are written with the job's own token
         creator = login.replace("[", "%5B").replace("]", "%5D")
         for i in api_list(f"repos/{repo}/issues?state=all&creator={creator}&per_page=100"):
-            if (i.get("user") or {}).get("login") in BOT_USERS \
+            if (i.get("user") or {}).get("login") in POSTING_BOT_USERS \
                     and (i.get("body") or "").startswith(issue_marker(kind)):
                 found[i["number"]] = i
     return [found[n] for n in sorted(found)]
@@ -234,7 +242,7 @@ def ledger(repo, since):
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
             m = SPEND.search(c.get("body") or "")
-            if not m or (c.get("user") or {}).get("login") not in BOT_USERS:
+            if not m or (c.get("user") or {}).get("login") not in POSTING_BOT_USERS:
                 continue
             try:
                 record = json.loads(base64.b64decode(m[1]))
@@ -598,7 +606,7 @@ def discussion(repo, pr):
                          "path": c.get("path"), "line": c.get("line"), "side": c.get("side"),
                          "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
                          "created_at": c.get("created_at"), "url": c.get("html_url"),
-                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in BOT_USERS})
+                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in POSTING_BOT_USERS})
     # The conversation tab: replies to the summary, and the author's answers.
     conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"),
                      "user_type": (c.get("user") or {}).get("type"), "created_at": c.get("created_at"),
@@ -641,9 +649,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
     # (too large, say) means a full review, never an empty since.diff.
     if not prev:
-        summaries = [c for c in conversation
-                     if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
-        state = render_summary.read_state(summaries[-1]["body"]) if summaries else None
+        state = last_state(conversation)
         last = (state or {}).get("head")
         since = f"repos/{repo}/compare/{last}...{head_sha}"
         try:
@@ -777,7 +783,35 @@ def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, gi
         print(f"::warning::Couldn't write the job summary: {e}")
 
 
-def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
+def earlier_review(repo, pr, prev):
+    """(state, answered): the state of the review this run built on, what render_summary.carried carries over,
+    from last-review.json or on a /review continue (which wasn't shown it) the last summary; and whether a
+    person other than the author has commented since that review. Not knowing reads as not answered."""
+    path, state = Path("last-review.json"), None
+    if path.exists():
+        state = json.loads(path.read_text())
+    elif not prev:
+        return None, False
+    try:
+        conversation = api_list(f"repos/{repo}/issues/{pr}/comments")
+        summaries = [c for c in conversation if (c.get("user") or {}).get("login") in BOT_USERS
+                     and (c["body"] or "").startswith(render_summary.MARKER)]
+        if state is None and summaries:
+            state = render_summary.read_state(summaries[-1]["body"])
+        if not state or not summaries:
+            return state, False
+        since = summaries[-1]["created_at"]
+        author = api(f"repos/{repo}/pulls/{pr}")["user"]["login"]
+        spoken = [*conversation, *api_list(f"repos/{repo}/pulls/{pr}/comments"),
+                  *api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")]
+    except (RuntimeError, ValueError, KeyError, TypeError):
+        return state, False
+    answered = any((c.get("submitted_at") or c.get("created_at") or "") > since
+                   and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") != author for c in spoken)
+    return state, answered
+
+
+def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
     """Post the summary, rendered from the review's fields by render_summary and redacted: model output from
     untrusted input. Read the PR's threads after the review posted its inline comments, so the status line
     counts them along with earlier ones still open. Each run posts its own summary comment, so a re-review
@@ -785,8 +819,9 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
     point here, and loses its marker so a later failure starts a fresh one."""
     pages = graphql(THREADS, repo, pr)
     try:
-        text = render_summary.render(json.loads(output), pages, head_sha, mode,
-                                     render_summary.stacked_above("stacked-above.json"), salvaged == "true")
+        review = render_summary.carried(json.loads(output), *earlier_review(repo, pr, prev))
+        text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
+                                     salvaged == "true")
     except Exception as e:
         text = ""
         print(f"::warning::The review's summary didn't render: {type(e).__name__}: {e}")
@@ -794,6 +829,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
     if not text.strip():
         print("::warning::The review returned no summary to render.")
         sys.exit(1)
+    out["result"] = redact(json.dumps(review))  # what the approval rule reads, with what it carried over
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")
@@ -982,7 +1018,7 @@ def referenced(timeline, number, repo):
         if event.get("event") != "cross-referenced":
             continue
         source = (event.get("source") or {}).get("issue") or {}
-        if (source.get("user") or {}).get("login") in BOT_USERS:
+        if (source.get("user") or {}).get("login") in POSTING_BOT_USERS:
             continue
         ref, labels = source.get("number"), {x.get("name") for x in source.get("labels") or []}
         is_pr = "pull_request" in source
@@ -1177,7 +1213,7 @@ def pr_evidence(repo, pr, since, records):
     def kept(comments):
         rows = []
         for c in comments:
-            mine = c["user"] in BOT_USERS
+            mine = c["user"] in POSTING_BOT_USERS
             if not c.get("body") or (c.get("user_type") == "Bot" and not mine):
                 continue
             if (c.get("created_at") or "") >= since or (mine and c.get("resolved")):
@@ -1231,7 +1267,7 @@ def improve_inputs(out, repo, key_set):
     status = [{"url": c.get("html_url"), "text": scrub(line)}
               for i in issues(repo, "status")
               for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100")
-              if (c.get("user") or {}).get("login") in BOT_USERS
+              if (c.get("user") or {}).get("login") in POSTING_BOT_USERS
               for line in (c.get("body") or "").splitlines() if line.strip()]
     if status:
         files["status.json"] = status[-IMPROVE_ITEMS:]

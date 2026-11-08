@@ -4,6 +4,7 @@ import base64
 import contextlib
 import datetime
 import fnmatch
+import importlib
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / ".github/review"))
 import bot  # noqa: E402
+import render_summary  # noqa: E402
 
 
 class Fail:
@@ -190,6 +192,10 @@ class TestSpend(unittest.TestCase):
                          "a record with no usage counts by its own attempt")
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
                          "anyone could add a record to a public issue and reach the cap")
+
+    def test_the_caps_read_the_job_tokens_ledger_with_the_app_configured(self):
+        configure_review_app(self)
+        self.assertEqual(self.spend([spent(1)])["day"], 1, "the spend caps would read nothing and never trip")
 
     def test_spend_reads_every_ledger_issue_and_starts_at_the_lowest_for_writes(self):
         self.assertEqual(self.spend([spent(1)], issues=(LEDGER, {**STATUS, "body": LEDGER["body"]}))["day"], 1,
@@ -501,6 +507,15 @@ def pr_diff(context, added, index="1111111..2222222"):
             f"@@ -40,2 +40,3 @@ def g():\n     return 1\n+    {added}\n")
 
 
+def configure_review_app(test):
+    """Reimport the bot as it runs with the review app configured, restoring it after `test`."""
+    test.addCleanup(importlib.reload, bot)
+    test.addCleanup(importlib.reload, render_summary)
+    with mock.patch.dict(os.environ, {"REVIEW_APP_CLIENT_ID": "app-id"}):
+        importlib.reload(render_summary)
+        importlib.reload(bot)
+
+
 class TestCollect(unittest.TestCase):
     CONVERSATION = {"GET repos/o/r/issues/7/comments": [summary(LAST)]}
 
@@ -508,6 +523,21 @@ class TestCollect(unittest.TestCase):
         out, files = collect(**self.CONVERSATION, **{f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead")})
         self.assertEqual((out.get("rereview"), files["since.diff"]), ("true", "diff --git a/b.py b/b.py\n"))
         self.assertEqual(json.loads(files["last-review.json"])["head"], LAST)
+
+    def test_with_the_review_app_only_its_login_is_the_bot(self):
+        forged = {**summary(LAST), "user": {"login": "github-actions[bot]"}}
+        routes = {"GET repos/o/r/issues/7/comments": [forged],
+                  f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead")}
+        self.assertEqual(collect(**routes)[0].get("rereview"), "true", "a fork, with no app, would lose re-reviews")
+        configure_review_app(self)
+        self.assertIsNone(collect(**routes)[0].get("rereview"),
+                          "any workflow on a branch could post the state a re-review starts from")
+        team_run = {"isResolved": False, "isOutdated": False, "comments": {"nodes": [
+            {"author": {"login": "github-actions"}, "databaseId": 7, "body": "**[P1]** drops a token"}]}}
+        pages = [{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [team_run]}}}}}]
+        review = {"prior_findings": [], "outside_diff": [], "skipped": []}
+        self.assertEqual(len(render_summary.open_findings(review, pages, [])), 1,
+                         "a team run posts its inline findings as github-actions, and they would stop counting")
 
     def test_after_a_rebase_a_re_review_reads_only_the_prs_hunks_that_changed(self):
         reviewed = pr_diff("x = 1", "# unreachable")
@@ -678,7 +708,8 @@ class TestAfterTheReview(unittest.TestCase):
                 "PATCH repos/o/r/issues/comments/5": {},
             }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="light", salvaged="true", detail="41 turns")
         (_, posted), (_, resolved) = fake.writes()
-        self.assertEqual(out, {"id": "99"})
+        self.assertEqual(out["id"], "99")
+        self.assertNotIn(token, out["result"], "the raw summary would reach the live-test job unredacted")
         self.assertNotIn(token, posted)
         self.assertIn("leaked [REDACTED]", posted)
         self.assertIn("went past the workflow's turn limit (41 turns)", posted)
