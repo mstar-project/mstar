@@ -7,6 +7,7 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.worker import Worker  # noqa: E402
 
 
@@ -42,11 +43,7 @@ def test_a_raising_ingest_rolls_back_every_resource_it_reached():
 
 
 def test_the_worker_fails_only_the_request_whose_ingest_raised():
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w._draining_rids = set()
-    w._reads_done_sent = set()
-    w._unprocessed_messages = {"wire": ["parked"]}
+    w = make_worker(_unprocessed_messages={"wire": ["parked"]})
     processed, failed, registered = [], [], []
     w._graph_runtime = SimpleNamespace(
         add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,

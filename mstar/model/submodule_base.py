@@ -826,6 +826,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # engines skip compiling such submodules (CUDA-graph capture is unaffected).
     disable_torch_compile: bool = False
 
+    def dynamo_recompile_limit(self) -> int | None:
+        """Entries dynamo may keep per code object of this submodule's compiled forwards, when
+        its captures need more than the engine's ``MSTAR_RECOMPILE_LIMIT``. The engine applies
+        it around this submodule's compiled calls only. None keeps the engine's."""
+        return None
+
     # Set True on a submodule that must run in its own parameter dtype — e.g. a
     # numerically sensitive fp32 vocoder. The engine then neither casts its
     # params to the autocast dtype nor wraps its forward (or capture) in
@@ -1213,6 +1219,12 @@ class NodeSubmodule(torch.nn.Module, ABC):
     def max_batch_size(self, graph_walk: str):
         return None
 
+    def batch_cap_varies(self, graph_walk: str) -> bool:
+        """Whether ``max_batch_size(graph_walk)`` follows state that changes while
+        serving (free slots, say). The scheduler caches every other cap."""
+        del graph_walk
+        return False
+
     def compile_regions(self) -> Mapping[str, Sequence[tuple]]:
         """Parts of this node the engine compiles on their own, for a node
         whose ``forward`` is not compiled whole (``disable_torch_compile``, or
@@ -1266,9 +1278,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Return the piecewise CUDA graph configs this submodule opts into.
 
         ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
-        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
-        allocate the hidden-state buffer in the dtype the captured region runs
-        under (avoids a copy-time upcast at replay).
+        ``disable_autocast``, passed so a config's ``make_static_inputs`` can
+        allocate each input buffer in the dtype the eager path hands the region,
+        often that one. The replay copies into the buffer and refuses a value the
+        buffer may round.
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the

@@ -88,6 +88,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
+        model_config=config,
     )
 
     ctx = mp.get_context("spawn")
@@ -235,13 +236,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    from mstar.utils.logging_config import quiet_noisy_loggers
+    from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s [dynamo_worker] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    log_off_thread()
 
     # No HTTP port to key the prefix on, and replicas of one endpoint
     # (same namespace, component and endpoint) commonly share a host.

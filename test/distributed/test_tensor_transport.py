@@ -23,6 +23,7 @@ from mstar.communication.tensors import (
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import NewRequest
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.rid_table import RidTable
@@ -245,20 +246,20 @@ def test_fanin_buffers_partial_then_completes(make_manager, protocol):
 def _receiving_worker(manager, sharding_config: ShardingConfig) -> Worker:
     """The real ``Worker._add_new_request`` over ``manager``, the rest cut down."""
     rids = RidTable()
-    w = Worker.__new__(Worker)
-    w.worker_id = manager.my_entity_id
-    w._draining_rids, w._reads_done_sent, w._unprocessed_messages = set(), set(), {}
-    w._graph_runtime = SimpleNamespace(
+    w = make_worker(
+        worker_id=manager.my_entity_id,
+        _graph_runtime=SimpleNamespace(
         add_request=lambda request_id, **kw: rids.intern(request_id),
         get_rid_handle=rids.handle,
         get_sharding_config=lambda rid: sharding_config,
         register_stop_limits=lambda rid, info: None,
-    )
-    w.request_state = RequestStateManager()
-    w.scheduler = SimpleNamespace(note_arrival=lambda rid: None)
-    w.tensor_manager = manager
-    w.engine_manager = SimpleNamespace(
+    ),
+        request_state=RequestStateManager(),
+        scheduler=SimpleNamespace(note_arrival=lambda rid: None),
+        tensor_manager=manager,
+        engine_manager=SimpleNamespace(
         engine=SimpleNamespace(publisher_nodes={}), add_request=lambda rid, configs, info: None,
+    ),
     )
     w.streams = StreamBufferManager(w.request_state, manager, [])
     w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
