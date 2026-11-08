@@ -21,7 +21,6 @@ committed or sent, and every rank runs the same collectives.
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import os
 import queue
 import traceback
@@ -42,6 +41,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
+from mstar.testing_utils.ranks import rank_context
 from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -217,7 +217,7 @@ def _run_four_ranks(target, args) -> dict:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    ctx = mp.get_context("spawn")
+    ctx = rank_context()
     out = ctx.Queue()
     procs = [ctx.Process(target=target, args=(r, *args(r, port), out)) for r in range(4)]
     for p in procs:

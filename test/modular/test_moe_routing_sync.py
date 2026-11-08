@@ -17,7 +17,6 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch import nn
 
@@ -28,6 +27,7 @@ from mstar.model.components import (
     ParallelSparseMoeBlockWithSharedExpert,
     dispatch_experts_fused,
 )
+from mstar.testing_utils.ranks import spawn_ranks
 
 HIDDEN, INTER, NUM_EXPERTS, TOP_K, TOKENS, WORLD = 32, 16, 8, 2, 6, 2
 
@@ -151,7 +151,7 @@ def _expert_slice(ckpt, expert: int, rank: int, x: torch.Tensor) -> torch.Tensor
 
 @pytest.mark.parametrize("cls", [ParallelSparseMoeBlock, ParallelSparseMoeBlockWithSharedExpert])
 def test_tp_ranks_that_route_differently_stay_in_lockstep(tmp_path, cls):
-    mp.spawn(_lockstep_worker, args=(cls, str(tmp_path / "store"), str(tmp_path)), nprocs=WORLD)
+    spawn_ranks(_lockstep_worker, args=(cls, str(tmp_path / "store"), str(tmp_path)), nprocs=WORLD)
     outs = [torch.load(tmp_path / f"{rank}.pt") for rank in range(WORLD)]
 
     reference, ckpt = _block(cls, CommGroup.trivial()), _checkpoint()

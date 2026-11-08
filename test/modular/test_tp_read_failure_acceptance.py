@@ -47,7 +47,6 @@ called when it exists; a design with its own setup has to be added to
 from __future__ import annotations
 
 import datetime
-import multiprocessing as mp
 import os
 import queue
 import sys
@@ -63,6 +62,7 @@ import torch
 
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.graph.runtime.base import PhasedPostprocess
+from mstar.testing_utils.ranks import rank_context
 from mstar.utils.ipc_format import WorkerMessageType
 
 HERE = Path(__file__).resolve().parent
@@ -847,7 +847,7 @@ def _run(tmp_path, scenario: Scenario) -> Run:
     tmp_path.mkdir(parents=True, exist_ok=True)
     scenario.shm_root = str(tmp_path / "shm")
     scenario.store = str(tmp_path / "store")
-    ctx = mp.get_context("spawn")
+    ctx = rank_context()
     inboxes = [ctx.Queue() for _ in WORKERS]
     outbox = ctx.Queue()
     procs = [ctx.Process(target=_rank_main, args=(r, scenario, inboxes[r], outbox), daemon=True) for r in (0, 1)]

@@ -32,6 +32,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     ADMIT_OK,
     AdmitRuntimeError,
 )
+from mstar.testing_utils.ranks import spawn_ranks
 
 ADAPTERS = ("a1", "a2", "a3", "a4")
 
@@ -436,10 +437,9 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
 
 
 def test_gloo_a_load_failing_on_one_rank_is_refused_on_both(tmp_path):
-    import torch.multiprocessing as mp
 
     lora_paths = _write_adapters(tmp_path, ("a1", "a2"))
-    mp.spawn(_gloo_worker, args=(str(tmp_path / "store"), str(tmp_path), lora_paths), nprocs=2, join=True)
+    spawn_ranks(_gloo_worker, args=(str(tmp_path / "store"), str(tmp_path), lora_paths), nprocs=2)
     for r in range(2):
         result = torch.load(tmp_path / f"rank{r}.pt")
         assert result["agree"] == ["ok", ("load", ("bad",))]

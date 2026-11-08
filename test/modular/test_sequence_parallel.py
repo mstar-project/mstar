@@ -16,7 +16,6 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
@@ -28,6 +27,7 @@ from mstar.model.components.distributed.sequence_parallel import (
     sp_seq_split,
     ulysses_attention,
 )
+from mstar.testing_utils.ranks import spawn_ranks
 
 HEADS = 6
 
@@ -40,7 +40,7 @@ def _group(rank: int, world: int) -> CommGroup:
 
 
 def _run(fn, world, store_path, *args):
-    mp.spawn(_entry, args=(fn, world, str(store_path), args), nprocs=world)
+    spawn_ranks(_entry, args=(fn, world, str(store_path), args), nprocs=world)
 
 
 def _entry(rank, fn, world, store_path, args):

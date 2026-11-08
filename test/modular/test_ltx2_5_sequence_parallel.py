@@ -11,7 +11,6 @@ import sys
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 sys.path.insert(0, ".")
 
@@ -19,6 +18,7 @@ from mstar.distributed.communication import CommGroup  # noqa: E402
 from mstar.model.components.diffusion.attention import sdpa_attention  # noqa: E402
 from mstar.model.ltx2_5.components.transformer import LTX2Attends, LTX2DiT, build_rope  # noqa: E402
 from mstar.model.ltx2_5.config import LTX25Config  # noqa: E402
+from mstar.testing_utils.ranks import spawn_ranks
 
 WORLD = 2
 
@@ -31,7 +31,7 @@ def _group(rank: int) -> CommGroup:
 
 
 def _run(fn, store_path, *args):
-    mp.spawn(_entry, args=(fn, str(store_path), args), nprocs=WORLD)
+    spawn_ranks(_entry, args=(fn, str(store_path), args), nprocs=WORLD)
 
 
 def _entry(rank, fn, store_path, args):

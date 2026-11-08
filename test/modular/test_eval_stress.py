@@ -116,7 +116,8 @@ def test_a_stream_of_blank_lines_or_no_headers_is_a_hang_not_progress():
         app = web.Application()
         app.router.add_post("/generate", blank)
         app.router.add_post("/silent/generate", silent)
-        runner = web.AppRunner(app)
+        # cleanup otherwise waits out the silent handler's sleep
+        runner = web.AppRunner(app, shutdown_timeout=0.1)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()

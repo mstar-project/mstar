@@ -7,7 +7,6 @@ import types
 
 import pytest
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
 # Imported here, not in _worker, so each spawned rank loads torch._dynamo (via
 # communication.py) before init_process_group: loaded after it, dynamo keeps the
@@ -15,6 +14,7 @@ import torch.multiprocessing as mp
 # abort the rank at exit.
 from mstar.distributed import ar_fusion
 from mstar.distributed.communication import CommGroup
+from mstar.testing_utils.ranks import spawn_ranks
 
 WORLD = 2
 
@@ -68,8 +68,7 @@ def _worker(rank, store_path, fails, out_dir):
     ({"auto": {0, 1}, "trtllm": {0}}, None),        # nothing works on rank 0
 ])
 def test_every_rank_agrees_on_backend(tmp_path, fails, expected):
-    mp.spawn(_worker, args=(str(tmp_path / "store"), fails, str(tmp_path)),
-             nprocs=WORLD, join=True)
+    spawn_ranks(_worker, args=(str(tmp_path / "store"), fails, str(tmp_path)), nprocs=WORLD)
     for rank in range(WORLD):
         chosen, leaked = (tmp_path / str(rank)).read_text().split("|")
         assert chosen == str(expected), f"rank {rank} chose {chosen}"
