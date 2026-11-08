@@ -205,54 +205,10 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
-      # Tell the commenter their /review was picked up; a comment-triggered run
-      # is otherwise invisible from the PR.
-      - name: Acknowledge the /review comment
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          COMMENT_ID: ${{ github.event.comment.id }}
-        run: gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null
-
-      # The PR's refs and title (an issue_comment event doesn't carry the PR's
-      # head or base). The title is untrusted; it only ever reaches the prompt.
-      - name: Resolve the PR
-        id: pr
-        continue-on-error: true
-        env:
-          MODE: ${{ needs.preflight.outputs.mode }}
-          CONTINUE: ${{ needs.preflight.outputs.mode == '' }}
-          # Someone with write access: a timeout that only stops a runaway, like the turn cap.
-          TEAM: ${{ needs.preflight.outputs.non_write_user == '' }}
-        run: |
-          gh api "repos/$REPO/pulls/$PR" > pr.json
-          if [ -z "$(jq -r '.head.repo.full_name // empty' pr.json)" ]; then
-            echo "::warning::The PR's head repository no longer exists; can't check it out."
-            echo "why=its head repository (the fork) no longer exists" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          {
-            echo "continue=$CONTINUE"
-            echo "head_sha=$(jq -r .head.sha pr.json)"
-            echo "head_repo=$(jq -r .head.repo.full_name pr.json)"
-            # Mode sets the prompt's reporting bar and the reasoning effort.
-            # Without --effort, Claude Code uses its default for Opus (medium).
-            # A /review continue takes the mode, effort and timeout of the review it continues.
-            case "$MODE" in
-              nogpu) echo "mode=nogpu"; echo "effort=xhigh"; timeout=45 ;;
-              *) echo "mode=light"; echo "effort=high"; timeout=25 ;;
-            esac
-            [ "$TEAM" = "true" ] && timeout=300
-            echo "timeout=$timeout"
-            delim="TITLE_$(openssl rand -hex 8)"
-            echo "title<<$delim"; jq -r .title pr.json; echo "$delim"
-          } >> "$GITHUB_OUTPUT"
-
       # Trusted: main's tip, pinned by name, never the PR's base branch or
       # base.sha, which for a stacked or old PR would be stale rules.
-      # AGENTS.md and the review prompt come from here.
+      # AGENTS.md, the review prompt and the bot's scripts come from here.
       - name: Check out main
-        if: steps.pr.outcome == 'success'
         id: base
         continue-on-error: true
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -260,68 +216,36 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      # React 👀 to the /review comment, since a comment-triggered run is otherwise
+      # invisible from the PR; then the PR's refs and title (an issue_comment event
+      # doesn't carry the PR's head or base) and the review's settings.
+      - name: Resolve the PR
+        if: steps.base.outcome == 'success'
+        id: pr
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          MODE: ${{ needs.preflight.outputs.mode }}
+          NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
+        run: python3 .github/review/bot.py resolve
+
       # /review continue: fetch the handoff a stopped review saved (see "Write
-      # the handoff" below); it waits in $RUNNER_TEMP until the diff step. The newest
-      # unexpired artifact for this PR wins, and only from this workflow on a
-      # trigger that runs the base repository's copy of it. The handoff's mode
-      # is kept; a nogpu one needs write access to continue, like `/review
-      # nogpu`. Values from handoff.json are checked before use. A stopped
-      # review can be continued only while its "didn't complete" comment is
-      # still open: any later run that finishes rewrites that comment as
-      # resolved, so a handoff it superseded is never used.
+      # the handoff" below); it waits in $RUNNER_TEMP until the diff step
+      # (bot.py, restore, says which handoffs it trusts).
       - name: Restore the stopped review
-        if: steps.base.outcome == 'success' && steps.pr.outputs.continue == 'true'
+        if: steps.pr.outcome == 'success' && steps.pr.outputs.continue == 'true'
         id: prev
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
-        run: |
-          name="claude-review-handoff-$PR"
-          fail() { echo "why=$1" >> "$GITHUB_OUTPUT"; echo "::notice::$1"; exit 1; }
-          open_ids=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
-              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
-                (.body | startswith("<!-- claude-review-incomplete -->"))) | .id') \
-            || fail "the PR's comments couldn't be read; try \`/review continue\` again"
-          [ -n "$open_ids" ] || fail "there is no stopped review of this PR to continue: none stopped part-way, or a later run already finished (handoffs are kept for 7 days); ask for a new review with \`/review light\` or \`/review\`"
-          found=""
-          for run_id in $(gh api "repos/$REPO/actions/artifacts?name=$name&per_page=30" --jq '
-              [.artifacts[] | select(.expired | not)] | sort_by(.created_at) | reverse | .[].workflow_run.id'); do
-            read -r path event < <(gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.path) \(.event)"') || continue
-            case "$path:$event" in
-              .github/workflows/claude-review.yml*:issue_comment)
-                found=$run_id; break ;;
-            esac
-          done
-          [ -n "$found" ] || fail "there is no stopped review of this PR to continue (handoffs are kept for 7 days); ask for a new review with \`/review light\` or \`/review\`"
-          dir="$RUNNER_TEMP/prev"
-          gh run download "$found" --repo "$REPO" -n "$name" -D "$dir" \
-            || fail "the saved handoff couldn't be downloaded; try \`/review continue\` again"
-          meta="$dir/handoff.json"
-          mode=$(jq -r '.mode // empty' "$meta" 2> /dev/null) || fail "the saved handoff is malformed"
-          # A handoff saved before the modes were renamed carries the old name.
-          mode=$(python3 -c 'import runpy, sys; print(runpy.run_path(".github/review/render_summary.py")["current_mode"](sys.argv[1]))' "$mode")
-          [ -s "$dir/handoff.md" ] || fail "the saved handoff is malformed"
-          [ "$(jq -r '.pr' "$meta")" = "$PR" ] || fail "the saved handoff is for another PR"
-          [ "$(jq -r '.head_sha' "$meta")" = "$HEAD_SHA" ] \
-            || fail "the PR has new commits since that review stopped; ask for a new review of the current head with \`/review light\` or \`/review\`"
-          case "$mode" in
-            light) effort=high; timeout=25 ;;
-            nogpu)
-              [ -z "$NON_WRITE" ] || fail "continuing a nogpu review takes write access, like \`/review nogpu\`"
-              effort=xhigh; timeout=45 ;;
-            *) fail "the saved handoff is malformed" ;;
-          esac
-          [ -n "$NON_WRITE" ] || timeout=300
-          {
-            echo "dir=$dir"
-            echo "mode=$mode"; echo "effort=$effort"; echo "timeout=$timeout"
-          } >> "$GITHUB_OUTPUT"
+        run: python3 .github/review/bot.py restore
 
       # Untrusted: the PR's tree, for reading changed files in full context.
       # Never executed.
       - name: Check out the PR into pr-head/
-        if: steps.base.outcome == 'success' && steps.prev.outcome != 'failure'
+        if: steps.pr.outcome == 'success' && steps.prev.outcome != 'failure'
         id: head
         continue-on-error: true
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -340,115 +264,7 @@ jobs:
           PREV: ${{ steps.prev.outputs.dir }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
-        run: |
-          if [ -n "$PREV" ]; then cp "$PREV/handoff.md" handoff.md; fi
-          # GitHub refuses `gh pr diff` past 20,000 lines or 300 files. Fall back
-          # to the files API (up to 3,000 files; it omits the patch of a file
-          # that is too large on its own). A removed file's new side is /dev/null,
-          # as in git's own diff.
-          if ! gh pr diff "$PR" --repo "$REPO" > pr.diff 2> diff.err; then
-            echo "::warning::gh pr diff failed ($(head -c 300 diff.err)); building pr.diff from the files API."
-            gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] |
-              (.previous_filename // .filename) as $old |
-              (if .status == "removed" then "/dev/null" else "b/\(.filename)" end) as $new |
-              "diff --git a/\($old) b/\(.filename)\n--- a/\($old)\n+++ \($new)\n\(.patch // "(no patch from GitHub: binary, or too large to show)")"' > pr.diff
-          fi
-          gh pr view "$PR" --repo "$REPO" --json body --jq .body > pr-body.md
-
-          # Inline review comments, each marked with its thread's resolved and
-          # outdated state (only GraphQL has those), and `mine` when this bot posted it.
-          gh api --paginate "repos/$REPO/pulls/$PR/comments" \
-            --jq '.[] | {id, user: .user.login, path, line, side, in_reply_to_id, body}' | jq -s . > review-comments.json
-          gh api graphql --paginate -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
-            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
-              repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-                reviewThreads(first: 100, after: $endCursor) {
-                  pageInfo { hasNextPage endCursor }
-                  nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId } } }
-                } } } }' \
-            --jq '.data.repository.pullRequest.reviewThreads.nodes[] |
-              {id: .comments.nodes[0].databaseId, resolved: .isResolved, outdated: .isOutdated}' | jq -s . > threads.json
-          bots=$(python3 -c 'import json, runpy; print(json.dumps(runpy.run_path(".github/review/render_summary.py")["BOTS"]))')
-          jq --slurpfile t threads.json --argjson bots "$bots" '
-            ($t[0] | map({key: (.id | tostring), value: {resolved, outdated}}) | from_entries) as $m
-            | map(. + ($m[(.in_reply_to_id // .id) | tostring] // {})
-                  + {mine: (.user as $u | any($bots[]; . + "[bot]" == $u))})' review-comments.json > pr-comments.json
-
-          # The conversation tab: replies to the summary, and the author's answers.
-          gh api --paginate "repos/$REPO/issues/$PR/comments" \
-            --jq '.[] | {id, user: .user.login, created_at, body}' | jq -s . > pr-conversation.json
-
-          # A re-review starts from this bot's last summary, when its commit is still an ancestor
-          # of the head: the review re-checks those findings and reads only what changed since
-          # (review-prompt.md, "Re-review"). After a force-push it reviews the whole PR again, and
-          # a nogpu review does too unless the last one was nogpu and skipped nothing.
-          # The state is read only from the bot's own summaries: comments that start with the
-          # summary's marker, in which model text can't open an HTML comment.
-          if [ -z "$PREV" ]; then
-            jq -r '[.[] | select(.user == "mstar-review[bot]" or .user == "github-actions[bot]")
-                    | select(.body | startswith("<!-- claude-review-summary -->"))] | last | .body // empty' \
-              pr-conversation.json | python3 .github/review/render_summary.py --state --mode "$MODE" > last-review.json
-            last=$(jq -r '.head // empty' last-review.json 2> /dev/null)
-            # A diff GitHub won't give (too large, say) means a full review, never an empty since.diff.
-            if [ -n "$last" ] && [ "$(gh api "repos/$REPO/compare/$last...$HEAD_SHA" --jq .status 2> /dev/null)" = "ahead" -o "$last" = "$HEAD_SHA" ] &&
-              gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$last...$HEAD_SHA" > since.diff; then
-              gh api --paginate "repos/$REPO/compare/$last...$HEAD_SHA" --jq '.commits[] |
-                "\(.sha[0:10]) \(if (.parents | length) > 1 then "[merge] " else "" end)\(.commit.message | split("\n")[0])"' \
-                > since-commits.txt || : > since-commits.txt
-              echo "::notice::Re-review: this PR was last reviewed at ${last:0:10}."
-              echo "rereview=true" >> "$GITHUB_OUTPUT"
-            else
-              rm -f last-review.json since.diff
-            fi
-          fi
-
-          # The PRs stacked above this one, for a finding one of them fixes (fixed_above): every open PR
-          # based on this PR's branch, then on theirs, up to 5. above-<n>.diff is the change from this
-          # head to PR n's head, and stacked-above.json lists them as [{number, head_sha}]; the summary
-          # counts a finding as fixed above only in one of them. Only a branch of this repository can
-          # have PRs based on it, so only PRs from this repository count and have their branches walked
-          # (a fork's branch name can match a branch here), and a PR counts only when its head descends
-          # from this head. Branch names and commits reach a command line only after jq has checked them.
-          # A failed fetch leaves none of these files, so a finding said to be fixed above stays open, and
-          # the review still runs.
-          stacked_above() {
-            local branches=() ref list n sha next status
-            ref=$(gh api "repos/$REPO/pulls/$PR" --jq 'select(.head.repo.full_name == .base.repo.full_name)
-                | .head.ref | select(test("^[A-Za-z0-9._/][A-Za-z0-9._/-]*$"))') || return 1
-            [ -z "$ref" ] || branches=("$ref")
-            echo '[]' > stacked-above.json
-            while [ ${#branches[@]} -gt 0 ] && [ "$(jq length stacked-above.json)" -lt 5 ]; do
-              list=$(gh pr list --repo "$REPO" --base "${branches[0]}" --state open \
-                --json number,headRefName,headRefOid,isCrossRepository \
-                --jq '.[] | select((.isCrossRepository | not) and (.number | type == "number") and (.headRefOid | test("^[0-9a-f]{40}$"))
-                  and (.headRefName | test("^[A-Za-z0-9._/][A-Za-z0-9._/-]*$"))) | "\(.number) \(.headRefOid) \(.headRefName)"') \
-                || return 1
-              branches=("${branches[@]:1}")
-              while read -r n sha next; do
-                [ -n "$n" ] && [ "$(jq length stacked-above.json)" -lt 5 ] || continue
-                status=$(gh api "repos/$REPO/compare/$HEAD_SHA...$sha" --jq .status) || return 1
-                [ "$status" = ahead ] || continue
-                gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$HEAD_SHA...$sha" > "above-$n.diff" \
-                  || return 1
-                jq --argjson n "$n" --arg sha "$sha" '. + [{number: $n, head_sha: $sha}]' stacked-above.json > above.json \
-                  && mv above.json stacked-above.json || return 1
-                branches+=("$next")
-              done <<< "$list"
-            done
-          }
-          stacked_above || rm -f above-*.diff above.json stacked-above.json
-
-          # The open issues, [{number, title}], so a latent bug on main can name the one that tracks it.
-          # Titles are user text: the model reads them as untrusted data, and no command line gets them.
-          # A failed fetch leaves no file, and the review says it couldn't check.
-          gh issue list --repo "$REPO" --state open --limit 1000 --json number,title > open-issues.json \
-            || rm -f open-issues.json
-
-          echo "lines=$(wc -l < pr.diff)" >> "$GITHUB_OUTPUT"
-          # The summary's fields, from main, for --json-schema. Assigned first so
-          # a failure ends the step rather than passing an empty schema.
-          schema=$(python3 .github/review/render_summary.py --schema)
-          echo "schema=$schema" >> "$GITHUB_OUTPUT"
+        run: python3 .github/review/bot.py collect
 
       - name: Review
         if: steps.diff.outcome == 'success'

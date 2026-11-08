@@ -1,9 +1,13 @@
 """Check .github/review/bot.py, the review workflow's steps, against a stand-in for `gh`."""
 
+import base64
+import contextlib
 import fnmatch
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -79,6 +83,18 @@ class FakeGh:
         return subprocess.CompletedProcess(argv, 0, answer, "")
 
 
+@contextlib.contextmanager
+def workspace():
+    """A fresh directory to run a step in, as the workflow's workspace."""
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as d:
+        os.chdir(d)
+        try:
+            yield Path(d)
+        finally:
+            os.chdir(cwd)
+
+
 def step(fn, routes, **env):
     """Run the step `fn` with `env` as its parameters and `routes` answering `gh`; its outputs and the fake."""
     fake = FakeGh(routes)
@@ -112,6 +128,79 @@ class TestPreflight(unittest.TestCase):
                          ({"run": "false"}, []), "someone without write access could review another author's PR")
         self.assertEqual(self.preflight("continue", read)[0]["mode"], "",
                          "a /review continue would not keep its own mode")
+
+
+HEAD, LAST = "1" * 40, "2" * 40
+
+
+class TestRestore(unittest.TestCase):
+    def restore(self, meta, non_write="", path=".github/workflows/claude-review.yml"):
+        """/review continue finding one stopped review whose saved handoff has `meta`."""
+        def download(argv, stdin):
+            saved = Path(argv[argv.index("-D") + 1])
+            saved.mkdir(parents=True)
+            (saved / "handoff.json").write_text(json.dumps({"pr": "7", "head_sha": HEAD, **meta}))
+            (saved / "handoff.md").write_text("notes")
+            return ""
+
+        with tempfile.TemporaryDirectory() as temp:
+            return step(bot.restore, {
+                "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
+                                                     "body": bot.INCOMPLETE + "\nThe review didn't complete"}],
+                "GET repos/o/r/actions/artifacts?*": {"artifacts": [
+                    {"expired": False, "created_at": "2026-11-01", "workflow_run": {"id": 9}}]},
+                "GET repos/o/r/actions/runs/9": {"path": path, "event": "issue_comment"},
+                "run download": download,
+            }, repo="o/r", pr="7", head_sha=HEAD, runner_temp=temp, non_write=non_write)[0]
+
+    def test_a_continue_takes_only_this_workflows_handoff_of_this_head(self):
+        self.assertEqual(self.restore({"mode": "thorough"})["mode"], "nogpu",
+                         "a review stopped before the rename couldn't continue")
+        self.assertIn("new commits", self.restore({"mode": "light", "head_sha": LAST})["why"],
+                      "a handoff from an older head would steer a review of new code")
+        self.assertIn("no stopped review", self.restore({"mode": "light"}, path=".github/workflows/fork.yml")["why"],
+                      "a fork's own workflow could plant the handoff")
+        self.assertIn("write access", self.restore({"mode": "nogpu"}, non_write="an-author")["why"],
+                      "a contributor could continue a nogpu review")
+
+
+def summary(head, mode="light"):
+    state = base64.b64encode(json.dumps({"head": head, "mode": mode, "skipped": [], "outside_diff": [],
+                                         "risk": None}).encode()).decode()
+    return {"id": 3, "user": {"login": "mstar-review[bot]"}, "created_at": "t",
+            "body": f"<!-- claude-review-summary -->\nx\n<!-- claude-review-state {state} -->"}
+
+
+def collect(mode="light", **routes):
+    """bot.collect on PR 7 at HEAD, its earlier comments and compares from `routes`; its outputs and files."""
+    with workspace() as ws:
+        out, _ = step(bot.collect, {
+            "GET repos/o/r/pulls/7": {"title": "T", "body": None, "head": {"sha": HEAD, "ref": "x", "repo": None},
+                                      "base": {"ref": "main", "repo": {"full_name": "o/r"}}},
+            "pr diff": "diff --git a/a.py b/a.py\n",
+            "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+            "GET repos/o/r/pulls/7/comments": [],
+            "GET repos/o/r/issues/7/comments": [],
+            "issue list": Fail(),
+            **routes}, repo="o/r", pr="7", head_sha=HEAD, mode=mode)
+        return out, {p.name: p.read_text() for p in ws.iterdir()}
+
+
+class TestCollect(unittest.TestCase):
+    def test_a_re_review_builds_only_on_an_ancestor(self):
+        since = f"GET repos/o/r/compare/{LAST}...{HEAD}"
+        conversation = {"GET repos/o/r/issues/7/comments": [summary(LAST)]}
+
+        def compare(status):
+            return lambda argv, stdin: "diff --git a/b.py b/b.py\n" if "Accept: application/vnd.github.diff" in argv \
+                else json.dumps([{"status": status, "commits": []}] if "--slurp" in argv else {"status": status})
+
+        out, files = collect(**conversation, **{since: compare("ahead")})
+        self.assertEqual((out.get("rereview"), files["since.diff"]), ("true", "diff --git a/b.py b/b.py\n"))
+        self.assertEqual(json.loads(files["last-review.json"])["head"], LAST)
+        out, files = collect(**conversation, **{since: compare("diverged")})
+        self.assertNotIn("rereview", out, "a re-review could rest on commits no longer in the PR")
+        self.assertNotIn("last-review.json", files)
 
 
 if __name__ == "__main__":
