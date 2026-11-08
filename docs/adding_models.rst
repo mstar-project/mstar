@@ -3156,7 +3156,7 @@ which declares the walks (``media_walks(max_iters, encoders)`` and
 ``text_combined_walks()``), runs the one prefill walk ``media_prefill_step`` picks
 through ``initial_prefill_args`` / ``next_prefill_args``, decodes text output, and owns
 media intake (``process_prompt``), the decode loop's cap (``get_loop_caps``, the
-request's output budget less the prefill's token), the KV label and its one-span layout (``kv_labels``,
+request's output budget less the prefill's token), the KV label and its layout (``kv_labels``,
 ``kv_layout``), the sampler's per-request config (``get_request_resource_configs``:
 the request's ``SAMPLING_KEYS`` over ``sampling_defaults``, which ``__init__`` reads
 from the checkpoint's ``generation_config.json``), the LLM's ``SamplerSpec``
@@ -3168,10 +3168,10 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
 ``_prompt_ids`` and ``_create_submodule``, which hands the LLM node
 ``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). The scaffold's
-``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
-``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
-or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through
-its sliding-window pool. ``media`` holds a
+``rebuild_policies`` lets the KV cache drop a request and reprefill its ids on its prefill
+walk, a media prompt's with host copies of its encoders' outputs. A model whose LLM node
+holds a resource that can't drop returns ``{}``, or the engine refuses to start; Muse
+Glimmer returns ``{}`` until a drop has run through its sliding-window pool. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
@@ -3182,11 +3182,11 @@ match its attachments, prepares each attachment in prompt order, expands each pl
 to one pad per token with ``expand_media_pads``, and ``process_prompt`` returns the pads'
 layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, length)``.
 The layout's runs say which encoders the prompt runs (``media_encoders``), for the prefill
-schedule's walk and the KV layout's alike. ``kv_layout``'s ``advance``, how far the prompt
-moves the position counter, defaults to the prompt's length; under Qwen-style MRoPE it is
-the positions' extent instead, an image spanning ``max(h', w')`` positions rather than its
-tokens, which Qwen3.5 computes from the
-runs' grids in its ``kv_layout`` override. ``process_prompt`` also empties each sent
+schedule's walk and the KV layout's alike. ``kv_layout`` lays a media prompt's text out as
+``ids`` spans and each run of pads as a ``rows`` span, which moves the position counter by
+``media_advance``, the run's tokens by default; under Qwen-style MRoPE it is the positions'
+extent instead, an image spanning ``max(h', w')`` positions rather than its tokens, which
+Qwen3.5's override computes from the run's grid. ``process_prompt`` also empties each sent
 attachment's raw ``<modality>_inputs``, spent once prepared. The encoders' inputs are
 lists in prompt order, as their outputs fill the pads. Each run's patch grid (the
 ``grids`` of its ``PreparedMedia``) rides ``MEDIA_LAYOUT`` rather than a tensor, so a
