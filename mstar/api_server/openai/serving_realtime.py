@@ -996,7 +996,7 @@ class RealtimeConversation:
         self.output_rate = model.get_output_sample_rate("audio")
         self.voice = model.get_default_voice()
         self.idle_steps = getattr(model, "turn_idle_steps", None)
-        self.silence_rms = getattr(model, "turn_silence_rms", 0.0)
+        self.silence_rms = getattr(model, "turn_silence_rms", 0.005)
         self.session_id = f"sess_{uuid.uuid4().hex[:16]}"
         self.instructions = ""
         self.turn_detection = "server_vad"
@@ -1320,7 +1320,7 @@ class RealtimeConversation:
         data = bytes(chunk.data)
         marks = meta.get("turn", ())
         if turn is None and data and self.idle_steps is not None and "start" not in marks:
-            # text after a reply ended for its padding, with no start mark: the model speaks again
+            # text after a reply ended on quiet, with no start mark: the model speaks again
             turn = await self._start_turn(step)
         for mark in marks:
             if mark == "start":
@@ -1384,6 +1384,8 @@ class RealtimeConversation:
             return   # silence between replies
         if turn.end is None and self.idle_steps is not None:
             self._end_if_idle(turn, step, pcm)
+            if turn.end is not None:   # its text's held tail goes out, as on every other end
+                await self._feed(turn, b"", final=True)
         last = turn.end == step
         audio = (self._encode_out(pcm, last) if len(pcm) <= 2 * INLINE_RESAMPLE_SAMPLES
                  else await asyncio.to_thread(self._encode_out, pcm, last))

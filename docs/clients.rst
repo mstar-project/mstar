@@ -523,9 +523,12 @@ Per-model notes:
   between; audio between replies is silence and is not sent. A reply ends at the
   model's end mark, where the next reply starts, or, for a model that declares
   ``turn_idle_steps``, once that long has passed with neither text nor audible audio
-  (Nemotron: 2 s, since it often sends no end mark and its audio runs behind its text); text after that opens the next reply. ``turn_detection``
-  ``server_vad`` and ``semantic_vad`` both mean "the model decides", and their knobs are
-  not used; null, or ``create_response`` / ``interrupt_response`` false, are refused.
+  (Nemotron: 2 s, since it often sends no end mark and its audio runs behind its text).
+  The count follows the audio: text that arrives before a pause's audio has played stays
+  in the open reply, so where two replies split depends on how far the text runs ahead,
+  and text after the reply ended opens the next one. ``turn_detection`` ``server_vad``
+  and ``semantic_vad`` both mean "the model decides", and their knobs are not used;
+  null, or ``create_response`` / ``interrupt_response`` false, are refused.
   ``input_audio_buffer.commit`` is acknowledged and flushes nothing; ``clear`` drops only
   what the server holds before the model (half a PCM16 sample, the resampler's few
   milliseconds), since the model hears audio as it comes; and ``conversation.item.create`` takes a user message of ``input_audio``

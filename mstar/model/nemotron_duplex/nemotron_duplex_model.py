@@ -788,8 +788,7 @@ class NemotronDuplexModel(Model):
     # The checkpoint often sends no EOS after a reply, so a reply ends 2 s (25 steps
     # of 80 ms) after both its text and its audible audio stop: the audio runs up to
     # several seconds behind the text.
-    turn_idle_steps = 25
-    turn_silence_rms = 0.005
+    turn_idle_steps = 25   # the talker's output between replies is silent (RMS 0) on H200
 
     def get_voices(self) -> list[str]:
         from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule

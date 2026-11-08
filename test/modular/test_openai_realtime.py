@@ -1509,7 +1509,22 @@ def test_a_reply_without_an_end_mark_ends_once_text_and_audio_go_quiet(duplex):
     assert _played(events, done[0]) == [_step_pcm(i) for i in range(1, 5)] + [bytes(3840)] * 2
 
 
-def test_text_after_a_reply_ended_for_its_padding_is_a_reply_of_its_own(duplex):
+def test_a_reply_ended_on_quiet_sends_its_held_text(duplex):
+    """The text a reply holds back (half a UTF-8 character) goes out when it ends
+    on quiet, as it does at an end mark."""
+    texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi\xe2\x82"), *(_text(i) for i in range(3, 6))]
+    audio = [_audio(0), _audio(1), _audio(2), *(_quiet(i) for i in range(3, 6))]
+    client, api = duplex([c for pair in zip(texts, audio, strict=True) for c in pair], end=True)
+    api.model.turn_idle_steps = 2
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        events = _until_closed(ws)
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert [r["output"][0]["content"][0]["transcript"] for r in done] == ["Hi\ufffd"]
+
+
+def test_text_after_a_reply_ended_on_quiet_is_a_reply_of_its_own(duplex):
     """A pause longer than turn_idle_steps inside the model's speech, or a next
     reply whose start mark is missing: the text after it opens a reply, not lost.
     (Text that arrives before the pause's audio still belongs to the open reply.)"""
@@ -1528,8 +1543,8 @@ def test_text_after_a_reply_ended_for_its_padding_is_a_reply_of_its_own(duplex):
     assert _played(events, done[1]) == [_step_pcm(5), _step_pcm(6)]
 
 
-def test_text_with_its_end_mark_after_a_padded_reply_ends_there(duplex):
-    """The text that opens a reply after padding may carry its end mark in the same step."""
+def test_text_with_its_end_mark_after_a_quiet_reply_ends_there(duplex):
+    """The text that opens a reply after a quiet one may carry its end mark in the same step."""
     texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), _text(3), _text(4), _text(5, b" ok", mark="end"),
              _text(6), _text(7), _text(8)]
     audio = [_audio(0), _audio(1), _audio(2), _quiet(3), _quiet(4), _audio(5), *(_quiet(i) for i in range(6, 9))]

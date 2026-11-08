@@ -1227,7 +1227,7 @@ class Model(ABC):
     # samples in [-1, 1]), and text outside a reply opens one; None: only the marks end
     # and open them.
     turn_idle_steps: int | None = None
-    turn_silence_rms: float = 0.0
+    turn_silence_rms: float = 0.005
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for
