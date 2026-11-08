@@ -215,7 +215,7 @@ def test_a_prefill_that_fills_the_pool_fails_at_its_first_decode():
 
     assert _engine(worker).offloaded == [], "the request was offloaded to retry"
     assert worker._graph_runtime.pushed_back == []
-    assert worker.admission.take_admit_errors() == {"long": _POOL_FILLER_ERROR}
+    assert worker.lifecycle.take_failures() == {"long": _POOL_FILLER_ERROR}
     assert worker.admission.held_until == {}, "the request was held to retry"
 
 
@@ -228,7 +228,7 @@ def test_a_pool_filler_fails_in_a_mixed_step_whichever_row_is_refused(prompt_fir
     worker = _refuse_after_a_pool_filling_prefill(dict(rows if prompt_first else rows[::-1]))
 
     assert _engine(worker).offloaded == [], "the pool filler was offloaded to retry"
-    assert worker.admission.admit_errors == {"long": _POOL_FILLER_ERROR}
+    assert worker.lifecycle.take_failures() == {"long": _POOL_FILLER_ERROR}
     assert worker._graph_runtime.pushed_back == ["short"]
 
 
@@ -341,7 +341,7 @@ def test_a_row_the_cache_served_does_not_make_a_batch_too_big_alone():
     ))
 
     assert _engine(worker).offloaded == ["decoder"], "the request holding pages was not evicted"
-    assert worker.admission.admit_errors == {}
+    assert worker.lifecycle.failed_rids == set()
 
 
 # --- a teardown that hands pages back lifts a cap ---------------------------

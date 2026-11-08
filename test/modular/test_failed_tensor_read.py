@@ -222,6 +222,7 @@ def test_the_worker_fails_a_request_once_when_its_input_read_fails(tmp_path):
         tensor_manager=mgr,
         wakeup_event=SimpleNamespace(drain=lambda: None),
         scheduler=SimpleNamespace(drop_backlogged=lambda rids: None),
+        graph_runtime=SimpleNamespace(get_rid_string=lambda rid: rid),
     )
     w.lifecycle.add("r1", "r1")
 

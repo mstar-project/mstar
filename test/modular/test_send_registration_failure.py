@@ -470,6 +470,7 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
         graph_runtime=SimpleNamespace(
             get_sharding_config=lambda rid: None,
             get_rid_handle=lambda wire: 3,
+            get_rid_string=lambda rid: "r",
             remove_request=lambda rid: released.append(("runtime", rid)),
         ),
     )

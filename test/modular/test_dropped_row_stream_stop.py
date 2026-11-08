@@ -93,6 +93,9 @@ class _Runtime(PhasedPostprocess):
     def clear_pending_loop_stops(self):
         pass
 
+    def get_rid_string(self, rid):
+        return rid
+
     def mark_partition_done(self, rid, partition):
         self.partition_done.append(rid)
 
