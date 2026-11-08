@@ -529,6 +529,8 @@ class APIServer:
             conn.edge_name for conn in model.get_partition_topology().client_connections()
         ) if model is not None else frozenset()
         self.takes_stream_input = bool(self.client_streams)
+        # the conductor's cap; the transcription route splits it between uploads
+        self.max_concurrent_requests = (model_config or {}).get("max_concurrent_requests")
         self._take_result_cpu()
 
         # Before any tensor manager; the conductor and workers inherit it.

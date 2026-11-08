@@ -2060,7 +2060,7 @@ worker with a heavier one can set ``side_stream_walks`` on its submodule to the 
 may run beside the chain instead, and a deployment turns that on with ``side_stream: true``
 on the node's group (see :doc:`serving`). Such a step neither takes a turn on the chain nor
 makes it yield, runs on a second stream, and the windows that come ready while it runs
-batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture on a stream
+batch into the next one (see ``StepPipeline._launch_side`` in ``mstar/worker/step_pipeline.py``). Its graphs capture on a stream
 of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
 walk that nothing on the chain reads, such as a codec. Where the config asks,
 ``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
