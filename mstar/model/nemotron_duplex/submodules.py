@@ -463,6 +463,20 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         self._s2c = subword_to_char
         self._char_pad = char_pad_idx
         self._warmup: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        # Integer tokenizer data, not cached floating conditioning or request
+        # state. The final row is the empty mapping for unknown token ids.
+        if subword_to_char is not None:
+            size = max(subword_to_char, default=-1) + 1
+            lengths = torch.tensor([len(subword_to_char.get(i, ())) for i in range(size)] + [0])
+            offsets = torch.cat((torch.zeros(1, dtype=torch.long), lengths.cumsum(0)))[:-1]
+            characters = torch.tensor(
+                [c for i in range(size) for c in subword_to_char.get(i, ())] + [char_pad_idx], dtype=torch.long,
+            )
+            self._char_widths = tuple(sorted(set(lengths.tolist())))
+            dev = talker.embed_code.weight.device
+            for name, value in (("_char_lengths", lengths), ("_char_offsets", offsets),
+                                ("_characters", characters)):
+                self.register_buffer(name, value.to(dev), persistent=False)
 
     # -- per-speaker constants -------------------------------------------
 
@@ -587,8 +601,8 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
         """Capture the steady-state step (one token per label per session).
-        ``preprocess`` (text conditioning and noise) runs eagerly before the
-        graph; the captured region fuses previous codes and runs the 2N-row backbone over the
+        ``preprocess`` draws noise before the graph; the captured region
+        computes exact-width text conditioning, fuses previous codes and runs the 2N-row backbone over the
         pool and the MaskGIT sampling loop."""
         return [
             BatchedAcceleratorGraphConfig(
@@ -610,22 +624,22 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         dev = talker.embed_code.weight.device
         rids = list(engine_inputs.request_ids)
         ids = torch.cat([inp.input_ids.reshape(-1)[:1] for inp in inputs]).to(dev)
-        # Exact character-width conditioning and native per-request noise remain
-        # host-prepared until their execution-time input contracts are available.
-        conds = talker.text_conditioning_from_ids(ids.tolist(), self._s2c, self._char_pad)
         previous = torch.stack([inp.tensor_inputs["prev_codes"].reshape(-1).to(dev) for inp in inputs])
         gens = [self._generator(rid, dev) for rid in rids]
         return {
-            "input_ids": ids, "prev_codes": previous, "conds": conds,
+            "input_ids": ids, "prev_codes": previous,
             "firsts": [bool(inp.kwargs.get("first", False)) for inp in inputs],
             "spans": [inp.input_seq_len for inp in inputs], **self._noise(gens, dev),
         }
 
-    def forward_batched(self, graph_walk, engine_inputs, input_ids=None, prev_codes=None, conds=None,
+    def forward_batched(self, graph_walk, engine_inputs, input_ids=None, prev_codes=None,
                         firsts=None, spans=None, noise_u=None, noise_eps=None, **kwargs) -> BatchedModelOutput:
         e = self.config.eartts
         rids = list(engine_inputs.request_ids)
         n = len(rids)
+        conds = self.talker.embed_subword.from_token_ids(
+            input_ids, self._char_lengths, self._char_offsets, self._characters, self._char_widths,
+        )
         frame_c, frame_u = self.talker.frame_inputs(prev_codes, conds, input_ids, self.config.text_eos_id)
         if any(firsts):
             warm_c, warm_u, _ = self.warmup()

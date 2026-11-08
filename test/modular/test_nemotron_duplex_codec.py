@@ -124,7 +124,7 @@ class _Talker:
             out = self.node.forward_batched(
                 "talker_decode", engine_inputs, input_ids=torch.zeros(m, dtype=torch.long),
                 prev_codes=torch.zeros(m, e.num_quantizers, dtype=torch.long),
-                conds=torch.zeros(m, 1, e.hidden_size), firsts=[False] * m, spans=[1] * m,
+                firsts=[False] * m, spans=[1] * m,
                 noise_u=torch.zeros(m, e.inference_num_iter, 1, e.mog_num_predictions),
                 noise_eps=torch.zeros(m, e.inference_num_iter, 1, e.code_dim))
         self.runner.commit(step)
@@ -221,6 +221,10 @@ def test_the_codec_decode_runs_no_fft():
     from torch.utils._python_dispatch import TorchDispatchMode
 
     class _NoFFT(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.supports_higher_order_operators = True
+
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             assert not func.__name__.startswith("_fft_"), f"{func} in the codec decode"
             return func(*args, **(kwargs or {}))

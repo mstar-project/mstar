@@ -32,10 +32,47 @@ def fwd(handle: str, iteration: int = 0) -> SimpleNamespace:
                            dynamic_loop_iter_counts={"talker_decode_loop": iteration})
 
 
-def make_sub() -> EarTTSTalkerSubmodule:
+def make_sub(mapping=S2C) -> EarTTSTalkerSubmodule:
     cfg = NemotronDuplexConfig()
     cfg.eartts = TINY
-    return EarTTSTalkerSubmodule(make_talker(), cfg, codec=tiny_codec(), subword_to_char=S2C, char_pad_idx=CHAR_PAD)
+    return EarTTSTalkerSubmodule(make_talker(), cfg, codec=tiny_codec(), subword_to_char=mapping, char_pad_idx=CHAR_PAD)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA exact-width conditioning"))])
+def test_token_conditioning_preserves_exact_physical_width_and_padding(dtype, device):
+    from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
+    from mstar.engine.accelerator_graph_runner import capture_into_graph
+    from mstar.engine.conditional_capture import ConditionalWarmup
+
+    mapping = {**S2C, 12: tuple(range(12))}
+    sub = make_sub(mapping).to(device=device, dtype=dtype).requires_grad_(False)
+    backend = get_accelerator_graph_backend(sub._characters.device) if device == "cuda" else None
+    captured = {}
+    for ids in ([7], [5, 9], [7, 12, 12, 12], [99, 99], [5, 7, 9, 12]):
+        with torch.inference_mode(), torch.autocast(device, dtype=torch.bfloat16, enabled=dtype == torch.bfloat16):
+            values = torch.tensor(ids, device=device)
+            def run(values=values):
+                return sub.talker.embed_subword.from_token_ids(
+                    values, sub._char_lengths, sub._char_offsets, sub._characters, sub._char_widths,
+                )
+            if device == "cuda":
+                if len(ids) not in captured:
+                    with ConditionalWarmup(backend):
+                        run()
+                    graph, output = capture_into_graph(
+                        run, backend.graph_pool_handle(), values.device, None, conditionals=True,
+                    )
+                    captured[len(ids)] = values, graph, output
+                target, graph, actual = captured[len(ids)]
+                target.copy_(values)
+                graph.replay()
+                backend.synchronize()
+            else:
+                actual = run()
+            expected = sub.talker.text_conditioning_from_ids(ids, mapping, CHAR_PAD)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_maskgit_schedule_matches_the_reference_formula():
@@ -185,7 +222,8 @@ def test_frame_fusion_reads_prepared_previous_codes_inside_forward(monkeypatch):
         assert pre["noise_eps"].shape == (n, e.inference_num_iter, 1, e.code_dim)
         warm_c, warm_u, _ = sub.warmup()
         frame_c, frame_u = sub.talker.frame_inputs(
-            pre["prev_codes"], pre["conds"], pre["input_ids"], sub.config.text_eos_id,
+            pre["prev_codes"], sub.talker.text_conditioning_from_ids(pre["input_ids"].tolist(), S2C, CHAR_PAD),
+            pre["input_ids"], sub.config.text_eos_id,
         )
         expected = torch.cat([
             torch.cat([warm, frame[i:i + 1]]) if inp.kwargs["first"] else frame[i:i + 1]
@@ -198,6 +236,10 @@ def test_frame_fusion_reads_prepared_previous_codes_inside_forward(monkeypatch):
         pre["prev_codes"].fill_(1)
         sub.forward_batched("talker_decode", eng, **pre)
         assert not torch.equal(backbone[-1], expected)
+        previous = backbone[-1].clone()
+        pre["input_ids"].fill_(9)  # a later replay's longer token is conditioned inside the body
+        sub.forward_batched("talker_decode", eng, **pre)
+        assert not torch.equal(backbone[-1], previous)
 
 
 def test_decode_capture_config_commits_two_labels_per_row():

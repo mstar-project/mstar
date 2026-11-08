@@ -453,6 +453,39 @@ class EmbedSubword(nn.Module):
         )
         subword_embeds[subword_mask] = out_emb
 
+        return self._add_flags(subword_embeds, subword_ids)
+
+    def from_token_ids(self, ids, lengths, offsets, characters, widths) -> torch.Tensor:
+        """One token per physical row, retaining the batch's exact char width.
+
+        The integer tokenizer tables are immutable model data. Each branch
+        runs the same encoder shape as host preparation, including PAD rows.
+        """
+        missing = lengths.numel() - 1
+        safe = torch.where((ids >= 0) & (ids < missing), ids, missing)
+        lens, starts = lengths[safe], offsets[safe]
+        maximum = lens.max()
+
+        def encode(lo, hi, maximum, lens, starts):
+            if hi - lo == 1:
+                columns = torch.arange(widths[lo], device=ids.device)
+                positions = torch.where(
+                    columns[None, :] < lens[:, None], starts[:, None] + columns, characters.numel() - 1,
+                )
+                return self.encode_chars(characters[positions], lens)
+            middle = (lo + hi) // 2
+            return torch.cond(
+                maximum < widths[middle],
+                lambda maximum, lens, starts: encode(lo, middle, maximum, lens, starts),
+                lambda maximum, lens, starts: encode(middle, hi, maximum, lens, starts),
+                (maximum, lens, starts),
+            )
+
+        pooled = encode(0, len(widths), maximum, lens, starts)[:, None, :]
+        return self._add_flags(pooled, ids[:, None])
+
+    def _add_flags(self, subword_embeds, subword_ids):
+
         # continuation-flag embedding (index 0 forced to zero in the checkpoint)
         vocab = self.subword_flag_emb.cont_emb.num_embeddings
         pad = self.subword_flag_emb.is_continuation.numel() - 1
