@@ -244,7 +244,6 @@ class TestStart(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "LIVE_TEST_ANTHROPIC_KEY"}
         lt = Path(tempfile.mkdtemp())
         config = types.SimpleNamespace(load_config=lambda: cfg, ApiError=RuntimeError,
-                                       entry=lambda key: {"usd_per_hour": 3.0, "launched_at": 1, "deadline": 2},
                                        slurm_node=lambda cfg, name: {"partition": "background"},
                                        slurm_run=lambda sl, cmd: pending)
         with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", config), \
@@ -375,18 +374,15 @@ class Done:
 
 
 class TestCost(unittest.TestCase):
-    def test_a_run_costs_its_gpu_hours_to_the_deadline_and_the_boxs_session(self):
+    def test_a_box_costs_what_its_session_reports_up_to_the_limit(self):
         lt = Path(tempfile.mkdtemp())
-        self.assertEqual(gpu_review.run_cost(lt, 10_000), (0.0, 0.0), "a run that never launched would cost something")
-        (lt / "entry.json").write_text(json.dumps({"usd_per_hour": 3.0, "launched_at": 3600, "deadline": 7200}))
+        self.assertEqual(gpu_review.box_cost(lt), 0.0, "a box that wrote nothing would cost something")
         (lt / "results").mkdir()
         (lt / "results/claude.json").write_text(json.dumps({"total_cost_usd": 1.5}))
-        self.assertEqual(gpu_review.run_cost(lt, 5400), (1.5, 1.5), "the GPU cost would not be pro-rated")
-        self.assertEqual(gpu_review.run_cost(lt, 100_000), (3.0, 1.5),
-                         "a run past its deadline would cost more than its Pod can")
+        self.assertEqual(gpu_review.box_cost(lt), 1.5)
         for cost in ("1e12", "Infinity", "NaN", "-1e12", "[1]"):  # claude.json is the box's own file
             (lt / "results/claude.json").write_text('{"total_cost_usd": %s}' % cost)
-            self.assertEqual(gpu_review.run_cost(lt, 5400)[1], 0.0, f"a box could claim a cost of {cost}")
+            self.assertEqual(gpu_review.box_cost(lt), 0.0, f"a box could claim a cost of {cost}")
 
     def test_a_cost_that_cant_be_read_still_releases_the_run(self):
         calls = []
@@ -394,7 +390,7 @@ class TestCost(unittest.TestCase):
                                       release_by_name=lambda cfg, pr, tag: None)
         with unittest.mock.patch.object(gpu_review, "gpu_py", state), \
                 unittest.mock.patch.object(gpu_review, "gpu", side_effect=lambda *a, **k: calls.append(a) or Done()), \
-                unittest.mock.patch.object(gpu_review, "run_cost", side_effect=ValueError("bad entry.json")), \
+                unittest.mock.patch.object(gpu_review, "box_cost", side_effect=ValueError("bad claude.json")), \
                 contextlib.redirect_stdout(io.StringIO()):
             gpu_review.cleanup({}, 7, "1-1", tempfile.mkdtemp())
         self.assertIn(("terminate", "eras:1"), calls, "a corrupt cost file would leave the box running")
