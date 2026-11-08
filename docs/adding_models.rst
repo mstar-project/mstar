@@ -1448,6 +1448,15 @@ the engine refuses, at load, a verifying node whose ``drafter`` (the submodule's
 Declare the pool's tunables (``page_size``, ``max_num_pages``) as for any pool: ``max_num_pages``
 counts pages of every layer, the drafter's included, as it always did.
 
+A target that builds and runs a drafter module (Qwen3) types it as ``HostedDrafterDecl``
+(``mstar/model/components/hosted_drafter.py``): ``num_draft_tokens``, ``tap_key``, ``prefill_steps()``,
+``verify_steps()``, ``build(...)``, and the module's ``prefill``.
+
+``mstar/model/qwen3`` is the worked example: a plain Qwen3 node that, under a draft block,
+adds a DSpark drafter (``mstar/model/components/dspark``) whose layers join the target's KV
+pool as layer set ``"dspark"``, rotate at the target's positions, and attend through a second
+attention resource over that pool with the hidden-last-row mask.
+
 The engine owns everything across steps: the order inside the step (draft, agree on rank 0's
 drafts, target, verify, observe), the bonus token in the sampler's loop-back slot, the KV
 length the resident graph advances by ``accepted + 1``, the token cut at stop ids and the
