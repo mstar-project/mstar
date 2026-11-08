@@ -1,9 +1,10 @@
 """``fp8_linear``: dense_fp8's block-fp8 linear (128 x 128 weight scales), swept per token count.
 
 Each bucket times every kernel that runs on this GPU (w8a16 at its built-in tile and at candidate tiles up to
-``W8A16_SWEEP_MAX`` tokens, flashinfer's swapAB GEMM, cuBLAS's block-scaled GEMM, DeepGEMM's where it is installed,
-the weight dequantized to bf16 for cuBLAS) inside a CUDA graph that calls
-the linear once per weight copy in a rotation, so the weights come from HBM rather than L2, as in a decode step.
+``W8A16_SWEEP_MAX`` tokens, the same kernel with an e4m3 dot (triton8) up to ``TRITON8_SWEEP_MAX``, flashinfer's
+swapAB GEMM, cuBLAS's block-scaled GEMM, DeepGEMM's where it is installed, the weight dequantized to bf16 for cuBLAS)
+inside a CUDA graph that calls the linear once per weight copy in a rotation, so the weights come from HBM rather
+than L2, as in a decode step.
 A candidate competes only when its output is within ``MAX_REL_L2`` of the bf16 product of the dequantized weight
 (the kernels that quantize activations to e4m3 per 128 columns sit a few percent away; a broken tile far more).
 
@@ -30,6 +31,7 @@ from mstar.utils.fp8_block import FP8_DTYPE
 
 DEFAULT_BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 2048)
 W8A16_SWEEP_MAX = 64
+TRITON8_SWEEP_MAX = 128
 MAX_REL_L2 = 0.06
 # enough weight copies that a rotation outgrows any GPU's L2
 ROTATION_BYTES = 256 << 20
@@ -45,6 +47,15 @@ def w8a16_candidates(m: int, k: int, quick: bool = False) -> Iterator[dict]:
     for dot, bn, bk, split, stages, warps in grid:
         if k % (split * bk) == 0:
             yield dict(DOT=dot, BN=bn, BK=bk, SPLIT=split, STAGES=stages, num_warps=warps)
+
+
+def triton8_candidates(k: int, quick: bool = False) -> Iterator[dict]:
+    """triton8 tiles worth timing: output columns, K split, pipeline depth, warps (the token tile follows M)."""
+    grid = itertools.product((64, 128) if quick else (32, 64, 128), (1, 2, 4, 8), (3, 4) if quick else (3, 4, 5),
+                             (4,) if quick else (4, 8))
+    for bn, split, stages, warps in grid:
+        if k % (split * 128) == 0:
+            yield dict(BN=bn, SPLIT=split, STAGES=stages, num_warps=warps)
 
 
 class Fp8LinearSweep:
@@ -76,7 +87,7 @@ class Fp8LinearSweep:
         """Rows name the op's kernels; the registry's check_rows already refused anything else."""
 
     def _runs(self, choice: Choice) -> bool:
-        return (choice.impl in ("w8a16", "dequant")
+        return (choice.impl in ("w8a16", "dequant", "triton8")
                 or (choice.impl == "flashinfer" and dense_fp8._FI_OK.get(self.device))
                 or (choice.impl == "cublas" and dense_fp8._W8A8_OK.get(self.device))
                 or (choice.impl == "deepgemm" and dense_fp8._DG_OK.get(self.device)))
@@ -113,9 +124,12 @@ class Fp8LinearSweep:
 
         result = BucketResult(bucket=m, current=current, current_us=us_of(current), default_us=us_of(default),
                               best=None, best_us=float("nan"))
-        options = [Choice("w8a16"), Choice("flashinfer"), Choice("cublas"), Choice("deepgemm"), Choice("dequant")]
+        options = [Choice("w8a16"), Choice("triton8"), Choice("flashinfer"), Choice("cublas"), Choice("deepgemm"),
+                   Choice("dequant")]
         if m <= W8A16_SWEEP_MAX:
             options += [Choice("w8a16", cfg) for cfg in w8a16_candidates(m, self.k, self.quick)]
+        if m <= TRITON8_SWEEP_MAX:
+            options += [Choice("triton8", cfg) for cfg in triton8_candidates(self.k, self.quick)]
         for choice in options:
             us = us_of(choice)
             if math.isnan(us):  # refused, failed or off the reference

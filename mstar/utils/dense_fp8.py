@@ -60,6 +60,13 @@ def _w8a16_unavailable(target) -> str | None:
     return None if target.device.type == "cuda" else f"needs a GPU, not {target.device.type}"
 
 
+def _triton8_unavailable(target) -> str | None:
+    if target.device.type != "cuda" or not current_platform.is_cuda():
+        return f"needs an NVIDIA GPU, not {target.device.type}"
+    capability = current_platform.cuda_capability(target.device)
+    return None if capability is not None and capability >= (8, 9) else "an e4m3 dot needs SM89 or newer"
+
+
 def _fi_unavailable(target) -> str | None:
     reserve(target.device)
     return None if _FI_OK.get(target.device) else "flashinfer's SM90 block-scale GEMM does not run here"
@@ -81,6 +88,9 @@ FP8_LINEAR = register(KernelOp(
         Impl("w8a16", _w8a16_unavailable,
              doc="the Triton kernel here; its config is the tile (DOT, BN, BK, SPLIT, STAGES, num_warps[, TB]), "
                  "none for the built-in tile of the token count"),
+        Impl("triton8", _triton8_unavailable,
+             doc="the Triton kernel here with an e4m3 dot (W8A8, x quantized per 128 columns inside it); its config "
+                 "is the tile (BN, SPLIT, STAGES, num_warps[, TB]), none for the built-in tile"),
         Impl("flashinfer", _fi_unavailable, doc="flashinfer's SM90 block-scale GEMM, x quantized per 128 columns"),
         Impl("cublas", _cublas_unavailable, doc="cuBLAS's block-scaled GEMM, x quantized per 128 columns"),
         Impl("deepgemm", _dg_unavailable,
@@ -136,6 +146,35 @@ def _dot_loop(x, w, s, rows, live_n, t, live_t, k_lo, n0, K: tl.constexpr, I: tl
                 acc += d * tl.where(up, tl.load(su_row + k // BI), sg)[:, None]
             else:
                 acc += d * sg
+    return acc
+
+
+@triton.jit
+def _dot8_loop(x, w, s, rows, live_n, t, live_t, k_lo, n0, K: tl.constexpr, I: tl.constexpr,
+               BO: tl.constexpr, BI: tl.constexpr, BN: tl.constexpr, R: tl.constexpr,
+               TB: tl.constexpr, KS: tl.constexpr, GLU: tl.constexpr, STAGES: tl.constexpr):
+    """``_dot_loop`` with an e4m3 dot (W8A8): each step is one scale block of BI columns, x's [TB, BI] slice
+    quantized here as per_token_group_quant_fp8 would (one scale per token per block), the weight tile fed to
+    the dot as stored (no conversion), the block's partial scaled by both scales into the fp32 accumulator."""
+    kk = tl.arange(0, BI)
+    w_row = w + rows[:, None].to(tl.int64) * K + kk[None, :]
+    x_row = x + t[:, None].to(tl.int64) * K + kk[None, :]
+    sg_row = s + (n0 // BO) * (K // BI)
+    su_row = s + ((I + n0) // BO) * (K // BI)
+    up = tl.arange(0, R) >= BN
+    acc = tl.zeros([R, TB], tl.float32)
+    for k in tl.range(k_lo, k_lo + KS, BI, num_stages=STAGES):
+        wk = tl.load(w_row + k, mask=live_n[:, None], other=0).to(tl.float8e4nv, bitcast=True)
+        xk = tl.load(x_row + k, mask=live_t[:, None], other=0.0).to(tl.float32)
+        xs = tl.maximum(tl.max(tl.abs(xk), 1), 1e-10) / 448.0
+        xq = tl.clamp(xk / xs[:, None], -448.0, 448.0).to(tl.float8e4nv)
+        d = tl.dot(wk, tl.trans(xq))
+        sg = tl.load(sg_row + k // BI)
+        if GLU:
+            d = d * tl.where(up, tl.load(su_row + k // BI), sg)[:, None]
+        else:
+            d = d * sg
+        acc += d * xs[None, :]
     return acc
 
 
@@ -228,9 +267,9 @@ def _w8a16_kernel(x, w, s, out, part, cnt, M, N_OUT,
                   K: tl.constexpr, I: tl.constexpr, BO: tl.constexpr, BI: tl.constexpr,
                   BN: tl.constexpr, BK: tl.constexpr, SB: tl.constexpr, TB: tl.constexpr,
                   SPLIT: tl.constexpr, GLU: tl.constexpr, DOT: tl.constexpr,
-                  STAGES: tl.constexpr):
+                  STAGES: tl.constexpr, A8: tl.constexpr = False):
     """Program (output tile, K split, token tile): BN output columns (and their up rows under
-    GLU) for TB tokens over K / SPLIT."""
+    GLU) for TB tokens over K / SPLIT. A8: the e4m3 dot (x quantized per block in the loop)."""
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
     pid_m = tl.program_id(2)
@@ -249,8 +288,12 @@ def _w8a16_kernel(x, w, s, out, part, cnt, M, N_OUT,
             rows = tl.where(r < BN, n0 + r, I + n0 + r - BN)
         else:
             rows = n0 + r
-        acc = _dot_loop(x, w, s, rows, live_n, t, live_t, pid_k * KS, n0, K, I, BO, BI, BN, R,
-                        BK, SB, TB, KS, GLU, STAGES)
+        if A8:
+            acc = _dot8_loop(x, w, s, rows, live_n, t, live_t, pid_k * KS, n0, K, I, BO, BI, BN, R,
+                             TB, KS, GLU, STAGES)
+        else:
+            acc = _dot_loop(x, w, s, rows, live_n, t, live_t, pid_k * KS, n0, K, I, BO, BI, BN, R,
+                            BK, SB, TB, KS, GLU, STAGES)
         if SPLIT == 1:
             _epilogue(acc, out, n0, t, live_t, N_OUT, BN, TB, GLU)
         else:
@@ -481,6 +524,25 @@ def _w8a16(x, w, s, block_size, glu, cfg=None):
     return out
 
 
+def _triton8_tiles(M: int, N: int, K: int, glu: bool) -> dict:
+    """triton8's built-in tile: 64 output columns, token tiles of 16 to 64, K split until about two programs
+    per SM."""
+    tb = min(64, max(16, triton.next_power_of_2(M)))
+    programs = triton.cdiv(N, 64) * triton.cdiv(M, tb)
+    split = 1
+    while programs * split < 264 and K % (2 * split * 128) == 0 and K // (2 * split) >= 512:
+        split *= 2
+    return dict(BN=64, SPLIT=split, STAGES=4, num_warps=4)
+
+
+def _triton8(x, w, s, block_size, glu, cfg=None):
+    """The split-K kernel with its e4m3 dot: one scale block per step, so BK is the block's width."""
+    M, K = x.shape
+    N = w.shape[0] // 2 if glu else w.shape[0]
+    cfg = dict(cfg or _triton8_tiles(M, N, K, glu))
+    return _w8a16(x, w, s, block_size, glu, dict(cfg, DOT=True, BK=block_size[1], A8=True))
+
+
 def _w8a8(x, w, s, block_size, glu):
     """cuBLAS's block-scaled fp8 GEMM: x group-quantized to e4m3 per 128 columns
     (fused_moe.prefill's kernel), the weight's 128 x 128 scales as they are. cuBLAS wants the
@@ -586,7 +648,7 @@ def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=
     if rows is not None:
         bounds, choices = rows
         choice = choices[bisect.bisect_left(bounds, m)]
-        if (choice.impl in ("w8a16", "dequant") or (choice.impl == "flashinfer" and _FI_OK.get(device))
+        if (choice.impl in ("w8a16", "dequant", "triton8") or (choice.impl == "flashinfer" and _FI_OK.get(device))
                 or (choice.impl == "cublas" and _W8A8_OK.get(device))
                 or (choice.impl == "deepgemm" and _DG_OK.get(device))):
             return choice.impl, choice.config
@@ -610,6 +672,8 @@ def _linear(x, w, s, block_size, glu):
         return _w8a8(x, w, s, block_size, glu)
     if impl == "deepgemm":
         return _dg(x, w, s, glu)
+    if impl == "triton8":
+        return _triton8(x, w, s, block_size, glu, config)
     return _w8a16(x, w, s, block_size, glu, config)
 
 
