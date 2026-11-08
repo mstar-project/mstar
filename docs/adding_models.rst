@@ -686,8 +686,8 @@ keys. Parakeet's transducer state and both speech codecs are the examples.
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
 ``compile_op`` and ``workspace_mb`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields, which a deployment's
-``resources:`` block overrides. A cross read on an array that keeps entries takes no setting yet. It
-refuses anything else.
+``resources:`` block overrides. A cross read on an array that keeps entries takes
+``decode_tensor_cores`` alone. It refuses anything else.
 
 Resource specs
 ~~~~~~~~~~~~~~

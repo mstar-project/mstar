@@ -210,10 +210,13 @@ def test_a_kept_cross_read_with_no_layout_yet_is_refused_by_name(arrays, cause):
         build_specs(arrays)
 
 
-def test_a_kept_cross_read_takes_no_kernel_setting_yet():
+def test_a_kept_cross_read_takes_only_decode_tensor_cores():
     arrays = [_self_array(), _context_array()]
-    with pytest.raises(ValueError, match=r"kernel_settings\['cross'\] sets \['decode_fmha'\]; a cross read"):
+    with pytest.raises(ValueError, match=r"kernel_settings\['cross'\] sets \['decode_fmha'\]; it may set only "
+                                         r"\['decode_tensor_cores'\]"):
         build_specs(arrays, kernel_settings={"cross": {"decode_fmha": True}})
+    built = build_specs(arrays, kernel_settings={"cross": {"decode_tensor_cores": False}})
+    assert next(spec for spec in built if spec.resource_key == "cross").config.decode_tensor_cores is False
     built = build_specs(arrays, kernel_settings={"context": {"max_num_pages": 9}})
     assert next(spec for spec in built if spec.resource_key == "context").config.max_num_pages == 9
 

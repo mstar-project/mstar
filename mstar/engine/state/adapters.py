@@ -401,10 +401,9 @@ def _apply_kernel_settings(
                              f"declarations, which have {sorted(owners)}")
         # a read on a node in ``sdpa_nodes`` has no spec to set
         spec = by_key.get(spec_of.get(key, key))
-        if isinstance(spec, CrossAttentionSpec) and settings:
-            raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{key!r}] sets {sorted(settings)}; a cross "
-                             "read on a kept array takes no setting yet")
-        if isinstance(spec, KVSpec):
+        if isinstance(spec, CrossAttentionSpec):
+            allowed = {"decode_tensor_cores"}
+        elif isinstance(spec, KVSpec):
             allowed = {"max_num_pages"}
         elif isinstance(spec, RecurrentStateSpec):
             allowed = {"max_slots"}
