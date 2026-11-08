@@ -4,6 +4,7 @@ No weights are loaded: the model object is built without ``__init__``, or with
 the checkpoint lookup and the tokenizer stubbed (``_no_checkpoint``)."""
 
 import base64
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -18,9 +19,11 @@ from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig,
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext, apply_yaml_overrides
 from mstar.engine.resources.attn.config import AttentionSpec
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec
+from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.position.config import PositionSpec
 from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.engine.state import host
+from mstar.engine.state.adapters import node_handles, node_resources
 from mstar.model.chatterbox.chatterbox_model import (
     PREV_TOKEN,
     REF_AUDIO,
@@ -30,9 +33,9 @@ from mstar.model.chatterbox.chatterbox_model import (
     ChatterboxModel,
     voice_key_for,
 )
+from mstar.model.chatterbox.components.s3gen import ReferenceConditioning
 from mstar.model.chatterbox.components.s3gen_graphs import EncoderGraphs, SolveGraphs, VocoderGraphs
 from mstar.model.chatterbox.config import (
-    CFG_LABEL,
     COND_LABEL,
     T3_ATTN,
     T3_KV,
@@ -49,7 +52,8 @@ from mstar.model.chatterbox.submodules import (
     VoiceCache,
 )
 from mstar.model.registry import HF_MODELS, get_model_class, model_init_kwargs
-from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, InputMetadata, ModelInputsFromEngine, engine_step
+from mstar.streaming.stream_buffer import StreamBuffer
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
@@ -65,7 +69,7 @@ class _TokenizerStub:
 
 
 def _sampler_spec(model: ChatterboxModel) -> SamplerSpec:
-    return next(s for s in model.get_node_resources() if isinstance(s, SamplerSpec))
+    return next(s for s in node_resources(model) if isinstance(s, SamplerSpec))
 
 
 def _make_model(variant: str = "chatterbox", voices_dir=None) -> ChatterboxModel:
@@ -152,7 +156,7 @@ def test_registry_graph_and_yaml_are_consistent(key, repo, yaml_name):
     offline = topo.connections[0].chunk_policy_factory()
     assert not offline.is_ready(model.config.t3.max_speech_tokens)  # flushes at producer done
 
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     kv = next(s for s in specs if isinstance(s, KVSpec))
     assert kv.nodes == {"T3"} and kv.config.num_layers == model.config.t3.backbone.num_hidden_layers
     assert kv.config.head_dim == 64 and kv.config.num_kv_heads == 16
@@ -460,15 +464,13 @@ def test_generation_kwargs_defaults_and_turbo_guards():
     configs = model.get_request_resource_configs({}, {"cfg_weight": 0.3, "temperature": 0.5, "seed": 1})
     assert configs[T3_SAMPLER].temperature == 0.5
     assert configs[T3_SAMPLER].repetition_penalty == 1.2
-    assert isinstance(configs[T3_KV], KVReqConfig)
-    assert configs[T3_KV].needed_labels == [COND_LABEL, UNCOND_LABEL]
-    assert model.get_request_resource_configs({}, {"cfg_weight": 0})[T3_KV].needed_labels == [COND_LABEL]
+    # the labels a request opens are the ones its layout names
+    assert configs.keys() == {T3_SAMPLER}
 
     turbo = _make_model("turbo")
     knobs = turbo.resolve_generation_kwargs({"cfg_weight": 0.5, "exaggeration": 0.7, "min_p": 0.1})
     assert knobs["cfg_weight"] == 0.0 and knobs["exaggeration"] == 0.0 and knobs["min_p"] == 0.0
     assert knobs["top_k"] == 1000 and knobs["top_p"] == 0.95
-    assert turbo.get_request_resource_configs({}, {})[T3_KV].needed_labels == [COND_LABEL]
 
 
 # Each of these hung a request for 600 s, failed its whole batch, or was
@@ -579,21 +581,28 @@ def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(name, caplog):
     assert "sets no max_concurrent_requests" in caplog.text
 
 
+def _fits(model, cap: int, max_num_pages: int) -> bool:
+    cfg = {"max_concurrent_requests": cap, "resources": {"t3_kv": {"page_size": 64, "max_num_pages": max_num_pages}}}
+    try:
+        model.validate_config_yaml(cfg, "x.yaml")
+    except ValueError as error:
+        assert f"need {max_num_pages + 1} pages" in str(error)
+        return False
+    return True
+
+
 def test_kv_fit_counts_the_requests_and_the_sink_page():
+    # 25 pages for each of the two CFG streams of 30 requests, and the sink page
     model = _make_model()
     model.config.max_new_tokens_limit = 1000
-    assert model._request_kv_pages(64) == 50  # 25 pages for each of the two CFG streams
-    cfg = {"max_concurrent_requests": 30, "resources": {"t3_kv": {"page_size": 64, "max_num_pages": 1501}}}
-    model.validate_config_yaml(cfg, "x.yaml")
-    cfg["resources"]["t3_kv"]["max_num_pages"] = 1500
-    with pytest.raises(ValueError, match="need 1501 pages"):
-        model.validate_config_yaml(cfg, "x.yaml")
+    assert _fits(model, 30, 1501) and not _fits(model, 30, 1500)
+    # one stream of 30 pages for each of 50 requests
     turbo = _make_model("turbo")
     turbo.config.max_new_tokens_limit = 1000
-    assert turbo._request_kv_pages(64) == 30
+    assert _fits(turbo, 50, 1501) and not _fits(turbo, 50, 1500)
     # T3 repeats the speech BOS, so 34 + 512 + 2 + 989 tokens take a 25th page
     model.config.max_new_tokens_limit = 989
-    assert model._request_kv_pages(64) == 2 * 25
+    assert not _fits(model, 30, 1500)
 
 
 # ---------------------------------------------------------------------------
@@ -738,12 +747,22 @@ class _TinyT3(torch.nn.Module):
         return self.speech_emb(ids) + self.speech_pos_emb.weight[position]
 
 
+class _StubResource:
+    """Stands in for a built resource the T3 handles hold."""
+
+    def layer_view(self, i):
+        return torch.empty(0)
+
+
 def _t3_submodule(variant="chatterbox"):
-    config = ChatterboxConfig.from_variant(variant)
+    model = _make_model(variant)
     voice = BuiltinT3Voice(
         speaker_emb=torch.zeros(256), prompt_tokens=torch.zeros(3, dtype=torch.long),
     )
-    return T3Submodule(_TinyT3(config.t3), config, builtin_voice=voice)
+    sub = T3Submodule(_TinyT3(model.config.t3), model.config, builtin_voice=voice)
+    resources = {spec.resource_key: _StubResource() for spec in node_resources(model)}
+    sub.bind_node_state(node_handles(model, "T3", resources))
+    return sub
 
 
 def _fwd_info(rid, cfg_weight=0.5, temperature=0.8, max_new=1000):
@@ -767,7 +786,6 @@ def test_t3_prefill_inputs_and_cfg_step_declaration():
     assert inputs[1].input_seq_len == cond_len + 3 + 2
     assert inputs[0].resource_step_info is True
     assert inputs[0].tensor_inputs["uncond_embeds"].shape == inputs[0].input_embeds.shape
-    assert sub.request_state("a")["generated"] == 0
 
     batch = ExecutingBatch(
         node_name="T3", step_context=_step_context("prefill", ["a", "b"]),
@@ -782,14 +800,14 @@ def test_t3_prefill_inputs_and_cfg_step_declaration():
     # sampling knobs are the sampler resource's, not forward inputs
     assert set(packed) == {"input_embeds", "requires_cfg", "cfg_weight"}
 
-    step = sub.declare_step("prefill", ["a", "b"], inputs)
+    step = engine_step(sub, graph_walk="prefill", request_ids=["a", "b"], inputs=inputs)
     assert step.cg_key_info is True
     labels = [(s.request_id, s.label, s.span) for s in step.segments]
     assert labels == [
         ("a", COND_LABEL, inputs[0].input_seq_len), ("b", COND_LABEL, inputs[1].input_seq_len),
         ("a", UNCOND_LABEL, inputs[0].input_seq_len), ("b", UNCOND_LABEL, inputs[1].input_seq_len),
     ]
-    assert step.steps[T3_KV].combined_labels == {(COND_LABEL, UNCOND_LABEL): CFG_LABEL}
+    assert step.steps[T3_KV].combined_labels == {(COND_LABEL, UNCOND_LABEL): "main+uncond"}
     assert step.steps[T3_ATTN].causal is True
     assert set(step.steps) == {T3_KV, T3_ATTN, T3_POS, T3_SAMPLER}
     tracked = step.steps[T3_SAMPLER].prefill_tracked_tokens
@@ -799,22 +817,20 @@ def test_t3_prefill_inputs_and_cfg_step_declaration():
 def test_t3_decode_inputs_track_speech_positions_and_no_cfg_is_single_stream():
     sub = _t3_submodule()
     info = _fwd_info("a", cfg_weight=0.0)
-    sub.prepare_inputs("prefill", info, {TEXT_INPUTS: [torch.tensor([255, 5, 0])]})
-    sub.postprocess("a", info, {SPEECH_TOKENS: [torch.tensor([17])]})
-    d1 = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([17])]})
-    # a step re-driven after a refused admit keeps its position
-    retry = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([17])]})
-    assert torch.equal(retry.input_embeds, d1.input_embeds)
-    sub.postprocess("a", info, {SPEECH_TOKENS: [torch.tensor([18])]})
-    d2 = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([18])]})
+
+    def decode(token, iteration):
+        loop = InputMetadata(dynamic_loop_iter_counts={"decode_loop": iteration})
+        return sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([token])]}, input_metadata=loop)
+
+    d1 = decode(17, 0)
+    d2 = decode(18, 1)
     assert d1.input_seq_len == 1 and d1.resource_step_info is False
     expected = sub.model.speech_emb(torch.tensor([18])) + sub.model.speech_pos_emb(torch.tensor([2]))
     assert torch.allclose(d2.input_embeds, expected)
-    sub.request_state("a").add("generated", sub.t3.speech_pos_table_size)
     with pytest.raises(ValueError, match="past the T3 table"):
-        sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([18])]})
+        decode(18, sub.t3.speech_pos_table_size - 1)
 
-    step = sub.declare_step("decode", ["a"], [d1])
+    step = engine_step(sub, graph_walk="decode", request_ids=["a"], inputs=[d1])
     assert step.cg_key_info is False and step.steps[T3_KV].combined_labels == {}
     assert [(s.label, s.span) for s in step.segments] == [(COND_LABEL, 1)]
     assert step.steps[T3_SAMPLER].prefill_tracked_tokens == {}
@@ -951,6 +967,10 @@ class _FakeS3Gen(torch.nn.Module):
         self.calls = []
         self.rows_calls = []
         self.buckets = []
+        self.vocoder = SimpleNamespace(m_source=SimpleNamespace(draw_noise=lambda *args: None))
+
+    def draw_noise(self, batch, prompt_len, gen_len, generator):
+        return torch.zeros(batch, 80, prompt_len + gen_len)
 
     def tokens_to_mel(self, tokens, lens, ref, *, n_timesteps, generator=None, noise=None, finalize=True):
         self.calls.append(("mel", tokens.shape, int(lens[0]), n_timesteps, ref, finalize, noise is not None))
@@ -964,14 +984,14 @@ class _FakeS3Gen(torch.nn.Module):
         mels = [
             self.tokens_to_mel(
                 row.tokens[None], torch.tensor([row.tokens.numel()]), row.ref, n_timesteps=n_timesteps,
-                generator=row.generator, noise=row.noise, finalize=row.finalize,
+                noise=row.noise, finalize=row.finalize,
             )
             for row in rows
         ]
         self.rows_calls.append(len(rows))  # kept apart so ``calls`` keeps its per-row order
         return mels
 
-    def vocode(self, mel, *, generator=None, cache_source=None, fade_in=True):
+    def vocode(self, mel, *, generator=None, noise=None, cache_source=None, fade_in=True):
         self.calls.append(("vocode", mel.shape[-1], cache_source is not None, fade_in))
         wav = mel[:, 0].repeat_interleave(480, dim=1) / 10000.0
         return wav, torch.ones(1, 1, wav.shape[-1])
@@ -987,30 +1007,62 @@ def _s3_info(seed=7, watermark=False, rid="r"):
     )
 
 
+def _fake_resources():
+    """``test/chatterbox/fake_resources.py``, loaded by path as `test_cosyvoice3_model` loads it."""
+    path = Path(__file__).resolve().parents[1] / "chatterbox" / "fake_resources.py"
+    spec = importlib.util.spec_from_file_location("chatterbox_test_fake_resources", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+FAKES = _fake_resources()
+
+
+def _bind_stream(sub: S3GenSubmodule) -> None:
+    FAKES.FakeS3GenStream(sub)
+
+
 def _s3_submodule(variant="chatterbox"):
     config = ChatterboxConfig.from_variant(variant)
     config.stream_context_tokens = 0  # these tests check the full-history bookkeeping
     fake = _FakeS3Gen()
     builtin = SimpleNamespace(num_prompt_tokens=4)
-    return S3GenSubmodule(fake, s3_tokenizer=None, config=config, builtin_voice=builtin), fake
+    sub = S3GenSubmodule(fake, s3_tokenizer=None, config=config, builtin_voice=builtin)
+    _bind_stream(sub)
+    return sub, fake
 
 
-def _run(sub, tokens, is_final=None, rid="r"):
-    inputs = {SPEECH_TOKENS: [tokens]} if tokens is not None else {SPEECH_TOKENS: []}
+def _prepare(sub, inputs, rid="r", **kwargs):
+    fields = sub.stream.host_fields
+    if not fields.is_open(rid):
+        fields.open(rid)
+    return sub.prepare_inputs("s3gen_chunk", _s3_info(rid=rid), inputs, **kwargs)
+
+
+_s3gen_step = FAKES.s3gen_step
+
+
+def _run(sub, tokens, is_final=None, rid="r", edges=None):
+    """``tokens`` is every token the stream has delivered, as the left-context edge hands them over."""
+    inputs = {SPEECH_TOKENS: [tokens] if tokens is not None else [], **(edges or {})}
     kwargs = {} if is_final is None else {"is_final_stream_chunk": is_final}
-    prepared = sub.prepare_inputs("s3gen_chunk", _s3_info(rid=rid), inputs, **kwargs)
-    out = sub.forward("s3gen_chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
-    return prepared, out["audio_chunk"][0]
+    prepared = _prepare(sub, inputs, rid=rid, **kwargs)
+    return prepared, _s3gen_step(sub, {rid: prepared})[rid]
+
+
+def _held(sub, rid="r"):
+    return host(sub.stream, rid, "main", 0)
 
 
 def test_s3gen_offline_chunk_filters_control_tokens_and_uses_builtin_voice():
     sub, fake = _s3_submodule()
     tokens = torch.tensor([[6561], [10], [20], [6562]])  # BOS, speech, speech, EOS
     prepared, pcm = _run(sub, tokens, is_final=True)
-    assert prepared.tensor_inputs[SPEECH_TOKENS].tolist() == [10, 20]
-    assert prepared.kwargs["ref"] is sub.builtin_voice and prepared.kwargs["seed"] == 7
+    plan = prepared.kwargs["plan"]
+    assert plan.tokens.tolist() == [10, 20] and plan.is_final is True
+    assert prepared.kwargs["ref"] is sub.builtin_voice
     assert prepared.kwargs["n_timesteps"] == 4 and prepared.kwargs["watermark"] is False
-    assert prepared.kwargs["is_final"] is True
     assert pcm.dtype == torch.int16 and pcm.numel() == 2 * 2 * 480
     assert fake.calls[0][1:4] == ((1, 2), 2, 4) and fake.calls[0][5] is True
 
@@ -1019,11 +1071,11 @@ def test_s3gen_stop_token_does_not_end_the_stream():
     # ignore_eos decodes past the stop token; only the engine's flag ends the stream
     sub, _ = _s3_submodule()
     prepared, a = _run(sub, torch.tensor([[10], [6562]]), is_final=False)
-    assert prepared.kwargs["is_final"] is False
-    prepared, b = _run(sub, torch.tensor([[6562]]))  # no flag at all
-    assert prepared.kwargs["is_final"] is False
-    prepared, c = _run(sub, torch.tensor([[30], [40]]), is_final=True)
-    assert prepared.kwargs["is_final"] is True
+    assert prepared.kwargs["plan"].is_final is False
+    prepared, b = _run(sub, torch.tensor([[10], [6562], [6562]]))  # no flag at all
+    assert prepared.kwargs["plan"].is_final is False
+    prepared, c = _run(sub, torch.tensor([[10], [6562], [6562], [30], [40]]), is_final=True)
+    assert prepared.kwargs["plan"].is_final is True
     # the speech after the stop tokens is vocoded: as much audio as 10, 30, 40 in one chunk
     whole, _ = _s3_submodule()
     _, ref = _run(whole, torch.tensor([[10], [30], [40]]), is_final=True)
@@ -1033,7 +1085,6 @@ def test_s3gen_stop_token_does_not_end_the_stream():
 def test_s3gen_turbo_appends_silence_and_empty_input_yields_no_audio():
     sub, fake = _s3_submodule("turbo")
     prepared, pcm = _run(sub, torch.tensor([[5], [6562]]), is_final=True)
-    assert prepared.tensor_inputs[SPEECH_TOKENS].tolist() == [5]
     assert fake.calls[0][1] == (1, 4)  # 5 + three silence tokens
     assert pcm.numel() == 4 * 2 * 480
 
@@ -1051,51 +1102,52 @@ def test_s3gen_streaming_holds_back_lookahead_and_vocoder_tail():
     tail = sub.cache_samples  # 8 frames x 480
 
     # chunk 1: 15 tokens, not final -> 12 tokens decoded, 8 frames held back
-    _, pcm1 = _run(sub, torch.arange(1, 16)[:, None], is_final=False)
+    prepared, pcm1 = _run(sub, torch.arange(1, 16)[:, None], is_final=False)
     assert pcm1.numel() == 12 * spf - tail
     mel_call, voc_call = fake.calls[-2], fake.calls[-1]
     assert mel_call[1] == (1, 15) and mel_call[5] is False and mel_call[6] is True  # noise field passed
     assert voc_call == ("vocode", 24, False, True)  # 24 new frames, no source cache, utterance fade-in
-    stream = sub.request_state("r")["stream"]
-    assert stream.token_offset == 12 and stream.noise is not None
+    assert _held(sub)["token_offset"] == 12
     # prompt frames + every token the request may still produce
-    assert stream.noise.shape[-1] == 2 * (4 + ChatterboxConfig.chatterbox().t3.max_speech_tokens)
+    assert prepared.kwargs["plan"].noise.shape[-1] == 2 * (4 + ChatterboxConfig.chatterbox().t3.max_speech_tokens)
 
     # chunk 2: 25 more tokens (40 total), still not final -> tokens 12..37 new
-    _, pcm2 = _run(sub, torch.arange(16, 41)[:, None], is_final=False)
+    _, pcm2 = _run(sub, torch.arange(1, 41)[:, None], is_final=False)
     assert pcm2.numel() == (37 - 12) * spf  # tail re-emitted, new tail withheld
     mel_call, voc_call = fake.calls[-2], fake.calls[-1]
     assert mel_call[1] == (1, 40) and mel_call[5] is False
     assert voc_call == ("vocode", 8 + 25 * 2, True, False)  # cache frames + new, source continued, no fade-in
-    assert sub.request_state("r")["stream"].token_offset == 37
+    assert _held(sub)["token_offset"] == 37
 
     # a small chunk still moves the look-ahead window: 2 more tokens decoded
-    _, pcm3 = _run(sub, torch.tensor([[41], [42]]), is_final=False)
+    _, pcm3 = _run(sub, torch.arange(1, 43)[:, None], is_final=False)
     assert pcm3.numel() == (39 - 37) * spf
-    assert sub.request_state("r")["stream"].token_offset == 39
+    assert _held(sub)["token_offset"] == 39
 
     # final flush with EOS: everything left (43 tokens total) is decoded
-    _, pcm4 = _run(sub, torch.tensor([[43], [6562]]), is_final=True)
+    history = torch.cat([torch.arange(1, 44), torch.tensor([6562])])[:, None]
+    _, pcm4 = _run(sub, history, is_final=True)
     assert pcm4.numel() == (43 - 39) * spf + tail
     assert fake.calls[-2][1] == (1, 43) and fake.calls[-2][5] is True
-    assert sub.request_state("r")["stream"].done
+    assert _held(sub)["done"]
     total = pcm1.numel() + pcm2.numel() + pcm3.numel() + pcm4.numel()
     assert total == 43 * spf
 
     # after the end, further chunks are ignored
-    _, pcm5 = _run(sub, torch.tensor([[1]]), is_final=True)
+    _, pcm5 = _run(sub, torch.cat([history, torch.tensor([[1]])]), is_final=True)
     assert pcm5.numel() == 0
 
 
 def test_s3gen_streaming_final_flush_without_new_tokens_releases_the_tail():
     sub, fake = _s3_submodule()
-    _, pcm1 = _run(sub, torch.arange(1, 21)[:, None], is_final=False)  # 17 decoded
-    _, pcm2 = _run(sub, torch.tensor([[6562]]), is_final=True)  # EOS only: 20 total, 3 new
+    history = torch.arange(1, 21)[:, None]
+    _, pcm1 = _run(sub, history, is_final=False)  # 17 decoded
+    _, pcm2 = _run(sub, torch.cat([history, torch.tensor([[6562]])]), is_final=True)  # EOS only: 20 total, 3 new
     assert pcm1.numel() + pcm2.numel() == 20 * 2 * 480
     sub, fake = _s3_submodule()
-    _run(sub, torch.arange(1, 21)[:, None], is_final=False)
+    _run(sub, history, is_final=False)
     # engine says final but no new tokens arrive: the look-ahead tokens still finish
-    _, pcm = _run(sub, None, is_final=True)
+    _, pcm = _run(sub, history, is_final=True)
     assert pcm.numel() == 3 * 2 * 480 + sub.cache_samples
 
 
@@ -1103,23 +1155,22 @@ def test_s3gen_streaming_turbo_adds_silence_only_at_the_end():
     sub, fake = _s3_submodule("turbo")
     _run(sub, torch.arange(1, 21)[:, None], is_final=False)
     assert fake.calls[0][1] == (1, 20)
-    _run(sub, torch.tensor([[21]]), is_final=True)
+    _run(sub, torch.arange(1, 22)[:, None], is_final=True)
     assert fake.calls[-2][1] == (1, 24)  # 21 tokens + 3 silence, finalised once
 
 
 def test_s3gen_reference_is_cached_per_voice_key():
-    config = ChatterboxConfig.chatterbox()
-    sub = S3GenSubmodule(_FakeS3Gen(), s3_tokenizer=None, config=config, builtin_voice="builtin")
+    sub, _ = _s3_submodule()
     calls = []
-    sub.condition = lambda wav: calls.append(wav.numel()) or ("ref", wav.numel())  # noqa: E731
+    sub.condition = lambda wav: calls.append(wav.numel()) or SimpleNamespace(num_prompt_tokens=3)  # noqa: E731
     inputs = {
         SPEECH_TOKENS: [torch.tensor([[1]])], REF_AUDIO: [torch.zeros(2400)], VOICE_KEY: [torch.tensor([99])],
     }
-    first = sub.prepare_inputs("s3gen_chunk_voice", _s3_info(), inputs)
-    second = sub.prepare_inputs("s3gen_chunk_voice", _s3_info(), inputs)
-    assert first.kwargs["ref"] == ("ref", 2400) and second.kwargs["ref"] == first.kwargs["ref"]
+    first = _prepare(sub, inputs)
+    second = _prepare(sub, inputs)
+    assert first.kwargs["ref"] is second.kwargs["ref"]
     assert calls == [2400]
-    assert first.kwargs["is_final"] is False  # no flag, no EOS, tokens present
+    assert first.kwargs["plan"].is_final is False  # no flag, no EOS, tokens present
 
 
 def test_voice_cache_is_lru():
@@ -1157,26 +1208,25 @@ def test_s3gen_batches_requests_into_one_flow_solve_and_matches_sequential():
               1: [torch.arange(101, 116), torch.arange(116, 131), torch.tensor([])]}
     finals = [False, False, True]
 
+    def history(rid, step):
+        return torch.cat(chunks[rid][: step + 1]).long()
+
     expected = {rid: [] for rid in chunks}
-    for rid, parts in chunks.items():
-        for part, final in zip(parts, finals, strict=True):
-            expected[rid].append(_run(single, part.long(), is_final=final, rid=rid)[1])
+    for rid in chunks:
+        for step, final in enumerate(finals):
+            expected[rid].append(_run(single, history(rid, step), is_final=final, rid=rid)[1])
 
     got = {rid: [] for rid in chunks}
     for step, final in enumerate(finals):
-        inputs = [
-            batched.prepare_inputs(
-                "s3gen_chunk", _s3_info(rid=rid), {SPEECH_TOKENS: [chunks[rid][step].long()]},
-                is_final_stream_chunk=final,
-            )
+        prepared = {
+            rid: _prepare(batched, {SPEECH_TOKENS: [history(rid, step)]}, rid=rid, is_final_stream_chunk=final)
             for rid in chunks
-        ]
-        assert batched.can_batch(None, inputs)
-        packed = batched.preprocess("s3gen_chunk", None, inputs)
-        assert packed["rid"] == [0, 1] and packed["is_final"] == [final, final]
-        out = batched.forward_batched("s3gen_chunk", None, **packed)
-        for rid in chunks:
-            got[rid].append(out[rid]["audio_chunk"][0])
+        }
+        assert batched.can_batch(None, list(prepared.values()))
+        packed = batched.preprocess("s3gen_chunk", None, list(prepared.values()))
+        assert packed["rid"] == [0, 1] and [plan.is_final for plan in packed["plan"]] == [final, final]
+        for rid, pcm in _s3gen_step(batched, prepared).items():
+            got[rid].append(pcm)
 
     for rid in chunks:
         for mine, theirs in zip(got[rid], expected[rid], strict=True):
@@ -1185,16 +1235,13 @@ def test_s3gen_batches_requests_into_one_flow_solve_and_matches_sequential():
     # flush still finalises its three withheld look-ahead tokens)
     assert fake_b.rows_calls == [2, 2, 2]
     assert set(fake_s.rows_calls) == {1}
-    for rid in chunks:
-        batched.cleanup_request(rid)
-    assert not batched.request_states
 
 
 def test_s3gen_batching_is_bounded_and_single_requests_keep_the_plain_path():
     sub, _ = _s3_submodule()
-    one = [sub.prepare_inputs("s3gen_chunk", _s3_info(rid="a"), {SPEECH_TOKENS: [torch.tensor([1, 2])]})]
+    one = [_prepare(sub, {SPEECH_TOKENS: [torch.tensor([1, 2])]}, rid="a")]
     assert not sub.can_batch(None, one)
-    assert set(sub.preprocess("s3gen_chunk", None, one)) >= {SPEECH_TOKENS, "rid", "ref", "is_final"}
+    assert set(sub.preprocess("s3gen_chunk", None, one)) >= {"rid", "plan", "ref"}
     many = one * (sub.MAX_BATCH_SIZE + 1)
     assert not sub.can_batch(None, many) and sub.can_batch(None, one * 2)
 
@@ -1230,8 +1277,9 @@ def test_s3gen_context_window_bounds_the_solve_and_keeps_the_frame_bookkeeping()
     chunks = [torch.arange(1, 21), torch.arange(21, 41), torch.arange(41, 61), torch.tensor([61, 62])]
     finals = [False, False, False, True]
 
-    out_full = [_run(full, c, is_final=f)[1] for c, f in zip(chunks, finals, strict=True)]
-    out_win = [_run(windowed, c, is_final=f)[1] for c, f in zip(chunks, finals, strict=True)]
+    histories = [torch.cat(chunks[: k + 1]) for k in range(len(chunks))]
+    out_full = [_run(full, h, is_final=f)[1] for h, f in zip(histories, finals, strict=True)]
+    out_win = [_run(windowed, h, is_final=f)[1] for h, f in zip(histories, finals, strict=True)]
 
     for a, b in zip(out_full, out_win, strict=True):
         assert torch.equal(a, b)
@@ -1616,8 +1664,9 @@ def test_s3gen_batch_size_knob_and_graph_rows():
     sub = S3GenSubmodule(
         _FakeS3Gen(), s3_tokenizer=None, config=config, builtin_voice=SimpleNamespace(num_prompt_tokens=4),
     )
+    _bind_stream(sub)
     assert sub.max_batch_size("s3gen_chunk") == 16
-    one = [sub.prepare_inputs("s3gen_chunk", _s3_info(rid="a"), {SPEECH_TOKENS: [torch.tensor([1, 2])]})]
+    one = [_prepare(sub, {SPEECH_TOKENS: [torch.tensor([1, 2])]}, rid="a")]
     assert sub.can_batch(None, one * 16) and not sub.can_batch(None, one * 17) and not sub.can_batch(None, one)
 
 
@@ -1629,45 +1678,48 @@ def test_s3gen_node_advertises_its_batch_size_to_the_scheduler():
     assert sub.max_batch_size("s3gen_chunk_voice") == 8
 
 
+def _new_tokens_per_chunk(policy, tokens: int) -> list[int]:
+    """The new tokens each chunk of a ``tokens``-long stream carries, T3 putting one token at a time."""
+    buffer = StreamBuffer(request_id=0, edge_name=SPEECH_TOKENS, from_partition="T3", policy=policy)
+    sizes = []
+    for i in range(tokens):
+        buffer.pre_read_register(str(i))
+        buffer.put(str(i), torch.tensor([i]))
+        while buffer.has_chunk_ready():
+            chunk = buffer.pop_chunk()
+            sizes.append(chunk.num_items - chunk.context_items)
+    return sizes
+
+
 def test_chunk_policy_growth_knobs_reach_the_ramp():
     model = ChatterboxModel(
         model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=15,
         stream_chunk_tokens=25, stream_chunk_growth=2.0, stream_max_chunk_tokens=100,
     )
-    policy = model._chunk_policy()
-    sizes = []
-    for buffered in (15, 25, 50, 100, 100):
-        assert policy.is_ready(buffered)
-        sizes.append(policy.next_chunk_size(buffered))
-        policy.register_chunk(buffered)
-    assert sizes == [15, 25, 50, 100, 100]
+    assert _new_tokens_per_chunk(model._chunk_policy(), 290) == [15, 25, 50, 100, 100]
     # the shipped default: 35, then 50, 100, 200, 200 ... with a 25-token context window
     default = _make_model()
     assert default.config.stream_context_tokens == 25
-    policy = default._chunk_policy()
-    sizes = []
-    for buffered in (35, 50, 100, 200, 200):
-        assert policy.is_ready(buffered)
-        sizes.append(policy.next_chunk_size(buffered))
-        policy.register_chunk(buffered)
-    assert sizes == [35, 50, 100, 200, 200]
+    assert _new_tokens_per_chunk(default._chunk_policy(), 585) == [35, 50, 100, 200, 200]
 
 
 def test_s3gen_keeps_the_reference_for_chunks_without_the_clip():
     """The clip rides with the first chunk only; later chunks arrive with
-    signal-only voice edges and must reuse the conditioned reference rather
-    than fall back to the built-in voice."""
-    config = ChatterboxConfig.chatterbox()
-    sub = S3GenSubmodule(_FakeS3Gen(), s3_tokenizer=None, config=config, builtin_voice="builtin")
-    sub.condition = lambda wav: ("ref", wav.numel())  # noqa: E731
-    wav = torch.randn(2400)
-    key = torch.tensor([12345])
-    first = {SPEECH_TOKENS: [torch.tensor([1, 2, 3])], REF_AUDIO: [wav], VOICE_KEY: [key]}
-    later = {SPEECH_TOKENS: [torch.tensor([4, 5, 6])], REF_AUDIO: [], VOICE_KEY: []}
+    signal-only voice edges and must reuse the conditioned reference, which
+    the stream's Value holds, rather than fall back to the built-in voice."""
+    sub, fake = _s3_submodule()
+    clip = ReferenceConditioning(
+        prompt_tokens=torch.tensor([[7, 8, 9]]), prompt_feat=torch.randn(1, 6, 80), embedding=torch.randn(1, 192),
+    )
+    sub.condition = lambda wav: clip  # noqa: E731
+    voice = {REF_AUDIO: [torch.randn(2400)], VOICE_KEY: [torch.tensor([12345])]}
 
-    a = sub.prepare_inputs("s3gen_chunk_voice", _s3_info(rid="r"), first, is_final_stream_chunk=False)
-    b = sub.prepare_inputs("s3gen_chunk_voice", _s3_info(rid="r"), later, is_final_stream_chunk=True)
-    assert a.kwargs["ref"] == ("ref", 2400) and b.kwargs["ref"] == ("ref", 2400)
+    a, _ = _run(sub, torch.tensor([1, 2, 3]), is_final=False, edges=voice)
+    b, _ = _run(sub, torch.arange(1, 7), is_final=True, edges={REF_AUDIO: [], VOICE_KEY: []})
+    assert a.kwargs["ref"] is clip and b.kwargs["ref"] is None
+    used = fake.calls[-2][4]
+    assert all(torch.equal(getattr(used, name), getattr(clip, name))
+               for name in ("prompt_tokens", "prompt_feat", "embedding"))
     # another request without any clip still gets the built-in voice
-    c = sub.prepare_inputs("s3gen_chunk", _s3_info(rid="other"), {SPEECH_TOKENS: [torch.tensor([7])]})
-    assert c.kwargs["ref"] == "builtin"
+    c = _prepare(sub, {SPEECH_TOKENS: [torch.tensor([7])]}, rid="other")
+    assert c.kwargs["ref"] is sub.builtin_voice

@@ -32,31 +32,35 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
     Segment,
     SlotLease,
     SubmoduleStep,
+    at_last_token,
+    host,
+    positions,
+    sample,
 )
 from mstar.model.chatterbox.components.s3_tokenizer import AudioEncoderV2
-from mstar.model.chatterbox.components.s3gen import FlowRow
+from mstar.model.chatterbox.components.s3gen import FlowRow, ReferenceConditioning
+from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
 from mstar.model.chatterbox.config import (
-    CFG_LABEL,
     COND_LABEL,
     S3_SR,
     S3GEN_SILENCE_TOKEN,
-    T3_ATTN,
-    T3_POS,
+    S3GEN_STREAM,
+    T3_KV,
     T3_SAMPLER,
     UNCOND_LABEL,
     ChatterboxConfig,
 )
 from mstar.model.submodule_base import (
+    EMPTY_INPUT_METADATA,
     ARNodeInputs,
     ARNodeSubmodule,
+    InputMetadata,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -179,6 +183,12 @@ class VoiceEncoderSubmodule(NodeSubmodule):
 # ===========================================================================
 
 
+@functools.lru_cache(maxsize=64)
+def _guidance_weight(weight: float, device: torch.device) -> torch.Tensor:
+    """``weight`` as a ``[1]`` tensor on ``device``, made once, so a decode step copies nothing to the device."""
+    return torch.tensor([weight], dtype=torch.float32, device=device)
+
+
 @dataclass
 class BuiltinT3Voice:
     """The T3 half of the checkpoint's ``conds.pt``."""
@@ -192,8 +202,8 @@ class T3Submodule(ARNodeSubmodule):
 
     Prefill packs ``[cond | text | BOS]`` per request; decode embeds the
     previous speech token at its learned speech position. With guidance each
-    request owns two KV streams, ``main`` and ``uncond``, that the step packs
-    label-major into one plan (``CFG_LABEL``); the forward then sees ``2B``
+    request owns two KV streams, ``main`` and ``uncond``, that the step lists
+    label-major, so they plan as one; the forward then sees ``2B``
     rows, combines the two logit halves with the per-request ``cfg_weight``
     and samples ``B`` tokens. Guidance on/off is the capture key, so a decode
     batch of either kind replays its own CUDA graph.
@@ -235,6 +245,10 @@ class T3Submodule(ARNodeSubmodule):
     def _requires_cfg(self, step_metadata: Mapping[str, Any] | None) -> bool:
         return self.supports_cfg and float(self._knob(step_metadata, "cfg_weight")) > 0.0
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[T3_KV]
+        self.sampler = handles[T3_SAMPLER]
+
     def cg_key_info(
         self, graph_walk: str,
         per_request_info: dict[str, CurrentForwardPassInfo],
@@ -251,15 +265,11 @@ class T3Submodule(ARNodeSubmodule):
         del graph_walk
         return self.supports_cfg
 
-    def _scalar_inputs(self, fwd_info: CurrentForwardPassInfo, requires_cfg: bool) -> dict[str, torch.Tensor]:
+    def _cfg_weight(self, fwd_info: CurrentForwardPassInfo, requires_cfg: bool) -> torch.Tensor:
         # sampling knobs (temperature, min_p, penalty) live in the request's
-        # SamplingReqConfig and are applied by the sampler resource
-        return {
-            "cfg_weight": torch.tensor(
-                [float(self._knob(fwd_info.step_metadata, "cfg_weight")) if requires_cfg else 0.0],
-                dtype=torch.float32, device=self.get_device(),
-            ),
-        }
+        # SampleSettings and are applied by the sampler
+        weight = float(self._knob(fwd_info.step_metadata, "cfg_weight")) if requires_cfg else 0.0
+        return _guidance_weight(weight, self.get_device())
 
     # -- inputs ----------------------------------------------------------------
 
@@ -276,13 +286,13 @@ class T3Submodule(ARNodeSubmodule):
 
     @torch.no_grad()
     def prepare_inputs(
-        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
+        input_metadata: InputMetadata = EMPTY_INPUT_METADATA, **kwargs,
     ) -> ARNodeInputs:
         del kwargs
         device = self.get_device()
-        state = self.request_state(_rid(fwd_info))
+        requires_cfg = self._requires_cfg(fwd_info.step_metadata)
         if graph_walk in PREFILL_WALKS:
-            requires_cfg = self._requires_cfg(fwd_info.step_metadata)
             text_ids = inputs[TEXT_INPUTS][0].to(device, torch.long).reshape(-1)
             speaker_emb, prompt_tokens = self._voice(inputs)
             emotion = None
@@ -292,27 +302,24 @@ class T3Submodule(ARNodeSubmodule):
                 )
             cond = self.model.conditioning(speaker_emb[None], prompt_tokens[None], emotion)[0]
             embeds = self.model.build_prefill_embeds(cond, text_ids, uncond=False)
-            tensor_inputs = self._scalar_inputs(fwd_info, requires_cfg)
+            tensor_inputs = {"cfg_weight": self._cfg_weight(fwd_info, requires_cfg)}
             if requires_cfg:
                 tensor_inputs["uncond_embeds"] = self.model.build_prefill_embeds(
                     cond, text_ids, uncond=True,
                 )
-            # decode reuses this device tensor rather than staging the
-            # request's constant guidance weight every step
-            state.add_all(generated=0, requires_cfg=requires_cfg, cfg_weight=tensor_inputs["cfg_weight"])
         elif graph_walk == "decode":
-            requires_cfg = bool(state["requires_cfg"])
             # The input token's speech position is how many tokens were
-            # sampled, which only postprocess advances: a step re-driven after
-            # a refused admit must not move it.
-            step = int(state["generated"])
+            # sampled: the prefill's, and one per decode step before this one.
+            # It reads the step's own iteration, so a step prepared again after
+            # a refused admit keeps it.
+            step = 1 + input_metadata.dynamic_loop_iter_counts.get(DECODE_LOOP, 0)
             if step >= self.t3.speech_pos_table_size:
                 raise ValueError(
                     f"speech position {step} is past the T3 table ({self.t3.speech_pos_table_size})"
                 )
             token = inputs[PREV_TOKEN][0].to(device, torch.long).reshape(-1)
             embeds = self.model.embed_speech(token, step)
-            tensor_inputs = {"cfg_weight": state["cfg_weight"]}
+            tensor_inputs = {"cfg_weight": self._cfg_weight(fwd_info, requires_cfg)}
         else:
             raise ValueError(f"Unknown T3 walk {graph_walk!r}")
         return ARNodeInputs(
@@ -353,14 +360,12 @@ class T3Submodule(ARNodeSubmodule):
         del slot_lease, piecewise_leases, kwargs
         requires_cfg = bool(inputs[0].resource_step_info)
         labels = (COND_LABEL, UNCOND_LABEL) if requires_cfg else (COND_LABEL,)
+        # label-major, so the two streams plan as one
         segments = [
             Segment(request_id=rid, label=label, span=inp.input_seq_len)
             for label in labels
             for rid, inp in zip(request_ids, inputs, strict=True)
         ]
-        kv_step = (
-            KVStep(combined_labels={labels: CFG_LABEL}) if requires_cfg else KVStep()
-        )
         tracked = {}
         if graph_walk in PREFILL_WALKS:
             # the reference penalises repeats of everything after the text,
@@ -369,54 +374,36 @@ class T3Submodule(ARNodeSubmodule):
             tracked = {rid: bos for rid in request_ids}
         return SubmoduleStep(
             segments=segments,
-            steps={
-                self._kv_key(): kv_step,
-                T3_ATTN: AttentionStep(causal=True),
-                T3_POS: PositionStep(),
-                T3_SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=tracked),
-            },
+            state={T3_KV: ArrayStep(), T3_SAMPLER: SampleStep(apply_penalty=True, prompt_tokens=tracked)},
             cg_key_info=requires_cfg,
         )
-
-    @staticmethod
-    def _kv_key() -> str:
-        from mstar.model.chatterbox.config import T3_KV
-
-        return T3_KV
 
     # -- compute ----------------------------------------------------------------
 
     def _forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        input_embeds: torch.Tensor,
-        cfg_weight: torch.Tensor,
-        requires_cfg: bool,
+        self, graph_walk: str, input_embeds: torch.Tensor, cfg_weight: torch.Tensor, requires_cfg: bool,
     ) -> torch.Tensor:
-        attn = engine_inputs.resources[T3_ATTN]
-        sampler = engine_inputs.resources[T3_SAMPLER]
-        label = CFG_LABEL if requires_cfg else COND_LABEL
         position_ids = None
         if self.t3.backbone.is_gpt2:
-            position_ids = engine_inputs.resources[T3_POS].pos_ids(label)[: input_embeds.shape[0]]
-        hidden = self.model.hidden(input_embeds, label=label, position_ids=position_ids)
+            position_ids = positions(self.kv)[: input_embeds.shape[0]]
+        hidden = self.model.hidden(input_embeds, position_ids=position_ids)
         if graph_walk in PREFILL_WALKS:
-            hidden = attn.select_last_hidden(hidden, label=label)
+            # every request's main row, then every request's uncond row
+            hidden = at_last_token(self.kv, hidden)
         logits = self.model.logits(hidden).float()
         if requires_cfg:
             cond, uncond = logits.chunk(2, dim=0)
             logits = cond + cfg_weight * (cond - uncond)
         # penalty -> temperature -> min_p -> top-p happen in the sampler, in
         # the reference's order
-        return sampler.sample(engine_inputs.request_ids, logits)
+        return sample(self.sampler, logits)
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_embeds: torch.Tensor,
         cfg_weight: torch.Tensor, requires_cfg: bool = False, **kwargs,
     ) -> NameToTensorList:
-        del kwargs
-        tokens = self._forward(graph_walk, engine_inputs, input_embeds, cfg_weight, requires_cfg)
+        del engine_inputs, kwargs
+        tokens = self._forward(graph_walk, input_embeds, cfg_weight, requires_cfg)
         return {SPEECH_TOKENS: [tokens.reshape(-1)[:1]]}
 
     def forward_batched(
@@ -424,9 +411,7 @@ class T3Submodule(ARNodeSubmodule):
         cfg_weight: torch.Tensor, requires_cfg: bool = False, **kwargs,
     ) -> dict[str, NameToTensorList]:
         del kwargs
-        tokens = self._forward(
-            graph_walk, engine_inputs, input_embeds, cfg_weight, requires_cfg,
-        ).reshape(-1)
+        tokens = self._forward(graph_walk, input_embeds, cfg_weight, requires_cfg).reshape(-1)
         return {
             rid: {SPEECH_TOKENS: [tokens[i : i + 1]]}
             for i, rid in enumerate(engine_inputs.request_ids)
@@ -438,13 +423,11 @@ class T3Submodule(ARNodeSubmodule):
         self, request_id: str, request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]], **kwargs,
     ) -> None:
-        del request_info, kwargs
+        del request_id, request_info, kwargs
         if SPEECH_TOKENS not in outputs:
             return
         # the sampled token is the next decode input; no value is read here
         outputs[PREV_TOKEN] = outputs[SPEECH_TOKENS]
-        state = self.request_state(request_id)
-        state.add("generated", int(state.get("generated", 0)) + 1)
 
     # -- batching and capture ---------------------------------------------------
 
@@ -527,42 +510,32 @@ class T3Submodule(ARNodeSubmodule):
 # ===========================================================================
 
 
+def max_reference_tokens(config: ChatterboxConfig) -> int:
+    """The most S3 prompt tokens `S3GenSubmodule.condition` keeps of a reference clip: those of its first
+    ``dec_cond_seconds``, cut to the 24 kHz mel's frames over ``token_mel_ratio`` as `S3Gen.embed_reference` cuts
+    them."""
+    wav24 = round(config.dec_cond_seconds * config.sample_rate)
+    wav16 = -(-wav24 * S3_SR // config.sample_rate)
+    tokens = AudioEncoderV2._conv_out_len(AudioEncoderV2._conv_out_len(wav16 // config.s3_tokenizer.hop_size, 2), 2)
+    return min(tokens, wav24 // config.s3gen.mel.hop_size // config.s3gen.token_mel_ratio)
+
+
 @dataclass
 class _ChunkPlan:
-    """What one request needs from the current step: a flow row to solve (and
-    how many tokens it settles), or audio that is ready without one."""
+    """What one request needs from the current step, planned with every draw
+    it takes before the step: a flow solve over ``tokens``, the held-back tail
+    to release, or nothing yet. ``host`` is the stream's host fields once the
+    step commits."""
 
-    state: "StreamState"
-    generator: torch.Generator
+    host: dict[str, Any]
     is_final: bool
-    usable: int = 0
+    token_offset: int  # tokens vocoded before this chunk
+    first: bool  # no chunk vocoded before this one
     window_start: int = 0  # first token of the flow solve (0 = whole history)
-    row: FlowRow | None = None
-    ready: torch.Tensor | None = None
-
-
-@dataclass
-class StreamState:
-    """One request's progress through chunked synthesis.
-
-    ``tokens`` is every speech token received so far; ``token_offset`` how
-    many of them have been turned into mel and vocoded. ``noise`` is the
-    request's fixed flow-matching noise field (drawn once, indexed by frame),
-    which is what keeps the mel of already-emitted frames stable when the
-    decoder is re-run with more context. ``hift_mel`` / ``hift_source`` /
-    ``hift_speech`` are the vocoder's held-back tail: the last mel frames,
-    their harmonic excitation and the waveform that was not emitted yet; the
-    next chunk re-vocodes those frames in context and crossfades them.
-    """
-
-    tokens: torch.Tensor
-    token_offset: int = 0
+    tokens: torch.Tensor | None = None
     noise: torch.Tensor | None = None
-    hift_mel: torch.Tensor | None = None
-    hift_source: torch.Tensor | None = None
-    hift_speech: torch.Tensor | None = None
-    chunks_emitted: int = 0
-    done: bool = False
+    vocoder_noise: HiFTNoise | None = None
+    release: bool = False
 
 
 class S3GenSubmodule(NodeSubmodule):
@@ -575,6 +548,10 @@ class S3GenSubmodule(NodeSubmodule):
     withheld until the end), vocodes only the new frames behind a small mel
     cache, continues the harmonic source from the previous chunk and
     crossfades the re-synthesised tail before emitting.
+
+    Every chunk brings the whole token history. Between chunks the stream's
+    vocoder tail and reference live in its ``S3GEN_STREAM`` Value, and its
+    progress and generator state in that Value's host fields.
 
     The reference conditioning (prompt tokens, prompt mel, x-vector) comes
     from the checkpoint's built-in voice or from the request's reference clip,
@@ -604,11 +581,15 @@ class S3GenSubmodule(NodeSubmodule):
         self.max_rows = int(config.s3gen_max_batch_size) if config.s3gen_max_batch_size else self.MAX_BATCH_SIZE
         self.cache_frames = config.stream_mel_cache_frames
         self.cache_samples = self.cache_frames * self.samples_per_frame
+        self.max_reference_tokens = max_reference_tokens(config)
         # crossfade of the re-synthesised tail: the second half of a Hamming
         # window fades the old tail out while the first half fades the new in
         self.register_buffer(
             "fade_window", torch.hamming_window(2 * self.cache_samples, periodic=False), persistent=False,
         )
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.stream = handles[S3GEN_STREAM]
 
     # -- reference conditioning ---------------------------------------------
 
@@ -621,27 +602,19 @@ class S3GenSubmodule(NodeSubmodule):
         tokens, lens = self.s3_tokenizer([wav16])
         return self.s3gen.embed_reference(wav24[None], wav16[None], tokens[:, : int(lens[0])])
 
-    def _reference(self, inputs: NameToTensorList, rid: int | None = None):
-        """The request's reference conditioning: computed (or fetched from the
-        per-voice cache) from the clip that rides with the first chunk, then
-        kept in the request's state for the chunks that follow, which carry
-        the voice edges without tensors."""
-        state = self.request_state(rid) if rid is not None else None
-        if inputs.get(REF_AUDIO):
-            key = int(inputs[VOICE_KEY][0].reshape(-1)[0].item())
-            ref = self.cache.get(key)
-            if ref is None:
-                wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
-                ref = self.condition(wav)
-                self.cache.put(key, ref)
-            if state is not None and state.get("ref") is None:
-                state.add("ref", ref)
-            return ref
-        if state is not None and state.get("ref") is not None:
-            return state["ref"]
-        if self.builtin_voice is None:
-            raise ValueError("No reference voice given and the checkpoint ships no built-in voice")
-        return self.builtin_voice
+    def _reference(self, inputs: NameToTensorList):
+        """The reference conditioning of the clip that rides with a stream's
+        first chunk, computed or fetched from the per-voice cache; None for a
+        chunk without the clip."""
+        if not inputs.get(REF_AUDIO):
+            return None
+        key = int(inputs[VOICE_KEY][0].reshape(-1)[0].item())
+        ref = self.cache.get(key)
+        if ref is None:
+            wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
+            ref = self.condition(wav)
+            self.cache.put(key, ref)
+        return ref
 
     # -- inputs ----------------------------------------------------------------
 
@@ -665,17 +638,30 @@ class S3GenSubmodule(NodeSubmodule):
         tokens = raw[raw < self.config.s3gen.vocab_size]
         meta = fwd_info.step_metadata
         rid = _rid(fwd_info)
-        return NodeInputs(
-            tensor_inputs={SPEECH_TOKENS: tokens},
-            kwargs={
-                "rid": rid,
-                "ref": self._reference(inputs, rid),
-                "n_timesteps": int(meta.get("n_cfm_timesteps", self.config.generation.n_cfm_timesteps)),
-                "watermark": bool(meta.get("watermark", self.config.generation.watermark)),
-                "seed": int(fwd_info.random_seed),
-                "is_final": is_final,
-            },
-        )
+        # what the last committed step left, so a row prepared again after a refused admit draws the same noise
+        held = host(self.stream, rid, "main", 0)
+        clip = ref = self._reference(inputs)
+        if clip is not None and clip.num_prompt_tokens > self.max_reference_tokens:
+            raise ValueError(
+                f"the reference has {clip.num_prompt_tokens} S3 tokens, past the {self.max_reference_tokens} its "
+                f"stream holds (dec_cond_seconds={self.config.dec_cond_seconds})"
+            )
+        if ref is None and not held["ref_len"]:
+            if self.builtin_voice is None:
+                raise ValueError("No reference voice given and the checkpoint ships no built-in voice")
+            ref = self.builtin_voice
+        prompt_tokens = held["ref_len"] if ref is None else ref.num_prompt_tokens
+        plan = self._plan_chunk(held, tokens, is_final, prompt_tokens, int(fwd_info.random_seed))
+        if clip is not None:
+            plan.host["ref_len"] = prompt_tokens
+        return NodeInputs(kwargs={
+            "rid": rid,
+            "plan": plan,
+            # None: the stream's own, which its Value holds
+            "ref": ref,
+            "n_timesteps": int(meta.get("n_cfm_timesteps", self.config.generation.n_cfm_timesteps)),
+            "watermark": bool(meta.get("watermark", self.config.generation.watermark)),
+        })
 
     # -- synthesis ----------------------------------------------------------------
 
@@ -696,142 +682,133 @@ class S3GenSubmodule(NodeSubmodule):
             wav = self.watermarker.apply(wav, self.config.sample_rate)
         return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
 
-    def _noise_field(self, state: StreamState, ref, generator: torch.Generator) -> torch.Tensor:
-        if state.noise is None:
-            prompt_frames = ref.num_prompt_tokens * self.frames_per_token
-            max_tokens = self.config.t3.max_speech_tokens + self.config.trailing_silence_tokens
-            frames = prompt_frames + max_tokens * self.frames_per_token
-            state.noise = torch.randn(
-                (1, self.config.s3gen.output_size, frames),
-                dtype=self.s3gen.dtype, device=self.get_device(), generator=generator,
-            )
-        return state.noise
+    def _noise_field(self, prompt_frames: int, generator: torch.Generator) -> torch.Tensor:
+        max_tokens = self.config.t3.max_speech_tokens + self.config.trailing_silence_tokens
+        frames = prompt_frames + max_tokens * self.frames_per_token
+        return torch.randn(
+            (1, self.config.s3gen.output_size, frames),
+            dtype=self.s3gen.dtype, device=self.get_device(), generator=generator,
+        )
 
     def _plan_chunk(
-        self, state: StreamState, new_tokens: torch.Tensor, is_final: bool, ref,
-        generator: torch.Generator,
+        self, held: Mapping[str, Any], tokens: torch.Tensor, is_final: bool, prompt_tokens: int, seed: int,
     ) -> _ChunkPlan:
-        """Take a request's new tokens and decide what this step owes it: a flow
-        row to solve, or audio that can go out right away (nothing new to
-        decode yet, or the held-back tail once the stream has ended)."""
-        device = self.get_device()
-        plan = _ChunkPlan(state=state, generator=generator, is_final=is_final)
-        if state.done:
-            plan.ready = torch.zeros(0, device=device)
+        """Take a request's token history and decide what this step owes it: a
+        flow row to solve, or audio that can go out right away (nothing new to
+        decode yet, or the held-back tail once the stream has ended). ``held``
+        is the stream's host fields, and the plan draws everything the chunk
+        takes from the generator they hold."""
+        plan = _ChunkPlan(
+            host=dict(held), is_final=is_final, token_offset=held["token_offset"], first=not held["chunks"],
+        )
+        if held["done"]:
             return plan
-        state.tokens = torch.cat([state.tokens, new_tokens.to(device)])
         if is_final:
-            state.tokens = self._with_trailing_silence(state.tokens)
-        n = state.tokens.numel()
+            tokens = self._with_trailing_silence(tokens)
+        n = tokens.numel()
         usable = n if is_final else max(n - self.lookahead_tokens, 0)
-        if usable <= state.token_offset:
-            if not is_final:
-                plan.ready = torch.zeros(0, device=device)  # not enough new tokens yet
-                return plan
-            state.done = True
-            # nothing new to decode: release the held-back tail as it is
-            tail = state.hift_speech
-            plan.ready = tail[0] if tail is not None else torch.zeros(0, device=device)
+        if usable <= plan.token_offset:
+            # not enough new tokens yet, or nothing new to decode at the end:
+            # release the held-back tail as it is
+            plan.release = plan.host["done"] = is_final
             return plan
-        plan.usable = usable
+        device = self.get_device()
+        generator = self._generator(seed, device)
+        if held["rng"]:
+            generator.set_state(torch.frombuffer(bytearray(held["rng"]), dtype=torch.uint8))
+        prompt_frames = prompt_tokens * self.frames_per_token
         # A whole utterance arriving at once is the reference's offline path:
         # noise drawn on the spot from the request's generator (bit-exact with
         # the package). A stream instead denoises one fixed field every chunk.
-        whole = is_final and state.token_offset == 0 and state.noise is None
-        if whole:
-            plan.row = FlowRow(tokens=state.tokens, ref=ref, finalize=True, generator=generator)
-            return plan
-        # A bounded window keeps only the last ``context_tokens`` settled
-        # tokens (plus the prompt) in the solve; the noise field is sliced by
-        # absolute frame so every frame keeps the draw it was started with.
-        start = 0
-        if self.context_tokens > 0:
-            start = max(state.token_offset - self.context_tokens, 0)
-        plan.window_start = start
-        noise = self._noise_field(state, ref, generator)
-        if start > 0:
-            prompt_frames = ref.num_prompt_tokens * self.frames_per_token
-            gen = noise[:, :, prompt_frames + start * self.frames_per_token : prompt_frames + n * self.frames_per_token]
-            noise = torch.cat([noise[:, :, :prompt_frames], gen], dim=2)
-        plan.row = FlowRow(
-            tokens=state.tokens[start:], ref=ref, finalize=is_final, noise=noise, generator=generator,
+        if is_final and not plan.token_offset:
+            plan.tokens = tokens
+            plan.noise = self.s3gen.draw_noise(1, prompt_frames, n * self.frames_per_token, generator)
+        else:
+            # The field is the first draw of the request's generator, so a
+            # chunk after the stream's first solve draws it again from the seed.
+            noise = self._noise_field(prompt_frames, self._generator(seed, device) if held["rng"] else generator)
+            # A bounded window keeps only the last ``context_tokens`` settled
+            # tokens (plus the prompt) in the solve; the noise field is sliced by
+            # absolute frame so every frame keeps the draw it was started with.
+            start = 0
+            if self.context_tokens > 0:
+                start = max(plan.token_offset - self.context_tokens, 0)
+            if start > 0:
+                ratio = self.frames_per_token
+                gen = noise[:, :, prompt_frames + start * ratio : prompt_frames + n * ratio]
+                noise = torch.cat([noise[:, :, :prompt_frames], gen], dim=2)
+            plan.window_start = start
+            plan.tokens = tokens[start:]
+            plan.noise = noise
+        # the vocoder runs over the new frames behind the held-back ones
+        frames = (usable - plan.token_offset) * self.frames_per_token + (0 if plan.first else self.cache_frames)
+        plan.vocoder_noise = self.s3gen.vocoder.m_source.draw_noise(
+            1, frames * self.samples_per_frame, self.s3gen.dtype, device, generator,
+        )
+        plan.host.update(
+            token_offset=usable, chunks=held["chunks"] + 1, done=is_final,
+            rng=generator.get_state().numpy().tobytes(),
         )
         return plan
 
-    def _emit_chunk(self, plan: _ChunkPlan, mel: torch.Tensor) -> torch.Tensor:
+    def _emit_chunk(self, plan: _ChunkPlan, mel: torch.Tensor, held: dict[str, torch.Tensor], i: int) -> torch.Tensor:
         """Vocode the frames the flow solve added, continuing the vocoder's
-        held-back tail, and return the waveform to emit now."""
-        state = plan.state
-        new_mel = mel[:, :, (state.token_offset - plan.window_start) * self.frames_per_token:]
-        state.token_offset = plan.usable
-
-        first = state.hift_mel is None
-        mel_in = new_mel if first else torch.cat([state.hift_mel, new_mel], dim=2)
+        held-back tail in row ``i`` of ``held``, and return the waveform to emit now."""
+        new_mel = mel[:, :, (plan.token_offset - plan.window_start) * self.frames_per_token:]
+        mel_in = new_mel if plan.first else torch.cat([held["hift_mel"][i : i + 1], new_mel], dim=2)
         wav, source = self.s3gen.vocode(
-            mel_in, generator=plan.generator, cache_source=state.hift_source, fade_in=first,
+            mel_in, noise=plan.vocoder_noise, cache_source=None if plan.first else held["hift_source"][i : i + 1],
+            fade_in=plan.first,
         )
-        if not first:
+        if not plan.first:
             n_fade = self.cache_samples
             wav[:, :n_fade] = (
                 wav[:, :n_fade] * self.fade_window[:n_fade]
-                + state.hift_speech[:, -n_fade:] * self.fade_window[n_fade:]
+                + held["hift_speech"][i : i + 1, -n_fade:] * self.fade_window[n_fade:]
             )
         if plan.is_final:
-            state.done = True
-            state.hift_mel = state.hift_source = state.hift_speech = None
-            emitted = wav
-        else:
-            state.hift_mel = mel_in[:, :, -self.cache_frames:]
-            state.hift_source = source[:, :, -self.cache_samples:]
-            state.hift_speech = wav[:, -self.cache_samples:]
-            emitted = wav[:, : -self.cache_samples]
-        state.chunks_emitted += 1
-        return emitted[0]
+            return wav[0]
+        held["hift_mel"][i] = mel_in[0, :, -self.cache_frames:]
+        held["hift_source"][i] = source[0, :, -self.cache_samples:]
+        held["hift_speech"][i] = wav[0, -self.cache_samples:]
+        return wav[0, : -self.cache_samples]
 
     @torch.no_grad()
-    def _solve(self, plans: list[_ChunkPlan], n_timesteps: list[int]) -> list[torch.Tensor]:
+    def _solve(
+        self, plans: list[_ChunkPlan], refs: list, n_timesteps: list[int], held: dict[str, torch.Tensor],
+    ) -> list[torch.Tensor]:
         """Run every plan that needs the flow decoder, batched by step count,
-        and return each plan's waveform (float)."""
-        outputs: list[torch.Tensor | None] = [plan.ready for plan in plans]
-        pending = [i for i, plan in enumerate(plans) if plan.row is not None]
+        and return each plan's waveform (float). ``held`` is the step's rows of
+        the streams' Value, which their references and vocoder tails are read
+        from and written to."""
+        outputs: list[torch.Tensor] = []
+        rows: list[FlowRow | None] = []
+        for i, (plan, ref) in enumerate(zip(plans, refs, strict=True)):
+            n = plan.host["ref_len"]
+            if ref is None:
+                ref = ReferenceConditioning(
+                    prompt_tokens=held["ref_tokens"][i : i + 1, :n],
+                    prompt_feat=held["ref_feat"][i : i + 1, : n * self.frames_per_token],
+                    embedding=held["ref_embedding"][i : i + 1],
+                )
+            elif n:
+                held["ref_tokens"][i, :n] = ref.prompt_tokens[0]
+                held["ref_feat"][i, : n * self.frames_per_token] = ref.prompt_feat[0]
+                held["ref_embedding"][i] = ref.embedding[0]
+            released = plan.release and not plan.first
+            outputs.append(held["hift_speech"][i] if released else torch.zeros(0, device=self.get_device()))
+            rows.append(None if plan.tokens is None else FlowRow(
+                tokens=plan.tokens, ref=ref, finalize=plan.is_final, noise=plan.noise,
+            ))
+        pending = [i for i, row in enumerate(rows) if row is not None]
         for steps in sorted({n_timesteps[i] for i in pending}):
             group = [i for i in pending if n_timesteps[i] == steps]
             mels = self.s3gen.tokens_to_mel_rows(
-                [plans[i].row for i in group], n_timesteps=steps, frame_bucket=self.frame_bucket,
+                [rows[i] for i in group], n_timesteps=steps, frame_bucket=self.frame_bucket,
             )
             for i, mel in zip(group, mels, strict=True):
-                outputs[i] = self._emit_chunk(plans[i], mel)
+                outputs[i] = self._emit_chunk(plans[i], mel, held, i)
         return outputs
-
-    @torch.no_grad()
-    def synthesize_chunk(
-        self, state: StreamState, new_tokens: torch.Tensor, is_final: bool, ref,
-        n_timesteps: int, generator: torch.Generator,
-    ) -> torch.Tensor:
-        """Advance one request by a chunk of tokens; returns the waveform to
-        emit now (float, possibly empty)."""
-        plan = self._plan_chunk(state, new_tokens, is_final, ref, generator)
-        return self._solve([plan], [n_timesteps])[0]
-
-    @torch.no_grad()
-    def synthesize(
-        self, tokens: torch.Tensor, ref, n_timesteps: int, seed: int, watermark: bool,
-    ) -> torch.Tensor:
-        """Whole-utterance synthesis, PCM16: the reference path, one call."""
-        device = self.get_device()
-        state = StreamState(tokens=torch.empty(0, dtype=torch.long, device=device))
-        wav = self.synthesize_chunk(state, tokens, True, ref, n_timesteps, self._generator(seed, device))
-        return self._finish(wav, watermark)
-
-    def _stream(self, rid: int, seed: int) -> tuple[StreamState, torch.Generator]:
-        state = self.request_state(rid)
-        if state.get("stream") is None:
-            device = self.get_device()
-            state.add_all(
-                stream=StreamState(tokens=torch.empty(0, dtype=torch.long, device=device)),
-                generator=self._generator(seed, device),
-            )
-        return state["stream"], state["generator"]
 
     # -- engine entry points ---------------------------------------------------
 
@@ -845,39 +822,47 @@ class S3GenSubmodule(NodeSubmodule):
         del graph_walk
         return self.max_rows
 
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep:
+        del graph_walk, slot_lease, piecewise_leases, kwargs
+        return SubmoduleStep(
+            segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
+            state={S3GEN_STREAM: ArrayStep(host={
+                (rid, "main", 0): inp.kwargs["plan"].host for rid, inp in zip(request_ids, inputs, strict=True)
+            })},
+        )
+
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs]):
         del graph_walk, engine_inputs
         if len(inputs) == 1:
-            return {**inputs[0].tensor_inputs, **inputs[0].kwargs}
-        packed: dict[str, Any] = {SPEECH_TOKENS: [inp.tensor_inputs[SPEECH_TOKENS] for inp in inputs]}
-        packed.update({key: [inp.kwargs[key] for inp in inputs] for key in inputs[0].kwargs})
-        return packed
+            return dict(inputs[0].kwargs)
+        return {key: [inp.kwargs[key] for inp in inputs] for key in inputs[0].kwargs}
 
     def forward(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, speech_tokens: torch.Tensor,
-        rid: int, ref=None, n_timesteps: int = 10, watermark: bool = True,
-        seed: int = 0, is_final: bool = True, **kwargs,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rid: int, plan: _ChunkPlan, ref,
+        n_timesteps: int, watermark: bool, **kwargs,
     ) -> NameToTensorList:
-        del graph_walk, engine_inputs, kwargs
-        stream, generator = self._stream(rid, seed)
-        plan = self._plan_chunk(stream, speech_tokens, is_final, ref, generator)
-        wav = self._solve([plan], [n_timesteps])[0]
-        return {AUDIO_CHUNK: [self._finish(wav, watermark)]}
+        del kwargs
+        return self.forward_batched(graph_walk, engine_inputs, [rid], [plan], [ref], [n_timesteps], [watermark])[rid]
 
     def forward_batched(
-        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, speech_tokens: list[torch.Tensor],
-        rid: list[int], ref: list, n_timesteps: list[int], watermark: list[bool],
-        seed: list[int], is_final: list[bool], **kwargs,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rid: list[int], plan: list[_ChunkPlan],
+        ref: list, n_timesteps: list[int], watermark: list[bool], **kwargs,
     ) -> dict[int, NameToTensorList]:
         """Several requests' chunks in one step: their flow solves share a
         padded batch, the vocoder runs per request behind its own cache.
         Keyed by rid handle, which is how the engine reads the outputs back."""
         del graph_walk, engine_inputs, kwargs
-        plans = []
-        for handle, tokens, r, s, final in zip(rid, speech_tokens, ref, seed, is_final, strict=True):
-            stream, generator = self._stream(handle, s)
-            plans.append(self._plan_chunk(stream, tokens, final, r, generator))
-        wavs = self._solve(plans, list(n_timesteps))
+        held = dict(self.stream.read(0).fields)
+        wavs = self._solve(plan, ref, list(n_timesteps), held)
+        self.stream.write(0, **held)
         return {
             handle: {AUDIO_CHUNK: [self._finish(wav, wm)]}
             for handle, wav, wm in zip(rid, wavs, watermark, strict=True)

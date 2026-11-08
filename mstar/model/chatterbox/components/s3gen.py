@@ -31,7 +31,7 @@ from mstar.model.chatterbox.components.audio import MelSpectrogram24k, kaldi_fba
 from mstar.model.chatterbox.components.s3gen_cfm import CausalConditionalCFM, ConditionalDecoder
 from mstar.model.chatterbox.components.s3gen_flow import FlowTokenEncoder
 from mstar.model.chatterbox.components.s3gen_graphs import EncoderGraphs, SolveGraphs, VocoderGraphs
-from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator
+from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator, HiFTNoise
 from mstar.model.chatterbox.components.s3gen_xvector import CAMPPlus
 from mstar.model.chatterbox.config import S3GenConfig
 from mstar.model.chatterbox.loader import fold_weight_norm, load_component
@@ -61,15 +61,14 @@ class ReferenceConditioning:
 @dataclass
 class FlowRow:
     """One request's share of a batched flow solve: its tokens so far, its
-    reference, whether the sequence is complete (else the look-ahead tokens are
-    provisional) and, for a stream, the fixed noise field it was started with
-    (``[1, 80, >= 2(N + n)]``) so every chunk denoises the same draw. Rows
-    without a field draw fresh noise from ``generator`` (the offline path)."""
+    reference, the noise field it denoises (``[1, 80, >= 2(N + n)]``), which a
+    stream keeps from its first chunk so every chunk denoises the same draw,
+    and whether the sequence is complete (else the look-ahead tokens are
+    provisional)."""
     tokens: torch.Tensor  # [n] long, S3 speech tokens
     ref: ReferenceConditioning
+    noise: torch.Tensor
     finalize: bool = True
-    noise: torch.Tensor | None = None
-    generator: torch.Generator | None = None
 
 
 class S3Gen(nn.Module):
@@ -174,7 +173,7 @@ class S3Gen(nn.Module):
     # Tokens -> mel
     # ------------------------------------------------------------------
 
-    def _draw_noise(
+    def draw_noise(
         self, batch: int, prompt_len: int, gen_len: int, generator: torch.Generator | None,
     ) -> torch.Tensor:
         """The reference's noise, drawn in its order: the mean-flow path
@@ -234,7 +233,7 @@ class S3Gen(nn.Module):
         mask = length_mask(h_lens, total).unsqueeze(1).to(mu.dtype)
 
         if noise is None:
-            noise = self._draw_noise(batch, mel_prompt, total - mel_prompt, generator)
+            noise = self.draw_noise(batch, mel_prompt, total - mel_prompt, generator)
         elif noise.shape[-1] != total:
             noise = noise[:, :, :total]
         mel = self._run_solve(mu, mask, spk, cond, noise, n_timesteps)
@@ -283,10 +282,7 @@ class S3Gen(nn.Module):
             mel_prompt = ref.num_prompt_tokens * ratio
             valid = int(h_lens[i])
             cond[i, :, :mel_prompt] = ref.prompt_feat[0].transpose(0, 1)
-            if row.noise is not None:
-                noise[i, :, :valid] = row.noise[0, :, :valid].to(noise.dtype)
-            else:
-                noise[i, :, :valid] = self._draw_noise(1, mel_prompt, valid - mel_prompt, row.generator)[0]
+            noise[i, :, :valid] = row.noise[0, :, :valid].to(noise.dtype)
         mask = length_mask(h_lens, total).unsqueeze(1).to(mu.dtype)
         mel = self._run_solve(mu, mask, spk, cond, noise, n_timesteps)
         return [
@@ -304,6 +300,7 @@ class S3Gen(nn.Module):
         mel: torch.Tensor,
         *,
         generator: torch.Generator | None = None,
+        noise: HiFTNoise | None = None,
         cache_source: torch.Tensor | None = None,
         fade_in: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -313,9 +310,11 @@ class S3Gen(nn.Module):
         excitation so a chunk continues the previous chunk's harmonics
         (reference ``HiFTGenerator.inference(cache_source=...)``). ``fade_in``
         applies the utterance-head trim/fade and belongs on the first chunk only.
+        ``noise`` is the excitation's draws, taken from ``generator`` when not given.
         """
         mel = mel.to(self.dtype)
-        noise = self.vocoder.draw_noise(mel, generator)
+        if noise is None:
+            noise = self.vocoder.draw_noise(mel, generator)
         if self.vocoder_graphs is not None:
             magnitude, phase, source = self.vocoder_graphs(mel, noise.phase, noise.harmonic, cache_source)
             wav = self.vocoder.waveform(magnitude, phase)

@@ -71,7 +71,7 @@ class ShapeGraphs:
         self.capture_after = max(1, int(capture_after))
         self._seen: dict[tuple, int] = {}
         self._graphs: OrderedDict[tuple, _CapturedGraph] = OrderedDict()
-        self._pool = None
+        self._graph_pool = None
         self.captures = 0
         self.replays = 0
         self.disabled = False
@@ -161,8 +161,8 @@ class ShapeGraphs:
         backend = DeviceCapability.of(device).graph_backend
         index = device.index if device.index is not None else torch.accelerator.current_device_index()
         with torch.accelerator.device_index(index):
-            if self._pool is None:
-                self._pool = backend.graph_pool_handle()
+            if self._graph_pool is None:
+                self._graph_pool = backend.graph_pool_handle()
             stream = backend.new_stream()
             stream.wait_stream(backend.current_stream())
             with backend.stream_context(stream):
@@ -170,7 +170,7 @@ class ShapeGraphs:
                     run()
             backend.current_stream().wait_stream(stream)
             backend.synchronize()
-            return capture_into_graph(run, self._pool, device, autocast_dtype=None)
+            return capture_into_graph(run, self._graph_pool, device, autocast_dtype=None)
 
 
 def _rows_for(rows: Sequence[int], batch: int) -> int | None:

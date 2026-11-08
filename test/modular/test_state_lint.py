@@ -21,7 +21,7 @@ PORTED = (
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/pi05",
     "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
-    "mstar/model/qwen3_tts", "mstar/model/bagel",
+    "mstar/model/qwen3_tts", "mstar/model/bagel", "mstar/model/chatterbox",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states",
@@ -46,6 +46,13 @@ ALLOWED = {
 ALLOWED_IN: dict[tuple[str, str, str], str] = {
     ("mstar/model/bagel/bagel_model.py", "mstar.engine.resources", "KVReqConfig"):
         "per-node and publish labels under CFG parallel and P/D, until P/D labels",
+} | {
+    ("mstar/model/chatterbox/components/s3gen_graphs.py", module, name):
+        "S3Gen's own captures per shape, which hold no state"
+    for module, name in (
+        ("mstar.engine.accelerator_graph_backend", "CapturedGraph"),
+        ("mstar.engine.accelerator_graph_runner", "capture_into_graph"),
+    )
 }
 # Graph breaks a ported package keeps, by file and function, since no state call sits behind them.
 ALLOWED_BREAKS = {

@@ -320,18 +320,27 @@ def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(va
         assert int(lens[0]) == reference_tokens(samples, config), f"a {samples}-sample clip is laid out wrong"
 
 
-@pytest.mark.parametrize(("cfg_weight", "clip"), [(0.0, False), (0.5, False), (0.5, True)])
-def test_chatterbox_lays_out_every_label_it_declares(cfg_weight, clip):
+@pytest.mark.parametrize(("cfg_weight", "clip", "labels"), [
+    (0.0, False, {"main"}), (0.5, False, {"main", "uncond"}), (0.5, True, {"main", "uncond"}),
+])
+def test_chatterbox_opens_the_labels_its_guidance_lays_out(cfg_weight, clip, labels):
     from test_chatterbox_model import _make_model, _tone
+
+    from mstar.conductor.conductor import Conductor
+    from mstar.engine.state.adapters import kv_layouts
 
     model = _make_model()
     tensors = {"audio_inputs": [_tone(2.0)]} if clip else None
-
     output = model.process_prompt("hello", ["text", "audio"] if clip else ["text"], ["audio"],
                                   tensors=tensors, cfg_weight=cfg_weight)
+    layout = kv_layouts(model.declare_state(), output.metadata["state_layout"], {})
 
-    opened = model.get_request_resource_configs({}, {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
-    assert set(output.metadata["kv_layout"]["t3_kv"]) == opened, "the layout doesn't name the labels the request opens"
+    conductor = SimpleNamespace(
+        model=model, _declarations=model.declare_state, _node_resources=list,
+        _kv_labels={key: tuple(labels) for key, labels in model.kv_labels().items()},
+    )
+    configs = Conductor._get_resource_configs(conductor, {"cfg_weight": cfg_weight, "kv_layout": layout}, {})
+    assert configs["t3_kv"].opened_labels() == labels, "an unguided request would open a stream it never lays out"
 
 
 class _Cosmos3Tokenizer:

@@ -44,32 +44,35 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVReqConfig,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    Entry,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
+    TensorType,
+    Value,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import ForwardPassArgs, KVLabel, Model, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.chatterbox.components.audio_frontend import resample, trim_silence
 from mstar.model.chatterbox.config import (
     COND_LABEL,
     S3_SR,
     S3GEN_NODE,
     S3GEN_SR,
+    S3GEN_STREAM,
     T3_ATTN,
     T3_KV,
     T3_NODE,
-    T3_POS,
     T3_SAMPLER,
     UNCOND_LABEL,
     VOICE_ENCODER_NODE,
@@ -77,7 +80,8 @@ from mstar.model.chatterbox.config import (
 )
 from mstar.model.chatterbox.loader import resolve_snapshot
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import FixedChunkPolicy, RampChunkPolicy
+from mstar.model.utils import check_kv_pools_fit
+from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 from mstar.utils.device import DeviceCapability
 
@@ -264,91 +268,70 @@ class ChatterboxModel(Model):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the T3 KV pool cannot hold.
 
-        Nothing preempts a stream once the pool is full: the requests wait on
-        each other until they time out. So ``max_concurrent_requests`` requests
-        at full text and ``max_new_tokens_limit`` speech tokens must fit, next to
-        the sink page (which a captured decode's padding rows also run against).
+        A stream holds the prompt (conditioning, text, the speech BOS, twice
+        where T3 repeats it) and a token per decode step, the step that runs
+        past the stop included. CFG keeps a conditional and an unconditional one.
         """
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: a burst of long requests can fill "
-                "the T3 KV cache and stall until the requests time out", config_path,
-            )
-            return
-        kv = next(s for s in self.get_node_resources() if s.resource_key == T3_KV).config
-        overrides = (config.get("resources") or {}).get(T3_KV) or {}
-        page_size = int(overrides.get("page_size", kv.tokens_per_page))
-        max_num_pages = int(overrides.get("max_num_pages", kv.max_num_pages))
-        need = 1 + int(cap) * self._request_kv_pages(page_size)
-        if need > max_num_pages:
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) at "
-                f"max_new_tokens_limit={self.config.max_new_tokens_limit or self.config.t3.max_speech_tokens} "
-                f"need {need} pages of resources.{T3_KV}, which has {max_num_pages}; "
-                "raise max_num_pages or lower one of the other two"
-            )
-
-    def _request_kv_pages(self, page_size: int) -> int:
-        """Pages one request can hold at full text and the token limit, per
-        stream (CFG keeps a conditional and an unconditional one): the prompt
-        (conditioning, text, the speech BOS, twice where T3 repeats it) and a
-        token per decode step, the step that runs past the stop included."""
         t3 = self.config.t3
         limit = self.config.max_new_tokens_limit or t3.max_speech_tokens
         bos = 2 if t3.duplicate_bos_in_prefill else 1
         tokens = t3.cond_len + self.config.max_text_tokens + bos + limit
         streams = 1 if self.config.is_turbo else 2
-        return streams * -(-tokens // page_size)
+        check_kv_pools_fit(self, config, config_path, logger, request_tokens={T3_KV: (tokens,) * streams})
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        t3 = self.config.t3
-        bb = t3.backbone
-        kv = PagedKVConfig(
-            num_layers=bb.num_hidden_layers,
-            num_kv_heads=bb.num_key_value_heads,
-            head_dim=bb.head_dim,
-            max_seq_len=t3.cond_len + self.config.max_text_tokens + t3.max_speech_tokens,
-            num_qo_heads=bb.num_attention_heads,
-        )
-        if bb.is_gpt2:
-            # learned absolute positions: the resource only counts
-            position = PositionConfig(kv_cache=T3_KV)
-        else:
-            position = PositionConfig(
-                kv_cache=T3_KV,
-                rope_theta=bb.rope_theta,
-                rope_scale=bb.rope_scaling["factor"],
-                low_freq_factor=bb.rope_scaling["low_freq_factor"],
-                high_freq_factor=bb.rope_scaling["high_freq_factor"],
-                old_context_len=bb.rope_scaling["original_max_position_embeddings"],
+    def declare_state(self) -> list[Array | Sampler]:
+        from mstar.model.chatterbox.submodules import max_reference_tokens
+
+        t3, bb, s3 = self.config.t3, self.config.t3.backbone, self.config.s3gen
+        rope = None
+        if not bb.is_gpt2:
+            scaling = bb.rope_scaling
+            rope = Rope(
+                theta=bb.rope_theta, scale=scaling["factor"], low_freq_factor=scaling["low_freq_factor"],
+                high_freq_factor=scaling["high_freq_factor"],
+                old_context_len=scaling["original_max_position_embeddings"],
             )
+        frames = self.config.stream_mel_cache_frames
+        samples = frames * s3.hift.upsample_factor
+        n_ref = max_reference_tokens(self.config)
+        f32 = torch.float32
         return [
-            KVSpec(resource_key=T3_KV, nodes={T3_NODE}, config=kv),
-            AttentionSpec(
-                resource_key=T3_ATTN, nodes={T3_NODE},
-                config=AttentionConfig(kv_cache=T3_KV),
+            Array(
+                T3_KV, nodes={T3_NODE}, layers=frozenset(range(bb.num_hidden_layers)),
+                entry=KVEntry(heads=bb.num_key_value_heads, head_dim=bb.head_dim),
+                max_len=t3.cond_len + self.config.max_text_tokens + t3.max_speech_tokens,
+                labels=frozenset({COND_LABEL, UNCOND_LABEL}),
+                # GPT-2 adds learned positions at the input, so its positions only count
+                positions=Positions(rope=rope),
+                reads={T3_ATTN: Read(mask=Causal(), op=Attend(q_heads=bb.num_attention_heads))},
             ),
-            PositionSpec(resource_key=T3_POS, nodes={T3_NODE}, config=position),
-            SamplerSpec(
-                resource_key=T3_SAMPLER, nodes={T3_NODE},
-                vocab_size=t3.speech_vocab_size,
-                enable_repetion_penalty=True,
-                # the reference samples with min_p 0.05 (Turbo does not)
-                enable_min_p=not self.config.is_turbo,
+            # the reference samples with min_p 0.05 (Turbo does not)
+            Sampler(
+                T3_SAMPLER, nodes={T3_NODE}, vocab_size=t3.speech_vocab_size, penalty=True,
+                min_p=not self.config.is_turbo,
             ),
+            # One stream's synthesis between chunks: the vocoder's held-back tail, the reference it conditions on
+            # (padded to the longest one dec_cond_seconds allows; ref_len 0 is the built-in voice), how far it got,
+            # and its generator's state.
+            Value(S3GEN_STREAM, nodes={S3GEN_NODE}, layers=frozenset({0}), entry=Entry({
+                "hift_mel": TensorType((s3.output_size, frames), dtype=f32),
+                "hift_source": TensorType((1, samples), dtype=f32),
+                "hift_speech": TensorType((samples,), dtype=f32),
+                "ref_tokens": TensorType((n_ref,), dtype=torch.long),
+                "ref_feat": TensorType((s3.token_mel_ratio * n_ref, s3.output_size), dtype=f32),
+                "ref_embedding": TensorType((s3.spk_embed_dim,), dtype=f32),
+            }, host={"token_offset": int, "chunks": int, "done": bool, "ref_len": int, "rng": bytes})),
         ]
 
     def get_request_resource_configs(
         self,
         partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del partition_fwd_args
         knobs = self.resolve_generation_kwargs(model_kwargs)
-        labels = [COND_LABEL, UNCOND_LABEL] if knobs["cfg_weight"] > 0 else [COND_LABEL]
         return {
-            T3_SAMPLER: SamplingReqConfig(
+            T3_SAMPLER: SampleSettings(
                 temperature=knobs["temperature"],
                 top_k=knobs["top_k"],
                 top_p=knobs["top_p"],
@@ -356,7 +339,6 @@ class ChatterboxModel(Model):
                 min_p=knobs["min_p"],
                 ignore_eos=knobs["ignore_eos"],
             ),
-            T3_KV: KVReqConfig(needed_labels=labels),
         }
 
     def resolve_generation_kwargs(self, model_kwargs: dict | None) -> dict[str, Any]:
@@ -516,16 +498,19 @@ class ChatterboxModel(Model):
         ]
 
     def _chunk_policy(self):
-        """Speech tokens reach S3Gen in a small first chunk and fixed later
-        chunks; ``stream_chunk_tokens=0`` hands the whole utterance over once
-        T3 finishes (the reference's offline decode)."""
-        if self.config.stream_chunk_tokens <= 0:
-            return FixedChunkPolicy(chunk_size=self.config.t3.max_speech_tokens + 1)
-        return RampChunkPolicy(
-            first_chunk=self.config.stream_first_chunk_tokens,
-            chunk_size=self.config.stream_chunk_tokens,
-            growth=self.config.stream_chunk_growth,
-            max_chunk=max(self.config.stream_max_chunk_tokens, self.config.stream_chunk_tokens),
+        """Speech tokens reach S3Gen in a small first chunk and chunks that grow
+        to a cap, each with every token before it as left context, so S3Gen
+        keeps no history of its own; ``stream_chunk_tokens=0`` hands the whole
+        utterance over once T3 finishes (the reference's offline decode)."""
+        cfg = self.config
+        if cfg.stream_chunk_tokens <= 0:
+            return FixedChunkPolicy(chunk_size=cfg.t3.max_speech_tokens + 1)
+        schedule, chunk = _ramp_schedule(
+            cfg.stream_first_chunk_tokens, cfg.stream_chunk_tokens, cfg.stream_chunk_growth,
+            max(cfg.stream_max_chunk_tokens, cfg.stream_chunk_tokens),
+        )
+        return ScheduledLeftContextChunkPolicy(
+            schedule=schedule, chunk=chunk, left_context=cfg.t3.max_speech_tokens + 1,
         )
 
     def get_partition_topology(self) -> PartitionTopology:
@@ -671,9 +656,9 @@ class ChatterboxModel(Model):
         layout = self._t3_layout(text_ids, wav)
         guided = knobs["cfg_weight"] > 0
         labels = (COND_LABEL, UNCOND_LABEL) if guided else (COND_LABEL,)
-        return ProcessPromptOutput(out, {"kv_layout": {T3_KV: dict.fromkeys(labels, layout)}})
+        return ProcessPromptOutput(out, {"state_layout": {T3_KV: dict.fromkeys(labels, layout)}})
 
-    def _t3_layout(self, text_ids: torch.Tensor, reference: torch.Tensor | None) -> LabelLayout:
+    def _t3_layout(self, text_ids: torch.Tensor, reference: torch.Tensor | None) -> Layout:
         """What T3 writes on each label the request opens: ``[cond | text | BOS]``, then a row per decode step."""
         from mstar.model.chatterbox.submodules import reference_tokens
 
@@ -689,7 +674,7 @@ class ChatterboxModel(Model):
             cond += prompt - t3.speech_cond_prompt_len
         text = text_ids.numel()
         bos = 2 if t3.duplicate_bos_in_prefill else 1
-        return LabelLayout(
+        return Layout(
             spans=(
                 Span("rows", walk, cond, cond, PROMPT_TOKENS),
                 Span("ids", walk, text, text, TEXT_INPUTS),
@@ -1074,6 +1059,19 @@ def _integer(name: str, value: Any, *, low: int, high: int | None = None) -> int
     if value < low or (high is not None and value > high):
         raise ValueError(f"{name}={value} is outside [{low}, {'inf' if high is None else high}]")
     return value
+
+
+def _ramp_schedule(first: int, chunk: int, growth: float, max_chunk: int) -> tuple[tuple[int, ...], int]:
+    """A ramp's chunk sizes as a schedule and the size it settles at: ``first``,
+    then ``chunk`` grown by ``growth`` up to ``max_chunk``, each rounded from
+    the running size as `RampChunkPolicy` rounds it."""
+    if growth < 1:
+        raise ValueError(f"growth must be >= 1, got {growth}")
+    sizes, size = [first, round(float(chunk))], float(chunk)
+    while growth > 1.0 and size < max_chunk:
+        size = min(size * growth, float(max_chunk))
+        sizes.append(round(size))
+    return tuple(sizes[:-1]), sizes[-1]
 
 
 def _graph_rows(max_rows: int) -> tuple[int, ...]:

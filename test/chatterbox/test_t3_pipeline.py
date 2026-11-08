@@ -1,12 +1,13 @@
 """Greedy speech-token parity of the T3 node against the reference package.
 
 Drives ``T3Submodule`` exactly as the engine does (prepare_inputs ->
-preprocess -> declare_step -> forward, prefill then decode steps) on CPU
-through the fake KV/attention/position resources and an argmax sampler, and
-compares the tokens with a greedy re-run of the reference ``T3.inference``
-loop (multinomial replaced by argmax, everything else as written). Then the
-offline S3Gen path turns the tokens into audio and is checked against the
-reference ``S3Gen.inference`` under the same seed.
+declare_step -> preprocess -> forward, prefill then decode steps) on CPU
+through its state handles over the fake KV/attention/position resources and
+an argmax sampler, and compares the tokens with a greedy re-run of the
+reference ``T3.inference`` loop (multinomial replaced by argmax, everything
+else as written). Then the S3Gen node turns tokens arriving in one final
+chunk into audio, which is checked against the reference ``S3Gen.inference``
+under the same seed.
 """
 
 from __future__ import annotations
@@ -27,20 +28,15 @@ from chatterbox.models.t3 import T3 as RefT3  # noqa: E402, N811
 from chatterbox.models.t3.inference.t3_hf_backend import T3HuggingfaceBackend  # noqa: E402
 from chatterbox.models.t3.modules.cond_enc import T3Cond  # noqa: E402
 from chatterbox.models.t3.modules.t3_config import T3Config as RefT3Config  # noqa: E402
-from fake_resources import FakeT3Resources  # noqa: E402
+from fake_resources import FakeS3GenStream, FakeT3State  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 
 from mstar.model.chatterbox.components.s3gen import ReferenceConditioning, S3Gen  # noqa: E402
 from mstar.model.chatterbox.components.t3 import T3Model  # noqa: E402
-from mstar.model.chatterbox.config import (  # noqa: E402
-    T3_ATTN,
-    T3_KV,
-    T3_POS,
-    T3_SAMPLER,
-    ChatterboxConfig,
-)
+from mstar.model.chatterbox.config import T3_SAMPLER, ChatterboxConfig  # noqa: E402
 from mstar.model.chatterbox.loader import iter_weights, resolve_snapshot  # noqa: E402
 from mstar.model.chatterbox.submodules import (  # noqa: E402
+    DECODE_LOOP,
     PREV_TOKEN,
     SPEECH_TOKENS,
     TEXT_INPUTS,
@@ -48,7 +44,7 @@ from mstar.model.chatterbox.submodules import (  # noqa: E402
     S3GenSubmodule,
     T3Submodule,
 )
-from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, engine_step  # noqa: E402
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 torch.manual_seed(0)
@@ -155,9 +151,8 @@ def _mstar_greedy(variant: str, snapshot: str, text_tokens: torch.Tensor, cfg_we
         prompt_tokens=conds["cond_prompt_speech_tokens"].reshape(-1),
     )
     sub = T3Submodule(model, config, builtin_voice=builtin)
-    res = FakeT3Resources()
-    res.bind(model, T3_ATTN, T3_KV, T3_POS)
-    resources = {T3_ATTN: res.kv_attn, T3_KV: res.kv_attn, T3_POS: res.pos, T3_SAMPLER: FakeGreedySampler()}
+    res = FakeT3State(config, FakeGreedySampler())
+    sub.bind_node_state(res.handles)
     info = SimpleNamespace(
         request_id="r", rid_handle="r",
         step_metadata={"cfg_weight": cfg_weight, "exaggeration": exaggeration, "min_p": 0.05,
@@ -165,24 +160,23 @@ def _mstar_greedy(variant: str, snapshot: str, text_tokens: torch.Tensor, cfg_we
         resource_configs={T3_SAMPLER: SimpleNamespace(temperature=0.0, ignore_eos=False)},
         max_tokens=4096, random_seed=0,
     )
-    engine = ModelInputsFromEngine(request_ids=["r"], per_request_info={"r": info}, resources=resources)
+    engine = ModelInputsFromEngine(request_ids=["r"], per_request_info={"r": info})
 
-    def run(walk, inputs):
-        prepared = sub.prepare_inputs(walk, info, inputs)
-        step = sub.declare_step(walk, ["r"], [prepared])
-        res.plan([seg.span for seg in step.segments])  # label-major, as the KV plan packs them
-        packed = sub.preprocess(walk, engine, [prepared])
-        out = sub.forward(walk, engine, **packed)
-        tok = out[SPEECH_TOKENS][0]
+    def run(walk, inputs, iteration=0):
+        loop = InputMetadata(dynamic_loop_iter_counts={DECODE_LOOP: iteration})
+        prepared = sub.prepare_inputs(walk, info, inputs, input_metadata=loop)
+        step = engine_step(sub, graph_walk=walk, request_ids=["r"], inputs=[prepared])
+        with res.opened(step, walk):  # label-major, as the KV plan packs them
+            out = sub.forward(walk, engine, **sub.preprocess(walk, engine, [prepared]))
         sub.postprocess("r", info, out)
-        return tok
+        return out[SPEECH_TOKENS][0]
 
     tokens = [int(run("prefill", {TEXT_INPUTS: [text_tokens]}))]
     prev = torch.tensor([tokens[-1]])
-    for _ in range(n_steps - 1):
-        prev = run("decode", {PREV_TOKEN: [prev]})
+    for iteration in range(n_steps - 1):
+        prev = run("decode", {PREV_TOKEN: [prev]}, iteration)
         tokens.append(int(prev))
-    return tokens, sub
+    return tokens
 
 
 @pytest.mark.parametrize("variant,cfg_weight,exaggeration", [
@@ -210,12 +204,9 @@ def test_t3_greedy_tokens_match_reference(variant, cfg_weight, exaggeration):
     )
     with torch.no_grad():
         expected = _reference_greedy(ref, cond, text_tokens, cfg_weight, N_STEPS)
-        got, sub = _mstar_greedy(variant, snapshot, text_tokens, cfg_weight, exaggeration, N_STEPS)
+        got = _mstar_greedy(variant, snapshot, text_tokens, cfg_weight, exaggeration, N_STEPS)
     print(f"[{variant} cfg={cfg_weight} exag={exaggeration}] ref={expected}\n mstar={got}")
     assert got == expected
-    # bookkeeping the loop control relies on
-    state = sub.request_state("r")
-    assert state["generated"] == N_STEPS
     assert config.t3.cond_len == (34 if variant == "chatterbox" else 376)
 
 
@@ -239,7 +230,8 @@ def test_offline_s3gen_matches_reference_under_the_same_seed():
         prompt_tokens=conds["prompt_token"], prompt_feat=conds["prompt_feat"], embedding=conds["embedding"],
     )
     sub = S3GenSubmodule(s3gen, s3_tokenizer=None, config=config, builtin_voice=builtin, watermarker=None)
-    pcm = sub.synthesize(tokens, builtin, n_timesteps=10, seed=1234, watermark=False)
+    stream = FakeS3GenStream(sub)
+    pcm = stream.step({0: stream.prepare(0, tokens, is_final=True, seed=1234, n_timesteps=10)})[0]
 
     expected = (ref_wav[0].clamp(-1, 1) * 32767).to(torch.int16)
     assert pcm.shape == expected.shape == (30 * 960,)
