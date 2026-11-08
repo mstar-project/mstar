@@ -376,8 +376,9 @@ Endpoints and model coverage:
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech, in
        ``audio.format`` ``wav`` (default), ``pcm16``, or ``mp3`` / ``flac`` / ``opus`` with
        the ``audio`` extra (Python frontend only); streamed audio is ``pcm16``. ``n`` or
-       ``best_of`` above 1, ``stop``, ``logprobs``, ``logit_bias``, ``presence_penalty`` /
-       ``frequency_penalty`` and a ``response_format`` other than text are refused.
+       ``best_of`` above 1, ``stop``, ``stop_token_ids``, ``logprobs``, ``top_logprobs``,
+       ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a ``response_format``
+       other than text are refused.
    * - ``POST /v1/audio/speech``
      - ``kokoro``, ``orpheus``, ``qwen3_omni``
      - Text-to-speech (``kokoro`` streams sentence by sentence with ``stream=True``).
