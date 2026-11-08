@@ -125,15 +125,21 @@ def inputs(out, pr, result, max_gpus="4", hours="4", above=""):
     """The review's fields (review.json) and the PRs stacked above it (stacked-above.json) as files for
     the steps below; whether the PR's author has write access (`trusted`): the live test runs the PR's
     code, so only then, checked against their permission (author_association can't tell write from
-    read); and the box's GPUs (the review's ask, capped), hours and the PR's base branch."""
-    Path("review.json").write_text(result)
+    read); and the box's GPUs (the review's ask, capped), hours and the PR's base branch. A review that asks
+    for more GPUs than a run gets has something the live test can't exercise: review.json's `untestable` says
+    so, for `carry` and `approve`."""
+    review = json.loads(result)
+    live, cap = review.get("live_test") or {}, int(max_gpus)
+    gpus = live.get("gpus")
+    if gpus and gpus > cap:
+        live["untestable"] = "; ".join(x for x in (live.get("untestable"), f"needs {gpus} GPUs, runs get {cap}") if x)
+    Path("review.json").write_text(json.dumps(review))
     if above:
         Path("stacked-above.json").write_text(above)
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
     if bot.permission(REPO, pull["user"]["login"]) in WRITE:
         out["trusted"] = "true"
-    gpus = (json.loads(result).get("live_test") or {}).get("gpus")
-    out.update(gpus=min(1 if gpus is None or gpus is False else gpus, int(max_gpus)), hours=hours,
+    out.update(gpus=min(1 if gpus is None or gpus is False else gpus, cap), hours=hours,
                base=pull["base"]["ref"])
 
 
