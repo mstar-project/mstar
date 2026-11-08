@@ -4342,13 +4342,13 @@ class KVManager(AttentionResource):
                 # the moves `make_room` chose for ``rid`` admitted it (`_settle`)
                 return None
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
-            if pages > room or not self._admit(rid, pages, self.journal):
+            if pages > room or not self._admit(rid, pages):
                 return RoomMark(rid, node_name, graph_walk, published, room, *self._index_counts())
             return None
 
-    def _admit(self, rid: str, pages: int, journal: Callable[..., None] | None = None) -> bool:
+    def _admit(self, rid: str, pages: int) -> bool:
         """Allot ``rid`` the ``pages`` it asks for, which the room covers, or return False when ``rid`` turns
-        guaranteed here and the room doesn't cover its footprint. ``journal`` takes the flip and the reservation for
+        guaranteed here and the room doesn't cover its footprint. Rank 0 journals the flip and the reservation for
         the other ranks to replay. Caller holds the lock."""
         # The host sets room aside for the prompt of a request that can move only there, and `_cover_move`
         # grows it page by page. With no room for even that, the request reserves what it grows into.
@@ -4356,13 +4356,13 @@ class KVManager(AttentionResource):
             pages = self._footprint(rid)
             self._flip(rid, pages)
             # the other ranks replay the flip, since it can come passes before the reservation they replay
-            if journal is not None:
-                journal(MoveKind.GUARANTEE, rid, pages)
+            if self.journal is not None:
+                self.journal(MoveKind.GUARANTEE, rid, pages)
             if pages > self._room():
                 return False
         self._reserve(rid, pages)
-        if journal is not None:
-            journal(MoveKind.RESERVE, rid, pages)
+        if self.journal is not None:
+            self.journal(MoveKind.RESERVE, rid, pages)
         return True
 
     def _reserve(self, rid: str, pages: int) -> None:
@@ -4719,7 +4719,7 @@ class KVManager(AttentionResource):
             # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
             # window's commit frees pages at another point of the step. The engine journals the move ahead of it.
             if self._decides and earmark.pages <= self._room():
-                self._admit(earmark.rid, earmark.pages, self.journal)
+                self._admit(earmark.rid, earmark.pages)
             return
         granted = min(earmark.pages - earmark.granted, freed)
         if granted:
@@ -4754,10 +4754,8 @@ class KVManager(AttentionResource):
             if kind == MoveKind.EARMARK:
                 self._mark_victims(Earmark(rid, count, set()), victims)
             elif kind == MoveKind.RESERVE:
-                # a request that holds an allotment asks only for the shortage it waits on
-                if rid in self._allotments:
-                    self._asks[rid] = count
-                elif (failed := self._ask(rid)) is not None:
+                # a request that holds an allotment asks only for the shortage its WAIT set
+                if rid not in self._allotments and (failed := self._ask(rid)) is not None:
                     raise RuntimeError(failed.reason.message)
                 if victims:
                     # rank 0's `make_room`, whose reservation rank 0 journals once the moves of ``victims`` cover it
