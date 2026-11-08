@@ -167,7 +167,7 @@ python3 $S/gpu.py terminate <instance>
 python3 $S/gpu.py list
 ```
 
-Copy back before terminating; the box's local disk goes with it. `save_caches` overwrites the tarball with this box's caches, which are a superset of what it restored; skip it when the run was cut short before any server finished compiling. Skip it on the review bot's box too: on Eras its cache volume is read-only and filled from main by `review-cache.yml`; on the Slurm node it would put a PR's kernels into the shared tarball. A restored Inductor cache also reuses autotune choices, so cross-restart repeats no longer sample kernel-selection variance (benchmarking skill, trap 1): that narrows the spread between arms, and both arms share it. Server logs over a few MB: copy the tail and grep hits (errors, tracebacks, recompiles), not the whole file.
+Copy back before terminating; the box's local disk goes with it. `save_caches` overwrites the tarball with this box's caches, which are a superset of what it restored; skip it when the run was cut short before any server finished compiling. Skip it on the review bot's box too: on Eras its cache volume is read-only and filled from main by `review-cache.yml`; on a Slurm node its tarball is a copy in the job's directory (`gpu_review_box.sh`), so a save would never reach the shared one. A restored Inductor cache also reuses autotune choices, so cross-restart repeats no longer sample kernel-selection variance (benchmarking skill, trap 1): that narrows the spread between arms, and both arms share it. Server logs over a few MB: copy the tail and grep hits (errors, tracebacks, recompiles), not the whole file.
 
 ## 5. Report
 
