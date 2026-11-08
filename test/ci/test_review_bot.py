@@ -2,6 +2,7 @@
 
 import base64
 import contextlib
+import datetime
 import fnmatch
 import json
 import os
@@ -112,6 +113,7 @@ class TestPreflight(unittest.TestCase):
         routes = {f"GET repos/o/r/collaborators/{login}/permission": {"permission": perm}
                   for login, perm in perms.items()}
         routes["pr comment"] = "https://github.com/o/r/pull/1#issuecomment-9"
+        routes["GET repos/o/r/issues[?]*"] = []  # no ledger yet: nothing spent
         out, fake = step(bot.preflight, routes, repo="o/r", pr="1", key_set="true", command=command, actor=actor,
                          author=author, assoc=assoc, skip_label="false")
         return out, [stdin for key, stdin in fake.writes()]
@@ -138,6 +140,107 @@ class TestPreflight(unittest.TestCase):
 
 
 HEAD, LAST = "1" * 40, "2" * 40
+
+
+NOW = datetime.datetime(2026, 11, 8, 12, tzinfo=datetime.timezone.utc)
+LEDGER = {"number": 1, "user": {"login": "github-actions[bot]"}, "body": bot.issue_marker("ledger") + "\nthe ledger"}
+STATUS = {"number": 2, "user": {"login": "github-actions[bot]"}, "body": bot.issue_marker("status") + "\nthe status"}
+
+
+def spent(usd, created="2026-11-08T01:00:00Z", run="1", attempt="1", login="github-actions[bot]", **extra):
+    """A ledger comment recording a run that cost `usd`."""
+    record = base64.b64encode(json.dumps({"usd": usd, "run": run, "attempt": attempt, **extra}).encode()).decode()
+    return {"user": {"login": login}, "created_at": created,
+            "body": f"PR #1: ${usd}.\n<!-- review-spend {record} -->\n"}
+
+
+class TestSpend(unittest.TestCase):
+    def spend(self, comments, issues=(LEDGER,)):
+        routes = {"GET repos/o/r/issues[?]*": list(issues),
+                  "GET repos/o/r/issues/1/comments*": comments, "GET repos/o/r/issues/2/comments*": comments}
+        with mock.patch.object(bot, "run", FakeGh(routes)):
+            return bot.spend("o/r", NOW)
+
+    def test_spend_sums_this_day_and_month_once_per_run_from_the_bots_comments_alone(self):
+        self.assertEqual(self.spend([spent(1.5), spent(2, "2026-11-01T23:59:59Z", run="2"),
+                                     spent(99, "2026-10-31T23:59:59Z", run="3")]), {"day": 1.5, "month": 3.5})
+        self.assertEqual(self.spend([spent(1), spent(1)]), {"day": 1, "month": 1},
+                         "a re-recorded run would count twice")
+        self.assertEqual(self.spend([spent(1, attempt="2"), spent(1, attempt="1")])["day"], 2,
+                         "a retried run's spend would be dropped")
+        self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
+                         "anyone could add a record to a public issue and reach the cap")
+
+    def test_spend_reads_every_ledger_issue_and_starts_at_the_lowest_for_writes(self):
+        self.assertEqual(self.spend([spent(1)], issues=(LEDGER, {**STATUS, "body": LEDGER["body"]}))["day"], 1,
+                         "the same run recorded in two issues would double")
+        comments = {1: [spent(1, run="1")], 2: [spent(2, run="2")]}
+        with mock.patch.object(bot, "run", FakeGh({
+                "GET repos/o/r/issues[?]*": [{**STATUS, "body": LEDGER["body"]}, LEDGER],
+                "GET repos/o/r/issues/1/comments*": comments[1], "GET repos/o/r/issues/2/comments*": comments[2]})):
+            self.assertEqual(bot.spend("o/r", NOW)["day"], 3, "a run in the second ledger issue would be missed")
+            self.assertEqual(bot.issue("o/r", "ledger"), 1, "writers would split across ledger issues")
+
+    def test_the_record_step_appends_what_spend_reads_back(self):
+        recorded = {}
+
+        def comment(argv, stdin):
+            recorded["body"] = stdin
+            return ""
+
+        usage = json.dumps({"total_cost_usd": 2.5, "tokens_from": "result", "pr": "7", "head_sha": HEAD, "mode": "full",
+                            "run_id": "9", "run_attempt": "1"})
+        out, fake = step(bot.record, {"GET repos/o/r/issues[?]*": [LEDGER], "issue comment": comment}, repo="o/r",
+                         pr="7", github_run_id="9", github_run_attempt="1", usage=usage, gpu_usd="3", box_usd="1.5",
+                         approval="approve")
+        self.assertEqual(self.spend([{"user": {"login": "github-actions[bot]"}, "created_at": "2026-11-08T01:00:00Z",
+                                      "body": recorded["body"]}]), {"day": 7.0, "month": 7.0},
+                         "a run's GPU and box cost would not count toward the cap")
+        self.assertEqual(self.spend_of(recorded["body"]).get("approval"), "approve")
+        self.assertTrue(all(recorded["body"] not in arg for argv, _ in fake.calls for arg in argv),
+                        "the record would reach gh's command line")
+
+    @staticmethod
+    def spend_of(body):
+        return json.loads(base64.b64decode(bot.SPEND.search(body)[1]))
+
+
+class TestCaps(unittest.TestCase):
+    def preflight(self, used, alerts=()):
+        routes = {"GET repos/o/r/collaborators/an-author/permission": {"permission": "write"},
+                  "GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/1/comments*": used,
+                  "GET repos/o/r/issues/2/comments*": list(alerts), "issue comment": "", "pr comment": ""}
+        with mock.patch.object(bot, "utcnow", lambda: NOW):
+            out, fake = step(bot.preflight, routes, repo="o/r", pr="1", key_set="true", command="full",
+                             actor="an-author", author="an-author", assoc="MEMBER", skip_label="false")
+        return out, fake.writes()
+
+    def test_past_a_cap_nothing_starts_it_says_so_on_the_pr_and_alerts_once(self):
+        out, writes = self.preflight([spent(10_000.5)])
+        self.assertEqual(out, {"run": "false"}, "a review would start past the day's cap")
+        said = dict(writes)
+        self.assertEqual(sorted(said), ["issue comment", "pr comment"])
+        self.assertIn("daily spend cap ($10,000 of $10,000)", said["pr comment"])
+        self.assertIn("resets at 00:00 UTC", said["pr comment"])
+        marker = said["issue comment"].split("\n")[0]
+        again = [{"user": {"login": "github-actions[bot]"}, "body": f"{marker}\nalready"}]
+        self.assertEqual([k for k, _ in self.preflight([spent(10_000.5)], again)[1]], ["pr comment"],
+                         "every refused request would alert the status issue's subscribers")
+        out, writes = self.preflight([spent(50_000, "2026-11-02T01:00:00Z")])
+        said = dict(writes)
+        self.assertIn("monthly spend cap", said["pr comment"])
+        self.assertIn("resets on the 1st", said["pr comment"])
+        self.assertEqual(self.preflight([spent(9_999)])[0]["run"], "true", "a run under the caps would be refused")
+
+    def test_an_unreadable_ledger_refuses_rather_than_spends(self):
+        with mock.patch.object(bot, "utcnow", lambda: NOW):
+            out, fake = step(bot.preflight, {"GET repos/o/r/collaborators/an-author/permission":
+                                             {"permission": "write"}, "GET repos/o/r/issues[?]*": Fail(),
+                                             "pr comment": ""},
+                             repo="o/r", pr="1", key_set="true", command="light", actor="an-author", author="an-author",
+                             assoc="MEMBER", skip_label="false")
+        self.assertEqual(out, {"run": "false"})
+        self.assertIn("couldn't read its spend ledger", fake.writes()[0][1], "a blind bot could spend past its cap")
 
 
 class TestRestore(unittest.TestCase):
@@ -289,10 +392,9 @@ class TestAfterTheReview(unittest.TestCase):
             for text in ('[{"type": "assistant", "message": ', None):
                 if text:
                     Path(temp, bot.EXECUTION).write_text(text)
-                step(bot.usage, {}, pr="1", head_sha="abc", mode="light", outcome="failure", runner_temp=temp,
-                     home=temp, github_run_id="5", github_run_attempt="1", github_step_summary=str(summary))
-                record = json.loads(Path(temp, "usage/review-usage-1-5-1.json").read_text())
-                self.assertEqual(record["api_calls"], 0)
+                out, _ = step(bot.usage, {}, pr="1", head_sha="abc", mode="light", outcome="failure", runner_temp=temp,
+                              home=temp, github_run_id="5", github_run_attempt="1", github_step_summary=str(summary))
+                self.assertEqual(json.loads(out["record"])["api_calls"], 0)
                 Path(temp, bot.EXECUTION).unlink(missing_ok=True)
             self.assertTrue(summary.read_text().strip(), "the job summary would have no table")
 

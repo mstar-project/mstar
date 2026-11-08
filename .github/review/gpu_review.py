@@ -280,6 +280,12 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
     (lt / "pr-body.md").write_text(f"# {pull['title']}\n\n{pull['body'] or ''}\n")
     (lt / "run.json").write_text(json.dumps({"repo": REPO, "pr": pr, "sha": head_sha, "main_sha": main_sha,
                                              "model": MODEL, "turns": turns, "claude": CLAUDE}))
+    stop = bot.over_cap(REPO)  # a review can take hours, so again right before the spend, as at preflight
+    if stop:
+        (lt / "unavailable.md").write_text(stop + "\n")
+        print(stop)
+        out["unavailable"] = "true"
+        sys.exit(3)
     cfg = gpu_py()["load_config"]()
     listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json").stdout)
     cap = listing["max_usd_per_hour"]
@@ -311,6 +317,8 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
         if r.returncode == 0:
             (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (lt / "offer.json").write_text(json.dumps(o))
+            # gpu.py drops its entry when it terminates the instance; this copy prices the run (run_cost).
+            (lt / "entry.json").write_text(json.dumps(gpu_py()["entry"](r.stdout.strip().splitlines()[-1])))
             print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
             return
         tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
@@ -377,9 +385,23 @@ def wait(out, runner_temp, start_timeout: int = 30):
     print(f"collected: {sorted(p.name for p in results.iterdir())}")
 
 
-def cleanup(out, pr: int, tag):
+def run_cost(lt, now):
+    """(GPU, box session) USD of this run: the hours from launch to now or the deadline, whichever came
+    first, at the offer's price (Slurm's is $0), and the box's own Claude Code total."""
+    gpu_usd = 0.0
+    if (lt / "entry.json").is_file():
+        e = json.loads((lt / "entry.json").read_text())
+        gpu_usd = max(0.0, e["usd_per_hour"] * (min(now, e["deadline"]) - e["launched_at"]) / 3600)
+    try:
+        box_usd = float(json.loads((lt / "results/claude.json").read_text()).get("total_cost_usd") or 0)
+    except (OSError, ValueError, AttributeError):
+        box_usd = 0.0
+    return gpu_usd, box_usd
+
+
+def cleanup(out, pr: int, tag, runner_temp):
     """Release whatever this run launched, and delete the ssh key it registered, from the ledger and by
-    name, for a run cancelled mid-launch."""
+    name, for a run cancelled mid-launch; then what the run's GPUs and box session cost, for the ledger."""
     print(gpu("list", check=False).stdout)
     state = gpu_py()
     for key in list(state["ledger"]()):
@@ -397,6 +419,7 @@ def cleanup(out, pr: int, tag):
             if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
         state["eras_delete_key"](name)
+    out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
 
 
 # ---------------------------------------------------------------- approval

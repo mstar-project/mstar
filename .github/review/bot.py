@@ -9,7 +9,9 @@ its interface. It records its outputs in `out`, which `main` writes to $GITHUB_O
 step fails. Every call to another program (`gh`, `git`, gpu.py, ssh-keygen) goes through `run`, the
 one place a test replaces. Text the bot posts reaches `gh` on stdin, never its command line.
 """
+import base64
 import collections
+import datetime
 import fnmatch
 import inspect
 import json
@@ -53,6 +55,13 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
       pageInfo { hasNextPage endCursor }
       nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
     } } } }"""
+# A run's record, base64 JSON, in a ledger comment: one comment per run, so concurrent runs can't lose updates.
+SPEND = re.compile(r"<!-- review-spend ([A-Za-z0-9+/=]+) -->")
+# USD the bot may spend per UTC day and month on review tokens and Eras GPU time, a change to main like the
+# approval rule. Slurm GPUs are free.
+CAPS = {"day": 10_000, "month": 50_000}
+ISSUES = {"ledger": ("Review bot spend ledger", "The review bot's spend, one comment per run. Read by code."),
+          "status": ("Review bot status", "The review bot's status: a daily report in this body, alerts as comments.")}
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
 
@@ -137,6 +146,105 @@ def redact(text, exact=()):
     return text
 
 
+def issue_marker(kind):
+    return f"<!-- review-bot-{kind} -->"
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def issues(repo, kind):
+    """The bot's own issues of `kind`, lowest number first: those a bot login created whose body starts
+    with the kind's marker. Created in a race, two can exist; readers take them all, writers the lowest."""
+    found = {}
+    for login in BOT_USERS:
+        creator = login.replace("[", "%5B").replace("]", "%5D")
+        for i in api_list(f"repos/{repo}/issues?state=all&creator={creator}&per_page=100"):
+            if (i.get("user") or {}).get("login") in BOT_USERS \
+                    and (i.get("body") or "").startswith(issue_marker(kind)):
+                found[i["number"]] = i
+    return [found[n] for n in sorted(found)]
+
+
+def issue(repo, kind):
+    """The number of the bot's issue of `kind`, created if there is none."""
+    found = issues(repo, kind)
+    if found:
+        return found[0]["number"]
+    title, text = ISSUES[kind]
+    body = json.dumps({"title": title, "body": f"{issue_marker(kind)}\n{text}\n"})
+    return json.loads(gh("api", "-X", "POST", f"repos/{repo}/issues", "--input", "-", input=body).stdout)["number"]
+
+
+def comment_on_issue(repo, number, body):
+    """Post `body` as a comment on an issue, from stdin."""
+    gh("issue", "comment", str(number), "--repo", repo, "--body-file", "-", input=body)
+
+
+def ledger(repo, since):
+    """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments, each run and
+    attempt once, from every ledger issue. A failed read raises."""
+    records, seen = [], set()
+    for i in issues(repo, "ledger"):
+        for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
+            m = SPEND.search(c.get("body") or "")
+            if not m or (c.get("user") or {}).get("login") not in BOT_USERS:
+                continue
+            try:
+                record = json.loads(base64.b64decode(m[1]))
+            except ValueError:
+                continue
+            key = (record.get("run"), record.get("attempt"))
+            if key not in seen:
+                seen.add(key)
+                records.append((c["created_at"], record))
+    return records
+
+
+def spend(repo, now):
+    """{"day": USD, "month": USD} spent so far in `now`'s UTC day and month."""
+    day, month = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m")
+    used = {"day": 0, "month": 0}
+    for created, record in ledger(repo, f"{month}-01T00:00:00Z"):
+        usd = record.get("usd") if isinstance(record.get("usd"), (int, float)) else 0
+        used["month"] += usd if created.startswith(month) else 0
+        used["day"] += usd if created.startswith(day) else 0
+    return used
+
+
+def over_cap(repo):
+    """Why nothing new may start, or None: the first cap reached, with one alert on the status issue for it
+    per day or month, or a failed read of the ledger. Checked at every step that starts spending."""
+    now = utcnow()
+    try:
+        used = spend(repo, now)
+    except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
+        print(f"::warning::Couldn't read the spend ledger: {e}")
+        return "The review bot couldn't read its spend ledger, so no new review or GPU run starts; try again later."
+    for window, cap in CAPS.items():
+        if used[window] < cap:
+            continue
+        word, resets, stamp = ("daily", "at 00:00 UTC", now.strftime("%Y-%m-%d")) if window == "day" \
+            else ("monthly", "on the 1st", now.strftime("%Y-%m"))
+        why = (f"The review bot's {word} spend cap (${used[window]:,.0f} of ${cap:,}) is reached; it resets {resets}. "
+               "No new review or GPU run starts until then.")
+        alert(repo, f"{window}-{stamp}", why)
+        return why
+    return None
+
+
+def alert(repo, key, text):
+    """Comment `text` on the status issue, once per `key`, best effort: a failed alert changes no decision."""
+    marker = f"<!-- review-alert {key} -->"
+    try:
+        number = issue(repo, "status")
+        if not marked(api_list(f"repos/{repo}/issues/{number}/comments?per_page=100"), marker):
+            comment_on_issue(repo, number, f"{marker}\n{text}\n")
+    except (RuntimeError, ValueError, KeyError, TypeError) as e:
+        print(f"::warning::Couldn't post the alert: {e}")
+
+
 # ---------------------------------------------------------------- preflight job
 
 def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label, team_turns="2000",
@@ -155,6 +263,17 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
         out["run"] = "false"
         return
     mode = "" if command == "continue" else command  # the stopped review's mode, from its handoff
+
+    def start(**outputs):
+        """The request is allowed: run it, unless the bot is past a spend cap or can't tell."""
+        stop = over_cap(repo)
+        if stop:
+            print(f"::notice::{stop}")
+            out["run"] = "false"
+            reply(repo, pr, stop)
+            return
+        out.update(run="true", **outputs)
+
     perm = permission(repo, actor)
     if perm in WRITE:
         author_perm = permission(repo, author) if command == "full" else ""
@@ -164,12 +283,12 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
             reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes an author with write access; "
                             "comment `/review nogpu` for the review without the live test.")
             return
-        out.update(run="true", mode=mode, turns=team_turns)
+        start(mode=mode, turns=team_turns)
         return
     own = assoc in CONTRIBUTORS and actor != "" and actor == author and skip_label != "true"
     if own and command in ("light", "continue"):
         print(f"::notice::{actor} has '{perm}' access; reviewing their own PR as its author ({assoc}).")
-        out.update(run="true", mode=mode, non_write_user=actor, turns=self_turns)
+        start(mode=mode, non_write_user=actor, turns=self_turns)
         return
     out["run"] = "false"
     if not own:
@@ -548,8 +667,8 @@ def salvage(out, repo, pr, runner_temp):
 def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, github_run_attempt,
           github_step_summary, prev=""):
     """What the run used, from the execution file or, after a timeout, the session transcript: a table in
-    the job summary, and a small record ($RUNNER_TEMP/usage/) to compare runs by. Never posted on the PR,
-    and never fails: a record that couldn't be read says why in its `error` field."""
+    the job summary, and the record the `spend` job writes to the ledger (`record`). Never posted on the
+    PR, and never fails: a record that couldn't be read says why in its `error` field."""
     record = {"pr": pr, "head_sha": head_sha, "mode": mode, "continue": prev != "", "run_id": github_run_id,
               "run_attempt": github_run_attempt, "outcome": outcome}
     try:
@@ -557,14 +676,12 @@ def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, gi
     except Exception as e:
         record["error"] = f"{type(e).__name__}: {e}"
         print(f"::warning::Couldn't read the review's usage: {record['error']}")
+    out["record"] = json.dumps(record, separators=(",", ":"))
     try:
-        path = Path(runner_temp, "usage", f"review-usage-{pr}-{github_run_id}-{github_run_attempt}.json")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(record, indent=1) + "\n")
         with open(github_step_summary, "a") as f:
             f.write(session.usage_table(record))
     except Exception as e:
-        print(f"::warning::Couldn't write the usage record: {e}")
+        print(f"::warning::Couldn't write the job summary: {e}")
 
 
 def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
@@ -706,6 +823,28 @@ def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_conti
         comment(repo, pr, text)
 
 
+# ---------------------------------------------------------------- spend job
+
+def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="", box_usd="", approval=""):
+    """Append one record for this run to the ledger issue (`spend` job, after the review and the live test),
+    so the caps and the monitor read what each run cost: the review's tokens and the live test's GPUs and
+    box session. Nothing spent, nothing written."""
+    try:
+        review = json.loads(usage) if usage else {}
+    except ValueError:
+        review = {}
+    gpu, box = float(gpu_usd or 0), float(box_usd or 0)
+    if not review and not gpu and not box:
+        return
+    cost = review.get("total_cost_usd")
+    usd = round((cost if isinstance(cost, (int, float)) else 0) + gpu + box, 4)
+    entry = {"pr": pr, "head": review.get("head_sha"), "mode": review.get("mode"), "run": github_run_id,
+             "attempt": github_run_attempt, "usage": review, "gpu_usd": gpu, "box_usd": box, "approval": approval,
+             "usd": usd}
+    b64 = base64.b64encode(json.dumps(entry).encode()).decode()
+    comment_on_issue(repo, issue(repo, "ledger"), f"PR #{pr}: ${usd:,.2f}.\n<!-- review-spend {b64} -->\n")
+
+
 # ---------------------------------------------------------------- dispatcher
 
 def main(steps):
@@ -736,7 +875,8 @@ def main(steps):
 
 
 STEPS = {"preflight": preflight, "resolve": resolve, "restore": restore, "collect": collect, "salvage": salvage,
-         "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete}
+         "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete,
+         "record": record}
 
 if __name__ == "__main__":
     main(STEPS)
