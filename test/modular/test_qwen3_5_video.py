@@ -860,6 +860,8 @@ def test_adapter_maps_video_url_to_a_video_attachment(tmp_path):
 @pytest.mark.parametrize("samples", [0, 2])
 @pytest.mark.parametrize("layout", ["images", "mixed"])
 def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupted_run(model, layout, samples):
+    """A dropped chat with images or video is rebuilt from its kept ids and host copies of its encoder output, into
+    the slots and pages it held, and decode resumes at the position it left."""
     from test_worker_rebuild import NODE, R, _worker
 
     from mstar.communication.tensors import LocalTransferEngine
