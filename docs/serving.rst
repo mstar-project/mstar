@@ -236,7 +236,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``model``
      - Registry key of the model (see :doc:`models`).
    * - ``max_seq_len``
-     - Default context limit for paged KV caches. Per-resource ``max_seq_len`` under
+     - Default context limit for paged KV caches, capped by each model declaration. Per-resource ``max_seq_len`` under
        ``resources: <kv>:`` takes precedence. A null value keeps model defaults;
        fixed-size and ring caches retain their own geometry.
    * - ``node_groups``

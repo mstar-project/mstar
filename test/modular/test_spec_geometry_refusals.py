@@ -133,7 +133,7 @@ def test_a_pool_with_no_layers_takes_a_per_layer_block_with_an_empty_axis():
     assert config.blocks["conv"].shape == (64, 0), "no layer reads this block, so nothing fails on the empty axis"
 
 
-@pytest.mark.parametrize("limit", [32, None, 0, True, "32"])
+@pytest.mark.parametrize("limit", [32, 128, None, 0, True, "32"])
 def test_deployment_context_default_and_resource_override(limit):
     from mstar.engine.resources.kv.config import KVSpec
     from mstar.engine.resources.spec import apply_yaml_overrides
@@ -146,5 +146,5 @@ def test_deployment_context_default_and_resource_override(limit):
             apply_yaml_overrides([first, second], config)
     else:
         apply_yaml_overrides([first, second], config)
-        assert first.config.max_seq_len == (64 if limit is None else limit)
+        assert first.config.max_seq_len == (64 if limit is None else min(64, limit))
         assert second.config.max_seq_len == 128

@@ -294,7 +294,7 @@ def apply_yaml_overrides(
             raise ValueError("max_seq_len must be a positive integer or null")
         for spec in by_key.values():
             if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig):
-                spec.apply_yaml_overrides(max_seq_len=limit)
+                spec.apply_yaml_overrides(max_seq_len=min(limit, spec.config.max_seq_len))
     for key, kwargs in overrides.items():
         try:
             by_key[key].apply_yaml_overrides(**kwargs)
