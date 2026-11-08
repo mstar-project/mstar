@@ -611,6 +611,10 @@ class TestInterdiff(unittest.TestCase):
             with self.subTest(name):
                 self.assertIn(shown, bot.interdiff(old, new))
         self.assertIn("evil()\rdiff --git", carriage_return, "a bare \\r would end the line, faking a file header")
+        typed = ("diff --git a/w b/w\ndeleted file mode 120000\nindex 1..0\n--- a/w\n+++ /dev/null\n@@ -1 +0,0 @@\n-t\n"
+                 "diff --git a/w b/w\nnew file mode 100644\nindex 0..{}\nBinary files /dev/null and b/w differ\n")
+        self.assertIn("0..3", bot.interdiff(typed.format("2"), typed.format("3")),
+                      "a binary swapped inside a type change would read as unchanged")
         self.assertEqual(bot.interdiff(binary.format("1..2 100644"), binary.format("9..2 100644")), "",
                          "main changing a binary's old side would read as the PR's change")
         rename = ("diff --git a/x b/y\nsimilarity index {}%\nrename from x\nrename to y\n--- a/x\n+++ b/y\n"
