@@ -2174,6 +2174,19 @@ into one GPU call. A submodule controls this behavior with these methods:
   every ready row fits, it doesn't matter. An admit that runs out of KV pages offloads the row
   last in that same line.
 
+**Walk priorities.** Which (node, walk) a worker's next step goes to is a
+``SchedulingPolicy`` (``mstar/worker/scheduling_policy.py``). By default it is round robin:
+the least recently scheduled key first, and a speculation chain keeps its first step before
+it gives way to other ready work. A model that returns ``{node: {walk: priority}}`` from
+``Model.get_walk_priorities`` gets ``Priority`` instead: keys with ready rows go in
+priority order, round robin among equals, and a chain gives way at once when a walk above
+its own has a row the engine would take. A pair that no walk runs refuses the worker's start. That trades the other walks' steps for the listed one's latency, and a
+walk that stays ready starves the rest, so it suits a walk whose steps are short, such as a
+TTS model's prefill, whose first audio waits on it while decode streams have time to spare.
+List every node the latency waits on, a reference-clip encoder before the prefill too: an
+unlisted one keeps priority 0 and gets fewer turns than before, since the chain now gives
+its turns to the listed walk.
+
 .. _combined-walks:
 
 **Combined walks.** By default a step holds one walk. A model lets several walks of a node

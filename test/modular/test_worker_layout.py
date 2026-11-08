@@ -48,7 +48,7 @@ def _connection(source, dest, edge):
     )
 
 
-def _model(topology=True, combined=None):
+def _model(topology=True, combined=None, priorities=None):
     return SimpleNamespace(
         get_graph_walk_graphs=_walks,
         get_partitions=lambda: [
@@ -62,6 +62,7 @@ def _model(topology=True, combined=None):
         ) if topology else None,
         chunking_policy_of=lambda: {("consumer", "consume"): object()},
         combined_walk_of=lambda: combined or {},
+        get_walk_priorities=lambda: priorities or {},
     )
 
 
@@ -178,6 +179,11 @@ def test_chunk_loops_read_the_speculate_mid_prefill_setting():
 def test_combined_walks_come_from_the_model():
     combined = {("consumer", "consume"): "mixed"}
     assert _derive(_model(combined=combined), sharding=SimpleNamespace(groups=[])).combined_walk_of == combined
+
+
+def test_walk_priorities_come_from_the_model_as_node_walk_keys():
+    layout = _derive(_model(priorities={"consumer": {"consume": 2}}))
+    assert dict(layout.walk_priorities) == {("consumer", "consume"): 2}
 
 
 COMBINED = {("consumer", "consume"): "mixed", ("consumer", "again"): "mixed"}

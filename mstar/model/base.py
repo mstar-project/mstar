@@ -795,6 +795,15 @@ class Model(ABC):
         """
         return type(self).__name__
 
+    def get_walk_priorities(self) -> dict[str, dict[str, int]]:
+        """``{node: {walk: priority}}``: walks a worker serves before others while they
+        have ready rows, higher first; unlisted walks are 0. A speculation chain gives way
+        to a ready walk above its own at once. Empty, the default, keeps round robin.
+        Starves lower walks while a higher one stays ready, so declare it for a walk
+        whose steps are short and latency-sensitive, such as a TTS prompt's first audio,
+        and for every node on that walk's path: a node left at 0 gets fewer turns."""
+        return {}
+
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
         return {}

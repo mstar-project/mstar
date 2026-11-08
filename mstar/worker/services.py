@@ -76,6 +76,8 @@ class WorkerLayout:
     is_tp_follower: bool = False
     # (node, real walk) -> combined walk; scheduling keys use the combined one
     combined_walk_of: Mapping[tuple[str, str], str] = field(default_factory=_no_entries)
+    # (node, walk) -> the model's priority for it (``Model.get_walk_priorities``)
+    walk_priorities: Mapping[tuple[str, str], int] = field(default_factory=_no_entries)
     # (node, walk) keys on the side lane; known once ``EngineManager.build`` has
     # validated them, so ``Worker`` fills this in after building the engines
     side_keys: frozenset[tuple[str, str]] = frozenset()
@@ -118,6 +120,7 @@ class WorkerLayout:
         )
         node_to_partition: dict[str, str] = {}
         innermost: Mapping[tuple[str, str], str] = {}
+        priorities: dict[tuple[str, str], int] = {}
         consumers: list[Connection] = []
         if model is not None:
             refuse_combined_walks_across_tp_groups(model, sharding_config, my_walks)
@@ -129,6 +132,7 @@ class WorkerLayout:
                         for node_name in section.get_nodes():
                             node_to_partition[node_name] = pdef.name
             innermost = innermost_loops(walks)
+            priorities = walk_priorities_of(model, walks)
             topology = model.get_partition_topology()
             if topology:
                 consumers = [
@@ -144,11 +148,27 @@ class WorkerLayout:
             parallel_leader_nodes=leaders,
             is_tp_follower=bool(parallel - leaders),
             combined_walk_of=MappingProxyType(model.combined_walk_of() if model is not None else {}),
+            walk_priorities=MappingProxyType(priorities),
             all_wg_nodes=all_wg_nodes,
             innermost_loop_by_node=MappingProxyType(innermost),
             consumer_connections=tuple(consumers),
             streaming_edge_names=frozenset(conn.edge_name for conn in consumers),
         )
+
+
+def walk_priorities_of(model: Model, walks: Mapping[str, GraphSection]) -> dict[tuple[str, str], int]:
+    """``Model.get_walk_priorities`` as (node, walk) keys, refusing a pair no walk has:
+    a typo there would silently leave the walk it meant at round robin."""
+    priorities: dict[tuple[str, str], int] = {}
+    for node, by_walk in model.get_walk_priorities().items():
+        for walk, priority in by_walk.items():
+            if walk not in walks or node not in walks[walk].get_nodes():
+                raise ValueError(
+                    f"{type(model).__name__}.get_walk_priorities names {node!r} on walk {walk!r}, "
+                    "which that walk does not run"
+                )
+            priorities[(node, walk)] = priority
+    return priorities
 
 
 def innermost_loops(walks: Mapping[str, GraphSection]) -> dict[tuple[str, str], str]:

@@ -5,7 +5,6 @@ import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any, NamedTuple
 
 from mstar.engine.chunking import ChunkRange
@@ -37,6 +36,7 @@ from mstar.worker.scheduled_batch import (  # noqa: F401 (re-exported)
     tp_chunk_ranges,
     unfinished_chunk_rids,
 )
+from mstar.worker.scheduling_policy import Priority, RoundRobin, SchedulingPolicy
 from mstar.worker.services import WorkerLayout, WorkerServices
 
 logger = logging.getLogger(__name__)
@@ -61,15 +61,6 @@ class ReadyNodeEntry:
 
 
 
-
-
-class SchedulingType(Enum):
-    ROUND_ROBIN = "round_robin"
-    # TODO: priority. It used to key off a per-engine-type table, which no
-    # longer exists — every node runs on the same engine now. The replacement
-    # is for the model to declare a (node, graph_walk) priority, since only it
-    # knows which walk is latency-sensitive. Worth weighing against
-    # head-of-line blocking: a busy high-priority walk starves the rest.
 
 
 class ChainPick(NamedTuple):
@@ -103,7 +94,7 @@ class MicroScheduler:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout,
         lifecycle: RequestLifecycle, lockstep: Lockstep, admission: Admission,
-        model_config: dict | None = None, sched_type=SchedulingType.ROUND_ROBIN,
+        model_config: dict | None = None,
         max_consec_tp_follower_batches: int = 1,
     ):
         model_config = model_config or {}
@@ -151,7 +142,7 @@ class MicroScheduler:
         self._chunk_starts = itertools.count()
         # (rid, node) -> cached prefix a measured, not yet chunked row starts past
         self.cached_prefix: dict[tuple[int, str], int] = {}
-        self.sched_type = sched_type
+        self.policy = self._policy(layout.walk_priorities)
 
         # lockstep-parallel (TP / SP / CFG instance) scheduling
         self.parallel_leader_nodes = layout.parallel_leader_nodes
@@ -239,15 +230,22 @@ class MicroScheduler:
             self._budgeted[key] = budgeted
         return budgeted
 
-    def _node_rr_order(
-        self, ready: dict[tuple[str, str], list[ReadyNodeEntry]],
-    ) -> list[tuple[str, str]]:
-        """The (node, walk) keys with a ready row, least recently scheduled
-        first; ties go to the first scanned."""
-        return sorted(
-            ready,
-            key=lambda key: self.node_and_walk_to_last_batch_num.get(key, 0),
-        )
+    def _policy(self, walk_priorities: Mapping[tuple[str, str], int]) -> SchedulingPolicy:
+        """Round robin, or ``Priority`` over the model's (node, walk) priorities. A
+        combined walk's key takes the highest of its walks', so its rows are served as
+        the most urgent of them; each real walk keeps its own, which a chain keys on."""
+        if not any(walk_priorities.values()):
+            return RoundRobin()
+        priorities = dict(walk_priorities)
+        for (node, walk), priority in walk_priorities.items():
+            key = self._key(node, walk)
+            priorities[key] = max(priorities.get(key, priority), priority)
+        return Priority(priorities)
+
+    def chain_yields(self, chain_key: tuple[str, str], consecutive: int, mid_prompt: bool) -> bool:
+        """The policy's verdict on whether a speculation chain into ``chain_key`` gives
+        the step after its own to other ready work (``SchedulingPolicy.chain_yields``)."""
+        return self.policy.chain_yields(chain_key, consecutive, mid_prompt, self)
 
     def note_ran(self, batch: ScheduledBatch) -> None:
         """Give ``batch``'s rows their turn under its scheduling key, in the
@@ -409,8 +407,6 @@ class MicroScheduler:
                 self.num_consec_tp_follower_batches += 1
                 return tp_follow_batch
 
-        if self.sched_type != SchedulingType.ROUND_ROBIN:
-            raise NotImplementedError(f"Unknown scheduling type {self.sched_type}")
         # A chain merges and yields away within its own real walk, or its whole
         # combined walk under `speculation_mixes`.
         skip_walk = None
@@ -459,7 +455,7 @@ class MicroScheduler:
         # scheduled, so round robin picks it again next pass anyway -- and
         # under a colocated model the node behind it is the one that frees
         # its pages (snac_decoder behind Orpheus's LLM).
-        for rr_key in self._node_rr_order(ready):
+        for rr_key in self.policy.order(ready, self.node_and_walk_to_last_batch_num):
             if rr_key in keys:
                 continue  # already tried above, off its backlog
             scheduled = schedule(rr_key, ready.get(rr_key, []))
@@ -1363,15 +1359,17 @@ class MicroScheduler:
     def _backlog_has_schedulable(
         self, exclude_target: tuple[str, str] | None,
         exclude_walk: str | None = None,
+        among: Collection[tuple[str, str]] | None = None,
     ) -> bool:
-        """Whether a backlogged chunk outside ``exclude_target`` holds a rid
-        still worth running; with ``exclude_walk``, only that walk's rows
-        under ``exclude_target`` are outside it."""
+        """Whether a backlogged chunk outside ``exclude_target`` (and, given
+        ``among``, under one of those keys) holds a rid still worth running;
+        with ``exclude_walk``, only that walk's rows under ``exclude_target``
+        are outside it."""
         now = time.monotonic()
         held = self.admission.held_until
         stopped = self.lifecycle.no_new_work()
         for node_walk, batch in self.backlog.items():
-            if self._lane(node_walk) != CHAIN_LANE:
+            if self._lane(node_walk) != CHAIN_LANE or (among is not None and node_walk not in among):
                 continue
             only_other = node_walk == exclude_target and exclude_walk is not None
             if node_walk == exclude_target and not only_other:
@@ -1393,6 +1391,7 @@ class MicroScheduler:
     def has_ready_excluding(
         self,
         exclude_target: tuple[str, str] | None,
+        among: Collection[tuple[str, str]] | None = None,
     ) -> bool:
         """Cheap peek: any worker-graph queue ready with a (node, walk) other
         than `exclude_target`? Used by the speculation path to decide whether
@@ -1416,7 +1415,13 @@ class MicroScheduler:
         speculation chain on that walk never merges, so it counts. A chain that
         mixes (`speculation_mixes`) merges those, so its whole combined walk is
         excluded.
+
+        With ``among``, only rows of those keys (real walks or scheduling keys)
+        count: the peek a ``Priority`` chain makes for the walks above its own.
         """
+        def counts(node: str, walk: str) -> bool:
+            return among is None or (node, walk) in among or self._key(node, walk) in among
+
         mixes = exclude_target is not None and self.speculation_mixes(*exclude_target)
         exclude_walk = exclude_target[1] if exclude_target is not None and not mixes else None
         # the runtime scan below takes the real walk as given, or the combined one
@@ -1424,12 +1429,13 @@ class MicroScheduler:
         exclude_target = None if exclude_target is None else self._key(*exclude_target)
         if mixes:
             scan_exclude = exclude_target
-        if self._backlog_has_schedulable(exclude_target, exclude_walk):
+        if self._backlog_has_schedulable(exclude_target, exclude_walk, among):
             return True
         # A waiting rebuild yields the step unless the chain takes it: one of the chain's own walk, or under a mix
         # one of its key.
         if any(
-            self._key(node, cursor.walk) != exclude_target or exclude_walk not in (None, cursor.walk)
+            (self._key(node, cursor.walk) != exclude_target or exclude_walk not in (None, cursor.walk))
+            and counts(node, cursor.walk)
             for node, _, cursor in self._waiting_rebuilds()
         ):
             return True
@@ -1460,6 +1466,8 @@ class MicroScheduler:
         if not self.runtime.has_ready_excluding(exclude, scan_exclude):
             return False
         for spec in self._rows_here(self._ready_specs(exclude, None, scan_exclude), head_node, tp_pend_rids):
+            if not counts(spec.node_name, spec.graph_walk):
+                continue
             node_partition = self.request_state.get_partition_for_node(
                 spec.node_name
             )
