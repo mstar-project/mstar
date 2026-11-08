@@ -12,23 +12,27 @@ finishes.
 from __future__ import annotations
 
 import sys
+from array import array
 
 sys.path.insert(0, ".")
 
 import pytest
 import test_kv_host_index as host
-from test_kv_admission import _remove, _runner
+from test_kv_admission import _RUNNERS, _remove, _runner
 from test_kv_prefix_layout_lease import IMAGE, IMAGE_WALK, RID, TAIL, TEXT, TEXT_WALK
 from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
 from test_kv_row_passes import backend  # noqa: F401, the Rust and the Python page arena
+from test_runner_admission import _StubPool
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine
+from mstar.engine.resources.base import Rebuild
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.cache import GroupPages
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import Victims
+from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import AdmitOutcome, Segment
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -380,6 +384,36 @@ def test_a_request_back_from_the_host_runs_the_grant_it_moved_for():
     assert _ready(kv, "r") and _step(kv, "r", PAGE_SIZE + 1).ok, "r came back without the pages its grant needed"
 
 
+@pytest.mark.usefixtures("backend")
+def test_a_request_back_from_the_host_with_a_shared_prefix_runs_the_grant_it_moved_for():
+    """r reads 3 of its 5 pages from a's prefix and needs two pages past its allotment, with one free. Its return
+    counted the pages r holds without those 3, but its reload counts them, so r came back a page short and went to
+    the host again."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    shared = list(range(3 * PAGE_SIZE))
+    _running(kv, "b", 3, arrival=0)
+    _request(kv, "a", 4, arrival=1, keyed=shared + list(range(100, 100 + PAGE_SIZE)))
+    assert _ready(kv, "a") and _step(kv, "a", 4 * PAGE_SIZE).ok
+    _request(kv, "r", 5, arrival=2, keyed=shared + list(range(200, 200 + 2 * PAGE_SIZE)))
+    assert _ready(kv, "r")
+    inputs = ARNodeInputs(input_seq_len=5 * PAGE_SIZE)
+    kv.apply_cached_prefix("r", NODE, WALK, inputs, kv.resolve_cached_prefix("r", NODE, WALK, inputs))
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok and kv._arena.num_free == 1
+    moves = []
+    for _ in range(2):
+        outcome = _step(kv, "r", PAGE_SIZE + 1)
+        if outcome.ok:
+            break
+        assert _preempt(kv, "r", outcome.reason.pages_short, droppable=lambda rid: False).to_host == ["r"]
+        moves.append(_offload(kv, "r"))
+        if not _ready(kv, "r"):
+            _remove(kv, "b")
+            assert _ready(kv, "r")
+
+    assert len(moves) == 1, f"r went to the host {len(moves)} times for one grant"
+
+
 def _make_room(kv, droppable) -> Victims | None:
     """`KVManager.make_room` for the oldest waiting request the pool refused that moves can let in, as the worker
     calls it."""
@@ -509,6 +543,27 @@ def test_a_request_no_move_covers_waits_until_its_whole_shortage_fits():
     assert _admitted(kv, "r") and _step(kv, "r", PAGE_SIZE + 1).ok, "r wasn't admitted once its shortage fit"
 
 
+def test_a_rollback_keeps_the_allotment_of_a_request_that_waits_for_its_shortage():
+    """r holds 6 of the pool's 10 pages and waits for 2 more. Once they fit, a pool on another node refused r, and the
+    rollback gave back r's allotment and asked for its 6 pages and the 2 again, on top of the 6 it holds. The pool
+    never had room for that."""
+    kv, slots = _pool(), _StubPool(0)
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "slots": slots}, node_resources={NODE: ["kv"], "other": ["slots"]}))
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "r", 6, arrival=1)
+    short = _step(kv, "r", PAGE_SIZE + 1).reason.pages_short
+    assert _preempt(kv, "r", short, droppable=lambda rid: False).waits == 2
+    _runner(kv).readmit("r", NODE)
+    assert _runner(kv).admit_request("r", "other", WALK) is not None
+    _remove(kv, "o")
+    assert not _admitted(kv, "r"), "r started though the other node's pool refused it"
+
+    slots.free = 1
+
+    assert _admitted(kv, "r"), "r's pool asked for its whole history after the rollback"
+    assert _step(kv, "r", PAGE_SIZE + 1).ok
+
+
 def test_a_waiting_request_asks_for_the_room_its_grant_counted_too():
     """A grant two pages past its allotment, with one page free, is one page short. Asking for that page alone, the
     request was let go at once into the free page, and its next grant failed the same way."""
@@ -579,6 +634,34 @@ def test_a_request_dropped_partway_through_its_prompt_returns_with_its_whole_pro
     kv.drop("v", 2 * PAGE_SIZE)
 
     assert kv._dropped["v"].returns == 5, "v would return with room for the pages it wrote and run short on the rest"
+
+
+@pytest.mark.usefixtures("backend")
+def test_a_dropped_request_is_charged_nothing_for_hits_another_request_holds():
+    """v reads 3 of its 4 pages from a's prefix. Dropped, it asked to return with its whole history and a page, though
+    a holds those 3 pages, which can't be evicted, and the rebuild's probe takes them for nothing. With a shared
+    prefix, that let one return into the pool at a time."""
+    kv = _pool()
+    shared = list(range(3 * PAGE_SIZE))
+    tokens = shared + list(range(200, 200 + PAGE_SIZE))
+    _request(kv, "a", 4, arrival=0, keyed=shared + list(range(100, 100 + PAGE_SIZE)))
+    assert _ready(kv, "a") and _step(kv, "a", 4 * PAGE_SIZE).ok
+    _running(kv, "r", 2, arrival=1)
+    _running(kv, "s", 3, arrival=2)
+    _request(kv, "v", 4, arrival=3, keyed=tokens)
+    assert _ready(kv, "v")
+    inputs = ARNodeInputs(input_seq_len=4 * PAGE_SIZE)
+    kv.apply_cached_prefix("v", NODE, WALK, inputs, kv.resolve_cached_prefix("v", NODE, WALK, inputs))
+    assert _step(kv, "v", PAGE_SIZE).ok and kv._arena.num_free == 0
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    assert _step(kv, "r", 1).ok
+    _remove(kv, "s")
+
+    assert _admitted(kv, "v"), "v waited for room for the 3 pages a holds"
+    kv.prepare_rebuild("v", Rebuild(WALK, array("i", [*tokens, 0])))
+    kv.apply_cached_prefix("v", NODE, WALK, inputs, kv.resolve_cached_prefix("v", NODE, WALK, inputs))
+    assert _step(kv, "v", PAGE_SIZE).ok and _step(kv, "v", PAGE_SIZE + 1).ok, "v ran short of its allotment"
 
 
 @pytest.mark.usefixtures("backend")
