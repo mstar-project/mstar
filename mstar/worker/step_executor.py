@@ -35,7 +35,7 @@ from mstar.utils import cpus, knobs
 from mstar.utils.containers import ParallelList
 from mstar.utils.device import DeviceCapability
 from mstar.utils.profiler import PhaseLaps, range_pop, range_push, set_step_key
-from mstar.utils.threads import ThreadPool, pin_thread
+from mstar.utils.threads import InlineExecutor, ThreadPool, pin_thread
 from mstar.worker.host_copies import HostCopies, _host_column, _LazyHostOutputs, crop_to_spans
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
@@ -311,8 +311,10 @@ class StepExecutor:
             services=services, timer=timer, lockstep=lockstep, lifecycle=lifecycle,
             host_copies=self._host_copies, device_capability=self.device_capability, enable_nvtx=enable_nvtx,
         )
-        self._gpu_pool: ThreadPool | None = None
-        self._plan_pool: ThreadPool | None = None
+        self._gpu_pool: ThreadPool | InlineExecutor | None = None
+        self._plan_pool: ThreadPool | InlineExecutor | None = None
+        # ``knobs: step_threads: serial``: the GPU and plan threads' work runs on the main thread
+        self._serial_steps = False
         # lane -> its stream, made on the lane's first step
         self._lane_streams: dict[int, torch.Stream] = {}
         self._stop_token_signal: dict[tuple[str, str], str] = {}
@@ -338,23 +340,31 @@ class StepExecutor:
         Default on; ``knobs: {pre_plan: false}`` or MSTAR_PRE_PLAN_SPEC=0 falls
         back to the double-buffer-without-pre-plan baseline.
         """
+        self._serial_steps = knobs.step_threads() == "serial"
         self._gpu_pool = self._engine_thread_pool("mstar-gpu")
-        logger.info("Worker %s: engine runs on dedicated GPU thread", self.worker_id)
+        logger.info(
+            "Worker %s: engine runs %s", self.worker_id,
+            "on the main thread (step_threads: serial)" if self._serial_steps else "on dedicated GPU thread",
+        )
         if knobs.pre_plan_enabled():
             self._plan_pool = self._engine_thread_pool("mstar-plan")
-            logger.info(
-                "Worker %s: plan_executor enabled — speculative plan() "
-                "pre-runs on a dedicated thread",
-                self.worker_id,
-            )
+            if not self._serial_steps:
+                logger.info(
+                    "Worker %s: plan_executor enabled — speculative plan() "
+                    "pre-runs on a dedicated thread",
+                    self.worker_id,
+                )
 
-    def _engine_thread_pool(self, name: str) -> ThreadPool:
+    def _engine_thread_pool(self, name: str) -> ThreadPool | InlineExecutor:
         """A one-thread pool for the GPU or plan thread, started here, before the loop: before torch
         2.12 dynamo's config is process-wide, and a plan thread whose initializer ran at its first
         pre-plan could read and write the recompile limit while the GPU thread's compiled call patches it
         (``with_recompile_limit``). ``apply_dynamo_config`` never lowering the limit covers a limit
         raised before the pools start (a DiT's, at compile time), not that interleaving. A failed
         initializer also stops the worker here rather than failing every step."""
+        if self._serial_steps:
+            self._init_engine_thread()
+            return InlineExecutor()
         pool = ThreadPool(
             max_workers=1, thread_name_prefix=f"{name}-{self.worker_id}",
             initializer=self._init_engine_thread,
