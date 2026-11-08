@@ -832,7 +832,7 @@ class Worker:
 
     def _set_rebuildable(self, request_id: int, configs: dict[str, ResourceReqConfig]) -> None:
         kv_configs = {key: config for key, config in configs.items() if isinstance(config, KVReqConfig)}
-        layouts = {key: (config.kv_layout or {}).values() for key, config in kv_configs.items()}
+        layouts = {key: config.keyed_layouts() for key, config in kv_configs.items()}
         unpausable = any(config.unpausable for config in kv_configs.values())
         for key, rebuildable in self._rebuilds.ingest_request(request_id, self._kv_writes, layouts, unpausable).items():
             if key in configs:

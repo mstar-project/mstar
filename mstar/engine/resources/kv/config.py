@@ -442,9 +442,7 @@ class KVReqConfig(ResourceReqConfig):
                     growth=tuple((loop, slots) for loop, slots in growth),
                     scratch=scratch,
                     retention=None if retention is None else RetentionPolicy(*retention),
-                    # a request with no keys for the label, as with the prefix cache off for it or for the server,
-                    # keys none of its spans
-                    keyed_spans=keyed_spans if self.keys_of(label) else 0,
+                    keyed_spans=keyed_spans,
                     max_growth=max_growth[0] if max_growth else None,
                 )
                 # a row may leave out the growth bound, as a span row may leave out its later fields
@@ -460,6 +458,14 @@ class KVReqConfig(ResourceReqConfig):
     def keys_of(self, label: str) -> list[bytes] | None:
         """``label``'s prefix keys, or None when the request keys nothing there, as with ``prefix_cache`` off."""
         return (self.prefix_keys or {}).get(label) if self.prefix_cache else None
+
+    def keyed_layouts(self) -> list["StreamLayout"]:
+        """Its layouts, each keying none of its spans where the request has no keys for the label, as with the prefix
+        cache off for the request or for the server."""
+        return [
+            layout if self.keys_of(label) else replace(layout, keyed_spans=0)
+            for label, layout in (self.kv_layout or {}).items()
+        ]
 
     def loop_room(self, spec: "KVSpec | None" = None) -> dict[str, int]:
         if spec is None or not isinstance(spec.config, PagedKVConfig):
@@ -578,7 +584,8 @@ def rebuild_refusal(layouts: Iterable["StreamLayout"]) -> str | None:
 
     The rows write one label, grown by one loop, one row per prefill step its layout lays out, in order. They write
     every span from what its step read, and the ids sampled since at the end of the last span, which must be ids.
-    A keyed label is keyed again by extending its keys, which needs them to cover every span.
+    A keyed label is keyed again by extending its keys, which needs them to cover every span. A layout keys only the
+    spans its request has keys for (`KVReqConfig.keyed_layouts`).
     """
     laid_out = [layout for layout in layouts if layout.spans]
     if len(laid_out) > 1 or any(len(layout.growth) != 1 for layout in laid_out):

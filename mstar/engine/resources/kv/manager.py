@@ -1340,7 +1340,7 @@ class KVManager(AttentionResource):
         self._recount(rid)
 
     def _warn_unkeyed(self, rid: str, node_name: str, graph_walk: str) -> None:
-        """Say once per node that a stream the model declared arrived with no keys and no layout.
+        """Say once per node that a stream the model declared arrived with no keys or no layout.
 
         Nothing else would: an unkeyed request is served in full and never
         reported, so the cache stays empty while every other line looks healthy.
@@ -1356,12 +1356,16 @@ class KVManager(AttentionResource):
         keys = overrides.prefix_keys or {}
         layouts = overrides.kv_layout or {}
         for label in overrides.get_labels(node_name, graph_walk):
-            if graph_walk in self._keyed_walks.get(label, ()) and not keys.get(label) and label not in layouts:
+            layout = layouts.get(label)
+            # a layout that keys no span leaves its request unkeyed on purpose
+            if graph_walk in self._keyed_walks.get(label, ()) and not keys.get(label) and (
+                layout is None or layout.keyed_spans
+            ):
                 self._warned_unkeyed.add(node_name)
                 logger.warning(
-                    "KV %s: requests reach %s with no layout for %s, which the "
+                    "KV %s: requests reach %s with no %s for %s, which the "
                     "model declared for prefix reuse, so nothing will be cached",
-                    self.name, node_name, label,
+                    self.name, node_name, "layout" if layout is None else "keys", label,
                 )
                 return
 
