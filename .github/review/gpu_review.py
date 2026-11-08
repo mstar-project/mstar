@@ -38,9 +38,12 @@ import gpu as gpu_py  # noqa: E402  (gpu.py's functions, for what its command li
 
 WRITE = bot.WRITE
 # Never approved, whatever the review says: the bot's own rules, CI, and the dependencies and toolchains.
-NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/", "docker/", "tools/", "packaging/")
-NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "MANIFEST.in", "pyproject.toml", "setup.py", "Cargo.toml",
-               "rust-toolchain.toml", "requirements*.txt")
+NEVER_DIRS = (".github/", "scripts/", "docker/", "tools/", "packaging/")
+NEVER_ANY_DEPTH = {".cargo", ".claude"}  # the tools read these from wherever they sit, at any depth
+NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "MANIFEST.in", "pyproject.toml", "setup.py", "setup.cfg",
+               "Cargo.toml", "rust-toolchain.toml", "uv.toml", "requirements*.txt", ".gitmodules")
+# A submodule's commit in a file's patch, how the compare API shows a gitlink (mode 160000; it gives no mode).
+GITLINK = re.compile(r"^[-+]Subproject commit [0-9a-f]{40}$", re.MULTILINE)
 # No runtime code: a review's `none` alone approves a change only to these.
 NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
 # Hardware the bot's GPUs aren't, as a word in a PR can name it (untestable): the backstop for the review's
@@ -72,11 +75,12 @@ def gpu(*args, check=True, timeout=900):
 
 def slurm_allowed(pr, slurm_authors, commenter):
     """Whether this PR's live test may use the Slurm nodes: only when the person who asked for it and the
-    PR's author are both in `slurm_authors` (REVIEW_SLURM_AUTHORS, the people already on the nodes). Unset
-    means no Slurm; everyone else with write access still gets a live test, on Eras. The nodes have no job
-    containers and the box runs PR code as root."""
+    PR's author are both in `slurm_authors` (REVIEW_SLURM_AUTHORS, the people already on the nodes), and so is
+    a fork's owner. Unset means no Slurm; everyone else with write access still gets a live test, on Eras. The
+    nodes have no job containers and the box runs PR code as root."""
     listed = slurm_authors.split()
-    return commenter in listed and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in listed
+    pull = bot.api(f"repos/{REPO}/pulls/{pr}")
+    return commenter in listed and pull["user"]["login"] in listed and bot.head_trusted(REPO, pull, listed)
 
 
 def configure(out, runner_temp, pr="0", ssh_key="", slurm_nodes="", slurm_authors="", commenter="",
@@ -101,8 +105,12 @@ def configure(out, runner_temp, pr="0", ssh_key="", slurm_nodes="", slurm_author
     nodes = json.loads(slurm_nodes or "[]")
     if not isinstance(nodes, list) or not all(
             isinstance(n, dict) and re.fullmatch(r"[A-Za-z0-9._-]+", str(n.get("name"))) and n.get("host")
-            for n in nodes):
-        raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]) and a host")
+            and n.get("host_key") for n in nodes):
+        raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]), a host and "
+                         "a pinned host_key")
+    for n in nodes:  # the variable isn't secret, but ssh's errors print the host to this public log
+        for host in {n["host"], n["host"].split("@")[-1]}:
+            print(f"::add-mask::{host}")
     slurm = []
     if ssh_key and nodes and slurm_allowed(pr, slurm_authors, commenter):
         defaults = {"port": 22, "partition": "background", "nice": 100, "max_gpus": int(max_gpus),
@@ -123,16 +131,17 @@ def configure(out, runner_temp, pr="0", ssh_key="", slurm_nodes="", slurm_author
 
 def inputs(out, pr, result, max_gpus="4", hours="4", above=""):
     """The review's fields (review.json) and the PRs stacked above it (stacked-above.json) as files for
-    the steps below; whether the PR's author has write access (`trusted`): the live test runs the PR's
-    code, so only then, checked against their permission (author_association can't tell write from
-    read); and the box's GPUs (the review's ask, capped), hours and the PR's base branch."""
+    the steps below; whether the PR's author has write access and its head repository is trusted
+    (`trusted`, bot.head_trusted): the live test runs the PR's code, so only then, checked against their
+    permission (author_association can't tell write from read); and the box's GPUs (the review's ask,
+    capped), hours and the PR's base branch."""
     review = json.loads(result)
     gpus, cap = (review.get("live_test") or {}).get("gpus"), int(max_gpus)
     Path("review.json").write_text(json.dumps(review))
     if above:
         Path("stacked-above.json").write_text(above)
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
-    if bot.permission(REPO, pull["user"]["login"]) in WRITE:
+    if bot.permission(REPO, pull["user"]["login"]) in WRITE and bot.head_trusted(REPO, pull):
         out["trusted"] = "true"
     out.update(gpus=min(1 if gpus is None or gpus is False else gpus, cap), hours=hours,
                base=pull["base"]["ref"])
@@ -168,10 +177,10 @@ def last_live_test(pr):
                               for c in bot.api_list(f"repos/{REPO}/issues/{pr}/comments"))
 
 
-def changed_files(base_sha, sha):
-    """GitHub's entries for the files changed from BASE_SHA to SHA, or None when its list is too long to
-    check (300 max)."""
-    files = bot.api(f"repos/{REPO}/compare/{base_sha}...{sha}").get("files")
+def changed_files(base, sha):
+    """GitHub's entries for the files changed from `base` (a commit or branch) to SHA, or None when its list is too
+    long to check (300 max)."""
+    files = bot.api(f"repos/{REPO}/compare/{base}...{sha}").get("files")
     return None if files is None or len(files) >= 300 else files
 
 
@@ -446,6 +455,7 @@ def file_gate(files, repo_root):
     aliases = labels["model_aliases"](str(repo_root), [{"filename": f} for f in files])
     areas = {f: set(labels["areas_of"](f, aliases)) for f in files}
     blocked = [f for f in files if f.startswith(NEVER_DIRS) or f.endswith(".lock")
+               or not NEVER_ANY_DEPTH.isdisjoint(Path(f).parts[:-1])
                or any(fnmatch.fnmatchcase(Path(f).name, name) for name in NEVER_FILES)]
     runtime = [f for f in files if not areas[f] <= NO_GPU_AREAS]
     return blocked, runtime
@@ -483,6 +493,7 @@ class ApprovalFacts:
     """Everything the approval rule (decide) looks at, gathered first so the rule reads as plain conditions."""
     head_moved: bool
     author_access: str
+    head_trusted: bool  # the head repository is this one or owned by someone with write access
     verdict: str
     # The review chose `none` and the workflow let it stand (the last live test passed on an ancestor, or
     # there is none and the review didn't build on an earlier one or the PR changes no runtime code).
@@ -500,17 +511,20 @@ class ApprovalFacts:
 def approval_facts(pr, sha, verdict, since, review):
     """The facts of this PR at `sha`, from GitHub and the review; the network reads the rule needs."""
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
-    changes = changed_files(pull["base"]["sha"], sha)
+    # Against the default branch, not the PR's base, so retargeting the PR can't hide a file.
+    changes = changed_files(pull["base"]["repo"]["default_branch"], sha)
     blocked, runtime = file_gate(file_names(changes), ROOT) if changes is not None else ((), False)
+    gitlinks = [f["filename"] for f in changes or [] if GITLINK.search(f.get("patch") or "")]
     return ApprovalFacts(
         head_moved=pull["head"]["sha"] != sha,
         author_access=bot.permission(REPO, pull["user"]["login"]),
+        head_trusted=bot.head_trusted(REPO, pull),
         verdict=verdict,
         review_chose_none=verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none",
         since=since,
         untestable=tuple(untestable(pull, changes or [], review)),
         too_many_files=changes is None,
-        blocked=tuple(blocked),
+        blocked=(*blocked, *gitlinks),
         runtime=bool(runtime),
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
         questions=len(review.get("questions") or ()),
@@ -537,6 +551,8 @@ def decide(f):
         rule.append("the PR has new commits since the reviewed one")
     if f.author_access not in WRITE:
         rule.append(f"the author's access is {f.author_access}, not write")
+    if not f.head_trusted:
+        rule.append("the PR's head repository isn't this one or owned by someone with write access")
     if not (f.verdict == "pass" or f.review_chose_none):
         note = "; judge its 👂 rows" if f.verdict == "partial" else ""
         rule.append(f"the live test's verdict is {f.verdict}{note}")
@@ -665,14 +681,15 @@ def render_comment(sha, lt, media_url=""):
         image = bang or MEDIA.get(Path(rel).suffix.lower()) == "img"
         return f"![{text}]({url})" if image else f"[{text}]({url})"
 
-    # The box's text can't open an HTML comment, so it can't forge the verdict marker the workflow reads.
-    report = re.sub(r"(!?)\[([^\]]*)\]\(([^)\s]+)\)", link, report).replace("<!--", "&lt;!--")
+    # The box's text is made inert first, so it can't ping, link, load an image or forge the verdict marker the
+    # workflow reads; then only links to the gallery's own media come back to life.
+    report = re.sub(r"(!\u200b)?\[([^\]]*)\]\u200b\(([^)\s]+)\)", link, render_summary.inert(report))
     head = ("> 🤖 **Automated live test, AI-generated** (Claude Code). Not checked line by line by a human. "
             "Numbers come from one allocation, so treat small deltas as provisional.")
     verdict = result.get("verdict") if result.get("verdict") in ("pass", "partial", "fail", "unavailable") else "none"
     lines = [f"<!-- claude-live-test sha={sha} verdict={verdict} -->", head, "",
              f"**Live test of `{sha[:7]}`: {verdict}.** "
-             f"{str(result.get('summary', '')).replace('<!--', '&lt;!--')}".rstrip()]
+             f"{render_summary.inert(str(result.get('summary', '')))}".rstrip()]
     if files and media_url:
         lines.append(f"Media: [gallery]({media_url.rstrip('/')}/index.html) ({len(files)} files).")
     body = "\n".join(lines) + "\n\n" + report
@@ -736,16 +753,17 @@ def redact(out, runner_temp, s1="", s2="", s3="", nodes=""):
 def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_outcome=""):
     """Post the live test's outcome and the approval decision, from the redacted copies: why nothing ran,
     the report, the providers' answer when no GPUs were free, or the review's `none`. Model text (the
-    gate's reasons, the review's reason) can't open an HTML comment, so it can't forge a marker."""
+    gate's reasons, the review's reason) is inert, so it can't forge a marker."""
     lt = Path(runner_temp, "lt")
 
     def text(path):
         return path.read_text() if path.is_file() and path.stat().st_size else ""
 
     if trusted != "true":
-        body = "The live test runs only on a PR whose author has write access; this review stands without it.\n"
+        body = ("The live test runs only on a PR whose author has write access and whose head is on this repository "
+                "or a fork owned by someone with write access; this review stands without it.\n")
     elif gated == "true":
-        reasons = Path(runner_temp, "gate.txt").read_text().replace("<!--", "&lt;!--").rstrip("\n")
+        reasons = render_summary.inert(Path(runner_temp, "gate.txt").read_text()).rstrip("\n")
         body = f"No live test yet: fix what the review left open first ({reasons}), then comment `/review` again.\n"
     elif text(lt / "comment.md"):
         body = text(lt / "comment.md")
@@ -753,7 +771,7 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
         body = f"<!-- claude-live-test sha={head_sha} verdict=unavailable -->\n" + text(lt / "unavailable.md")
     else:  # the review chose `none` and it stood
         reason = (json.loads(Path("review.json").read_text()).get("live_test") or {}).get("reason")
-        reason = str("" if reason is None else reason).replace("<!--", "&lt;!--").rstrip("\n")
+        reason = render_summary.inert(str("" if reason is None else reason)).rstrip("\n")
         body = f"<!-- claude-live-test-none -->\nNo GPU run: {reason}\n"
     decision = text(Path(runner_temp, "decision.md"))  # what approve decided: one approval line, or the checklist
     if decision:

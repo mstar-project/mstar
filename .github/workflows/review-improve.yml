@@ -22,6 +22,8 @@ env:
 jobs:
   improve:
     name: Look for improvements
+    # ANTHROPIC_API_KEY is in the environment; its branch rule passes on a scheduled run from the default branch.
+    environment: review-bot
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
@@ -56,8 +58,9 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          # As in the review: reads stay inside the checkout, and any call that would prompt is refused.
-          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+          # As in the review: reads stay inside the checkout, none in .git (where the action writes this job's
+          # token; the review's step says why each rule), and any call that would prompt is refused.
+          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true,"deny":["Read(.git)","Read(.git/**)","Read(//**/.git/**)"]}}'
           prompt: |
             Read .github/review/improve-prompt.md from the repository root and follow it
             exactly. The week's evidence is in improve-evidence/.

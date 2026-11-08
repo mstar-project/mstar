@@ -38,6 +38,10 @@ CLEARS = ("fixed", "moot")
 # Handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
+# The first character of anything that can start markup, a link, or a reference to a person, issue or commit.
+# `#` not before a space or another `#`: those are a Markdown heading, which links nothing.
+MARKUP = re.compile(r"(?i)(?:[@<&\\]|#(?![\s#]|$)|\](?=\()|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))"
+                    r"(?!\u200b)")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
     "type": "object",
@@ -127,6 +131,20 @@ SCHEMA = {
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "latent", "risk"],
 }
+
+
+def inert(value):
+    """Untrusted text, or the strings in a list or dict of it, with a zero-width space after the first character of
+    every `@`, `#`, `<`, `&`, `\\`, `](`, `![`, `://`, `GH-` and `www.`, in any case. So it can't ping anyone, mark
+    another issue's timeline, link, load an image, open HTML or a comment, or spell any of those as an entity or a
+    backslash escape. Nothing is escaped, so text in a code span still reads right and a second pass changes nothing."""
+    if isinstance(value, str):
+        return MARKUP.sub("\\g<0>\u200b", value)
+    if isinstance(value, list):
+        return [inert(v) for v in value]
+    if isinstance(value, dict):
+        return {k: inert(v) for k, v in value.items()}
+    return value
 
 
 def stacked_above(path):
@@ -241,7 +259,7 @@ def open_findings(review, pages, stacked):
 
 def status(review, pages, head, mode, stacked):
     found = [p for _, p, _ in open_findings(review, pages, stacked)]
-    review = judged(review, stacked)
+    review = inert(judged(review, stacked))
     counts = {p: found.count(p) for p in PRIORITIES}
     if counts["P0"] or counts["P1"]:
         icon = "🔴"
@@ -282,27 +300,28 @@ def checklist(review, pages, stacked, extra=()):
     and latent bugs aren't decisions. Past ten lines the rest fold away, so a question or decision, whose
     only home this is, is never lost."""
     found = open_findings(review, pages, stacked)
-    review = judged(review, stacked)
+    review = inert(judged(review, stacked))
 
     def where(item):
         return f"`{item['location']}`" if item.get("location") else "(PR-wide)"
 
     def findings(*priorities):
-        return [f"**[{p}]** `{w}`: {what}" for wanted in priorities for w, p, what in found if p == wanted]
+        return [f"**[{p}]** `{inert(w)}`: {inert(what)}"
+                for wanted in priorities for w, p, what in found if p == wanted]
 
     items = [*findings("P0", "P1"),
              *[f"**[{f['priority']}]** {f['ref']}: {above(f)}" for f in prior_above(review)],
              *[f"**[{f['priority']}]** `{f['location']}`: {above(f)}" for f in review["outside_diff"]
                if f.get("fixed_in")],
-             *extra,
+             *inert(list(extra)),
              *[f"{where(d)}: {d['why']}" for d in (review.get("risk") or {}).get("look_at", [])],
              *[f"{where(q)}: {q['text']}" for q in review["questions"]],
              *findings("P2"), *[f"Not reviewed: `{path}`" for path in review["skipped"]]]
     title = "#### What's left for you"
     if not items:
         return f"{title}\nNothing left from the review."
-    # Model text and file names: kept to one line, and unable to open an HTML comment.
-    lines = [f"- [ ] {' '.join(str(item).split()).replace('<!--', '&lt;!--')}" for item in items]
+    # Model text and file names: kept to one line (`inert` above, so unable to open an HTML comment).
+    lines = [f"- [ ] {' '.join(str(item).split())}" for item in items]
     text = "\n".join([title, *lines[:10]])
     if lines[10:]:
         rest = "\n".join(lines[10:])
@@ -314,7 +333,8 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above).
     `salvaged`: the review went past its turn limit, so the action failed it and no live test follows."""
     parts = ["### Automated review", status(review, pages, head, mode, stacked)]
-    review = judged(review, stacked)
+    raw = judged(review, stacked)  # the saved state and the checklist; what's shown goes through `inert`
+    review = inert(raw)
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
@@ -351,20 +371,21 @@ def render(review, pages, head, mode, stacked, salvaged=False):
         after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
-    left = checklist(review, pages, stacked)
+    left = checklist(raw, pages, stacked)
     parts.append(f"{left} The live-test comment adds its own items." if mode == "full" and not salvaged else left)
     # Only full mode can lead to an approval, by gpu_review.py's rule.
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
-    risk = review.get("risk")
-    state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
+    risk = raw.get("risk")
+    state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": raw["outside_diff"],
              "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
-             "latent": review.get("latent", []),
-             "questions": review["questions"],
-             "live_test": live, "moot": [f for f in prior if f["status"] == "moot"]}
-    # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
-    text = "\n\n".join(parts).replace("<!--", "&lt;!--")
+             "latent": raw.get("latent", []),
+             "questions": raw["questions"],
+             "live_test": raw.get("live_test"),
+             "moot": [f for f in raw.get("prior_findings", []) if f["status"] == "moot"]}
+    # `inert` keeps model text from opening an HTML comment, so it can't forge a marker this bot or the workflow reads.
+    text = "\n\n".join(parts)
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
 
 

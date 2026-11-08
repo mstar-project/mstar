@@ -66,7 +66,7 @@ class FakeGh:
     def writes(self):
         """(key, stdin) of every call that changes something on GitHub."""
         return [(self.key(argv), stdin) for argv, stdin in self.calls
-                if not self.key(argv).startswith(("GET ", "pr list", "issue list", "run download"))
+                if not self.key(argv).startswith(("GET ", "pr list", "run download"))
                 and not (self.key(argv) == "POST graphql" and not any(a.startswith("query=mutation") for a in argv))]
 
     def __call__(self, argv, input=None, check=True, timeout=None):
@@ -111,10 +111,12 @@ def step(fn, routes, **env):
 
 
 class TestPreflight(unittest.TestCase):
-    def preflight(self, command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR"):
+    def preflight(self, command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR", head="o/r"):
         routes = {f"GET repos/o/r/collaborators/{login}/permission": {"permission": perm}
                   for login, perm in perms.items()}
         routes["pr comment"] = "https://github.com/o/r/pull/1#issuecomment-9"
+        routes["GET repos/o/r/pulls/1"] = {"head": {"repo": head and {
+            "full_name": head, "owner": {"login": head.split("/")[0]}}}}
         out, fake = step(bot.preflight, routes, repo="o/r", pr="1", key_set="true", command=command, actor=actor,
                          author=author, assoc=assoc, skip_label="false")
         return out, [stdin for key, stdin in fake.writes()]
@@ -135,6 +137,13 @@ class TestPreflight(unittest.TestCase):
         out, replies = self.preflight("full", {"a-maintainer": "write", "an-author": "read"}, actor="a-maintainer")
         self.assertEqual(out, {"run": "false"}, "a live test could run the code of an author without write access")
         self.assertIn("/review nogpu", replies[0], "the maintainer wouldn't be told what they can run")
+        out, replies = self.preflight("full", {"an-author": "write", "a-stranger": "read"}, head="a-stranger/r")
+        self.assertEqual(out, {"run": "false"}, "a live test could run the code of a fork its owner holds")
+        self.assertIn("/review nogpu", replies[0], "the maintainer wouldn't be told what they can run")
+        self.assertEqual(self.preflight("full", write, head=None)[0], {"run": "false"},
+                         "a head repository GitHub no longer shows would count as trusted")
+        self.assertEqual(self.preflight("full", {"an-author": "write", "a-peer": "write"}, head="a-peer/r"),
+                         ({"run": "true", "mode": "full", "turns": "2000"}, []))
         out, replies = self.preflight("full", read)
         self.assertEqual(out, {"run": "false"}, "a contributor without write access could start a live test")
         self.assertIn("/review light", replies[0], "the contributor wouldn't be told what they can run")
@@ -388,7 +397,7 @@ def collect(mode="light", diff="diff --git a/a.py b/a.py\n", **routes):
             "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
             "GET repos/o/r/pulls/7/comments": [],
             "GET repos/o/r/issues/7/comments": [],
-            "issue list": Fail(),
+            "GET repos/o/r/issues?state=open*": Fail(),
             **routes}, repo="o/r", pr="7", head_sha=HEAD, mode=mode)
         return out, {p.name: p.read_text() for p in ws.iterdir()}
 
@@ -463,6 +472,28 @@ class TestCollect(unittest.TestCase):
         self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
                          "what the merge brought in from main would be reviewed as the author's change")
         self.assertNotIn("since.diff", files)
+
+
+class TestFullModeInputs(unittest.TestCase):
+    def test_only_the_teams_and_bots_text_reaches_the_review_that_steers_the_box(self):
+        def comment(user, assoc):
+            return {"id": 1, "user": {"login": user}, "author_association": assoc, "body": user}
+
+        routes = {"GET repos/o/r/pulls/7/comments": [comment("a-stranger", "NONE"), comment("a-member", "MEMBER")],
+                  "GET repos/o/r/issues/7/comments": [comment("github-actions[bot]", "NONE"),
+                                                      comment("a-contributor", "CONTRIBUTOR")],
+                  "GET repos/o/r/issues?state=open*": [
+                      {"number": 1, "title": "stranger's", "author_association": "NONE"},
+                      {"number": 2, "title": "team's", "author_association": "OWNER"},
+                      {"number": 3, "title": "a PR", "author_association": "OWNER", "pull_request": {}}]}
+        full, light = collect("full", **routes)[1], collect("light", **routes)[1]
+        self.assertEqual([c["user"] for c in json.loads(full["pr-comments.json"])], ["a-member"])
+        self.assertEqual([c["user"] for c in json.loads(full["pr-conversation.json"])], ["github-actions[bot]"],
+                         "the bot's own comments, which a re-review judges, must stay")
+        self.assertEqual(json.loads(full["open-issues.json"]), [{"number": 2, "title": "team's"}])
+        self.assertEqual([c["user"] for c in json.loads(light["pr-conversation.json"])],
+                         ["github-actions[bot]", "a-contributor"], "other modes read everything")
+        self.assertEqual([i["number"] for i in json.loads(light["open-issues.json"])], [1, 2])
 
 
 class TestInterdiff(unittest.TestCase):
