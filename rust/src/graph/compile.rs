@@ -24,6 +24,9 @@ pub struct NodeArg {
     #[pyo3(item)] pub async_enabled: bool,
     #[pyo3(item)] pub inputs: Vec<String>,
     #[pyo3(item)] pub streaming_inputs: Vec<String>,
+    /// The streaming inputs whose stream continues past its end in this walk
+    /// (Python's `ChunkPolicy.continues_in`).
+    #[pyo3(item)] pub continuing_inputs: Vec<String>,
     #[pyo3(item)] pub outputs: Vec<EdgeArg>,
 }
 
@@ -89,16 +92,21 @@ pub fn compile_one(
         let name = it.intern(&n.name);
         let inputs: Vec<Sym> = n.inputs.iter().map(|s| it.intern(s)).collect();
         let full = if inputs.len() == 64 { u64::MAX } else { (1u64 << inputs.len()) - 1 };
-        let mut streaming_mask = 0u64;
-        for s in &n.streaming_inputs {
-            let sym = it.intern(s);
-            if let Some(i) = inputs.iter().position(|&x| x == sym) {
-                streaming_mask |= 1 << i;
+        let mut mask_of = |names: &[String]| {
+            let mut mask = 0u64;
+            for s in names {
+                let sym = it.intern(s);
+                if let Some(i) = inputs.iter().position(|&x| x == sym) {
+                    mask |= 1 << i;
+                }
             }
-        }
+            mask
+        };
+        let streaming_mask = mask_of(&n.streaming_inputs);
+        let continuing_mask = mask_of(&n.continuing_inputs) & streaming_mask;
         let outputs = n.outputs.iter().map(|e| mk_edge(it, e, &local)).collect();
         node_specs.push(NodeSpec {
-            name, inputs, full_mask: full, streaming_mask,
+            name, inputs, full_mask: full, streaming_mask, continuing_mask,
             // Filled below, once the loops exist to be asked.
             held_mask: 0,
             async_enabled: n.async_enabled,

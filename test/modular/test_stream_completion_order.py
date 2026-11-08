@@ -358,8 +358,9 @@ def test_a_stream_that_sent_nothing_ends_at_once():
 
 
 def test_a_continuing_stream_waits_for_its_last_item_too(tmp_path):
-    """Qwen3-Omni's Thinker to Talker: empty chunks keep the consumer going
-    after the producer ends, and one must not stand in for the last item."""
+    """Qwen3-TTS's text stream: its consumer keeps going after the stream
+    ends, which it does with its last item; an empty chunk must not stand in
+    for that item."""
     producer = _Producer(tmp_path)
     descriptor, wgd = producer.step(uuid=11)
     done = _conduct(_conductor(), [wgd])
@@ -369,7 +370,9 @@ def test_a_continuing_stream_waits_for_its_last_item_too(tmp_path):
     assert w.streams.pop_edge(buf, EDGE, 1) is None, "an empty chunk overtook the last item"
     _deliver(w, descriptor)
     se = w.streams.pop_edge(buf, EDGE, 1)
-    assert se.chunk.num_items == 1 and not se.chunk.is_final
+    assert se.chunk.num_items == 1 and se.chunk.is_final
+    assert w.streams.pop_edge(buf, EDGE, 1) is None, "a stream ends once"
+    assert not buf.maybe_ready, "an ended stream is polled again"
 
 
 def test_counts_are_credited_by_edge_from_every_rank():

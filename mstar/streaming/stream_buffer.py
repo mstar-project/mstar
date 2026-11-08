@@ -98,8 +98,8 @@ class StreamBuffer:
     _delivered_end: int = 0
     producer_done: bool = False
     # Set once a chunk has been popped with ``is_final=True`` (the terminal
-    # flush). Guards the empty-buffer final flush below so it fires exactly
-    # once and ``has_chunk_ready`` doesn't spin returning True forever.
+    # flush). Every stream sends exactly one: from then on ``has_chunk_ready``
+    # stays False, and the buffer is ``closed`` unless that chunk is handed back.
     _final_chunk_emitted: bool = False
 
     # Whether a chunk may be ready: set by everything that can make one ready
@@ -217,6 +217,11 @@ class StreamBuffer:
             and self._num_buffer_writes >= self._num_tensors_registered
         )
 
+    @property
+    def closed(self) -> bool:
+        """Its final chunk is out and was not handed back: it yields nothing more."""
+        return self._final_chunk_emitted and not self._waiting_graph_edges
+
     def pop_waiting_edge(self) -> StreamingEdge | None:
         if len(self._waiting_graph_edges) > 0:
             return self._waiting_graph_edges.popleft()
@@ -244,29 +249,36 @@ class StreamBuffer:
         if not self._producer_done_and_all_read():
             return self.policy.is_ready(buf_len)
 
-        # When continue_after_producer_done is set, keep producing empty
-        # chunks after the producer finishes and all items are consumed.
-        # This allows the consumer to keep running (e.g., Talker continues
-        # generating codec tokens after the Thinker hits text EOS).
-        # Producer done and the buffer already drained to empty (all items
-        # were consumed in earlier chunks. Emit exactly one final
-        # (empty) chunk so ``is_final`` propagates and the stream closes.
+        # Producer done and every item read: flush what is left, then, if
+        # the buffer drained without a final chunk, one empty final chunk so
+        # the stream closes. A stream that ends only in some consumer walks
+        # waits for one of them to end there (``ChunkPolicy.continues_in``).
+        if buf_len > 0:
+            return True
+        return not self._final_chunk_emitted and self._may_end_in(consumer_walk)
 
-        if self.policy.continue_after_producer_done():
-            return buf_len > 0 or self.policy.continues_in(consumer_walk)
-        return buf_len > 0 or not self._final_chunk_emitted
+    def _may_end_in(self, walk: str | None) -> bool:
+        """Whether the stream's final chunk may run under ``walk``: any walk,
+        unless its consumer outlives it, and then only one it continues in."""
+        return (
+            not self.policy.continue_after_producer_done() or self.policy.continues_in(walk)
+        )
 
-    def pop_chunk(self) -> StreamChunk:
+    def pop_chunk(self, consumer_walk: str | None = None) -> StreamChunk:
         """Pop the next chunk. Only call when has_chunk_ready() is True.
 
         For sliding-window: returns `window_size` items, advances by
         `stride` items, discards items that have fallen out of the window.
         start_offset is the global position of the first item in the chunk.
+        ``consumer_walk`` is the walk an untagged chunk runs under: a
+        continuing stream's chunk ends it only in a walk it ends in.
         """
         self._update_buffer()
         buf_len = len(self._buffer)
         window = self.policy.window_size()
         offset = self._consumed  # global position of buffer[0]
+        # the walk this chunk runs under: its items' own, else the consumer's
+        walk = self._walk_runs[0][0] if self._walk_runs else consumer_walk
 
         run = self._walk_run_len()
 
@@ -300,11 +312,10 @@ class StreamBuffer:
             if run[1] == 0:
                 self._walk_runs.popleft()
 
-        is_final = self._producer_done_and_all_read() and len(self._buffer) == 0
-        # When continue_after_producer_done, never mark as final — the
-        # consumer decides when it's done via its own model logic.
-        if self.policy.continue_after_producer_done():
-            is_final = False
+        is_final = (
+            self._producer_done_and_all_read() and len(self._buffer) == 0
+            and self._may_end_in(walk)
+        )
         if is_final:
             self._final_chunk_emitted = True
 

@@ -2025,9 +2025,9 @@ class Conductor:
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
-                    # A finished consumer takes no more input; told its
-                    # producer is done, a continue_after_done stream would
-                    # keep feeding it empty chunks
+                    # A finished consumer takes no more input: its
+                    # stream's final chunk would be refused, and offered
+                    # again on every poll
                     if request_data.partition_states[conn.to_partition].is_done:
                         continue
                     if conn.to_partition not in consumers:

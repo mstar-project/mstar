@@ -5,7 +5,8 @@ it is final for the node (``is_final_stream_chunk``) only if every other stream
 into the node already ended, and it reports the partition done only if every
 stream into the partition did. Streams end in any order, over several steps; a
 speculative step that hands its final chunk back reopens that stream; a
-``continue_after_producer_done`` stream never ends and holds nothing back.
+``continue_after_producer_done`` stream's end ends nothing and holds nothing
+back.
 """
 
 import sys
@@ -99,6 +100,16 @@ def test_a_step_with_no_final_chunk_is_never_final():
     _step(worker, "vocoder", {"r": {"codes", "pitch"}})
 
     assert _step(worker, "vocoder", {}) == (set(), set())
+
+
+def test_a_continuing_streams_end_ends_neither_node_nor_partition():
+    """Qwen3-TTS's Talker keeps decoding past its text stream's end, until
+    codec EOS: ending it there would cut the audio short."""
+    worker = _worker()
+    _step(worker, "captioner", {"r": {"captions"}})
+    _step(worker, "vocoder", {"r": {"codes", "pitch"}})
+
+    assert _step(worker, "vocoder", {"r": {"speaker"}}) == (set(), set())
 
 
 def test_requests_in_one_batch_are_tracked_apart():

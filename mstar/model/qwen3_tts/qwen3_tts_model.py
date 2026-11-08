@@ -674,9 +674,9 @@ class Qwen3TTSModel(Model):
         chunks of new frames.
 
         ``text_in`` takes one text token per decode frame: the ones the
-        prefill left (``text_stream_start``), then any the client appends. It
-        keeps popping empty chunks once it ends, which the decode reads as TTS
-        EOS and then TTS PAD; the loop ends on codec EOS.
+        prefill left (``text_stream_start``), then any the client appends.
+        Once it ends, the decode steps run without it, which the decode reads
+        as TTS EOS and then TTS PAD; the loop ends on codec EOS.
 
         The first Codec invocation runs after ``chunk_schedule[0]`` frames so
         audio starts flowing early; chunks then grow to ``chunk_frames``. No

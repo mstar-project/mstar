@@ -163,8 +163,8 @@ def test_chain_closes_partition_by_partition():
 
 def test_a_finished_consumer_is_not_told_its_producer_is_done():
     """A consumer done from the start (e.g. Qwen3-Omni's Talker with no audio
-    out) must not get producer_done: a continue_after_done stream would then
-    hand it empty chunks to run on."""
+    out) must not get producer_done: its stream's final chunk would then be
+    offered to a consumer that takes no more input."""
     c, req, rec = _conductor()
     req.partition_states["C"].is_done = True
     _done_forward(c, req, "B", partition_done=True)

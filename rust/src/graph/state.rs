@@ -75,13 +75,17 @@ struct NodeState {
     spec: Slot,      // speculative_signals
     completed: bool,
     in_flight: bool, // GraphNode._in_flight
+    /// The continuing inputs (`continuing_mask`) whose final chunk was
+    /// ingested: present for readiness from then on, in every slot, but never
+    /// among the node's inputs. Kept across loop iterations; `clear` drops it.
+    ended: u64,
 }
 
 impl NodeState {
     fn new(n: usize) -> Self {
         NodeState {
             cur: Slot::new(n), next: Slot::new(n), spec: Slot::new(n),
-            completed: false, in_flight: false,
+            completed: false, in_flight: false, ended: 0,
         }
     }
     fn clear(&mut self) {
@@ -90,6 +94,7 @@ impl NodeState {
         self.spec.clear();
         self.completed = false;
         self.in_flight = false;
+        self.ended = 0;
     }
 }
 
@@ -247,7 +252,7 @@ impl RequestState {
         let spec = self.graph.node(id);
         let st = &self.nodes[id as usize];
         let live = !st.completed;
-        let ready = st.cur.mask == spec.full_mask && live;
+        let ready = st.cur.mask | st.ended == spec.full_mask && live;
         let (w, b) = Self::bit(id);
         // `in_flight` gates the ADD only, never a removal. Python's
         // register_ingested_input skips the queue add for a
@@ -278,11 +283,12 @@ impl RequestState {
         let spec = self.graph.node(id);
         let st = &self.nodes[id as usize];
         // The mask alone, no liveness: Python's `ReadySignals.is_ready`.
-        let full = st.cur.mask == spec.full_mask;
+        let have = st.cur.mask | st.ended;
+        let full = have == spec.full_mask;
         // input_names ⊆ ready_names ∪ streaming_inputs, as bits: nothing is
         // missing except streaming slots.
         let only_streaming_missing =
-            spec.full_mask & !st.cur.mask & !spec.streaming_mask == 0;
+            spec.full_mask & !have & !spec.streaming_mask == 0;
         let sched = st.in_flight;
         let (w, b) = Self::bit(id);
         if full {
@@ -320,6 +326,7 @@ impl RequestState {
         tensors: &[TensorRef], can_buffer: bool, final_chunk: bool,
     ) -> bool {
         let name = g.node(node).inputs[slot as usize];
+        let continuing = g.node(node).continuing_mask >> slot & 1 == 1;
         {
             let st = &mut self.nodes[node as usize];
             if !st.cur.has(slot) {
@@ -328,6 +335,10 @@ impl RequestState {
                 st.next.set(slot, tensors.to_vec(), final_chunk);
             } else {
                 return false;
+            }
+            // A continuing stream's end: its input stays present from now on.
+            if final_chunk && continuing {
+                st.ended |= 1 << slot;
             }
         }
         // An ingest bubbles through every enclosing loop, each recording it if
@@ -365,6 +376,12 @@ impl RequestState {
     /// Python's `ReadySignals.remove` — speculation rollback. No dereference.
     pub fn remove_input(&mut self, node: NodeId, slot: u8, from_next: bool) -> Option<Vec<TensorRef>> {
         let st = &mut self.nodes[node as usize];
+        // Read before `take` clears it: taking back the final chunk reopens
+        // the stream.
+        let was_final = if from_next { &st.next } else { &st.cur }.is_final_chunk(slot);
+        if was_final {
+            st.ended &= !(1 << slot);
+        }
         let t = if from_next { st.next.take(slot) } else { st.cur.take(slot) };
         self.refresh_ready(node);
         t
@@ -856,7 +873,8 @@ impl RequestState {
             needed &= !spec.streaming_mask;
         }
         let st = &self.nodes[node as usize];
-        let mut have = if check_next_iter { st.next.mask } else { st.cur.mask } | st.spec.mask;
+        let mut have =
+            if check_next_iter { st.next.mask } else { st.cur.mask } | st.spec.mask | st.ended;
         if check_next_iter {
             // Held (loop-external) inputs are re-injected into the current
             // slot every iteration and never reach the next-iter slot, so a
@@ -910,6 +928,7 @@ mod tests {
             name: name.into(), async_enabled: false,
             inputs: inputs.iter().map(|s| s.to_string()).collect(),
             streaming_inputs: streaming.iter().map(|s| s.to_string()).collect(),
+            continuing_inputs: vec![],
             outputs,
         }
     }
@@ -1083,6 +1102,53 @@ mod tests {
         st.ingest(&g, talker, 1, &[t(3)], false, false);
         assert!(st.is_ready(talker));
         assert!(!st.is_ready_for_streaming(talker), "full, so plain ready");
+    }
+
+    #[test]
+    fn an_ended_continuing_input_counts_as_present_until_its_final_chunk_is_taken_back() {
+        // Qwen3-TTS's Talker decode after its text stream ends (Qwen3-Omni's
+        // has two such inputs, which end apart): each later step runs on the
+        // loop-back alone and reads the ended input as absent.
+        let mut it = StrToId::default();
+        let nodes = vec![NodeArg {
+            continuing_inputs: vec!["mask".into(), "text".into()],
+            ..node("talker", &["emb", "mask", "text"], &["mask", "text"], vec![edge("emb", "talker")])
+        }];
+        let loops = vec![LoopArg {
+            name: "L".into(), max_iters: 10, parent: None,
+            member_nodes: vec!["talker".into()], outputs: vec![], accumulated: vec![],
+            loop_back: vec![("emb".into(), "talker".into())], external_inputs: vec![],
+        }];
+        let g = compile_one(&mut it, &nodes, &loops).unwrap();
+        let (talker, emb, mask, text) = (0, 0, 1, 2);
+        let text_sym = it.get("text").unwrap();
+        let mut st = RequestState::new(g.clone());
+        let step = |st: &mut RequestState, uuid: u64| {
+            assert!(st.is_ready(talker));
+            st.take_for_schedule(talker);
+            st.clear_consumed_inputs(&g, talker);
+            let done = st.complete(&g, talker, &[vec![t(uuid)]]);
+            assert!(st.ingest(&g, talker, emb, &done.edges[0].tensors, true, false));
+        };
+
+        st.ingest(&g, talker, emb, &[t(1)], true, false);
+        st.ingest(&g, talker, mask, &[t(2)], false, true);
+        st.ingest(&g, talker, text, &[t(3)], false, false);
+        step(&mut st, 10);
+        assert!(!st.is_ready(talker), "only the mask stream ended");
+        // A speculation stages the text stream's end, then rolls it back.
+        assert!(st.ingest(&g, talker, text, &[], false, true));
+        st.remove_input(talker, text, false);
+        assert!(!st.is_ready(talker), "a rolled-back end must not count");
+        assert!(!st.ready_for_speculation(talker, false, false));
+
+        // The end for real: the next steps need only the loop-back.
+        st.ingest(&g, talker, text, &[], false, true);
+        step(&mut st, 11);
+        assert!(st.ready_for_speculation(talker, false, false));
+        step(&mut st, 12);
+        assert!(st.is_ready(talker));
+        assert!(st.input_tensors(talker, false).iter().all(|(n, _, _)| *n != text_sym));
     }
 
     #[test]

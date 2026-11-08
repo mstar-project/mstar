@@ -60,7 +60,7 @@ PEER = "worker_1"
 def _node(name, inputs, outs, modality="", streaming=False):
     return {
         "name": name, "async_enabled": True, "inputs": sorted(inputs),
-        "streaming_inputs": [],
+        "streaming_inputs": [], "continuing_inputs": [],
         "outputs": [
             {"name": sig, "dest": dest, "persist": persist,
              "new_token": False, "streaming": streaming, "modality": modality}

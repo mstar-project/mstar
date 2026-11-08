@@ -84,6 +84,9 @@ pub struct NodeSpec {
     pub inputs: Vec<Sym>,
     pub full_mask: u64,
     pub streaming_mask: u64,
+    /// Streaming inputs that continue past their stream's end: once the final
+    /// chunk is ingested the input counts as present (`NodeState::ended`).
+    pub continuing_mask: u64,
     /// Inputs an enclosing loop re-injects every iteration (Python's
     /// `_persist_for_loop`), so clearing the node's slots must NOT dereference
     /// them. Purely structural -- the loop's declared `external_inputs`, minus

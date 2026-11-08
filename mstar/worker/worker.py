@@ -2504,8 +2504,8 @@ class Worker:
         # Stream-terminated loop: a stream-consuming node inside a loop has no
         # internal stop signal (unlike a self-EOS loop), so when it consumes
         # the terminal chunk of its stream (``final_stream_rids``: the
-        # StreamBuffer popped ``is_final``, which a ``continue_after_done``
-        # policy never sets) end its innermost enclosing loop. Without this
+        # StreamBuffer popped ``is_final``; ``settle_final`` leaves out a
+        # ``continue_after_done`` stream's) end its innermost enclosing loop. Without this
         # the loop would spin to ``max_iters`` and the partition would never
         # report done.
         stops: dict[int, set[str]] = {}

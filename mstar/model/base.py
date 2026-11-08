@@ -406,15 +406,18 @@ def _divide_into_worker_graphs(
     graph_walk: str,
     node_to_group_idx: dict[str, int],
     node_groups: list[dict],
-    input_streams: set[str],
+    input_streams: dict[str, bool],
 ) -> list[WorkerGraph]:
     """
-    Given a graph, break it into worker graphs
+    Given a graph, break it into worker graphs. ``input_streams`` maps each
+    stream into the walk's partition to whether it continues past its end in
+    this walk (``ChunkPolicy.continues_in``).
     """
     if isinstance(graph, GraphNode):
         # Mutate via the GraphNode helper so the ReadySignals instances built in
         # __post_init__ keep referencing the live set (they captured by reference).
-        graph._register_streaming(input_streams.intersection(graph.input_names))
+        streams = input_streams.keys() & graph.input_names
+        graph._register_streaming(streams, {name for name in streams if input_streams[name]})
 
         group_idx = node_to_group_idx[graph.name]
         ng = node_groups[group_idx]
@@ -668,10 +671,22 @@ class Model(ABC):
             if graph_walk in part.graph_walks:
                 partition = part.name
                 break
-        input_streams = set()
-        for conn in self.get_partition_topology().connections:
+        input_streams: dict[str, bool] = {}
+        topology = self.get_partition_topology()
+        walk_drivers = topology.walk_drivers()
+        for conn in topology.connections:
             if conn.to_partition == partition:
-                input_streams.add(conn.edge_name)
+                # structural (``ChunkPolicy.continues_in``), so one policy answers
+                policy = conn.chunk_policy_factory()
+                continues = policy.continues_in(graph_walk)
+                # a buffer learns its consumer's walk only from a connection
+                # that drives it, and asks with None otherwise
+                if partition not in walk_drivers and continues != policy.continues_in(None):
+                    raise ValueError(
+                        f"{conn.edge_name}: its chunk policy continues past its end in some "
+                        f"walks only, but it does not drive {partition!r}'s walk (consumer_walk)"
+                    )
+                input_streams[conn.edge_name] = continues
 
         return _divide_into_worker_graphs(
             graph,
