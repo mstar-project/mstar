@@ -1088,7 +1088,7 @@ class Engine:
         )
         apply_region_ladders(
             node_name, configs, submodule_mgmt.region_ladders, submodule_mgmt.token_ladders,
-            declares_regions=getattr(type(submodule_mgmt.submodule), "get_piecewise_accelerator_graph_configs", None)
+            declares_regions=type(submodule_mgmt.submodule).get_piecewise_accelerator_graph_configs
             is not NodeSubmodule.get_piecewise_accelerator_graph_configs,
         )
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
