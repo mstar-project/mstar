@@ -74,7 +74,7 @@ from mstar.communication.rust_communicator import (
 )
 from mstar.graph.runtime.utils import CHECKOUT_RUST, is_mstar_rust_crate, require_rust_extension
 from mstar.model.multimodal import PromptPart
-from mstar.utils.client_errors import client_error_text
+from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
@@ -257,7 +257,7 @@ class RustFrontendBridge:
             # drifting), so it keeps its traceback, as on the router.
             if isinstance(e, ValueError):
                 logger.info("submit %s refused: %s", rid, e)
-                text = str(e)
+                text = scrub_paths(str(e))
             else:
                 text, _ = client_error_text(e, f"submit {rid} failed", log=logger, type_name=False)
             self._send({

@@ -2777,7 +2777,7 @@ async def generate(
         except json.JSONDecodeError:
             raise   # a downstream parse failure, not a bad request (a 500 below)
         except ValueError as e:   # submit_request's refusals are the client's fault
-            raise HTTPException(status_code=400, detail=str(e)) from e
+            raise HTTPException(status_code=400, detail=scrub_paths(str(e))) from e
 
         if streaming:
             # Substring match, not RFC 7231 q-value parsing: the value is a

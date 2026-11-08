@@ -181,6 +181,34 @@ def test_the_generate_catch_all_answers_with_an_error_id(monkeypatch, caplog):
     assert segment in _logged(caplog, _error_id(detail)).getMessage()
 
 
+def _bridge(server) -> RustFrontendBridge:
+    """A Rust frontend bridge that records what it sends."""
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.sent = []
+    bridge._send = bridge.sent.append
+    bridge._keys = {}
+    bridge.server = server
+    return bridge
+
+
+@pytest.mark.parametrize("path", ["generate", "rust-frontend"])
+def test_a_refusal_reaches_the_client_without_its_directory(monkeypatch, path):
+    """As the OpenAI routes cut it: /generate and the Rust frontend sent it whole."""
+    server = _FailingServer(ValueError("cannot read /tmp/x/a.wav"))
+    if path == "generate":
+        monkeypatch.setattr(entrypoint, "api_server", server)
+        response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
+        assert response.status_code == 400
+        text = response.json()["detail"]
+    else:
+        bridge = _bridge(server)
+        bridge._submit({"rid": "r1", "text": "hi"})
+        [message] = bridge.sent
+        assert message["metadata"] == {"status": 400}
+        text = message["data"].decode()
+    assert text == "cannot read a.wav"
+
+
 def test_the_generate_catch_all_keeps_a_deliberate_refusal(monkeypatch):
     monkeypatch.setattr(entrypoint, "api_server", _FailingServer(ValueError("Unsupported modality: 'smell'")))
     response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
@@ -204,11 +232,7 @@ def test_generate_ws_answers_with_an_error_id(monkeypatch, tmp_path, caplog):
 
 def test_the_rust_frontend_bridge_answers_with_an_error_id(tmp_path, caplog):
     tensor_file = f"{tmp_path}/mstar_tensors_{USER}/r1.pt"
-    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
-    bridge.sent = []
-    bridge._send = bridge.sent.append
-    bridge._keys = {}
-    bridge.server = _FailingServer(FileNotFoundError(f"cannot open {tensor_file}"))
+    bridge = _bridge(_FailingServer(FileNotFoundError(f"cannot open {tensor_file}")))
 
     bridge._submit({"rid": "r1", "text": "hi"})
     asyncio.run(bridge._relay("r2", None, bridge.server.iter_result_chunks("r2")))
@@ -222,11 +246,7 @@ def test_the_rust_frontend_bridge_answers_with_an_error_id(tmp_path, caplog):
 
 def test_the_rust_frontend_bridge_logs_a_type_error_s_traceback(caplog):
     """Still a 400, but maybe a bug in the bridge, so it keeps its stack, as on the router."""
-    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
-    bridge.sent = []
-    bridge._send = bridge.sent.append
-    bridge._keys = {}
-    bridge.server = _FailingServer(TypeError("PromptPart.__init__() got an unexpected keyword argument 'x'"))
+    bridge = _bridge(_FailingServer(TypeError("PromptPart.__init__() got an unexpected keyword argument 'x'")))
 
     bridge._submit({"rid": "r1", "text": "hi"})
 
