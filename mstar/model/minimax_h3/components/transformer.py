@@ -35,7 +35,7 @@ from mstar.model.components.distributed.sequence_parallel import (
     ulysses_attention,
 )
 from mstar.model.components.distributed.ulysses_pipeline import UlyssesPipeline
-from mstar.model.minimax_h3.components.qk_norm_rope import qk_norm_rope
+from mstar.model.minimax_h3.components.qk_norm_rope import QKNormRope
 from mstar.model.minimax_h3.config import NUM_MODALITIES, H3TransformerConfig
 
 # (q, k, v) -> out over [B, S, H, D]
@@ -137,8 +137,12 @@ class H3Attention(nn.Module):
         if rope is not None and qkv.shape[0] == 1 and torch.compiler.is_compiling():
             # one kernel for both norms and the rope (qk_norm_rope.py); eager keeps the torch ops
             weights = torch.stack([self.q_norm.weight, self.k_norm.weight])
-            qk = qk_norm_rope(qkv[0], weights, rope.cos, rope.sin, self.q_norm.eps, self.local_heads, rope.rotary_dim)
-            q, k = qk[None].split(self.local_heads, dim=2)
+            qk = QKNormRope(qkv[0], weights, rope.cos, rope.sin, self.q_norm.eps, self.local_heads, rope.rotary_dim)
+            if sp is not None and sp.pipeline is not None:
+                # the Ulysses pipeline runs it, writing q and k straight into its exchange buffers
+                return self.out_proj(sp.attend(None, None, v, attend, qk).flatten(2, 3).type_as(v))
+            q, k = qk.standard()
+            q, k = q[None], k[None]
         else:
             q = self.q_norm(q.unflatten(-1, (self.local_heads, self.head_dim)))
             k = self.k_norm(k.unflatten(-1, (self.local_heads, self.head_dim)))
@@ -296,16 +300,21 @@ class SeqParallel(NamedTuple):
     def count(self) -> int:
         return self.sizes[self.group.rank]
 
-    def attend(self, q, k, v, run: Attend) -> torch.Tensor:
-        """``run`` attends one head group's ``[B, S, H / head_groups, D]``."""
+    def attend(self, q, k, v, run: Attend, qk: QKNormRope | None = None) -> torch.Tensor:
+        """``run`` attends one head group's ``[B, S, H / head_groups, D]``. With ``qk`` (batch 1), q and k are
+        None and ``qk`` computes them, into the pipeline's buffers when it serves the call."""
 
         def sequential() -> torch.Tensor:
-            return ulysses_attention(self.group, q, k, v, head_grouped(run, self.head_groups, head_dim=2),
+            q_, k_ = (q, k) if qk is None else qk.standard()
+            if qk is not None:
+                q_, k_ = q_[None], k_[None]
+            return ulysses_attention(self.group, q_, k_, v, head_grouped(run, self.head_groups, head_dim=2),
                                      self.sizes, seq_dim=1, head_dim=2)
 
-        if self.pipeline is not None and q.shape[0] == 1 and len(set(self.sizes)) == 1:
-            out = self.pipeline(q[0], k[0], v[0], lambda a, b, c: run(a[None], b[None], c[None])[0],
-                                lambda: sequential()[0])
+        if self.pipeline is not None and v.shape[0] == 1 and len(set(self.sizes)) == 1:
+            filled = qk is not None
+            out = self.pipeline(None if filled else q[0], None if filled else k[0], v[0],
+                                lambda a, b, c: run(a[None], b[None], c[None])[0], lambda: sequential()[0], qk)
             if out is not None:
                 return out[None]
         return sequential()

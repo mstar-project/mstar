@@ -20,7 +20,7 @@ import ctypes
 import logging
 import os
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import torch
 import torch.distributed as dist
@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 
 # (q, k, v) [rows, heads, head_dim] -> out [rows, heads, head_dim], for one head group
 AttendGroup = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+class FillQK(Protocol):
+    """Computes q and k into the pipeline's buffers in place of handing them over: row r of head h (q's heads,
+    then k's) goes to ``out.view(-1)[head_offset[h] + r * row_stride:]``."""
+
+    def into(self, out: torch.Tensor, head_offset: torch.Tensor, row_stride: int) -> None: ...
 
 _CU_MEMORYTYPE_DEVICE = 2
 
@@ -110,16 +117,17 @@ class _Pool:
     """Every rank's receive slots, output and flags, each peer's opened in this rank's context; one pool for every
     call, grown to the largest (a pool per shape would grow with every new row bucket). For a call of ``rows``: per
     head group, q, k and v slots as attention reads them, ``[world * rows, group_heads, head_dim]`` each, rank r's
-    rows at ``r * rows``; the call's output, ``[rows, heads, head_dim]``, which every rank writes its heads of
-    directly. ``fin[p]`` counts the head groups peer p has delivered to this rank's slots, ``fout[p]`` those it has
-    written into this rank's output."""
+    rows at ``r * rows``; then, for a call whose q and k are filled in, a staging block per (destination, group)
+    of this rank's q and k rows, ``[2, rows, group_heads, head_dim]``; and the call's output,
+    ``[rows, heads, head_dim]``, which every rank writes its heads of directly. ``fin[p]`` counts the head groups
+    peer p has delivered to this rank's slots, ``fout[p]`` those it has written into this rank's output."""
 
     def __init__(self, group: CommGroup, shape: _Shape, groups: int):
         world = group.world_size
         self.shape = shape
         self.group_heads = shape.heads // (world * groups)
         per_row = self.group_heads * shape.head_dim
-        self.inb = _share(group, _shareable_zeros(groups * 3 * world * shape.rows * per_row, shape.dtype))
+        self.inb = _share(group, _shareable_zeros(groups * 5 * world * shape.rows * per_row, shape.dtype))
         self.out = _share(group, _shareable_zeros(shape.rows * shape.heads * shape.head_dim, shape.dtype))
         self.fin = _share(group, _shareable_zeros(world, torch.int32))
         self.fout = _share(group, _shareable_zeros(world, torch.int32))
@@ -168,9 +176,10 @@ class UlyssesPipeline:
         self._ops: _StreamOps | None = None
         self._usable: bool | None = None
         self._pool: _Pool | None = None
-        self._verdict: dict[_Shape, bool] = {}
+        self._verdict: dict[tuple[_Shape, bool], bool] = {}  # (shape, q/k filled in) -> kept
         self._copy_in = self._copy_out = None
         self._copy_rows = None
+        self._head_offset: dict[int, torch.Tensor] = {}  # rows -> where a fill writes each q / k head
 
     def group_heads(self, heads: int) -> int:
         return heads // (self.group.world_size * self.groups)
@@ -195,30 +204,34 @@ class UlyssesPipeline:
         return self._usable
 
     @torch.compiler.disable
-    def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attend_group: AttendGroup,
-                 sequential: Callable[[], torch.Tensor]) -> torch.Tensor | None:
+    def __call__(self, q: torch.Tensor | None, k: torch.Tensor | None, v: torch.Tensor, attend_group: AttendGroup,
+                 sequential: Callable[[], torch.Tensor], fill: FillQK | None = None) -> torch.Tensor | None:
         """``q``/``k``/``v``: this rank's ``[rows, heads, head_dim]``, each row's heads one contiguous run (any
-        row stride), rows equal on every rank;
+        row stride), rows equal on every rank; with ``fill``, q and k are None and ``fill`` writes them (as many
+        heads as v) straight into the slots and staging blocks;
         ``attend_group`` attends one head group's slots; ``sequential()`` is the serving exchange's result,
         run once per shape to check the pipeline against it. Returns this rank's ``[rows, heads, head_dim]``."""
-        if (q.device.type != "cuda" or torch.cuda.is_current_stream_capturing() or not self.supports(q.shape[1])
-                or not all(t.shape == q.shape and t.dtype == q.dtype and t.stride(2) == 1 and t.stride(1) == q.shape[2]
-                           for t in (q, k, v))
+        given = (v,) if fill is not None else (q, k, v)
+        if (v.device.type != "cuda" or torch.cuda.is_current_stream_capturing() or not self.supports(v.shape[1])
+                or not all(t.shape == v.shape and t.dtype == v.dtype and t.stride(2) == 1 and t.stride(1) == v.shape[2]
+                           for t in given)
                 or not self._ready()):
             return None
-        shape = _Shape(q.shape[0], q.shape[1], q.shape[2], q.dtype)
-        verdict = self._verdict.get(shape)
+        shape = _Shape(v.shape[0], v.shape[1], v.shape[2], v.dtype)
+        key = (shape, fill is not None)
+        verdict = self._verdict.get(key)
         if verdict is False:
             return None
         if (self._pool is None or not self._pool.serves(shape)) and not self._grow(shape):
-            self._verdict[shape] = False
+            self._verdict[key] = False
             return None
-        out = self._run(q, k, v, attend_group, self._pool)
+        out = self._run(q, k, v, attend_group, self._pool, fill)
         if verdict is None:
             reference = sequential()
             same = self.group.agree([int(torch.equal(out, reference))])[0]
-            self._verdict[shape] = bool(same)
-            logger.info("Ulysses pipeline over %d head groups at %s: %s", self.groups, tuple(shape),
+            self._verdict[key] = bool(same)
+            logger.info("Ulysses pipeline over %d head groups at %s%s: %s", self.groups, tuple(shape),
+                        ", q/k filled in" if fill is not None else "",
                         "bit-identical to the serving exchange; kept" if same else "differs; serving exchange kept")
             return out if same else reference
         return out
@@ -228,7 +241,7 @@ class UlyssesPipeline:
         some rank can't spare it twice over, and the shape keeps the serving exchange. Every rank reaches the same
         call with the same shape, in lockstep; each waits out its queued copies into the old pool before it goes."""
         world = self.group.world_size
-        need = (self.groups * 3 * world * self.group_heads(shape.heads) + shape.heads) * shape.rows \
+        need = (self.groups * 5 * world * self.group_heads(shape.heads) + shape.heads) * shape.rows \
             * shape.head_dim * torch.empty((), dtype=shape.dtype).element_size()
         held = 0
         if self._pool is not None:
@@ -242,21 +255,39 @@ class UlyssesPipeline:
                         need / 2**30, tuple(shape))
             return False
         self._pool = None
+        self._head_offset.clear()
         self._pool = _Pool(self.group, shape, self.groups)
         return True
 
-    def _run(self, q, k, v, attend_group: AttendGroup, buf: _Pool) -> torch.Tensor:
+    def _fill_offsets(self, rows: int, heads: int, head_dim: int) -> torch.Tensor:
+        """Where a fill writes row 0 of each q head, then each k head, in this rank's ``inb``: this rank's heads
+        into its own slots at its rows, a peer's into that (peer, group)'s staging block. Built once per row count."""
+        offsets = self._head_offset.get(rows)
+        if offsets is None:
+            world, r, groups = self.group.world_size, self.group.rank, self.groups
+            hg = self.group_heads(heads)
+            width = hg * head_dim
+            slot_numel = world * rows * width
+            h = torch.arange(heads, dtype=torch.int64)
+            p, g, j = h // (heads // world), h % (heads // world) // hg, h % hg
+            own = [(g * 3 + part) * slot_numel + r * rows * width for part in (0, 1)]
+            staged = [groups * 3 * slot_numel + ((p * groups + g) * 2 + part) * rows * width for part in (0, 1)]
+            offsets = torch.cat([torch.where(p == r, own[part], staged[part]) + j * head_dim for part in (0, 1)])
+            offsets = self._head_offset[rows] = offsets.cuda()
+        return offsets
+
+    def _run(self, q, k, v, attend_group: AttendGroup, buf: _Pool, fill: FillQK | None) -> torch.Tensor:
         group, ops, groups, copy_rows = self.group, self._ops, self.groups, self._copy_rows
         world, r = group.world_size, group.rank
-        rows, heads, head_dim = q.shape
-        hg, esz = buf.group_heads, q.element_size()
-        slot_numel = world * rows * hg * head_dim
+        rows, heads, head_dim = v.shape
+        hg, esz = buf.group_heads, v.element_size()
+        width = hg * head_dim
+        slot_numel = world * rows * width
         main = torch.cuda.current_stream()
         base, buf.groups_sent = buf.groups_sent, buf.groups_sent + groups
-        parts = (q, k, v)
         peers = [(r + i) % world for i in range(1, world)]
-        row_bytes, head_bytes = hg * head_dim * esz, head_dim * esz
-        out_pitch = heads * head_bytes
+        row_bytes, head_bytes = width * esz, head_dim * esz
+        out_pitch, chunk = heads * head_bytes, rows * row_bytes
         # addresses, not views: a tensor view per copy costs more host time than queueing the copy
         inb, outs = [t.data_ptr() for t in buf.inb], [t.data_ptr() for t in buf.out]
         fin, fout = buf.fin[r].data_ptr(), buf.fout[r].data_ptr()
@@ -267,12 +298,18 @@ class UlyssesPipeline:
         def slot(g: int, part: int) -> torch.Tensor:  # this rank's
             return buf.inb[r].narrow(0, (g * 3 + part) * slot_numel, slot_numel).view(world * rows, hg, head_dim)
 
+        def slot_addr(member: int, g: int, part: int) -> int:  # of this rank's rows in member's slot
+            return inb[member] + ((g * 3 + part) * slot_numel + r * rows * width) * esz
+
         ready = main.record_event()
         # this rank's own rows on the SMs, before the first attention: a same-device copy queued behind a
         # running attention would wait for it, and hold up the peer copies behind it. One pass a part, every group.
-        width = hg * head_dim
         own = buf.inb[r]
-        for part, t in enumerate(parts):
+        if fill is not None:
+            fill.into(own, self._fill_offsets(rows, heads, head_dim), width)
+            filled = main.record_event()
+        sent = [(2, v)] if fill is not None else [(0, q), (1, k), (2, v)]  # (part, rows) the copies move
+        for part, t in sent:
             copy_rows(own.as_strided((groups, rows, width), (3 * slot_numel, width, 1),
                                      own.storage_offset() + part * slot_numel + r * rows * width),
                       t.as_strided((groups, rows, width), (width, t.stride(0), 1),
@@ -280,11 +317,16 @@ class UlyssesPipeline:
         self._copy_in.wait_event(ready)
         for g in range(groups):
             for p in peers:
-                h0 = head0(p, g)
-                for part, t in enumerate(parts):
-                    dst = inb[p] + ((g * 3 + part) * slot_numel) * esz + r * rows * row_bytes
-                    ops.copy2d(self._copy_in, dst, row_bytes, t.data_ptr() + h0 * head_bytes, t.stride(0) * esz,
-                               row_bytes, rows)
+                for part, t in sent:
+                    ops.copy2d(self._copy_in, slot_addr(p, g, part), row_bytes,
+                               t.data_ptr() + head0(p, g) * head_bytes, t.stride(0) * esz, row_bytes, rows)
+            if fill is not None:
+                if g == 0:
+                    self._copy_in.wait_event(filled)
+                for p in peers:
+                    # q's block, then k's, both contiguous: one copy into the q and k slots, a slot apart
+                    staged = inb[r] + (groups * 3 * slot_numel + (p * groups + g) * 2 * rows * width) * esz
+                    ops.copy2d(self._copy_in, slot_addr(p, g, 0), slot_numel * esz, staged, chunk, chunk, 2)
             for p in peers:
                 ops.write(self._copy_in, buf.fin[p].data_ptr() + 4 * r, base + g + 1)
         # Every rank writes its heads of this rank's rows straight in, and the caller reads it on `main` until the
@@ -317,8 +359,8 @@ class UlyssesPipeline:
         # every peer has written, every peer has also attended over its slots, which the next call rewrites.
         for p in peers:
             ops.wait(main, fout + 4 * p, base + groups)
-        # the caller may free q / k / v, which the copy-in stream reads; `main` needn't wait out this rank's own
-        # sends, whose sources record_stream keeps alive
+        # the caller may free q / k / v, and the next call's fill rewrites the staging blocks, both of which the
+        # copy-in stream reads; `main` needn't wait out this rank's own sends, whose sources record_stream keeps alive
         main.wait_stream(self._copy_in)
         if self.group_streams:
             for stream in self._streams[:groups]:
