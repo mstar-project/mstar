@@ -58,10 +58,6 @@ def _all_to_all_single(
     return recv
 
 
-def _with_extent(shape: Sequence[int], dim: int, n: int) -> tuple[int, ...]:
-    """``shape`` with ``dim`` at extent ``n``."""
-    return (*shape[:dim], n, *shape[dim + 1:])
-
 
 # torch 2.13 renamed the into-tensor collectives to the *_single scheme.
 # Import-time selection keeps the fallback out of compiled call paths.
@@ -319,9 +315,10 @@ class CommGroup:
         graph. A tensor goes out with ``scatter_dim`` leading, so every rank's
         piece is one run of it, and the uneven extents are the collective's
         split sizes: nothing pads, and nothing branches on the sizes, so a
-        compiled caller keeps them symbolic, compiles once for every sequence
-        length and fuses the copies around the collective, which alone runs
-        outside the graph.
+        compiled caller keeps them symbolic and compiles once for every
+        sequence length. The copies around the collective compile in this
+        call's own graphs (a graph break inside a call ends the caller's graph
+        at the call); only the collective runs eagerly.
         """
         tensors = (input_,) if isinstance(input_, torch.Tensor) else tuple(input_)
         if self.world_size == 1:
@@ -340,20 +337,20 @@ class CommGroup:
             send_splits = None
             shapes = [piece.shape[1:] for piece in pieces]
         else:
-            assert len(xs) == 1, "all_to_all: several tensors need an even scatter"
+            assert len(xs) == 1, "all_to_all: several tensors take scatter_sizes=None"
             send = xs[0]
             send_splits = [n * send[0].numel() for n in scatter_sizes]
-            shapes = [_with_extent(send.shape, 0, scatter_sizes[self.rank])]
+            shapes = [(scatter_sizes[self.rank], *send.shape[1:])]
         # from rank r, this rank's piece of each tensor at rank r's gathered extent
         gathered = [mine] * world_size if gather_sizes is None else gather_sizes
-        per_row = [math.prod(_with_extent(shape, 1, 1)) for shape in shapes]
+        per_row = [shape[0] * math.prod(shape[2:]) for shape in shapes]
         recv_splits = [n * sum(per_row) for n in gathered]
         recv = _all_to_all_single(
             self._device_pg(), send.reshape(-1), send.new_empty(sum(recv_splits)),
             None if gather_sizes is None else recv_splits, send_splits,
         )
         blocks = [
-            [piece.view(_with_extent(shape, 1, n)).movedim((0, 1), dims)
+            [piece.view(shape[0], n, *shape[2:]).movedim((0, 1), dims)
              for piece, shape in zip(block.split([n * k for k in per_row]), shapes, strict=True)]
             for block, n in zip(recv.split(recv_splits), gathered, strict=True)
         ]

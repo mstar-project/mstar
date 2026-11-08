@@ -150,41 +150,44 @@ def test_attention_over_sharded_keys_matches_one_rank(tmp_path, world, total):
     _run(_sharded_keys, world, tmp_path / "store", total)
 
 
-def _compiled_packs(rank, world, dynamic):
+def _compiled_packs(rank, world, dynamic, batched):
     """The compiled stack Cosmos3's batched denoise step (length dynamic) and LTX's DiT (one
     static graph per shape) run, over packs whose length varies: the per-rank split comes
     from the length, so under ``dynamic`` no new length, whatever its remainder by the group
     size, may recompile. Either way the only graph breaks are the collectives: the exchanges'
-    pack and unpack copies stay in the compiled graph, where they fuse."""
+    pack and unpack copies compile rather than run eagerly around them."""
     group = _group(rank, world)
+    seq_dim, head_dim = _layout(batched)
 
     def stack(q, k, v):
-        sizes = sp_seq_split(q.shape[0], world)
-        q, k, v = (scatter_sequence(group, t, sizes) for t in (q, k, v))
+        sizes = sp_seq_split(q.shape[seq_dim], world)
+        q, k, v = (scatter_sequence(group, t, sizes, dim=seq_dim) for t in (q, k, v))
         for _ in range(2):
-            q = ulysses_attention(group, q, k, v, _sdpa(batched=False), sizes)
-        return gather_sequence(group, q, sizes)
+            q = ulysses_attention(group, q, k, v, _sdpa(batched), sizes, seq_dim, head_dim)
+        return gather_sequence(group, q, sizes, dim=seq_dim)
 
     # Serving compiles once, at one even pack (Cosmos3's `warmup_compiles`, two equal requests),
     # with the length dynamic; every later length, uneven split or not, reuses that compile. 30
     # splits evenly at SP2 and SP3 into shards that match no other dimension: a warm-up pack that
     # does match one is `warmup_compiles`'s to handle (test_denoise_compile.py).
-    compiled = torch.compile(stack, backend="eager", dynamic=dynamic)
+    # aot_eager: functionalizes the exchanges' in-place packs as inductor does
+    compiled = torch.compile(stack, backend="aot_eager", dynamic=dynamic)
     lengths = (30, 7, 9, 22, 13, 8, 31, 10, 12) if dynamic else (30, 7)
     for i, total in enumerate(lengths):
-        q, k, v = (_full(total, batched=False, seed=seed) for seed in range(3))
+        q, k, v = (_full(total, batched, seed=seed) for seed in range(3))
         with torch.compiler.set_stance("fail_on_recompile" if dynamic and i >= 1 else "default"):
             out = compiled(q, k, v)
-        attend = _sdpa(batched=False)
+        attend = _sdpa(batched)
         torch.testing.assert_close(out, attend(attend(q, k, v), k, v))
     breaks = torch._dynamo.utils.counters["graph_break"]
     assert breaks and all("_all_to_all_single" in reason for reason in breaks), list(breaks)
 
 
+@pytest.mark.parametrize("batched", [False, True], ids=["SHD", "BSHD"])
 @pytest.mark.parametrize("dynamic", [True, False], ids=["dynamic", "static"])
 @pytest.mark.parametrize("world", [2, 3])
-def test_compiled_sequence_parallel_stack_breaks_only_at_the_collectives(tmp_path, world, dynamic):
-    _run(_compiled_packs, world, tmp_path / "store", dynamic)
+def test_compiled_sequence_parallel_stack_breaks_only_at_the_collectives(tmp_path, world, dynamic, batched):
+    _run(_compiled_packs, world, tmp_path / "store", dynamic, batched)
 
 
 def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
