@@ -1224,6 +1224,9 @@ class Model(ABC):
     # ``(start_id, end_id)``: the text tokens that open and close a full-duplex
     # model's turns (see "Streams from the client" in docs/adding_models.rst); None: none.
     turn_tokens: tuple[int, int] | None = None
+    # A model whose replies may never get their end mark: a reply ends after this many
+    # steps whose text is only padding (no text, no mark); None: only the marks end one.
+    turn_idle_steps: int | None = None
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for

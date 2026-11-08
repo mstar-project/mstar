@@ -3333,7 +3333,8 @@ streams (audio and video, say): each has its own buffer and its own end.
 - A model that declares ``ClientAudio`` decides when to speak (full duplex). To serve
   ``/v1/realtime`` conversations it also declares ``turn_tokens = (start_id, end_id)`` on
   the model (a property when the ids come from its config): the text tokens that open and
-  close each reply. Without them ``/generate/ws`` still serves it, and a conversation is
+  close each reply, and, if its replies may get no end mark, ``turn_idle_steps``: a reply
+  then also ends after that many steps whose text is only padding. Without them ``/generate/ws`` still serves it, and a conversation is
   refused (an omitted ``intent`` then means transcription, if the model's adapter serves it). The data worker marks the text chunks they arrive in with
   ``metadata["turn"]``, their marks (``"start"`` / ``"end"``) in token order, on every
   route, before ``postprocess`` (which may decode them to nothing), and stamps each text

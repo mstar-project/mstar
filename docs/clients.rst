@@ -199,7 +199,9 @@ or ``/v1/realtime``. On either route, a model that declares its audio frame (Nem
 VoiceChat: 80 ms, 1280 samples at 16 kHz) gets a live call's audio in whole frames: each
 whole frame of an append goes on as a step of its own and the rest waits for the next
 append, or goes with the stream's end, so appends of any size keep the call on the steps
-Nemotron runs as one CUDA graph (see :doc:`models`).
+Nemotron runs as one CUDA graph (see :doc:`models`). The part of a frame that waits costs
+latency: with one call, 20 ms appends put a frame's step about 60 ms later and 100 ms
+appends about 100 ms later (H200), while 80 ms appends, whole frames, cost nothing.
 
 .. code-block:: python
 
@@ -506,11 +508,15 @@ Per-model notes:
   network jitter) and a frame behind real time (a muted mic, a client waiting for the
   reply), whole frames of silence are appended for it, at most 30 s a pause and
   counted against the call's length cap, so a client that stops sending past that stops
-  the agent. A client that stops sending hears the reply up to that 200 ms later; one
-  that streams its mic, silence included, doesn't. Each reply
+  the agent. A client that stops sending hears the reply about 0.35 s later (the
+  allowance, a frame and the clock's tick; measured on H200); one that streams its mic,
+  silence included, doesn't. Each reply
   is one response, ``response.created`` through ``response.done``, with
   ``response.output_audio.delta`` and ``response.output_audio_transcript.delta`` in
-  between; audio between replies is silence and is not sent. ``turn_detection``
+  between; audio between replies is silence and is not sent. A reply ends at the
+  model's end mark, where the next reply starts, or, for a model that declares
+  ``turn_idle_steps``, once its text has been only padding that long (Nemotron: 2 s,
+  since it often sends no end mark). ``turn_detection``
   ``server_vad`` and ``semantic_vad`` both mean "the model decides", and their knobs are
   not used; null, or ``create_response`` / ``interrupt_response`` false, are refused.
   ``input_audio_buffer.commit`` is acknowledged and flushes nothing; ``clear`` drops only

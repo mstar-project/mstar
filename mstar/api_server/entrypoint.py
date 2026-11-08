@@ -488,6 +488,8 @@ class APIServer:
         # tokenizer-only model the API server already builds for preprocessing.
         self.model = model
         self.model_name = model_name
+        # only a model with turn marks reads its chunks' loop steps (metadata.step)
+        self.reads_turns = getattr(model, "turn_tokens", None) is not None
         # what an OpenAI request's `model` field may name: the base model, or an adapter
         self.served_models = ServedModels.of(model_name, model_config)
         # The openpi WebSocket at `/`, when the config maps robot observations to this model.
@@ -1128,14 +1130,16 @@ class APIServer:
                             pending = self.pending_requests
                             if all(rid in pending for rid in body.request_ids):
                                 rids, values, logprobs = body.request_ids, body.values, body.logprobs
-                                loops = body.loop_indices
+                                loops = body.loop_indices if self.reads_turns else None
                             else:
-                                rids, values, logprobs, loops = [], [], [], []
+                                rids, values, logprobs = [], [], []
+                                loops = [] if self.reads_turns else None
                                 for i, (rid, value) in enumerate(zip(body.request_ids, body.values, strict=True)):
                                     if rid in pending:
                                         rids.append(rid)
                                         values.append(value)
-                                        loops.append(body.loop_indices[i])
+                                        if loops is not None:
+                                            loops.append(body.loop_indices[i])
                                         if body.logprobs:
                                             logprobs.append(body.logprobs[i])
                                     elif rid not in self.recently_completed:
