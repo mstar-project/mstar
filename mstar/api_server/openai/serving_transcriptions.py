@@ -30,7 +30,8 @@ Long uploads
 
     ``parallel`` cuts fixed windows, each at the quietest moment shortly
     before its nominal boundary, with no conditioning, and keeps up to
-    :data:`PARALLEL_INFLIGHT` of them on the engine at once. With timestamps
+    :data:`PARALLEL_INFLIGHT` of them on the engine at once, fewer while other
+    uploads share the server's concurrency cap (:class:`WindowShare`). With timestamps
     (a non-streamed timed format), a window that stopped inside a segment
     keeps its closed segments as in sequential mode, and the audio from the
     last of them to the cut is decoded as one more window.
@@ -94,7 +95,7 @@ CUT_FRAME_SECONDS = 0.02
 MIN_TAIL_SECONDS = 0.02
 # parallel mode: windows on the engine at once for one upload. A decode batch can
 # hold no more than this many of one upload's windows, so a small value starves a
-# lone upload of batching; past the ASR configs' caps the rest queue in the conductor.
+# lone upload of batching; uploads at once split the config's cap (WindowShare).
 PARALLEL_INFLIGHT = 32
 # shortest window a request may ask for (``window_seconds``)
 MIN_WINDOW_SECONDS = 5.0
@@ -102,6 +103,41 @@ MIN_WINDOW_SECONDS = 5.0
 MAX_DURATION_SECONDS = 30 * 60
 MAX_UPLOAD_BYTES = 512 * 2**20
 _SF_UNKNOWN_FRAMES = 2**62
+
+
+@dataclass(slots=True)
+class WindowShare:
+    """How many windows an upload cut in parallel keeps on the engine.
+
+    A window past the config's ``max_concurrent_requests`` waits in the
+    conductor with its audio already staged in shared memory, so the uploads
+    being transcribed split the cap between them, at least one window each; a
+    lone upload keeps up to :data:`PARALLEL_INFLIGHT`, as does every upload
+    when there is no cap. Only the event loop touches it.
+    """
+
+    cap: int | None
+    uploads: int = 0
+
+    def per_upload(self) -> int:
+        if not self.cap:
+            return PARALLEL_INFLIGHT
+        return max(1, min(PARALLEL_INFLIGHT, self.cap // max(1, self.uploads)))
+
+    def join(self) -> WindowShare:
+        self.uploads += 1
+        return self
+
+    def leave(self) -> None:
+        self.uploads -= 1
+
+
+def window_share(api) -> WindowShare:
+    """The API server's share, made on first use."""
+    share = getattr(api, "window_share", None)
+    if share is None:
+        share = api.window_share = WindowShare(getattr(api, "max_concurrent_requests", None))
+    return share
 
 
 def save_upload(audio_bytes: bytes, filename: str | None, upload_dir: Path) -> str:
@@ -597,14 +633,15 @@ async def create_transcription(
         )
 
     inflight: set[str] = set()
+    share = window_share(api).join()
     try:
         if mode == "parallel" or planner.single:
             windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
             # each tail goes to the engine as soon as its window is in, beside
-            # the windows still decoding
+            # the windows still decoding, and counts against the upload's share
             tails: dict[int, Window] = {}
             collected = 0
-            async for window in _parallel(api, adapter, req, windows, inflight, raw_request):
+            async for window in _parallel(api, adapter, req, windows, inflight, share, raw_request):
                 tail = await _tail(adapter, req, planner, window)
                 if tail is not None:
                     _submit(api, adapter, req, tail, streaming=False, inflight=inflight)
@@ -625,6 +662,7 @@ async def create_transcription(
             windows = [w async for w in _sequential(api, adapter, req, planner, inflight, raw_request)]
         duration = planner.duration
     finally:
+        share.leave()
         _release(api, inflight)
         planner.cleanup()
 
@@ -707,12 +745,20 @@ def render_vtt(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _parallel(api, adapter, req, windows: list[Window], inflight: set[str], raw_request=None):
-    """Collect ``windows`` in order with up to :data:`PARALLEL_INFLIGHT` on
-    the engine, yielding each once its raw text is in."""
+def _room(share: WindowShare, inflight: set[str], submitted: int, index: int) -> bool:
+    """Whether window ``submitted`` goes to the engine before window ``index`` is
+    read: always if it is that window, else while the upload is under its share."""
+    return submitted <= index or len(inflight) < share.per_upload()
+
+
+async def _parallel(
+    api, adapter, req, windows: list[Window], inflight: set[str], share: WindowShare, raw_request=None,
+):
+    """Collect ``windows`` in order with up to the upload's share on the
+    engine, yielding each once its raw text is in."""
     submitted = 0
     for index, window in enumerate(windows):
-        while submitted < min(len(windows), index + PARALLEL_INFLIGHT):
+        while submitted < len(windows) and _room(share, inflight, submitted, index):
             _submit(api, adapter, req, windows[submitted], streaming=False, inflight=inflight)
             submitted += 1
         text = await _collect(api, window, inflight, raw_request)
@@ -746,6 +792,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
     is accepted, since only then is it known to stand."""
     windows: list[Window] = []
     inflight: set[str] = set()
+    share = window_share(api).join()
     try:
         if mode == "parallel" or planner.single:
             windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
@@ -759,7 +806,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
             # before a window's first text: a silent window adds none
             spoken = False
             for i, window in enumerate(windows):
-                while submitted < min(len(windows), i + PARALLEL_INFLIGHT):
+                while submitted < len(windows) and _room(share, inflight, submitted, i):
                     _submit(api, adapter, window_req, windows[submitted], streaming=True, inflight=inflight)
                     submitted += 1
                 raw, emitted, gap = "", "", spoken
@@ -813,6 +860,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
         yield _stream_error_event(exc)
         yield SSE_DONE
     finally:
+        share.leave()
         _release(api, inflight)
         planner.cleanup()
 

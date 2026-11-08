@@ -568,8 +568,9 @@ def test_client_gone_after_a_parallel_tail_releases_it_and_submits_nothing_more(
     r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
                        "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(10 * 60))
     assert r.status_code == 200, r.text
-    # the first window's tail went out when that window came back, before the disconnect
-    assert len(stub.submits) == 2 + 8
+    # the first window's tail went out when that window came back, before the disconnect;
+    # it counts against the upload's 8, so no ninth window went out
+    assert len(stub.submits) == 8 + 1
     # the tail's file is cut after every fixed window's, so it has the highest _wNNNN
     tail = max(stub.submits, key=lambda sub: sub["file_paths"]["audio"][0])["request_id"]
     assert tail in stub.released
@@ -858,6 +859,44 @@ def test_parallel_bounds_windows_in_flight(client_and_stub, monkeypatch):
               filename="long.wav", content=_wav_bytes(140))
     assert r.json() == {"text": "w0 w1 w2 w3 w4"}
     assert seen == [2, 3, 4, 5, 5]
+
+
+def test_uploads_split_the_concurrency_cap():
+    share = serving_transcriptions.WindowShare
+    assert share(cap=None, uploads=3).per_upload() == serving_transcriptions.PARALLEL_INFLIGHT
+    assert share(cap=64, uploads=1).per_upload() == serving_transcriptions.PARALLEL_INFLIGHT
+    assert share(cap=64, uploads=4).per_upload() == 16
+    assert share(cap=64, uploads=100).per_upload() == 1
+
+
+@requires_audio_duration
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_upload_beside_another_keeps_its_half_of_the_cap(client_and_stub, stream):
+    """Windows past the cap would wait in the conductor with their audio staged,
+    so a second upload holds back the first's lookahead to its share."""
+    client, stub = client_and_stub
+    stub.window_share = serving_transcriptions.WindowShare(cap=4, uploads=1)
+    seen = []
+    collect, chunks = stub.collect_results, stub.iter_result_chunks
+
+    async def watching(request_id, raw_request=None):
+        seen.append(len(stub.submits))
+        return await collect(request_id, raw_request)
+
+    async def watching_chunks(request_id):
+        seen.append(len(stub.submits))
+        async for c in chunks(request_id):
+            yield c
+
+    stub.collect_results, stub.iter_result_chunks = watching, watching_chunks
+    stub.queued_chunks = [_text(f" w{i}") for i in range(5)]
+    data = {"model": "whisper_large", "long_form": "parallel"}
+    if stream:
+        data["stream"] = "true"
+    r = _post(client, data, filename="long.wav", content=_wav_bytes(140))
+    assert r.status_code == 200
+    assert seen == [2, 3, 4, 5, 5]
+    assert stub.window_share.uploads == 1
 
 
 def test_parallel_failure_releases_the_other_windows(client_and_stub):
