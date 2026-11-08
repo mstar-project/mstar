@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -586,13 +587,31 @@ def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, 
     other.write_text("not an adapter")
     model = tmp_path / "model.safetensors"
     save_file({"model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2)}, str(model))
+    # a FIFO is refused without being opened: its open waits for a writer, holding every
+    # later load and unload behind it (in a child, as such an open blocks holding the GIL)
+    fifo = tmp_path / "adapter.fifo"
+    os.mkfifo(fifo)
+    check = (
+        "import sys, types\n"
+        "from mstar.engine.resources.lora.store import check_adapter_file\n"
+        "spec = types.SimpleNamespace(convert_keys=None, check_adapter=print)\n"
+        "try:\n"
+        "    check_adapter_file(spec, 'x', sys.argv[1])\n"
+        "except OSError as exc:\n"
+        "    print('refused:', exc)\n"
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", check, str(fifo)], capture_output=True, text=True, timeout=30, check=False,
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+    )
+    assert child.stdout.startswith("refused:"), child.stderr
     answers = set()
-    for path in (str(tmp_path / "missing.safetensors"), str(other), str(tmp_path), str(model)):
+    for path in (str(tmp_path / "missing.safetensors"), str(other), str(tmp_path), str(model), str(fifo)):
         with pytest.raises(REFUSED) as err:
             d.load("x", path)
         assert _status(err.value) == 400 and str(tmp_path) not in _message(err.value)
         answers.add(_message(err.value))
-    # a missing file, a file of another kind, a directory and a model's weights read the same
+    # a missing file, a file of another kind, a directory, a model's weights and a FIFO read the same
     assert len(answers) == 1 and "could not be read" in answers.pop()
     # as they do on a worker, should the file change after the API server's check
     read = LoraAdapterPool(make_spec({}), "cpu").load_adapter_async("x", str(model))

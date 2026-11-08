@@ -7,6 +7,8 @@ An adapter's tensors are laid out exactly like one device slot (rank padded to t
 from __future__ import annotations
 
 import logging
+import os
+import stat
 from collections import OrderedDict
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
@@ -172,6 +174,10 @@ def check_adapter_file(
     from the checkpoint's header; returns its digest. The digest is read once per way the
     specs convert the checkpoint (``convert_keys``), so once for specs that read it alike.
     Raises ``ValueError`` for an adapter the deployment cannot serve."""
+    # anything but a regular file is unreadable, and not opened: a FIFO's open waits for
+    # a writer, with every later runtime load and unload queued behind it
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        raise OSError(f"{path} is not a regular file")
     digests: dict = {}  # convert_keys -> the digest of the file read that way
     for each in (spec, *others):
         each.check_adapter(name, inspect_adapter(each, path))
