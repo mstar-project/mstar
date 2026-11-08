@@ -145,8 +145,8 @@ COMPONENT_PENDING_STEPS = Family(
 )
 REBUILD_HOST_BYTES_USED = Family(
     "mstar_rebuild_host_bytes_used", GAUGE,
-    "Bytes of a worker's rebuild host pool that hold kept prompt ids, which a "
-    "request dropped from the KV cache is rebuilt from.",
+    "Bytes of a worker's rebuild host pool that hold kept prompt ids and host "
+    "copies, which a request dropped from the KV cache is rebuilt from.",
     ("component",),
 )
 REBUILD_HOST_BYTES_TOTAL = Family(

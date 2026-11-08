@@ -10,6 +10,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources import StepAllowance
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
@@ -89,6 +90,7 @@ def _manager(max_num_pages: int = 128, host_pages: int = 64) -> KVManager:
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
+        host_allowance=StepAllowance(),
     )
     kv.enable_prefix_cache(ROOT)
     kv._cpu_pool = _HostPool(host_pages)
@@ -351,4 +353,16 @@ def test_a_request_looked_up_skips_the_host_walk_until_its_stream_resets():
     assert len(kv._cpu_pool.copied_in) == copied + 6, "a request whose stream reset didn't look its prefix up again"
 
 
+def test_a_host_pool_needs_the_engines_allowance():
+    """The pool built an allowance of its own when none was passed, so a caller that left out the engine's gave the
+    copy engine a second budget."""
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=4, max_seq_len=4096, max_num_pages=8,
+                          page_size=PAGE_SIZE),
+        name="kv", joint_comm_group=None, transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.enable_prefix_cache(ROOT)
+    kv._cpu_pool = _HostPool(8)
 
+    with pytest.raises(AssertionError, match="StepAllowance"):
+        kv._open_host_writes()

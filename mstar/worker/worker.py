@@ -188,11 +188,14 @@ def _make_rebuilds(
     policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
     # A lockstep node's KV refuses every drop, so its requests keep no ids.
     policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
-    host_mb = _serving_mb(model_config, "rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
-    if host_mb and any(names for node, policy in policies.items() for names in policy.check(node, graphs).values()):
-        host_mb += _serving_mb(model_config, "rebuild_media_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB)
+    copies = any(names for node, policy in policies.items() for names in policy.check(node, graphs).values())
+    host_mb = _serving_mb(
+        model_config, "rebuild_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB if copies else DEFAULT_REBUILD_HOST_MB,
+    )
+    if not host_mb:
+        policies = {}
     return Rebuilds(
-        policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None, engine.host_allowance,
+        policies, graphs, HostPool(host_mb << 20, device) if policies else None, engine.host_allowance,
         {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None},
     )
 
@@ -3987,7 +3990,8 @@ class Worker:
                         side_steps.finish(block=True)
                         continue
                     self._rebuilds.flush_idle()
-                    self.communicator.wait_for_work(10)
+                    # the next pass's `flush_idle` waits for the copies just started, so it needn't wait the tick too
+                    self.communicator.wait_for_work(0 if self._rebuilds.copies_queued else 10)
                     continue
 
                 if self.enable_nvtx:

@@ -14,39 +14,15 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mstar.engine.resources.base import StepAllowance
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 logger = logging.getLogger(__name__)
 
-# What a step may queue for the host. The device has one device-to-host copy engine, which runs copies
-# in the order they were queued whatever their stream or priority, and the writes queue behind the
-# step's own output copy.
-# `_WRITE_BYTES_PER_STEP` bounds how long a step's copies to the host, the worker's included, hold the copy engine
-# before the next step's output copy can run (about 1 ms on an H100).
-# `_WRITE_PAGES_PER_STEP` bounds the copies launched from the host, one per page at most (about 0.1 ms of host
-# time at 16).
-_WRITE_BYTES_PER_STEP = 32 << 20
+# `_WRITE_PAGES_PER_STEP` bounds the copies a step launches from the host for cached pages, one per page at most (about
+# 0.1 ms of host time at 16).
 _WRITE_PAGES_PER_STEP = 16
-
-
-class StepAllowance:
-    """What a step may still queue for the host once its outputs are sent, shared by every copy to the host on the
-    device: the worker's host copies for rebuilds first, then each pool's cached pages. The engine refills it once
-    the pools have taken theirs."""
-
-    def __init__(self, nbytes: int = _WRITE_BYTES_PER_STEP) -> None:
-        self._per_step = nbytes
-        self.left = nbytes
-
-    def spend(self, nbytes: int) -> int:
-        """Take up to ``nbytes`` of what is left, and return how many were taken."""
-        taken = min(nbytes, self.left)
-        self.left -= taken
-        return taken
-
-    def refill(self) -> None:
-        self.left = self._per_step
 
 
 @dataclass
