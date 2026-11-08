@@ -2,7 +2,7 @@
 
 What mstar reviewers ask for again and again, mined from human review comments on past PRs. Much of
 it is written down nowhere else. Section A is factoring and placement, B is style, C is everything
-else. The factoring pass (SKILL.md §4.7) and style pass (§4.10) list every check; open a pattern here
+else. The factoring pass (SKILL.md §4.6) and style pass (§4.9) list every check; open a pattern here
 for its examples when a finding needs one.
 
 Cite a miss as "factoring pattern A3", "style pattern B1" or "pattern C1". Where AGENTS.md states
@@ -208,7 +208,8 @@ AGENTS.md invariant 9: a row in `docs/environment_variables.rst` (#164, #185).
 - **C6. Keep `forward` capturable** (AGENTS.md invariant 3): data-dependent control flow captures one
   branch (#31); keep `preprocess` a pure function of its inputs (#184).
 - **C7. Tests that run and test something.** A default that makes the test vacuous (#169); a
-  `skipif` that makes it a no-op in CI (#347); a module outside CI's selection (#358).
+  `skipif` that makes it a no-op in CI when nothing else runs it (#347); a module nothing selects,
+  neither CI nor the GPU live test (#358).
 - **C8. Frontend parity.** The Python API server and the Rust frontend answer alike (#169: a client
   expecting MP3 could get WAV back).
 - **C9. Match the reference's pre- and post-processing** (#249: a raw string where training put a

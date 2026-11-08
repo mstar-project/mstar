@@ -39,7 +39,7 @@ class TestApproval(unittest.TestCase):
                  {"ref": "3", "priority": "P2", "status": "open", "why": "moved, not fixed"}]
         outside = [{"priority": "P2", "location": "mstar/engine/engine.py:10", "claim": "c", "detail": "d"}]
         found = blocking(review(prior, outside), [{"data": {"repository": {"pullRequest": {
-            "reviewThreads": {"nodes": threads}}}}}])
+            "reviewThreads": {"nodes": threads}}}}}], [])
         self.assertEqual(len(found), 4, found)
         for expected in ("inline 1", "inline 5", "engine.py:10", "earlier 3"):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")
@@ -70,7 +70,8 @@ class TestApproval(unittest.TestCase):
             r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": [],
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "confirm": [], "checks": ["correctness"], "gpus": 1}}
-            a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict, since=since)
+            a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict, since=since,
+                                   above="stacked-above.json")
             return GPU_REVIEW["reasons_not_to_approve"](a, r)[0]
 
         self.assertEqual(why("pass", "full"), [])

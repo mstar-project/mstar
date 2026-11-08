@@ -14,7 +14,7 @@ Slurm node when it has them free, else any open Eras listing under the hourly ca
     gpu_review.py wait     --out DIR [--start-timeout MIN]
     gpu_review.py cleanup  --pr N --tag T
     gpu_review.py approve  --pr N --sha SHA --review review.json --complete true|false --verdict pass|skipped|...
-                           [--since SHA]
+                           --above stacked-above.json [--since SHA]
     gpu_review.py comment  --pr N --sha SHA --out DIR [--site SITE] [--media-url URL]
 
 `start` exits 3 when no GPUs are free, or the bot has REVIEW_GPU_MAX_RUNS runs going, after writing
@@ -377,9 +377,9 @@ def review_threads(pr):
                          "-F", f"pr={pr}", "-f", f"query={q}").stdout)
 
 
-def blocking(review, pages):
+def blocking(review, pages, stacked):
     """The open P0–P2 findings, by the summary's own rule (render_summary.open_findings)."""
-    return [f"{where} ({p})" for where, p in SUMMARY["open_findings"](review, pages) if p != "P3"]
+    return [f"{where} ({p})" for where, p in SUMMARY["open_findings"](review, pages, stacked) if p != "P3"]
 
 
 def file_gate(files, repo_root):
@@ -423,7 +423,7 @@ def reasons_not_to_approve(a, review):
         why.append(f"{len(review['questions'])} open question(s)")
     if review.get("skipped"):
         why.append("the review skipped files")
-    open_ = blocking(review, review_threads(a.pr))
+    open_ = blocking(review, review_threads(a.pr), SUMMARY["stacked_above"](a.above))
     if open_:
         why.append("open P0–P2 findings: " + ", ".join(open_))
     files = pr_files(pr["base"]["sha"], a.sha)
@@ -582,6 +582,8 @@ def main():
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--why", help="write the reasons not to approve here")
     p.add_argument("--since", type=commit, help="a `none`: the commit the last passing live test ran on")
+    p.add_argument("--above", required=True,
+                   help="stacked-above.json: the PRs stacked above whose diffs the review was given")
     p = sub.add_parser("dismiss")
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--message", required=True)
