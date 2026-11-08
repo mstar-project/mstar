@@ -443,7 +443,7 @@ def test_llm_prefill_splices_audio_embeddings_and_decode_carries_ids():
     assert [(s.label, s.span) for s in step.segments] == [("main", 8)] and KV_CACHE in step.steps
     (decode, prefill) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode.capture_batch_sizes == sub.DECODE_CAPTURE_BATCH_SIZES
-    assert prefill.capture_token_lengths == sub.PREFILL_TOKEN_BUCKETS
+    assert prefill.capture_token_lengths == {1: sub.PREFILL_TOKEN_BUCKETS}
     assert prefill.make_node_input(7).input_embeds.shape == (7, cfg.text.hidden_size)
 
 

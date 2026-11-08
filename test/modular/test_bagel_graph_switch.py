@@ -100,7 +100,7 @@ def test_enabled_capture_keeps_existing_recipes(monkeypatch, device_type):
     assert [config.capture_batch_sizes for config in configs] == [
         None, None, [1, 2, 4, 8, 16, 32, 64],
     ]
-    assert configs[2].capture_token_lengths == [128, 256, 512, 1024, 2048]
+    assert configs[2].capture_token_lengths == {1: [128, 256, 512, 1024, 2048]}
 
 
 @pytest.mark.parametrize("graph_walk", sorted(DENOISE_WALKS))

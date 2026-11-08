@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from mstar.engine import recompile_limit
+from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig
 from mstar.utils import knobs
 
 
@@ -53,17 +54,14 @@ def _shipped_prefill_ladders():
     return ladders
 
 
-def _captured_ladders(submodule, ladders) -> dict[str, list[int]]:
-    """Each packed capture walk's ladder once the engine has applied the
+def _captured_ladders(submodule, ladders) -> dict[str, PackedAcceleratorGraphConfig]:
+    """Each packed capture walk's config once the engine has applied the
     serving config's ``ladders`` under the LLM's budget."""
-    from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig, apply_token_ladders
+    from mstar.engine.accelerator_graph_config import apply_token_ladders
     configs = submodule.get_accelerator_graph_configs(torch.device("cpu"))
     if ladders:
         apply_token_ladders("LLM", configs, ladders, lambda walk: submodule.MAX_BATCH_TOKENS)
-    return {
-        c.capture_graph_walk: c.capture_token_lengths
-        for c in configs if isinstance(c, PackedAcceleratorGraphConfig)
-    }
+    return {c.capture_graph_walk: c for c in configs if isinstance(c, PackedAcceleratorGraphConfig)}
 
 
 @pytest.mark.parametrize("ladders", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
@@ -82,8 +80,8 @@ def test_shipped_ladders_stay_inside_dynamos_recompile_limit(monkeypatch, ladder
     # graphs. The count is an estimate: a compile it doesn't model (another eager shape, a
     # guard failure) would leave the last bucket uncompiled, so one is kept spare.
     compiles = (
-        len(s.DECODE_CAPTURE_BATCH_SIZES) + len(captured["prefill_text"])
-        + pairs(s.MIXED_CAPTURE_BATCH_SIZES, captured["mixed"])
+        len(s.DECODE_CAPTURE_BATCH_SIZES) + len(captured["prefill_text"].get_total_tokens(1))
+        + sum(len(captured["mixed"].get_total_tokens(r)) for r in s.MIXED_CAPTURE_BATCH_SIZES)
         + pairs(s.PREFILL_MEDIA_CAPTURE_BATCH_SIZES, s.PREFILL_MEDIA_TOKEN_BUCKETS)
     )
     assert compiles < recompile_limit()

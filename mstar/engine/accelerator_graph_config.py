@@ -194,6 +194,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         capture_graph_walk: str,
         # a ladder, or ``{min batch size: ladder}``: a batch size takes the
         # ladder of the largest key at or below it, and none if every key is above
+        # (a plain ladder is kept as ``{1: ladder}``)
         capture_token_lengths: list[int] | Mapping[int, list[int]],
         # seq len -> NodeInputs
         make_node_input: Callable[[int], NodeInputs],
@@ -229,7 +230,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         if total_tokens_multiplier < 1:
             raise ValueError("total_tokens_multiplier must be at least 1")
         self.make_node_input = make_node_input
-        self.capture_token_lengths = capture_token_lengths
+        self.capture_token_lengths = ladders_by_batch_size(capture_token_lengths)
         self.total_tokens_multiplier = total_tokens_multiplier
         self.token_layout = token_layout or distribute_tokens
 
@@ -237,9 +238,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         return AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
     def get_total_tokens(self, bs: int) -> list[int]:
-        ladder = self.capture_token_lengths
-        if isinstance(ladder, Mapping):
-            ladder = max(((k, v) for k, v in ladder.items() if k <= bs), default=(0, []))[1]
+        ladder = max(((k, v) for k, v in self.capture_token_lengths.items() if k <= bs), default=(0, []))[1]
         # every real row carries a token, so a bucket with fewer tokens than
         # rows could never serve a step; capturing it would give rows of none
         return [n * self.total_tokens_multiplier for n in ladder if n >= bs]
@@ -252,21 +251,25 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         ]
 
 
+def ladders_by_batch_size(ladder: Any) -> dict[int, Any]:
+    """A ``capture_token_lengths`` or ``prefill_token_buckets`` value as
+    ``{min batch size: ladder}``: a plain ladder serves every batch size."""
+    return dict(ladder) if isinstance(ladder, Mapping) else {1: ladder}
+
+
 def check_token_ladder(where: str, ladder: Any) -> None:
     """Refuse a ``prefill_token_buckets`` value that is not a ladder (a
     non-empty list of distinct positive ints) or ``{min batch size: ladder}``
     whose top rungs rise with the batch size: a capture's static buffers are
     sized by its first, largest-batch bucket, so a smaller batch's ladder must
     not reach past it."""
-    if not isinstance(ladder, Mapping):
-        capture_ladder(f"prefill_token_buckets for {where}", ladder)
-        return
-    if not ladder or not all(isinstance(k, int) and not isinstance(k, bool) and k > 0 for k in ladder):
+    by_bs = ladders_by_batch_size(ladder)
+    if not by_bs or not all(isinstance(k, int) and not isinstance(k, bool) and k > 0 for k in by_bs):
         raise ValueError(
             f"prefill_token_buckets for {where} maps a min batch size (a positive int) to a "
             f"ladder, got {ladder!r}"
         )
-    tops = [max(capture_ladder(f"prefill_token_buckets for {where}/{k}", ladder[k])) for k in sorted(ladder)]
+    tops = [max(capture_ladder(f"prefill_token_buckets for {where}", by_bs[k])) for k in sorted(by_bs)]
     if tops != sorted(tops):
         raise ValueError(
             f"prefill_token_buckets for {where}: a larger batch size's ladder must reach at least as "
@@ -322,15 +325,11 @@ def apply_token_ladders(
         for config in targets:
             budgets = [step_budget(w) for w in config.replay_graph_walks]
             budget = None if None in budgets else max(budgets)
-            if not isinstance(ladder, Mapping):
-                trimmed: list[int] | dict[int, list[int]] = _trim(ladder, budget)
-                dropped = sorted(set(ladder) - set(trimmed))
-            else:
-                trimmed, top, dropped = {}, 0, []
-                for k in sorted(ladder):
-                    trimmed[k] = _trim(ladder[k], budget, top)
-                    top = trimmed[k][-1]
-                    dropped += sorted(set(ladder[k]) - set(trimmed[k]))
+            trimmed, top, dropped = {}, 0, []
+            for k, rungs in sorted(ladders_by_batch_size(ladder).items()):
+                trimmed[k] = _trim(rungs, budget, top)
+                top = trimmed[k][-1]
+                dropped += sorted(set(rungs) - set(trimmed[k]))
             if dropped:
                 logger.info(
                     "%s/%s: drops prefill_token_buckets %s, past the first that holds its "
