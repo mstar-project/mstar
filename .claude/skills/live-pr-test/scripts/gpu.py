@@ -1007,7 +1007,7 @@ def main():
     cache.add_argument("--cache", choices=("ro", "none"), default="ro",
                        help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
     cache.add_argument("--cache-write", metavar="ID",
-                       help="Eras: mount this cache volume read-write at /cache instead, to fill it; dies if it is held")
+                       help="Eras: mount this cache volume read-write at /cache instead, to fill it; dies if held")
     p.add_argument("--allow-over-budget", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("wait")
