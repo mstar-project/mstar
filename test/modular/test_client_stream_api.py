@@ -1884,11 +1884,13 @@ def test_websocket_deflate_is_a_serving_setting():
     assert off.ws_per_message_deflate is False
 
 
-def test_websocket_message_size_is_a_serving_setting():
-    """The largest WebSocket message the server reads: uvicorn's 16 MiB unless
-    the config raises it (several raw camera frames can be more)."""
+def test_websocket_message_size_is_a_serving_setting(monkeypatch):
+    """The largest WebSocket message the server reads: an HTTP body's limit, not
+    uvicorn's 16 MiB, whose close aborts every request pipelined on the socket,
+    unless the config sets its own (several raw camera frames can be more)."""
+    monkeypatch.setenv("MSTAR_MAX_BODY_MB", "200")
     app = object()
-    assert entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {}).ws_max_size == 16 << 20
+    assert entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {}).ws_max_size == 200 << 20
     assert entrypoint._uvicorn_config(app, "127.0.0.1", 8000, {"ws_max_message_mb": 64}).ws_max_size == 64 << 20
     for bad in (0, -1, "64", True, float("inf")):
         with pytest.raises(ValueError, match="ws_max_message_mb"):
