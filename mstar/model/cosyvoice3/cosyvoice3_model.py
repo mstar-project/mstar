@@ -233,6 +233,10 @@ class CosyVoice3Model(Model):
             cfg.hift_capture_frame_buckets = _sizes("hift_capture_frame_buckets", hift_capture_frame_buckets)
         if hift_capture_batch_sizes is not None:
             cfg.hift_capture_batch_sizes = _sizes("hift_capture_batch_sizes", hift_capture_batch_sizes)
+        if flow_max_batch_size is not None:
+            cfg.flow_max_batch_size = _integer("flow_max_batch_size", flow_max_batch_size, low=1)
+        if hift_max_batch_size is not None:
+            cfg.hift_max_batch_size = _integer("hift_max_batch_size", hift_max_batch_size, low=1)
         if (
             cfg.hift_captured
             and cfg.hift_capture_batch_sizes
@@ -252,10 +256,6 @@ class CosyVoice3Model(Model):
             cfg.lm_prefill_token_buckets = _sizes("lm_prefill_token_buckets", lm_prefill_token_buckets)
         if lm_prefill_batch_sizes is not None:
             cfg.lm_prefill_batch_sizes = _sizes("lm_prefill_batch_sizes", lm_prefill_batch_sizes)
-        if flow_max_batch_size is not None:
-            cfg.flow_max_batch_size = _integer("flow_max_batch_size", flow_max_batch_size, low=1)
-        if hift_max_batch_size is not None:
-            cfg.hift_max_batch_size = _integer("hift_max_batch_size", hift_max_batch_size, low=1)
         if flow_cache_frames is not None:
             cfg.flow_cache_frames = _integer("flow_cache_frames", flow_cache_frames, low=0)
         if flow_new_frame_buckets is not None:
