@@ -343,7 +343,8 @@ def cmd_approve(a):
         return
     if engine:  # a comment, not an approval, so it can't count toward required reviews
         body = (f"The review bot would approve `{a.sha[:7]}`: low risk, no open P0–P2 finding, and the live test "
-                "passed on it. This doesn't count toward required reviews, because the change touches area/engine or area/resources ("
+                "passed on it. This doesn't count toward required reviews, because the change touches "
+                "area/engine or area/resources ("
                 + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else "") + ").")
         gh("api", "-X", "POST", f"repos/{REPO}/pulls/{a.pr}/reviews", "-f", f"commit_id={a.sha}",
            "-f", "event=COMMENT", "-f", f"body={body}")
