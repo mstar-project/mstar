@@ -805,6 +805,11 @@ class TestImprove(unittest.TestCase):
                 self.assertNotRegex(scrubbed, r"&(?!amp;)", "an entity would render as the character it spells")
                 self.assertNotRegex(scrubbed, r"(?<!\\)\\(?!\\)", "a backslash would hide a link from the pattern")
 
+    def test_scrub_keeps_ordinary_text_readable(self):
+        for text in ("a//b", "use n//2 here", "path/to//file.py", "`a//b`", "`List<int>`"):
+            with self.subTest(text):
+                self.assertEqual(bot.scrub(text).replace("\u200b", ""), text, "ordinary text would read as a link")
+
 
 if __name__ == "__main__":
     unittest.main()

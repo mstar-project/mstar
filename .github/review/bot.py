@@ -1138,9 +1138,9 @@ def monitor(out, repo, approvals=""):
 def scrub(text):
     """Comment or model text for the weekly improvement run: `safe`, clipped, and without names, links,
     markup or references, so it can't name anyone, load an image or mark a PR's timeline."""
-    text = re.sub(r"(?i)(?:[a-z][a-z0-9+.-]*:)?//\S+|\bwww\.\S+", "[link]",
+    text = re.sub(r"(?i)[a-z][a-z0-9+.-]*://[^\s`]+|(?<![\w./-])//[^\s`]+|\bwww\.[^\s`]+", "[link]",
                   re.sub(r"@[\w-]+", "@someone", str(text or "")))
-    return (safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "&lt;")
+    return (safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "<\u200b")
             .replace("](", "]\u200b("))[:IMPROVE_TEXT]
 
 
