@@ -477,8 +477,10 @@ Per-model notes:
   is split by a boundary), and is decoded again when its text is a repetition loop
   (gzip compression ratio above 2.4): first without the conditioning text, then at
   rising temperatures, after which the transcript so far stops conditioning later
-  windows. Leave ``temperature`` at 0 to get that fallback; a pinned temperature is
-  used as is. It is several times slower, and only it has that repetition guard.
+  windows. Higgs-Audio's windows run at fixed cuts with no conditioning text, but get
+  the same retry at rising temperatures. Leave ``temperature`` at 0 to get that
+  fallback; a pinned temperature is used as is. Sequential mode is several times
+  slower, and only it has that repetition guard.
   Segment timestamps are offset to the whole file. ``window_seconds`` in
   ``extra_body`` (5 to 30) sets the window length for one request, and an upload
   longer than it is windowed. An upload, like any audio a request attaches, is refused
