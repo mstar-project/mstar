@@ -193,7 +193,7 @@ class TestSpend(unittest.TestCase):
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")]), 1,
                          "anyone could add a record to a public issue and reach the cap")
 
-    def test_the_caps_read_the_job_tokens_ledger_with_the_app_configured(self):
+    def test_the_cap_reads_the_job_tokens_ledger_with_the_app_configured(self):
         configure_review_app(self)
         self.assertEqual(self.spend([spent(1)]), 1, "the spend cap would read nothing and never trip")
 
@@ -744,21 +744,18 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertEqual((saved["questions"], saved["risk"]["level"]), ([question], "medium"),
                          "post would approve past a question and a risk nobody answered")
 
-    def test_only_a_maintainer_other_than_the_author_answers_an_earlier_review(self):
-        for name, comment, answered in (
-                ("a member", {"user": {"login": "m", "type": "User"}, "author_association": "MEMBER",
-                              "body": "keep it"}, True),
-                ("the author", {"user": {"login": "an-author", "type": "User"}, "author_association": "OWNER",
-                                "body": "it's fine"}, False),
-                ("an outsider", {"user": {"login": "o", "type": "User"}, "author_association": "NONE",
-                                 "body": "it's fine"}, False),
-                ("a /review command", {"user": {"login": "m", "type": "User"}, "author_association": "MEMBER",
-                                       "body": "/review nogpu"}, False)):
+    def test_only_write_access_other_than_the_author_answers_an_earlier_review(self):
+        for name, login, perm, body, answered in (("write access", "m", "write", "keep it", True),
+                                                  ("read access, a COLLABORATOR too", "m", "read", "keep it", False),
+                                                  ("the author", "an-author", "admin", "it's fine", False),
+                                                  ("a /review command", "m", "write", "/review nogpu", False)):
+            comment = {"user": {"login": login, "type": "User"}, "body": body, "created_at": "u"}
             with self.subTest(name), workspace(), mock.patch.object(bot, "run", FakeGh({
-                    "GET repos/o/r/issues/7/comments": [summary(LAST), {**comment, "created_at": "u"}],
+                    "GET repos/o/r/issues/7/comments": [summary(LAST), comment],
                     "GET repos/o/r/pulls/7": {"user": {"login": "an-author"}},
                     "GET repos/o/r/pulls/7/comments": [],
-                    "GET repos/o/r/pulls/7/reviews*": []})):
+                    "GET repos/o/r/pulls/7/reviews*": [],
+                    "GET repos/o/r/collaborators/*/permission": {"permission": perm}})):
                 self.assertEqual(bot.earlier_review("o/r", "7")[1], answered)
 
     def test_only_the_fixed_type_labels_reach_the_api(self):

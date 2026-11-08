@@ -161,7 +161,7 @@ class TestCarry(unittest.TestCase):
     ]
 
     def carry(self, rereview, run, checks, comments, status, files=("mstar/worker/worker.py",), review=None,
-              threads=()):
+              threads=(), untestable=""):
         """carry's outputs and the earlier report it kept; comments None: the fetch fails. files: the
         PR's changed files. review: more of the review's fields; threads: the PR's review threads."""
         routes = {"POST graphql": threads_page(*threads), f"GET repos/{R}/pulls/7": {"base": {"sha": "b" * 40}},
@@ -170,12 +170,20 @@ class TestCarry(unittest.TestCase):
                   f"GET repos/{R}/issues/7/comments": Fail() if comments is None else comments}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws, contextlib.redirect_stdout(io.StringIO()):
             (ws / "review.json").write_text(json.dumps({"outside_diff": [], **(review or {}),
-                                                        "live_test": {"run": run, "checks": checks}}))
+                                                        "live_test": {"run": run, "checks": checks,
+                                                                      "untestable": untestable}}))
             out, _ = step(gpu_review.carry, routes, pr="7", head_sha="1" * 40, runner_temp=temp,
                           rereview="true" if rereview else "")
             self.gate = Path(temp, "gate.txt").read_text() if Path(temp, "gate.txt").exists() else None
             earlier = ws / "earlier-live-test.md"
             return out, earlier.read_text() if earlier.exists() else None
+
+    def test_a_re_review_that_cant_approve_isnt_made_full(self):
+        for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
+                             ("none", {"run": "none", "checks": "correctness", "verdict": "skipped"})):
+            with self.subTest(run):
+                self.assertEqual(self.carry(True, run, ["correctness"], [], "", untestable="AMD kernels")[0], outputs,
+                                 "a full run would rent a box for a PR that can't be approved")
 
     def test_the_review_call_stands_only_on_a_passing_live_test_of_an_ancestor(self):
         for name, rereview, run, checks, comments, status, expected in self.CASES:

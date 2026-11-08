@@ -723,8 +723,6 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
 
 # ---------------------------------------------------------------- review job: after the review
 
-# Whose comment can answer an earlier review's risk or questions (GitHub's author_association).
-MAINTAINERS = ("OWNER", "MEMBER", "COLLABORATOR")
 
 def salvage(out, repo, pr, runner_temp):
     """The action fails a run that went past --max-turns even when Claude finished and returned its
@@ -785,7 +783,8 @@ def earlier_review(repo, pr):
     last-review.json showed this run, or the last summary's when it had no last-review.json (no earlier
     diff, a partial review, or a /review continue); and whether a person other than the author has
     commented since that review. Not knowing reads as not answered; not being able to read the state fails.
-    Answering takes a maintainer (MAINTAINERS) who isn't the author, and a comment that isn't a `/review` command."""
+    Answering takes someone with write access (the bar `/review` uses) who isn't the author, and a comment that
+    isn't a `/review` command."""
     path, state = Path("last-review.json"), None
     if path.exists():
         state = json.loads(path.read_text())
@@ -805,11 +804,10 @@ def earlier_review(repo, pr):
         if state is None:
             raise
         return state, False
-    answered = any((c.get("submitted_at") or c.get("created_at") or "") > since
-                   and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") != author
-                   and c.get("author_association") in MAINTAINERS
-                   and not (c.get("body") or "").startswith("/review") for c in spoken)
-    return state, answered
+    answering = {u["login"] for c in spoken if (c.get("submitted_at") or c.get("created_at") or "") > since
+                 and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") not in (author, None)
+                 and not (c.get("body") or "").startswith("/review")}
+    return state, any(permission(repo, login) in WRITE for login in answering)
 
 
 def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):

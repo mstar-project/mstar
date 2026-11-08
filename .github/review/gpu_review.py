@@ -198,8 +198,9 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     head; then the run is full, with every kind of check, whatever the review asked for, so a failure is
     never hidden behind a narrower run. A re-review (`rereview`) with no live test before it judged only
     what changed since the last review, which no GPU run has covered: its `targeted` is full too, and so
-    is its `none` when the PR touches runtime code (file_gate). After a pass on an ancestor, a
-    `targeted` run gets that live test's comment (earlier-live-test.md). A failed read of the PR's
+    is its `none` when the PR touches runtime code (file_gate). A re-review naming something `untestable`
+    is left alone: that PR can't be approved, so a full run would rent GPUs for nothing. After a pass on
+    an ancestor, a `targeted` run gets that live test's comment (earlier-live-test.md). A failed read of the PR's
     comments fails the step: it never reads as "no earlier live test"."""
     review = json.loads(Path("review.json").read_text())
     first = to_fix_first(review, pr, "stacked-above.json")
@@ -219,7 +220,8 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     except (RuntimeError, ValueError, KeyError, TypeError):
         passed = False
     untested = not last and rereview and (run == "targeted" or run == "none" and touches_runtime(pr, head_sha))
-    forced = "failed" if last and not passed else "untested" if untested else None
+    forced = None if rereview and live.get("untestable") \
+        else "failed" if last and not passed else "untested" if untested else None
     if forced:
         print(f"::notice::The review asked for a {run} live test, but {FORCED[forced]}; running it in full, every "
               "kind of check.")
