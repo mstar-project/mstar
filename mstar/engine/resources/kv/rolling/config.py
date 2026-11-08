@@ -11,7 +11,9 @@ It owns no memory either: each request's K/V live in a buffer of its region in
 a request pool (``RollingKVConfig.pool``), named after this resource's key and
 shaped ``[layers, 2, sink + window, heads, head_dim]``, which the model declares
 with the request's other buffers (``RollingKVConfig.buffer``). The window is the
-rules over that buffer, as linear attention is over the recurrent state pool.
+rules over that buffer, which it reads in its own plan (``RequestPool.buffer``)
+rather than through the pool's plan: a region can hold many buffers, and the
+window needs one.
 
 Unlike bounded KV, whose window is a ring that its own kernel reads in pieces,
 the range here is one slice, so the same kernel over the same keys gives the
@@ -43,11 +45,6 @@ class RollingKVConfig:
         """The pool buffer a request keeping ``tokens`` a layer (its sink plus
         window) declares, under this resource's key."""
         return (self.num_layers, 2, tokens, self.num_heads, self.head_dim), self.dtype
-
-    def token_bytes(self, tokens: int, dtype: torch.dtype | None = None) -> int:
-        """``tokens`` a layer, keys and values of every layer."""
-        dtype = dtype or self.dtype
-        return self.num_layers * 2 * tokens * self.num_heads * self.head_dim * dtype.itemsize
 
 
 class RollingPosition(NamedTuple):

@@ -15,11 +15,17 @@ that order), and checks:
   * ``--expect-rearranges``: the pool rearranged at least that often (the server
     log's count, at INFO), which sizes like these force: D takes the front of the
     pool, S the room after it, and L fits only once D has ended and S has slid
-    left into D's gap, its K/V and VAE caches moved under it while it runs
+    left into D's gap, its region (everything it keeps in the pool) moved under it
+    while it runs
 
 The trajectory is synthetic and the image one of Cosmos3-Edge's assets, as in
-``run_served_numerics.py``. The default pool holds one rollout at 720x1280 or two
-at the default size (8.6 GiB each with this image's aspect).
+``run_served_numerics.py``. The report lists the region each session declares
+(``region_gib``); the default pool holds one rollout at 720x1280 or two at the
+default size.
+
+While LingBot refuses more than one rollout at a time
+(``LingBotWorldModel.validate_config_yaml``), the examples with several rollouts at
+once need that check lifted locally.
 
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc2
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc3 --sessions 3 --expect-waits 1

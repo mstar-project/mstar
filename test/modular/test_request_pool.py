@@ -312,3 +312,13 @@ def test_random_requests_keep_their_bytes_through_every_rearrange(monkeypatch, s
         _random_workload(rng, counts)
     assert counts["rearranges"], counts  # the workloads do rearrange
 
+
+
+def test_a_request_that_declares_no_buffer_is_refused_when_it_opens():
+    """At the conductor, as a 400: not as a missing region at its first step."""
+    spec = RequestPoolSpec(resource_key="pool", nodes={"n"}, config=RequestPoolConfig(pool_bytes=30 * UNIT))
+    with pytest.raises(ValueError, match="declares at least one buffer"):
+        RequestPoolReqConfig().validate(spec)
+    with pytest.raises(ValueError, match="declares at least one buffer"):
+        RequestPoolReqConfig.of({}).validate(spec)
+    _wants(1).validate(spec)

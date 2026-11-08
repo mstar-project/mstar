@@ -10,9 +10,11 @@ of each holding the largest.
 
 The pool knows nothing of what a buffer means. A resource that needs rules
 over a buffer (the rolling K/V window, say) depends on the pool and reads the
-request's buffer from it, as linear attention reads the recurrent state pool.
+request's buffer directly in its own plan (``RequestPool.buffer``): a region
+can hold many buffers, and such a resource needs one of them.
 """
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -67,14 +69,16 @@ class RequestPoolReqConfig(ResourceReqConfig):
         for name, shape, dtype_name in zip(self.names, self.shapes, self.dtypes, strict=True):
             dtype = getattr(torch, dtype_name)
             out[name] = (offset, tuple(shape), dtype)
-            offset += aligned(_numel(shape) * dtype.itemsize)
+            offset += aligned(math.prod(shape) * dtype.itemsize)
         return out
 
     def nbytes(self) -> int:
         sizes = zip(self.shapes, self.dtypes, strict=True)
-        return sum(aligned(_numel(s) * getattr(torch, d).itemsize) for s, d in sizes)
+        return sum(aligned(math.prod(s) * getattr(torch, d).itemsize) for s, d in sizes)
 
     def validate(self, spec: "NodeResourceSpec | None" = None) -> None:
+        if not self.names:
+            raise ValueError("a request using the request pool declares at least one buffer")
         if not (len(self.names) == len(self.shapes) == len(self.dtypes)) or len(set(self.names)) != len(self.names):
             raise ValueError("request pool buffers need one shape and dtype each, under distinct names")
         for name, shape, dtype_name in zip(self.names, self.shapes, self.dtypes, strict=True):
@@ -88,13 +92,6 @@ class RequestPoolReqConfig(ResourceReqConfig):
                 f"the request keeps {self.nbytes() / 2**30:.2f} GiB in the request pool; it holds "
                 f"{config.pool_bytes / 2**30:.2f} GiB (resources: {spec.resource_key}: pool_bytes)"
             )
-
-
-def _numel(shape) -> int:
-    n = 1
-    for d in shape:
-        n *= d
-    return n
 
 
 @dataclass(frozen=True)

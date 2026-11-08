@@ -1173,9 +1173,9 @@ A step declares the pool with a ``RequestPoolStep`` naming its rows. The model r
 row's buffer with ``view(name, row)``, a tensor into the pool that is good for that step
 only: a rearrange moves regions, so a view is asked for again each step and never kept in
 per-request state. A resource that needs rules over a buffer depends on the pool (its
-spec's ``depends_on``) and reads the request's buffer in its own ``plan`` with
-``buffer(rid, name)``, as linear attention reads the recurrent state pool; rolling K/V
-(below) is one. How many requests run at once is then the pool's to decide, as long as
+spec's ``depends_on``) and reads the request's buffer directly in its own ``plan`` with
+``buffer(rid, name)``, not through the pool's plan: a region can hold many buffers and the
+resource needs one. Rolling K/V (below) is one. How many requests run at once is then the pool's to decide, as long as
 the model keeps no other per-request state outside it. A step that declares the pool runs
 eager (no capture yet), and the pool does not shard across ranks yet. LingBot-World keeps
 each rollout's rolling K/V in one (``DIT_POOL``); its text K/V and VAE caches are still

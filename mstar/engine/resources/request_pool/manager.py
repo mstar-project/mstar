@@ -172,8 +172,8 @@ class RequestPool(Resource):
                 return None
         if wants.nbytes() > self._size:
             return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
-                f"the request keeps {wants.nbytes()} bytes in the request pool; it holds {self._size} "
-                f"(resources: {self.name}: pool_bytes)", request_ids=frozenset({rid})))
+                f"the request keeps {wants.nbytes() / 2**30:.2f} GiB in the request pool; it holds "
+                f"{self._size / 2**30:.2f} GiB (resources: {self.name}: pool_bytes)", request_ids=frozenset({rid})))
         return ASKS
 
     def reserve(self, rid, node_name: str, graph_walk: str, published: None) -> int | None:
