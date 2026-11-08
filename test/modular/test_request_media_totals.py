@@ -12,6 +12,7 @@ import torch
 
 from mstar.model.base import TensorAndMetadata
 from mstar.model.media_limits import UNKNOWN_FRAMES, RequestMediaBudget, check_media_limits
+from mstar.testing_utils.model import make_model
 
 RATE = 16_000
 
@@ -88,7 +89,7 @@ def _fake_model(loaded, seconds, max_input_files=None):
     def process_prompt(*_args, **_kwargs):
         raise _ReachedPromptError
 
-    return types.SimpleNamespace(
+    return make_model(
         load_audio=_recording_loader(loaded, seconds),
         max_input_files=lambda: dict(max_input_files or {}),
         process_prompt=process_prompt,

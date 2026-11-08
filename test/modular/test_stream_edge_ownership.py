@@ -20,6 +20,7 @@ from mstar.graph.base import TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
 from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.profiler import PhaseLaps
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.speculation import Speculation, SpeculationContext, SpeculationPreparer
@@ -148,8 +149,7 @@ def _streams(rids, refuse=frozenset(), window=3, stride=2, items=5):
 @pytest.mark.parametrize("refuse", [set(), {0}, {1}, {0, 1}])
 def test_the_poll_holds_or_hands_back_every_chunk(refuse):
     streams, runtime = _streams([1, 2], refuse)
-    w = Worker.__new__(Worker)
-    w.streams, w._graph_runtime = streams, runtime
+    w = make_worker(streams=streams, _graph_runtime=runtime)
     Worker._poll_stream_buffers(w)
     assert len(streams.popped) == 2
     assert not streams.unsettled()
@@ -176,9 +176,11 @@ def test_a_speculation_hands_back_only_what_its_settle_undid(success, dropped, r
         partition="p", is_new_iter=False, is_same_node=True,
         consumed_streaming_edges=prep.consumed_streaming_edges, spec_id=prep.spec_id,
     )
-    w = Worker.__new__(Worker)
-    w.streams, w._graph_runtime = streams, runtime
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda b: None))
+    w = make_worker(
+        streams=streams,
+        _graph_runtime=runtime,
+        engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda b: None)),
+    )
     Worker._settle_speculation(w, spec, success, dropped)
     assert not streams.unsettled()
     kept = {id(se) for r, edges in runtime.spec_held.items() for se in edges if success and r not in dropped}
@@ -187,8 +189,7 @@ def test_a_speculation_hands_back_only_what_its_settle_undid(success, dropped, r
 
 def test_the_ledger_catches_a_chunk_handed_back_while_held():
     streams, runtime = _streams([1])
-    w = Worker.__new__(Worker)
-    w.streams, w._graph_runtime = streams, runtime
+    w = make_worker(streams=streams, _graph_runtime=runtime)
     Worker._poll_stream_buffers(w)
     (se,) = streams.popped.values()
     with pytest.raises(AssertionError, match="graph holds"):

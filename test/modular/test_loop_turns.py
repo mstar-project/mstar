@@ -38,6 +38,7 @@ from mstar.graph.runtime.base import (  # noqa: E402
     SpeculationOutput,
 )
 from mstar.model.submodule_base import StepOrder  # noqa: E402
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops
@@ -87,6 +88,7 @@ class _Runtime:
 def _scheduler(runtime: _Runtime, order: StepOrder) -> tuple[MicroScheduler, SimpleNamespace]:
     engine = SimpleNamespace(
         get_max_batch_size=lambda node, walk: 1,
+        batch_cap_varies=lambda node, walk: False,
         get_max_batch_tokens=lambda node, walk: None,
         get_max_rows_in_combined=lambda node, walk: None,
         get_step_order=lambda node, walk: order,
@@ -348,19 +350,15 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
             node_batch.register_admit_error("out of pages")
         return {}
 
-    w = Worker.__new__(Worker)
-    w.worker_id = "worker_0"
-    w.enable_nvtx = False
-    w._phase_period, w._phase_buf = 0, {}
-    w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
-    w.tp_async_sched, w.is_tp_follower = False, False
-    w._in_flight_rids = set()
-    w._metrics = None
-    w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
-    w.engine_manager = SimpleNamespace(warmup_all=stub)
-    w.communicator = SimpleNamespace(send=stub, wait_for_work=idle)
-    w.wakeup_event = SimpleNamespace(register_future=stub)
-    w.scheduler, w.request_state = sched, state
+    w = make_worker(
+        worker_id="worker_0",
+        parallel_groups=SimpleNamespace(barrier_all=stub, restore_default_timeout=stub),
+        engine_manager=SimpleNamespace(warmup_all=stub),
+        communicator=SimpleNamespace(send=stub, wait_for_work=idle),
+        wakeup_event=SimpleNamespace(register_future=stub),
+        scheduler=sched,
+        request_state=state,
+    )
     for name in ("_verify_tp_async_sched_agrees", "_pin_step_thread", "_init_engine_thread",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
                  "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",

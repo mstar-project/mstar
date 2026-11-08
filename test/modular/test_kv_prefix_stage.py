@@ -21,8 +21,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.chunking import ChunkingManagement
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.model.submodule_base import (
@@ -30,6 +29,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     NodeInputs,
 )
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 RID = "r0"
 NODE = "LLM"
@@ -73,18 +73,17 @@ class _Submodule:
 
 
 def _engine(resources: dict[str, Resource], node_resources: dict[str, list[str]]):
-    engine = Engine.__new__(Engine)
-    engine._resources = resources
-    engine._runner = StepRunner(resources, node_resources=node_resources)
-    engine._submodules = {
-        node: SimpleNamespace(submodule=_Submodule())
-        for node in node_resources
-    }
-    # every node keys WALK, as a declaration would name it
-    engine._keyed_walks = {node: {WALK} for node in node_resources}
-    engine._chunking = ChunkingManagement(engine._submodules)
-    engine._prefix_model = "_Model"
-    engine._loopback_steps = {}
+    engine = make_engine(
+        _resources=resources,
+        _runner=StepRunner(resources, node_resources=node_resources),
+        _submodules={
+            node: make_mgmt(submodule=_Submodule())
+            for node in node_resources
+        },
+        # every node keys WALK, as a declaration would name it
+        _keyed_walks={node: {WALK} for node in node_resources},
+        _prefix_model="_Model",
+    )
     return engine
 
 
@@ -333,7 +332,7 @@ class _Preparing(_Submodule):
 
 def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
     engine = _engine({"kv": _RaisingFor(96, RID)}, {NODE: ["kv"]})
-    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    engine._submodules[NODE] = make_mgmt(_Preparing())
     batch = ExecutingBatch(
         node_name=NODE, per_request_info={RID: None, "r1": None},
         step_context=StepContext(
@@ -358,7 +357,7 @@ def test_a_resource_that_raises_in_apply_fails_only_its_own_request():
 @pytest.mark.parametrize("request_walks", [{}, {RID: WALK, "r1": "decode"}], ids=["one walk", "mixed"])
 def test_a_walk_the_cache_serves_whole_completes_without_failing_its_request(request_walks):
     engine = _engine({"kv": _Answering(PROMPT)}, {NODE: ["kv"]})
-    engine._submodules[NODE] = SimpleNamespace(submodule=_Preparing(), resources={})
+    engine._submodules[NODE] = make_mgmt(_Preparing())
     batch = ExecutingBatch(
         node_name=NODE, per_request_info={RID: None, "r1": None},
         step_context=StepContext(

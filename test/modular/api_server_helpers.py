@@ -37,6 +37,7 @@ def make_test_api_server(**overrides) -> APIServer:
     server.model = None
     server.model_name = "dummy"
     server.served_models = ServedModels.of("dummy", None)
+    server.openpi_policy = None   # no openpi: block
     # no LoRA block: no adapters to digest, as APIServer.__init__ leaves it
     server.lora_adapter_digests = {}
     server.client_streams = frozenset()
