@@ -394,15 +394,16 @@ jobs:
                     | select(.body | contains("<!-- claude-review-state "))] | last | .body // empty' \
               pr-conversation.json | python3 .github/review/render_summary.py --state > last-review.json
             last=$(jq -r '.head // empty' last-review.json 2> /dev/null)
-            if [ -n "$last" ] && [ "$(gh api "repos/$REPO/compare/$last...$HEAD_SHA" --jq .status 2> /dev/null)" = "ahead" -o "$last" = "$HEAD_SHA" ]; then
-              gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$last...$HEAD_SHA" > since.diff || : > since.diff
+            # A diff GitHub won't give (too large, say) means a full review, never an empty since.diff.
+            if [ -n "$last" ] && [ "$(gh api "repos/$REPO/compare/$last...$HEAD_SHA" --jq .status 2> /dev/null)" = "ahead" -o "$last" = "$HEAD_SHA" ] &&
+              gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$last...$HEAD_SHA" > since.diff; then
               gh api --paginate "repos/$REPO/compare/$last...$HEAD_SHA" --jq '.commits[] |
                 "\(.sha[0:10]) \(if (.parents | length) > 1 then "[merge] " else "" end)\(.commit.message | split("\n")[0])"' \
                 > since-commits.txt || : > since-commits.txt
               echo "::notice::Re-review: this PR was last reviewed at ${last:0:10}."
               echo "rereview=true" >> "$GITHUB_OUTPUT"
             else
-              rm -f last-review.json
+              rm -f last-review.json since.diff
             fi
           fi
 
