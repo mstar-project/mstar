@@ -1,6 +1,6 @@
 ---
 name: review-standard
-description: Gaurav Shah's review method for M* PRs, kept as his — read the change in its whole context, check every premise and claim, run his four passes (Context read, Architecture, Performance, Testing and claims) and Overlap, and hold the PR to his hard rules R1–R12 (R13–R16 on trial), with his review bar and reference reviews, his decision log, the maintainers' rulings and his architecture map of main. The review bot uses it in thorough mode as an independent second pass, after its main pass with pr-review — a subagent with a fresh context, no shell and no network reads the same inputs and returns numbered P0–P3 findings to the main session, which verifies and posts them. Use it the same way for any read-only second review of an M* PR.
+description: Gaurav Shah's review method for M* PRs, kept as his — read the change in its whole context, check every premise and claim, run his four passes (Context read, Architecture, Performance, Testing and claims) and Overlap, and hold the PR to his hard rules R1–R13 (R14–R16 on trial), with his review bar and reference reviews, his decision log, the maintainers' rulings and his architecture map of main. The review bot uses it in thorough mode as an independent second pass, after its main pass with pr-review — a subagent with a fresh context, no shell and no network reads the same inputs and returns numbered P0–P3 findings to the main session, which verifies and posts them. Use it the same way for any read-only second review of an M* PR.
 ---
 
 # M* review standard
@@ -31,7 +31,8 @@ The rules apply to every hunk, and with full force to the core files, where a de
 ```
 mstar/graph/base.py
 mstar/graph/runtime/base.py
-mstar/graph/runtime/python.py
+mstar/graph/runtime/rust.py
+rust/src/graph/
 mstar/model/base.py
 mstar/model/submodule_base.py
 mstar/api_server/data_worker.py
@@ -187,11 +188,14 @@ Each is a thing to look for. A broken rule is a finding citing "hard rule R<n>",
 **Rules fixed before merge.**
 
 - **R7. No regression.** No model gets slower, host time included: no new per-step or per-message work in a core path without a measurement against main that shows none. Boot stays within 5% of main. A step that now runs eagerly, or runs with a memory peak the capture plan never measured, is a regression.
-- **R8. Both graph runtimes and both frontends behave the same** (AGENTS.md invariant 5).
+- **R8. One graph runtime, two frontends.** A graph-runtime, wire-format or edge-semantics change lands in `rust/` with a `test/rust` case (AGENTS.md invariant 5), and both frontends answer the same request the same way.
 - **R9. Handle-keyed state is purged on every release path** and listed in `mstar/worker/rid_table.py` (invariant 14).
-- **R10. One concern per PR.** Separable changes bundled into core files are split, but only when the split changes what lands.
 - **R11. The description matches the code.** That includes the PR's comments and docstrings stating a premise ("no step of this shape can be served").
 - **R12. Nothing beyond what is needed.** Every added line changes behavior or explains a hazard, and the change deletes what it replaces. No guard for a case no caller reaches (#561's `if covered:`, #546's `align_up` overflow). Comments at the file's density. No new environment variable where the code around uses the config or the CLI. Tests guard behavior with a correct oracle, in proportion to the code.
+
+**A note, never blocking.**
+
+- **R10. One concern per PR**: a note, at most P3 and never blocking, raised only when the split changes what lands (AGENTS.md "Splitting work across PRs").
 
 **Rules on trial** (from the rulings; R13 is decided, R14–R16 are questions to ask rather than rules to enforce, unless a defect follows):
 
@@ -236,9 +240,9 @@ These are the checks the October drafts missed.
 
 ## Output
 
-Return a numbered list of findings to the main session, and nothing else: no preamble, no checked list, no summary, no verdict. Zero findings is a normal result; then return `No findings.` Never pad. One finding per root cause, not per occurrence.
+Return a numbered list of findings to the main session, and nothing else: no preamble, no checked list, no summary, no verdict. Return every finding that meets the bar and none that don't, and hold none back. If none meets it, return `No findings.` One finding per root cause, not per occurrence.
 
-Rank each by the P0–P3 bar in `.claude/skills/pr-review/SKILL.md` §2, including its priority rules (a lockstep hang or rank divergence is at least P1; a mechanism built beside an mstar primitive in a shared layer is P1; reachability is searched, not guessed). His tiers suggest the floor: a broken R1–R6 is usually P1, a broken R7–R12 usually P2 (P1 when the description claims the opposite), R10 at most P3, R14–R16 a question or P3 unless a defect follows. The bar decides.
+Rank each by the P0–P3 bar in `.claude/skills/pr-review/SKILL.md` §2, including its priority rules (a lockstep hang or rank divergence is at least P1; a mechanism built beside an mstar primitive in a shared layer is P0; reachability is searched, not guessed). His tiers suggest the floor: a broken R1–R6 is usually P1, a broken R7–R12 usually P2 (P1 when the description claims the opposite), R10 at most P3, R14–R16 a question or P3 unless a defect follows. The bar decides.
 
 Each finding:
 

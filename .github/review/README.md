@@ -32,7 +32,7 @@ Running out of turns is handled in two ways. A review that finished but went pas
 | File | Role |
 | --- | --- |
 | [`../../AGENTS.md`](../../AGENTS.md) | **The substance.** Numbered invariants the reviewer checks and cites. Also read by contributors' own coding agents. |
-| [`review-prompt.md`](review-prompt.md) | The bot's inputs, trust boundary, re-review scope and output. The method and bar are in `pr-review`. |
+| [`review-prompt.md`](review-prompt.md) | The bot's inputs, trust boundary, re-review scope, second pass and output. The method and bar are in `pr-review`. |
 | [`../workflows/claude-review.yml`](../workflows/claude-review.yml) | The workflow, and the safety rules that come with running on `issue_comment`. |
 | [`render_summary.py`](render_summary.py) | The summary's fields (its `--schema`), and the comment they render to. |
 | [`session.py`](session.py) | Reads a run's execution file and transcripts: the usage record, and the handoff for `/review continue`. |

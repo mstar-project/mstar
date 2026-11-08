@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a design-risk rating (whether a human must make a design or direction call). One session runs every pass itself (a big PR's slices go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, hard rules, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (every pass, P0–P2) and thorough (all passes, P0–P3 and design questions). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
+description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a design-risk rating (whether a human must make a design or direction call). One session runs every pass itself (a big PR's slices, and in thorough mode an independent review-standard second pass, go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, hard rules, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (every pass, P0–P2) and thorough (all passes, P0–P3 and design questions). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
 ---
 
 # Reviewing an M* pull request
@@ -30,9 +30,10 @@ never runs PR code.
 | `thorough` | everything, P0–P3, and design questions | all | read only, no shell |
 
 Every pass in §3–§4 runs in every mode; the modes differ in what they report. One session runs the
-review and owns every finding: no orchestrator, parallel finders or cross-check round trips. The one
-exception is a big PR, whose slices go to subagents as "Working efficiently" says; the session
-verifies what they return.
+review and owns every finding: no orchestrator, parallel finders or cross-check round trips. The
+exceptions are a big PR, whose slices go to subagents as "Working efficiently" says, and in thorough
+mode the independent `review-standard` second pass (the review prompt); the session verifies what
+both return.
 
 ## Working efficiently
 
