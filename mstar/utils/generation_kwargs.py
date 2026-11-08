@@ -86,6 +86,24 @@ def _coerce_int(value):
     return value
 
 
+#: the integers msgpack, which carries model_kwargs to the conductor, can encode
+_WIRE_INTS = range(-(2**63), 2**64)
+
+
+def _check_wire_ints(key: str, value) -> None:
+    """``ValueError`` for an integer anywhere in ``value`` the wire cannot carry:
+    the data worker's send to the conductor would raise, a 500 for the client."""
+    stack = [value]
+    while stack:
+        v = stack.pop()
+        if type(v) is int and v not in _WIRE_INTS:
+            raise ValueError(f"{key}: integer {v} is out of range")
+        if type(v) is dict:
+            stack.extend(v.values())
+        elif type(v) in (list, tuple):
+            stack.extend(v)
+
+
 def _knob(key: str, names) -> str | None:
     """The knob ``key`` names: itself, or a ``<stage>_<knob>`` prefix of one."""
     for name in names:
@@ -117,4 +135,6 @@ def normalize_generation_kwargs(model_kwargs: dict | None) -> dict:
             check_int_knob(key, value, *_INT_RULES[name])
         elif _knob(key, _BOOL_KNOBS) is not None:
             check_bool_knob(key, value)
+        # any key, knob or not: unknown ones pass through to the conductor too
+        _check_wire_ints(key, value)
     return kwargs

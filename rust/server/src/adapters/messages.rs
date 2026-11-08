@@ -50,27 +50,28 @@ pub fn flatten_messages(
             let ptype = obj.get("type").and_then(Value::as_str).unwrap_or("");
             match ptype {
                 "text" => {
-                    if let Some(t) = obj.get("text").and_then(Value::as_str) {
-                        if !t.is_empty() {
-                            add_text(&mut parts, t, role);
-                        }
+                    let t = part_str(obj, "text", ptype, "")?;
+                    if !t.is_empty() {
+                        add_text(&mut parts, t, role);
                     }
                 }
                 "image_url" | "video_url" | "audio_url" => {
-                    let url = nested_url(obj, ptype);
+                    let url = match part_object(obj, ptype, ptype)? {
+                        Some(o) => part_str(o, "url", ptype, "")?,
+                        None => "",
+                    };
                     if !url.is_empty() {
                         let fallback = ptype.trim_end_matches("_url");
-                        let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
+                        let (m, p) = media::resolve_media_ref(url, upload_dir, allow_remote)?;
                         let m = if m == "unknown" { fallback.to_string() } else { m };
                         add_file(&mut parts, &mut saved.paths, m, p);
                     }
                 }
                 "input_audio" => {
                     // OpenAI-native audio input: base64 + format.
-                    let ia = obj.get("input_audio").and_then(Value::as_object);
-                    if let Some(ia) = ia {
-                        let data = ia.get("data").and_then(Value::as_str).unwrap_or("");
-                        let fmt = ia.get("format").and_then(Value::as_str).unwrap_or("wav");
+                    if let Some(ia) = part_object(obj, ptype, ptype)? {
+                        let data = part_str(ia, "data", ptype, "")?;
+                        let fmt = part_str(ia, "format", ptype, "wav")?;
                         if !data.is_empty() {
                             let (m, p) = media::save_base64(data, fmt, "audio", upload_dir)?;
                             add_file(&mut parts, &mut saved.paths, m, p);
@@ -128,14 +129,32 @@ pub(super) fn add_text(parts: &mut Vec<Part>, text: &str, role: &str) {
     });
 }
 
-/// `{ "<key>": { "url": "..." } }` -> the url string (or "").
-pub(super) fn nested_url(obj: &Map<String, Value>, key: &str) -> String {
-    obj.get(key)
-        .and_then(Value::as_object)
-        .and_then(|o| o.get("url"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
+/// `obj[key]` as an object, `None` when missing or null; another JSON type is
+/// a 400, as `_part_object` in the Python adapters.
+fn part_object<'a>(
+    obj: &'a Map<String, Value>,
+    key: &str,
+    ptype: &str,
+) -> Result<Option<&'a Map<String, Value>>, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(o)) => Ok(Some(o)),
+        Some(_) => Err(format!("content part {ptype}: {key} must be an object")),
+    }
+}
+
+/// `obj[key]` as a string, `default` when missing or null; a 400 otherwise.
+fn part_str<'a>(
+    obj: &'a Map<String, Value>,
+    key: &str,
+    ptype: &str,
+    default: &'a str,
+) -> Result<&'a str, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::String(s)) => Ok(s.as_str()),
+        Some(_) => Err(format!("content part {ptype}: {key} must be a string")),
+    }
 }
 
 /// `max_completion_tokens`, else `max_tokens`, as Python reads them: an

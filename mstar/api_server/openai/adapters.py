@@ -84,6 +84,27 @@ class Transcript:
     unfinished: bool = False
 
 
+def _part_object(obj: dict, key: str, ptype: str) -> dict:
+    """``obj[key]`` as an object, empty when missing or null. Valid JSON of
+    another type is the client's mistake: a 400, as the Rust frontend answers."""
+    value = obj.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"content part {ptype}: {key} must be an object")
+    return value
+
+
+def _part_str(obj: dict, key: str, ptype: str, default: str = "") -> str:
+    """``obj[key]`` as a string, ``default`` when missing or null; a 400 otherwise."""
+    value = obj.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise ValueError(f"content part {ptype}: {key} must be a string")
+    return value
+
+
 def flatten_messages(
     messages: list, upload_dir: Path, allow_remote: bool = False
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
@@ -139,17 +160,17 @@ def flatten_messages(
                     continue
                 ptype = part.get("type")
                 if ptype == "text":
-                    if part.get("text"):
-                        add_text(part["text"], role)
+                    if text := _part_str(part, "text", ptype):
+                        add_text(text, role)
                 elif ptype in ("image_url", "video_url", "audio_url"):  # video and audio are extensions
-                    url = (part.get(ptype) or {}).get("url", "")
+                    url = _part_str(_part_object(part, ptype, ptype), "url", ptype)
                     if url:
                         mod, path = media_io.resolve_media_ref(url, upload_dir, allow_remote=allow_remote)
                         # a MIME that names no modality (application/octet-stream) takes the part's
                         add_file(mod if mod != "unknown" else ptype.removesuffix("_url"), path)
                 elif ptype == "input_audio":  # OpenAI-native audio input (base64 + format)
-                    ia = part.get("input_audio") or {}
-                    data, fmt = ia.get("data"), ia.get("format", "wav")
+                    ia = _part_object(part, ptype, ptype)
+                    data, fmt = _part_str(ia, "data", ptype), _part_str(ia, "format", ptype, "wav")
                     if data:
                         mod, path = media_io.save_base64(data, fmt, "audio", upload_dir)
                         add_file(mod, path)

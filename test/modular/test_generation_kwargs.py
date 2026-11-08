@@ -70,10 +70,25 @@ def test_in_contract_values_pass(kwargs):
     ({"enable_thinking": "false"}, "enable_thinking"),  # a chat template thinks on "false"
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
+    # past what msgpack carries to the conductor: the data worker's send raised, a 500
+    ({"max_output_tokens": 2**64}, "max_output_tokens"),
+    ({"max_tokens": 2**70}, "max_output_tokens"),
+    ({"top_k": 2**64}, "top_k"),
+    ({"not_a_knob": 2**64}, "not_a_knob"),
+    ({"not_a_knob": {"a": [1, -(2**63) - 1]}}, "not_a_knob"),
 ])
 def test_out_of_contract_values_raise(kwargs, name):
     with pytest.raises(ValueError, match=name):
         normalize_generation_kwargs(kwargs)
+
+
+@pytest.mark.parametrize("value", [2**64 - 1, -(2**63), [2**63, {"b": -1}], True])
+def test_integers_the_wire_carries_pass_and_encode(value):
+    from mstar.communication import wire
+
+    kwargs = normalize_generation_kwargs({"not_a_knob": value})
+    assert kwargs == {"not_a_knob": value}
+    wire.encode(kwargs)
 
 
 @pytest.mark.parametrize("kwargs, expected", [

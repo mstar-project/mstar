@@ -344,6 +344,9 @@ PARITY_CASES = {
     # remote fetch is off unless MSTAR_ALLOW_REMOTE=1, and a server path never reads
     "remote-image": (_image_chat("https://example.com/page.png"), False),
     "server-path-image": (_image_chat("/etc/hosts"), False),
+    "bad-part-type": ({"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": "data:image/png;base64,AAAA"}, {"type": "text", "text": "hi"},
+    ]}]}, False),
 }
 
 

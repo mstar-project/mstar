@@ -74,6 +74,30 @@ fn a_role_a_chat_cannot_render_is_refused() {
     assert_eq!(err, "a message's role must be system, developer, user or assistant, not 'tool'");
 }
 
+#[test]
+fn a_content_part_of_the_wrong_json_type_is_refused() {
+    for (part, err) in [
+        (r#"{"type":"image_url","image_url":"data:image/png;base64,AAAA"}"#,
+         "content part image_url: image_url must be an object"),
+        (r#"{"type":"video_url","video_url":{"url":12345}}"#,
+         "content part video_url: url must be a string"),
+        (r#"{"type":"text","text":5}"#, "content part text: text must be a string"),
+        (r#"{"type":"input_audio","input_audio":{"data":"AAAA","format":1}}"#,
+         "content part input_audio: format must be a string"),
+    ] {
+        let messages = format!(r#"[{{"role":"user","content":[{part}]}}]"#);
+        assert_eq!(flatten(&messages, Path::new("/unused")).unwrap_err(), err, "{part}");
+    }
+    // missing or null is no attachment, as before
+    let (text, files, _, _) = flatten(
+        r#"[{"role":"user","content":[{"type":"image_url","image_url":null},
+            {"type":"image_url","image_url":{"url":null}},{"type":"text","text":"hi"}]}]"#,
+        Path::new("/unused"),
+    )
+    .unwrap();
+    assert_eq!((text.as_deref(), files.len()), (Some("hi"), 0));
+}
+
 /// The surfaces a class serves: chat, speech, images, videos.
 fn surfaces(adapter: &dyn OpenAIAdapter) -> [bool; 5] {
     [

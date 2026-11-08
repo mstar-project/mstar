@@ -277,6 +277,31 @@ def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields)
     assert set(fields).isdisjoint(sa.model_kwargs)
 
 
+@pytest.mark.parametrize("part, error", [
+    ({"type": "image_url", "image_url": "data:image/png;base64,AAAA"}, "image_url: image_url must be an object"),
+    ({"type": "video_url", "video_url": {"url": 12345}}, "video_url: url must be a string"),
+    ({"type": "text", "text": 5}, "text: text must be a string"),
+    ({"type": "input_audio", "input_audio": {"data": "AAAA", "format": 1}}, "input_audio: format must be a string"),
+], ids=["bare_string_url", "int_url", "int_text", "int_format"])
+def test_a_content_part_of_the_wrong_json_type_is_a_400(tmp_path, part, error):
+    # it was a 500 (AttributeError, TypeError) here and a dropped part on the Rust frontend;
+    # the image saved before it is not left behind
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(b"png").decode()}}
+    messages = [{"role": "user", "content": [image, part]}]
+    with pytest.raises(ValueError, match=error):
+        adapters.flatten_messages(messages, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("part", [
+    {"type": "image_url", "image_url": None}, {"type": "image_url", "image_url": {"url": None}},
+], ids=["null_object", "null_url"])
+def test_a_null_media_part_is_no_attachment(tmp_path, part):
+    messages = [{"role": "user", "content": [part, {"type": "text", "text": "hi"}]}]
+    text, file_paths, modalities, _ = adapters.flatten_messages(messages, tmp_path)
+    assert (text, file_paths, modalities) == ("hi", {}, ["text"])
+
+
 def test_qwen3_chat_audio_url_input(tmp_path):
     raw = b"RIFFfakewavbytes"
     url = "data:audio/wav;base64," + base64.b64encode(raw).decode()
