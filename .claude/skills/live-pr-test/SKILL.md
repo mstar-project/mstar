@@ -109,6 +109,18 @@ Installing packages and making new venvs is fine, and expected when a check need
 
 A venv with a different torch (or FlashInfer/Triton) version gets its own JIT caches: point `FLASHINFER_WORKSPACE_BASE`, `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` at a directory of its own whenever that arm runs. FlashInfer keys its cache by its own version, not torch's, so two torch versions share one directory, rebuild each other's kernels, and hold the build lock while they do. One torch-2.10 arm's first boot (a `gdn_prefill` rebuild) blocked every other Qwen3.5 server on the node until it was stopped. Expect that arm's first boot to recompile everything (20–30 minutes); size its readiness timeout for it.
 
+**Then CI's tests, on the GPUs, before any server starts** (they would compete with it for GPU memory). GitHub's CPU Core job skips every test that needs CUDA; here they run, in the PR arm bootstrap built. The paths are CI's own, from `scripts/ci/select_cpu_tests.py`, plus the CUDA cases in `test/rust/test_arena_transport.py`. ruff, the dynamo smoke and cargo stay with GitHub's CI: a GPU changes nothing for them.
+
+```bash
+source ~/live-pr/env.sh && arm pr && uv pip install -q pytest-xdist && mkdir -p $LIVE_RESULTS/ci
+paths=$(python -c 'import sys; sys.path.insert(0, "scripts/ci"); from pathlib import Path; from select_cpu_tests import expand_paths; print(*expand_paths(Path(".")))')
+HF_HUB_OFFLINE=1 python -m pytest -p xdist -n 4 -ra --junitxml=$LIVE_RESULTS/ci/pytest.xml $paths test/rust/test_arena_transport.py > $LIVE_RESULTS/ci/pytest.log 2>&1
+```
+
+- Keep `-n` small: every worker lands on `cuda:0`.
+- Rerun each failure once, serially (`python -m pytest <node id>`, no xdist), in `arm pr`, so contention flakes drop out. Rerun what still fails in `arm main` (run bootstrap again without `--no-main` if the plan skipped that arm). A test that fails on main too is "also fails on main" and doesn't count against the PR. One that only the PR fails makes the verdict Fail.
+- Tests that need more GPUs than the box has, or a checkpoint the box hasn't cached (`HF_HUB_OFFLINE=1`), skip themselves. The report's Tests block says which, from `-ra`.
+
 ## 3. Run
 
 Never serve weights straight from FUSE-mounted persistent storage (RunPod's `/workspace` is geesefs): a server mmaps the checkpoint, and random page-ins through FUSE ran at ~4 MB/s per worker, so a 27B TP4 load had not finished after 20 minutes. `bootstrap.sh` detects a FUSE mount and points `HF_HOME` at local disk; run `stage_model <hf repo>` for every model in the plan before its first server start. It downloads from the Hub (52 GB in ~1 min, where a sequential copy off geesefs took ~9) and falls back to the persistent cache for a repo the Hub won't serve. On NFS (the cluster, Lambda) it is a no-op.
