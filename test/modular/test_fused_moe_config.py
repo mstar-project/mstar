@@ -120,12 +120,19 @@ def test_compiled_fused_experts_takes_the_tables_tiles(tuned_table, monkeypatch,
             torch.testing.assert_close(compiled(x), module(x), atol=1e-2, rtol=1e-2)
 
 
+_PAIR_ROW = {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 4, "bk": 256, "warps": 4},
+                                           "down": {"bn": 32, "bc": 128, "warps": 4}}}
+
+
 @CUDA
+@pytest.mark.parametrize("crossover", [2, 0], ids=["per_pair_to_2", "grouped_only"])
 @pytest.mark.parametrize("dynamic", [False, None], ids=["captured", "eager_forward"])
-def test_compiled_fused_experts_takes_the_per_pair_crossover_of_its_gpus_entry(tuned_table, monkeypatch, dynamic):
+def test_compiled_fused_experts_takes_the_per_pair_crossover_of_its_gpus_entry(tuned_table, monkeypatch, dynamic,
+                                                                                crossover):
     """The bf16 per-pair path runs up to the moe_decode entry's crossover for these experts on
     this GPU, with its tiles, and the grouped GEMMs past it, compiled as the engine compiles
-    (the token count symbolic in the eager forward) as eagerly."""
+    (the token count symbolic in the eager forward) as eagerly. An entry of the ``"*"`` row
+    alone (the H200's Thinker entry) runs grouped at every count."""
     import mstar.engine  # noqa: F401 - the engine's process-wide dynamo settings
     from mstar.utils.fused_moe import decode, fused_experts
 
@@ -135,8 +142,7 @@ def test_compiled_fused_experts_takes_the_per_pair_crossover_of_its_gpus_entry(t
     path.write_text(json.dumps({"format": 2, "op": "moe_decode", "entries": [{
         "dtype": "bfloat16", "shape": {"H": hidden, "E": experts, "I": inter, "K": top_k},
         "provenance": {"device": "Test GPU", "date": "2026-11-04", "harness": "test"},
-        "rows": {"2": {"impl": "triton", "config": {"path": "pair", "gate_up": {"bj": 4, "bk": 256, "warps": 4},
-                                                    "down": {"bn": 32, "bc": 128, "warps": 4}}},
+        "rows": {**({str(crossover): _PAIR_ROW} if crossover else {}),
                  "*": {"impl": "triton", "config": {"path": "grouped"}}}}]}))
     registry.reset_lookups()
     pairs = []
@@ -163,8 +169,8 @@ def test_compiled_fused_experts_takes_the_per_pair_crossover_of_its_gpus_entry(t
             logits = torch.rand(tokens, experts, device="cuda")
             pairs.clear()
             torch.testing.assert_close(compiled(x, logits), run(x, logits), atol=1e-2, rtol=1e-2)
-            # the compiled call and the eager one each take the per-pair path, up to 2 tokens
-            assert len(pairs) == (2 if tokens <= 2 else 0), (tokens, pairs)
+            # the compiled call and the eager one each take the per-pair path, up to the crossover
+            assert len(pairs) == (2 if tokens <= crossover else 0), (tokens, pairs)
 
 
 @CUDA

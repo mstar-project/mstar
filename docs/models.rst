@@ -753,10 +753,12 @@ Qwen3-Omni notes
   decode batch of up to 16 tokens also gets its block alignment from that
   kernel, unless it is small enough to run its experts as per-pair GEMVs,
   which need none: up to the ``moe_decode`` kernel table's crossover for the
-  GPU and expert shape (``mstar/kernels/tables/moe_decode``), 2 tokens for the
-  TP1 Thinker on an H200 (aligned from 3), else the built-in 7, swept on an
-  H100 (aligned from 8). The Thinker at TP2 (expert width 384) has no H200
-  entry yet, so it keeps 7 there, unmeasured.
+  GPU and expert shape (``mstar/kernels/tables/moe_decode``), else the
+  built-in 7, swept on an H100 (aligned from 8). On an H200 the TP1 Thinker
+  runs none (aligned from 1 token), since the GEMVs' speed there depends on
+  the torch / Triton build: 5-10% slower than the grouped GEMMs at 1-2 tokens
+  on torch 2.10, 4-6% faster on 2.12. The Thinker at TP2 (expert width 384)
+  has no H200 entry yet, so it keeps 7 there, unmeasured.
 - ``configs/qwen3omni_pd_2gpu.yaml`` runs ``qwen3omni_pd_disaggregated.yaml``'s
   prefill/decode split on two GPUs: the prefill Thinker shares rank 0 with the
   encoders, the Talker and Code2Wav, and rank 1 runs the Thinker's decode. At
