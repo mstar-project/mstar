@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision Hopper-or-newer GPU boxes on RunPod and Lambda for live PR tests.
+"""Provision Hopper-or-newer GPUs for live PR tests: a Slurm node, Eras Cloud, RunPod or Lambda.
 
 usage:
   gpu.py check                                   keys, persistent storage, budget
@@ -18,11 +18,18 @@ mounts anywhere; a RunPod network volume or a Lambda filesystem pins one region)
 HF cache lives there; --all-regions lists the rest for
 a "no availability" report. Prices are USD/hr for the whole box.
 
+A Slurm node (`slurm` in the config) is offered first when it has the GPUs free now: an
+"instance" there is a batch job that holds them, every command runs inside it with
+`srun --overlap`, and Slurm's `--time` ends it at the deadline. Serve with `mserve` there,
+never `--gpus`. An Eras instance gets the GPU notebook template's Pod, an ssh key the run
+registers, and a timer in the Pod that ends its run, and so releases it, at the deadline.
+
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
 its deadline (budget.max_hours by default), even if the session that launched it is gone.
 
-Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY; settings from config.local.json next to
-the skill (see config.example.json). Stdlib only, so it runs from any python3.
+Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY; the Slurm node is reached by
+ssh. Settings from config.local.json next to the skill (see config.example.json). Stdlib
+only, so it runs from any python3.
 """
 from __future__ import annotations
 
@@ -32,6 +39,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -46,6 +54,7 @@ LEDGER = STATE / "instances.json"
 RUNPOD = "https://api.runpod.io/v2"
 RUNPOD_GRAPHQL = "https://api.runpod.io/graphql"
 LAMBDA = "https://cloud.lambda.ai/api/v1"
+ERAS = "https://api.erascloud.ai"
 # Hopper or newer. \b keeps out the H20 (Hopper silicon, a fraction of the compute).
 HOPPER_PLUS = re.compile(r"\b(H100|H200|GH200|B200|B300)\b", re.I)
 
@@ -73,7 +82,8 @@ class ApiError(Exception):
         return self.body.get("error", {}).get("code", "") if isinstance(self.body, dict) else ""
 
 
-def http(method: str, url: str, key_env: str, body: dict | None = None, params: dict | None = None):
+def http(method: str, url: str, key_env: str, body: dict | None = None, params: dict | None = None,
+         key_header: str = "Authorization", key_prefix: str = "Bearer "):
     key = os.environ.get(key_env)
     if not key:
         raise ApiError(0, f"{key_env} is not set")
@@ -82,7 +92,7 @@ def http(method: str, url: str, key_env: str, body: dict | None = None, params: 
     data = json.dumps(body).encode() if body is not None else None
     for attempt in range(6):
         req = urllib.request.Request(url, data=data, method=method, headers={
-            "Authorization": f"Bearer {key}",
+            key_header: f"{key_prefix}{key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": "mstar-live-pr-test/1",  # Cloudflare in front of Lambda rejects urllib's default
@@ -125,6 +135,37 @@ def runpod_list(path: str, field: str, params: dict | None = None) -> list:
 
 def lambda_(method, path, body=None):
     return http(method, LAMBDA + path, "LAMBDA_API_KEY", body).get("data")
+
+
+_eras_org: str | None = None
+
+
+def eras(method, path, body=None, params=None):
+    """Eras Cloud, under the key's default organization."""
+    global _eras_org
+    call = lambda m, u, b=None, q=None: http(m, ERAS + u, "ERAS_API_KEY", b, q, "x-api-key", "")
+    _eras_org = _eras_org or call("GET", "/v1/me")["default_organization"]["id"]
+    return call(method, f"/v1/org/{_eras_org}{path}", body, params)
+
+
+def slurm_run(cfg: dict, command: str, check: bool = True) -> str:
+    """One shell command on the Slurm login host; stdout."""
+    r = subprocess.run(slurm_ssh(cfg) + [command], capture_output=True, text=True, check=False, timeout=120)
+    if check and r.returncode != 0:
+        raise ApiError(r.returncode, f"slurm: {command.split()[0]}: {(r.stderr or r.stdout).strip()[-400:]}")
+    return r.stdout
+
+
+def slurm_ssh(cfg: dict, scp: bool = False) -> list[str]:
+    sl = cfg["slurm"]
+    known = STATE / f"slurm_{re.sub(r'[^A-Za-z0-9.]', '_', sl['host'])}.known_hosts"
+    STATE.mkdir(parents=True, exist_ok=True)
+    cmd = ["scp" if scp else "ssh", "-P" if scp else "-p", str(sl.get("port", 22)),
+           "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={known}",
+           "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=20", "-o", "BatchMode=yes"]
+    if sl.get("identity_file"):
+        cmd += ["-i", str(Path(sl["identity_file"]).expanduser())]
+    return cmd if scp else cmd + [sl["host"]]
 
 
 # ---------------------------------------------------------------- storage
@@ -240,38 +281,94 @@ def lambda_offers(cfg, gpus, min_vram, all_regions, allow_arm=False) -> list[dic
     return offers
 
 
+GIB = re.compile(r"(\d+(?:\.\d+)?)\s*([GT])i?", re.I)
+
+
+def eras_offers(cfg, gpus, min_vram, all_regions) -> list[dict]:
+    # Hopper+ is checked here rather than in the filter: Eras names models "H200", "B300", ...
+    flt = json.dumps({"field": "hardware.gpu.count", "op": ">=", "value": gpus})
+    page, offers = eras("GET", "/compute-listings", params={"page_size": 100, "filter": flt}), []
+    for x in page.get("items") or []:
+        g = (x.get("hardware") or {}).get("gpu") or {}
+        m = GIB.match(str(g.get("memory_per_device") or ""))
+        vram = int(float(m.group(1)) * (1024 if m.group(2).upper() == "T" else 1)) if m else None
+        if not HOPPER_PLUS.search(str(g.get("model") or "")) or (vram is not None and vram < min_vram):
+            continue
+        if x.get("hourly_price") is None:
+            continue
+        now = (x.get("access_method") or {}).get("is_available") and (x.get("launches_available") or 0) > 0
+        if now or all_regions:
+            # Local NVMe only: stage_model pulls weights from the Hub (the default hf_home is on it).
+            offers.append({
+                "id": f"eras:{x['id']}", "provider": "eras", "gpu": g["model"], "count": g["count"],
+                "vram_gb": vram or "?", "region": x.get("name", "eras"), "usd_per_hour": round(x["hourly_price"], 2),
+                "availability": "now" if now else "none", "storage": True,
+            })
+    return offers
+
+
+def slurm_offers(cfg, gpus, min_vram, all_regions) -> list[dict]:
+    """A node with `gpus` free now. Never more than slurm.max_gpus: the node is shared."""
+    sl = cfg["slurm"]
+    if gpus > sl.get("max_gpus", 4):
+        return []
+    offers = []
+    out = slurm_run(cfg, f"sinfo -h -N -p {shlex.quote(sl.get('partition', 'main'))} -O 'NodeHost:40,Gres:40,GresUsed:60,StateLong:20'")
+    for line in out.splitlines():
+        host, gres, used, state = (line.split() + ["", "", "", ""])[:4]
+        # "gpu:8(S:0-1)" and "gpu:(null):5(IDX:0-3,6)": drop the parentheses, then the count is last
+        count = lambda g: int((re.search(r"gpu:(?:[^:,]*:)?(\d+)", re.sub(r"\([^)]*\)", "", g)) or [0, 0])[1])
+        total, busy = count(gres), count(used)
+        free = 0 if any(s in state for s in ("drain", "down", "fail")) else total - busy
+        if free >= gpus or (all_regions and total >= gpus):
+            offers.append({
+                "id": f"slurm:{host}:{gpus}", "provider": "slurm", "gpu": sl.get("gpu", "?"), "count": gpus,
+                "vram_gb": sl.get("vram_gb", "?"), "region": host, "usd_per_hour": 0.0,
+                "availability": f"{free} free" if free >= gpus else f"busy ({free} free)", "storage": True,
+            })
+    return offers
+
+
+PROVIDERS = {"slurm": slurm_offers, "eras": eras_offers, "runpod": runpod_offers, "lambda": lambda_offers}
+
+
 def enabled(cfg, provider) -> bool:
-    key = {"runpod": "RUNPOD_API_KEY", "lambda": "LAMBDA_API_KEY"}[provider]
+    if provider == "slurm":
+        return bool(cfg.get("slurm", {}).get("host")) and cfg["slurm"].get("enabled", True)
+    key = {"runpod": "RUNPOD_API_KEY", "lambda": "LAMBDA_API_KEY", "eras": "ERAS_API_KEY"}[provider]
     return cfg.get(provider, {}).get("enabled", True) and bool(os.environ.get(key))
 
 
 def cmd_offers(args, cfg):
     offers, errors = [], []
-    for provider, fn in (("runpod", runpod_offers), ("lambda", lambda_offers)):
+    for provider, fn in PROVIDERS.items():
         if not enabled(cfg, provider):
-            errors.append(f"{provider}: skipped (disabled or no API key)")
+            errors.append(f"{provider}: skipped (disabled, or no API key or host)")
             continue
         try:
             offers += fn(cfg, args.gpus, args.min_vram, args.all_regions,
                          **({"allow_arm": args.allow_arm} if provider == "lambda" else {}))
-        except ApiError as e:
+        except (ApiError, subprocess.TimeoutExpired) as e:
             errors.append(f"{provider}: {e}")
-    offers.sort(key=lambda o: (o["usd_per_hour"], o["count"]))
+    # What can start now first, then the cheapest (a Slurm node costs nothing extra).
+    offers.sort(key=lambda o: (o["availability"] in ("none",) or o["availability"].startswith("busy"),
+                               o["usd_per_hour"], o["count"]))
     cap = cfg["budget"]["max_usd_per_hour"]
     if args.json:
         print(json.dumps({"offers": offers, "errors": errors, "max_usd_per_hour": cap}, indent=1))
         return
     for e in errors:
         print("#", e)
-    if not offers:
+    if not any(o["availability"] not in ("none",) and not o["availability"].startswith("busy") for o in offers):
         print(f"no availability: no Hopper+ box with >= {args.gpus} GPUs"
               + ("" if args.all_regions else " in a region with team storage (try --all-regions)"))
-        return
+        if not offers:
+            return
     print(f"{'offer':58} {'$/hr':>7}  {'gpus':>4}  {'vram':>5}  avail   storage")
     for o in offers:
         flag = "" if o["usd_per_hour"] <= cap else f"  over ${cap}/hr cap"
         print(f"{o['id']:58} {o['usd_per_hour']:7.2f}  {o['count']:4}  {o['vram_gb']:4}G  "
-              f"{o['availability']:7} {'yes' if o['storage'] else 'no '}{flag}")
+              f"{str(o['availability']):7} {'yes' if o['storage'] else 'no '}{flag}")
 
 
 # ---------------------------------------------------------------- ledger
@@ -321,6 +418,10 @@ def find_offer(cfg, offer_id: str) -> dict:
         pool = runpod_offers(cfg, int(count), 0, True)
     elif provider == "lambda":
         pool = lambda_offers(cfg, 1, 0, True, allow_arm=True)
+    elif provider == "slurm":
+        pool = slurm_offers(cfg, int(offer_id.rsplit(":", 1)[1]), 0, False)
+    elif provider == "eras":
+        pool = eras_offers(cfg, 1, 0, False)
     else:
         die(f"bad offer id {offer_id!r}")
     for o in pool:
@@ -343,7 +444,16 @@ def cmd_launch(args, cfg):
     max_instances = cfg["budget"].get("max_concurrent_instances", 1)
     max_total = cfg["budget"].get("max_total_usd")
 
-    if o["provider"] == "runpod":
+    if o["provider"] == "slurm":
+        sl, n = cfg["slurm"], o["count"]
+        body = " ".join(["sbatch", "--parsable", "-p", shlex.quote(sl.get("partition", "main")),
+                         f"--gres=gpu:{n}", f"-c {sl.get('cpus_per_gpu', 24) * n}",
+                         f"--mem={sl.get('mem_gb_per_gpu', 180) * n}G", f"--time={max(1, int(hours * 60))}",
+                         f"--nice={sl.get('nice', 100)}", f"-J {shlex.quote(sl.get('job_prefix', 'live-pr') + f'-{args.pr}')}",
+                         "-o /dev/null", "--wrap 'sleep infinity'"])
+    elif o["provider"] == "eras":
+        body = eras_launch_body(cfg, o, name, pubkey, hours)
+    elif o["provider"] == "runpod":
         rp = cfg["runpod"]
         vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
         kind = "global" if vol["kind"] == "global" else "network"
@@ -366,7 +476,7 @@ def cmd_launch(args, cfg):
             "image": {"family": lm.get("image_family", "lambda-stack-24-04")},
         }
     if args.dry_run:
-        print(json.dumps(body, indent=1).replace(pubkey, "<public key>"))
+        print(body if isinstance(body, str) else json.dumps(body, indent=1).replace(pubkey, "<public key>"))
         return
 
     # The caps are checked and the launch recorded under one lock, so parallel
@@ -380,7 +490,11 @@ def cmd_launch(args, cfg):
             die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
                 f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
         try:
-            if o["provider"] == "runpod":
+            if o["provider"] == "slurm":
+                iid = slurm_run(cfg, body).strip().split(";")[0]
+            elif o["provider"] == "eras":
+                iid = eras_create(body)
+            elif o["provider"] == "runpod":
                 iid = runpod("POST", "/pods", body)["id"]
             else:
                 iid = lambda_("POST", "/instance-operations/launch", body)["instance_ids"][0]
@@ -393,7 +507,7 @@ def cmd_launch(args, cfg):
         d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
               "usd_per_hour": o["usd_per_hour"], "gpu": o["gpu"], "count": o["count"], "region": o["region"],
               "launched_at": now, "deadline": now + hours * 3600,
-              "user": "root" if o["provider"] == "runpod" else "ubuntu",
+              "user": "ubuntu" if o["provider"] == "lambda" else "root",
               "hf_home": hf_home(cfg, o["provider"], o["region"])}
     log = STATE / f"{key.replace(':', '_')}.watchdog.log"
     with open(log, "a") as fh:
@@ -404,7 +518,60 @@ def cmd_launch(args, cfg):
     print(key)
 
 
+ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Notebook (NVIDIA GPU): sshd as root
+
+
+def eras_ssh_key_id(pubkey: str) -> str:
+    """The organization's id for this public key, registering it once."""
+    import base64
+    import hashlib
+    blob = base64.b64decode(pubkey.split()[1])
+    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+    for k in eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []:
+        if k.get("fingerprint") == fingerprint:
+            return k["id"]
+    return eras("POST", "/ssh-keys", {"name": "live-pr-test", "public_key": pubkey})["id"]
+
+
+def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float) -> dict:
+    """The GPU notebook template's Pod with a big /dev/shm, every GPU of the listing, and a
+    timer that stops the Pod at the deadline. A run that ends releases the instance
+    (`release_when`), so the box goes even if nothing that launched it is left to."""
+    er = cfg.get("eras", {})
+    tpl = eras("GET", f"/templates/{er.get('template_id', ERAS_GPU_NOTEBOOK)}")
+    pod = tpl["pod"]
+    box = next(c for c in pod["containers"] if (c.get("resources") or {}).get("limits", {}).get("nvidia.com/gpu"))
+    box["resources"]["limits"]["nvidia.com/gpu"] = str(o["count"])
+    box["args"][-1] = f"(sleep {int(hours * 3600)}; kill -TERM 1) &\n" + box["args"][-1]
+    for v in pod.get("volumes") or []:
+        if v["name"] == "shm":
+            v["emptyDir"]["sizeLimit"] = er.get("shm", "256Gi")
+    return {
+        "listing_id": o["id"].split(":", 1)[1], "name": name, "idempotency_key": name,
+        "run": {"pod": pod, "endpoints": tpl.get("endpoints"),
+                "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [eras_ssh_key_id(pubkey)]}},
+                             "volumes": {"workspace": "emptyDir"}},
+                "release_when": {"after_success_seconds": 0, "after_failure_seconds": 0}},
+    }
+
+
+def eras_create(body: dict) -> str:
+    """Preview, accept the quoted prices, create; the instance id."""
+    preview = eras("POST", "/instances/preview", body)
+    if not preview.get("is_available"):
+        raise ApiError(409, f"capacity: {preview.get('unavailable_detail') or preview.get('unavailable_reason')}")
+    for w in preview.get("warnings") or []:
+        print(f"gpu.py: eras preview: {w.get('message')}", file=sys.stderr)
+    body = dict(body, accepted_prices={i["usage_type"]: i["unit_price"] for i in preview["quote"]["line_items"]},
+                accepted_available_until=preview.get("available_until"))
+    return eras("POST", "/instances", body)["id"]
+
+
 def hf_home(cfg, provider, region) -> str:
+    if provider == "slurm":
+        return cfg["slurm"].get("hf_home", "/workspace/shared/hf")
+    if provider == "eras":
+        return cfg.get("eras", {}).get("hf_home", "/workspace/hf")
     if provider == "runpod":
         return cfg["runpod"]["hf_home"]
     fs = lambda_filesystems(cfg)[region]
@@ -413,8 +580,16 @@ def hf_home(cfg, provider, region) -> str:
 
 # ---------------------------------------------------------------- status / ssh
 
-def status(e: dict) -> tuple[str, str | None, int]:
+def status(e: dict, cfg: dict | None = None) -> tuple[str, str | None, int]:
     """(status, host, ssh port)."""
+    if e["provider"] == "slurm":
+        st = slurm_run(cfg or load_config(), f"squeue -h -j {e['instance_id']} -o %T", check=False).strip()
+        return (st or "ended").lower(), ("slurm" if st == "RUNNING" else None), 0
+    if e["provider"] == "eras":
+        i = eras("GET", f"/instances/{e['instance_id']}")
+        ssh = next((p for p in (i.get("standalone") or {}).get("endpoints") or []
+                    if p.get("name") == "ssh" and p.get("ready")), None)
+        return i.get("status", "?"), ssh and ssh.get("host"), int((ssh or {}).get("port") or 22)
     if e["provider"] == "runpod":
         p = runpod("GET", f"/pods/{e['instance_id']}")
         direct = (p.get("ssh") or {}).get("direct") or {}
@@ -430,23 +605,34 @@ def ssh_base(e: dict, scp: bool = False) -> list[str]:
             "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=15"]
 
 
+def remote(e: dict, cfg: dict, command: list[str] | str, tty: bool = False) -> list[str]:
+    """The ssh command line that runs `command` on the box (inside the job, on Slurm)."""
+    cmd = command if isinstance(command, str) else " ".join(command)
+    if e["provider"] == "slurm":
+        inner = f"srun --jobid={e['instance_id']} --overlap" + (" --pty bash -l" if not cmd else f" bash -lc {shlex.quote(cmd)}")
+        return slurm_ssh(cfg)[:1] + (["-t"] if tty or not cmd else []) + slurm_ssh(cfg)[1:] + [inner]
+    return ssh_base(e) + [f"{e['user']}@{e['host']}"] + ([cmd] if cmd else [])
+
+
 def cmd_wait(args, cfg):
     e = entry(args.instance)
     t0 = time.time()
     while True:
-        st, host, port = status(e)
-        if st.lower() in ("exited", "error", "terminated", "terminating", "unhealthy", "preempted"):
+        st, host, port = status(e, cfg)
+        if st.lower() in ("exited", "error", "terminated", "terminating", "unhealthy", "preempted",
+                          "ended", "releasing", "cancelled", "failed", "timeout", "completed"):
             die(f"{args.instance} is {st}")
         if host:
             e["host"], e["port"] = host, port
-            probe = ssh_base(e) + ["-o", "BatchMode=yes", f"{e['user']}@{host}", "nvidia-smi -L"]
+            probe = remote(e, cfg, "nvidia-smi -L")
+            probe[1:1] = ["-o", "BatchMode=yes"]
             r = subprocess.run(probe, capture_output=True, text=True, check=False)
             if r.returncode == 0:
                 with ledger_txn() as d:
                     if args.instance in d:
                         d[args.instance].update(host=host, port=port)
                 print(r.stdout.strip())
-                print(f"ready after {int(time.time() - t0)}s: {' '.join(ssh_base(e))} {e['user']}@{host}")
+                print(f"ready after {int(time.time() - t0)}s: {' '.join(remote(e, cfg, ''))}")
                 print(f"hf_home: {e['hf_home']}")
                 return
         if time.time() - t0 > args.timeout:
@@ -463,21 +649,28 @@ def reachable(key: str) -> dict:
 
 def cmd_ssh(args, cfg):
     e = reachable(args.instance)
-    os.execvp("ssh", ssh_base(e) + [f"{e['user']}@{e['host']}"] + args.command)
+    os.execvp("ssh", remote(e, cfg, args.command))
 
 
 def cmd_copy(args, cfg):
     e = reachable(args.instance)
-    target = f"{e['user']}@{e['host']}:{args.remote}"
+    if e["provider"] == "slurm":  # the job's files are the login host's files
+        target, scp = f"{cfg['slurm']['host']}:{args.remote}", slurm_ssh(cfg, scp=True)
+    else:
+        target, scp = f"{e['user']}@{e['host']}:{args.remote}", ssh_base(e, scp=True)
     src, dst = (args.local, target) if args.cmd == "push" else (target, args.local)
-    sys.exit(subprocess.run(ssh_base(e, scp=True) + ["-r", src, dst], check=False).returncode)
+    sys.exit(subprocess.run(scp + ["-r", src, dst], check=False).returncode)
 
 
 # ---------------------------------------------------------------- list / extend / terminate
 
 def terminate(key: str, e: dict) -> None:
     try:
-        if e["provider"] == "runpod":
+        if e["provider"] == "slurm":
+            slurm_run(load_config(), f"scancel {e['instance_id']}")
+        elif e["provider"] == "eras":
+            eras("POST", f"/instances/{e['instance_id']}/release", {})
+        elif e["provider"] == "runpod":
             runpod("DELETE", f"/pods/{e['instance_id']}")
         else:
             lambda_("POST", "/instance-operations/terminate", {"instance_ids": [e["instance_id"]]})
@@ -508,7 +701,7 @@ def cmd_list(args, cfg):
         print("no instances launched by this tool are up")
     for key, e in d.items():
         try:
-            st = status(e)[0]
+            st = status(e, cfg)[0]
         except ApiError as err:
             st = f"? ({err.status})"
         hrs = (time.time() - e["launched_at"]) / 3600
@@ -520,6 +713,14 @@ def cmd_list(args, cfg):
         if enabled(cfg, "runpod"):
             for p in runpod_list("/pods", "pods"):
                 print(f"runpod:{p['id']}  {p.get('name')}  {p.get('status')}  ${p.get('cost', '?')}/hr")
+        if enabled(cfg, "slurm"):
+            out = slurm_run(cfg, "squeue -h -o '%j %i %T %M/%l'", check=False)
+            mine = [ln for ln in out.splitlines() if ln.startswith(cfg["slurm"].get("job_prefix", "live-pr") + "-")]
+            print("\n".join(f"slurm: {ln}" for ln in mine) or "slurm: no jobs")
+        if enabled(cfg, "eras"):
+            for i in eras("GET", "/instances", params={"page_size": 100}).get("items") or []:
+                if i.get("status") not in ("ended",):
+                    print(f"eras:{i['id']}  {i.get('name')}  {i.get('status')}")
         if enabled(cfg, "lambda"):
             for i in lambda_("GET", "/instances") or []:
                 print(f"lambda:{i['id']}  {i.get('name')}  {i.get('status')}  {i['instance_type']['name']}")
