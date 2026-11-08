@@ -170,6 +170,7 @@ class UlyssesPipeline:
         self._pool: _Pool | None = None
         self._verdict: dict[_Shape, bool] = {}
         self._copy_in = self._copy_out = None
+        self._copy_rows = None
 
     def group_heads(self, heads: int) -> int:
         return heads // (self.group.world_size * self.groups)
@@ -183,8 +184,10 @@ class UlyssesPipeline:
             ok = 1
             try:
                 self._ops = _StreamOps()
-            except (OSError, AttributeError, RuntimeError) as error:
-                logger.warning("Ulysses pipeline: stream memory operations unavailable (%s)", error)
+                from mstar.model.components.distributed.row_copy import copy_rows  # needs triton
+                self._copy_rows = copy_rows
+            except (OSError, AttributeError, RuntimeError, ImportError) as error:
+                logger.warning("Ulysses pipeline: its transport is unavailable (%s)", error)
                 ok = 0
             self._usable = bool(self.group.agree([ok])[0])
             if self._usable:
@@ -243,7 +246,7 @@ class UlyssesPipeline:
         return True
 
     def _run(self, q, k, v, attend_group: AttendGroup, buf: _Pool) -> torch.Tensor:
-        group, ops, groups = self.group, self._ops, self.groups
+        group, ops, groups, copy_rows = self.group, self._ops, self.groups, self._copy_rows
         world, r = group.world_size, group.rank
         rows, heads, head_dim = q.shape
         hg, esz = buf.group_heads, q.element_size()
@@ -266,11 +269,14 @@ class UlyssesPipeline:
 
         ready = main.record_event()
         # this rank's own rows on the SMs, before the first attention: a same-device copy queued behind a
-        # running attention would wait for it, and hold up the peer copies behind it
-        for g in range(groups):
-            h0 = head0(r, g)
-            for part, t in enumerate(parts):
-                slot(g, part)[r * rows:(r + 1) * rows].copy_(t[:, h0:h0 + hg])
+        # running attention would wait for it, and hold up the peer copies behind it. One pass a part, every group.
+        width = hg * head_dim
+        own = buf.inb[r]
+        for part, t in enumerate(parts):
+            copy_rows(own.as_strided((groups, rows, width), (3 * slot_numel, width, 1),
+                                     own.storage_offset() + part * slot_numel + r * rows * width),
+                      t.as_strided((groups, rows, width), (width, t.stride(0), 1),
+                                   t.storage_offset() + head0(r, 0) * head_dim))
         self._copy_in.wait_event(ready)
         for g in range(groups):
             for p in peers:
@@ -306,7 +312,7 @@ class UlyssesPipeline:
                                out.data_ptr() + p * rows * row_bytes, row_bytes, row_bytes, rows)
                 for p in peers:
                     ops.write(self._copy_out, buf.fout[p].data_ptr() + 4 * r, base + g + 1)
-                merged[:, h0:h0 + hg].copy_(out[r * rows:(r + 1) * rows])
+                copy_rows(merged[:, h0:h0 + hg].flatten(1)[None], out[r * rows:(r + 1) * rows].flatten(1)[None])
         # A peer writes its groups from one stream, in order, so its count covers every group before it. Once
         # every peer has written, every peer has also attended over its slots, which the next call rewrites.
         for p in peers:
