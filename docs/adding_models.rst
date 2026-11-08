@@ -3108,7 +3108,7 @@ Shared pieces to build the components from: ``flow_match.py`` (shift schedules a
 exact Euler step), ``rope.py`` (multi-axis rotary embeddings), ``attention.py`` (joint
 attention over packed tokens: SDPA eagerly, the ragged FlashInfer resource under graphs),
 ``text_encoder.py`` (native Qwen3 hidden-state taps), ``autoencoder_kl.py`` (the KL VAE
-family), ``image_io.py`` (latent packing, PNG, the mp4 encoder) and ``lora.py`` (static LoRA merge at load,
+family), ``image_io.py`` (latent packing, PNG) and ``lora.py`` (static LoRA merge at load,
 also into fused ``q``/``k``/``v`` shards via ``FusedColumnLinear.shard_slice``; the checkpoint
 parsing it uses is shared, in ``mstar/engine/resources/lora/checkpoint.py``).
 
@@ -3170,7 +3170,8 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
 ``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
 or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through
-its sliding-window pool. ``media`` holds a
+its sliding-window pool. A model without text prompts (``TEXT_PROMPTS = False``) has no
+``prefill_text`` walk, so the scaffold returns ``{}`` for it. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per

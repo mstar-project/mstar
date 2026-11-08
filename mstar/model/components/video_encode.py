@@ -37,15 +37,14 @@ def encode_mp4(
     fps: float | Fraction,
     *,
     options: Mapping[str, str] | None = None,
-    rate_denominator: int = 1001,
     pad_even: bool = False,
 ) -> bytes:
     """H.264 mp4 bytes from uint8 RGB ``frames`` ``[F, H, W, 3]`` through PyAV's
     bundled libx264, in yuv420p.
 
     The container's rate is ``fps`` as the nearest fraction with a denominator up
-    to ``rate_denominator`` (PyAV takes no float rate: 24 -> 24, 23.976 ->
-    2997/125). ``options`` are the stream's codec options (None: libx264's
+    to 1001, so NTSC rates are exact (PyAV takes no float rate: 24 -> 24,
+    23.976 -> 24000/1001). ``options`` are the stream's codec options (None: libx264's
     defaults). yuv420p needs even sides; ``pad_even`` repeats the last row or
     column of an odd-sized clip, else such a clip fails to encode.
     """
@@ -55,7 +54,7 @@ def encode_mp4(
         frames = np.pad(frames, ((0, 0), (0, frames.shape[1] % 2), (0, frames.shape[2] % 2), (0, 0)), mode="edge")
     buffer = io.BytesIO()
     with av.open(buffer, mode="w", format="mp4") as container:
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(rate_denominator))
+        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
         stream.height, stream.width = frames.shape[1], frames.shape[2]
         stream.pix_fmt = "yuv420p"
         if options:

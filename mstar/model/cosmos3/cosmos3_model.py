@@ -1189,9 +1189,14 @@ class Cosmos3Model(Model):
             # encode all of them as an H.264 mp4. The frames already reflect the
             # request fps (it modulates the temporal positions during generation),
             # and the container carries that same rate so playback runs at the
-            # requested speed. torchcodec takes the same CRF 18 / ultrafast /
-            # threads=0 settings as ``encode_mp4`` (see there); the preset is
-            # overridable via COSMOS3_X264_PRESET.
+            # requested speed.
+            #
+            # CRF 18 keeps the H.264 output near-visually-lossless; libx264
+            # otherwise defaults to 23, which is visibly lossier. The "ultrafast"
+            # preset and multithreading (threads=0) target the same CRF/quality
+            # but encode several times faster than libx264's default "medium"
+            # preset, which otherwise dominates the serving latency for a
+            # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
             frames = output.cpu()
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
@@ -1217,7 +1222,7 @@ class Cosmos3Model(Model):
                         "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
-                # the default rate_denominator (1001) writes NTSC rates exactly
+                # NTSC rates exactly (encode_mp4's denominator is 1001)
                 data = encode_mp4(
                     frames.permute(0, 2, 3, 1).numpy(), fps,
                     options={"crf": "18", "preset": preset, "threads": "0"}, pad_even=True,
