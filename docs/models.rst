@@ -98,6 +98,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        openpi's DROID normalization: raw joint state in, joint velocities out. It also
        serves openpi's policy WebSocket, so openpi's DROID client connects unchanged
        (see :doc:`clients`).
+   * - ``qwen3_8b``
+     - ``Qwen/Qwen3-8B``
+     - Dense Qwen3 text chat; see the notes below.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -438,6 +441,20 @@ is the model's channel stream as generated: reasoning addressed ``to=self``,
 then the answer ``to=user``. Tool calls are refused for now. Images resize with the
 reference's antialiased Lanczos, which torchvision has from 0.27 (torch 2.12); an older
 torchvision falls back to PIL's Lanczos with a warning, and its pixels differ slightly.
+
+Qwen3-8B (``qwen3_8b``)
+-----------------------
+
+Text-only chat on ``Qwen/Qwen3-8B`` (``Qwen3ForCausalLM``), through the checkpoint's chat
+template (``enable_thinking`` reaches it); other sizes aren't registered. A packed
+prefill samples the first token and a decode loop the rest; both are captured.
+Sampling defaults come from the checkpoint's ``generation_config.json``.
+``model_kwargs.max_seq_len`` bounds prompt plus reply (default: the
+checkpoint's context), and ``prefill_token_buckets`` replaces the captured
+prefill ladder. Rope scaling, sliding windows and attention biases are refused
+at startup rather than ignored. A request's ``min_tokens`` is a 400 unless
+``model_kwargs.serve_min_tokens: true``, which bars the stop ids at the cost of
+FlashInfer's fused sampling path on every step.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
