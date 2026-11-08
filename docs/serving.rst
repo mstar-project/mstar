@@ -519,7 +519,7 @@ for Qwen3.5 0.8B, whatever its length), and the budget turns one eager step per 
 whole prompts into one per prompt or two. With no budget prompts run whole, up to the
 prefill capture's row cap a step, and decode takes its rows afterwards. MI325X, 1k-token
 prompts, c=64, output tok/s with the budget and without: 0.8B 4.1k and 8.4k, 2B 3.8k and
-5.8k, 9B TP2 1.56k and 1.80k; chat prompts within 2 %.
+5.8k, 9B TP2 1.56k and 1.80k, 0.8B with MTP drafts 4.1k and 7.7k; chat prompts within 2 %.
 What it costs there is time to first token under load (9B TP2 at c=64: p50 280 ms with
 the budget, 970 without, p95 level) and chunked prefill itself: a long prompt runs whole
 in one step and decode waits for it.
