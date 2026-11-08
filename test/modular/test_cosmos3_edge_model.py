@@ -148,7 +148,9 @@ def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
     assert specs["vision_attn"].nodes == {VISION_ENCODER_NODE}
     assert specs["vision_attn"].config.max_segments_per_step == 16384 // 16
     assert [split.combined_walk for split in specs[ATTN].config.splits] == ["mixed"]
-    assert model.get_combined_graph_walks() == {REASONER_NODE: {"mixed": {"prefill_text", "decode"}}}
+    # text and media prompt rows both join decode steps, on the prefill kernels
+    assert model.get_combined_graph_walks() == {REASONER_NODE: {"mixed": {"prefill_text", "prefill_vision", "decode"}}}
+    assert specs[ATTN].config.splits[0].prefill_walks == ("prefill_text", "prefill_vision")
     # Nano-shaped defaults declare no reasoner resources.
     nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
     nano_keys = {s.resource_key for s in nano.get_node_resources()}
@@ -427,6 +429,38 @@ def test_reasoner_rotary_tables_come_from_the_layout_and_the_counter(tmp_path) -
     cos, sin = sub.decoder_kwargs(Cosmos3Model.REASONER_DECODE_WALK, types.SimpleNamespace(captured=True), 2)["cos_sin"]
     want = tower.build_cos_sin(planned.expand(3, -1), torch.float32)
     assert torch.equal(cos, want[0]) and torch.equal(sin, want[1])
+
+
+def test_a_mixed_step_carries_media_prompt_rows(tmp_path) -> None:
+    """A media prompt row joins a decode step: it advances the position
+    counter by its MRoPE advance beside the decode rows' one, its encoder
+    output is packed beside the decode rows' loop-back tokens, and a mixed
+    step holds at most the scaffold's cap of prompt rows."""
+    import types
+
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    model = _model(tmp_path)
+    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
+    image_pad = model.config.reasoner.image_token_id
+    decode = ARNodeInputs(input_seq_len=1)
+    decode.graph_walk = Cosmos3Model.REASONER_DECODE_WALK
+    media = ARNodeInputs(
+        input_seq_len=10, input_ids=torch.tensor([5, 6, 7, 8, 9] + [image_pad] * 4 + [10]),
+        resource_step_info=8, tensor_inputs={"vision_embeds": torch.ones(4, 8)},
+    )
+    media.graph_walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
+    step = sub.declare_step("mixed", ["d", "m"], [decode, media])
+    assert step.steps[ROPE].advance == (1, 8)
+    assert sub.max_rows_in_combined(Cosmos3Model.REASONER_PREFILL_VISION_WALK) == sub.MIXED_MAX_PREFILL_ROWS
+
+    sampler = types.SimpleNamespace(loopback_tokens=lambda rids: torch.tensor([42, 0]))
+    engine_inputs = types.SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["d", "m"])
+    out = SampledTokenDecoder.preprocess(sub, "mixed", engine_inputs, [decode, media])
+    assert out["input_ids"].tolist() == [42, 5, 6, 7, 8, 9] + [image_pad] * 4 + [10]
+    assert torch.equal(out["vision_embeds"], torch.ones(4, 8))
 
 
 def test_edge_chat_adapter(tmp_path) -> None:

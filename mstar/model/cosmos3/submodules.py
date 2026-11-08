@@ -3276,6 +3276,9 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64]
     PREFILL_MEDIA_TOKEN_BUCKETS = [256, 512, 1024, 2048]
+    # Image and video prompts join decode steps too, so a burst of them does
+    # not stop every decode stream for a step each
+    MIXED_MEDIA = True
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)

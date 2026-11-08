@@ -112,6 +112,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     PREFILL_MEDIA_CAPTURE_BATCH_SIZES = [1, 2, 4]
     # A mixed step's token ladder; None runs it on PREFILL_TOKEN_BUCKETS
     MIXED_TOKEN_BUCKETS: list[int] | None = None
+    # Whether a mixed step also carries media prompt rows beside its decode rows
+    # (a model listing its media walks in its combined walk): its capture then
+    # holds every encoder's buffer, so a replay splices them in.
+    MIXED_MEDIA: bool = False
 
     # The attention resource whose plan picks each prefill row's last token.
     ATTN_KEY: str
@@ -243,11 +247,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 capture_token_lengths=(
                     self.PREFILL_TOKEN_BUCKETS if self.MIXED_TOKEN_BUCKETS is None else self.MIXED_TOKEN_BUCKETS
                 ),
-                make_node_input=ids,
+                make_node_input=media if self._mixes_media else ids,
                 capture_batch_sizes=self.MIXED_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(MIXED),
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
+                input_seq_dims={e.output: 0 for e in self._encoders} if self._mixes_media else None,
             )]
         if self._encoders and self.CAPTURE_PREFILL:
             walks = media_walk_names(self._encoders)
@@ -273,8 +278,13 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     def max_batch_size(self, graph_walk: str) -> int | None:
         return max(self.PREFILL_MEDIA_CAPTURE_BATCH_SIZES) if graph_walk in self._media_walks else None
 
+    @property
+    def _mixes_media(self) -> bool:
+        return self.MIXED_MEDIA and bool(self._encoders)
+
     def max_rows_in_combined(self, graph_walk: str) -> int | None:
-        return self.MIXED_MAX_PREFILL_ROWS if graph_walk == self.PREFILL_WALK else None
+        prompt = graph_walk == self.PREFILL_WALK or (self._mixes_media and graph_walk in self._media_walks)
+        return self.MIXED_MAX_PREFILL_ROWS if prompt else None
 
     # ------------------------------------------------------------------
     # Inputs
@@ -409,14 +419,21 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             laps.lap("splice")
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
-            return {"input_ids": ids}
+            out = {"input_ids": ids}
+            if not decode:
+                # a mixed step's media prompt rows
+                self._pack_media(out, inputs)
+            return out
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs], dim=0)}
+        self._pack_media(out, inputs)
+        return out
+
+    def _pack_media(self, out: dict, inputs: list[ARNodeInputs]) -> None:
         for e in self._encoders:
             # in row order, as the forward's cumulative pad count reads them
             rows = [inp.tensor_inputs[e.output] for inp in inputs if e.output in inp.tensor_inputs]
             if rows:
                 out[e.output] = torch.cat(rows, dim=0)
-        return out
 
     def declare_step(
         self,
@@ -435,10 +452,16 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         } if graph_walk != self.DECODE_WALK else {}
 
         # None advances by the span; a media prompt placing its own
-        # positions advances by what it says (see `_media_inputs`)
+        # positions advances by what it says (see `_media_inputs`), and so does
+        # each such row of a mixed step, beside rows advancing by their span
+        def places_own(inp: ARNodeInputs) -> bool:
+            return (inp.graph_walk or graph_walk) in self._media_walks and inp.resource_step_info is not None
+
         advance = None
-        if graph_walk in self._media_walks and inputs[0].resource_step_info is not None:
-            advance = tuple(int(inp.resource_step_info) for inp in inputs)
+        if any(places_own(inp) for inp in inputs):
+            advance = tuple(
+                int(inp.resource_step_info) if places_own(inp) else int(inp.input_seq_len) for inp in inputs
+            )
 
         return SubmoduleStep(
             segments=[
