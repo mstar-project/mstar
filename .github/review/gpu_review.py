@@ -33,6 +33,9 @@ BOX = Path(__file__).with_name("gpu_review_box.sh")
 REPO = os.environ.get("REPO", "mstar-project/mstar")
 # gpu.py's ledger, for this run only.
 os.environ.setdefault("LIVE_PR_STATE", str(Path(os.environ.get("RUNNER_TEMP", "/tmp"), "live-pr")))
+sys.path.insert(0, str(GPU.parent))
+import gpu as gpu_py  # noqa: E402  (gpu.py's functions, for what its command line doesn't do)
+
 WRITE = bot.WRITE
 # Never approved, whatever the review says: the bot's own rules, CI, and the dependencies and toolchains.
 NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/", "docker/", "tools/", "packaging/")
@@ -66,11 +69,6 @@ MEDIA = {".png": "img", ".jpg": "img", ".jpeg": "img", ".gif": "img", ".webp": "
 def gpu(*args, check=True, timeout=900):
     """gpu.py's command line, through bot.run."""
     return bot.run([sys.executable, str(GPU), *args], check=check, timeout=timeout)
-
-
-def gpu_py():
-    """gpu.py's functions, for what its command line doesn't do."""
-    return runpy.run_path(str(GPU))
 
 
 # ---------------------------------------------------------------- GPUs
@@ -290,11 +288,10 @@ def unavailable(out, lt, text):
 
 def pending_ahead(cfg, offer):
     """How many jobs are pending in a Slurm offer's partition (0 when its queue can't be read: the offer stands)."""
-    state = gpu_py()
-    node = state["slurm_node"](cfg, offer["region"])
+    node = gpu_py.slurm_node(cfg, offer["region"])
     try:
-        out = state["slurm_run"](node, f"squeue -h -t PD -p {shlex.quote(node.get('partition', 'main'))} -o %i")
-    except (state["ApiError"], subprocess.TimeoutExpired):
+        out = gpu_py.slurm_run(node, f"squeue -h -t PD -p {shlex.quote(node.get('partition', 'main'))} -o %i")
+    except (gpu_py.ApiError, subprocess.TimeoutExpired):
         return 0
     return len(out.split())
 
@@ -327,7 +324,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
     stop = bot.over_cap(REPO)  # a review can take hours, so again right before the spend, as at preflight
     if stop:
         unavailable(out, lt, stop)
-    cfg = gpu_py()["load_config"]()
+    cfg = gpu_py.load_config()
     # check=False: offers exits 1 with its JSON when something errored and nothing has an offer. That
     # is "no GPUs" here too, with the errors listed.
     listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json", check=False).stdout)
@@ -362,7 +359,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
             (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (lt / "offer.json").write_text(json.dumps(o))
             # gpu.py drops its entry when it terminates the instance; this copy prices the run (run_cost).
-            (lt / "entry.json").write_text(json.dumps(gpu_py()["entry"](r.stdout.strip().splitlines()[-1])))
+            (lt / "entry.json").write_text(json.dumps(gpu_py.entry(r.stdout.strip().splitlines()[-1])))
             print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
             return
         tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
@@ -377,8 +374,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
 
 def instance(lt):
     key = (lt / "instance").read_text().strip()
-    state = gpu_py()
-    return key, state["entry"](key), state
+    return key, gpu_py.entry(key)
 
 
 def wait(out, runner_temp, start_timeout="30"):
@@ -386,12 +382,12 @@ def wait(out, runner_temp, start_timeout="30"):
     `unavailable` set, when a Slurm job never started."""
     start_timeout = int(start_timeout)
     lt = Path(runner_temp, "lt")
-    key, e, g = instance(lt)
-    cfg = g["load_config"]()
+    key, e = instance(lt)
+    cfg = gpu_py.load_config()
     started, t0 = False, time.time()
     while True:
         try:
-            st, host, port = g["status"](e, cfg)
+            st, host, port = gpu_py.status(e, cfg)
         except Exception as err:  # a flaky ssh or API call is not an outcome
             print(f"status: {err}", flush=True)
             time.sleep(60)
@@ -408,7 +404,7 @@ def wait(out, runner_temp, start_timeout="30"):
         else:
             started = started or bool(host)
             if host and (e.get("host"), e.get("port")) != (host, port):  # where gpu.py ssh and pull connect
-                with g["ledger_txn"]() as d:
+                with gpu_py.ledger_txn() as d:
                     d[key].update(host=host, port=port)
                 e.update(host=host, port=port)
             if st.startswith("run ") or st in ("ended", "releasing"):
@@ -443,31 +439,18 @@ def run_cost(lt, now):
 
 
 def cleanup(out, pr, tag, runner_temp):
-    """Release whatever this run launched, and delete the ssh key it registered, from the ledger and by
-    name, for a run cancelled mid-launch; and first what the run's GPUs and box session cost, for the
-    ledger, so a failed release can't lose it."""
+    """Release whatever this run launched, from the ledger and by name, for a run cancelled mid-launch;
+    and first what the run's GPUs and box session cost, for the ledger, so a failed release can't lose
+    it."""
     pr = int(pr)
     try:  # nothing here may stop the release below
         out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
     except Exception as e:
         print(f"::warning::Couldn't read the run's cost: {type(e).__name__}: {e}")
     print(gpu("list", check=False).stdout)
-    state = gpu_py()
-    for key in list(state["ledger"]()):
+    for key in list(gpu_py.ledger()):
         gpu("terminate", key, check=False)
-    cfg = state["load_config"]()
-    for sl in state["slurm_nodes"](cfg):
-        name = state["job_name"](sl, pr, tag)
-        try:
-            state["slurm_cancel"](sl, f"--name={shlex.quote(name)}", state["job_dir"](sl, name))
-        except (state["ApiError"], subprocess.TimeoutExpired) as err:  # still release what the others hold
-            print(f"slurm {sl['name']}: {err}")
-    if state["enabled"](cfg, "eras"):
-        name = state["job_name"](None, pr, tag)
-        for i in state["eras_instances"]():
-            if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
-                state["eras"]("POST", f"/instances/{i['id']}/release", {})
-        state["eras_delete_key"](name)
+    gpu_py.release_by_name(gpu_py.load_config(), pr, tag)
 
 
 # ---------------------------------------------------------------- approval

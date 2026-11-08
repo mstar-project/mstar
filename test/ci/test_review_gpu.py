@@ -4,9 +4,9 @@ import contextlib
 import io
 import json
 import os
-import runpy
 import sys
 import tempfile
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -19,7 +19,6 @@ import gpu_review  # noqa: E402
 from test_review_bot import Fail, FakeGh, step, workspace  # noqa: E402
 
 blocking, file_gate = gpu_review.blocking, gpu_review.file_gate
-GPU = runpy.run_path(str(REPO_ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"))
 R = gpu_review.REPO
 
 
@@ -244,11 +243,11 @@ class TestStart(unittest.TestCase):
                   f"GET repos/{R}/issues[?]*": []}
         env = {k: v for k, v in os.environ.items() if k != "LIVE_TEST_ANTHROPIC_KEY"}
         lt = Path(tempfile.mkdtemp())
-        config = {"load_config": lambda: cfg,
-                  "entry": lambda key: {"usd_per_hour": 3.0, "launched_at": 1, "deadline": 2},
-                  "slurm_node": lambda cfg, name: {"partition": "background"}, "slurm_run": lambda sl, cmd: pending,
-                  "ApiError": RuntimeError}
-        with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", lambda: config), \
+        config = types.SimpleNamespace(load_config=lambda: cfg, ApiError=RuntimeError,
+                                       entry=lambda key: {"usd_per_hour": 3.0, "launched_at": 1, "deadline": 2},
+                                       slurm_node=lambda cfg, name: {"partition": "background"},
+                                       slurm_run=lambda sl, cmd: pending)
+        with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", config), \
                 unittest.mock.patch.dict(os.environ, env | ({"LIVE_TEST_ANTHROPIC_KEY": env_key} if env_key else {}),
                                          clear=True), contextlib.redirect_stdout(io.StringIO()):
             (ws / "review.json").write_text(json.dumps({"live_test": {
@@ -390,9 +389,10 @@ class TestCost(unittest.TestCase):
             self.assertEqual(gpu_review.run_cost(lt, 5400)[1], 0.0, f"a box could claim a cost of {cost}")
 
     def test_a_cost_that_cant_be_read_still_releases_the_run(self):
-        calls, state = [], {"ledger": lambda: {"eras:1": {}}, "load_config": dict, "slurm_nodes": lambda cfg: [],
-                            "enabled": lambda cfg, provider: False}
-        with unittest.mock.patch.object(gpu_review, "gpu_py", return_value=state), \
+        calls = []
+        state = types.SimpleNamespace(ledger=lambda: {"eras:1": {}}, load_config=dict,
+                                      release_by_name=lambda cfg, pr, tag: None)
+        with unittest.mock.patch.object(gpu_review, "gpu_py", state), \
                 unittest.mock.patch.object(gpu_review, "gpu", side_effect=lambda *a, **k: calls.append(a) or Done()), \
                 unittest.mock.patch.object(gpu_review, "run_cost", side_effect=ValueError("bad entry.json")), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -566,13 +566,14 @@ class TestEras(unittest.TestCase):
         def ledger_txn():
             yield led
 
-        g = {"entry": lambda key: dict(led[key]), "load_config": dict, "ledger_txn": ledger_txn,
-             "status": lambda e, cfg: ("active", "box.example", 2222)}
-        with unittest.mock.patch.object(gpu_review, "gpu_py", lambda: g), contextlib.redirect_stdout(io.StringIO()):
+        g = types.SimpleNamespace(entry=lambda key: dict(led[key]), load_config=dict, ledger_txn=ledger_txn,
+                                  status=lambda e, cfg: ("active", "box.example", 2222))
+        with unittest.mock.patch.object(gpu_review, "gpu_py", g), contextlib.redirect_stdout(io.StringIO()):
             step(gpu_review.wait, {"gpu.py *": ""}, runner_temp=str(temp))
         self.assertEqual((led["eras:i-1"].get("host"), led["eras:i-1"].get("port")), ("box.example", 2222),
                          "gpu.py ssh and pull would die with 'run gpu.py wait first'")
-        ssh = GPU["ssh_base"]({**e, "host": "box.example", "port": 2222}, {"identity_file": "~/.ssh/live_pr"})
+        ssh = gpu_review.gpu_py.ssh_base({**e, "host": "box.example", "port": 2222},
+                                         {"identity_file": "~/.ssh/live_pr"})
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
 
 

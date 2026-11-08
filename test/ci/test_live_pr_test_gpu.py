@@ -8,8 +8,8 @@ import hashlib
 import io
 import json
 import os
-import runpy
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -17,7 +17,10 @@ import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GPU = runpy.run_path(str(REPO_ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"))
+sys.path.insert(0, str(REPO_ROOT / ".claude/skills/live-pr-test/scripts"))
+import gpu as gpu_module  # noqa: E402
+
+GPU = vars(gpu_module)  # patched in place, with each test's cleanup restoring it
 SLURM_CFG = {"slurm": [{"name": "node1", "host": "root@node", "job_prefix": "live-pr",
                         "workdir": "/workspace/live-pr"}]}
 
@@ -39,7 +42,7 @@ def fake_slurm(replies, calls=None):
 
 class TestSlurm(unittest.TestCase):
     def setUp(self):
-        self.globals = GPU["status"].__globals__
+        self.globals = GPU
         self.saved = self.globals["slurm_run"]
 
     def tearDown(self):
@@ -316,9 +319,9 @@ class TestEras(unittest.TestCase):
                        "/volumes/v2": {"attachment": None}}
             return replies.get(path, tpl)
 
-        saved = {k: GPU["cmd_launch"].__globals__[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
-        self.addCleanup(GPU["cmd_launch"].__globals__.update, saved)
-        GPU["cmd_launch"].__globals__.update(
+        saved = {k: GPU[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
+        self.addCleanup(GPU.update, saved)
+        GPU.update(
             eras=eras, STATE=state, LEDGER=state / "instances.json", find_offer=lambda cfg, offer: {
                 "id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1, "usd_per_hour": 3.0, "region": "x",
                 "storage": True})
@@ -351,7 +354,7 @@ class TestEras(unittest.TestCase):
                                             "so the next volume or a cold box would never launch")
 
     def test_a_create_whose_answer_was_lost_is_not_sent_again(self):
-        posts, globs = [], GPU["eras"].__globals__
+        posts, globs = [], GPU
         self.addCleanup(globs.update, {"_eras_org": globs["_eras_org"]})
         globs["_eras_org"] = "org"
 
@@ -381,7 +384,7 @@ class TestEras(unittest.TestCase):
                      {"id": "i-9", "name": "live-pr-7-t", "status": "active"}]
             return {"items": items if path == "/instances" else [], "next_page_token": None}
 
-        globs = GPU["terminate"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {k: globs[k] for k in ("eras", "STATE", "LEDGER")})
         globs.update(eras=eras, STATE=state, LEDGER=state / "instances.json")
         e = {"provider": "eras", "instance_id": None, "name": "live-pr-7-t", "launched_at": 0, "usd_per_hour": 1.0,

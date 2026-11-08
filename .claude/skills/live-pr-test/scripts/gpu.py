@@ -1211,6 +1211,21 @@ def running(cfg: dict) -> tuple[list[str], dict[str, str]]:
     return up, errors
 
 
+def release_by_name(cfg: dict, pr: int, tag: str) -> None:
+    """End whatever this tool launched for `pr` and `tag`, by its name on every Slurm node and on Eras,
+    for a launch cancelled before its instance was recorded. Keeps going past a node it can't reach."""
+    for p in slurm_providers(cfg):
+        name = p.job_name(pr, tag)
+        try:
+            slurm_cancel(p.sl, f"--name={shlex.quote(name)}", p.job_dir(name))
+        except (ApiError, subprocess.TimeoutExpired) as err:
+            print(f"{p.label}: {err}")
+    eras_cloud = Eras(cfg)
+    if eras_cloud.enabled():
+        for iid in eras_cloud.named(eras_cloud.job_name(pr, tag)):
+            eras_cloud.release(iid, {})
+
+
 def cmd_list(args, cfg):
     d = ledger()
     if not d:
