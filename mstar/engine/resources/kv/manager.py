@@ -377,6 +377,13 @@ class Victims(NamedTuple):
     waits: int = 0
 
 
+class ParkedMoves(NamedTuple):
+    """The requests that wait holding pages which a move can take now, and the host's room, which decides how many
+    of them fit there."""
+    rids: frozenset[str]
+    host_room: int
+
+
 class ShortGrant(NamedTuple):
     """A grant that ran short: the room then, and the pages it needed past what its request's allotment had left."""
     room: int
@@ -4416,6 +4423,20 @@ class KVManager(AttentionResource):
     def any_parked(self) -> bool:
         """Whether a request waits holding its allotment, as `make_room` needs. Read without the lock."""
         return bool(self._parked)
+
+    def parked_moves(self, droppable: Callable[[str], bool]) -> ParkedMoves:
+        """What `make_room` can move. It chooses no differently for a refusal whose mark is the same until this
+        changes."""
+        with self._lock:
+            host = 0 if self._cpu_pool is None else self._cpu_pool.room()
+            rids = set()
+            for rid in self._parked:
+                if not (self._holds(rid) and self._movable(rid)):
+                    continue
+                pages = self._host_pages(rid)
+                if self._unwritten(rid) or (pages is not None and pages <= host) or droppable(rid):
+                    rids.add(rid)
+            return ParkedMoves(frozenset(rids), host)
 
     def make_room(self, mark: RoomMark, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
         """Choose requests from ``newer`` that wait holding pages, newest first, to move off the device for

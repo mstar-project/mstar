@@ -43,6 +43,7 @@ class Preemption:
         # `_preempted`: handle -> its `Preempted`. `counts`: node -> its counts for the metrics.
         # `_waits_logged`: (node, walk) -> when its last wait was logged, and the waits since.
         # `_moves_logged`: node -> when its last move was logged, and the moves since.
+        # `_walked`: what the last walk of `make_room` that moved nothing read, or None.
         self._keys: dict[str, list[str]] = defaultdict(list)
         self._caches: dict[str, PagedKVCache] = {}
         for kv in engine_manager.engine.paged_kv_caches():
@@ -53,6 +54,7 @@ class Preemption:
         self.counts: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
         self._waits_logged: dict[tuple[str, str], tuple[float, int]] = {}
         self._moves_logged: dict[str, tuple[float, int]] = {}
+        self._walked: tuple | None = None
 
     def preempt(self, node_batch: ExecutingBatch) -> bool:
         """`KVManager.preempt` chooses victims for the request that hit KV OOM. Move each victim to the host or
@@ -87,11 +89,20 @@ class Preemption:
         that such moves can let in, as `KVManager.make_room` chooses them. No step of theirs runs short to move
         them, since none of them runs. An older request stuck on something no move frees, another resource or a
         pool that doesn't move, holds up no younger one, and one the room now fits moves nothing, so no younger one
-        takes that room."""
+        takes that room.
+
+        A walk that moved nothing runs again only once the refusals or what the pools can move have changed. A
+        refusal's mark changes once its room grows, but a request becomes droppable when its ids land, which grows
+        nothing."""
         if not any(kv.cache.any_parked() for kv in self._caches.values()):
             return
         engine = self._engine_manager.engine
-        for refusal in engine.refusals():
+        refusals = engine.refusals()
+        walked = (refusals, [kv.cache.parked_moves(self._droppable(kv, engine)) for kv in self._caches.values()])
+        if walked == self._walked:
+            return
+        self._walked = None
+        for refusal in refusals:
             kv = self._caches.get(refusal.key)
             if kv is None or not self._moves(kv, refusal.mark.node_name):
                 continue
@@ -100,6 +111,7 @@ class Preemption:
             if victims is not None:
                 self._move(kv, self.counts[refusal.mark.node_name], victims, refusal.rid)
                 return
+        self._walked = walked
 
     def rebuilt(self, rid: int, node_name: str, tokens: int) -> None:
         """Count the ``tokens`` of ``rid``'s rebuild on ``node_name``, which has landed."""
