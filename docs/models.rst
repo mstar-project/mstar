@@ -1297,7 +1297,8 @@ Chatterbox notes
   the playback time to produce a bigger one, so a stream costs three or four
   flow solves instead of one per 25 tokens. Each chunk re-runs
   the flow decoder over all tokens so far with a fixed noise field, holds back
-  the three look-ahead tokens and crossfades the vocoder tail, so the stream
+  the three look-ahead tokens and crossfades the vocoder tail (which a first chunk
+  of at least 7 tokens fills), so the stream
   is continuous but not sample-identical to the whole-utterance decode;
   ``stream_chunk_tokens: 0`` synthesises whole utterances (the reference
   path, bit-exact with the package at a fixed seed). ``stream_context_tokens``
@@ -1770,9 +1771,29 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
 
-**Two GPUs.** ``configs/wan22_dp2.yaml`` serves a whole replica per GPU: 5.2
-videos/min at 4 concurrent on H200s (measured on an earlier version), while one
-request takes the 1-GPU time.
+**Two GPUs.** ``configs/wan22_cfg_parallel_2gpu.yaml`` is CFG-parallel: it runs
+the dit over two ranks (``cfg_size: 2``) that split the classifier-free guidance
+batch: each rank runs one branch over the batch's rows and the two noise
+predictions are all-gathered
+every step, so a guided step costs one branch's forward (502 vs 1000 ms at
+1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps;
+measured on that earlier version). The
+text encoder and VAE run on rank 0. Without guidance both ranks compute the same
+step, correct but no faster. For throughput under concurrency,
+``configs/wan22_dp2.yaml`` serves a whole replica per GPU instead: 5.2 videos/min
+at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE
+decode; measured on that earlier version), while one request takes the 1-GPU time.
+
+**Four GPUs.** ``configs/wan22_cfg2_sp2_4gpu.yaml`` also splits each branch's
+tokens over a pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's
+self-attention) to cut one request's latency. Split the guidance branches
+first (``cfg_size: 2``), then add ``sp_size`` on top: on two GPUs,
+``sp_size: 2`` alone is slower than ``cfg_size: 2``.
+``sp_size`` must divide the dit's 24 attention heads. Under concurrency, data
+parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
+replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
+against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
+H100s.
 
 LTX-2.5 (``ltx2_5``)
 --------------------
@@ -1986,7 +2007,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``max_image_area``
    Pixels, default 2048². Bounds the output size a request may ask for; larger requests
    are rejected with a 400 before scheduling instead of occupying the worker for minutes
-   (an 8192² request means 262k tokens of quadratic attention).
+   (an 8192² request means 262k tokens of quadratic attention). Z-Image also refuses a side
+   over 8192 px, the 512 tokens its rotary table covers.
 
 With the klein defaults every served image was within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it was bit-exact; both were measured while

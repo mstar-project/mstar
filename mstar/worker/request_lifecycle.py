@@ -196,8 +196,14 @@ class RequestLifecycle:
     # -- drains --------------------------------------------------------------
 
     def drain(self, body: DrainRequest) -> None:
-        """A DRAIN. A follower honors only the leader's forward, like a remove."""
-        if not self._is_tp_follower or body.source == MessageSource.TP_RANK_0:
+        """A DRAIN. A follower honors only the leader's forward, like a remove,
+        but for a request never admitted here: the conductor sends a NEW_REQUEST
+        ahead of its drain on one FIFO socket, so the leader has no handle either
+        and forwards nothing."""
+        if (
+            not self._is_tp_follower or body.source == MessageSource.TP_RANK_0
+            or body.request_id not in self._handles
+        ):
             self.pending_drains.add(body.request_id)
 
     def drains_ready(self, in_flight: Collection[int]) -> list[str]:

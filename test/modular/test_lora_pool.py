@@ -500,7 +500,7 @@ def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
     _, paths = adapters
 
     def build(sp_group):
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=sp_group)
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=sp_group, instance=sp_group)
         return LoraAdapterPool.build(make_spec(paths), EngineResourceInfo(device=CPU, joint_comm_group=groups))
 
     with pytest.raises(ValueError, match=r"sequence parallelism \(SP=2\)"):

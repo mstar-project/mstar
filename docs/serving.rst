@@ -244,10 +244,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``resources: <kv>:`` (see the resource overrides below).
    * - ``node_groups``
      - List of placements. Each entry assigns ``node_names`` to ``ranks``, optionally
-       scoped to specific ``graph_walks`` and/or sharded with ``tp_size``. An
-       ``ep_config`` block picks TP or EP for the group's MoE experts. ``side_stream:
-       true`` runs the group's node beside the worker's main chain of steps (see
-       below).
+       scoped to specific ``graph_walks`` and/or parallelized with ``tp_size``,
+       ``sp_size`` and ``cfg_size``. An ``ep_config`` block picks TP or EP for the
+       group's MoE experts. ``side_stream: true`` runs the group's node beside the
+       worker's main chain of steps (see below).
    * - ``resources``
      - *(optional)* Per-resource overrides, keyed by the model's resource names (see
        below).
@@ -313,18 +313,18 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        the server at startup.
    * - ``ws_per_message_deflate``
      - *(optional, default true)* Whether the server offers per-message deflate on its
-       WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.
+       WebSocket routes; it applies to every route.
        Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and to
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
        event loop, not the network, is the bottleneck.
    * - ``ws_max_message_mb``
-     - *(optional, default 16)* The largest WebSocket message the server reads, in MiB,
-       on every WebSocket route. A larger one closes its socket with ``1009`` before any
-       handler sees it, so the client gets no error frame. Raise it for clients that send
-       big uncompressed frames, such as several raw camera images in one openpi
-       observation.
+     - *(optional)* The largest WebSocket message the server reads, in MiB, on every
+       WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
+       closes its socket with ``1009`` before any handler sees it, so the client gets no
+       error frame. Raise it for clients that send big uncompressed frames, such as several
+       raw camera images in one openpi observation.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
@@ -365,7 +365,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
        which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
        keeps no ids, so it is never dropped on that node, though it can still move to the host
-       with ``cpu_offload_pages``. A tensor or sequence parallel node never drops a request, so it
+       with ``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it
        keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
@@ -392,7 +392,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        Unset keeps PyTorch's default throughout. Raise it only where weight load,
        JIT or CUDA-graph capture can exceed that default.
    * - ``tp_allreduce``
-     - *(optional)* Small-message all-reduce path of every TP and SP group:
+     - *(optional)* Small-message all-reduce path of every TP, SP and CFG group:
        ``nccl`` (default), ``symm_oneshot``, ``symm_multimem`` or ``flashinfer``;
        any other value fails at startup. ``flashinfer`` sends 2-D bf16 CUDA messages
        up to ``tp_allreduce_max_kb`` through FlashInfer's one-kernel all-reduce.
@@ -560,7 +560,7 @@ degree above one runs its prefills whole, whatever the model and these budgets s
 logs a warning at load.
 
 **Data-parallel routing.** A node group whose ``ranks`` hold several lockstep instances
-(``tp_size * sp_size`` ranks each, or one rank) runs each request on one of them, its
+(``cfg_size * sp_size * tp_size`` ranks each, or one rank) runs each request on one of them, its
 replica. The conductor picks it per request, at ingest, as the replica with the lowest
 cost: ``routing_weights.load`` times the live requests on the replica (counted per set of
 groups that pick together, for each request with a partition on them that is not done at
@@ -636,7 +636,7 @@ comes ready meanwhile batches into the next one. It applies to the walks the nod
 submodule declares in ``side_stream_walks`` (Qwen3-TTS's ``Codec`` declares
 ``codec_chunk``, but no config sets the field while it holds its ``codec_state`` pool), and keeps both nodes on one
 worker and one CUDA context, unlike a split with MPS. Startup fails with a
-``ValueError`` naming the field where the lane can't apply: a TP or SP node, a node
+``ValueError`` naming the field where the lane can't apply: a TP, SP or CFG node, a node
 alone on its worker, a device without streams, a node that also runs walks on the
 chain or holds resources, or a side walk that isn't the node's alone, is part of a
 combined walk, or has output spans or a stop check. Without the field the node runs on
@@ -677,10 +677,29 @@ weight loaders then shard parameters automatically, with no model-code changes. 
 :ref:`Tensor parallelism <tensor-parallelism>` in the model guide for the model-side
 details.
 
-Several TP (or SP) nodes can share GPUs when, on each worker, they are in the same TP and SP
-groups, each listed in the model's ``tp_enabled_nodes`` (or ``sp_enabled_nodes``). The ranks
-then run every node's steps in one order. The conductor refuses lockstep nodes on one worker
-in different TP or SP groups, and two lockstep nodes on one worker that share a paged KV cache:
+**Sequence and guidance parallelism.** ``sp_size`` splits a node's token sequence over
+that many ranks (Ulysses: an all-to-all around attention), and ``cfg_size`` splits its
+classifier-free-guidance branches, each rank running its share of them and the noise
+predictions gathered every step. Each needs the model to declare the node SP- or
+CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for Wan2.2).
+The axes compose: a group's ``ranks`` form lockstep instances of
+``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks),
+each instance's ranks listed in ascending order, and the conductor routes each request to
+one whole instance:
+
+.. code-block:: yaml
+
+   model: "wan22"
+   max_seq_len: 512
+   node_groups:
+     - {node_names: [text_encoder, vae_encoder, vae_decoder], ranks: [0]}
+     # one guidance branch per pair of ranks, each branch's tokens split over its pair
+     - {node_names: [dit], ranks: [0, 1, 2, 3], cfg_size: 2, sp_size: 2}
+
+Several lockstep-parallel nodes can share GPUs when, on each worker, they are in the same
+groups on every axis, each declared parallel on those axes by the model. The ranks then run
+every node's steps in one order. The conductor refuses lockstep nodes on one worker in
+different groups, and two lockstep nodes on one worker that share a paged KV cache:
 rank 0 replicates the page moves it makes on a pool (host offloads and reloads, for example)
 per node, riding on one node's next step, so two nodes on one pool could admit out of step on
 a follower. Until rank 0 journals a shared pool's moves in one stream, place such nodes on
@@ -757,9 +776,16 @@ of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be no
 [-1, 1].
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`. A ``seed`` fixes a request's random stream whatever
-it is batched with, so requests sent with the same seed and settings sample the same
-tokens; give each request its own seed for independent samples.
+client instead — see :doc:`clients`. Give each request its own ``seed`` for independent
+samples. A seed fixes a request's tokens whatever it is batched with only where M\* draws
+with one kernel that reads each row's own seed: on CUDA, a sampler whose vocabulary is at
+most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),
+with none of ``min_p``, the windowed penalty, ``min_tokens``, ``top_p_first`` or processed
+log-probs enabled on its node, on eager and captured steps alike. Every other sampler (every
+text LLM, and Fish S2 Pro's 4,097-token semantic head) draws through FlashInfer, which
+reads the first row's seed for the whole batch and folds each row's batch position into
+its random stream, so there the same seed and settings sample the same tokens only in the
+same batch, such as a request sent alone.
 
 Restarts and the compile cache
 ------------------------------
@@ -1062,7 +1088,7 @@ second old:
 The engine workers also send the conductor their own metrics every second, which it
 adds to its status message, so these can be up to two seconds old. ``component`` is the
 graph node; a node with replicas on several workers shows their sum, and the ranks of a
-tensor or sequence parallel instance count once (the instance's first rank reports).
+TP, SP or CFG instance count once (the instance's first rank reports).
 The histograms and counters count from the first request after the warmup requests, as
 the API server's do (the gauges show the current state), so read them with ``rate()``
 or ``increase()``.

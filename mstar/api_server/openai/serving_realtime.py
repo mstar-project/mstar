@@ -956,6 +956,7 @@ class _AgentTurn:
     item_id: str = field(default_factory=lambda: f"item_{uuid.uuid4().hex[:12]}")
     text: Utf8Stream = field(default_factory=Utf8Stream)
     transcript: list[str] = field(default_factory=list)
+    idle: int = 0               # its steps in a row whose text is only padding
 
     def item(self, status: str) -> dict:
         content = [] if status == "in_progress" else [{"type": "output_audio", "transcript": "".join(self.transcript)}]
@@ -991,6 +992,7 @@ class RealtimeConversation:
         model = api.model
         self.output_rate = model.get_output_sample_rate("audio")
         self.voice = model.get_default_voice()
+        self.idle_steps = getattr(model, "turn_idle_steps", None)
         self.session_id = f"sess_{uuid.uuid4().hex[:16]}"
         self.instructions = ""
         self.turn_detection = "server_vad"
@@ -1006,6 +1008,7 @@ class RealtimeConversation:
         self.text_steps = 0                       # steps whose text has arrived
         self.early: deque[tuple[int, bytes]] = deque()   # audio steps waiting for their text
         self.closed = False
+        self.call_over = False   # the call's output ran out: it ended on its own, nothing to abort
         self._send_lock = asyncio.Lock()
         self._set_formats(AudioFormat("audio/pcm", OPENAI_PCM_RATE), AudioFormat("audio/pcm", OPENAI_PCM_RATE))
 
@@ -1056,7 +1059,7 @@ class RealtimeConversation:
                     # passes on, and the server's cancel scope then doesn't recognise)
                     await asyncio.wait(tasks)
             finally:   # the call ends even if the server cancels the wait
-                if self.key is not None:
+                if self.key is not None and not self.call_over:
                     self.api.abort_submission(self.key)
 
     async def handle(self, event: dict) -> None:
@@ -1287,7 +1290,9 @@ class RealtimeConversation:
                     await self.send(error_event(_clip(_scrub_paths(message, self.api.upload_dir)),
                                            kind=error_type(http_status)))
                     status, code = "failed", 1011 if http_status >= 500 else 1000
-        except HTTPException as exc:
+            self.call_over = True
+        except HTTPException as exc:   # the request failed, so it has ended too
+            self.call_over = True
             await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
             status, code = "failed", 1011
         except Exception as exc:  # noqa: BLE001 — the socket must still close
@@ -1322,6 +1327,11 @@ class RealtimeConversation:
                 data, turn.end, turn = b"", step, None
         if turn is not None:   # between replies the text channel is padding
             await self._feed(turn, data)
+            turn.idle = 0 if data or meta.get("turn") else turn.idle + 1
+            if self.idle_steps is not None and turn.idle >= self.idle_steps:
+                # the model sent no end mark: its reply ends after its padding (turn_idle_steps)
+                await self._feed(turn, b"", final=True)
+                turn.end = step
         while self.early and self.early[0][0] < self.text_steps:
             await self._play(*self.early.popleft())
 
