@@ -185,7 +185,11 @@ def cmd_cleanup(a):
     cfg = state["load_config"]()
     if state["enabled"](cfg, "slurm"):
         name = f"{cfg['slurm'].get('job_prefix', 'live-pr')}-{a.pr}-{a.tag}"
-        state["slurm_run"](cfg, f"scancel --name={shlex.quote(name)}", check=False)
+        try:
+            state["slurm_cancel"](cfg, f"--name={shlex.quote(name)}",
+                                  f"{cfg['slurm'].get('workdir', '/workspace/live-pr')}/{name}")
+        except (state["ApiError"], subprocess.TimeoutExpired) as err:  # still release what Eras holds
+            print(f"slurm: {err}")
     if state["enabled"](cfg, "eras"):
         for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []:
             if i.get("name") == f"live-pr-{a.pr}-{a.tag}" and i.get("status") not in ("ended", "releasing"):

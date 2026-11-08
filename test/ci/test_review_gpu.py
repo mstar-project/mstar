@@ -1,6 +1,7 @@
 """Check the approval rule in .github/review/gpu_review.py, which decides whether the review bot approves."""
 
 import runpy
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -80,6 +81,18 @@ class TestSlurm(unittest.TestCase):
         self.assertEqual(GPU["status"](e, SLURM_CFG)[0], "ended")
         self.globals["slurm_run"] = fake_slurm({"squeue": "RUNNING\n"})
         self.assertEqual(GPU["status"](e, SLURM_CFG)[0], "running")
+
+    def test_terminate_leaves_nothing_of_the_run_on_the_node(self):
+        calls, saved = [], {k: self.globals[k] for k in ("load_config", "STATE", "LEDGER")}
+        self.addCleanup(self.globals.update, saved)
+        state = Path(tempfile.mkdtemp())
+        self.globals.update(slurm_run=fake_slurm({"scancel": ""}, calls), load_config=lambda: SLURM_CFG,
+                            STATE=state, LEDGER=state / "instances.json")
+        jobdir = "/workspace/review-bot/review-bot-7-1-1"
+        GPU["terminate"]("slurm:42", {"provider": "slurm", "instance_id": "42", "dir": jobdir, "launched_at": 0,
+                                      "usd_per_hour": 0.0})
+        self.assertTrue(any("scancel 42" in c and f"rm -rf {jobdir}" in c for c in calls),
+                        f"the job's directory (the Anthropic key, venvs, builds) would stay on the node: {calls}")
 
 
 if __name__ == "__main__":

@@ -3,13 +3,14 @@
 # reviewed commit. gpu_review.py launches it with `gpu.py launch --run`, so the box (a Slurm job or
 # an Eras Pod) is this script, and its GPUs go when it ends.
 #
-# Its inputs sit beside it: run.json (repo, PR, commits, model), brief.md (what to do), and on
-# Slurm anthropic.key (mode 0600, removed once read). On Eras the key is an Eras secret at
+# Its inputs are run.json (repo, PR, commits, model), brief.md (what to do), and on Slurm
+# anthropic.key (mode 0600, removed once read). On Slurm they are in the job's directory, where
+# the job runs (--chdir; $0 is Slurm's spool copy of this script), and gpu.py removes that
+# directory when the job ends. On Eras they are in /run/live-pr, and the key is an Eras secret at
 # /run/live-pr-key/value. Nothing here holds a GitHub token or a cloud key.
 set -uo pipefail
 
-IN=$(cd "$(dirname "$0")" && pwd)
-if [ -n "${SLURM_JOB_ID:-}" ]; then W=$PWD; else W=/workspace/live-pr; fi
+if [ -n "${SLURM_JOB_ID:-}" ]; then W=$PWD IN=$PWD; else W=/workspace/live-pr IN=/run/live-pr; fi
 OUT=$W/out
 mkdir -p "$OUT" "$W/home" "$W/tmux"
 field() { python3 -c "import json,sys; print(json.load(open('$IN/run.json'))['$1'])"; }

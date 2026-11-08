@@ -164,6 +164,13 @@ def slurm_run(cfg: dict, command: str, check: bool = True) -> str:
     return r.stdout
 
 
+def slurm_cancel(cfg: dict, job: str, jobdir: str | None) -> None:
+    """Cancel a job (scancel's arguments) and, once it has gone, remove its directory: on a shared
+    node nothing of a run stays but what was copied back (weights live in slurm.hf_home)."""
+    rm = f"sleep 60; rm -rf {shlex.quote(jobdir)}" if jobdir else ":"
+    slurm_run(cfg, f"scancel {job}; (nohup sh -c {shlex.quote(rm)} > /dev/null 2>&1 < /dev/null &)")
+
+
 def slurm_ssh(cfg: dict, scp: bool = False) -> list[str]:
     sl = cfg["slurm"]
     known = STATE / f"slurm_{re.sub(r'[^A-Za-z0-9.]', '_', sl['host'])}.known_hosts"
@@ -726,7 +733,7 @@ def cmd_copy(args, cfg):
 def terminate(key: str, e: dict) -> None:
     try:
         if e["provider"] == "slurm":
-            slurm_run(load_config(), f"scancel {e['instance_id']}")
+            slurm_cancel(load_config(), e["instance_id"], e.get("dir"))
         elif e["provider"] == "eras":
             eras("POST", f"/instances/{e['instance_id']}/release", {})
         elif e["provider"] == "runpod":
