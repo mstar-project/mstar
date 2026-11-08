@@ -799,11 +799,15 @@ class StreamLayout:
         if retention is None:
             return pages
         prefix = retention.protected_prefix
-        step, end = self.scratch, 0
+        step, start, end, scratch = self.scratch, 0, 0, 0
         for span in self.spans:
+            # One step writes a span that opens a step and every span after it that doesn't.
+            if span.opens_step:
+                start, scratch = end, 0
+            scratch = max(scratch, end - start + span.scratch)
             end += span.length
-            if max(end, end - span.length + span.scratch) > prefix:
-                step = max(step, span.length, span.scratch)
+            if max(end, start + scratch) > prefix:
+                step = max(step, end - start, scratch)
         step = max([step, *(slots for _, slots in self.growth)])
         return min(pages, retention.max_pages(page_size, step))
 
