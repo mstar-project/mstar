@@ -384,9 +384,12 @@ def test_one_run_body_reuses_standalone_and_composed_parents():
     standalone = backend.compose((entry, GraphConditional("while", state.continuation, (captured,))))
     # Both parents own fresh conditional handles but reuse the same entry/body
     # and exclusive bound storage. Entry executes once, never inside the loop.
-    composed = backend.compose((entry, GraphConditional("while", state.continuation, (
-        GraphConditional("if", state.continuation, (captured,)),
-    ))))
+    member = backend.compose((GraphConditional("if", state.continuation, (captured,)),))
+    composed = backend.compose((entry, GraphConditional("while", state.continuation, (member,))))
+    # The parent owns a snapshot of the operations, not the member's executable.
+    # Its IF must stay below the WHILE and after entry, with fresh native handles.
+    member.reset()
+    del member
     try:
         cases = [(standalone, False, 6), (composed, False, 6),
                  (standalone, True, 6), (composed, True, 6),

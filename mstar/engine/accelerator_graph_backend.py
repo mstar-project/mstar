@@ -98,9 +98,10 @@ class _CUDAComposedGraph:
 
     def __init__(self, backend, ops):
         self._backend, self._cuda = backend, backend.while_runtime()
-        self._ops = tuple(ops)
         self._graph, self._exec = ctypes.c_void_p(), ctypes.c_void_p()
+        self._ops = ()
         try:
+            self._ops = self._snapshot(ops)
             self._cuda._call("cudaGraphCreate", ctypes.byref(self._graph), ctypes.c_uint(0))
             self._append(self._graph.value, self._ops)
             self._cuda._call("cudaGraphInstantiateWithFlags", ctypes.byref(self._exec), self._graph,
@@ -108,6 +109,25 @@ class _CUDAComposedGraph:
         except BaseException:
             self.reset()
             raise
+
+    def _snapshot(self, ops) -> tuple:
+        """Own the leaves, never a conditional executable used as a child.
+
+        Normalize within each conditional's scope before lowering so a nested
+        sequence keeps the dependency on its preceding sibling. A new parent
+        also survives reset of an intermediate composed executable.
+        """
+        result = []
+        for op in ops:
+            if isinstance(op, _CUDAComposedGraph):
+                if not op._graph.value or op._backend.device != self._backend.device:
+                    raise ValueError("a composed member must be live and on the same device")
+                result.extend(self._snapshot(op._ops))
+            elif isinstance(op, GraphConditional):
+                result.append(GraphConditional(op.kind, op.predicate, self._snapshot(op.body)))
+            else:
+                result.append(op)
+        return tuple(result)
 
     def _append(self, graph: int, ops) -> ctypes.c_void_p | None:
         previous = None

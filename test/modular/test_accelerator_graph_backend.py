@@ -413,6 +413,53 @@ def test_composed_cuda_captures_keep_each_round_and_reuse_both_slots(monkeypatch
             torch.testing.assert_close(member_got, member_want)
 
 
+def test_composed_parent_owns_operations_after_intermediate_reset(monkeypatch):
+    from test_device_run import _Loop
+
+    from mstar.engine.accelerator_graph_backend import _CUDAComposedGraph
+
+    # Exercise production operation ownership without claiming native lowering.
+    # The real CUDA body-reuse case checks the dependency chain and IF-in-WHILE.
+    def call(name, *args):
+        if name in ("cudaGraphCreate", "cudaGraphInstantiateWithFlags"):
+            args[0]._obj.value = 1
+    backend = SimpleNamespace(device=torch.device("cpu"), while_runtime=lambda: SimpleNamespace(_call=call))
+    monkeypatch.setattr(_CUDAComposedGraph, "_append", lambda *args: None)
+    value = torch.zeros(1)
+    predicate = torch.ones(1, dtype=torch.long)
+    class Leaf:
+        def replay(self):
+            value.mul_(2)
+    leaf = Leaf()
+    held = weakref.ref(leaf)
+    inner = _CUDAComposedGraph(backend, (leaf,))
+    selected = _CUDAComposedGraph(backend, (GraphConditional("if", predicate, (inner,)),))
+    parent = _CUDAComposedGraph(backend, (
+        SimpleNamespace(replay=lambda: value.add_(3)), selected,
+        SimpleNamespace(replay=lambda: value.add_(1)),
+    ))
+    inner.reset()
+    selected.reset()
+    del inner, selected, leaf
+    gc.collect()
+    assert held() is not None
+    for enabled, expected in ((True, 7), (False, 4), (True, 7)):
+        predicate.fill_(enabled)
+        value.zero_()
+        _Loop().compose(parent._ops).replay()
+        assert value.item() == expected
+    # Invalid nested members fail before changing the live source composition.
+    other = SimpleNamespace(device=torch.device("cuda:1"), while_runtime=backend.while_runtime)
+    with pytest.raises(ValueError, match="same device"):
+        _CUDAComposedGraph(other, (parent,))
+    assert parent._graph.value
+    parent.reset()
+    with pytest.raises(ValueError, match="live"):
+        _CUDAComposedGraph(backend, (GraphConditional("if", predicate, (parent,)),))
+    gc.collect()
+    assert held() is None
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="real CUDA conditional composition")
 def test_one_cuda_launch_gates_members_independently_and_drains_without_producing(monkeypatch):
     """Nested IFs are constructed in the WHILE body, never launched as child runs."""
