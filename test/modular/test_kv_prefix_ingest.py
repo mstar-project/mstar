@@ -77,11 +77,12 @@ def _worker(runner: StepRunner) -> Worker:
     rids = RidTable()
     request_state = RequestStateManager()
     tensor_manager = SimpleNamespace(
+        get_tensor=None,
         register_request=lambda rid, sharding: None,
         start_read_tensors=lambda rid, edges, graph_walk=None: [],
     )
     w = make_worker(
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             add_request=lambda request_id, **kw: rids.intern(request_id),
             get_rid_handle=rids.handle,
             get_sharding_config=lambda rid: None,

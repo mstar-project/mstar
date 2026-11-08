@@ -62,13 +62,14 @@ requests batch together and are captured per batch size (1 to 64).
 ``<|startofprev|>`` context), ``timestamps`` (``segment`` or ``word``, set
 from ``response_format`` / ``timestamp_granularities``), ``temperature``.
 
-**Long-form audio.** Whisper hears 30 s; the transcription route serves a
-longer upload as consecutive windows (openai-whisper's loop): each window is
-conditioned on the transcript so far, decoded with timestamps so the next
-window starts where the last closed segment ended, and re-decoded (first
-without the prompt, then at rising temperatures) when its text is a
-repetition loop. ``long_form="parallel"`` submits fixed windows at once,
-cut at the quietest point before each boundary. See :doc:`clients`.
+**Long-form audio.** Whisper hears 30 s; the transcription route cuts a longer
+upload into fixed windows, each at the quietest point before its boundary, and
+submits them at once. ``long_form="sequential"`` asks for openai-whisper's loop
+instead: each window is conditioned on the transcript so far, decoded with
+timestamps so the next window starts where the last closed segment ended, and
+re-decoded (first without the prompt, then at rising temperatures) when its text
+is a repetition loop. It is several times slower, and only it has that
+repetition guard. See :doc:`clients`.
 
 Qwen3-ASR
 ---------
@@ -85,8 +86,10 @@ buckets) and decode (captured per batch size) run on paged KV. The model
 writes ``language {Name}<asr_text>{text}``; the adapter reports the
 language as an ISO code and the text alone.
 
-A request hears up to 20 minutes; longer uploads are cut into 20 minute
-windows. The ``context`` (the OpenAI ``prompt``) is the system-turn hint
+A request hears up to 20 minutes, but the route cuts an upload into 30 s windows
+and submits them at once, which is several times faster and holds far fewer KV
+pages. ``window_seconds=1200`` in ``extra_body`` asks for the whole file as one
+request (on 10 minute English files, about 1.07 % WER against 1.2 % on the windows one request at a time; at concurrency 16 the difference is within batching noise). The ``context`` (the OpenAI ``prompt``) is the system-turn hint
 the reference SDK also takes; ``language`` forces the language;
 ``assistant_prefix`` prefills the assistant turn, which is what streaming
 builds on.
@@ -113,6 +116,14 @@ the event loop and transport threads. On a 192-core H200 host the cap matched
 models, where the default pool lost 4-9 % (up to 29 % with the server pinned
 to 16 cores), so no launch setting is needed.
 
+``whisper_large_v3_turbo.yaml`` and ``qwen3_asr.yaml`` set ``knobs: step_threads: serial``.
+ASR's GPU and plan threads overlap no CPU work to speak of (with the clock held,
+threaded, turn-taking and serial run within 2 %; Turbo at concurrency 1 loses
+5 % in serial), and on a ``schedutil`` host work split across threads stays near
+the lowest clock. One thread stays busy enough for the governor to raise it:
+Turbo gained 59 % and 67 % at concurrency 4 and 16, Qwen3-ASR 77 % and 63 %, on
+one H200 with client-cut 30 s windows and no pinning.
+
 A transcription moves its audio, encoder states and output tokens as many small
 tensors. The SHM transport places them in the shared-memory arena's
 preallocated segments; the file per tensor it used before cost throughput.
@@ -123,22 +134,26 @@ and 64 with a file per tensor, 87, 252, 494 and 558 on the arena, with the same
 Every ASR config sets ``max_concurrent_requests``. Whisper's decoder caches
 hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
 and the model refuses at startup a cap they cannot hold. Requests past the cap
-wait in the conductor. Qwen3-ASR's requests vary far more in size: a 20 minute
+wait in the conductor, with their audio already staged in shared memory, so
+the uploads the transcription route is cutting at once split the cap between
+them, at least one window each; their other windows wait in the API server.
+A lone upload keeps up to 32 windows on the engine. Qwen3-ASR's requests vary far more in size: a 20 minute
 file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
-its transcript, so the shipped config's 2048 pages (``kv_cache.max_num_pages``)
-hold about 13 of them at full size at once. More concurrent long files than
-the pool holds offload to the host pool and, once that is full too, wait on
-each other until they time out: 16 concurrent single-window 20 minute files
-stalled on 2048 pages, and peaked at 2352 pages with 4096 in the pool.
+its transcript, while a 30 s window holds about 4. ``qwen3_asr.yaml`` sizes
+its pools for an 80 GB H100 (``kv_cache.max_num_pages: 3500`` and
+``cpu_offload_pages: 1536``) and caps Qwen3-ASR at 64
+concurrent requests, which any mix of windows fits and which is what the
+default long-form throughput needs. Under 16 and 32 concurrent whole 20 minute
+files, GPU memory peaked at 74,285 and 78,651 MiB in two sessions on an H200, against
+an H100's 81,559 MiB. It hasn't been run on an H100; the H200's larger memory may
+let the allocator cache more, so an H100 may peak lower.
 
-``qwen3_asr.yaml`` and ``qwen3_asr_split.yaml`` therefore cap Qwen3-ASR at 12
-concurrent requests, which any mix of files up to 20 minutes fits. The cap costs short-utterance
-throughput: on LibriSpeech test-clean (one H200, Qwen3-ASR 1.7B) RTFx was
-about 420 at 8 concurrent requests, 900 at 32 and 1280 at 64. A deployment
-that only serves short audio can raise ``max_concurrent_requests`` (64 fits
-the default pool); one that serves many long files at once can raise
-``kv_cache.max_num_pages`` with the cap. Admission that sizes the cap by each
-request's pages instead is planned.
+The cap does not bound long whole files. Admission reserves only a request's
+prompt, so more concurrent 20 minute files than the pools hold offload to the
+host pool and, once that is full too, wait on each other until they time out.
+Only requests that ask for whole files with ``window_seconds`` can do this; one
+that takes bursts of them should lower the cap or raise the pools with it.
+``qwen3_asr_split.yaml`` keeps its cap of 12 and 2048 pages, which hold any mix of files up to 20 minutes; it hasn't been measured at a higher cap.
 
 Both decode loops stream their transcript token by token. A decode step
 keeps its rows' tokens on the device for the next step (the sampler's device
