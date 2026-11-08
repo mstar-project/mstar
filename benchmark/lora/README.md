@@ -140,11 +140,8 @@ kept 96.2/96.2/97.2% of its LoRA-off throughput at c=1/32/64 without that captur
 
 ## 4. Tensor parallelism: TP2 against one GPU, and slot churn (about 30 minutes, 2 GPUs)
 
-Until #1082 lands, startup refuses LoRA on a tensor-parallel node under the async TP
-scheduler (`docs/models.rst`), so the phase runs `MSTAR_TP_ASYNC_SCHED=0` only.
-
 Needs at least two GPUs and the `reference` and captured `serve` output of
-section 2 in the same `--out`. With `MSTAR_TP_ASYNC_SCHED=0` (the serial TP protocol), the
+section 2 in the same `--out`. With `MSTAR_TP_ASYNC_SCHED=0` and `=1` in turn, the
 same server with the LLM node at TP2 (vision encoder on rank 0):
 
 ```
@@ -152,8 +149,7 @@ python -m benchmark.lora.qwen3_5_parity --model qwen3_5_0.8b --out ~/lora_parity
 ```
 
 (`--model qwen3_5_9b` for the 9B, whose stock config is single-GPU too; `--tp 2`
-rewrites the node groups either way. `--async-sched 0,1` adds the async scheduler once
-#1082 lands.)
+rewrites the node groups either way. `--async-sched 1` runs one setting.)
 
 * Parity: every `serve` request against the single-GPU captured run, by the
   `graphs` rule (identical, or a first difference where both tokens are in the
@@ -166,10 +162,10 @@ rewrites the node groups either way. `--async-sched 0,1` adds the async schedule
   evictions, and the run finishes (each request times out at 300 s, so a hang
   surfaces as failures).
 
-Pass: the phase exits 0. Results: `mstar_tp2_async0.json`, `tp_tp2_async0.json` and
-`server_tp2_async0.log`; copy them off after the run. `MSTAR_TP_ASYNC_SCHED=1`, the default
-outside this harness, exercises the leader's teardowns landing behind a speculated step's
-admit, and waits on #1082.
+Pass: the phase exits 0 for both settings. Results: `mstar_tp2_async{0,1}.json`,
+`tp_tp2_async{0,1}.json` and `server_tp2_async{0,1}.log`; copy them off after each
+setting. `MSTAR_TP_ASYNC_SCHED=1` (the default) is the setting that exercises the
+leader's teardowns landing behind a speculated step's admit; `=0` is the serial protocol.
 
 ## 5. Prefix caching keyed by adapter, on Orpheus (about 15 minutes)
 
@@ -245,18 +241,18 @@ Qwen3.5 keys no prefix-cache stream, so no adapter has a prefix-cache root in th
 That a reload of the same weights keeps its root, and of other weights does not, is the
 CPU test `test_a_runtime_load_and_unload_end_to_end` in `test/modular/test_lora_api.py`.
 
-Under TP (two GPUs; after section 4 passes), on the serial protocol (`--async-sched 1`, the
-async TP scheduler, is refused with LoRA until #1082 lands):
+Under TP (two GPUs; after section 4 passes), once per `MSTAR_TP_ASYNC_SCHED` setting:
 
 ```
 python -m benchmark.lora.runtime_load --model qwen3_5_0.8b --out ~/lora_parity --tp 2 --async-sched 0
+python -m benchmark.lora.runtime_load --model qwen3_5_0.8b --out ~/lora_parity --tp 2 --async-sched 1
 ```
 
 Loads and unloads reach each rank of the instance on its own, at whatever step it is on;
 the pool is built so that this cannot change a slot decision (`LoraAdapterPool`'s
 docstring). A hang (requests time out at 300 s and count as failed), a failed base
 request or a parity failure here is the sign it can. Results are suffixed
-`_tp2_async0`.
+`_tp2_async<0|1>`.
 
 ## 7. Against vLLM and SGLang: per-request multi-LoRA serving (about 3.5 hours, GPU 0 only)
 

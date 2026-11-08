@@ -416,7 +416,7 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
     tp.device_group = tp.cpu_group = dist.group.WORLD
     tp.initialized = True
     tp.init_all_reduce()
-    joint = JointGroups(tp_group=tp, sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp)
     pool = LoraAdapterPool.build(make_spec(lora_paths, max_slots=2, cpu_capacity=1),
                                  EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
     if rank == 1:
