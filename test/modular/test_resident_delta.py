@@ -130,6 +130,7 @@ class _Resource:
     supports_eviction = True
     supports_preplan = False
     force_double_buffer = False
+    idle_capture = False
 
     def __init__(self):
         self.offloaded: set[str] = set()
