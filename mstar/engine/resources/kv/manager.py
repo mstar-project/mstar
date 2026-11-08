@@ -3707,7 +3707,10 @@ class KVManager(AttentionResource):
             # retaining the runs already took their evictable pages out of the room, so the check runs
             # even when the index holds every page
             fits = not self._decides or needed <= self._reload_room(rid)
-            pages = self._grant(rid, ", ".join(states), needed, 0) if fits else None
+            # A follower can replay rank 0's reload before its own commit gives back the pages the reload takes, so
+            # it waits for that commit rather than evict or raise.
+            waits = not self._decides and needed > self._arena.num_free and self._commit_pending()
+            pages = self._grant(rid, ", ".join(states), needed, 0) if fits and not waits else None
             if pages is None:
                 for run in runs.values():
                     self._arena.release(run)
@@ -3747,6 +3750,10 @@ class KVManager(AttentionResource):
                     copied = self._streams[rid][label].page_indices[len(run):len(state.keys)]
                     self._index.insert_run(state.keys[len(run):], copied, run[-1] if run else None)
         return True
+
+    def _commit_pending(self) -> bool:
+        """Whether a step admitted here hasn't committed yet."""
+        return any(stream.step_in_flight for streams in self._streams.values() for stream in streams.values())
 
     def _add_host_copy(self, copy: HostCopy) -> None:
         self._arena.retain(copy.pages)
