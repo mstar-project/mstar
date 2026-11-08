@@ -7,7 +7,8 @@ decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config the workflow writes: the team's
 Slurm node when it has them free, else any open Eras listing under the hourly cap.
 
-    gpu_review.py start    --pr N --sha SHA --main-sha SHA --gpus G --hours H --review review.json --out DIR
+    gpu_review.py start    --pr N --sha SHA --main-sha SHA --gpus G --hours H --run full|targeted
+                           --review review.json --out DIR
     gpu_review.py wait     --out DIR [--start-timeout MIN]
     gpu_review.py cleanup  --pr N --tag T
     gpu_review.py approve  --pr N --sha SHA --review review.json --complete true|false --verdict pass|...
@@ -88,7 +89,7 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   `report.md` (the report reference's format, media linked relatively under `media/`),
   `media/` (the test matrix's Media rules: small files, a stereo recording for duplex), and
   `result.json` as {{"verdict": "pass" | "partial" | "fail" | "unavailable", "summary": "<one sentence>"}}.
-- What to run: **{live['run']}**. {live['reason']}
+- What to run: **{a.run}**. {live['reason']}
 - The static review's open findings, to settle as extra claims:
 {confirm}
 - GPUs are expensive: the smallest model and layout that reach the changed code, no reruns of
@@ -361,6 +362,8 @@ def main():
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--gpus", type=int, required=True)
     p.add_argument("--hours", type=float, required=True)
+    p.add_argument("--run", choices=("full", "targeted"), required=True,
+                   help="the review's call, made full when the last live test didn't pass on an ancestor")
     p.add_argument("--model", default="claude-opus-5-5")
     p.add_argument("--turns", type=int, default=2000)
     p.add_argument("--claude-version", default="stable")

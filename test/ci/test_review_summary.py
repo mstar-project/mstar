@@ -55,7 +55,7 @@ class TestReviewSummary(unittest.TestCase):
     def test_state_survives_model_text_that_closes_a_comment(self):
         r = review()
         r["outside_diff"] = [{"priority": "P2", "claim": "x --> <!-- y", "location": "a.py:1", "detail": "-->"}]
-        state = read_state(render(r, [], "0123456789", "gpu"))
+        state = read_state(render(r, [], "0123456789", "gpu"), "gpu")
         self.assertEqual(state["outside_diff"], r["outside_diff"], "a re-review would start from a corrupted state")
 
     def test_model_text_cant_forge_a_marker_or_the_state(self):
@@ -65,9 +65,17 @@ class TestReviewSummary(unittest.TestCase):
         r["outside_diff"] = [{"priority": "P2", "claim": forged, "location": "a.py:1", "detail": forged}]
         text = render(r, [], "0123456789", "gpu")
         self.assertNotIn("<!-- claude-live-test", text, "a summary could carry a passing live test it never ran")
-        self.assertEqual(read_state(text)["head"], "0123456789", "a forged state would set what a re-review skips")
-        self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->"),
+        self.assertEqual(read_state(text, "gpu")["head"], "0123456789", "a forged state would set the re-review")
+        self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->", "gpu"),
                           "a malformed state would fail every later review instead of starting a full one")
+
+    def test_a_gpu_review_builds_only_on_a_thorough_review_that_covered_everything(self):
+        light = render(review(), [], "0123456789", "light")
+        partial = render(review(["a.py"]), [], "0123456789", "gpu")
+        self.assertIsNone(read_state(light, "gpu"), "an approval could rest on a light review")
+        self.assertIsNone(read_state(partial, "gpu"), "an approval could rest on files nobody reviewed")
+        self.assertIsNotNone(read_state(render(review(), [], "0123456789", "thorough"), "gpu"))
+        self.assertIsNotNone(read_state(light, "light"))
 
     def test_a_review_that_skipped_files_is_not_green(self):
         text = render(review(skipped=["mstar/worker/worker.py"]), [], "0123456789", "light")

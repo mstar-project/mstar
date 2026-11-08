@@ -10,7 +10,7 @@ claude-review.yml with the default branch checked out:
 
     python3 .github/review/render_summary.py --schema     # for --json-schema
     python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json < output.json
-    python3 .github/review/render_summary.py --state < summary-comment-body   # the review state a later run reads
+    python3 .github/review/render_summary.py --state --mode gpu < summary-comment-body   # what a re-review reads
 """
 import argparse
 import base64
@@ -147,22 +147,28 @@ def render(review, pages, head, mode):
     if live and mode == "gpu":
         parts.append(f"Live test: **{live['run']}**. {live['reason']}")
     parts.append(FOOTER)
-    state = {"head": head, "mode": mode, "outside_diff": review["outside_diff"], "risk": review.get("risk"),
-             "live_test": live}
+    state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
+             "risk": review.get("risk"), "live_test": live}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
     text = "\n\n".join(parts).replace("<!--", "&lt;!--")
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
 
 
-def read_state(body):
-    """The state a summary comment carries (its last), or None, also when it doesn't decode: then the
-    next run reviews the whole PR."""
+def read_state(body, mode):
+    """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
+    None, and that run reviews the whole PR. None too when it doesn't decode, and for a gpu review
+    unless the earlier one was thorough or gpu and skipped nothing, since its result can approve."""
     found = STATE.findall(body)
     try:
         state = json.loads(base64.b64decode(found[-1])) if found else None
     except ValueError:
         return None
-    return state if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        return None
+    # A state from before `skipped` was kept counts as having skipped files.
+    if mode == "gpu" and (state.get("mode") not in ("thorough", "gpu") or state.get("skipped", [None])):
+        return None
+    return state
 
 
 def main():
@@ -171,12 +177,13 @@ def main():
     ap.add_argument("--head")
     ap.add_argument("--mode")
     ap.add_argument("--threads", help="the PR's review threads, from `gh api graphql --paginate --slurp`")
-    ap.add_argument("--state", action="store_true", help="print the state a summary comment (stdin) carries")
+    ap.add_argument("--state", action="store_true",
+                    help="print the state a summary comment (stdin) carries, for a re-review in --mode")
     a = ap.parse_args()
     if a.schema:
         print(json.dumps(SCHEMA, separators=(",", ":")))
     elif a.state:
-        state = read_state(sys.stdin.read())
+        state = read_state(sys.stdin.read(), a.mode)
         print(json.dumps(state) if state else "")
     else:
         with open(a.threads) as f:

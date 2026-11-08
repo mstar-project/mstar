@@ -352,6 +352,7 @@ jobs:
         env:
           PREV: ${{ steps.prev.outputs.dir }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
         run: |
           if [ -n "$PREV" ]; then cp "$PREV/handoff.md" handoff.md; fi
           # GitHub refuses `gh pr diff` past 20,000 lines or 300 files. Fall back
@@ -390,13 +391,14 @@ jobs:
 
           # A re-review starts from this bot's last summary, when its commit is still an ancestor
           # of the head: the review re-checks those findings and reads only what changed since
-          # (review-prompt.md, "Re-review"). After a force-push it reviews the whole PR again.
+          # (review-prompt.md, "Re-review"). After a force-push it reviews the whole PR again, and
+          # a gpu review does too unless the last one was thorough or gpu and skipped nothing.
           # The state is read only from the bot's own summaries: comments that start with the
           # summary's marker, in which model text can't open an HTML comment.
           if [ -z "$PREV" ]; then
             jq -r '[.[] | select(.user == "mstar-review[bot]" or .user == "github-actions[bot]")
                     | select(.body | startswith("<!-- claude-review-summary -->"))] | last | .body // empty' \
-              pr-conversation.json | python3 .github/review/render_summary.py --state > last-review.json
+              pr-conversation.json | python3 .github/review/render_summary.py --state --mode "$MODE" > last-review.json
             last=$(jq -r '.head // empty' last-review.json 2> /dev/null)
             # A diff GitHub won't give (too large, say) means a full review, never an empty since.diff.
             if [ -n "$last" ] && [ "$(gh api "repos/$REPO/compare/$last...$HEAD_SHA" --jq .status 2> /dev/null)" = "ahead" -o "$last" = "$HEAD_SHA" ] &&
@@ -811,12 +813,14 @@ jobs:
           run=$(jq -r '.live_test.run // "full"' review.json)
           { echo "gpus=$gpus"; echo "run=$run"; echo "hours=$HOURS"; } >> "$GITHUB_OUTPUT"
 
-      # `none`: the review found nothing since the last passing live test that
-      # reaches code it exercised. Carry that result only when it passed and its
-      # commit is an ancestor of this head.
-      - name: Carry the last live test
-        if: steps.cfg.outputs.run == 'none' && steps.cfg.outputs.trusted == 'true'
+      # `none` and `targeted` build on the last live test: only when it passed, on a commit
+      # that is an ancestor of this head. Otherwise the live test runs in full. A `none` that
+      # holds carries that pass.
+      - name: Check the last live test
+        if: steps.cfg.outputs.run != 'full' && steps.cfg.outputs.trusted == 'true'
         id: carry
+        env:
+          RUN: ${{ steps.cfg.outputs.run }}
         run: |
           # Only the first line of the bot's live-test comments: the report below it is the box's text.
           marker=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
@@ -825,16 +829,21 @@ jobs:
             | grep -x '<!-- claude-live-test sha=[0-9a-f]* verdict=[a-z]* -->' | tail -n 1)
           sha=$(sed -E 's/.*sha=([0-9a-f]*).*/\1/' <<< "$marker"); verdict=$(sed -E 's/.*verdict=([a-z]*).*/\1/' <<< "$marker")
           status=$( [ -n "$sha" ] && gh api "repos/$REPO/compare/$sha...$HEAD_SHA" --jq .status 2> /dev/null || true )
-          if [ "$verdict" = "pass" ] && { [ "$status" = "ahead" ] || [ "$status" = "identical" ]; }; then
+          if [ "$verdict" != "pass" ] || { [ "$status" != "ahead" ] && [ "$status" != "identical" ]; }; then
+            echo "::notice::The review asked for a $RUN live test, but the last one didn't pass on an ancestor; running it in full."
+            echo "run=full" >> "$GITHUB_OUTPUT"
+          elif [ "$RUN" = "none" ]; then
+            echo "run=none" >> "$GITHUB_OUTPUT"
             echo "verdict=pass" >> "$GITHUB_OUTPUT"
             echo "note=No GPU run: nothing since the passing live test of \`${sha:0:7}\` reaches code it exercised." >> "$GITHUB_OUTPUT"
           else
-            echo "verdict=none" >> "$GITHUB_OUTPUT"
-            echo "note=No GPU run, and no passing live test of an earlier commit to carry, so this can't be approved; comment \`/review gpu\` after a change that needs one." >> "$GITHUB_OUTPUT"
+            echo "run=targeted" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Get GPUs and start the live test
-        if: steps.cfg.outputs.run != 'none' && steps.cfg.outputs.trusted == 'true'
+        if: >-
+          steps.cfg.outputs.trusted == 'true' &&
+          (steps.cfg.outputs.run == 'full' || (steps.carry.outputs.run != '' && steps.carry.outputs.run != 'none'))
         id: start
         continue-on-error: true
         env:
@@ -843,6 +852,7 @@ jobs:
           set +e
           python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
             --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
+            --run "${{ steps.carry.outputs.run || steps.cfg.outputs.run }}" \
             --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
           code=$?
           [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
@@ -906,7 +916,7 @@ jobs:
           git push -q
 
       - name: Decide approval
-        if: always() && (steps.render.outcome == 'success' || steps.carry.outcome == 'success')
+        if: always() && (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '')
         id: approve
         continue-on-error: true
         env:
@@ -922,7 +932,7 @@ jobs:
       - name: Post the live test
         if: >-
           always() && steps.cfg.outcome == 'success' &&
-          (steps.render.outcome == 'success' || steps.carry.outcome == 'success' || steps.cfg.outputs.trusted != 'true' ||
+          (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '' || steps.cfg.outputs.trusted != 'true' ||
            steps.start.outputs.unavailable == 'true' || steps.wait.outputs.unavailable == 'true')
         continue-on-error: true
         env:

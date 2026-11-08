@@ -472,6 +472,9 @@ to test, and the review's findings.
 - `none`: nothing since the last passing live test reaches code it exercised (docs, tests,
   comments, an unrelated file). Its result carries over to this head.
 
+`targeted` and `none` build on the last live test, so they hold only when it passed on an ancestor
+of the head; otherwise the bot runs the live test in full.
+
 **GPUs are expensive; use as few as settle the question.** Size the box to the largest config the
 plan needs, not the largest the model supports; prefer the smallest model and layout that reaches
 the changed code; stop as soon as the plan is done; and never rerun a passing check whose code is
