@@ -37,6 +37,7 @@ from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import gather_merge, position_pools
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep, StepContext
+from mstar.platforms.compile import compiled
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -153,6 +154,8 @@ class SeqShardPlan(NamedTuple):
 
     split: bool
     ranges: Mapping[str, SeqRange]
+    # a warm-up or capture of this step, which every replay repeats
+    captured: bool = False
 
 
 COPIED = SeqShardPlan(False, {})
@@ -243,6 +246,8 @@ class SequenceShard(Resource):
             self._current, self._pending, self._preplanned = self._pending, None, False
             return self._current
         result = self._decide(step, ctx) if self.can_split else COPIED
+        if ctx.capture:
+            result = result._replace(captured=True)
         if ctx.is_preplan:
             self._pending, self._preplanned = result, True
         else:
@@ -329,6 +334,11 @@ class SequenceShard(Resource):
         return SeqRange(self.group, tuple(sp_seq_split(spans[0], world)), len(spans))
 
     ### Submodule-level functionality
+
+    @property
+    def captured(self) -> bool:
+        """This step is a warm-up or capture, so the kernels its exchanges run are the ones its replays repeat."""
+        return self._current is not None and self._current.captured
 
     def split_range(self, label: str) -> SeqRange | None:
         """``label``'s ranges if this step splits it; None when copied, unlisted or outside a step."""
@@ -429,21 +439,27 @@ def _packed(x: torch.Tensor, r: SeqRange) -> torch.Tensor:
     return x if r.rows is None else x.flatten(0, 1)
 
 
-def ulysses(run: Callable, q, k, v, r: SeqRange):
+def ulysses(run: Callable, q, k, v, r: SeqRange, captured: bool = False):
     """Split tokens to split heads: one all-to-all of q, k and v (each ``[n, H, D]``, this rank's
-    tokens) to ``[N, H / P, D]``, ``run``, and the output back."""
+    tokens) to ``[N, H / P, D]``, ``run``, and the output back.
+
+    A ``captured`` step compiles the all-to-all at its own shapes, once in the warm-up, so the graph
+    replays fused layout copies; ``dynamic=False`` because another bucket's token count would make
+    that dim dynamic, a slower kernel than eager. Any other step stays eager: its token counts vary,
+    so compiling would stall on each new one and gain nothing per step."""
     _check_entry(r, q, k, v)
+    all_to_all = compiled(CommGroup.all_to_all, dynamic=False) if captured else CommGroup.all_to_all
     seq, head = (0, 1) if r.rows is None else (1, 2)
     parts = [x for x in (q, k, v) if x is not None]
-    exchanged = r.group.all_to_all(
-        [_seq_view(x, r) for x in parts], scatter_dim=head, gather_dim=seq, gather_sizes=list(r.counts),
+    exchanged = all_to_all(
+        r.group, [_seq_view(x, r) for x in parts], scatter_dim=head, gather_dim=seq, gather_sizes=list(r.counts),
     )
     exchanged = [_packed(x, r) for x in exchanged]
     if q is None:
         run(None, *exchanged)
         return None
     out = run(*exchanged)
-    out = r.group.all_to_all(_seq_view(out, r), scatter_dim=seq, gather_dim=head, scatter_sizes=list(r.counts))
+    out = all_to_all(r.group, _seq_view(out, r), scatter_dim=seq, gather_dim=head, scatter_sizes=list(r.counts))
     return _packed(out, r)
 
 

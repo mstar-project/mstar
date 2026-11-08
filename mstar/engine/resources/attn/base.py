@@ -109,7 +109,7 @@ class AttentionManager(AttentionResource):
         try:
             if r is not None:
                 shard.check_scattered(label)
-                return ulysses(run, q, k, v, r)
+                return ulysses(run, q, k, v, r, shard.captured)
             return head_slice(run, q, k, v, shard.group)
         finally:
             shard.exchanging = False

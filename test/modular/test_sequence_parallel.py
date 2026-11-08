@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from flashinfer_reference import reference_attention
+from torch._C._dynamo.eval_frame import _debug_get_cache_entry_list
 
 from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, sp_seq_split
@@ -156,7 +157,7 @@ def _rows_attention(rows: int, causal: bool, lse: bool = False):
     return run
 
 
-def _split_exchanges(rank, world, total, rows):
+def _split_exchanges(rank, world, total, rows, captured):
     """Each exchange of this rank's tokens of a ``rows``-row step (None: one packed label) against
     one rank attending them all, and a write alone (``q=None``), with the same collectives on every
     rank."""
@@ -184,7 +185,12 @@ def _split_exchanges(rank, world, total, rows):
     communication._all_gather_into_tensor = record
     run = _rows_attention(b, causal=True)
     want = run(q, k, v)
-    torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r), local(want))
+    torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r, captured), local(want))
+    if captured:
+        # the capture itself, on what its warm-up above compiled
+        with torch.compiler.set_stance("fail_on_recompile"):
+            torch.testing.assert_close(ulysses(run, local(q), local(k), local(v), r, captured), local(want))
+        assert _debug_get_cache_entry_list(CommGroup.all_to_all.__code__)
     torch.testing.assert_close(head_slice(run, q, k, v, group), want)
     # copied queries over this rank's keys
     q_short = torch.randn(b * 5, HEADS, 4, generator=gen)
@@ -209,9 +215,12 @@ def _split_exchanges(rank, world, total, rows):
 
 
 @pytest.mark.parametrize("rows", [None, 2], ids=["packed", "rows"])
-@pytest.mark.parametrize("world,total", [(2, 7), (3, 11)], ids=["2-uneven", "3-uneven"])
-def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows):
-    _run(_split_exchanges, world, tmp_path / "store", total, rows)
+@pytest.mark.parametrize(
+    "world,total,captured", [(2, 7, False), (3, 11, False), (2, 6, True), (2, 7, True)],
+    ids=["2-uneven", "3-uneven", "2-even-captured", "2-uneven-captured"],
+)
+def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows, captured):
+    _run(_split_exchanges, world, tmp_path / "store", total, rows, captured)
 
 
 # --- when a step splits ---------------------------------------------------------------------------
@@ -223,11 +232,11 @@ def _shard(world: int = 2, rank: int = 0, labels=("main",), axis: int = 0, **spe
     return spec.resource_class.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
 
 
-def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=None, rows=None):
+def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=None, rows=None, capture=False):
     """The shard's plan of a step of ``segments`` ((request, label, span)), as label -> (counts, rows)
     when it splits, None when copied."""
     rids = rows or sorted({rid for rid, _, _ in segments})
-    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, slot_lease=lease,
+    ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=capture, slot_lease=lease,
                       force_prefill=force_prefill)
     # declared once on the submodule step, as a model does, which hands it to every resource step
     step = SubmoduleStep(
@@ -241,6 +250,14 @@ def _split(shard, segments, walk="w", lease=None, force_prefill=False, combined=
 
 def _rows(label, span, n=2):
     return [(f"r{i}", label, span) for i in range(n)]
+
+
+@pytest.mark.parametrize("tokens", [10, 1], ids=["split", "copied"])
+@pytest.mark.parametrize("capture", [False, True], ids=["replayed", "capture"])
+def test_a_step_is_captured_only_when_the_runner_captures_it(tokens, capture):
+    shard = _shard()
+    _split(shard, [("r0", "main", tokens)], capture=capture)
+    assert shard.captured == capture
 
 
 @pytest.mark.parametrize("shard, step, ranges", [
