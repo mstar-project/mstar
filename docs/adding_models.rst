@@ -309,6 +309,13 @@ There are two ``ResourceReqConfig`` subclasses:
 
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
+
+  A sampler whose ``vocab_size`` is past the one-kernel draw (4096) also gets a greedy
+  capture of each batched bucket, keyed ``GreedySample(<the node's own key>)``, whose
+  sampler is an argmax. The engine leases it for a step whose every row samples
+  greedily: temperature 0, no repetition penalty, no ``min_tokens`` and no log-probs
+  (``samples_greedy``). Any other step replays the full sampler. The model declares
+  nothing for it.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
