@@ -1615,17 +1615,21 @@ def test_a_read_sees_a_bound_only_the_mover_had_stale(monkeypatch):
         waits._real_sleep(0.1)
         time.perf_counter()  # past the true bound, though the mover's says not
         print(waits.REPORT["ahead_stalls"])
-        table.bound, table.latest = lambda: 1e9, lambda: 1e6
+        far = clock.now() + 1e6  # (the clock starts at the box's uptime: no fixed time is ahead of it)
+        table.bound, table.latest = lambda: 2 * far, lambda: far
         go = waits._real_lock()
         go.acquire()
-        threading.Thread(target=lambda: (go.acquire(), time.perf_counter()), name=waits.OWN + "reader").start()
+        reads = []
+        reader = threading.Thread(target=lambda: (go.acquire(), reads.append(time.perf_counter())),
+                                  name=waits.OWN + "reader")
+        reader.start()
         with clock.LOCK:
             clock.PARKED[0] = True
             go.release()
             waits._real_sleep(0.05)  # it has seen the process parked, and waits for this lock
             clock.PARKED[0] = False
-        waits._real_sleep(0.05)
-        print(clock.now() < 1e6)
+        reader.join()
+        print(reads[0] < far)  # (its own read: a later one could follow a legitimate park)
     """)
     assert out.split() == ["1", "True"], out
 
