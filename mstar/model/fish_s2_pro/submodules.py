@@ -440,6 +440,20 @@ class CodecSubmodule(ARNodeSubmodule):
         widths = ([wide[-1]] if wide else []) + ([1] if self.windows[0] == 1 else [])
         return {"incremental": [example(rows, width) for width in widths for rows in (1, self.MAX_BATCH_SIZE)]}
 
+    def warmup_compiles(self) -> None:
+        """Run each step the codec decodes eagerly, past its captures, once at its
+        exact size (rows x width). ``compile_regions`` traces the decode for every
+        size, but each conv's cuDNN plan, and the allocator's blocks, are made on
+        the first step of each size, which would otherwise fall on live requests."""
+        device, blocks = self.get_device(), self.incremental.state_blocks()
+        for width in self.windows:
+            for rows in range(2, self.MAX_BATCH_SIZE + 1):
+                if rows * width <= self.CAPTURE_MAX_FRAMES:
+                    continue
+                state = {name: torch.zeros(rows, *b.shape, dtype=b.dtype, device=device) for name, b in blocks.items()}
+                codes = torch.zeros(rows, self.config.num_codebooks, width, dtype=torch.long, device=device)
+                self.incremental(codes, state, torch.full((rows,), width, dtype=torch.long, device=device))
+
     def _bucket(self, frames: int) -> int:
         """Smallest captured chunk width that holds ``frames``."""
         for window in self.windows:
