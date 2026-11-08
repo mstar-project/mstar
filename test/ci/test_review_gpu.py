@@ -90,9 +90,10 @@ def live_test(verdict, sha="a" * 40, user="mstar-review[bot]"):
     return {"user": {"login": user}, "body": f"<!-- claude-live-test sha={sha} verdict={verdict} -->\nreport {verdict}"}
 
 
-def full(asked, forced):
+def full(asked, forced, asked_checks="correctness"):
     """carry's outputs for a run it made full: every kind of check, and what the review asked for and why not."""
-    return {"run": "full", "checks": "correctness,performance", "asked": asked, "forced": forced}
+    return {"run": "full", "checks": "correctness,performance", "asked": asked, "asked_checks": asked_checks,
+            "forced": forced}
 
 
 class TestCarry(unittest.TestCase):
@@ -119,7 +120,7 @@ class TestCarry(unittest.TestCase):
          full("full", "failed")),
         ("partial", True, "none", ["correctness"], [live_test("partial")], "ahead", full("none", "failed")),
         ("unavailable", True, "targeted", ["performance"], [live_test("unavailable")], "ahead",
-         full("targeted", "failed")),
+         full("targeted", "failed", "performance")),
         ("a fail after a pass, and a pass someone else posted", True, "none", ["correctness"],
          [live_test("pass"), live_test("fail"), live_test("pass", user="mallory")], "ahead",
          full("none", "failed")),
@@ -198,7 +199,7 @@ class TestStart(unittest.TestCase):
         a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="main", gpus=1, hours=4.0,
                                run="full", review=str(out / "review.json"), out=str(out), tag="1-1",
                                model="m", turns=10, claude_version="stable", since=None, earlier_report=None,
-                               checks=["correctness", "performance"], forced=None, asked=None)
+                               checks=["correctness", "performance"], forced=None, asked=None, asked_checks=None)
         vars(a).update(args)
         env = {k: v for k, v in os.environ.items() if k != "LIVE_TEST_ANTHROPIC_KEY"}
         with unittest.mock.patch.dict(os.environ, env | ({"LIVE_TEST_ANTHROPIC_KEY": env_key} if env_key else {}),
@@ -240,10 +241,15 @@ class TestStart(unittest.TestCase):
         a.checks = checks("performance,correctness")
         self.assertIn("- Checks: correctness (served output, parity, regressions) and performance",
                       GPU_REVIEW["brief"](a))
-        vars(a).update(run="full", checks=checks("correctness,performance"), asked="targeted", forced="failed")
-        self.assertIn("The review asked for `targeted`; the workflow made it full, with both kinds of check, because "
-                      "the PR's last live test didn't pass on an ancestor of this head.", GPU_REVIEW["brief"](a),
-                      "the session would plan a narrower run than the workflow chose")
+        vars(a).update(run="full", checks=checks("correctness,performance"), asked="targeted",
+                       asked_checks=checks("correctness"), forced="failed")
+        self.assertIn("The review asked for `targeted` with correctness checks only; the workflow made it full, with "
+                      "both kinds of check, because the PR's last live test didn't pass on an ancestor of this head.",
+                      GPU_REVIEW["brief"](a), "the session would plan a narrower run than the workflow chose")
+        a.asked = "full"
+        self.assertIn("The review asked for `full` with correctness checks only; the workflow runs both kinds of "
+                      "check, because the PR's last live test didn't pass", GPU_REVIEW["brief"](a),
+                      "the session would read the run the workflow widened as the one the review asked for")
         for bad in ("", "speed", "correctness,correctness", "correctness;id", "correctness,"):
             with self.assertRaises(argparse.ArgumentTypeError, msg=f"{bad!r} would reach the brief"):
                 checks(bad)

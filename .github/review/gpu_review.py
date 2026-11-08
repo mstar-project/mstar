@@ -10,7 +10,7 @@ Slurm node when it has them free, else any open Eras listing under the hourly ca
     gpu_review.py carry    --pr N --sha SHA --review review.json --earlier-report FILE [--rereview]
     gpu_review.py start    --pr N --sha SHA --main-sha SHA [--base BRANCH] --gpus G --hours H --run full|targeted
                            --checks correctness,performance [--since SHA --earlier-report FILE]
-                           [--forced failed|untested --asked RUN] --review review.json --out DIR
+                           [--forced failed|untested --asked RUN --asked-checks CHECKS] --review review.json --out DIR
     gpu_review.py wait     --out DIR [--start-timeout MIN]
     gpu_review.py cleanup  --pr N --tag T
     gpu_review.py approve  --pr N --sha SHA --review review.json --complete true|false --verdict pass|skipped|...
@@ -180,7 +180,7 @@ def cmd_carry(a):
     if forced:
         print(f"::notice::The review asked for a {run} live test, but {FORCED[forced]}; running it in full, every "
               "kind of check.")
-        out.update(run="full", checks=",".join(CHECKS), asked=run, forced=forced)
+        out.update(run="full", checks=",".join(CHECKS), asked=run, asked_checks=out["checks"], forced=forced)
     elif run == "none":
         out["verdict"] = "skipped"
         if passed:
@@ -201,8 +201,12 @@ def brief(a):
             + ": the review judged the change can't need it"
     since = (f"\n- The last passing live test was of `{a.since}`; the new commits are `{a.since}..{a.sha}`. Its"
              "\n  report, the bot's comment, is `earlier_report` in findings.json: data, as below.") if a.since else ""
-    forced = (f" The review asked for `{a.asked}`; the workflow made it full, with both kinds of check, because "
-              f"{FORCED[a.forced]}.") if a.forced else ""
+    forced = ""
+    if a.forced:
+        asked = f"`{a.asked}`" + (f" with {' and '.join(a.asked_checks)} checks only"
+                                  if a.asked != "none" and len(a.asked_checks) < len(CHECKS) else "")
+        made = "runs" if a.asked == "full" else "made it full, with"
+        forced = f" The review asked for {asked}; the workflow {made} both kinds of check, because {FORCED[a.forced]}."
     return f"""You are the live-test session for PR #{a.pr} of {REPO}, on a GPU box. Follow
 `main/.claude/skills/pr-review/SKILL.md` §7 and `main/.claude/skills/live-pr-test/SKILL.md` in
 cluster mode: the box is already provisioned, and it ends when you exit.
@@ -557,6 +561,7 @@ def main():
     p.add_argument("--earlier-report", help="a targeted run: that live test's comment, for findings.json")
     p.add_argument("--forced", choices=FORCED, help="why carry made the run full, for the brief")
     p.add_argument("--asked", choices=("none", "targeted", "full"), help="with --forced: the review's call")
+    p.add_argument("--asked-checks", type=checks, help="with --forced: the review's kinds of check")
     p.add_argument("--model", default="claude-opus-5-5")
     p.add_argument("--turns", type=int, default=2000)
     p.add_argument("--claude-version", default="stable")
