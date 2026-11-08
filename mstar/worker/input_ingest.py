@@ -175,7 +175,7 @@ class InputIngest:
             loop_caps=body.loop_caps,
         )
         body.request_info.rid_handle = rid
-        parked = lifecycle.add(rid, wire_rid)
+        lifecycle.add(rid, wire_rid)
         laps.lap("runtime_add")
 
         # One NewRequest comes per partition this worker serves, and a later one
@@ -203,7 +203,7 @@ class InputIngest:
                     log=logger,
                 )
                 lifecycle.fail({rid: f"Error in worker: {text}"})
-                self._dispatch(parked)
+                self._dispatch(lifecycle.take_parked(wire_rid))
                 return
         body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
@@ -221,7 +221,7 @@ class InputIngest:
         if signal_only:
             runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
         laps.lap("ingest_signals")
-        self._dispatch(parked)
+        self._dispatch(lifecycle.take_parked(wire_rid))
 
     def _remove_request(self, body: RemoveRequest) -> None:
         rid = self._runtime.get_rid_handle(body.request_id)

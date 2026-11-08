@@ -128,9 +128,43 @@ def test_parked_messages_come_back_once_and_a_removed_id_refuses_them():
     lifecycle = _lifecycle()
     message = _Msg("r1")
     assert lifecycle.park(message)
-    assert lifecycle.add(1, "r1") == [message]
-    assert list(lifecycle.add(1, "r1")) == []
+    lifecycle.add(1, "r1")
+    assert lifecycle.take_parked("r1") == [message]
+    assert lifecycle.take_parked("r1") == []
 
     assert lifecycle.park(_Msg("r2"))
     assert len(list(lifecycle.removed(None, "r2"))) == 1
     assert not lifecycle.park(_Msg("r2"))
+
+
+def test_parked_messages_stay_parked_until_the_replay_takes_them():
+    """A setup that raises between the arrival and the replay leaves them for
+    the request's teardown to drop and ACK."""
+    lifecycle = _lifecycle()
+    message = type("_Msg", (), {"body": DrainRequest(request_id="r1")})()
+    assert lifecycle.park(message)
+    lifecycle.add(1, "r1")
+
+    assert list(lifecycle.removed(1, "r1")) == [message], "a parked message would never be ACKed"
+
+
+def test_a_rows_first_error_is_the_one_reported():
+    lifecycle = _lifecycle(1)
+    lifecycle.fail({1: "Error in worker: request too long"})
+    lifecycle.fail({1: "Error in worker: internal error"})
+
+    assert lifecycle.take_failures() == {1: "Error in worker: request too long"}, (
+        "the client would get the step's generic error instead of its own"
+    )
+
+
+def test_a_teardown_that_raised_keeps_its_request_out_and_is_not_retried():
+    lifecycle = _lifecycle(1)
+    lifecycle.remove(1, RemoveRequest(request_id="r1", source=MessageSource.CONDUCTOR), -1)
+    assert lifecycle.removes_ready(set(), -1) == [1]
+    lifecycle.removed(1, "r1")
+
+    lifecycle.teardown_failed(1)
+
+    assert 1 in lifecycle.failed_rids, "a half torn-down request would be scheduled again"
+    assert lifecycle.removes_ready(set(), -1) == [], "the teardown would raise again every pass"
