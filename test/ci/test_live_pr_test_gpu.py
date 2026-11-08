@@ -8,8 +8,8 @@ import hashlib
 import io
 import json
 import os
-import runpy
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -17,7 +17,10 @@ import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-GPU = runpy.run_path(str(REPO_ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"))
+sys.path.insert(0, str(REPO_ROOT / ".claude/skills/live-pr-test/scripts"))
+import gpu as gpu_module  # noqa: E402
+
+GPU = vars(gpu_module)  # patched in place, with each test's cleanup restoring it
 SLURM_CFG = {"slurm": [{"name": "node1", "host": "root@node", "job_prefix": "live-pr",
                         "workdir": "/workspace/live-pr"}]}
 
@@ -39,7 +42,7 @@ def fake_slurm(replies, calls=None):
 
 class TestSlurm(unittest.TestCase):
     def setUp(self):
-        self.globals = GPU["status"].__globals__
+        self.globals = GPU
         self.saved = self.globals["slurm_run"]
 
     def tearDown(self):
@@ -283,68 +286,15 @@ class TestSlurm(unittest.TestCase):
 
 
 class TestEras(unittest.TestCase):
-    def test_terminate_deletes_only_its_own_ssh_key_once_no_live_instance_binds_it(self):
-        """A deleted key leaves the authorized_keys of every box that binds it (the spec's
-        SecretBindingRequest.ssh_key_ids), and DELETE /ssh-keys refuses nothing in use."""
-        calls, state = [], Path(tempfile.mkdtemp())
-        old = "2026-01-01T00:00:00Z"
-        keys = [{"id": k, "name": n, "key_type": "ssh-ed25519", "fingerprint": f"SHA256:{k}", "created_at": old,
-                 "created_by": None} for k, n in (("k1", "live-pr-7-1-1"), ("k2", "someone's laptop"),
-                                                  ("k3", "live-pr-6-1-1"))]
-        names = {"i-1": "live-pr-7-1-1", "i-2": "live-pr-9-1-1", "i-3": "live-pr-8-1-1"}
-        binds = {"i-1": ["k1"], "i-2": ["k1"], "i-3": ["k3"]}  # i-2 reuses the key launch 7 registered
-        status = {"i-1": "releasing", "i-2": "active", "i-3": "active"}
-
-        def eras(method, path, body=None, params=None):
-            calls.append((method, path))
-            if method == "DELETE" and refused:
-                raise GPU["ApiError"](403, {"code": "permission_denied", "message": "Not allowed."})
-            if path == "/instances":  # ended instances aren't listed
-                return {"items": [{"id": i, "name": names[i], "status": status[i], "mode": "standalone",
-                                   "standalone": {"current_run": {"status": "running", "bindings": {
-                                       "secrets": {"authorized-keys": {"ssh_key_ids": ids}}, "volumes": {}}}}}
-                                  for i, ids in binds.items()], "next_page_token": None, "total": len(binds)}
-            flt = json.loads((params or {}).get("filter") or "null")
-            return {"items": [k for k in keys if not flt or k["name"] == flt["value"]], "next_page_token": None,
-                    "total": len(keys)}
-
-        globs = GPU["terminate"].__globals__
-        saved = {k: globs[k] for k in ("eras", "STATE", "LEDGER")}
-        self.addCleanup(globs.update, saved)
-        globs.update(eras=eras, STATE=state, LEDGER=state / "instances.json")
-
-        def terminate(iid, name):
-            calls.clear()
-            e = {"provider": "eras", "instance_id": iid, "name": name, "launched_at": 0, "usd_per_hour": 1.0}
-            GPU["save_ledger"]({f"eras:{iid}": e})
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                GPU["terminate"](f"eras:{iid}", e)
-            return [c[1] for c in calls if c[0] == "DELETE"]
-
-        refused = False
-        self.assertEqual(terminate("i-1", names["i-1"]), [],
-                         "the box still binding the key would lose ssh access")
-        status["i-2"] = "releasing"
-        self.assertEqual(terminate("i-1", names["i-1"]), ["/ssh-keys/k1"],
-                         "a key whose other binders are going away would never be deleted")
-        del binds["i-3"]
-        self.assertEqual(terminate("i-3", names["i-3"]), [],
-                         "a launch would delete a key it reused, which another launch or a person registered")
-        # A delete that fails: the release stands, and the watchdog stops.
-        refused = True
-        terminate("i-1", names["i-1"])
-        self.assertEqual(GPU["ledger"](), {}, "the watchdog would retry a released instance forever")
-
-    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", deleted=False):
+    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview"):
         """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview (or the
         create, `refused_by`) refuses those `held` (as the spec has it), as when another box took them in
-        between; the calls it made. With `deleted`, the organization has the launch's ssh key already, and
-        the terminate of the launch that registered it deletes it between the lookup and the create."""
+        between; the calls it made."""
         key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
         key.write_text("ssh-ed25519 AAAA test")
         digest = hashlib.sha256(base64.b64decode("AAAA")).digest()
         fingerprint = "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
-        keys = [{"id": "k0", "name": "live-pr-1-old", "fingerprint": fingerprint}] if deleted else []
+        keys = []
         tpl = {"endpoints": {"ssh": {"port": 22}}, "pod": {"containers": [
             {"resources": {"limits": {"nvidia.com/gpu": "1"}}, "volumeMounts": []}], "volumes": []}}
 
@@ -359,13 +309,7 @@ class TestEras(unittest.TestCase):
                 if method == "POST":
                     keys.append({"id": f"k{len(calls)}", "name": body["name"], "fingerprint": fingerprint})
                 return keys[-1] if method == "POST" else {"items": keys}
-            if path == "/instances" and method == "POST" and not {k["id"] for k in keys} >= set(
-                    body["run"]["bindings"]["secrets"]["authorized-keys"]["ssh_key_ids"]):
-                raise GPU["ApiError"](404, {"code": "not_found", "message": "No such SSH key.",
-                                            "timestamp": "2026-11-08T00:00:00Z"})
             if path == "/instances/preview":
-                if deleted:
-                    keys.clear()
                 bound = bound and refused_by == "preview"
                 return {"run": {"problems": []}, "is_available": not bound,
                         "unavailable_reason": "volume_bound" if bound else None,
@@ -375,9 +319,9 @@ class TestEras(unittest.TestCase):
                        "/volumes/v2": {"attachment": None}}
             return replies.get(path, tpl)
 
-        saved = {k: GPU["cmd_launch"].__globals__[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
-        self.addCleanup(GPU["cmd_launch"].__globals__.update, saved)
-        GPU["cmd_launch"].__globals__.update(
+        saved = {k: GPU[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
+        self.addCleanup(GPU.update, saved)
+        GPU.update(
             eras=eras, STATE=state, LEDGER=state / "instances.json", find_offer=lambda cfg, offer: {
                 "id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1, "usd_per_hour": 3.0, "region": "x",
                 "storage": True})
@@ -409,16 +353,8 @@ class TestEras(unittest.TestCase):
         self.assertEqual(len(set(keys)), 3, "Eras refuses a key reused with another body (idempotency_key_reused), "
                                             "so the next volume or a cold box would never launch")
 
-    def test_a_launch_whose_ssh_key_was_deleted_registers_it_again(self):
-        calls = self.eras_launch(deleted=True, held=())
-        bound = [c[2]["run"]["bindings"]["secrets"]["authorized-keys"]["ssh_key_ids"] for c in calls
-                 if c[:2] == ("POST", "/instances")]
-        self.assertEqual([ids == ["k0"] for ids in bound], [True, False],
-                         "a launch reusing a key another launch deleted mid-launch would fail")
-        self.assertNotIn("exit", [c[0] for c in calls])
-
     def test_a_create_whose_answer_was_lost_is_not_sent_again(self):
-        posts, globs = [], GPU["eras"].__globals__
+        posts, globs = [], GPU
         self.addCleanup(globs.update, {"_eras_org": globs["_eras_org"]})
         globs["_eras_org"] = "org"
 
@@ -434,7 +370,7 @@ class TestEras(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}), unittest.mock.patch("time.sleep"), \
                 unittest.mock.patch("urllib.request.urlopen", urlopen), \
                 self.assertRaises(GPU["ApiError"]) as caught:
-            GPU["eras_create"](body, "ssh-ed25519 AAAA test")
+            GPU["eras_create"](body)
         self.assertEqual(len(posts), 1, "the retry loop would buy a box for each resend it couldn't confirm")
         self.assertEqual(caught.exception.status, -1)
 
@@ -448,7 +384,7 @@ class TestEras(unittest.TestCase):
                      {"id": "i-9", "name": "live-pr-7-t", "status": "active"}]
             return {"items": items if path == "/instances" else [], "next_page_token": None}
 
-        globs = GPU["terminate"].__globals__
+        globs = GPU
         self.addCleanup(globs.update, {k: globs[k] for k in ("eras", "STATE", "LEDGER")})
         globs.update(eras=eras, STATE=state, LEDGER=state / "instances.json")
         e = {"provider": "eras", "instance_id": None, "name": "live-pr-7-t", "launched_at": 0, "usd_per_hour": 1.0,

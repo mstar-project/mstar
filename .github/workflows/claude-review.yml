@@ -212,7 +212,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     outputs:
-      mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+      mode: ${{ steps.pr.outputs.mode }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       main_sha: ${{ steps.base.outputs.commit }}
       # The summary's fields as `post` rendered them, with what it carried over from the earlier review.
@@ -265,35 +265,34 @@ jobs:
           persist-credentials: false
 
       # React 👀 to the /review comment, since a comment-triggered run is otherwise
-      # invisible from the PR; then the PR's refs and title (an issue_comment event
-      # doesn't carry the PR's head or base) and the review's settings.
+      # invisible from the PR. Best effort, with the app token (a reaction needs
+      # issues: write, the job's token only has read), so it isn't part of the
+      # next step, which reads the saved handoff with the job's token.
+      - name: React to the /review comment
+        if: steps.base.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: python3 .github/review/bot.py react
+
+      # The PR's refs and title (an issue_comment event doesn't carry the PR's head
+      # or base) and the review's settings; for /review continue, the handoff a
+      # stopped review saved ("Write the handoff" below; bot.py, restore, says which
+      # it trusts), which waits in $RUNNER_TEMP until the diff step.
       - name: Resolve the PR
         if: steps.base.outcome == 'success'
         id: pr
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          COMMENT_ID: ${{ github.event.comment.id }}
           MODE: ${{ needs.preflight.outputs.mode }}
           NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
         run: python3 .github/review/bot.py resolve
 
-      # /review continue: fetch the handoff a stopped review saved (see "Write
-      # the handoff" below); it waits in $RUNNER_TEMP until the diff step
-      # (bot.py, restore, says which handoffs it trusts).
-      - name: Restore the stopped review
-        if: steps.pr.outcome == 'success' && steps.pr.outputs.continue == 'true'
-        id: prev
-        continue-on-error: true
-        env:
-          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
-        run: python3 .github/review/bot.py restore
-
       # Untrusted: the PR's tree, for reading changed files in full context.
       # Never executed.
       - name: Check out the PR into pr-head/
-        if: steps.pr.outcome == 'success' && steps.prev.outcome != 'failure'
+        if: steps.pr.outcome == 'success'
         id: head
         continue-on-error: true
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -309,9 +308,9 @@ jobs:
         id: diff
         continue-on-error: true
         env:
-          PREV: ${{ steps.prev.outputs.dir }}
+          PREV: ${{ steps.pr.outputs.dir }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+          MODE: ${{ steps.pr.outputs.mode }}
         run: python3 .github/review/bot.py collect
 
       - name: Review
@@ -320,7 +319,7 @@ jobs:
         # Never red: an API or action failure (bad key, outage, out of turns,
         # timeout) never turns the PR's check red; the last step reports it.
         continue-on-error: true
-        timeout-minutes: ${{ fromJSON(steps.prev.outputs.timeout || steps.pr.outputs.timeout || '25') }}
+        timeout-minutes: ${{ fromJSON(steps.pr.outputs.timeout || '25') }}
         uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -343,12 +342,12 @@ jobs:
             exactly. It defines your trust boundary, inputs and output format, and points
             you to the method and its bar.
 
-            Mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+            Mode: ${{ steps.pr.outputs.mode }}
             PR #${{ env.PR }}: ${{ steps.pr.outputs.title }}
             Head commit (pass as commit_id on every inline comment): ${{ steps.pr.outputs.head_sha }}
             pr.diff is ${{ steps.diff.outputs.lines }} lines.
             Turn cap: ${{ needs.preflight.outputs.turns }}.
-            ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
+            ${{ steps.pr.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
             ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json is present, with since.diff and since-commits.txt or, after a force-push, rebase or merge of main, interdiff.diff. Follow the prompt''s Re-review section.' || '' }}
           # No shell or edits; page fetches only from the sites listed here (GitHub, the
           # vLLM and SGLang docs, Hugging Face, PyTorch, arXiv) and Claude Code's
@@ -404,8 +403,8 @@ jobs:
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
-          PREV: ${{ steps.prev.outputs.dir }}
+          MODE: ${{ steps.pr.outputs.mode }}
+          PREV: ${{ steps.pr.outputs.dir }}
           OUTCOME: ${{ steps.review.outcome }}
         run: python3 .github/review/bot.py usage
 
@@ -422,7 +421,7 @@ jobs:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
           OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
+          MODE: ${{ steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
@@ -460,8 +459,8 @@ jobs:
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
-          PREV: ${{ steps.prev.outputs.dir }}
+          MODE: ${{ steps.pr.outputs.mode }}
+          PREV: ${{ steps.pr.outputs.dir }}
         run: python3 .github/review/bot.py handoff
 
       - name: Upload the handoff
@@ -483,17 +482,16 @@ jobs:
       - name: Report a review that didn't complete
         if: >-
           always() && steps.salvage.outputs.billing != 'true' &&
-          (steps.pr.outcome == 'failure' || steps.prev.outcome == 'failure' ||
-           steps.head.outcome == 'failure' ||
+          (steps.pr.outcome == 'failure' || steps.head.outcome == 'failure' ||
            steps.diff.outcome == 'failure' || steps.post.outcome == 'failure' ||
            (steps.review.outcome == 'failure' && steps.salvage.outputs.structured_output == ''))
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
-          WHY: ${{ steps.prev.outputs.why || steps.salvage.outputs.why || steps.pr.outputs.why }}
+          WHY: ${{ steps.salvage.outputs.why || steps.pr.outputs.why }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
           CAN_CONTINUE: ${{ steps.upload.outcome == 'success' }}
-          REFUSED: ${{ steps.prev.outcome == 'failure' }}
+          REFUSED: ${{ steps.pr.outputs.refused == 'true' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/bot.py incomplete
 
@@ -536,11 +534,12 @@ jobs:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
 
-      # gpu.py's settings, from repository variables; the Slurm nodes' key from a secret, and
-      # each node's host and pinned host key from REVIEW_SLURM_NODES. Nothing here reaches the box.
+      # gpu.py's settings, from repository variables; the ssh key every box is reached with from a
+      # secret, and each node's host and pinned host key from REVIEW_SLURM_NODES. The key stays on
+      # the runner: it never reaches the box.
       - name: Configure the GPUs
         env:
-          SLURM_KEY: ${{ secrets.REVIEW_SLURM_SSH_KEY }}
+          SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
           SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
           SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
           COMMENTER: ${{ github.event.comment.user.login }}

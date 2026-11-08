@@ -2,31 +2,14 @@
 
 mstar's design principles, each with the questions to ask of a diff. AGENTS.md states the rules
 (invariants 1–14, style rules S1–S4) and [patterns.md](patterns.md) the concrete review checks
-(A1–A10, B1–B13, C1–C16). This file is why those exist, plus the values neither writes down. The
-philosophy pass (SKILL.md §4.10) applies it. Cite a miss as "mstar philosophy §N".
+(A1–A10, B1–B13, C1–C16). This file is why those exist, plus the values neither writes down; a
+section AGENTS.md already says in full points there. The philosophy pass (SKILL.md §4.10) applies
+it. Cite a miss as "mstar philosophy §N".
 
 ## 1. Models declare, the engine executes, and shared layers know nothing about any one model
 
-Model code says what it needs; the engine, worker, conductor, data worker and API server provide it
-the same way for every model. Shared code must not name a model, compare graph-walk names
-(`== "decode"`), guess a dimension from a tensor's size, or check a resource's concrete class. When
-shared code needs model-specific behaviour, it calls a base-class hook with a default. The engine
-is where optimizations are written once for every model: each model-specific branch in shared code
-is where the next model breaks, and each engine mechanism a model reimplements opts that model out
-of batching, capture and backpressure.
-
-Maps to: invariants 1, 2, 3, 8; S3; A6, A7, A10, B1.
-
-- Does a file under `mstar/engine/`, `mstar/worker/`, `mstar/conductor/` or `mstar/api_server/`
-  (including the shared OpenAI adapters) gain a model name, one model's tensor name, a graph-walk
-  string comparison, or an `isinstance` check on a concrete resource?
-- Does model code do engine work: capture graphs, allocate or evict state, choose batches, create
-  streams and syncs, or run a data-dependent loop and its stop decision inside `forward`?
-- When shared code needs a per-model answer, is there a base-class method with a default, or
-  `hasattr`/`getattr` probing?
-- Is a hook used to wire a cross-cutting feature into every model, when the engine could find the
-  same answer from the module tree or a declaration? Hooks are for answers that really differ per
-  model.
+AGENTS.md invariants 1, 2, 3, 8 and S3 state this; the checks are A6, A7, A10, B1. What they don't say: a
+hook is for an answer that really differs per model, never to wire a cross-cutting feature into every model.
 
 ## 2. When a model has to work around the system, it has found a system gap
 
@@ -98,17 +81,7 @@ startup" design pattern explains this but is not citable.)
 
 ## 6. A change for one model must not cost any other model
 
-Global defaults, process-wide settings and shared contracts don't move to suit one model. If one has
-to move, the PR shows the other models still work and run as fast (BAGEL, Orpheus, Qwen3-Omni,
-Whisper are representative).
-
-Maps to: invariants 4, 10; C14.
-
-- Does the diff change a default, a process-wide setting (dynamo or inductor config, the allocator,
-  an env-var default), a timeout or a base-class contract? Who else reads it?
-- Is the PR framed as being about one model while it edits shared files? (#103: a shared-contract
-  change framed as model-only.)
-- Does the PR say which other models and workloads were checked?
+AGENTS.md invariants 4 and 10 state this (C14).
 
 ## 7. Complexity must pay for itself in measured performance
 

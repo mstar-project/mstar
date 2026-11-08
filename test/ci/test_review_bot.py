@@ -539,7 +539,7 @@ class TestCollect(unittest.TestCase):
         self.assertEqual(len(render_summary.open_findings(review, pages, [])), 1,
                          "a team run posts its inline findings as github-actions, and they would stop counting")
 
-    def test_after_a_rebase_a_re_review_reads_only_the_prs_hunks_that_changed(self):
+    def test_after_a_rebase_a_re_review_reads_only_the_files_that_changed(self):
         reviewed = pr_diff("x = 1", "# unreachable")
         routes = {**self.CONVERSATION, f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("diverged"),
                   f"GET repos/o/r/compare/{BASE}...{LAST}": compare("ahead", reviewed)}
@@ -548,11 +548,8 @@ class TestCollect(unittest.TestCase):
                              **routes)
         self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
                          "a rebase that moved the PR's changes would read as new changes")
-        header = "diff --git a/a.py b/a.py\nindex 1111111..2222222 100644\n--- a/a.py\n+++ b/a.py\n"
-        hunk = "@@ -40,2 +40,3 @@ def g():\n     return 1\n+    # "
         out, files = collect(diff=pr_diff("x = 1", "# dead code"), **routes)
-        self.assertEqual(files["interdiff.diff"],
-                         f"{header}{hunk}dead code\n{bot.DROPPED}{header}{hunk}unreachable\n")
+        self.assertEqual(files["interdiff.diff"], f"{pr_diff('x = 1', '# dead code')}{bot.DROPPED}{reviewed}")
         self.assertNotIn("since.diff", files)
 
     def test_a_merge_in_the_range_takes_the_interdiff(self):
@@ -597,15 +594,13 @@ class TestInterdiff(unittest.TestCase):
         self.assertEqual(bot.interdiff(binary.format("1..2 100644"), binary.format("9..2 100644")), "",
                          "main changing a binary's old side would read as the PR's change")
         self.assertIn(bot.DROPPED, bot.interdiff(self.REVIEWED + other, self.REVIEWED))
-        self.assertNotIn(bot.DROPPED, bot.interdiff(self.REVIEWED, mode),
-                         "a mode change beside hunks would list the file as dropped")
 
 
 class TestDispatcher(unittest.TestCase):
     def test_a_step_that_exits_still_writes_its_outputs_with_env_as_parameters(self):
         seen = {}
 
-        def failing(out, pr: int, mode="light"):
+        def failing(out, pr, mode="light"):
             seen.update(pr=pr, mode=mode)
             out["reason"] = "a\nb"
             sys.exit(1)
@@ -614,7 +609,7 @@ class TestDispatcher(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PR": "7", "MODE": "", "GITHUB_OUTPUT": str(output)}), \
                 mock.patch.object(sys, "argv", ["bot.py", "failing"]), self.assertRaises(SystemExit):
             bot.main({"failing": failing})
-        self.assertEqual(seen, {"pr": 7, "mode": "light"})
+        self.assertEqual(seen, {"pr": "7", "mode": "light"})
         self.assertRegex(output.read_text(), r"^reason<<EOF_\w+\na\nb\nEOF_\w+\n$",
                          "the steps after a failed one read what it had found from $GITHUB_OUTPUT")
 

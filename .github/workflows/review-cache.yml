@@ -65,6 +65,7 @@ jobs:
         volume: ${{ fromJSON(needs.volumes.outputs.ids) }}
     env:
       ERAS_API_KEY: ${{ secrets.ERAS_API_KEY }}
+      SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
       VOLUME: ${{ matrix.volume }}
       MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
       TAG: cache-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}

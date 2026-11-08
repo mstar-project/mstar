@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import bot
@@ -33,6 +34,9 @@ BOX = Path(__file__).with_name("gpu_review_box.sh")
 REPO = os.environ.get("REPO", "mstar-project/mstar")
 # gpu.py's ledger, for this run only.
 os.environ.setdefault("LIVE_PR_STATE", str(Path(os.environ.get("RUNNER_TEMP", "/tmp"), "live-pr")))
+sys.path.insert(0, str(GPU.parent))
+import gpu as gpu_py  # noqa: E402  (gpu.py's functions, for what its command line doesn't do)
+
 WRITE = bot.WRITE
 # Never approved, whatever the review says: the bot's own rules, CI, and the dependencies and toolchains.
 NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/", "docker/", "tools/", "packaging/")
@@ -68,11 +72,6 @@ def gpu(*args, check=True, timeout=900):
     return bot.run([sys.executable, str(GPU), *args], check=check, timeout=timeout)
 
 
-def gpu_py():
-    """gpu.py's functions, for what its command line doesn't do."""
-    return runpy.run_path(str(GPU))
-
-
 # ---------------------------------------------------------------- GPUs
 
 def slurm_allowed(pr, slurm_authors, commenter):
@@ -84,34 +83,38 @@ def slurm_allowed(pr, slurm_authors, commenter):
     return commenter in listed and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in listed
 
 
-def configure(out, runner_temp, pr: int = 0, slurm_key="", slurm_nodes="", slurm_authors="", commenter="",
+def configure(out, runner_temp, pr="0", ssh_key="", slurm_nodes="", slurm_authors="", commenter="",
               max_gpus="4", hours="4", max_usd="30", max_runs="2", eras_secret="", eras_cache_volumes=""):
-    """gpu.py's config.local.json from the workflow's variables and secrets, and the ssh keys. The Slurm
-    nodes only with their key (one for all of them) and for a run `slurm_allowed` lets use them; Eras
-    only with ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of nodes, each with its name, host,
-    port and pinned host key, and optionally any other field of gpu.py's node. ERAS_CACHE_VOLUMES: the Eras
-    cache volumes' ids, space-separated. Nothing here reaches the box."""
+    """gpu.py's config.local.json from the workflow's variables and secrets, and the runner's ssh key
+    (`ssh_key`, REVIEW_SSH_KEY, stored in the environment, one for every Slurm node and Eras; it stays on
+    the runner and never reaches the box). The Slurm nodes only with that key and for a run `slurm_allowed`
+    lets use them; Eras only with that key and ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of
+    nodes, each with its name, host, port and pinned host key, and optionally any other field of gpu.py's
+    node. ERAS_CACHE_VOLUMES: the Eras cache volumes' ids, space-separated."""
+    pr = int(pr)
     Path(os.environ["LIVE_PR_STATE"]).mkdir(parents=True, exist_ok=True)
     ssh = Path.home() / ".ssh"
     ssh.mkdir(mode=0o700, exist_ok=True)
-    if not (ssh / "live_pr").exists():  # Eras boxes: this run's key, which gpu.py registers
-        bot.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "live_pr")])
+    key = ssh / "live_pr"
+    if ssh_key:
+        key.touch(mode=0o600)
+        key.write_text(ssh_key.strip() + "\n")
+        (ssh / "live_pr.pub").write_text(bot.run(["ssh-keygen", "-y", "-f", str(key)]).stdout)
+    else:
+        print("::warning::REVIEW_SSH_KEY is not set, so the live test has no GPUs to reach.")
     nodes = json.loads(slurm_nodes or "[]")
     if not isinstance(nodes, list) or not all(
             isinstance(n, dict) and re.fullmatch(r"[A-Za-z0-9._-]+", str(n.get("name"))) and n.get("host")
             for n in nodes):
         raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]) and a host")
     slurm = []
-    if slurm_key and nodes and slurm_allowed(pr, slurm_authors, commenter):
-        key = ssh / "review_slurm"
-        key.touch(mode=0o600)
-        key.write_text(slurm_key.strip() + "\n")
+    if ssh_key and nodes and slurm_allowed(pr, slurm_authors, commenter):
         defaults = {"port": 22, "partition": "background", "nice": 100, "max_gpus": int(max_gpus),
                     "job_prefix": "review-bot", "workdir": "/workspace/review-bot", "gpu": "H200", "vram_gb": 141,
                     "hf_home": "/workspace/shared/hf"}
         slurm = [{**defaults, **n, "identity_file": str(key)} for n in nodes]
     usd, hours = float(max_usd), float(hours)
-    eras = {"cache_volume_ids": eras_cache_volumes.split()}
+    eras = {"cache_volume_ids": eras_cache_volumes.split(), **({} if ssh_key else {"enabled": False})}
     if eras_secret:
         eras["run_secret_id"] = eras_secret
     cfg = {"mode": "cloud", "results_dir": "results", "ssh_public_key": str(ssh / "live_pr.pub"),
@@ -163,15 +166,10 @@ def check_kinds(text):
 
 
 def last_live_test(pr):
-    """The bot's last live-test comment on the PR, {"sha", "verdict", "body"}, or None. Only its first
-    line, the marker, is read: the report below it is the box's text. A failed fetch raises: it never
-    reads as "no earlier live test"."""
-    last = None
-    for c in bot.api_list(f"repos/{REPO}/issues/{pr}/comments"):
-        m = bot.LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
-        if m and c["user"]["login"] in bot.BOT_USERS:
-            last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
-    return last
+    """bot.last_live_test on the PR's comments. A failed fetch raises: it never reads as "no earlier live
+    test"."""
+    return bot.last_live_test({"user": (c.get("user") or {}).get("login"), "body": c["body"]}
+                              for c in bot.api_list(f"repos/{REPO}/issues/{pr}/comments"))
 
 
 def changed_files(base_sha, sha):
@@ -216,11 +214,7 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     run = live.get("run") if live.get("run") in ("none", "targeted", "full") else "full"
     asked = live.get("checks") if isinstance(live.get("checks"), list) else []
     out.update(run=run, checks=",".join([k for k in CHECKS if k in asked] or CHECKS))
-    try:
-        passed = bool(last) and last["verdict"] == "pass" and \
-            bot.api(f"repos/{REPO}/compare/{last['sha']}...{head_sha}")["status"] in ("ahead", "identical")
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        passed = False
+    passed = bot.passed_on_ancestor(REPO, last, head_sha)
     untested = not last and rereview and (run == "targeted" or run == "none" and touches_runtime(pr, head_sha))
     forced = None if rereview and live.get("untestable") \
         else "failed" if last and not passed else "untested" if untested else None
@@ -288,23 +282,35 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 """
 
 
+def unavailable(out, lt, text):
+    """Say why the live test can't run, in lt/unavailable.md, and stop the step, exit 3 with `unavailable`
+    set."""
+    (lt / "unavailable.md").write_text(text + "\n")
+    print(text.split("\n")[0])
+    out["unavailable"] = "true"
+    sys.exit(3)
+
+
 def pending_ahead(cfg, offer):
     """How many jobs are pending in a Slurm offer's partition (0 when its queue can't be read: the offer stands)."""
-    state = gpu_py()
-    node = state["slurm_node"](cfg, offer["region"])
+    node = gpu_py.slurm_node(cfg, offer["region"])
     try:
-        out = state["slurm_run"](node, f"squeue -h -t PD -p {shlex.quote(node.get('partition', 'main'))} -o %i")
-    except (state["ApiError"], subprocess.TimeoutExpired):
+        out = gpu_py.slurm_run(node, f"squeue -h -t PD -p {shlex.quote(node.get('partition', 'main'))} -o %i")
+    except (gpu_py.ApiError, subprocess.TimeoutExpired):
         return 0
     return len(out.split())
 
 
-def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hours: float, run, checks: check_kinds,
-          since: commit = "", forced="", asked="", asked_checks: check_kinds = (), turns: int = 2000):
+def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, since="", forced="", asked="",
+          asked_checks="", turns="2000"):
     """Get GPUs and start the live-test session on them: the brief (fixed text, the commits and carry's
     call), the review's notes (findings.json) and the PR's title and description (pr-body.md) as data,
     and the box's own Anthropic key. Exits 3, with `unavailable` set, when the bot is past the spend cap,
     no GPUs are free or it has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md."""
+    pr, gpus, hours, turns = int(pr), int(gpus), float(hours), int(turns)
+    base, checks = branch(base), check_kinds(checks)
+    since = commit(since) if since else ""
+    asked_checks = check_kinds(asked_checks) if asked_checks else ()
     if run not in ("full", "targeted") or forced not in ("", *FORCED) or asked not in ("", "none", "targeted", "full"):
         raise ValueError(f"unexpected run {run!r}, forced {forced!r} or asked {asked!r}")
     lt = Path(runner_temp, "lt")
@@ -322,11 +328,8 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
                                              "model": MODEL, "turns": turns, "claude": CLAUDE}))
     stop = bot.over_cap(REPO)  # a review can take hours, so again right before the spend, as at preflight
     if stop:
-        (lt / "unavailable.md").write_text(stop + "\n")
-        print(stop)
-        out["unavailable"] = "true"
-        sys.exit(3)
-    cfg = gpu_py()["load_config"]()
+        unavailable(out, lt, stop)
+    cfg = gpu_py.load_config()
     # check=False: offers exits 1 with its JSON when something errored and nothing has an offer. That
     # is "no GPUs" here too, with the errors listed.
     listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json", check=False).stdout)
@@ -356,15 +359,12 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
         if r.returncode == 4:  # budget.max_running, which holds on every provider
             msg = (f"The bot already has {cfg['budget']['max_running']} GPU runs going (REVIEW_GPU_MAX_RUNS); "
                    "comment `/review` again when one finishes.")
-            (lt / "unavailable.md").write_text(msg + "\n")
-            print(msg)
-            out["unavailable"] = "true"
-            sys.exit(3)
+            unavailable(out, lt, msg)
         if r.returncode == 0:
             (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (lt / "offer.json").write_text(json.dumps(o))
             # gpu.py drops its entry when it terminates the instance; this copy prices the run (run_cost).
-            (lt / "entry.json").write_text(json.dumps(gpu_py()["entry"](r.stdout.strip().splitlines()[-1])))
+            (lt / "entry.json").write_text(json.dumps(gpu_py.entry(r.stdout.strip().splitlines()[-1])))
             print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
             return
         tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
@@ -374,28 +374,25 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
     lines += [f"- `{o['id']}`: {o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr, {o['availability']}"
               for o in everything["offers"]] or ["- no listing has that many Hopper-class GPUs"]
     lines += [f"- {e}" for e in everything["errors"]]
-    (lt / "unavailable.md").write_text("\n".join(lines) + "\n")
-    print(lines[0])
-    out["unavailable"] = "true"
-    sys.exit(3)
+    unavailable(out, lt, "\n".join(lines))
 
 
 def instance(lt):
     key = (lt / "instance").read_text().strip()
-    state = gpu_py()
-    return key, state["entry"](key), state
+    return key, gpu_py.entry(key)
 
 
-def wait(out, runner_temp, start_timeout: int = 30):
+def wait(out, runner_temp, start_timeout="30"):
     """Until the box's session finishes; then copy its results back and let the box go. Exits 3, with
     `unavailable` set, when a Slurm job never started."""
+    start_timeout = int(start_timeout)
     lt = Path(runner_temp, "lt")
-    key, e, g = instance(lt)
-    cfg = g["load_config"]()
+    key, e = instance(lt)
+    cfg = gpu_py.load_config()
     started, t0 = False, time.time()
     while True:
         try:
-            st, host, port = g["status"](e, cfg)
+            st, host, port = gpu_py.status(e, cfg)
         except Exception as err:  # a flaky ssh or API call is not an outcome
             print(f"status: {err}", flush=True)
             time.sleep(60)
@@ -404,17 +401,15 @@ def wait(out, runner_temp, start_timeout: int = 30):
         if e["provider"] == "slurm":
             if st == "pending" and not started and time.time() - t0 > start_timeout * 60:
                 gpu("terminate", key, check=False)
-                (lt / "unavailable.md").write_text(
-                    f"No GPUs for the live test: the Slurm job waited {start_timeout} minutes without starting.\n")
-                out["unavailable"] = "true"
-                sys.exit(3)
+                unavailable(out, lt, f"No GPUs for the live test: the Slurm job waited {start_timeout} minutes "
+                                     "without starting.")
             started = started or st == "running"
             if st == "ended":
                 break
         else:
             started = started or bool(host)
             if host and (e.get("host"), e.get("port")) != (host, port):  # where gpu.py ssh and pull connect
-                with g["ledger_txn"]() as d:
+                with gpu_py.ledger_txn() as d:
                     d[key].update(host=host, port=port)
                 e.update(host=host, port=port)
             if st.startswith("run ") or st in ("ended", "releasing"):
@@ -448,31 +443,19 @@ def run_cost(lt, now):
     return gpu_usd, box_usd
 
 
-def cleanup(out, pr: int, tag, runner_temp):
-    """Release whatever this run launched, and delete the ssh key it registered, from the ledger and by
-    name, for a run cancelled mid-launch; and first what the run's GPUs and box session cost, for the
-    ledger, so a failed release can't lose it."""
+def cleanup(out, pr, tag, runner_temp):
+    """Release whatever this run launched, from the ledger and by name, for a run cancelled mid-launch;
+    and first what the run's GPUs and box session cost, for the ledger, so a failed release can't lose
+    it."""
+    pr = int(pr)
     try:  # nothing here may stop the release below
         out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
     except Exception as e:
         print(f"::warning::Couldn't read the run's cost: {type(e).__name__}: {e}")
     print(gpu("list", check=False).stdout)
-    state = gpu_py()
-    for key in list(state["ledger"]()):
+    for key in list(gpu_py.ledger()):
         gpu("terminate", key, check=False)
-    cfg = state["load_config"]()
-    for sl in state["slurm_nodes"](cfg):
-        name = state["job_name"](sl, pr, tag)
-        try:
-            state["slurm_cancel"](sl, f"--name={shlex.quote(name)}", state["job_dir"](sl, name))
-        except (state["ApiError"], subprocess.TimeoutExpired) as err:  # still release what the others hold
-            print(f"slurm {sl['name']}: {err}")
-    if state["enabled"](cfg, "eras"):
-        name = state["job_name"](None, pr, tag)
-        for i in state["eras_instances"]():
-            if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
-                state["eras"]("POST", f"/instances/{i['id']}/release", {})
-        state["eras_delete_key"](name)
+    gpu_py.release_by_name(gpu_py.load_config(), pr, tag)
 
 
 # ---------------------------------------------------------------- approval
@@ -528,44 +511,94 @@ def untestable(pull, changes, review):
             *([f"couldn't read the diff of `{unread[0]}` to check what the live test can't cover"] if unread else [])]
 
 
-def reasons_not_to_approve(pr, sha, verdict, since, review):
-    """(why not, engine files, the conditions only this rule knows): the rule's failed conditions, the files
-    that make an approval one that doesn't count, and what the checklist has no field for, its `extra`."""
+@dataclass(frozen=True)
+class ApprovalFacts:
+    """Everything the approval rule (decide) looks at, gathered first so the rule reads as plain conditions."""
+    head_moved: bool
+    author_access: str
+    verdict: str
+    # The review chose `none` and the workflow let it stand (the last live test passed on an ancestor, or
+    # there is none and the review didn't build on an earlier one or the PR changes no runtime code).
+    review_chose_none: bool
+    since: str  # the last passing live test this run built on, or ""
+    untestable: tuple  # what the live test can't cover here (untestable)
+    too_many_files: bool  # the changed-file list is over GitHub's limit, so it couldn't be checked
+    blocked: tuple  # files that rule out any approval (the bot's rules, CI, dependencies, toolchains)
+    engine: tuple  # area/engine or area/resources files, which make an approval a comment instead
+    runtime: bool  # the PR touches runtime code
+    risk_level: str
+    questions: int
+    to_fix_first: tuple  # what the review left open (to_fix_first)
+
+
+def approval_facts(pr, sha, verdict, since, review):
+    """The facts of this PR at `sha`, from GitHub and the review; the network reads the rule needs."""
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
-    why, engine = [], []
-    if pull["head"]["sha"] != sha:
-        why.append("the PR has new commits since the reviewed one")
-    perm = bot.permission(REPO, pull["user"]["login"])
-    if perm not in WRITE:
-        why.append(f"the author's access is {perm}, not write")
-    # `skipped`: the review chose `none` and the workflow let it stand (the last live test passed on an
-    # ancestor, or there is none and the review didn't build on an earlier one or the PR changes no
-    # runtime code). On runtime code it counts only after that passing live test (below).
-    if not (verdict == "pass" or (verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none")):
-        why.append(f"the live test's verdict is {verdict}" + ("; judge its 👂 rows" if verdict == "partial" else ""))
     changes = changed_files(pull["base"]["sha"], sha)
-    why += untestable(pull, changes or [], review)
-    if changes is None:
-        why.append("the file list is too long to check")
-    else:
-        blocked, engine, runtime = file_gate(file_names(changes), ROOT)
-        if blocked:
-            why.append("touches the review's rules or dependencies: " + ", ".join(blocked[:8])
-                       + (" and more" if len(blocked) > 8 else ""))
-        if verdict == "skipped" and not since and runtime:
-            why.append("no GPU run on runtime code")
-    extra = list(why)
-    if engine:
-        extra.append("touches area/engine or area/resources, so the bot's approval wouldn't count: "
-                     + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else ""))
-    if (review.get("risk") or {}).get("level") != "low":
-        level = (review.get("risk") or {}).get("level", "unrated")
-        why.append(f"the review rated the design risk {level}: a maintainer owns the decisions its summary's "
-                   "\"What's left for you\" lists")
-    if review.get("questions"):
-        why.append(f"{len(review['questions'])} open question(s)")
-    why += to_fix_first(review, pr, "stacked-above.json")
-    return why, engine, extra
+    blocked, engine, runtime = file_gate(file_names(changes), ROOT) if changes is not None else ((), (), False)
+    return ApprovalFacts(
+        head_moved=pull["head"]["sha"] != sha,
+        author_access=bot.permission(REPO, pull["user"]["login"]),
+        verdict=verdict,
+        review_chose_none=verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none",
+        since=since,
+        untestable=tuple(untestable(pull, changes or [], review)),
+        too_many_files=changes is None,
+        blocked=tuple(blocked),
+        engine=tuple(engine),
+        runtime=bool(runtime),
+        risk_level=(review.get("risk") or {}).get("level", "unrated"),
+        questions=len(review.get("questions") or ()),
+        to_fix_first=tuple(to_fix_first(review, pr, "stacked-above.json")),
+    )
+
+
+@dataclass(frozen=True)
+class Decision:
+    """What decide concludes. `why` is every reason not to approve: `rule`, the conditions only this rule
+    knows, then `review`, what the review itself left open, which the checklist already lists.
+    `engine` turns an approval into a comment that doesn't count."""
+    rule: tuple
+    engine: tuple
+    review: tuple
+
+    @property
+    def why(self):
+        return [*self.rule, *self.review]
+
+    def extra(self):
+        """What the checklist has no field for."""
+        engine = ("touches area/engine or area/resources, so the bot's approval wouldn't count: "
+                  + ", ".join(f"`{f}`" for f in self.engine[:8]) + (" and more" if len(self.engine) > 8 else ""))
+        return [*self.rule, engine] if self.engine else list(self.rule)
+
+
+def decide(f):
+    """The approval rule: pure, from ApprovalFacts."""
+    rule = []
+    if f.head_moved:
+        rule.append("the PR has new commits since the reviewed one")
+    if f.author_access not in WRITE:
+        rule.append(f"the author's access is {f.author_access}, not write")
+    if not (f.verdict == "pass" or f.review_chose_none):
+        note = "; judge its 👂 rows" if f.verdict == "partial" else ""
+        rule.append(f"the live test's verdict is {f.verdict}{note}")
+    rule += f.untestable
+    if f.too_many_files:
+        rule.append("the file list is too long to check")
+    if f.blocked:
+        rule.append("touches the review's rules or dependencies: " + ", ".join(f.blocked[:8])
+                    + (" and more" if len(f.blocked) > 8 else ""))
+    # A review's `none` counts on runtime code only after a passing live test.
+    if f.verdict == "skipped" and not f.since and f.runtime:
+        rule.append("no GPU run on runtime code")
+    review = []
+    if f.risk_level != "low":
+        review.append(f"the review rated the design risk {f.risk_level}: a maintainer owns the decisions its "
+                      "summary's \"What's left for you\" lists")
+    if f.questions:
+        review.append(f"{f.questions} open question(s)")
+    return Decision(rule=tuple(rule), engine=f.engine, review=(*review, *f.to_fix_first))
 
 
 def refresh_above():
@@ -577,11 +610,8 @@ def refresh_above():
         return
     kept = []
     for p in json.loads(path.read_text()):
-        try:
-            pull = bot.api(f"repos/{REPO}/pulls/{p['number']}")
-        except (RuntimeError, ValueError, KeyError, TypeError):
-            continue
-        if pull.get("state") == "open" and (pull.get("head") or {}).get("sha") == p["head_sha"]:
+        pull = bot.read(bot.api, f"repos/{REPO}/pulls/{p['number']}")
+        if pull and pull.get("state") == "open" and (pull.get("head") or {}).get("sha") == p["head_sha"]:
             kept.append(p)
     path.write_text(json.dumps(kept))
 
@@ -590,35 +620,34 @@ def approvals_on():
     """The kill switch, the repository variable REVIEW_APPROVALS, read now rather than from the job's
     start, so a live test that began hours ago still obeys it. Unset, any other value or a failed read
     (the job's own token can't read variables) means off."""
-    try:
-        return bot.api(f"repos/{REPO}/actions/variables/REVIEW_APPROVALS").get("value") == "on"
-    except (RuntimeError, ValueError, AttributeError):
-        return False
+    return (bot.read(bot.api, f"repos/{REPO}/actions/variables/REVIEW_APPROVALS") or {}).get("value") == "on"
 
 
-def left_for_you(pr, review, extra):
+def left_for_you(pr, review, decision):
     stacked = render_summary.stacked_above("stacked-above.json")
-    return render_summary.checklist(review, review_threads(pr), stacked, extra)
+    return render_summary.checklist(review, review_threads(pr), stacked, decision.extra())
 
 
-def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
-    """Approve the PR when the rule holds (reasons_not_to_approve) and REVIEW_APPROVALS is on, as a comment
+def approve(out, pr, head_sha, runner_temp, verdict, since=""):
+    """Approve the PR when the rule holds (decide) and REVIEW_APPROVALS is on, as a comment
     that doesn't count toward required reviews when it touches area/engine or area/resources. What the
     live-test comment says of it goes in $RUNNER_TEMP/decision.md: the approval line, or the checklist of
     what's left, which with approvals off also says what the rule would have done; then no GitHub review
     is posted at all. The review finished cleanly: the live-test job runs only then."""
+    pr, since = int(pr), commit(since) if since else ""
     review = json.loads(Path("review.json").read_text())
     refresh_above()
-    why, engine, extra = reasons_not_to_approve(pr, head_sha, verdict, since, review)
+    outcome = decide(approval_facts(pr, head_sha, verdict, since, review))
     decision = Path(runner_temp, "decision.md")
     if not approvals_on():
-        decision.write_text(f"Approvals are off (`REVIEW_APPROVALS`). By the rule this would {'not ' if why else ''}be "
-                            f"approved.\n\n{left_for_you(pr, review, extra)}\n")
+        decision.write_text(f"Approvals are off (`REVIEW_APPROVALS`). By the rule this would "
+                            f"{'not ' if outcome.why else ''}be approved.\n\n{left_for_you(pr, review, outcome)}\n")
         return
-    if why:
-        print("not approved: " + "; ".join(why))
-        decision.write_text(left_for_you(pr, review, extra) + "\n")
+    if outcome.why:
+        print("not approved: " + "; ".join(outcome.why))
+        decision.write_text(left_for_you(pr, review, outcome) + "\n")
         return
+    engine = outcome.engine
     tested = "the live test passed on it" if verdict == "pass" else "the review found nothing that needs a GPU run"
     if engine:  # a comment, not an approval, so it can't count toward required reviews
         body = (f"The review bot would approve `{head_sha[:7]}`: low design risk, no open P0–P2 finding, and "
@@ -634,11 +663,8 @@ def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
                                        f"P0–P2 finding, and {tested}. It covers this commit only.")
     # A push between the check and the approval would leave it on a commit nobody tested; a failed read can't
     # rule one out.
-    try:
-        moved = bot.api(f"repos/{REPO}/pulls/{pr}")["head"]["sha"] != head_sha
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        moved = True
-    if moved:
+    pull = bot.read(bot.api, f"repos/{REPO}/pulls/{pr}")
+    if pull is None or pull["head"]["sha"] != head_sha:
         said = f"**Not approved:** new commits arrived while approving `{head_sha[:7]}`.\n"
         try:
             dismiss_approvals(pr, "new commits arrived while approving")
@@ -692,31 +718,36 @@ def published_media(results):
     return files
 
 
-def render_comment(pr, sha, lt, site=None, media_url=""):
-    """lt/comment.md for the PR and lt/verdict, and with `site`, that directory with the media and an
-    index.html of players."""
+def write_gallery(pr, sha, results, site):
+    """`site`: the published media of `results`, and an index.html of players. Nothing when there are none."""
+    files = published_media(results)
+    if not files:
+        return
+    rows = []
+    for p in files:
+        rel = p.relative_to(results).as_posix()
+        (site / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(p, site / rel)
+        kind = MEDIA[p.suffix.lower()]
+        tag = (f'<img src="{html.escape(rel)}" loading="lazy">' if kind == "img"
+               else f'<{kind} controls preload="none" src="{html.escape(rel)}"></{kind}>')
+        rows.append(f"<section><h3>{html.escape(rel)}</h3>{tag}</section>")
+    (site / "index.html").write_text(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+        f"<title>PR #{pr} live test media</title>"
+        "<style>body{font:14px system-ui;max-width:960px;margin:2em auto;padding:0 16px}"
+        "img,video{max-width:100%}audio{width:100%}</style>"
+        f"<h1>PR #{pr}, live test of {sha[:7]}</h1>" + "".join(rows))
+
+
+def render_comment(sha, lt, media_url=""):
+    """lt/comment.md for the PR and lt/verdict, links to the gallery's copies once `media_url` says it is
+    published; its verdict."""
     results = lt / "results"
     report = (results / "report.md").read_text() if (results / "report.md").exists() else ""
     result = json.loads((results / "result.json").read_text()) if (results / "result.json").exists() else {}
     files = published_media(results)
     rels = {p.relative_to(results).as_posix() for p in files}
-    if files and site:
-        site = Path(site)
-        rows = []
-        for p in files:
-            rel = p.relative_to(results).as_posix()
-            (site / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(p, site / rel)
-            kind = MEDIA[p.suffix.lower()]
-            tag = (f'<img src="{html.escape(rel)}" loading="lazy">' if kind == "img"
-                   else f'<{kind} controls preload="none" src="{html.escape(rel)}"></{kind}>')
-            rows.append(f"<section><h3>{html.escape(rel)}</h3>{tag}</section>")
-        (site / "index.html").write_text(
-            "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-            f"<title>PR #{pr} live test media</title>"
-            "<style>body{font:14px system-ui;max-width:960px;margin:2em auto;padding:0 16px}"
-            "img,video{max-width:100%}audio{width:100%}</style>"
-            f"<h1>PR #{pr}, live test of {sha[:7]}</h1>" + "".join(rows))
 
     def link(m):  # links to the gallery's media point at its copy; images show inline
         bang, text, rel = m[1], m[2], m[3]
@@ -747,7 +778,9 @@ def render_comment(pr, sha, lt, site=None, media_url=""):
 
 def comment(out, pr, head_sha, runner_temp):
     """Render the live test's comment and its media gallery ($RUNNER_TEMP/site) from the redacted report."""
-    out["verdict"] = render_comment(pr, head_sha, Path(runner_temp, "lt"), site=Path(runner_temp, "site"))
+    lt, site = Path(runner_temp, "lt"), Path(runner_temp, "site")
+    write_gallery(pr, head_sha, lt / "results", site)
+    out["verdict"] = render_comment(head_sha, lt)
     if Path(runner_temp, "site/index.html").exists():
         out["media"] = "true"
 
@@ -776,7 +809,7 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner)
     bot.run([*git, "-c", "user.name=mstar-review", "-c", "user.email=mstar-review@users.noreply.github.com", "commit",
              "-qm", "Live-test media, the newest runs"])
     bot.run([*git, "push", "-q", f"--force-with-lease={branch}:{old}", "origin", f"HEAD:{branch}"])
-    render_comment(pr, head_sha, Path(runner_temp, "lt"),
+    render_comment(head_sha, Path(runner_temp, "lt"),
                    media_url=f"https://{owner.lower()}.github.io/{media_repo}/pr-{pr}/{tag}")
 
 
@@ -812,7 +845,7 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
         body = f"<!-- claude-live-test sha={head_sha} verdict=unavailable -->\n" + text(lt / "unavailable.md")
     else:  # the review chose `none` and it stood
         reason = (json.loads(Path("review.json").read_text()).get("live_test") or {}).get("reason")
-        reason = bot.jq_text("" if reason is None else reason).replace("<!--", "&lt;!--").rstrip("\n")
+        reason = str("" if reason is None else reason).replace("<!--", "&lt;!--").rstrip("\n")
         body = f"<!-- claude-live-test-none -->\nNo GPU run: {reason}\n"
     decision = text(Path(runner_temp, "decision.md"))  # what approve decided: one approval line, or the checklist
     if decision:

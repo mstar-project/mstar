@@ -1,6 +1,5 @@
 """Check how .github/review/render_summary.py renders the review's summary."""
 
-import base64
 import json
 import runpy
 import unittest
@@ -190,14 +189,6 @@ class TestReviewSummary(unittest.TestCase):
         self.assertIsNotNone(read_state(light), "a nogpu review after a light one would review the whole PR again")
         self.assertIsNone(read_state(render(review(["a.py"]), [], "0123456789", "light", [])),
                           "a re-review could leave the files the last one skipped unreviewed for good")
-        state = base64.b64encode(json.dumps({"head": "0123456789", "mode": "light", "skipped": [],
-                                             "outside_diff": [], "risk": None}).encode()).decode()
-        self.assertIsNone(read_state(f"<!-- claude-review-state {state} -->"),
-                          "a re-review could rest on a light review from before light mode ran every pass")
-        old = read_state(render(review(), [], "0123456789", "thorough", []))
-        self.assertEqual((old or {}).get("mode"), "nogpu", "a summary from before the rename would keep the old name")
-        old = read_state(render(review(), [], "0123456789", "gpu", []))
-        self.assertEqual((old or {}).get("mode"), "full", "a summary from before the rename would keep the old name")
 
     def test_whats_left_lists_the_decisions_ranked_with_their_places(self):
         r = review(skipped=["vendored.py"])
