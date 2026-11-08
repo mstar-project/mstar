@@ -71,10 +71,11 @@ class KeptIds:
 
 
 class LogRoom(NamedTuple):
-    """What a request's log takes on a node: the slice of the pool its ids and host copies go to, and how many slots
-    its spans hold."""
+    """What a request's log takes on a node: the slice of the pool its ids and host copies go to, how many slots its
+    spans hold, and how many of those its ids spans hold."""
     piece: HostSlice
     slots: int
+    ids: int
 
 
 class QueuedCopy(NamedTuple):
@@ -247,7 +248,8 @@ class Rebuilds:
                 "and the serving config's rebuild_host_mb and rebuild_media_host_mb size the pool.",
                 node, nbytes, self._pool.nbytes_used(), self._pool.nbytes,
             )
-        return None if piece is None else LogRoom(piece, slots)
+        ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
+        return None if piece is None else LogRoom(piece, slots, ids)
 
     def ingest_request(
         self, rid: int, writes: Mapping[str, Mapping[str, NodeWrites]],
@@ -314,20 +316,25 @@ class Rebuilds:
             if not row or rid in kept or rid not in droppable or row_walk not in policy.walks:
                 continue
             tensors = [tensor.reshape(-1) for tensor in row[policy.ids_input]]
-            piece = droppable[rid].piece
-            prompt = self._pool.view(piece, tensors[0].dtype, torch.Size([sum(map(len, tensors))]))
+            room, length, copies = droppable[rid], sum(map(len, tensors)), bool(self._copied[node][row_walk])
+            # The host copies fill the slots past the ids spans, or none when the walk read an id at every slot.
+            # Any other count of ids would rebuild other slots than the KV holds, so the request keeps none.
+            if copies and length not in (room.ids, room.slots):
+                self._forget(node, rid)
+                continue
+            piece = room.piece
+            prompt = self._pool.view(piece, tensors[0].dtype, torch.Size([length]))
             # Copy each tensor to its place in the slice, since joining them first would allocate on the device. The
             # copies run in order on the pool's stream, so the last one's event covers all of them.
             offset = piece.offset
             for tensor in tensors:
                 copy = self._pool.copy_out(tensor, HostSlice(offset, tensor.nbytes), node_batch.completion_event)
                 offset += tensor.nbytes
-            copies = bool(self._copied[node][row_walk])
             kept[rid] = KeptIds(
                 HostCopy(prompt, copy.landed), row_walk, array("i"),
                 dict(node_batch.per_request_info[rid].step_metadata),
                 tuple(map(len, tensors)) if len(tensors) > 1 else None,
-                HostCopies(droppable[rid].slots - prompt.numel()) if copies else None,
+                HostCopies(0 if length == room.slots else room.slots - room.ids) if copies else None,
             )
             if not copies:
                 self._trim(node, rid, aligned(prompt.nbytes))

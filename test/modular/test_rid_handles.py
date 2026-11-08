@@ -179,7 +179,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     a, b = t.handle("req-a"), t.handle("req-b")
     w._in_flight_rids = set()
     w._rebuilds._pool = HostPool(16, torch.device("cpu"))
-    rooms = {rid: LogRoom(w._rebuilds._pool.take(8), 0) for rid in (a, b)}
+    rooms = {rid: LogRoom(w._rebuilds._pool.take(8), 0, 0) for rid in (a, b)}
     w._rebuilds._kept, w._rebuilds._droppable = {"n": {a: None, b: None}}, {"n": dict(rooms)}
     w._rebuilds._cursors[("n", a)] = None
     w._preemption._preempted[a] = Preempted()
