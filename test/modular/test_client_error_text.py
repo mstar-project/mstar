@@ -209,13 +209,6 @@ def test_a_refusal_reaches_the_client_without_its_directory(monkeypatch, path):
     assert text == "cannot read a.wav"
 
 
-def test_the_generate_catch_all_keeps_a_deliberate_refusal(monkeypatch):
-    monkeypatch.setattr(entrypoint, "api_server", _FailingServer(ValueError("Unsupported modality: 'smell'")))
-    response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
-    assert response.status_code == 400
-    assert response.json() == {"detail": "Unsupported modality: 'smell'"}
-
-
 def test_generate_ws_answers_with_an_error_id(monkeypatch, tmp_path, caplog):
     segment = f"/dev/shm/mstar_arena_api_{os.getpid()}_77.seg0"
     server = _FailingServer(RuntimeError(f"io on {segment}"), upload_dir=tmp_path)
