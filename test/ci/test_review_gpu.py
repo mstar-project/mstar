@@ -301,8 +301,8 @@ class TestEras(unittest.TestCase):
 
         def eras(method, path, body=None, params=None):
             calls.append((method, path))
-            if method == "DELETE" and in_use:
-                raise GPU["ApiError"](409, {"code": "resource_in_use", "message": "In use."})
+            if method == "DELETE" and refused:
+                raise GPU["ApiError"](403, {"code": "permission_denied", "message": "Not allowed."})
             if path == "/instances":  # ended instances aren't listed
                 return {"items": [{"id": i, "name": names[i], "status": status[i], "mode": "standalone",
                                    "standalone": {"current_run": {"status": "running", "bindings": {
@@ -325,7 +325,7 @@ class TestEras(unittest.TestCase):
                 GPU["terminate"](f"eras:{iid}", e)
             return [c[1] for c in calls if c[0] == "DELETE"]
 
-        in_use = False
+        refused = False
         self.assertEqual(terminate("i-1", names["i-1"]), [],
                          "the box still binding the key would lose ssh access")
         status["i-2"] = "releasing"
@@ -334,8 +334,8 @@ class TestEras(unittest.TestCase):
         del binds["i-3"]
         self.assertEqual(terminate("i-3", names["i-3"]), [],
                          "a launch would delete a key it reused, which another launch or a person registered")
-        # A key Eras won't delete: the release stands, and the watchdog stops.
-        in_use = True
+        # A delete that fails: the release stands, and the watchdog stops.
+        refused = True
         terminate("i-1", names["i-1"])
         self.assertEqual(GPU["ledger"](), {}, "the watchdog would retry a released instance forever")
 
