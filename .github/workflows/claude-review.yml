@@ -566,7 +566,8 @@ jobs:
       # them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
       # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
       # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
-      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry). A
+      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry); a
+      # re-review with `untestable` set is exempt, since that PR can't be approved. A
       # `none` that stands runs nothing (verdict `skipped`), and counts as a pass for approval after
       # that pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
       # test, so the next run still checks against the last real one. A failed read of the PR's comments

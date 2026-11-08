@@ -160,7 +160,9 @@ def carried(review, earlier, answered):
     one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
     still open loses any `fixed_in` from before); and its risk level as a floor, with the `look_at` that names
     the decision, and its questions, unless a maintainer other than the author has commented since
-    (`answered`), when this review's judgement stands. Everything here is carried into the next state too."""
+    (`answered`), when this review's judgement stands; and what the live test can't exercise
+    (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no comment makes
+    the bot's GPUs able to run it. Everything here is carried into the next state too."""
     earlier = earlier or {}
     verdicts = {f["ref"]: f for f in review["prior_findings"]}
     locations = {f["location"] for f in review["outside_diff"]}
@@ -184,6 +186,9 @@ def carried(review, earlier, answered):
         asked = {q["text"] for q in review["questions"]}
         review["questions"] = [*review["questions"], *[q for q in earlier.get("questions", [])
                                                        if q["text"] not in asked]]
+    untestable = (earlier.get("live_test") or {}).get("untestable")
+    if untestable and not (review.get("live_test") or {}).get("untestable"):
+        review["live_test"] = {**(review.get("live_test") or {}), "untestable": untestable}
     return review
 
 
@@ -330,7 +335,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     if review["skipped"]:
         parts.append("Not reviewed: " + ", ".join(f"`{path}`" for path in review["skipped"]) + ".")
     live = review.get("live_test")
-    if live and mode == "full":
+    if live and "run" in live and mode == "full":  # without `run`: only what `carried` kept
         checks = f" ({', '.join(live.get('checks') or [])})" if live["run"] != "none" and live.get("checks") else ""
         after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")

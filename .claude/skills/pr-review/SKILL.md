@@ -615,8 +615,9 @@ ancestor of the head (it failed, was partial or unavailable, or ran on a commit 
 the live test runs in full, with both kinds of check, whatever the review asked for, so a failure is
 never hidden behind a narrower run; and so does a re-review's `targeted` when no live test ran
 before it, since no GPU run covered the commits that review built on, and its `none` too unless the
-PR changes only docs, tests and benchmarks. After a pass on an ancestor, a `targeted` run is told
-that commit and given its report. A `none` that stands starts no box; the PR's comment says "No GPU
+PR changes only docs, tests and benchmarks. A re-review with `untestable` set is exempt from both:
+that PR can't be approved, so a full run would rent GPUs for nothing. After a pass on an ancestor,
+a `targeted` run is told that commit and given its report. A `none` that stands starts no box; the PR's comment says "No GPU
 run" with your reason. It counts as a pass for approval after a passing live test on an ancestor, or
 when the PR changes only docs, tests and benchmarks.
 

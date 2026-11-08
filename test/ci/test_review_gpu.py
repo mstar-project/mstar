@@ -178,6 +178,18 @@ class TestCarry(unittest.TestCase):
             earlier = ws / "earlier-live-test.md"
             return out, earlier.read_text() if earlier.exists() else None
 
+    def test_a_review_asking_for_more_gpus_than_runs_get_cant_approve(self):
+        routes = {f"GET repos/{R}/pulls/7": {"user": {"login": "an-author"}, "base": {"ref": "main"}},
+                  f"GET repos/{R}/collaborators/an-author/permission": {"permission": "write"}}
+        for gpus, named, expected in ((8, "", "needs 8 GPUs, runs get 4"), (8, "AMD", "AMD; needs 8 GPUs, runs get 4"),
+                                      (4, "AMD", "AMD")):
+            with self.subTest(gpus=gpus, named=named), workspace() as ws:
+                result = {"live_test": {"run": "full", "gpus": gpus, "untestable": named}}
+                out, _ = step(gpu_review.inputs, routes, pr="7", result=json.dumps(result), max_gpus="4")
+                self.assertEqual(out["gpus"], min(gpus, 4))
+                self.assertEqual(json.loads((ws / "review.json").read_text())["live_test"]["untestable"], expected,
+                                 "a pass on a smaller box would approve what it couldn't run")
+
     def test_a_re_review_that_cant_approve_isnt_made_full(self):
         for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
                              ("none", {"run": "none", "checks": "correctness", "verdict": "skipped"})):
@@ -438,16 +450,16 @@ class TestApprove(unittest.TestCase):
                 text, out, writes = self.approve({"value": "on"}, **kwargs)
                 self.assertEqual((writes, out.get("approval")), ([], None), f"{name} would still approve")
                 self.assertIn(says, text)
+        text, out, writes = self.approve({"value": "On"})
+        self.assertEqual((writes, out.get("approval")), ([], None), "only the exact word `on` turns approvals on")
 
     def test_the_fixed_check_finds_hardware_words_and_leaves_ordinary_ones(self):
         for text, hit in (("amdsmi.gpu", True), ("if isAMD():", True), ("MI300A nodes", True), ("hipcc -c x", True),
                           ("torch.xpu", True), ("Intel Gaudi", True), ("TPU", True), ("Apple Silicon", True),
-                          ("amd64 builds", False), ("AuthenticAMD", False), ("hipster", False),
+                          ("tpu = PS // 2", False), ("amd64 builds", False), ("AuthenticAMD", False), ("hipster", False),
                           ("test_bare_metal", False), ("bare-metal hosts", False), ("MPS on and off", False)):
             with self.subTest(text):
                 self.assertEqual(bool(gpu_review.UNTESTABLE_HARDWARE.search(text)), hit)
-        text, out, writes = self.approve({"value": "On"})
-        self.assertEqual((writes, out.get("approval")), ([], None), "only the exact word `on` turns approvals on")
 
     def test_an_engine_change_gets_a_comment_that_cant_count(self):
         for files in ([{"filename": "mstar/engine/engine.py"}],
