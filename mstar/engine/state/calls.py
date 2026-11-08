@@ -33,7 +33,7 @@ def step_labels(segments: Sequence[Segment]) -> tuple[str, ...]:
 
 
 class ArrayHandle(StepHandle):
-    """A node's calls on one declared array that keeps entries, or on a Value.
+    """The calls on one declared array that keeps entries, or on a Value.
 
     ``layer`` is always the model's layer id as declared: the int, or a 0-d int64 CPU tensor holding it. A compiled
     caller passes the tensor, so that its frame doesn't guard on the layer and one frame serves every layer. Each row's
@@ -466,7 +466,7 @@ class ArrayHandle(StepHandle):
 
 
 class SamplerHandle(StepHandle):
-    """A node's calls on one declared sampler. Its rows are the step's, padding included."""
+    """The calls on one declared sampler. Its rows are the step's, padding included."""
 
     def __init__(self, sampler: Sampler, resource: Any):
         self.sampler = sampler

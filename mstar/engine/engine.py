@@ -55,6 +55,7 @@ from mstar.engine.resources.step import (
     FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
+    StepHandle,
 )
 from mstar.engine.state.adapters import node_handles
 from mstar.engine.state.host import HostFields
@@ -689,6 +690,7 @@ class Engine:
 
         self._open_prefix_caches(specs_by_key, model, instance, prefix_caches, checkpoint)
 
+        shared: dict[str, StepHandle] = {}
         for node_name, submodule in submodules.items():
             # Inference only. `exec` is under no_grad, but `prepare_inputs` and
             # `postprocess_batch` are not, so anything they derive from a
@@ -713,6 +715,9 @@ class Engine:
                 model, node_name, resources, sp_group=parallel_groups.get_sp_config_for_node(node_name),
                 sdpa=node_name in self._sdpa_nodes, host_fields=self._host_fields,
             )
+            # Nodes in one engine can share layers, as BAGEL's LLM nodes share one language model, and a second
+            # node's bind would point those layers at a handle the first node's steps never open.
+            handles = {name: shared.setdefault(name, handle) for name, handle in handles.items()}
             if handles:
                 bind_state_ops(handles)
                 submodule.bind_node_state(handles)

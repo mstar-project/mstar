@@ -459,9 +459,11 @@ def node_handles(
             queries = next((read.queries for read in declared.reads.values()), None)
             handles[declared.name] = ArrayHandle(
                 declared, resources, key, queried=arrays.get(queries), read_resources=_read_specs(declared)[1],
-                combined=model.get_combined_graph_walks().get(node, EMPTY) if any(
-                    read.walks is not None for read in declared.reads.values()
-                ) else EMPTY,
+                # every node's, since the nodes of one process share this handle
+                combined={
+                    walk: members for name in sorted(declared.nodes)
+                    for walk, members in model.get_combined_graph_walks().get(name, EMPTY).items()
+                } if any(read.walks is not None for read in declared.reads.values()) else EMPTY,
             )
         else:
             ((read_key, read),) = declared.reads.items()
