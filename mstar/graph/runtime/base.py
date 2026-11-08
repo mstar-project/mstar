@@ -891,7 +891,10 @@ class GraphRuntime(PhasedPostprocess, ABC):
     #
     # Handles are worker-internal. Messages carry the string, so the only
     # translations are: de-intern at each send site, intern at each receive
-    # handler. In worker.py that is 12 sends and 9 receive handlers.
+    # handler. In the worker the receive handlers are InputIngest's and
+    # Lockstep's; sends take the string from RequestLifecycle (wire_of, or its
+    # wire-keyed drain sets) or get_rid_string; step outputs leave through the
+    # runtime.
 
     @abstractmethod
     def get_rid_string(self, handle: int) -> str:

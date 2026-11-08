@@ -1,6 +1,6 @@
 ---
 name: async-worker
-description: The worker's asynchronous step loop — what runs on which thread and stream, what each stage waits on, how speculation and pre-plan are rolled back on failure, and what breaks the overlap. Load this before changing anything in mstar/worker/worker.py's main loop, the GPU thread, the plan thread, speculation, or postprocess; and before concluding that a worker-level change has a bug.
+description: The worker's asynchronous step loop — what runs on which thread and stream, what each stage waits on, how speculation and pre-plan are rolled back on failure, and what breaks the overlap. Load this before changing anything in the worker's step path — StepPipeline's main loop (mstar/worker/step_pipeline.py), StepExecutor and GpuStepBody's GPU and plan threads and postprocess (step_executor.py), the Speculator (speculation.py), HostCopies (host_copies.py) or executing_batch.py — and before concluding that a worker-level change has a bug.
 ---
 
 # The worker's async step loop
