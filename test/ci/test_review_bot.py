@@ -555,5 +555,103 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertIn("What it had so far:\n\n**Inline comments it made (1):**", json.loads(body)["body"])
 
 
+class TestImprove(unittest.TestCase):
+    def inputs(self, routes):
+        with mock.patch.object(bot, "utcnow", lambda: NOW):
+            return step(bot.improve_inputs, routes, repo="o/r", key_set="true")
+
+    def test_past_a_cap_nothing_runs(self):
+        # No PR route: reading any evidence would fail the test.
+        routes = {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/1/comments*": [spent(10_000.5)],
+                  "GET repos/o/r/issues/2/comments*": [], "issue comment": ""}
+        with workspace() as d:
+            out, fake = self.inputs(routes)
+            self.assertFalse((d / "improve-evidence").exists(), "evidence was collected past the cap")
+        self.assertEqual(out, {"run": "false"}, "the model would run past the cap")
+        self.assertEqual([k for k, _ in fake.writes()], ["issue comment"])
+
+    def test_a_finished_run_this_week_starts_nothing_and_a_failed_one_can_be_retried(self):
+        routes = {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/2/comments*": []}
+        done = spent(1, mode="improve", usage={"outcome": "success"})
+        with workspace():
+            routes["GET repos/o/r/issues/1/comments*"] = [done]
+            self.assertEqual(self.inputs(routes)[0], {"run": "false"}, "a re-run would pay twice for one week")
+        failed = spent(1, mode="improve", usage={"outcome": "failure"})
+        with workspace():
+            routes["GET repos/o/r/issues/1/comments*"] = [failed]
+            routes["GET repos/o/r/issues/2/comments*"] = [{"user": {"login": "github-actions[bot]"},
+                                                           "html_url": "u", "body": "a signal"}]
+            self.assertEqual(self.inputs(routes)[0]["run"], "true", "a failed run could never be retried")
+
+    def test_evidence_keeps_what_a_reader_needs_without_names(self):
+        state = base64.b64encode(json.dumps({"moot": [{"ref": "11", "why": "gone"}]}).encode()).decode()
+        at, old = "2026-11-07T00:00:00Z", "2026-10-01T00:00:00Z"
+        bot_user = {"login": "mstar-review[bot]", "type": "Bot"}
+        person = {"login": "a-person", "type": "User"}
+        routes = {
+            "GET repos/o/r/issues[?]*": [LEDGER, STATUS],
+            "GET repos/o/r/issues/1/comments*": [spent(3, pr="5", mode="light", run="9", usage={"outcome": "failure"})],
+            "GET repos/o/r/issues/2/comments*": [],
+            "GET repos/o/r/pulls/5": {"user": {"login": "a-person"}},
+            "GET repos/o/r/pulls/5/reviews*": [],
+            "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+                {"isResolved": True, "isOutdated": False, "comments": {"nodes": [{"databaseId": 11}]}}]}}}}},
+            "GET repos/o/r/pulls/5/comments*": [
+                {"id": 11, "user": bot_user, "created_at": old, "html_url": "f", "path": "a.py", "line": 1,
+                 "body": "[P2] x"},
+                {"id": 12, "user": person, "created_at": at, "in_reply_to_id": 11, "html_url": "r",
+                 "body": "not a bug, ask @a-person, see https://evil.example/x and #7"},
+                {"id": 13, "user": {"login": "ci[bot]", "type": "Bot"}, "created_at": at, "body": "lint"}],
+            "GET repos/o/r/issues/5/comments*": [
+                {"id": 3, "user": bot_user, "created_at": at, "html_url": "s",
+                 "body": f"<!-- claude-review-summary -->\nx\n<!-- claude-review-state {state} -->"}],
+        }
+        with workspace() as d:
+            out, _ = self.inputs(routes)
+            text = (d / "improve-evidence/5.json").read_text()
+        self.assertEqual(out["run"], "true")
+        self.assertEqual(json.loads(out["schema"]), bot.IMPROVE_SCHEMA)
+        e = json.loads(text)
+        self.assertNotIn("a-person", text, "a login reached the model")
+        self.assertNotIn("evil.example", text)
+        self.assertEqual([(c["id"], c["role"]) for c in e["inline"]], [(11, "bot"), (12, "author")],
+                         "the old resolved finding, the reply, and not another bot's comment")
+        self.assertTrue(e["inline"][0]["resolved"] and not e["inline"][0]["outdated"])
+        self.assertEqual([m["why"] for m in e["moot"]], ["gone"])
+        self.assertEqual(e["runs"][0]["outcome"], "failure")
+
+    def post(self, output, usage=""):
+        routes = {"GET repos/o/r/issues[?]*": [LEDGER], "GET repos/o/r/issues/1/comments*": [], "issue comment": "",
+                  "POST repos/o/r/issues": "{}"}
+        with mock.patch.object(bot, "utcnow", lambda: NOW):
+            return step(bot.improve_post, routes, repo="o/r", github_run_id="7", github_run_attempt="1", output=output,
+                        usage=usage)
+
+    def test_an_empty_list_opens_no_issue_and_still_records_the_cost(self):
+        out, fake = self.post('{"improvements": []}', json.dumps({"mode": "improve", "total_cost_usd": 1.5}))
+        self.assertNotIn("exit", out)
+        writes = fake.writes()
+        self.assertEqual([k for k, _ in writes], ["issue comment"], "an empty week opened an issue")
+        record = json.loads(base64.b64decode(bot.SPEND.search(writes[0][1])[1]))
+        self.assertEqual((record["usd"], record["pr"]), (1.5, ""))
+
+    def test_a_post_is_redacted_on_stdin_with_links_kept_in_the_repository(self):
+        secret = "sk-ant-" + "a1b2c3d4" * 3
+        item = {"title": f"leak {secret}", "change": "ask @a-person about #7, see https://evil.example/x.png",
+                "where": "bot.py", "evidence": ["https://github.com/o/r/pull/5#discussion_r1", "https://evil.example/y"]}
+        out, fake = self.post(json.dumps({"improvements": [item]}))
+        self.assertNotIn("exit", out)
+        [(key, stdin)] = fake.writes()
+        self.assertEqual(key, "POST repos/o/r/issues")
+        issue = json.loads(stdin)
+        self.assertEqual(issue["title"], "Review bot: what to improve, week of 2026-11-02")
+        self.assertNotIn(secret, stdin)
+        self.assertIn("[REDACTED]", issue["body"])
+        self.assertFalse(any(secret in " ".join(argv) for argv, _ in fake.calls), "text reached the command line")
+        self.assertIn("https://redirect.github.com/o/r/pull/5#discussion_r1", issue["body"])
+        self.assertNotIn("evil.example", issue["body"])
+        self.assertNotIn("a-person", issue["body"])
+
+
 if __name__ == "__main__":
     unittest.main()

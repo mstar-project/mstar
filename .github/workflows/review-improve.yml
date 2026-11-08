@@ -1,0 +1,108 @@
+name: Review bot improvements
+
+# Once a week, one issue listing what the review bot could improve about itself, from the past
+# week's evidence (bot.py, improve_inputs). It never edits code, opens a PR or changes the bot.
+# The model has the review's restrictions and no web; everything it reads is untrusted data
+# (improve-prompt.md). Its job can't write issues: the issue and the ledger comment come
+# from a job of their own, as in claude-review.yml.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency: review-improve
+
+env:
+  PYTHONDONTWRITEBYTECODE: 1
+
+jobs:
+  improve:
+    name: Look for improvements
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      run: ${{ steps.inputs.outputs.run }}
+      result: ${{ steps.improve.outputs.structured_output }}
+      usage: ${{ steps.usage.outputs.record }}
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check out main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # No ref: a scheduled run's event has no repository, and it checks out the default branch.
+          persist-credentials: false
+
+      - name: Collect the week's evidence
+        id: inputs
+        env:
+          KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: python3 .github/review/bot.py improve_inputs
+
+      - name: Look for improvements
+        if: steps.inputs.outputs.run == 'true'
+        id: improve
+        continue-on-error: true
+        timeout-minutes: 45
+        uses: anthropics/claude-code-action@374f254f5efaf968abfe15d399fd90972e8138b9 # v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # As in the review: reads stay inside the checkout, and any call that would prompt is refused.
+          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+          prompt: |
+            Read .github/review/improve-prompt.md from the repository root and follow it
+            exactly. The week's evidence is in improve-evidence/.
+          # No shell, edits, subagents or web: it only reads the checkout, and returns its list as structured output.
+          claude_args: |
+            --model claude-opus-5-5
+            --effort high
+            --max-turns 40
+            --permission-mode dontAsk
+            --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,Skill,Task,Agent,WebFetch,WebSearch
+            --json-schema '${{ steps.inputs.outputs.schema }}'
+
+      - name: Record usage
+        if: always() && steps.inputs.outputs.run == 'true'
+        id: usage
+        continue-on-error: true
+        env:
+          PR: ""
+          HEAD_SHA: ""
+          MODE: improve
+          OUTCOME: ${{ steps.improve.outcome }}
+        run: python3 .github/review/bot.py usage
+
+  post:
+    name: Open the issue
+    needs: improve
+    if: always() && needs.improve.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The week's issue and the ledger comment.
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Check out main's scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          sparse-checkout: .github/review
+          persist-credentials: false
+
+      - name: Record the cost and open the issue
+        env:
+          OUTPUT: ${{ needs.improve.outputs.result }}
+          USAGE: ${{ needs.improve.outputs.usage }}
+        run: python3 .github/review/bot.py improve_post

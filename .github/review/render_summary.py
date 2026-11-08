@@ -272,7 +272,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
              "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": review.get("latent", []),
-             "live_test": live}
+             "live_test": live, "moot": [f for f in prior if f["status"] == "moot"]}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
     text = "\n\n".join(parts).replace("<!--", "&lt;!--")
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
@@ -283,16 +283,22 @@ def current_mode(mode):
     return RENAMED_MODES.get(mode, mode)
 
 
-def read_state(body):
-    """The state a summary comment carries (its last), for a re-review to start from; else None, and
-    that run reviews the whole PR. None too when it doesn't decode and when the earlier review skipped
-    files. Any mode can build on any other, since every mode runs every pass."""
+def saved_state(body):
+    """The state a summary comment carries (its last), or None when it has none that decodes."""
     found = STATE.findall(body)
     try:
         state = json.loads(base64.b64decode(found[-1])) if found else None
     except ValueError:
         return None
-    if not isinstance(state, dict):
+    return state if isinstance(state, dict) else None
+
+
+def read_state(body):
+    """The state a summary comment carries, for a re-review to start from; else None, and that run
+    reviews the whole PR. None too when it doesn't decode and when the earlier review skipped files.
+    Any mode can build on any other, since every mode runs every pass."""
+    state = saved_state(body)
+    if state is None:
         return None
     state["mode"] = current_mode(state.get("mode"))
     # A state without `latent` is from before light mode ran every pass, so it counts as a partial review;
