@@ -290,6 +290,20 @@ def test_a_rebuild_keeps_an_image_prompts_spans_and_writes_its_samples_after_its
     )
 
 
+def test_a_rebuild_whose_ids_hold_a_pad_at_each_image_slot_keeps_the_image_prompts_spans():
+    """A VLM's media walk reads an id at every slot, a pad at each of the image's, so its rebuild writes as many ids
+    as the prompt has slots. The KV refused that as more ids than its ids spans hold."""
+    kv = _manager()
+    _image_prompt(kv, decoded=2)
+
+    # the prompt's 11 ids, then the prefill's sample and one per decode step
+    kv.prepare_rebuild("r", Rebuild(WALK, array("i", [*range(11), 100, 101, 102])))
+
+    assert kv._overrides["r"].kv_layout["main"].spans == (PrefixSpan(3, 3, WALK), IMAGE, PrefixSpan(4, 4, WALK)), (
+        "the image would lose its slots or its advance, or the samples would land at other positions"
+    )
+
+
 def test_a_rebuilt_stream_whose_growth_is_bounded_keeps_its_footprint():
     """The rebuild's span covers what the loop wrote, so the growth bound drops by that as the loop's cap does.
     Otherwise the stream would grow by those slots."""

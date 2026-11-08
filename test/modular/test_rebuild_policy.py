@@ -326,6 +326,19 @@ def test_a_prompt_with_images_keeps_its_ids_as_its_walk_read_them_and_waits_for_
     )
 
 
+def test_a_prompt_that_read_a_pad_id_at_each_image_slot_leaves_its_copies_no_slots_of_their_own():
+    """A VLM's media walk reads an id at every slot, a pad where the encoder's output goes in. Counting the image's
+    slots again for its copies made the rebuild write more slots than the KV held, so every drop refused it."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
+    _ingest(rebuilds, R, IMAGE_CHAT)
+    rows = {R: {"text_inputs": [torch.arange(11)], "embeds": [torch.zeros(6, 2)]}}
+
+    rebuilds.keep_prompts(_ran(VISION, rows))
+    rebuilds._kept[NODE][R].sampled.append(6)
+
+    assert rebuilds.tokens(R, NODE, None) == 11, "the rebuild would write other slots than the prompt's KV holds"
+
+
 def _vision_step(rids, walks: dict, **fields) -> SimpleNamespace:
     infos = {rid: SimpleNamespace(graph_walk=walks.get(rid, VISION), step_metadata={"prefill_order": (rid,)})
              for rid in rids}
