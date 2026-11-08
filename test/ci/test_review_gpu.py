@@ -441,9 +441,14 @@ class TestApprove(unittest.TestCase):
                 self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], approved, f"a PR above that is {name}")
 
     def test_approvals_happen_only_when_the_variable_reads_on(self):
-        text, out, writes = self.approve({"value": "on"})
-        self.assertEqual(writes, [f"POST repos/{R}/pulls/7/reviews"])
-        self.assertIn("**Approved** on `0123456`", text)
+        posted = []
+        capture = {f"POST repos/{R}/pulls/7/reviews": lambda a, i: posted.append(json.loads(i)) or {}}
+        for files in (None, [{"filename": "mstar/engine/worker.py"}]):  # engine files follow the bot's risk call too
+            text, out, writes = self.approve({"value": "on"}, files=files, extra=capture)
+            self.assertEqual(writes, [f"POST repos/{R}/pulls/7/reviews"])
+            self.assertEqual((posted[-1]["commit_id"], posted[-1]["event"]), ("0123456789", "APPROVE"),
+                             "the approval would land on another commit, or not count as an approval")
+            self.assertIn("**Approved** on `0123456`", text)
         for variable, what in (({"value": "off"}, "off"), (Fail("HTTP 404"), "unset"),
                                (Fail("HTTP 403"), "unreadable")):
             text, out, writes = self.approve(variable)

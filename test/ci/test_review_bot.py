@@ -145,6 +145,7 @@ HEAD, LAST = "1" * 40, "2" * 40
 
 NOW = datetime.datetime(2026, 11, 8, 12, tzinfo=datetime.timezone.utc)
 STATUS = {"number": 2, "user": {"login": "github-actions[bot]"}, "body": bot.STATUS_ISSUE + "\nthe status"}
+BOT_AUTHOR = {"__typename": "Bot", "login": "mstar-review"}  # as GraphQL names it
 
 
 class TestMonitor(unittest.TestCase):
@@ -218,6 +219,20 @@ class TestMonitor(unittest.TestCase):
                 found = bot.ci_regressions("o/r", 7, "m", "p")
             self.assertEqual(bool(found), regressed, f"a parent that {parent}")
 
+    @staticmethod
+    def merged_prs(*reviews):
+        """GitHub's answer to the monitor's query, filtering by the query's states as GitHub does: PR 7 with
+        `reviews` and PR 8, the bot's approved too but merged before the window."""
+        def answer(argv, stdin):
+            query = next(a for a in argv if a.startswith("query="))
+            nodes = [{"author": r["author"]} for r in reviews
+                     if "states: APPROVED" not in query or r["state"] == "APPROVED"]
+            return {"data": {"repository": {"pullRequests": {"nodes": [
+                {"number": 7, "mergedAt": "2026-11-01T00:00:00Z", "reviews": {"nodes": nodes}},
+                {"number": 8, "mergedAt": "2026-01-01T00:00:00Z",
+                 "reviews": {"nodes": [{"author": BOT_AUTHOR}]}}]}}}}
+        return answer
+
     def run_monitor(self, body, bug_title="crash in decode", **routes_over):
         calls = {"body": None}
 
@@ -230,14 +245,10 @@ class TestMonitor(unittest.TestCase):
 
         routes = {
             "GET repos/o/r/issues[?]state=all&creator=*": [STATUS],
-            "GET repos/o/r/issues[?]state=closed&since=*": [
-                {"number": 7, "pull_request": {"merged_at": "2026-11-01T00:00:00Z"}},
-                {"number": 8, "pull_request": {"merged_at": "2026-01-01T00:00:00Z"}}, {"number": 9},
-                {"number": 10, "pull_request": {"merged_at": None}}],
+            "POST graphql": self.merged_prs({"state": "APPROVED", "author": BOT_AUTHOR}),
             "GET repos/o/r/issues/2": issue_status, "PATCH repos/o/r/issues/2": patch, "issue comment": "",
             "GET repos/o/r/pulls/7": {"number": 7, "title": "Faster decode @someone", "state": "closed",
                                       "merged_at": "t", "merge_commit_sha": "d" * 40},
-            "GET repos/o/r/pulls/7/reviews*": [{"state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
             "GET repos/o/r/pulls/7/commits*": [{"sha": "a" * 40}],
             "GET repos/o/r/issues/7/timeline*": [],
             "GET repos/o/r/commits/*/check-runs*": {"check_runs": []},
@@ -286,18 +297,30 @@ class TestMonitor(unittest.TestCase):
 
     def test_a_pr_that_cant_be_read_is_reported_and_the_rest_goes_on(self):
         reported, _ = self.run_monitor(STATUS["body"])
-        body, _ = self.run_monitor(reported, **{"GET repos/o/r/pulls/7/reviews*": Fail("HTTP 502")})
+        body, _ = self.run_monitor(reported, **{"GET repos/o/r/pulls/7": Fail("HTTP 502")})
         self.assertIn("couldn't read", body)
         self.assertIn("`#7`", body)
         _, fake = self.run_monitor(body)
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a PR read again after a failed read would re-post its old signals")
 
-    def test_a_dismissed_approval_is_not_counted(self):
-        body, fake = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": [
-            {"state": "DISMISSED", "user": {"login": "mstar-review[bot]"}}]})
-        self.assertNotIn("Faster decode", body, "a PR whose approval was withdrawn would count as approved")
-        self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [])
+    def test_only_the_bots_own_live_approval_counts(self):
+        for name, review in (("dismissed", {"state": "DISMISSED", "author": BOT_AUTHOR}),
+                             ("a person with the bot's login", {"state": "APPROVED", "author": {
+                                 "__typename": "User", "login": "mstar-review"}}),
+                             ("another bot", {"state": "APPROVED", "author": {"__typename": "Bot", "login": "ci"}}),
+                             ("a deleted account", {"state": "APPROVED", "author": None})):
+            with self.subTest(name):
+                body, fake = self.run_monitor(STATUS["body"], **{"POST graphql": self.merged_prs(review)})
+                self.assertNotIn("Faster decode", body, f"{name}: the PR would count as bot-approved")
+                self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [])
+
+    def test_the_status_issue_is_the_one_a_bot_made_with_the_marker(self):
+        routes = {"GET repos/o/r/issues[?]state=all&creator=*": [
+            {"number": 3, "user": {"login": "a-person"}, "body": STATUS["body"]},
+            {"number": 4, "user": {"login": "github-actions[bot]"}, "body": "<!-- other -->"}, STATUS]}
+        with mock.patch.object(bot, "run", FakeGh(routes)):
+            self.assertEqual(bot.status_issue("o/r")["number"], 2, "a forged issue would become the status issue")
 
 
 class TestRestore(unittest.TestCase):
@@ -702,7 +725,9 @@ class TestImprove(unittest.TestCase):
                 {"issue_url": "https://api.github.com/repos/o/r/issues/5", "user": bot_user,
                  "body": "<!-- claude-review-summary -->\nx"},
                 {"issue_url": "https://api.github.com/repos/o/r/issues/6", "user": person,
-                 "body": "<!-- claude-review-summary -->\nforged"}],
+                 "body": "<!-- claude-review-summary -->\nforged"},
+                {"issue_url": "https://api.github.com/repos/o/r/issues/8", "user": bot_user,
+                 "body": "an ordinary comment of the bot's"}],
             "GET repos/o/r/issues/2/comments*": [],
             "GET repos/o/r/pulls/5": {"user": {"login": "a-person"}},
             "GET repos/o/r/pulls/5/reviews*": [],
