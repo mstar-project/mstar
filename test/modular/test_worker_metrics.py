@@ -42,6 +42,7 @@ from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
 from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -53,7 +54,6 @@ from mstar.utils.ipc_format import (  # noqa: E402
 from mstar.worker import worker_metrics  # noqa: E402
 from mstar.worker.host_pool import HostPool  # noqa: E402
 from mstar.worker.rebuild import Rebuilds  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
 from mstar.worker.worker_metrics import WorkerMetrics  # noqa: E402
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
@@ -342,21 +342,17 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     def stub(*a, **k):
         return None
 
-    w = Worker.__new__(Worker)
-    w.worker_id = "worker_0"
-    w.enable_nvtx = False
-    w._phase_period, w._phase_buf = 0, {}
-    w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
-    w.tp_async_sched, w.is_tp_follower = False, False
-    w._in_flight_rids = set()
-    w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
-    w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
-    w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
-    w.wakeup_event = SimpleNamespace(register_future=stub)
-    w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
-    w.scheduler = SimpleNamespace(
+    w = make_worker(
+        worker_id="worker_0",
+        parallel_groups=SimpleNamespace(barrier_all=stub, restore_default_timeout=stub),
+        engine_manager=SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng),
+        communicator=SimpleNamespace(send=stub, wait_for_work=stub),
+        wakeup_event=SimpleNamespace(register_future=stub),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
+        scheduler=SimpleNamespace(
         take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
         remember_ready=contextlib.nullcontext,
+    ),
     )
     for name in ("_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
@@ -505,8 +501,7 @@ def test_prefix_lookups_before_start_counting_are_not_counted():
 
 
 def test_the_worker_starts_counting_on_enable_metrics(clock):
-    w = Worker.__new__(Worker)
-    w._metrics = _metrics(counting=False)
+    w = make_worker(_metrics=_metrics(counting=False))
     clock.now = 1.0
     w._process_message_list([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
     clock.now = 1.25
@@ -671,7 +666,7 @@ def test_the_worker_status_crosses_the_wire_typed():
 
 
 def test_metrics_are_off_on_a_worker_built_without_an_interval():
-    assert Worker.__new__(Worker)._metrics is None
+    assert make_worker()._metrics is None
 
 
 def test_every_worker_process_gets_the_status_interval(tmp_path, monkeypatch):

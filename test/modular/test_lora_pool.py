@@ -469,9 +469,9 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
     import logging
     from types import SimpleNamespace
 
-    from mstar.worker.worker import Worker
+    from mstar.testing_utils.worker import make_worker
 
-    w = Worker.__new__(Worker)
+    w = make_worker()
     asked = []
     engine = SimpleNamespace(
         evictable=lambda node, resources=None: resources is None or "kv" in resources,
