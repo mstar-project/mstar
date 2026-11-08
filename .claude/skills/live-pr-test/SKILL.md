@@ -18,7 +18,7 @@ Read alongside this:
   - "The first request of a new shape pays compilation" (trap 2), and "Slow eager steps are often recompiles" (`TORCH_LOGS=recompiles`), before calling a tail or a stall a regression.
   - "CPU-bound or GPU-bound" via `benchmark.worker_phases`, whenever a throughput row moves.
   - "Match the configuration before comparing" for any reference or competitor arm: sampling defaults, state dtype, prefix caching.
-- [AGENTS.md](../../../AGENTS.md) for the invariants a PR can break: invariant 4 (one model's change must not degrade others) and invariant 5 (Python/Rust drift) drive most regression choices.
+- [AGENTS.md](../../../AGENTS.md) for the invariants a PR can break: invariant 4 (one model's change must not degrade others) and invariant 5 (one graph runtime, in `rust/`) drive most regression choices.
 - [references/test-matrix.md](references/test-matrix.md) for touched paths → suites, the worker A/B set, concurrency and sizing.
 - [references/report.md](references/report.md) for the report and the PR-comment rules.
 
@@ -51,7 +51,7 @@ gh pr diff <n>
 - Extract the claims: every behavior or number the description asserts. Each becomes a check. For each claimed number, note the GPU, harness and metric it came from, so the report can say when yours isn't comparable.
 - A case the description hands to another open PR is that PR's: test it there (or on both merged) if it matters, otherwise mark it "owned by #N" in the report.
 - **Map what could break, and test each risk directly.** The claims table checks what the author thought of. The risk map checks what they didn't, and it is where human reviewers found most of the bugs our runs missed. Read the whole diff, not the description.
-  - For every changed function, find its callers and the paths that reach it: eager and captured, TP leader and follower, the Python and Rust runtimes and frontends, streaming and not, the first request of a shape and steady state, and failure, abort and teardown.
+  - For every changed function, find its callers and the paths that reach it: eager and captured, TP leader and follower, both frontends, streaming and not, the first request of a shape and steady state, and failure, abort and teardown.
   - For each path, write down what would go wrong if the change were subtly wrong, and plan a test that fails if it is.
   - Run that test on a model, config and layout that actually take that path, with the input or fault that provokes it.
   - Put the risk map in the plan, one line per risk: path → what could break → the test. [test-matrix.md](references/test-matrix.md) lists, by layer, the probes that have found bugs.
