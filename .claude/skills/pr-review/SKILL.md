@@ -125,7 +125,7 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
 
 **Priority rules.** These sharpen the bar; the passes add their own floors.
 
-- **Unsure between P2 and P3: P2.**
+- **Unsure between P2 and P3: P3.**
 - **A crash, hang or wrong output on a config the code accepts is at least P2**, even when no
   shipped YAML sets it. Never fold a defect into a minimality or cleanup finding.
 - **Any path to a lockstep hang or rank divergence is at least P1** (invariant 11), however rare
