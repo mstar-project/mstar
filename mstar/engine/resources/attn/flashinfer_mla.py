@@ -12,6 +12,7 @@ from __future__ import annotations
 import functools
 import logging
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import (
@@ -20,7 +21,8 @@ from mstar.engine.resources.attn.base import (
     captured_page_capacity,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
+from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool, workspace_bytes
+from mstar.engine.resources.attn.wrappers import fmha_decode_applies
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
 from mstar.engine.resources.kv.plan import KVPlanOutputs, build_paged_indptrs, context_only_views
@@ -215,6 +217,180 @@ class FlashInferMLAWrapper:
         return (out, lse) if return_lse else out
 
 
+# trtllm-gen's MLA decode reads 32- or 64-token pages; a cache page is read as page_size // 64 of them
+FMHA_MLA_BLOCK = 64
+
+
+def expand_mla_block_table(
+    indptr: np.ndarray, indices: np.ndarray, last_page_len: np.ndarray, page_size: int,
+    table: np.ndarray, lens: np.ndarray,
+) -> None:
+    """Fill ``table`` (rows x sub-pages) and ``lens`` from a paged plan: cache page ``p`` of a
+    row becomes sub-pages ``p * k .. p * k + k - 1`` (``k = page_size // FMHA_MLA_BLOCK``), and
+    a row's length is its tokens, at least 1 (a padding row's output is dropped)."""
+    k = page_size // FMHA_MLA_BLOCK
+    pages = np.diff(indptr)
+    rows = np.repeat(np.arange(len(pages)), pages)
+    cols = np.arange(len(rows)) - indptr[rows]
+    sub = indices[:, None].astype(np.int64) * k + np.arange(k)
+    table[rows[:, None], cols[:, None] * k + np.arange(k)] = sub
+    lens[:] = np.maximum(np.maximum(pages - 1, 0) * page_size + last_page_len * (pages > 0), 1)
+
+
+class FlashInferMLAFmhaDecodeWrapper:
+    """Captured one-token MLA decode on FlashInfer's trtllm-gen MLA kernel (Blackwell).
+
+    ``FmhaDecodeWrapper`` for the latent cache: it owns the block table and lengths a capture
+    holds the addresses of, staged through pinned buffers, so a replay reads what the last plan
+    staged and there is no FlashInfer plan per step. The kernel reads 64-token pages, so the
+    layer's cache is viewed ``[pages * k, 64, latent]`` and the table lists each page's ``k``
+    sub-pages.
+    """
+
+    def __init__(
+        self,
+        workspace_buffer: Workspace,
+        num_qo_heads: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        page_size: int,
+        sm_scale: float,
+        batch_size: int,
+        max_seq_len: int,
+        device: torch.device,
+    ):
+        from flashinfer.utils import _get_trtllm_gen_multi_ctas_kv_counter_buffer, get_device_sm_count
+
+        if page_size % FMHA_MLA_BLOCK:
+            raise ValueError(f"trtllm-gen MLA reads {FMHA_MLA_BLOCK}-token pages; page_size {page_size} "
+                             "isn't a whole number of them")
+        self.batch_size = batch_size
+        self.num_qo_heads = num_qo_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.page_size = page_size
+        self.sm_scale = sm_scale
+        self.dtype = torch.bfloat16
+        self.kv_dtype = torch.bfloat16
+        self.fallback = False
+        self._workspace = workspace_buffer.tensor
+        self._max_seq_len = -(-max_seq_len // page_size) * page_size
+        width = (self._max_seq_len // page_size + 1) * (page_size // FMHA_MLA_BLOCK)
+        self._table = torch.zeros((batch_size, width), dtype=torch.int32, device=device)
+        self._kv_len_buf = torch.ones(batch_size, dtype=torch.int32, device=device)
+        # one query token per row, which plan() checks
+        self._qo_indptr_buf = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+        # the kernel resets these itself at the end of every launch
+        self._counters = _get_trtllm_gen_multi_ctas_kv_counter_buffer(
+            batch_size, num_qo_heads, get_device_sm_count(device), device,
+        )
+        on_gpu = torch.device(device).type == "cuda"
+        self._pinned_table = torch.zeros_like(self._table, device="cpu", pin_memory=on_gpu)
+        self._pinned_lens = torch.ones_like(self._kv_len_buf, device="cpu", pin_memory=on_gpu)
+        self._table_np = self._pinned_table.numpy()
+        self._lens_np = self._pinned_lens.numpy()
+        # set once the previous plan's copies out of the staging buffers are issued
+        self._done = torch.cuda.Event() if on_gpu else None
+        self._planned = False
+
+    def plan(
+        self,
+        qo_indptr: torch.Tensor,
+        paged_kv_indptr: torch.Tensor,
+        paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor,
+        causal: bool = True,
+        dtype: torch.dtype = torch.bfloat16,
+        kv_dtype: torch.dtype | None = None,
+        **kwargs,
+    ):
+        """Host tensors from the KV plan, one query token per row."""
+        n_req = paged_kv_indptr.shape[0] - 1
+        if n_req != self.batch_size or not np.array_equal(qo_indptr.numpy(), np.arange(n_req + 1)):
+            raise ValueError(
+                f"FlashInferMLAFmhaDecodeWrapper: {n_req} rows of one token each expected, captured for "
+                f"{self.batch_size}; qo_indptr {qo_indptr.tolist()[:8]}")
+        if self._done is not None and self._planned:
+            # this wrapper's previous plan, a step or more back: long since done
+            self._done.synchronize()
+        expand_mla_block_table(
+            paged_kv_indptr.numpy(), paged_kv_indices.numpy(), paged_kv_last_page_len.numpy(),
+            self.page_size, self._table_np, self._lens_np)
+        self._table.copy_(self._pinned_table, non_blocking=True)
+        self._kv_len_buf.copy_(self._pinned_lens, non_blocking=True)
+        if self._done is not None:
+            self._done.record()
+        self._planned = True
+        self.dtype = dtype
+        self.kv_dtype = kv_dtype or dtype
+
+    @torch.compiler.disable
+    def run(self, q_nope: torch.Tensor, q_pe: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False):
+        """As ``FlashInferMLAWrapper.run``: ``q_nope [B, H, kv_lora_rank]``, ``q_pe [B, H,
+        qk_rope_head_dim]``, ``kv_cache_layer [pages, page_size, latent]`` -> ``[B, H, kv_lora_rank]``."""
+        from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+
+        query = torch.cat([q_nope.to(self.dtype), q_pe.to(self.dtype)], dim=-1).unsqueeze(1)
+        out = trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache_layer.view(-1, FMHA_MLA_BLOCK, kv_cache_layer.shape[-1]),
+            workspace_buffer=self._workspace,
+            qk_nope_head_dim=self.kv_lora_rank,  # read by the sparse and cake backends only
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=self._table,
+            seq_lens=self._kv_len_buf,
+            max_seq_len=self._max_seq_len,
+            bmm1_scale=self.sm_scale,
+            bmm2_scale=1.0,
+            backend="trtllm-gen",
+            multi_ctas_kv_counter_buffer=self._counters,
+            return_lse=return_lse,
+            return_lse_base="basee" if return_lse else None,
+        )
+        if return_lse:
+            o, lse = out
+            return o.squeeze(1), lse.view(o.shape[0], o.shape[2])
+        return out.squeeze(1)
+
+
+@functools.cache
+def mla_fmha_matches(
+    device: torch.device, num_qo_heads: int, kv_lora_rank: int, qk_rope_head_dim: int, page_size: int,
+    sm_scale: float,
+) -> str | None:
+    """None when the trtllm-gen MLA decode gives the paged MLA kernel's output on this GPU and
+    geometry (random latents over a few pages, rows of 1 to 3 pages, within 2% relative L2), else
+    why not. Once per process and geometry; a kernel trtllm-gen lacks or fetches badly fails here
+    rather than mid-capture."""
+    try:
+        workspace = Workspace(torch.empty(workspace_bytes(), dtype=torch.uint8, device=device), "mla_fmha_probe")
+        rows, pages = 3, 6
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        latent = kv_lora_rank + qk_rope_head_dim
+        cache = (torch.randn(pages, page_size, latent, generator=gen) * 0.5).to(device, torch.bfloat16)
+        q_nope = torch.randn(rows, num_qo_heads, kv_lora_rank, generator=gen).to(device, torch.bfloat16)
+        q_pe = torch.randn(rows, num_qo_heads, qk_rope_head_dim, generator=gen).to(device, torch.bfloat16)
+        plan = dict(
+            qo_indptr=torch.arange(rows + 1, dtype=torch.int32),
+            paged_kv_indptr=torch.tensor([0, 1, 3, 6], dtype=torch.int32),
+            paged_kv_indices=torch.tensor([4, 0, 2, 5, 1, 3], dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([page_size // 3, page_size, 7], dtype=torch.int32),
+        )
+        paged = FlashInferMLAWrapper(workspace, num_qo_heads, kv_lora_rank, qk_rope_head_dim, page_size,
+                                     sm_scale, device=device)
+        paged.plan(**plan)
+        ref = paged.run(q_nope, q_pe, cache).float()
+        fmha = FlashInferMLAFmhaDecodeWrapper(workspace, num_qo_heads, kv_lora_rank, qk_rope_head_dim,
+                                              page_size, sm_scale, rows, 3 * page_size, device)
+        fmha.plan(**plan)
+        got = fmha.run(q_nope, q_pe, cache).float()
+        err = ((got - ref).norm() / ref.norm()).item()
+    except Exception as exc:  # a missing kernel, a fetch, a layout the kernel refuses
+        return f"{type(exc).__name__}: {str(exc)[:200]}"
+    return None if err < 0.02 else f"relative L2 {err:.3f} against the paged MLA kernel"
+
+
 class FlashInferMLAManager(AttentionManager):
     supports_drop = True
 
@@ -226,6 +402,7 @@ class FlashInferMLAManager(AttentionManager):
         kv_config: KVConfig,
         backend: str = "auto",
         sm_scale: float | None = None,
+        decode_fmha: bool = False,
     ):
         assert kv_config.layout == KVLayout.MLA, (
             f"FlashInferMLAManager needs a KVLayout.MLA cache; {kv_cache!r} is {kv_config.layout}"
@@ -259,6 +436,8 @@ class FlashInferMLAManager(AttentionManager):
             backend=backend,
         )
         self._workspaces = WorkspacePool(device, owner=kv_cache)
+        self._sm_scale = sm_scale
+        self._decode_fmha = decode_fmha and dtype == torch.bfloat16 and fmha_decode_applies(torch.device(device))
 
     def depends_on(self):
         return {self._kv_cache_name}
@@ -269,7 +448,7 @@ class FlashInferMLAManager(AttentionManager):
         return torch.device(self._device).type == "cuda" and flashinfer_mla_supports(
             self._kv_config.kv_lora_rank, self._kv_config.qk_rope_head_dim)
 
-    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int):
+    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool = False):
         if not self.uses_kernel:
             # the fallback reads its plan from host lists, so a replay would
             # attend the capture's pages
@@ -280,14 +459,38 @@ class FlashInferMLAManager(AttentionManager):
         key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
         wrapper = self._cg_plan_states.get(key)
         if wrapper is None:
-            kwargs = {**self._wrapper_kwargs, "max_num_pages": captured_page_capacity(
-                num_rows, lease.bucket.num_tokens, self._kv_config)}
-            wrapper = FlashInferMLAWrapper(
-                workspace_buffer=self._workspaces.get(label, lease.slot),
-                batch_size=num_rows, use_cuda_graph=True, **kwargs,
-            )
+            if lease.bucket.bs == lease.bucket.num_tokens and not force_prefill:
+                wrapper = self._fmha_wrapper(lease, label, num_rows)
+            if wrapper is None:
+                kwargs = {**self._wrapper_kwargs, "max_num_pages": captured_page_capacity(
+                    num_rows, lease.bucket.num_tokens, self._kv_config)}
+                wrapper = FlashInferMLAWrapper(
+                    workspace_buffer=self._workspaces.get(label, lease.slot),
+                    batch_size=num_rows, use_cuda_graph=True, **kwargs,
+                )
             self._cg_plan_states[key] = wrapper
         return wrapper
+
+    def _fmha_wrapper(self, lease: SlotLease, label: str, num_rows: int) -> FlashInferMLAFmhaDecodeWrapper | None:
+        """A one-token decode capture's trtllm-gen MLA wrapper (``decode_fmha``), or None to keep the
+        paged kernel: not asked for, or the probe found no matching kernel for this geometry."""
+        if not self._decode_fmha:
+            return None
+        config = self._kv_config
+        geometry = (config.num_qo_heads, config.kv_lora_rank, config.qk_rope_head_dim, config.tokens_per_page)
+        why = mla_fmha_matches(torch.device(self._device), *geometry, self._sm_scale)
+        if why is not None:
+            logger.warning("MLA decode stays on the paged kernel (trtllm-gen MLA, heads %d, latent %d+%d, "
+                           "page %d: %s)", *geometry, why)
+            self._decode_fmha = False
+            return None
+        return FlashInferMLAFmhaDecodeWrapper(
+            workspace_buffer=self._workspaces.get(label, lease.slot),
+            num_qo_heads=config.num_qo_heads, kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim, page_size=config.tokens_per_page,
+            sm_scale=self._sm_scale, batch_size=num_rows, max_seq_len=config.max_seq_len,
+            device=self._device,
+        )
 
     def _eager_wrapper(self, label: str, slot: int):
         """The persistent eager wrapper for one (label, slot): its plan stages into a
@@ -335,7 +538,7 @@ class FlashInferMLAManager(AttentionManager):
                 views = context_only_views(kv_out.views, spans, self._kv_config.tokens_per_page)
                 indptrs = build_paged_indptrs(views, self._kv_config.tokens_per_page)
             if lease is not None:
-                wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1)
+                wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1, ctx.force_prefill)
             else:
                 wrapper = self._eager_wrapper(label, ctx.slot)
             wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())

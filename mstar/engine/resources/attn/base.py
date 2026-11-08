@@ -180,6 +180,7 @@ class AttentionManager(AttentionResource):
                 kv_config=kv_config,
                 backend=spec.config.flashinfer_backend,
                 sm_scale=spec.config.sm_scale,
+                decode_fmha=spec.config.decode_fmha,
             )
         if backend == AttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.flashinfer import FlashInferManager

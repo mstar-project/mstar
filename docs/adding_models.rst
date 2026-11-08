@@ -673,7 +673,9 @@ The spec types are:
        captured one-token decode rows on FlashInfer's trtllm-gen fmha kernel on Blackwell,
        with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
        the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
-       kernels. Qwen3.5 declares ``True``. ``sm_scale`` (default
+       kernels. Qwen3.5 declares ``True``. Under ``FLASHINFER_MLA`` it runs them on
+       trtllm-gen's MLA kernel, kept only where a load probe matches the paged kernel; the
+       GLM B300 configs set it. ``sm_scale`` (default
        ``1/sqrt(head_dim)``) sets the softmax scale; FlashInfer and ``FLASHINFER_MLA``
        read it, and the other backends refuse it. ``FLASHINFER_MLA`` is
        Multi-head Latent Attention over a ``KVLayout.MLA`` cache. It needs ``sm_scale``,
