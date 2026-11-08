@@ -171,6 +171,10 @@ class TestSpend(unittest.TestCase):
                          "re-running only a run's spend job would count its costs twice")
         self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "2"})])["day"], 2,
                          "re-running all a run's jobs spends again, and that would go uncounted")
+        live = {"usage": {"run_attempt": "1"}, "gpu_usd": 2, "box_usd": 1}
+        self.assertEqual(self.spend([spent(13, **live), spent(16, attempt="2", **{**live, "gpu_usd": 5}),
+                                     spent(16, attempt="3", **{**live, "gpu_usd": 5})])["day"], 19,
+                         "re-running only the live test spends GPUs again, and its review tokens are already counted")
         self.assertEqual(self.spend([spent(1, attempt="1"), spent(1, attempt="2")])["day"], 2,
                          "a record with no usage counts by its own attempt")
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,

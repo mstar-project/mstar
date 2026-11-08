@@ -224,7 +224,9 @@ def comment_on_issue(repo, number, body):
 def ledger(repo, since):
     """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments from every ledger
     issue, once per run and attempt of what they cost. Re-running only a run's spend job records the same costs
-    again, with the attempt its usage came from; re-running all its jobs spends again. A failed read raises."""
+    again, with the attempt its usage came from; re-running all its jobs spends again, and re-running only its
+    live test spends GPUs and the box again, which counts on top of the review already counted. A failed read
+    raises."""
     records, seen = [], set()
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
@@ -235,10 +237,14 @@ def ledger(repo, since):
                 record = json.loads(base64.b64decode(m[1]))
             except ValueError:
                 continue
-            key = record.get("run"), (record.get("usage") or {}).get("run_attempt") or record.get("attempt")
-            if key not in seen:
-                seen.add(key)
-                records.append((c["created_at"], record))
+            run_key = record.get("run"), (record.get("usage") or {}).get("run_attempt") or record.get("attempt")
+            live_key = (*run_key, record.get("gpu_usd"), record.get("box_usd"))
+            if live_key in seen:
+                continue
+            if run_key in seen:  # the live test ran again: new GPU and box cost, the review's tokens already counted
+                record = {**record, "usd": round(finite_usd(record, "gpu_usd") + finite_usd(record, "box_usd"), 4)}
+            seen |= {run_key, live_key}
+            records.append((c["created_at"], record))
     return records
 
 
@@ -253,9 +259,9 @@ def spend(repo, now):
     return used
 
 
-def finite_usd(record):
-    """A record's USD, or 0 when it isn't a finite, non-negative number."""
-    usd = record.get("usd")
+def finite_usd(record, key="usd"):
+    """A record's USD under `key`, or 0 when it isn't a finite, non-negative number."""
+    usd = record.get(key)
     return usd if isinstance(usd, (int, float)) and not isinstance(usd, bool) and 0 <= usd < float("inf") else 0
 
 
