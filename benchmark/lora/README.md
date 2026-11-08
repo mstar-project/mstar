@@ -140,6 +140,9 @@ kept 96.2/96.2/97.2% of its LoRA-off throughput at c=1/32/64 without that captur
 
 ## 4. Tensor parallelism: TP2 against one GPU, and slot churn (about 30 minutes, 2 GPUs)
 
+Until #1082 lands, startup refuses LoRA on a tensor-parallel node under the async TP
+scheduler (`docs/models.rst`), so only the `MSTAR_TP_ASYNC_SCHED=0` runs below start.
+
 Needs at least two GPUs and the `reference` and captured `serve` output of
 section 2 in the same `--out`. With `MSTAR_TP_ASYNC_SCHED=0` and `=1` in turn, the
 same server with the LLM node at TP2 (vision encoder on rank 0):
