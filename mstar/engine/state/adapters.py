@@ -67,19 +67,25 @@ if TYPE_CHECKING:
 
 
 def node_resources(model: "Model", *, sdpa_nodes: Collection[str] = frozenset()) -> list[NodeResourceSpec]:
-    """The specs ``model`` declares through `declare_state`, then the ones it writes by hand."""
-    specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings(), sdpa_nodes=sdpa_nodes)
+    """The specs ``model`` declares through `declare_state`, then the ones it writes by hand. The walk graphs are built
+    only for an array on several nodes, since building them can read checkpoints."""
+    declarations = model.declare_state()
+    walks = None
+    if any(isinstance(declared, Array) and len(declared.nodes) > 1 for declared in declarations):
+        walks = {walk: frozenset(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
+    specs = build_specs(declarations, kernel_settings=model.kernel_settings(), sdpa_nodes=sdpa_nodes, walks=walks)
     return specs + list(model.get_node_resources() or [])
 
 
 def build_specs(
     declarations: Sequence[Array | Sampler], *, kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
-    sdpa_nodes: Collection[str] = frozenset(),
+    sdpa_nodes: Collection[str] = frozenset(), walks: Mapping[str, Collection[str]] | None = None,
 ) -> list[NodeResourceSpec]:
-    """One pool per array that keeps entries, under its name, one `AttentionSpec` per read and one `LinearAttnSpec`
-    per `GatedDeltaNet`, each under its key, one ragged spec per kind of read of the arrays with ``max_len`` 0 (see
-    `_within_step_specs`), and one `PositionSpec` and `SamplerSpec` for each that declares them. A node in
-    ``sdpa_nodes`` builds no ragged spec, since its reads run SDPA.
+    """One pool per array that keeps entries, under its name, one `AttentionSpec` per spec its reads build (see
+    `_read_specs`) and one `LinearAttnSpec` per `GatedDeltaNet`, each under its key, one ragged spec per kind of read of
+    the arrays with ``max_len`` 0 (see `_within_step_specs`), and one `PositionSpec` and `SamplerSpec` for each that
+    declares them. A node in ``sdpa_nodes`` builds no ragged spec, since its reads run SDPA. ``walks`` gives each walk's
+    nodes, from which a pool on several nodes takes its leader (`_leader`).
 
     Raises ``ValueError`` on an array today's specs can't hold, naming what they lack.
     """
@@ -91,7 +97,7 @@ def build_specs(
         if array.rewritable:
             specs += _value_specs(array, arrays)
         elif array.max_len:
-            specs += _kv_specs(array, by_name)
+            specs += _kv_specs(array, by_name, walks)
         elif not array.nodes <= sdpa_nodes:
             specs += [by_read[key] for key in array.reads if by_read[key].resource_key == key]
         if array.positions is not None:
@@ -113,7 +119,9 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
     return k.shape
 
 
-def _kv_specs(array: Array, by_name: Mapping[str, Array]) -> list[NodeResourceSpec]:
+def _kv_specs(
+    array: Array, by_name: Mapping[str, Array], walks: Mapping[str, Collection[str]] | None,
+) -> list[NodeResourceSpec]:
     heads, head_dim = _kv_shape(array)
     if array.seq_sharded:
         raise _no_layout(array, "seq_sharded takes max_len 0, and a paged pool plans whole segments")
@@ -148,7 +156,7 @@ def _kv_specs(array: Array, by_name: Mapping[str, Array]) -> list[NodeResourceSp
     if len(q_heads) > 1:
         raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")
     specs: list[NodeResourceSpec] = [KVSpec(
-        resource_key=array.name, nodes=array.nodes,
+        resource_key=array.name, nodes=array.nodes, leader=_leader(array, walks),
         config=PagedKVConfig(
             num_layers=len(array.layers), num_qo_heads=q_heads.pop(),
             num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,
@@ -166,6 +174,16 @@ def _kv_specs(array: Array, by_name: Mapping[str, Array]) -> list[NodeResourceSp
     configs, _ = _read_specs(array)
     specs += [AttentionSpec(resource_key=key, nodes=array.nodes, config=config) for key, config in configs.items()]
     return specs
+
+
+def _leader(array: Array, walks: Mapping[str, Collection[str]] | None) -> str | None:
+    """The node of ``array``'s pool that admits each request: the one node that runs every walk any of its nodes runs.
+    None on one node, and where no node or several do, so each node admits for itself."""
+    if walks is None or len(array.nodes) == 1:
+        return None
+    running = [nodes for nodes in walks.values() if not array.nodes.isdisjoint(nodes)]
+    leaders = [node for node in sorted(array.nodes) if all(node in nodes for nodes in running)]
+    return leaders[0] if len(leaders) == 1 else None
 
 
 def _read_specs(array: Array) -> tuple[dict[str, AttentionConfig], dict[str, str]]:
