@@ -26,9 +26,11 @@ class _Waiting:
 
 
 class Refusal(NamedTuple):
-    """A waiting request that didn't fit, the resource that refused it, and the mark that resource returned."""
+    """A waiting request that didn't fit, the resource that refused it, the node it asked that resource for, and the
+    mark that resource returned."""
     rid: str
     key: str
+    node_name: str
     mark: object
 
 
@@ -138,9 +140,12 @@ class Admission:
 
     def refusals(self) -> list[Refusal]:
         """The waiting requests that have been tried and didn't fit, oldest first."""
-        refused = [Refusal(rid, *held) for rid, held in self._returns.items() if held is not None]
-        refused += [Refusal(self._queues[key][0], key, mark) for key, mark in self._short.items()]
-        return sorted(refused, key=lambda refusal: self._arrival[refusal.rid])
+        refused = [(rid, *held) for rid, held in self._returns.items() if held is not None]
+        refused += [(self._queues[key][0], key, mark) for key, mark in self._short.items()]
+        return sorted(
+            (Refusal(rid, key, self._waiting[rid].asked[key][0], mark) for rid, key, mark in refused),
+            key=lambda refusal: self._arrival[refusal.rid],
+        )
 
     def admit_waiting(
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
