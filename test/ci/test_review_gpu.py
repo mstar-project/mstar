@@ -419,17 +419,25 @@ class TestApprove(unittest.TestCase):
                                    ("a blocked file", {"files": [{"filename": ".github/workflows/ci.yml"}]}, "rules"),
                                    ("a blocked file renamed away", {"files": [blocked]}, "rules"),
                                    ("the review says the GPUs can't run it", {"untestable": "AMD kernels"},
-                                    "needs a test on AMD kernels: the bot's GPUs can't run it"),
+                                    "the bot's live test can't cover this: AMD kernels"),
                                    ("a changed line names AMD hardware", {"files": [
                                        {"filename": "docs/x.rst", "changes": 1,
                                         "patch": "@@ -1 +1 @@\n+runs on ROCm"}]},
-                                    "needs a test on rocm"),
+                                    "can't cover this: rocm"),
                                    ("a diff that can't be read", {"files": [
                                        {"filename": "docs/x.rst", "changes": 9000}]}, "couldn't read the diff")):
             with self.subTest(name):
                 text, out, writes = self.approve({"value": "on"}, **kwargs)
                 self.assertEqual((writes, out.get("approval")), ([], None), f"{name} would still approve")
                 self.assertIn(says, text)
+
+    def test_the_fixed_check_finds_hardware_words_and_leaves_ordinary_ones(self):
+        for text, hit in (("amdsmi.gpu", True), ("if isAMD():", True), ("MI300A nodes", True), ("hipcc -c x", True),
+                          ("torch.xpu", True), ("Intel Gaudi", True), ("TPU", True), ("Apple Silicon", True),
+                          ("amd64 builds", False), ("AuthenticAMD", False), ("hipster", False),
+                          ("test_bare_metal", False), ("bare-metal hosts", False), ("MPS on and off", False)):
+            with self.subTest(text):
+                self.assertEqual(bool(gpu_review.UNTESTABLE_HARDWARE.search(text)), hit)
         text, out, writes = self.approve({"value": "On"})
         self.assertEqual((writes, out.get("approval")), ([], None), "only the exact word `on` turns approvals on")
 

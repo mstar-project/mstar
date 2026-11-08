@@ -42,9 +42,12 @@ NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "MANIFEST.in", "pyproject.toml", "setup
 NO_COUNT_AREAS = {"area/engine", "area/resources"}
 # No runtime code: a review's `none` alone approves a change only to these.
 NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
-# Hardware the bot's GPUs aren't, named in a PR (other_hardware). Lookarounds rather than \b, so `rocm_env`
-# and `is_amd` count, and `amd64` and `hipster` don't.
-UNTESTABLE_HARDWARE = re.compile(r"(?<![a-z0-9])(amd|rocm|hip|mi\d{3}x?)(?![a-z0-9])", re.IGNORECASE)
+# Hardware the bot's GPUs aren't, as a word in a PR can name it (untestable): the backstop for the review's
+# own `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
+# `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
+# Multi-Process Service.
+UNTESTABLE_HARDWARE = re.compile(r"(?<![a-z0-9])(?:(?:is)?amd(?!64)[a-z0-9]*|rocm|hip(?:cc)?|mi\d{3}[ax]?|xpu|gaudi|hpu"
+                                 r"|tpu|(?<!bare[- _])metal|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
 MAX_BOX_USD = 500  # what a box's own claude.json can claim for one run; a box controls that file
 ERAS_OUT = "/workspace/live-pr/out"
 # The kinds of check the review can ask for (the schema's `checks`), as the brief names them.
@@ -507,18 +510,18 @@ def to_fix_first(review, pr, above):
     return why
 
 
-def other_hardware(pull, changes, review):
-    """Why the bot's GPUs passing doesn't cover this PR, as reasons not to approve (none when they do): what
-    the review's `untestable` field says and what UNTESTABLE_HARDWARE finds in the PR's title, file names and
-    changed lines. A diff GitHub won't give is a reason too."""
+def untestable(pull, changes, review):
+    """What the live test can't cover in this PR, as reasons not to approve (none when it covers it all):
+    what the review's `untestable` field says and what UNTESTABLE_HARDWARE finds in the PR's title, file
+    names and changed lines. A diff GitHub won't give is a reason too."""
     text = [pull["title"], *file_names(changes)]
     for f in changes:
         text += [line[1:] for line in (f.get("patch") or "").splitlines() if line[:1] in ("+", "-")]
     named = sorted({m.lower() for line in text for m in UNTESTABLE_HARDWARE.findall(line)})
     needs = [x for x in ((review.get("live_test") or {}).get("untestable"), ", ".join(named)) if x]
     unread = [f["filename"] for f in changes if f.get("changes") and not f.get("patch")]
-    return [*([f"needs a test on {'; '.join(needs)}: the bot's GPUs can't run it"] if needs else []),
-            *([f"couldn't read the diff of `{unread[0]}` to check what hardware it needs"] if unread else [])]
+    return [*([f"the bot's live test can't cover this: {'; '.join(needs)}"] if needs else []),
+            *([f"couldn't read the diff of `{unread[0]}` to check what the live test can't cover"] if unread else [])]
 
 
 def reasons_not_to_approve(pr, sha, verdict, since, review):
@@ -537,7 +540,7 @@ def reasons_not_to_approve(pr, sha, verdict, since, review):
     if not (verdict == "pass" or (verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none")):
         why.append(f"the live test's verdict is {verdict}" + ("; judge its 👂 rows" if verdict == "partial" else ""))
     changes = changed_files(pull["base"]["sha"], sha)
-    why += other_hardware(pull, changes or [], review)
+    why += untestable(pull, changes or [], review)
     if changes is None:
         why.append("the file list is too long to check")
     else:

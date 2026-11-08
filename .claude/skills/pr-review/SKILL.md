@@ -597,12 +597,13 @@ the last review.
   `what` (an input, a claim to measure, or a config or path the change only shows on) and `why`
   (one line): the input your trace found, the config that takes the changed branch. Short strings,
   no commands. Empty when you have none. The live test folds them into its risk map.
-- `untestable`: what in this PR the bot's GPUs can't exercise, as a short string; empty when there is
-  nothing. Set it for code or configs whose path runs only on hardware the live test doesn't have
-  (AMD/ROCm, XPU, Apple, anything else). When nothing the bot's GPUs can run is reached, `run` is
-  `none`, even for a change to what a model does on that hardware; when shared code changes too, the
-  live test still runs for what it can reach. It doesn't gate the GPU run. It stops the bot's approval:
-  such a PR gets the normal review and checklist, and a person approves it.
+- `untestable`: what in this PR the live test can't exercise, as a short string; empty when there is
+  nothing. It names anything of the kind: hardware the bot's GPUs aren't (AMD, Intel, Apple, TPU, a
+  GPU type no offer provides), more GPUs or nodes than a run gets (`REVIEW_GPU_MAX_GPUS`, a multi-node
+  layout), weights or services it can't get, anything else. When the live test can reach none of the
+  change, `run` is `none`, even for a change to what a model does on that hardware; when shared code
+  changes too, the live test still runs for what it can reach. It doesn't gate the GPU run. It stops
+  the bot's approval: such a PR gets the normal review and checklist, and a person approves it.
 
 The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
 counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first
