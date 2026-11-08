@@ -1,0 +1,44 @@
+model: "qwen3_5_2b"
+# Qwen3.5-2B drafting with its own MTP head (the checkpoint's mtp.* layer). Each decode
+# step drafts num_draft_tokens tokens with the head and the target verifies them in the same
+# forward; the GDN state of rejected drafts is undone in the graph. Greedy replies are the
+# target's; temperature > 0 verifies by speculative sampling. A request's repetition_penalty
+# (other than 1) is refused. No mixed prompt-plus-decode steps on this node. Off: use
+# qwen3_5_2b.yaml. Docs: docs/serving.rst (the `draft` block), docs/models.rst (Qwen3.5).
+max_seq_len: 32768
+# Raise the gen-0 GC threshold: at CPython's 700 a 128-row decode step collects
+# almost every step and runs a full collection every few hundred.
+knobs:
+  gc_gen0_threshold: 50000
+model_kwargs:
+  draft:
+    method: mtp
+    num_draft_tokens: 3
+    # asynchronous where every resource corrects itself on the device (FA3 on Hopper),
+    # else synchronous; the startup log says which and why
+    mode: auto
+node_groups:
+  # Text and images (video is refused while drafting). Colocated: the
+  # encoder runs once per request, then idles.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]
+resources:
+  gdn_state:
+    max_slots: 129
+    # GDN state snapshots at page boundaries for the prefix cache, kept across requests and
+    # evicted oldest first, replies before prompts. A prefill keeps up to two, and each takes
+    # a request slot's memory.
+    prefix_slots: 128
+    # state_dtype must stay float32 here: verifying runs FlashInfer's multi-token GDN kernel,
+    # which reads a float32 pool.
+
+# The vision regions compile at start-up; these two sizes (64 and 608 image
+# tokens) warm two of the captured block loop's buckets and the LLM's vision
+# prefill before the server binds.
+warmup_requests:
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/example_action_fd_umi_first_frame.png]
+    model_kwargs: {max_output_tokens: 4}
+  - text: What is in this image?
+    files: [hf://nvidia/Cosmos3-Edge/assets/edge_action_id_av_0_output.png]
+    model_kwargs: {max_output_tokens: 4}
