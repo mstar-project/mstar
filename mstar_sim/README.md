@@ -249,3 +249,6 @@ the roofline.
   which FlashInfer serves on cuDNN at head dim 128 or 256.
 - A FlashInfer API the stand-in lacks raises `NotImplementedError("mstar_sim: flashinfer.<name>
   has no stand-in yet")` when called.
+- A Gluon kernel launches like a Triton one (one priced kernel, nothing computed). Its `.warmup`
+  raises `NotImplementedError`: there's no compiled kernel to hand back, and `depth_kernel: true`
+  (`DepthFrame`, the only caller) reads one and the driver's occupancy. Serve without it.

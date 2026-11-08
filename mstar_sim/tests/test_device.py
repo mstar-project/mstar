@@ -2906,6 +2906,8 @@ def test_every_cuda_seam_mstar_reaches_is_emulated():
                         names += [f"{node.module}.{a.name}" for a in node.names]
                     elif top == "cuda":
                         names.append("module:cuda")
+                    elif "gluon" in node.module.split(".") or any(a.name == "gluon" for a in node.names):
+                        names.append("gluon")
                 elif isinstance(node, ast.Import):
                     for a in node.names:
                         if a.name.split(".")[0] == "cuda":
@@ -2922,6 +2924,18 @@ def test_every_cuda_seam_mstar_reaches_is_emulated():
         from mstar.engine.resources.attn import wrappers  # mstar's pin moves, so must the stand-in
         assert flashinfer.__version__ in wrappers.DIRECT_PLAN_FLASHINFER_VERSIONS, flashinfer.__version__
 
+        def gluon_launches():
+            from triton.experimental import gluon
+            from triton.experimental.gluon import language as gl
+
+            @gluon.jit
+            def kernel(ptr, N: gl.constexpr, LAYOUT: gl.constexpr):
+                gl.store(ptr + gl.arange(0, N, layout=LAYOUT), 1)
+
+            x = torch.zeros(32, dtype=torch.int32, device="cuda")
+            kernel[(1,)](x, 32, gl.BlockedLayout([1], [32], [4], [0]), num_warps=4)
+            return True
+
         def resolves(name):
             obj = importlib.import_module(name.split(".")[0])
             for part in name.split(".")[1:]:
@@ -2936,7 +2950,9 @@ def test_every_cuda_seam_mstar_reaches_is_emulated():
 
         missing = []
         for name, where in sorted(found.items()):
-            if name.startswith("ops:"):
+            if name == "gluon":
+                ok = gluon_launches()
+            elif name.startswith("ops:"):
                 ok = name[4:] in device.OPS_NAMESPACES
             elif name.startswith("module:"):
                 ok = name[7:] in device.ABSENT_MODULES

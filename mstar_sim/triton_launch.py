@@ -24,6 +24,23 @@ def traffic(*args, **kwargs) -> tuple[float, float]:
     return 0.0, float(nbytes)
 
 
+def _gluon(launch) -> None:
+    """A Gluon kernel's launch is ``launch``'s (``TRITON_INTERPRET`` doesn't reach Gluon). No compiled
+    kernel stands in for ``warmup``, and what mstar's only caller reads of one is the CUDA driver's."""
+    try:
+        from triton.experimental.gluon._runtime import GluonJITFunction
+    except ImportError:  # a Triton without Gluon
+        return
+
+    def gluon_launch(self, *args, grid, warmup, **kwargs):
+        if warmup:
+            raise NotImplementedError(f"mstar_sim: gluon warmup of {self.fn.__name__} has no stand-in")
+        return launch(self, *args, grid=grid, warmup=warmup, **kwargs)
+
+    gluon_launch.__mstar_sim_kernel__ = True
+    GluonJITFunction.run = gluon_launch
+
+
 def install() -> None:
     from triton.runtime import interpreter
 
@@ -45,6 +62,7 @@ def install() -> None:
 
     launch.__mstar_sim_kernel__ = True
     interpreter.InterpretedFunction.run = launch
+    _gluon(launch)
     from triton.runtime import autotuner
 
     # nothing to benchmark on the emulated GPU (the real path asks for a CUDA driver):
