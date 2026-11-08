@@ -64,17 +64,20 @@ def main() -> int:
     args = ap.parse_args()
     stop = threading.Event()
     uuids = visible_uuids()
-    threads = [threading.Thread(target=burn, args=(i, stop)) for i in range(len(uuids))]
+    sample(uuids)  # a GPU nvidia-smi can't match exits here, before anything is loaded
+    threads = [threading.Thread(target=burn, args=(i, stop), daemon=True) for i in range(len(uuids))]
     for t in threads:
         t.start()
-    time.sleep(args.seconds / 2)  # let temperatures settle before judging
     rows = []
-    for _ in range(5):
-        rows.append(sample(uuids))
-        time.sleep(args.seconds / 10)
-    stop.set()
-    for t in threads:
-        t.join()
+    try:
+        time.sleep(args.seconds / 2)  # let temperatures settle before judging
+        for _ in range(5):
+            rows.append(sample(uuids))
+            time.sleep(args.seconds / 10)
+    finally:
+        stop.set()
+        for t in threads:
+            t.join()
 
     bad = []
     last = rows[-1]
