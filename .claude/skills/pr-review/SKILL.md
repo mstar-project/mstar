@@ -165,9 +165,9 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   that each count the same thing (a counter, a metric, a tracked set) end with one count: the one
   that lands second folds into the first.
 - **The author's stated reason.** For every finding, P0–P3, read the description, replies, commit
-  messages and code comments for a reason the author gave for that code. When there is one, the
-  finding states it in one clause and then says why it doesn't hold or why the finding stands
-  anyway; otherwise drop the finding. A finding that contradicts a stated reason without engaging it
+  messages and code comments for a reason the author gave for that code. When there is one and it
+  holds, drop the finding. When there is one and it doesn't, the finding states it in one clause
+  and says why it doesn't hold or why the finding stands anyway. A finding that contradicts a stated reason without engaging it
   isn't ready to report.
 
 **Latent bugs on main.** A bug in code the PR didn't write or worsen is reported apart, as latent:
