@@ -615,7 +615,8 @@ def main() -> int:
                    help="fewer slots than adapters exercises eviction in the mixed phase")
     p.add_argument("--tp", type=int, default=1,
                    help="serve / tp: the LLM node's TP size (needs that many GPUs)")
-    p.add_argument("--async-sched", default="0,1",
+    # 1 (the async TP scheduler) is refused with a lora block until #1082 lands
+    p.add_argument("--async-sched", default="0",
                    help="tp: the MSTAR_TP_ASYNC_SCHED values to run, comma-separated")
     args = p.parse_args()
     args.async_sched = args.async_sched.split(",")

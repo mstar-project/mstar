@@ -66,7 +66,11 @@ def _lora_tp_problems(config: Mapping[str, Any], lora: list) -> list[str]:
 
     from mstar.worker.worker import _tp_async_sched_setting
 
-    on, only = _tp_async_sched_setting(os.environ.get("MSTAR_TP_ASYNC_SCHED"), config.get("tp_async_sched"))
+    env = os.environ.get("MSTAR_TP_ASYNC_SCHED")
+    on, only = _tp_async_sched_setting(env, config.get("tp_async_sched"))
+    # the env var overrides the config, so it is the one to change when set
+    switch = (f"unset MSTAR_TP_ASYNC_SCHED (={env}) or set it to 0" if env
+              else "set `tp_async_sched: false` (or leave these nodes out of its list)")
     lora_nodes = set().union(*(spec.nodes for spec in lora))
     problems = []
     for group in config.get("node_groups") or ():
@@ -75,8 +79,8 @@ def _lora_tp_problems(config: Mapping[str, Any], lora: list) -> list[str]:
             problems.append(
                 f"node_groups entry {sorted(group.get('node_names', []))} runs LoRA node(s) "
                 f"{sorted(async_nodes)} at tp_size {group['tp_size']} under the async TP scheduler, "
-                "which LoRA does not support yet; set `tp_async_sched: false` (or leave these nodes "
-                "out of its list), serve them at tp_size 1, or drop the 'lora:' block"
+                f"which LoRA does not support yet; {switch}, serve them at tp_size 1, or drop the "
+                "'lora:' block"
             )
     return problems
 
@@ -168,7 +172,7 @@ def validate_deployment(
                 size_lora_specs(lora, config)
             specs += lora
             if not malformed:  # reads node_groups, which the placement checks found readable
-                problems += _lora_tp_problems(config, lora)
+                problems += _checked("checking LoRA under tensor parallelism", _lora_tp_problems, config, lora)
     if specs is not None:
         problems += _checked("checking the node resources", check_resources, model, specs, checked_config)
         # the placement checks see what the workers build of them
