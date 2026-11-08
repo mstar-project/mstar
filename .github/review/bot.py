@@ -103,11 +103,11 @@ def marked(comments, marker):
             if (c.get("user") or {}).get("login") in BOT_USERS and (c.get("body") or "").startswith(marker)]
 
 
-def last_state(conversation):
-    """The state of the bot's last summary among the PR's conversation comments, or None (read_state)."""
+def last_summary(conversation):
+    """The bot's last summary among the PR's conversation comments, or None."""
     summaries = [c for c in conversation
                  if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
-    return render_summary.read_state(summaries[-1]["body"]) if summaries else None
+    return summaries[-1]["body"] if summaries else None
 
 
 def oneline(commits):
@@ -448,7 +448,8 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
     # (too large, say) means a full review, never an empty since.diff.
     if not prev:
-        state = last_state(conversation)
+        summary = last_summary(conversation)
+        state = summary and render_summary.read_state(summary)
         last = (state or {}).get("head")
         since = f"repos/{repo}/compare/{last}...{head_sha}"
         try:
@@ -558,19 +559,20 @@ def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, gi
         print(f"::warning::Couldn't write the usage record: {e}")
 
 
-def earlier_outside_diff(repo, pr, prev):
-    """The findings outside the diff of the review this run built on, which stay open until it judges them:
-    what last-review.json showed it, or the last summary's on a /review continue, which wasn't shown them."""
-    state = None
+def earlier_outside_diff(repo, pr):
+    """The findings outside the diff of the last review, which stay open until a review judges them: what
+    last-review.json showed this run, or the last summary's own when the run had no last-review.json (no
+    earlier diff, a partial review, or a /review continue)."""
     if Path("last-review.json").exists():
         state = json.loads(Path("last-review.json").read_text())
-    elif prev:
-        state = last_state([{"user": (c.get("user") or {}).get("login"), "body": c.get("body")}
-                            for c in api_list(f"repos/{repo}/issues/{pr}/comments")])
+    else:
+        summary = last_summary([{"user": (c.get("user") or {}).get("login"), "body": c.get("body")}
+                                for c in api_list(f"repos/{repo}/issues/{pr}/comments")])
+        state = summary and render_summary.saved_state(summary)
     return (state or {}).get("outside_diff") or []
 
 
-def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
+def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
     """Post the summary, rendered from the review's fields by render_summary and redacted: model output from
     untrusted input. Read the PR's threads after the review posted its inline comments, so the status line
     counts them along with earlier ones still open. Each run posts its own summary comment, so a re-review
@@ -578,7 +580,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
     point here, and loses its marker so a later failure starts a fresh one."""
     pages = graphql(THREADS, repo, pr)
     try:
-        review = render_summary.carried(json.loads(output), earlier_outside_diff(repo, pr, prev))
+        review = render_summary.carried(json.loads(output), earlier_outside_diff(repo, pr))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"))
     except Exception as e:
         text = ""

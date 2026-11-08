@@ -408,6 +408,25 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertTrue(all(posted not in arg for argv, _ in fake.calls for arg in argv),
                         "posted text would reach gh's command line")
 
+    def test_the_summary_keeps_the_last_reviews_findings_a_re_review_wasnt_shown(self):
+        item = {"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"}
+        state = {"head": LAST, "mode": "nogpu", "skipped": ["big.py"], "latent": [], "outside_diff": [item]}
+        partial = f"{render_summary.MARKER}\n<!-- claude-review-state " \
+                  f"{base64.b64encode(json.dumps(state).encode()).decode()} -->"
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []}}
+        with workspace():
+            _, fake = step(bot.post, {
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
+                                                     "body": partial}],
+            }, repo="o/r", pr="7", output=json.dumps(review), head_sha=HEAD, mode="light", salvaged="false")
+        (_, posted), = fake.writes()
+        self.assertEqual(render_summary.saved_state(posted)["outside_diff"], [item],
+                         "a run with no last-review.json, or a /review continue, would drop the finding for good")
+
     def test_only_the_fixed_type_labels_reach_the_api(self):
         out, fake = step(bot.labels, {"GET repos/o/r/issues/7/labels": [{"name": "type/docs"}, {"name": "area/x"}],
                                       "DELETE *": {}, "GET repos/o/r/labels/*": Fail(), "POST *": {}},
