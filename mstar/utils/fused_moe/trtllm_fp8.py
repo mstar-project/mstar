@@ -47,6 +47,11 @@ _VERDICTS: dict[tuple, str | None] = {}
 _LOGGED: set[tuple] = set()
 # (device, w13 shape, top_k, tokens) -> the autotune's summary
 _TUNED: dict[tuple, str] = {}
+# (device, w13 shape, top_k, scale) -> None where the in-kernel routing's probe passed, else why not
+_ROUTING: dict[tuple, str | None] = {}
+# where the kernel routes itself, its outputs within this of the same kernel on the reference router's ids and
+# weights: they differ by the kernel's bf16 routing weights (~0.4%), a wrong routing by O(1)
+ROUTING_TOLERANCE = 0.02
 
 
 class ExpertWeights(NamedTuple):
@@ -141,6 +146,97 @@ def _(x, w13, s13, w2, s2, topk_weights, topk_ids):
     return torch.empty_like(x)
 
 
+def deepseek_v3_route(logits: torch.Tensor, bias: torch.Tensor, top_k: int,
+                      scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(weights, ids)`` as the kernel's DeepSeekV3 routing with one expert group computes them, in fp32:
+    experts by sigmoid(logit) + bias, weights the selected sigmoid scores renormalized (+ 1e-20) times
+    ``scale``. That is GLM's noaux_tc router (``NoAuxTcRouter`` with ``norm_topk_prob``)."""
+    scores = logits.float().sigmoid()
+    ids = torch.topk(scores + bias.float().unsqueeze(0), k=top_k, dim=-1).indices
+    w = scores.gather(1, ids)
+    return w * scale / (w.sum(dim=-1, keepdim=True) + 1e-20), ids
+
+
+def experts_from_logits(x: torch.Tensor, packed: ExpertWeights, logits: torch.Tensor, bias: torch.Tensor,
+                        top_k: int, scale: float) -> torch.Tensor:
+    """:func:`experts` with the routing done inside the kernel (DeepSeekV3, one group) from the router's fp32
+    ``(T, E)`` logits and ``bias``: no top-k, id cast or weight copies of its own."""
+    return torch.ops.mstar.trtllm_fp8_moe_logits(x, packed.w13, packed.s13, packed.w2, packed.s2,
+                                                logits, bias, top_k, scale)
+
+
+@torch.library.custom_op("mstar::trtllm_fp8_moe_logits", mutates_args=())
+def _experts_logits_op(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    s13: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    top_k: int,
+    scale: float,
+) -> torch.Tensor:
+    return launch_from_logits(x, ExpertWeights(w13, s13, w2, s2), logits, bias, top_k, scale)
+
+
+@_experts_logits_op.register_fake
+def _(x, w13, s13, w2, s2, logits, bias, top_k, scale):
+    return torch.empty_like(x)
+
+
+def launch_from_logits(x, packed: ExpertWeights, logits, bias, top_k: int, scale: float) -> torch.Tensor:
+    """One call of the monolithic kernel, routing from the logits (vLLM routes GLM-5.x on Blackwell this way)."""
+    from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+    from flashinfer.tllm_enums import RoutingMethodType
+
+    from mstar.utils.quant_fp8 import per_token_group_quant_fp8
+
+    e, hidden = packed.w13.shape[0], x.shape[1]
+    xq, xs = per_token_group_quant_fp8(x.contiguous(), BLOCK)
+    out = trtllm_fp8_block_scale_moe(
+        logits.float().contiguous(), bias, xq, xs.t().contiguous(),
+        packed.w13.view(torch.float8_e4m3fn), packed.s13, packed.w2.view(torch.float8_e4m3fn), packed.s2,
+        e, top_k, 1, 1, packed.s2.shape[2] * BLOCK, 0, e, scale,
+        routing_method_type=int(RoutingMethodType.DeepSeekV3), use_shuffled_weight=True,
+        weight_layout=BLOCK_MAJOR_K,
+    )
+    out = out[0] if isinstance(out, (list, tuple)) else out
+    assert out.shape == (x.shape[0], hidden)
+    return out if out.dtype == x.dtype else out.to(x.dtype)
+
+
+def take_routing(packed: ExpertWeights, hidden: int, bias: torch.Tensor, top_k: int, scale: float) -> bool:
+    """Whether the kernel routes these experts itself: once per device and shape, on random logits and the
+    block's own bias at 1, 8 and 200 tokens, against the same kernel fed :func:`deepseek_v3_route`'s ids and
+    weights, within :data:`ROUTING_TOLERANCE`; then its tactics are tuned in that call form. A failure or an
+    exception logs and keeps the router outside the kernel. Ranks decide alone; neither path has a collective."""
+    device = packed.w13.device
+    key = (device, tuple(packed.w13.shape), top_k, float(scale))
+    if key not in _ROUTING:
+        try:
+            gen = torch.Generator(device=device).manual_seed(1)
+            e, worst = packed.w13.shape[0], 0.0
+            for tokens in (1, 8, 200):
+                x = torch.randn(tokens, hidden, device=device, generator=gen).to(torch.bfloat16)
+                logits = 2 * torch.randn(tokens, e, device=device, generator=gen)
+                w, ids = deepseek_v3_route(logits, bias, top_k, scale)
+                worst = max(worst, rel_l2(experts_from_logits(x, packed, logits, bias, top_k, scale),
+                                          experts(x, packed, w, ids)))
+            _ROUTING[key] = (None if worst <= ROUTING_TOLERANCE
+                             else f"relative error {worst:.3g}, above {ROUTING_TOLERANCE}")
+        except Exception as exc:  # noqa: BLE001 - an unproven call form keeps the outside router
+            _ROUTING[key] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if _ROUTING[key] is not None:
+            logger.warning("Blackwell fp8 MoE: routing stays outside the kernel for experts %s on %s: %s",
+                           key[1], device, _ROUTING[key])
+        else:
+            tuned = autotune(packed, hidden, top_k, device, routing=(bias, float(scale)))
+            logger.info("Blackwell fp8 MoE: the kernel routes experts %s on %s itself (DeepSeekV3, one group; "
+                        "probe within %s; %s)", key[1], device, ROUTING_TOLERANCE, tuned)
+    return _ROUTING[key] is None
+
+
 def launch(x, packed: ExpertWeights, topk_weights, topk_ids, *, shuffled: bool = True,
            routing_method: int = 1, scale_t: bool = True) -> torch.Tensor:
     """One call of the kernel. The keywords are the production layout; the B300 trials
@@ -227,26 +323,32 @@ def _tune_cache_path(name: str, device: torch.device) -> str | None:
 
 
 def autotune(packed: ExpertWeights, hidden: int, top_k: int, device: torch.device,
-             tokens: tuple[int, ...] = TUNE_TOKENS) -> str:
+             tokens: tuple[int, ...] = TUNE_TOKENS, routing: tuple[torch.Tensor, float] | None = None) -> str:
     """Profile the kernel's tactics at ``tokens`` inside ``flashinfer.autotune``: one call at the largest count
     tunes every count, and the calls after it (CUDA graph captures included) look the tactics up. Once per process
     and shape, the experts of a model's layers sharing it; the tactics persist per GPU (:func:`_tune_cache_path`).
-    Returns a summary for the log; a failure is logged and keeps the default tactics, never failing the load."""
+    Returns a summary for the log; a failure is logged and keeps the default tactics, never failing the load.
+    With ``routing`` (bias, scale) the call that is tuned routes in the kernel (:func:`experts_from_logits`)."""
     e = packed.w13.shape[0]
-    key = (device, tuple(packed.w13.shape), top_k, tuple(tokens))
+    key = (device, tuple(packed.w13.shape), top_k, tuple(tokens), routing is not None)
     if key in _TUNED:
         return _TUNED[key]
     try:
         from flashinfer.autotuner import autotune as fi_autotune
 
-        path = _tune_cache_path(f"fp8block_E{e}_I{packed.s2.shape[2] * BLOCK}_H{hidden}_K{top_k}", device)
+        path = _tune_cache_path(f"fp8block_E{e}_I{packed.s2.shape[2] * BLOCK}_H{hidden}_K{top_k}"
+                                + ("_dsv3" if routing is not None else ""), device)
         gen = torch.Generator(device=device).manual_seed(0)
         m = max(tokens)
         x = torch.randn(m, hidden, device=device, generator=gen).to(torch.bfloat16)
         w, ids = probe_routing(m, e, top_k, device, gen)
         t = time.time()
         with fi_autotune(True, cache=path, tuning_buckets=tuple(tokens)):
-            experts(x, packed, w, ids)
+            if routing is None:
+                experts(x, packed, w, ids)
+            else:
+                experts_from_logits(x, packed, 2 * torch.randn(m, e, device=device, generator=gen), routing[0],
+                                    top_k, routing[1])
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         summary = (f"tactics autotuned at {len(tokens)} token counts {tokens[0]}..{tokens[-1]} in "

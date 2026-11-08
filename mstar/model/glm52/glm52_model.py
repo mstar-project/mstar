@@ -118,6 +118,11 @@ class Glm52Model(Model):
             if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 1):
                 raise ValueError(f"dense_bf16_min_tokens must be a token count, 1 or more, or null; got {n!r}")
             self.config.dense_bf16_min_tokens = n
+        if "routed_experts_routing" in kwargs:
+            if kwargs["routed_experts_routing"] not in ("torch", "kernel"):
+                raise ValueError("routed_experts_routing must be torch or kernel, got "
+                                 f"{kwargs['routed_experts_routing']!r}")
+            self.config.routed_experts_routing = kwargs["routed_experts_routing"]
         if "graph_compile" in kwargs:
             # bool("false") is True
             if not isinstance(kwargs["graph_compile"], bool):

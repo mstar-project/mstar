@@ -365,3 +365,96 @@ def test_a_glm_block_on_blackwell_takes_the_kernel_and_matches_the_reference():
     for tokens in (3, 100):
         x = torch.randn(tokens, 512, device=DEV).to(torch.bfloat16)
         assert trtllm_fp8.rel_l2(block(x), ref(x)) < REFERENCE_TOLERANCE
+
+
+def test_the_kernels_routing_is_glms_router():
+    """deepseek_v3_route (the kernel's DeepSeekV3 routing, one group) picks GLM's router's experts, with its
+    weights, from the router's own logits."""
+    from mstar.model.components.moe import NoAuxTcRouter
+
+    torch.manual_seed(11)
+    gate = NoAuxTcRouter(64, 16, 4, 2.5, True)
+    gate.weight.data.normal_(0, 0.1)
+    gate.e_score_correction_bias.data.normal_(0, 0.5)
+    x = torch.randn(9, 64)
+    w_ref, ids_ref, _ = gate(x)
+    w, ids = trtllm_fp8.deepseek_v3_route(gate.logits(x), gate.e_score_correction_bias, 4, 2.5)
+    order_ref, order = ids_ref.sort(-1), ids.sort(-1)
+    assert torch.equal(order_ref.values, order.values)
+    torch.testing.assert_close(w_ref.gather(1, order_ref.indices), w.gather(1, order.indices))
+
+
+@pytest.mark.parametrize("agrees", [True, False])
+def test_take_routing_probes_once_and_keeps_the_outside_router_on_a_mismatch(monkeypatch, caplog, agrees):
+    monkeypatch.setattr(trtllm_fp8, "_ROUTING", {})
+    calls, tuned = [], []
+    monkeypatch.setattr(trtllm_fp8, "experts", lambda x, packed, w, ids: torch.ones(x.shape[0], 4))
+    monkeypatch.setattr(trtllm_fp8, "experts_from_logits",
+                        lambda x, packed, logits, bias, k, s: calls.append(x.shape[0]) or
+                        torch.ones(x.shape[0], 4) * (1 if agrees else 2))
+    monkeypatch.setattr(trtllm_fp8, "autotune", lambda *a, **k: tuned.append(k["routing"]) or "tuned")
+    packed = trtllm_fp8.ExpertWeights(torch.zeros(8, 1, 256, 128), None, None, torch.zeros(8, 1, 1))
+    with caplog.at_level(logging.WARNING, logger=trtllm_fp8.__name__):
+        assert trtllm_fp8.take_routing(packed, 128, torch.zeros(8), 2, 2.5) is agrees
+        assert trtllm_fp8.take_routing(packed, 128, torch.zeros(8), 2, 2.5) is agrees
+    assert calls == [1, 8, 200]
+    assert len(tuned) == (1 if agrees else 0)
+    assert ("routing stays outside the kernel" in caplog.text) is not agrees
+
+
+def test_a_block_routing_in_the_kernel_hands_it_the_logits(blackwell_stand_in, fused_here, monkeypatch):
+    """routed_experts_routing: kernel and a passed probe: the block skips its router and gives the kernel the
+    gate's logits, bias, top-k and scale; through the kernel's documented routing and contract that is the
+    reference block's output."""
+    monkeypatch.setattr(trtllm_fp8, "take_routing", lambda *a: True)
+    raw = random_experts(8, 128, 128, "cpu", seed=3)
+    cfg = _cfg()
+    cfg.routed_experts_routing = "kernel"
+    ref, block = _block(_cfg(), raw), _block(cfg, raw)
+    block.process_weights_after_loading("cpu")
+    assert block._trtllm and block._kernel_routing
+    seen = []
+
+    def kernel(x, packed, logits, bias, top_k, scale):
+        seen.append((x.shape[0], top_k, scale))
+        w, ids = trtllm_fp8.deepseek_v3_route(logits, bias, top_k, scale)
+        return _kernel_as_documented(x, packed, w, ids)
+
+    monkeypatch.setattr(trtllm_fp8, "experts_from_logits", kernel)
+    monkeypatch.setattr(block.gate, "forward", lambda *a, **k: pytest.fail("the outside router ran"))
+    x = torch.randn(5, 128) * 0.5
+    torch.testing.assert_close(block(x), ref(x), rtol=1e-4, atol=1e-4)
+    assert seen == [(5, cfg.num_experts_per_tok, cfg.routed_scaling_factor)]
+
+
+def test_routed_experts_routing_is_torch_or_kernel():
+    from mstar.model.glm52.glm52_model import Glm52Model
+
+    assert Glm52Model(model_path_hf=None, config_variant="reduced_fp8").config.routed_experts_routing == "torch"
+    model = Glm52Model(model_path_hf=None, config_variant="reduced_fp8", routed_experts_routing="kernel")
+    assert model.config.routed_experts_routing == "kernel"
+    with pytest.raises(ValueError, match="routed_experts_routing"):
+        Glm52Model(model_path_hf=None, config_variant="reduced_fp8", routed_experts_routing="auto")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="M*'s CUDA router kernels")
+@pytest.mark.parametrize("tokens", [1, 8, 64, 300])
+def test_glms_cuda_router_routes_as_the_kernel_does(tokens):
+    """On any CUDA GPU: GLM-5.3's router as served (the fused decode router up to its row bound, the GEMM + top-k
+    kernel past it; bf16 weight, 256 experts, top-8, scale 2.5) picks deepseek_v3_route's experts with its
+    weights. The trtllm kernel's own routing is held to deepseek_v3_route by its load probe on Blackwell."""
+    from mstar.model.components.moe import NoAuxTcRouter
+
+    torch.manual_seed(5)
+    gate = NoAuxTcRouter(6144, 256, 8, 2.5, True).cuda()
+    gate.weight.data = (torch.randn(256, 6144, device="cuda") * 0.02).to(torch.bfloat16)
+    gate.e_score_correction_bias.data.normal_(0, 0.1)
+    gate.finalize_weights(topk_kernel=True)
+    x = torch.randn(tokens, 6144, device="cuda").to(torch.bfloat16)
+    w_ref, ids_ref, _ = gate(x)
+    w, ids = trtllm_fp8.deepseek_v3_route(gate.logits(x), gate.e_score_correction_bias, 8, 2.5)
+    order_ref, order = ids_ref.long().sort(-1), ids.sort(-1)
+    same = (order_ref.values == order.values).all(-1)
+    assert same.float().mean() >= 0.98, f"{(~same).sum()} of {tokens} rows pick other experts"
+    torch.testing.assert_close(w_ref.float().gather(1, order_ref.indices)[same], w.gather(1, order.indices)[same],
+                               rtol=1e-3, atol=1e-4)

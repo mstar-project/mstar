@@ -86,6 +86,10 @@ class Glm52SparseMoeBlock(nn.Module):
         # Set by process_weights_after_loading where flashinfer's Blackwell kernel passed its probe:
         # the routed experts then hold its layout (fused_moe.trtllm_fp8) and it serves every count.
         self._trtllm = False
+        # Set there too where the kernel also routes from the router's logits (routed_experts_routing:
+        # kernel) and that call form passed its probe
+        self._kernel_routing = False
+        self._routing_wanted = getattr(config, "routed_experts_routing", "torch") == "kernel"
         # the decode chain (w8a16, fp32 routing weights) and the router kernel (ids can differ
         # at exact ties, weights by an ulp) change numerics, so only kernels: auto takes them;
         # the prefill kernels keep the runner's bits, so every fused block does
@@ -211,6 +215,12 @@ class Glm52SparseMoeBlock(nn.Module):
                 out = self.comm_group.all_reduce(out)
             return out.view(input_shape)
 
+        if self._kernel_routing:
+            routed = self._dispatch_trtllm_logits(flat)
+            if self.tp_size > 1 and not self._sum_partials:
+                routed = self.comm_group.all_reduce(routed)
+            return self._with_shared(flat, routed, input_shape)
+
         # topk_weights stay fp32 into the combine, as in HF's experts.
         topk_weights, topk_ids, _ = self.gate(flat)
         if self.fp8_experts:
@@ -260,6 +270,9 @@ class Glm52SparseMoeBlock(nn.Module):
             )
             if not self._sum_partials:
                 routed = self.comm_group.all_reduce(routed)
+        return self._with_shared(flat, routed, input_shape)
+
+    def _with_shared(self, flat: torch.Tensor, routed: torch.Tensor, input_shape) -> torch.Tensor:
         shared = self.shared_expert(flat)
         out = routed + shared
         if self._sum_partials and self.reduce_results:
@@ -325,6 +338,30 @@ class Glm52SparseMoeBlock(nn.Module):
             flat, trtllm_fp8.ExpertWeights(exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
                                            exp.down_proj_fp8, exp.down_proj_scale_inv),
             topk_weights, topk_ids)
+
+    def _dispatch_trtllm_logits(self, flat: torch.Tensor) -> torch.Tensor:
+        """The routed experts in flashinfer's Blackwell kernel, routed inside it from the gate's logits."""
+        from mstar.utils.fused_moe import trtllm_fp8
+
+        exp, gate = self.experts, self.gate
+        return trtllm_fp8.experts_from_logits(
+            flat, trtllm_fp8.ExpertWeights(exp.gate_up_proj_fp8, exp.gate_up_proj_scale_inv,
+                                           exp.down_proj_fp8, exp.down_proj_scale_inv),
+            gate.logits(flat), gate.e_score_correction_bias, gate.top_k, gate.routed_scaling_factor)
+
+    def _take_kernel_routing(self) -> bool:
+        """Whether the trtllm kernel can route this block itself: GLM's router is noaux_tc over one
+        group, which is its DeepSeekV3 routing when the top-k renormalizes (fused_moe.trtllm_fp8.take_routing)."""
+        from mstar.utils.fused_moe import trtllm_fp8
+
+        gate, exp = self.gate, self.experts
+        if not gate.norm_topk_prob:
+            return False
+        return trtllm_fp8.take_routing(
+            trtllm_fp8.ExpertWeights(exp.gate_up_proj_fp8.data, exp.gate_up_proj_scale_inv.data,
+                                     exp.down_proj_fp8.data, exp.down_proj_scale_inv.data),
+            self.hidden_size, gate.e_score_correction_bias.data.float().contiguous(), gate.top_k,
+            float(gate.routed_scaling_factor))
 
     def _take_trtllm(self) -> bool:
         """Repack the routed experts in place for flashinfer's Blackwell kernel where it runs and
@@ -411,6 +448,7 @@ class Glm52SparseMoeBlock(nn.Module):
             return
         # kernels: auto only (the reference stays the numerics anchor); repacked experts stay so
         self._trtllm = self._trtllm or (self._use_fused and self._decode_kernel and self._take_trtllm())
+        self._kernel_routing = self._trtllm and self._routing_wanted and self._take_kernel_routing()
         global _BACKEND_LOGGED
         if not _BACKEND_LOGGED:
             logger.info(

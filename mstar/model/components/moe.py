@@ -255,6 +255,20 @@ class NoAuxTcRouter(nn.Module):
             self._route_op, self._topk_op = decode.route_op, decode.router_topk
             self._route_rows = decode.MAX_ROUTER_TOKENS
 
+    def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The fp32 ``(T, E)`` router logits, for a kernel that routes from them itself."""
+        flat = hidden_states.reshape(-1, self.hidden_size)
+        # the engine's bf16 autocast would run F.linear in bf16 and round the logits
+        with torch.autocast(flat.device.type, enabled=False):
+            if _MM_OUT_DTYPE and flat.is_cuda and flat.dtype == self.weight.dtype == torch.bfloat16:
+                # bf16 x bf16 products are exact in fp32: the fp32 router in another
+                # summation order, without an fp32 copy of the tokens
+                return torch.mm(flat, self.weight.t(), out_dtype=torch.float32)
+            w = self._weight_fp32
+            if w is None or w.device != self.weight.device:
+                w = self.weight.float()
+            return F.linear(flat.float(), w)
+
     def forward(
         self, hidden_states: torch.Tensor, router_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
@@ -264,17 +278,7 @@ class NoAuxTcRouter(nn.Module):
                 flat.contiguous(), self.weight, self.e_score_correction_bias, self.top_k,
                 self.routed_scaling_factor, self.norm_topk_prob)
             return topk_weights, topk_ids, None
-        # the engine's bf16 autocast would run F.linear in bf16 and round the logits
-        with torch.autocast(flat.device.type, enabled=False):
-            if _MM_OUT_DTYPE and flat.is_cuda and flat.dtype == self.weight.dtype == torch.bfloat16:
-                # bf16 x bf16 products are exact in fp32: the fp32 router in another
-                # summation order, without an fp32 copy of the tokens
-                logits = torch.mm(flat, self.weight.t(), out_dtype=torch.float32)
-            else:
-                w = self._weight_fp32
-                if w is None or w.device != self.weight.device:
-                    w = self.weight.float()
-                logits = F.linear(flat.float(), w)
+        logits = self.logits(flat)
         if self._topk_op is not None and logits.is_cuda:
             topk_weights, topk_ids = self._topk_op(
                 logits, self.e_score_correction_bias, self.top_k, self.routed_scaling_factor,

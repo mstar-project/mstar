@@ -139,6 +139,10 @@ class Glm52ModelConfig:
     # whose block-fp8 GEMM loses to bf16 past a few tokens: on B300, w8a16 runs ~0.5x bf16 at
     # 4-64 tokens and up to ~1.8x at one. Costs a bf16 copy of those weights.
     dense_bf16_min_tokens: int | None = None
+    # Where the routed experts run on flashinfer's Blackwell trtllm fp8 kernel: "kernel" lets it route
+    # from the router's logits itself (DeepSeekV3 routing, one group: GLM's noaux_tc), as vLLM runs it,
+    # where its load probe agrees; "torch" routes first and passes it the ids and weights.
+    routed_experts_routing: str = "torch"
     # Keep routed experts FP8-resident (uint8 container + block scales). Disabling this
     # dequantizes them to bf16 on load — fine for reduced tests, but bf16 routed experts
     # alone outsize a device at TP8 on the real 753B checkpoint.
