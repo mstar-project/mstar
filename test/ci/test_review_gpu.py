@@ -450,16 +450,16 @@ class TestApprove(unittest.TestCase):
                 text, out, writes = self.approve({"value": "on"}, **kwargs)
                 self.assertEqual((writes, out.get("approval")), ([], None), f"{name} would still approve")
                 self.assertIn(says, text)
+        text, out, writes = self.approve({"value": "On"})
+        self.assertEqual((writes, out.get("approval")), ([], None), "only the exact word `on` turns approvals on")
 
     def test_the_fixed_check_finds_hardware_words_and_leaves_ordinary_ones(self):
         for text, hit in (("amdsmi.gpu", True), ("if isAMD():", True), ("MI300A nodes", True), ("hipcc -c x", True),
                           ("torch.xpu", True), ("Intel Gaudi", True), ("TPU", True), ("Apple Silicon", True),
-                          ("amd64 builds", False), ("AuthenticAMD", False), ("hipster", False),
+                          ("tpu = PS // 2", False), ("amd64 builds", False), ("AuthenticAMD", False), ("hipster", False),
                           ("test_bare_metal", False), ("bare-metal hosts", False), ("MPS on and off", False)):
             with self.subTest(text):
                 self.assertEqual(bool(gpu_review.UNTESTABLE_HARDWARE.search(text)), hit)
-        text, out, writes = self.approve({"value": "On"})
-        self.assertEqual((writes, out.get("approval")), ([], None), "only the exact word `on` turns approvals on")
 
     def test_an_engine_change_gets_a_comment_that_cant_count(self):
         for files in ([{"filename": "mstar/engine/engine.py"}],

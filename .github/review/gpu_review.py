@@ -45,9 +45,9 @@ NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
 # Hardware the bot's GPUs aren't, as a word in a PR can name it (untestable): the backstop for the review's
 # own `untestable` field. Lookarounds rather than \b, so `rocm_env`, `is_amd`, `amdsmi` and `isAMD` count, and
 # `amd64`, `AuthenticAMD` (a CPU), `hipster` and `bare_metal` don't. Not `mps`: here that is usually NVIDIA's
-# Multi-Process Service.
+# Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable.
 UNTESTABLE_HARDWARE = re.compile(r"(?<![a-z0-9])(?:(?:is)?amd(?!64)[a-z0-9]*|rocm|hip(?:cc)?|mi\d{3}[ax]?|xpu|gaudi|hpu"
-                                 r"|tpu|(?<!bare[- _])metal|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
+                                 r"|(?-i:TPU)|(?<!bare[- _])metal|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
 MAX_BOX_USD = 500  # what a box's own claude.json can claim for one run; a box controls that file
 ERAS_OUT = "/workspace/live-pr/out"
 # The kinds of check the review can ask for (the schema's `checks`), as the brief names them.
