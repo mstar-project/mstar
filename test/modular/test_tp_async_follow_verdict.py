@@ -280,7 +280,6 @@ def _tp_loop(monkeypatch, follower=False, forward_raises=()):
     w.tp_async_sched, w.tp_async_nodes = True, None
     w.parallel_nodes, w.parallel_leader_nodes = {node}, set() if follower else {node}
     w.is_tp_follower = follower
-    w._tp_nospec = RecentSet(Worker._TP_NOSPEC_KEEP)
     w._graph_runtime = types.SimpleNamespace(
         is_async_schedulable=lambda node, walk: True, push_back_node=lambda *a: None,
     )

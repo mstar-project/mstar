@@ -361,15 +361,15 @@ def test_a_read_that_raises_as_it_starts_goes_to_the_check_and_fails_once():
     with r1 empty rather than this rank waiting on r1 for good."""
     sched, manager = _follower_scheduler(ready=["r0"])
     manager.per_request_info["r1"] = SimpleNamespace(stream_buffers={"audio": None})
-    w = Worker.__new__(Worker)
-    w.worker_id, w.enable_nvtx, w._reads_done_sent = "w1", False, set()
-    w.scheduler, w.request_state = sched, manager
-    w._graph_runtime = SimpleNamespace(get_rid_handle=lambda r: r, get_rid_string=lambda h: h)
-    w.tensor_manager = SimpleNamespace(start_read_tensors=lambda *a, **kw: (_ for _ in ()).throw(
-        RuntimeError("CUDA out of memory"),
-    ))
     sent = []
-    w.communicator = SimpleNamespace(send=lambda dest, msg: sent.append(msg))
+    w = make_worker(
+        worker_id="w1", scheduler=sched, request_state=manager,
+        _graph_runtime=SimpleNamespace(get_rid_handle=lambda r: r, get_rid_string=lambda h: h),
+        tensor_manager=SimpleNamespace(start_read_tensors=lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("CUDA out of memory"),
+        )),
+        communicator=SimpleNamespace(send=lambda dest, msg: sent.append(msg)),
+    )
     edge = _input(18, "audio")
     edge.is_streaming = True
     for _ in range(2):
