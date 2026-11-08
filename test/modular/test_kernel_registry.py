@@ -465,9 +465,10 @@ THINKER = (2048, 128, 768, 8)  # Qwen3-Omni's Thinker experts at TP1: H, E, I, K
 
 
 def test_the_routed_path_takes_its_gpus_shipped_entry_and_keeps_the_builtin_table_elsewhere(monkeypatch):
-    """bf16 experts (``routed_experts``) take their crossover and tiles from the package's
-    moe_decode table for the GPU, the H200's Thinker entry there. Without an entry (an H100,
-    the Talker's shape) the built-in table runs, as before the registry had one."""
+    """bf16 experts (``routed_experts``) take their crossover (and tiles, where it has per-pair
+    rows) from the package's moe_decode table for the GPU, the H200's grouped-only Thinker entry
+    there. Without an entry (an H100, the Talker's shape) the built-in table runs, as before the
+    registry had one."""
     pytest.importorskip("triton")
     from mstar.utils.fused_moe import decode
 
