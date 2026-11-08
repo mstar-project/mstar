@@ -287,7 +287,7 @@ def test_a_rebuild_row_stays_out_of_the_runtime_and_publishes_nothing():
     assert list(node_batch.request_ids) == [R, A] and batch.graph_rows() == {A: 0}, (
         "the runtime would route the rebuild row"
     )
-    assert w._publishable_request_ids(node_batch) == [A], "the rebuild row would publish with MSTAR_LAZY_PUBLISH=0"
+    assert w.lifecycle.publishable(node_batch) == [A], "the rebuild row would publish with MSTAR_LAZY_PUBLISH=0"
 
 
 def test_a_yield_away_to_rebuild_rows_alone_runs_them(monkeypatch):

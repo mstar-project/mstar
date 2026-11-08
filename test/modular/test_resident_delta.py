@@ -30,11 +30,14 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import Residency
 from mstar.engine.resources.step import FULL_ADMIT_OK, AllocationFailed, StepContext
 from mstar.testing_utils.engine import make_engine, make_mgmt
-from mstar.testing_utils.worker import make_scheduler, make_worker
+from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
 from mstar.utils.ipc_format import (
+    MessageSource,
     OffloadDelta,
     RemoveRequest,
     ScheduleTPNode,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import ScheduledBatch
@@ -695,23 +698,22 @@ def _rank(*, leader: bool, parallel: bool = True) -> Worker:
         parallel_leader_nodes={"node"} if leader else set(),
         is_tp_follower=parallel and not leader,
         scheduler=SimpleNamespace(
-            arrival=["victim"], last_in_line=lambda node, walk, rids: next(iter(rids)),
+            last_in_line=lambda node, walk, rids: next(iter(rids)),
             could_refill=lambda node, walk, rids: False,
         ),
     )
     rank.engine = engine
     rank.flushed_removes = 0
     rank.flush_protected = None
+    rank.lifecycle.add("victim", "victim")
+    teardown = rank._teardown
 
-    def flush_landed():
+    def flush(in_flight_rids):
         rank.flushed_removes += 1
         assert engine.offload_attempts == [], "a teardown was spent after the eviction"
-
-    def flush_safe(in_flight_rids):
-        flush_landed()
         rank.flush_protected = set(in_flight_rids)
-    rank._apply_removes_whose_step_landed = flush_landed
-    rank._apply_pending_removes_safe_to_drop = flush_safe
+        teardown(in_flight_rids)
+    rank._teardown = flush
     return rank
 
 
@@ -748,7 +750,7 @@ def test_rank_zero_still_evicts_and_holds_its_victim():
     _oom(leader)
 
     assert leader.engine.offload_attempts == ["node"]
-    assert leader.flushed_removes == 2, (
+    assert leader.flushed_removes == 1, (
         "a pending teardown releases pages, so it has to be spent before an "
         "eviction is chosen — otherwise a page move happens that need not"
     )
@@ -843,68 +845,76 @@ def _consume(rank, seq: int) -> None:
     rank.lockstep.pop_follow_head()
 
 
-def _remove_rank(consumed: int) -> Worker:
-    """``_remove_request``'s ordering, with the teardown itself recorded."""
-    rank = make_worker(engine_manager=SimpleNamespace())
-    rank.applied = []
-    rank._remove_request = lambda body: rank.applied.append(body.request_id)
+def _remove_rank(consumed: int, *, follower: bool = True) -> Worker:
+    """A rank whose lifecycle orders a forwarded removal against the step stream."""
+    rank = make_worker(engine_manager=SimpleNamespace(), is_tp_follower=follower)
     if consumed >= 0:
         _consume(rank, consumed)
     return rank
 
 
+def _forwarded(rank: Worker, rid: int, after_tp_seq: int) -> None:
+    rank.lifecycle.remove(rid, RemoveRequest(
+        request_id=f"wire-{rid}", source=MessageSource.TP_RANK_0, after_tp_seq=after_tp_seq,
+    ), rank.lockstep.last_consumed_seq)
+
+
+def _due(rank: Worker) -> list[int]:
+    due = rank.lifecycle.removes_ready(set(), rank.lockstep.last_consumed_seq)
+    for rid in due:
+        rank.lifecycle.removed(rid, f"wire-{rid}")
+    return due
+
+
 def test_a_removal_for_a_step_not_yet_reached_waits():
     rank = _remove_rank(consumed=5)
+    _forwarded(rank, 1, after_tp_seq=7)
 
-    assert rank._removal_step_reached(
-        RemoveRequest(request_id="r", after_tp_seq=7)
-    ) is False
+    assert _due(rank) == []
+    assert rank.lifecycle._removes_awaiting_step == {7: [1]}
 
 
 def test_a_removal_for_a_step_already_consumed_applies():
     rank = _remove_rank(consumed=7)
+    _forwarded(rank, 1, after_tp_seq=7)
 
-    assert rank._removal_step_reached(
-        RemoveRequest(request_id="r", after_tp_seq=7)
-    ) is True
+    assert _due(rank) == [1]
 
 
 def test_an_unstamped_removal_is_not_ordered():
-    """The conductor's own sends, and a rank re-applying its own deferral."""
-    rank = _remove_rank(consumed=-1)
+    """The conductor's own sends, which only a rank that leads takes."""
+    rank = _remove_rank(consumed=-1, follower=False)
+    rank.lifecycle.remove(1, RemoveRequest(request_id="r"), -1)
 
-    assert rank._removal_step_reached(RemoveRequest(request_id="r")) is True
+    assert _due(rank) == [1]
 
 
 def test_a_held_removal_lands_once_its_step_does():
     rank = _remove_rank(consumed=5)
-    rank._removes_awaiting_step = {7: ["late"], 4: ["early"]}
+    _forwarded(rank, 1, after_tp_seq=7)
+    _forwarded(rank, 2, after_tp_seq=4)
 
-    rank._apply_removes_whose_step_landed()
-
-    assert rank.applied == ["early"], "applied a teardown from a step not reached"
-    assert rank._removes_awaiting_step == {7: ["late"]}
+    assert _due(rank) == [2], "applied a teardown from a step not reached"
+    assert rank.lifecycle._removes_awaiting_step == {7: [1]}
 
     _consume(rank, 7)
-    rank._apply_removes_whose_step_landed()
 
-    assert rank.applied == ["early", "late"]
-    assert rank._removes_awaiting_step == {}
+    assert _due(rank) == [1]
+    assert rank.lifecycle._removes_awaiting_step == {}
 
 
 def test_held_removals_land_in_step_order():
     """Two teardowns from different gaps have to be applied in the order rank 0
     made them, for the same reason the delta is a queue."""
     rank = _remove_rank(consumed=9)
-    rank._removes_awaiting_step = {8: ["second"], 3: ["first"]}
+    _forwarded(rank, 1, after_tp_seq=8)
+    _forwarded(rank, 2, after_tp_seq=3)
 
-    rank._apply_removes_whose_step_landed()
-
-    assert rank.applied == ["first", "second"]
+    assert _due(rank) == [2, 1]
 
 
 def _forwarding_leader(broadcast_seq: int) -> Worker:
-    """Rank 0's real ``_remove_request``, over stubs, to pin what it forwards."""
+    """Rank 0's real removal, over stubs, to pin what it forwards."""
     group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
     sent: list = []
     request_state = SimpleNamespace(remove_request=lambda rid: None)
@@ -927,7 +937,12 @@ def _forwarding_leader(broadcast_seq: int) -> Worker:
     )
     leader.lockstep._broadcast_seq = broadcast_seq
     leader.sent = sent
+    leader.lifecycle.add(0, "gone")
     return leader
+
+
+def _remove(rank: Worker, body: RemoveRequest) -> None:
+    deliver(rank, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, body))
 
 
 def test_the_forwarded_teardown_carries_the_step_it_follows():
@@ -935,7 +950,7 @@ def test_the_forwarded_teardown_carries_the_step_it_follows():
     and applies it on whichever side of the step its loop happens to be on."""
     leader = _forwarding_leader(broadcast_seq=1229)
 
-    leader._remove_request(RemoveRequest(request_id="gone"))
+    _remove(leader, RemoveRequest(request_id="gone"))
 
     assert [w for w, _ in leader.sent] == ["rank1"]
     body = leader.sent[0][1].body
@@ -952,11 +967,9 @@ def test_a_rank_that_leads_never_parks_a_teardown():
     leader = _forwarding_leader(broadcast_seq=1229)
 
     # stamped, as if it had somehow arrived ordered
-    leader._remove_request(
-        RemoveRequest(request_id="gone", after_tp_seq=9999)
-    )
+    _remove(leader, RemoveRequest(request_id="gone", after_tp_seq=9999))
 
-    assert leader._removes_awaiting_step == {}, "a leader parked a teardown"
+    assert leader.lifecycle._removes_awaiting_step == {}, "a leader parked a teardown"
     assert [w for w, _ in leader.sent] == ["rank1"], "and it still forwarded"
 
 
@@ -982,9 +995,7 @@ def test_the_teardown_flush_runs_after_the_push_back():
     leader._graph_runtime.push_back_node = (
         lambda node_name, rids, wg_ids: order.append("push")
     )
-    leader._apply_pending_removes_safe_to_drop = (
-        lambda in_flight: order.append("flush")
-    )
+    leader._teardown = lambda in_flight: order.append("flush")
 
     _oom(leader)
 

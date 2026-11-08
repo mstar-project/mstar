@@ -77,9 +77,8 @@ class _StubTM:
 
 class _Scheduler:
     """The scheduler questions the speculation asks: no backlog, an optional
-    cap, and the fresh rows a test queues (the same batch to both builds)."""
-    failed_rids: set = frozenset()
-
+    cap, every row ready for the next node, and the fresh rows a test queues
+    (the same batch to both builds)."""
     def __init__(self):
         self.room = None
         self.fresh: ScheduledBatch | None = None
@@ -145,23 +144,26 @@ def _runtime(max_iters: int, pair: bool = False, mixed: bool = False):
     return rust_runtime.RustGraphRuntime(**common, bookkeeping=book), _StubTM(book)
 
 
-def _worker(max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False) -> Worker:
+def _worker(
+    max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False,
+    connections=(), walks=None,
+) -> Worker:
     rt, tm = _runtime(max_iters, pair, mixed)
+    request_state = RequestStateManager(node_to_partition={NODE: PART, NODE_B: PART})
+    # every row ready, and no resource splits a walk, so a mixed step keeps its rows' order
+    engine = SimpleNamespace(
+        check_ready=lambda *a, **k: SimpleNamespace(queued=False, rebuild=False, reason=None, ok=True, ready=True),
+        order_split_rows=lambda node, walk, rids, walks: rids,
+        release_cached_prefix=lambda batch: None,
+    )
     w = make_worker(
         _graph_runtime=rt,
         tensor_manager=tm,
-        request_state=RequestStateManager(node_to_partition={NODE: PART, NODE_B: PART}),
+        request_state=request_state,
         scheduler=_Scheduler(),
-        admission=SimpleNamespace(check_ready=lambda node_name, rid, fwd_info: True),
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        streams=StreamBufferManager(request_state, tm, list(connections), walks),
     )
-    w.streams = StreamBufferManager(w.request_state, tm, [])
-    # no resource splits a walk here, so a mixed step keeps its rows' order
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        order_split_rows=lambda node, walk, rids, walks: rids,
-    ))
-    w._pending_removes = {}
-    w._pending_drains = {}
-    w._draining_rids = set()
     w.parallel_nodes = set()
     w.worker_id = ME
     w._rid_str = rt.get_rid_string
@@ -440,7 +442,7 @@ def test_teardown_and_room_filter_the_same_rows(monkeypatch):
     w = _worker()
     rids = _admit(w, 6)
     pending = _first_step(w, rids)
-    w._pending_removes = {rids[1]: object()}
+    w.lifecycle.pending_removes[rids[1]] = None
     w.scheduler.room = 3
     spec = _step_both(w, pending, monkeypatch)
     assert list(spec.node_batch.request_ids) == [rids[0], rids[2], rids[3]]
