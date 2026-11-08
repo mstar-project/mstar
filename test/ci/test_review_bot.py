@@ -166,8 +166,8 @@ class TestSpend(unittest.TestCase):
                                      spent(99, "2026-10-31T23:59:59Z", run="3")]), {"day": 1.5, "month": 3.5})
         self.assertEqual(self.spend([spent(1), spent(1)]), {"day": 1, "month": 1},
                          "a re-recorded run would count twice")
-        self.assertEqual(self.spend([spent(1, attempt="2"), spent(1, attempt="1")])["day"], 2,
-                         "a retried run's spend would be dropped")
+        self.assertEqual(self.spend([spent(1, attempt="2"), spent(1, attempt="1")])["day"], 1,
+                         "re-running a run's spend job would count its costs twice")
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
                          "anyone could add a record to a public issue and reach the cap")
 
@@ -180,6 +180,27 @@ class TestSpend(unittest.TestCase):
                 "GET repos/o/r/issues/1/comments*": comments[1], "GET repos/o/r/issues/2/comments*": comments[2]})):
             self.assertEqual(bot.spend("o/r", NOW)["day"], 3, "a run in the second ledger issue would be missed")
             self.assertEqual(bot.issue("o/r", "ledger"), 1, "writers would split across ledger issues")
+
+    def test_a_full_ledger_issue_rolls_over_and_a_failed_record_alerts(self):
+        full = {**LEDGER, "comments": bot.ISSUE_COMMENTS}
+        spare = {**LEDGER, "number": 3, "comments": 0}
+        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [full, spare]})):
+            self.assertEqual(bot.issue("o/r", "ledger"), 3, "a full issue would keep being written to")
+        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [full],
+                                                   "POST repos/o/r/issues": {"number": 4}})):
+            self.assertEqual(bot.issue("o/r", "ledger"), 4, "no new ledger issue when the last one is full")
+        comments = []
+
+        def comment(argv, stdin):
+            comments.append(stdin)
+            return Fail("HTTP 502") if len(comments) == 1 else ""
+
+        with self.assertRaises(RuntimeError, msg="the step would pass, with the spend lost"):
+            step(bot.record, {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/2/comments*": [],
+                              "issue comment": comment}, repo="o/r", pr="7", github_run_id="9",
+                 github_run_attempt="1", gpu_usd="3")
+        self.assertEqual(len(comments), 2, "the ledger write and its alert")
+        self.assertIn("ledger", comments[1], "a lost ledger write would pass silently")
 
     def test_the_record_step_appends_what_spend_reads_back(self):
         recorded = {}
@@ -254,16 +275,30 @@ class TestMonitor(unittest.TestCase):
                          "a revert before the merge, or one of another PR's commit, would be blamed on this PR")
 
     def test_timeline_cross_references_are_signals_only_when_they_report_or_fix_a_bug(self):
-        def ref(number, labels=(), pr=False, body=""):
-            issue = {"number": number, "title": "t", "labels": [{"name": n} for n in labels], "body": body}
-            return {"event": "cross-referenced", "source": {"issue": {**issue, **({"pull_request": {}} if pr else {})}}}
+        def ref(number, labels=(), pr=False, body="", merged=None, login="someone"):
+            issue = {"number": number, "title": "t", "labels": [{"name": n} for n in labels], "body": body,
+                     "user": {"login": login}}
+            return {"event": "cross-referenced",
+                    "source": {"issue": {**issue, **({"pull_request": {"merged_at": merged}} if pr else {})}}}
 
-        timeline = [ref(10, ["bug"]), ref(11, ["enhancement"]), ref(12, pr=True, body="Fixes #7"),
+        timeline = [ref(10, ["bug"]), ref(11, ["enhancement"]), ref(12, pr=True, body="Fixes #7", merged="t"),
                     ref(13, ["type/bug"], pr=True), ref(14, pr=True, body="Fixes #70"),
-                    {"event": "labeled"}]
-        signals, mentions = bot.referenced(timeline, 7)
-        self.assertEqual({int(s["key"].split(":")[-1]) for s in signals}, {10, 12, 13})
-        self.assertEqual(len(mentions), 2, "an unrelated mention would be reported as a bug")
+                    ref(15, pr=True, body="Fixes #7", login="a-maintainer"),
+                    ref(16, pr=True, body="Fixes #7", login="a-stranger"),
+                    ref(17, body="`#7`", login="github-actions[bot]"), {"event": "labeled"}]
+        with mock.patch.object(bot, "run", FakeGh({
+                "GET repos/o/r/collaborators/a-maintainer/permission": {"permission": "write"},
+                "GET repos/o/r/collaborators/a-stranger/permission": {"permission": "read"}})):
+            signals, mentions = bot.referenced(timeline, 7, "o/r")
+        self.assertEqual({int(s["key"].split(":")[-1]) for s in signals}, {10, 12, 13, 15},
+                         "anyone could write `Fixes #7` on an open PR and make it a signal")
+        self.assertEqual(sorted(mentions), ["#11", "#14", "#16"], "an unrelated mention or the bot's own would count")
+
+    def test_only_a_bug_fix_subject_counts_as_a_fix(self):
+        for subject in ("Fix a crash (#9)", "[Worker][Critical fix] Drop late messages", "Revert \"x\"", "bugfix: y"):
+            self.assertTrue(bot.FIX_SUBJECT.search(subject), subject)
+        for subject in ("fix typo in README", "Fix a typo", "fix: docs for x", "prefix cache"):
+            self.assertFalse(bot.FIX_SUBJECT.search(subject), subject)
 
     def test_a_fix_that_changes_a_prs_lines_is_blamed_on_it(self):
         with workspace() as ws:
@@ -282,8 +317,20 @@ class TestMonitor(unittest.TestCase):
             git("commit", "-qam", "Fix a crash (#9)")
             fix = git("rev-parse", "HEAD")
             hits = bot.szz([{"sha": fix, "subject": "Fix a crash (#9)", "body": ""}], {pr_sha}, 7, {"a.py"})
-        self.assertEqual([s["text"] for s in hits], ["#9 changed lines #7 wrote at `a.py:2`"],
-                         "a fix of the PR's lines would go unseen")
+            self.assertEqual([s["text"] for s in hits], ["`#9` changed lines `#7` wrote at `a.py:2`"],
+                             "a fix of the PR's lines would go unseen")
+            self.assertEqual(bot.szz([{"sha": fix, "subject": "Fix a crash (#9)", "body": ""}], {"e" * 40}, 7,
+                                     {"a.py"}), [], "a fix of lines another PR wrote would be blamed on this one")
+
+    def test_a_ci_failure_counts_only_against_a_parent_that_passed(self):
+        def checks(argv, stdin):
+            sha = next(a for a in argv if "check-runs" in a).split("/")[-2]
+            return {"check_runs": [{"name": "cpu-tests", "conclusion": "failure" if sha == "m" else parent}]}
+
+        for parent, regressed in (("success", True), ("failure", False), ("cancelled", False)):
+            with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/commits/*/check-runs*": checks})):
+                found = bot.ci_regressions("o/r", 7, "m", "p")
+            self.assertEqual(bool(found), regressed, f"a parent that {parent}")
 
     def test_an_open_approved_pr_the_merge_queue_threw_out_is_a_signal(self):
         nodes = [{"createdAt": "2026-11-07T00:00:00Z", "reason": "FAILED_CHECKS"}]
@@ -291,9 +338,9 @@ class TestMonitor(unittest.TestCase):
                 "data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}}})):
             signals, _ = bot.pr_signals("o/r", {"number": 8, "state": "open"}, [], set())
         self.assertEqual(signals, [{"key": "8:ejected:2026-11-07T00:00:00Z",
-                                    "text": "#8 removed from the merge queue (FAILED_CHECKS)"}])
+                                    "text": "`#8` removed from the merge queue (FAILED_CHECKS)"}])
 
-    def run_monitor(self, body, bug_title="crash in decode"):
+    def run_monitor(self, body, bug_title="crash in decode", **routes_over):
         calls = {"body": None}
 
         def issue_status(argv, stdin):
@@ -319,7 +366,7 @@ class TestMonitor(unittest.TestCase):
             "GET repos/o/r/pulls[?]*": [],
             "git log": (f'{"c" * 40}\x1f{"d" * 40}\x1fRevert "Faster decode (#7)"\x1f\x1e\n'
                         f'{"d" * 40}\x1f{"b" * 40}\x1fFaster decode (#7)\x1f\x1e\n'),
-            "git diff": "a.py\n", "git show": "", "git blame": "",
+            "git diff": "a.py\n", "git show": "", "git blame": "", **routes_over,
         }
         with mock.patch.object(bot, "utcnow", lambda: NOW):
             out, fake = step(bot.monitor, routes, repo="o/r", approvals="on")
@@ -338,6 +385,24 @@ class TestMonitor(unittest.TestCase):
         _, fake = self.run_monitor(body)
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a signal already reported would notify subscribers every day")
+
+    def test_a_failed_post_leaves_the_state_unwritten_so_the_signal_goes_out_tomorrow(self):
+        patched = []
+        with self.assertRaises(RuntimeError):
+            self.run_monitor(STATUS["body"], **{"issue comment": Fail("HTTP 502"),
+                                                "PATCH repos/o/r/issues/2": lambda a, i: patched.append(i) or {}})
+        self.assertEqual(patched, [], "the day's signals would count as reported though the post failed")
+
+    def test_a_pr_that_cant_be_read_is_reported_and_the_rest_goes_on(self):
+        body, _ = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": Fail("HTTP 502")})
+        self.assertIn("couldn't read", body)
+        self.assertIn("`#7`", body)
+
+    def test_a_dismissed_approval_is_not_one_that_stood(self):
+        body, fake = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": [
+            {"state": "DISMISSED", "user": {"login": "mstar-review[bot]"}}]})
+        self.assertNotIn("Faster decode", body, "a PR whose approval was withdrawn would count as approved")
+        self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [])
 
 
 class TestRestore(unittest.TestCase):
