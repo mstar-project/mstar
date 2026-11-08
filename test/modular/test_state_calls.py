@@ -731,7 +731,7 @@ def test_a_step_that_keeps_adds_on_only_some_layers_is_refused():
 
 def test_a_step_that_adds_on_no_layer_only_reads_and_passes():
     h = _kv_handle()
-    h.check_step(_begin(h))
+    h.check_step(_begin(h, segments=[Segment(1, "main", 0)]))
 
 
 def test_a_layer_ending_on_a_scratch_add_in_a_step_that_keeps_is_refused():

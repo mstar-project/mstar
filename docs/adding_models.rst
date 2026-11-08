@@ -1965,7 +1965,8 @@ and each row's label comes from the step's segments, so there are no cursors:
   per layer per step, and it is the layer's last add. Scratch adds can repeat, and last until
   the next add or the end of the step. ``keep=None`` takes the step's ``keep``. The resources keep
   or drop a step's adds as a whole, so a step that keeps needs each layer to end on a kept add,
-  and a step with ``keep=False`` refuses ``keep=True``.
+  unless every row it lists has span 0 or is a placeholder, and a step with ``keep=False``
+  refuses ``keep=True``.
 - ``read`` sees kept entries from earlier steps, plus this layer's latest add, at the
   positions its mask reaches. It runs the op the declaration names for the layer.
 - ``write`` overwrites entries in place.
