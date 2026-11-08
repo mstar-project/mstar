@@ -785,9 +785,11 @@ class NemotronDuplexModel(Model):
         # the agent channel's BOS / EOS open and close each reply
         return self.config.text_bos_id, self.config.text_eos_id
 
-    # The checkpoint often sends no EOS after a reply, so a reply ends after 2 s
-    # (25 steps of 80 ms) of padding.
+    # The checkpoint often sends no EOS after a reply, so a reply ends 2 s (25 steps
+    # of 80 ms) after both its text and its audible audio stop: the audio runs up to
+    # several seconds behind the text.
     turn_idle_steps = 25
+    turn_silence_rms = 0.005
 
     def get_voices(self) -> list[str]:
         from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule

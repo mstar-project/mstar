@@ -1480,11 +1480,24 @@ def test_a_reply_without_an_end_mark_ends_where_the_next_starts(duplex):
     assert not api.aborted, "the call ended on its own: nothing to abort"
 
 
-def test_a_reply_without_an_end_mark_ends_after_its_padding(duplex):
+def _quiet(step):
+    """A step's audio below any silence threshold: the talker has stopped."""
+    return _Chunk("audio", np.zeros(1920, dtype="<i2").tobytes(), {"sample_rate": 24000, "step": step})
+
+
+def _played(events, response):
+    return [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"
+            and e["response_id"] == response["id"]]
+
+
+def test_a_reply_without_an_end_mark_ends_once_text_and_audio_go_quiet(duplex):
     """A model whose replies may get no end mark declares turn_idle_steps: its
-    reply ends that many steps into padding, and later padding is between replies."""
-    texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), _text(3), _text(4), _text(5)]
-    client, api = duplex([*texts, *(_audio(i) for i in range(6))], end=True)
+    reply ends that many steps after both its last text and its last audible
+    audio, so speech still sounding after the text (the audio runs behind it)
+    stays in the reply."""
+    texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), *(_text(i) for i in range(3, 9))]
+    audio = [*(_audio(i) for i in range(5)), *(_quiet(i) for i in range(5, 9))]
+    client, api = duplex([*texts, *audio], end=True)
     api.model.turn_idle_steps = 2
     with client.websocket_connect("/v1/realtime") as ws:
         ws.receive_text()
@@ -1492,16 +1505,18 @@ def test_a_reply_without_an_end_mark_ends_after_its_padding(duplex):
         events = _until_closed(ws)
     done = [e["response"] for e in events if e["type"] == "response.done"]
     assert [(r["status"], r["output"][0]["content"][0]["transcript"]) for r in done] == [("completed", "Hi")]
-    assert [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"] == [
-        _step_pcm(i) for i in (1, 2, 3, 4)]
+    # audible through step 4, two quiet steps, then the reply ends
+    assert _played(events, done[0]) == [_step_pcm(i) for i in range(1, 5)] + [bytes(3840)] * 2
 
 
 def test_text_after_a_reply_ended_for_its_padding_is_a_reply_of_its_own(duplex):
     """A pause longer than turn_idle_steps inside the model's speech, or a next
-    reply whose start mark is missing: the text after it opens a reply, not lost."""
+    reply whose start mark is missing: the text after it opens a reply, not lost.
+    (Text that arrives before the pause's audio still belongs to the open reply.)"""
     texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), _text(3), _text(4), _text(5, b" again"),
              _text(6, mark="end"), _text(7)]
-    client, api = duplex([*texts, *(_audio(i) for i in range(8))], end=True)
+    audio = [_audio(0), _audio(1), _audio(2), _quiet(3), _quiet(4), _audio(5), _audio(6), _quiet(7)]
+    client, api = duplex([c for pair in zip(texts, audio, strict=True) for c in pair], end=True)
     api.model.turn_idle_steps = 2
     with client.websocket_connect("/v1/realtime") as ws:
         ws.receive_text()
@@ -1509,16 +1524,16 @@ def test_text_after_a_reply_ended_for_its_padding_is_a_reply_of_its_own(duplex):
         events = _until_closed(ws)
     done = [e["response"] for e in events if e["type"] == "response.done"]
     assert [r["output"][0]["content"][0]["transcript"] for r in done] == ["Hi", " again"]
-    for response, steps in zip(done, ([1, 2, 3, 4], [5, 6]), strict=True):
-        assert [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"
-                and e["response_id"] == response["id"]] == [_step_pcm(i) for i in steps]
+    assert _played(events, done[0]) == [_step_pcm(1), _step_pcm(2), bytes(3840), bytes(3840)]
+    assert _played(events, done[1]) == [_step_pcm(5), _step_pcm(6)]
 
 
 def test_text_with_its_end_mark_after_a_padded_reply_ends_there(duplex):
     """The text that opens a reply after padding may carry its end mark in the same step."""
     texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), _text(3), _text(4), _text(5, b" ok", mark="end"),
              _text(6), _text(7), _text(8)]
-    client, api = duplex([*texts, *(_audio(i) for i in range(9))], end=True)
+    audio = [_audio(0), _audio(1), _audio(2), _quiet(3), _quiet(4), _audio(5), *(_quiet(i) for i in range(6, 9))]
+    client, api = duplex([c for pair in zip(texts, audio, strict=True) for c in pair], end=True)
     api.model.turn_idle_steps = 2
     with client.websocket_connect("/v1/realtime") as ws:
         ws.receive_text()
@@ -1526,9 +1541,7 @@ def test_text_with_its_end_mark_after_a_padded_reply_ends_there(duplex):
         events = _until_closed(ws)
     done = [e["response"] for e in events if e["type"] == "response.done"]
     assert [r["output"][0]["content"][0]["transcript"] for r in done] == ["Hi", " ok"]
-    for response, steps in zip(done, ([1, 2, 3, 4], [5]), strict=True):
-        assert [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"
-                and e["response_id"] == response["id"]] == [_step_pcm(i) for i in steps]
+    assert _played(events, done[1]) == [_step_pcm(5)]
 
 
 def test_a_call_that_ends_mid_reply_finishes_its_response(duplex):
