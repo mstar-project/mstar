@@ -323,12 +323,12 @@ class PreprocessWorker:
         # directly once a request is done (no cross-thread queue / race).
         # Sends never block the thread (OutboxCommunicator): the conductor and
         # the workers block on sends to it, so it has to keep reading.
-        self.communicator = OutboxCommunicator(make_communicator(
+        self.communicator = make_communicator(
             my_id="api_server_preprocess_worker",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
             nonblocking_send=True,
-        ))  # only used to send (from the worker thread)
+        )  # only used to send (from the worker thread)
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
             my_entity_id="api_server_preprocess_worker",

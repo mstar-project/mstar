@@ -282,7 +282,9 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        ``Content-Length`` is answered before it is read, so a client that
        writes the whole body before reading the reply can see a connection
        reset instead of the 413; one that sends ``Expect: 100-continue``
-       gets the 413 before it sends the body.
+       gets the 413 before it sends the body. It also caps one
+       message on every WebSocket route unless the config sets
+       ``ws_max_message_mb``; a larger one closes the socket (1009).
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
