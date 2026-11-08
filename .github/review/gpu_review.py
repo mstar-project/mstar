@@ -92,7 +92,7 @@ def cmd_configure(a):
         slurm = {"host": env("SLURM_HOST"), "port": int(env("SLURM_PORT") or 22), "host_key": env("SLURM_HOST_KEY", ""),
                  "identity_file": str(key), "partition": env("SLURM_PARTITION") or "background", "nice": 100,
                  "max_gpus": int(env("MAX_GPUS") or 4), "job_prefix": "review-bot", "workdir": "/workspace/review-bot",
-                 "gpu": "H200", "vram_gb": 141, "hf_home": env("SLURM_HF_HOME") or "/workspace/shared/hf"}
+                 "gpu": "H200", "vram_gb": 141, "hf_home": "/workspace/shared/hf"}
     usd, hours = float(env("MAX_USD") or 30), float(env("HOURS") or 4)
     eras = {"cache_volume_ids": (env("ERAS_CACHE_VOLUMES") or "").split()}
     if env("ERAS_SECRET"):

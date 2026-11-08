@@ -7,7 +7,8 @@
     "max_usd_per_hour": 20,
     "max_hours": 6,
     "max_concurrent_instances": 1,
-    "max_total_usd": 150
+    "max_total_usd": 150,
+    "max_running": null
   },
   "runpod": {
     "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
@@ -45,6 +46,7 @@
     "hf_home": "/workspace/hf",
     "template_id": "ed6d2a30-36aa-5d50-b911-1f6b551f2081",
     "shm": "64Gi",
-    "run_secret_id": ""
+    "run_secret_id": "",
+    "cache_volume_ids": []
   }
 }
