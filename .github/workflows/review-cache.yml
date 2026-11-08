@@ -95,7 +95,7 @@ jobs:
           jq -n --arg r "$GITHUB_REPOSITORY" --arg s "$(git rev-parse HEAD)" --arg m "$MODELS" --arg k "$SKIP" \
             --arg w "$WEIGHTS" '{repo: $r, main_sha: $s, models: $m, skip: $k, weights: $w}' > "$out/run.json"
           S=.claude/skills/live-pr-test/scripts/gpu.py
-          # `offers` exits 1 when no provider has one, and still prints its JSON, with why in `.errors`.
+          # `offers` exits 1 when availability is unknown, and still prints its JSON, with why in `.errors`.
           listing=$(python3 "$S" offers --gpus "$GPUS" --json) || true
           offers=$(jq -r --argjson cap "$MAX_USD" \
             '.offers[] | select(.provider == "eras" and .availability == "now" and .usd_per_hour <= ($cap * 2)) | .id' \
