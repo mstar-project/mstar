@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.engine import Engine
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.kv import manager as manager_mod
@@ -38,6 +39,8 @@ from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
+from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.model import StubModel
 from mstar.validation.resources import _unskippable_resources
 
 NODE, WALK, PAGE = "llm", "prefill", 4
@@ -72,7 +75,8 @@ def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool
     """The pool as the engine builds it, over a KV cache whose `prefix_cache` is ``prefix_cache``."""
     kv = _specs(0)["kv"]
     kv.config.prefix_cache = prefix_cache
-    group = type("Group", (), {"world_size": world_size})() if world_size > 1 else None
+    tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(world_size)))
+    group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if world_size > 1 else None
     spec = RecurrentStateSpec(resource_key="state", nodes=set(kv.nodes), config=config)
     return RecurrentStatePool.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), joint_comm_group=group, dependencies={"kv": kv},
@@ -302,11 +306,8 @@ class _StubTransfer:
         pass
 
 
-class _Keyed:
+class _Keyed(StubModel):
     """Keys ``main`` on ``kv`` from the prompt walk, decode extending it."""
-
-    def checkpoint_path(self):
-        return None
 
     def preprocess_fingerprint(self):
         return "_Keyed"
@@ -349,13 +350,14 @@ def _specs(prefix_slots: int) -> dict[str, NodeResourceSpec]:
 def _open(monkeypatch, prefix_slots: int = 2, world_size: int = 1) -> Engine:
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     specs = _specs(prefix_slots)
-    engine = Engine.__new__(Engine)
-    engine._resources = {
-        "kv": KVManager(cfg=specs["kv"].config, name="kv", joint_comm_group=None,
-                        transfer_engine_info=None, device=torch.device("cpu")),
-        "state": _build(specs["state"].config, world_size),
-        "gdn": _StubGDN(),
-    }
+    engine = make_engine(
+        _resources={
+            "kv": KVManager(cfg=specs["kv"].config, name="kv", joint_comm_group=None,
+                            transfer_engine_info=None, device=torch.device("cpu")),
+            "state": _build(specs["state"].config, world_size),
+            "gdn": _StubGDN(),
+        },
+    )
     instance = {"LLM": world_size}
     opened = opening_prefix_caches(specs.values(), instance, checkpoint_named=False)
     engine._open_prefix_caches(specs, _Keyed(), instance, opened, None)
@@ -448,8 +450,7 @@ def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, 
     local = [spec for spec in specs if not spec.nodes.isdisjoint(instance)]
     # as Engine.load_model evaluates it, once, for the builds and for opening
     rule = opening_prefix_caches(specs, instance, checkpoint_named=False)
-    engine = Engine.__new__(Engine)
-    engine._resources = {}
+    engine = make_engine()
     for spec in local:
         size = min(instance[node] for node in spec.nodes & instance.keys())
         if isinstance(spec, KVSpec):
@@ -458,7 +459,8 @@ def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, 
                 transfer_engine_info=None, device=torch.device("cpu"),
             )
         elif isinstance(spec, RecurrentStateSpec):
-            group = type("Group", (), {"world_size": size})() if size > 1 else None
+            tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(size)))
+            group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if size > 1 else None
             engine._resources[spec.resource_key] = RecurrentStatePool.build(spec, EngineResourceInfo(
                 device=torch.device("cpu"), joint_comm_group=group,
                 dependencies={dep: by_key[dep] for dep in spec.depends_on()},

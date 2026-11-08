@@ -71,6 +71,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Tokenizer-free TTS: MiniCPM-4 base and residual LMs emit continuous latent
        patches through a local flow-matching DiT, decoded by AudioVAE V2 in
        streamed chunks. Zero-shot, voice design, and cloning from a clip. 48 kHz.
+   * - ``muse_glimmer`` *(Beta)*
+     - ``meta-models/Muse-Glimmer-30B``
+     - Meta's 30B dense agentic VLM (text + image in, text out): sliding-window and
+       NoPE global attention layers 3:1, plus a windowed ViT perception encoder.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -91,7 +95,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        ``configs/pi05.yaml``). Cameras it leaves out are masked, as openpi does, and more
        images than that are a 400.
        ``configs/pi05_droid.yaml`` serves the DROID fine-tune (``lerobot/pi05_droid``) with
-       openpi's DROID normalization: raw joint state in, joint velocities out.
+       openpi's DROID normalization: raw joint state in, joint velocities out. It also
+       serves openpi's policy WebSocket, so openpi's DROID client connects unchanged
+       (see :doc:`clients`).
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -404,6 +410,35 @@ BAGEL notes
   ``graph_walks`` names these walks: ``LLM_cfg_text`` and ``combine_cfg`` both,
   ``LLM_cfg_img`` only ``image_gen_cfg3``.
 
+Muse Glimmer (``muse_glimmer``)
+-------------------------------
+
+Meta's Muse Glimmer 30B: text-and-image chat (video is refused), on ``POST
+/generate`` and ``/v1/chat/completions``. bf16 needs one 141 GB GPU, or two
+80 GB ones::
+
+    mstar serve muse_glimmer --gpus 0
+    mstar serve muse_glimmer --config configs/muse_glimmer_tp2.yaml --gpus 0,1
+
+Three in four layers attend a 2048-token sliding window; every layer writes the
+one paged KV cache, and the sliding layers attend it through a windowed
+attention resource. The cache keeps only the window of the sliding layers'
+K/V (``AttentionConfig.layers``) and returns the pages behind it to the
+pool, so a 32k-token request holds about 3.4x less KV than with every layer's
+history. A page holds 192 tokens of the full layers, or 64 of the sliding
+ones. Such a cache doesn't prefix cache yet, so the configs set
+``prefix_cache: false``. Sampling defaults to the checkpoint's (temperature 1,
+top_p 0.95, top_k 64); a request's ``min_p`` above 0 is refused (a 400)
+unless the checkpoint's generation_config sets a ``min_p``, which turns the
+sampler's min-p filter on. ``reasoning_effort`` (``low``, ``medium``, ``high``,
+``xhigh``; default ``high``) sets the template's reasoning strength, and
+``enable_thinking: false`` means ``low``, as the template has no off: the model
+still reasons, at the template's lowest strength. The reply
+is the model's channel stream as generated: reasoning addressed ``to=self``,
+then the answer ``to=user``. Tool calls are refused for now. Images resize with the
+reference's antialiased Lanczos, which torchvision has from 0.27 (torch 2.12); an older
+torchvision falls back to PIL's Lanczos with a warning, and its pixels differ slightly.
+
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------
 
@@ -471,15 +506,24 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 Text prefill and mixed steps replay captured graphs by total tokens, on the
-ladder ``32 ... 8704`` (powers of two, plus 2176, 4352 and 8704 for a mixed
-step's decode rows and batches a few tokens over; a mixed step keeps only the
-powers of two past 2176); a step pads to its bucket and a longer one runs
-eagerly. ``model_kwargs: prefill_token_buckets: [...]`` sets a
-deployment's own ladder (distinct positive token counts, checked when the
-worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
-and 2176 for a mixed step, since the LLM's 2048-token step budget
+ladder ``32 ... 8192`` (powers of two, plus 2176 as slack for a step a few
+tokens over the 2048-token step budget); a step pads to its bucket and a longer
+one runs eagerly. A text-prefill step, one with no decode rows beside it, also
+has 1152, 1280, 1536 and 1792, so a prompt a little past 1024 tokens doesn't
+pad to 2048; a mixed step captures only the ladder's powers of two and 2176, on
+a deployment's own ladder too, so a ladder needs at least one of those.
+``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own ladder
+(distinct positive token counts, checked when the worker loads):
+``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048,
+1152-1792, and 2176 as slack, since the LLM's 2048-token step budget
 (``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
-reached. Each bucket adds captures and startup time.
+reached. Each bucket adds captures and startup time. 4096 and 8192 stay in the
+default ladder for a deployment that raises ``max_batch_tokens`` or turns
+chunking off, which fills them exactly. The ladder leaves out slack rungs above
+them (4352, 8704): such a deployment adds them to its own ladder, and without
+them a step just past a power of two pads to the next one and a step past 8192
+runs eagerly. Added rungs serve text-prefill steps only; a mixed step's slack
+stays 2176.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
@@ -498,9 +542,15 @@ at 27B TP4 on H200: 151 against 169) and gains at 4B on B300 (372 against 353); 
 c=4 up it makes no difference.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
-``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
-a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
-via ``extra_body``.
+``top_k``, ``min_p``, ``repetition_penalty``, ``penalize_prompt`` and
+``enable_thinking`` (default true; the template opens a ``<think>`` block) are
+read by the model but are not OpenAI fields — pass them via ``extra_body``.
+Sampling defaults to the checkpoint's generation_config, under whatever the
+request sets. Qwen3.5-27B's sets temperature 0.6, top_k 20 and top_p 0.95,
+and Qwen3.8-27B's temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
+and 9B ship none, so the engine sampler's defaults apply. A request's
+``min_p`` above 0 is refused (a 400) unless the checkpoint sets a ``min_p``,
+which turns the sampler's min-p filter on; none of these does.
 
 With ``resources: {sampler: {enable_logprobs: true}}`` in the deployment's
 YAML, ``"return_logprobs": true`` in ``model_kwargs`` on ``/generate`` puts each
@@ -653,7 +703,8 @@ Qwen3-Omni notes
   needed. A deployment can pick the kernel under ``resources:`` in its YAML,
   e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
   is captured as a CUDA graph per token-count bucket; a request past the
-  largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
+  largest bucket (8192 patches, about a 1920x1080 image; 4096 audio tokens)
+  runs it eagerly.
 - A request with no audio output decodes on its own walk, ``thinker_text_decode``:
   its token stays on the device between steps and reaches the client inline, as
   Qwen3.5's does, and nothing goes to the Talker. A request with audio output
@@ -1061,7 +1112,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   8, which keep up; from 24 calls up the server fell behind real time, so lag
   grew over the call. Capturing the encoder's live step (below) took its host
   time at 32 calls from 23.6 to 8.4 ms and cut live lag 2-6x at 16-32 calls
-  (paced runs interleaved against the uncaptured encoder, ``MSTAR_SHM_ARENA=1``);
+  (paced runs interleaved against the uncaptured encoder, on the SHM arena);
   32 calls staggered over 2 s all finish, heard latency p50 2.1-2.3 s (from the
   user stopping to agent audio playable without gaps). With the codec in the
   talker's step, on one H200: 16 live calls keep real time whether they start
@@ -1419,14 +1470,16 @@ is faster for a single frame. False decodes everything with the compiled stock
 ``vae.decode`` on the shared instance.
 
 Two or more requests at the same denoise step run one cross-request forward
-(``max_gen_batch_size``, default 8) for video, image and sound; the action step
-runs eager. With ``compile_denoise_batched`` (default on) its layer stack is
+(``max_gen_batch_size``, default 8) for video, image, sound and action. With
+``compile_denoise_batched`` (default on) the layer stack these steps share is
 compiled with the same mode, once, while the server starts, with the packed
 length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
-per-request patchify, rotary tables and unpatchify around it run eager. At
-832x480x121 one request's guidance pair is 24k tokens, which already fills the
-GPU's GEMM and attention throughput, so a batch of N costs about N single
-steps: batching keeps requests in step rather than adding throughput.
+per-request patchify, rotary tables and unpatchify around it run eager.
+Compiled, a batched action step's outputs differ from the eager stack's at the
+kernel-drift level. At 832x480x121 one request's guidance pair is 24k tokens,
+which already fills the GPU's GEMM and attention throughput, so a batch of N
+costs about N single steps: batching keeps requests in step rather than adding
+throughput.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
@@ -1699,9 +1752,29 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
 
-**Two GPUs.** ``configs/wan22_dp2.yaml`` serves a whole replica per GPU: 5.2
-videos/min at 4 concurrent on H200s (measured on an earlier version), while one
-request takes the 1-GPU time.
+**Two GPUs.** ``configs/wan22_cfg_parallel_2gpu.yaml`` is CFG-parallel: it runs
+the dit over two ranks (``cfg_size: 2``) that split the classifier-free guidance
+batch: each rank runs one branch over the batch's rows and the two noise
+predictions are all-gathered
+every step, so a guided step costs one branch's forward (502 vs 1000 ms at
+1280x704x81 on H200s; one request 13.4 s vs 23.3 s end to end at 20 steps;
+measured on that earlier version). The
+text encoder and VAE run on rank 0. Without guidance both ranks compute the same
+step, correct but no faster. For throughput under concurrency,
+``configs/wan22_dp2.yaml`` serves a whole replica per GPU instead: 5.2 videos/min
+at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE
+decode; measured on that earlier version), while one request takes the 1-GPU time.
+
+**Four GPUs.** ``configs/wan22_cfg2_sp2_4gpu.yaml`` also splits each branch's
+tokens over a pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's
+self-attention) to cut one request's latency. Split the guidance branches
+first (``cfg_size: 2``), then add ``sp_size`` on top: on two GPUs,
+``sp_size: 2`` alone is slower than ``cfg_size: 2``.
+``sp_size`` must divide the dit's 24 attention heads. Under concurrency, data
+parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
+replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
+against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
+H100s.
 
 LTX-2.5 (``ltx2_5``)
 --------------------

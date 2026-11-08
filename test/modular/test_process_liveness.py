@@ -18,9 +18,11 @@ from unittest import mock
 import pytest
 from api_server_helpers import StandInSocket, make_test_api_server
 from fastapi import HTTPException
+from test_outbox_communicator import _Peer
 
 from mstar.api_server.entrypoint import DeadConductorError, PendingRequest
 from mstar.api_server.request_types import APIServerMessage
+from mstar.communication.communicator import OutboxCommunicator
 from mstar.communication.event import EventWakeup
 from mstar.conductor.conductor import (
     Conductor,
@@ -95,7 +97,7 @@ def _conductor(procs, inbox=()):
     c.sent = []
     c.communicator = SimpleNamespace(
         send=lambda entity, msg: c.sent.append((entity, msg)),
-        get_all_new_messages=_inbox(inbox),
+        get_all_new_messages=_inbox(inbox), flush=lambda: False,
     )
     c.worker_ids = [f"worker_{i}" for i in range(len(procs))]
     c._worker_processes = list(procs)
@@ -190,6 +192,20 @@ def test_dead_worker_fails_every_waiting_client_with_503():
     for body in failed.values():
         assert body.status == 503
         assert "worker_1 (pid 12) exited with signal SIGSEGV" in body.error_message
+
+
+def test_a_dead_workers_failures_reach_a_full_api_server_before_the_exit():
+    """The conductor's sends queue for a full peer; the exit must not drop the
+    clients' 503s that are still queued."""
+    c = _conductor([_Proc(12, alive=False, exitcode=-11)])
+    c.requests = {"r": _request_data(["worker_0"])}
+    peer = _Peer(full={"api_server": 3})
+    c.communicator = OutboxCommunicator(peer)
+
+    with pytest.raises(DeadWorkerError):
+        c._poll_worker_liveness()
+
+    assert [(entity, m.body.request_id) for entity, m in peer.delivered] == [("api_server", "r")]
 
 
 def test_orphaned_worker_leaves_gracefully_then_hard(monkeypatch):

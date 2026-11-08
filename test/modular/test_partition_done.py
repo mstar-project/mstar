@@ -22,10 +22,11 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.model.base import ForwardPassArgs
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import WorkerGraphsDone
 
 
-class _StubModel:
+class _StubModel(StubModel):
     """Never ends a partition on its own; records what it was asked."""
 
     def __init__(self):

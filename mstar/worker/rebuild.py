@@ -243,19 +243,20 @@ class Rebuilds:
         )
 
     def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> HostSlice | None:
-        """The slice ``node``'s log takes for a request of ``layouts``, holding each ids span and the host copies for
-        its other spans. None when the pool can't hold it, or when the request has spans other than ids and the
-        node's dtype is unknown.
+        """The slice ``node``'s log takes for a request of ``layouts``, holding its steps' ids, at most one a slot, and
+        the host copies for its spans other than ids. None when the pool can't hold it, or when the request has spans
+        other than ids and the node's dtype is unknown.
 
         The ids' dtype isn't known until a step reads them, so each takes 8 B, enough for int64, the widest dtype a
-        step reads ids in. What the steps don't use goes back to the pool once the last is recorded."""
+        step reads ids in. A copied span takes room for ids too, since a step may read a pad id at each slot its host
+        copies fill. What the steps don't use goes back to the pool once the last is recorded."""
         spans = [span for layout in layouts for span in layout.spans]
         dtype, width = self._node_dtypes.get(node), self._policies[node].copy_width
         if dtype is None and any(span.kind != SpanKind.IDS for span in spans):
             return None
         nbytes = sum(
-            aligned(span.length * torch.long.itemsize) if span.kind == SpanKind.IDS
-            else span.length * width[span.walk] * dtype.itemsize
+            aligned(span.length * torch.long.itemsize)
+            + (0 if span.kind == SpanKind.IDS else span.length * width[span.walk] * dtype.itemsize)
             for span in spans
         )
         piece = self._pool.take(nbytes)
@@ -437,7 +438,8 @@ class Rebuilds:
         host_rows: HostRows | None, skip_rids: Collection[int] = (),
     ) -> None:
         """Append each kept row's sample, from the stop check's host copy, to its log, once its log holds every
-        prefill step. ``skip_rids`` are rows whose sample is not real, as for `Engine.step_finished`."""
+        prefill step, or forget the log when the sample is one of the policy's ``pad_ids``. ``skip_rids`` are rows
+        whose sample is not real, as for `Engine.step_finished`."""
         node = node_batch.node_name
         kept_ids = self._kept.get(node)
         if not kept_ids:
@@ -463,7 +465,7 @@ class Rebuilds:
                 if sample.numel() != 1:
                     raise ValueError(self._not_one_id(node, name, sample.numel()))
                 pairs.append((rid, int(sample)))
-        prefilling = self._prefilling[node]
+        prefilling, pads = self._prefilling[node], self._policies[node].pad_ids
         for rid, token in pairs:
             kept = kept_ids.get(rid)
             # The host rows are the forward's, which can hold a row the worker has since taken out of the step. A
@@ -472,7 +474,10 @@ class Rebuilds:
                 kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids
                 and rid not in prefilling
             ):
-                kept.sampled.append(token)
+                if token in pads:
+                    self._forget(node, rid)
+                else:
+                    kept.sampled.append(token)
 
     @staticmethod
     def _not_one_id(node: str, name: str, count: int) -> str:

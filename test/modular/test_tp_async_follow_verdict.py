@@ -20,12 +20,11 @@ forward) and then hangs in the collective. So:
   on which the leader clears its own speculation before threading), unless
   the prefix cache is open, where the leader pre-planned the head and the
   follower builds it too;
-* a step whose forward raised is closed (``_close_tp_follow_step``): a head from it,
+* a step whose forward raised is closed (``Lockstep.close_follow_step``): a head from it,
   queued or arriving later, becomes a step of moves alone.
 
-Drives the real ``Worker`` methods unbound on a minimal stub with a real
-``MicroScheduler`` for the FIFO, the pattern ``test_worker_message_handling``
-uses. ``_try_follow_speculation`` is stubbed per test — its own build logic
+Drives a real ``Worker`` and its real ``Lockstep``, which holds the FIFO.
+``_try_follow_speculation`` is stubbed per test — its own build logic
 is exercised against the graph API elsewhere; here we pin the protocol.
 """
 
@@ -37,16 +36,28 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from test_loop_turns import NODE as LOOP_NODE  # noqa: E402
+from test_loop_turns import _looping_worker, _Runtime, _scheduler, _StopLoopError  # noqa: E402
+
 from mstar.engine.resources import Residency  # noqa: E402
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
-from mstar.utils.containers import RecentSet  # noqa: E402
-from mstar.utils.ipc_format import MoveKind, OffloadDelta, RemoveRequest, ScheduleTPNode, TPNoSpeculation  # noqa: E402
-from mstar.worker.micro_scheduler import MicroScheduler  # noqa: E402
-from mstar.worker.worker import (  # noqa: E402
-    Worker,
-    _parse_tp_async_sched,
-    _tp_async_sched_setting,
+from mstar.model.submodule_base import StepOrder  # noqa: E402
+from mstar.testing_utils.worker import bound, make_scheduler, make_worker  # noqa: E402
+from mstar.utils.ipc_format import (  # noqa: E402
+    MoveKind,
+    OffloadDelta,
+    RemoveRequest,
+    ScheduleTPNode,
+    TPNoSpeculation,
+    WorkerMessageType,
 )
+from mstar.worker.lockstep import (  # noqa: E402
+    _TP_NOSPEC_KEEP,
+    parse_tp_async_sched,
+    tp_async_sched_setting,
+)
+from mstar.worker.scheduled_batch import ScheduledBatch  # noqa: E402
+from mstar.worker.worker import Worker  # noqa: E402
 
 NODE = "LLM"
 WALK = "decode"
@@ -72,13 +83,12 @@ class _FakeEngineManager:
 
 class _Communicator:
     """wait_for_work delivers one queued message batch per call; the test
-    pushes messages via ``inbox`` (drained by the next ``_process_messages``)
+    pushes messages via ``inbox`` (drained by the next ``process_messages``)
     or schedules them in ``deliveries`` (wait number -> messages that land on
     that wait). Raises if the follower keeps waiting after everything was
     delivered — that would be a hang."""
 
-    def __init__(self, stub):
-        self.stub = stub
+    def __init__(self):
         self.inbox = []
         self.deliveries = {}
         self.waits = 0
@@ -91,21 +101,20 @@ class _Communicator:
         self.inbox.extend(self.deliveries.pop(self.waits, []))
 
 
-def _stub(cache_open: bool = False):
-    stub = types.SimpleNamespace()
-    stub.worker_id = "w1"
-    stub.tp_async_sched = True
-    stub.tp_async_nodes = None
-    stub._tp_async_for = lambda n: Worker._tp_async_for(stub, n)
-    stub._tp_nospec = RecentSet(Worker._TP_NOSPEC_KEEP)
-    stub._tp_leader_gap_warned = False
-    stub.engine_manager = _FakeEngineManager(cache_open)
-    stub.scheduler = MicroScheduler(
-        engine_manager=stub.engine_manager, parallel_leader_nodes=set(),
+def _stub(cache_open: bool = False, async_sched=(True, None)):
+    """A follower of NODE: a real ``Worker``, ``Lockstep`` and ``MicroScheduler``."""
+    engine_manager = _FakeEngineManager(cache_open)
+    scheduler = make_scheduler(
+        engine_manager=engine_manager, parallel_leader_nodes=set(), parallel_nodes={NODE},
+        async_sched=async_sched,
     )
-    stub.communicator = _Communicator(stub)
-    stub._check_ready_tensors = lambda: None
-    stub._poll_stream_buffers = lambda: None
+    stub = make_worker(
+        worker_id="w1", scheduler=scheduler, lockstep=scheduler.lockstep,
+        admission=scheduler.admission, engine_manager=engine_manager,
+        communicator=_Communicator(),
+    )
+    stub.ingest.check_ready_tensors = lambda: None
+    stub.ingest.poll_stream_buffers = lambda: None
     stub.build_results = []   # what _try_follow_speculation returns, in order
     stub.request_state = None   # read only for a dropped row
 
@@ -113,44 +122,45 @@ def _stub(cache_open: bool = False):
         while stub.communicator.inbox:
             msg = stub.communicator.inbox.pop(0)
             if isinstance(msg, TPNoSpeculation):
-                stub._register_tp_nospec(msg)
+                stub.lockstep.enqueue_no_spec(msg)
             else:
-                stub._register_tp_follow(msg)
+                stub.lockstep.enqueue_follow(msg)
 
     def _try_follow(pending):
         # like the real one: a successful build consumes the FIFO head
         if stub.build_results:
             res = stub.build_results.pop(0)
-            if res is not None and stub.scheduler.peek_tp_follow() is not None:
-                stub.scheduler.pop_tp_follow_head()
+            if res is not None and stub.lockstep.follow_head() is not None:
+                stub.lockstep.pop_follow_head()
             return res
         return None
 
-    stub._process_messages = _process_messages
+    stub.ingest.process_messages = _process_messages
     stub._try_follow_speculation = _try_follow
-    stub._register_tp_follow = lambda m: Worker._register_tp_follow(stub, m)
-    stub._register_tp_nospec = lambda m: Worker._register_tp_nospec(stub, m)
-    stub._close_tp_follow_step = lambda p: Worker._close_tp_follow_step(stub, p)
-    stub._await_tp_follow_step = (
-        lambda p, arm: Worker._await_tp_follow_step(stub, p, arm)
-    )
-    stub._step_voids_head = Worker._step_voids_head
-    stub._prefix_cache_open = lambda node: Worker._prefix_cache_open(stub, node)
     return stub
 
 
-def _leader_stub():
-    stub = types.SimpleNamespace()
-    stub.tp_async_sched = True
-    stub.tp_async_nodes = None
-    stub._tp_async_for = lambda n: Worker._tp_async_for(stub, n)
-    stub.parallel_nodes = {NODE}
-    stub.parallel_leader_nodes = {NODE}
-    stub._is_tp_lead_pending = lambda p: Worker._is_tp_lead_pending(stub, p)
-    stub._tp_lead_needs_marker = (
-        lambda p, sp: Worker._tp_lead_needs_marker(stub, p, sp)
-    )
-    return stub
+def _leader(leads: bool = True, async_nodes=None, async_sched: bool = True):
+    """Rank 0 of NODE's instance, or with ``leads`` off a follower shard of it. Its
+    ``Lockstep`` is real; what it sends lands in ``.sent``."""
+    sent = []
+    group = types.SimpleNamespace(_workers=["w0", "w1"])
+    return types.SimpleNamespace(sent=sent, lockstep=make_worker(
+        parallel_nodes={NODE}, parallel_leader_nodes={NODE} if leads else set(), is_tp_follower=not leads,
+        tp_async_sched=async_sched, tp_async_nodes=async_nodes,
+        _graph_runtime=types.SimpleNamespace(get_sharding_config=lambda rid: types.SimpleNamespace(
+            get_sharding_group=lambda node, walk: group,
+        )),
+        communicator=types.SimpleNamespace(send=lambda dest, msg: sent.append((dest, msg))),
+    ).lockstep)
+
+
+def _markers(leader, pending, speculation) -> list[tuple[str, int]]:
+    """Who the leader tells that no head follows ``pending``, and which step it names."""
+    leader.sent.clear()
+    leader.lockstep.maybe_broadcast_nospec(pending, speculation)
+    assert all(msg.message_type == WorkerMessageType.TP_NO_SPEC for _, msg in leader.sent)
+    return [(dest, msg.body.spec_from_seq) for dest, msg in leader.sent]
 
 
 def _pending(tp_seq, future=None, admit_error=None, failed_requests=()):
@@ -158,7 +168,7 @@ def _pending(tp_seq, future=None, admit_error=None, failed_requests=()):
     ``ExecutingBatch`` the way the GPU thread leaves them."""
     return types.SimpleNamespace(
         node_name=NODE, graph_walk=WALK, tp_seq=tp_seq, future=future,
-        batch=types.SimpleNamespace(request_to_worker_graph={"r0": "wg0"}, incomplete_node_rids=set()),
+        batch=ScheduledBatch(node_name=NODE, graph_walk=WALK, request_to_worker_graph={"r0": "wg0"}),
         node_batch=types.SimpleNamespace(
             admit_error=admit_error,
             failed_requests={rid: "boom" for rid in failed_requests},
@@ -193,10 +203,10 @@ def _nospec(from_seq):
 # ------------------------------------------------------------- the switch
 
 def test_env_parses_master_switch_and_node_list():
-    assert _parse_tp_async_sched("0") == (False, None)
-    assert _parse_tp_async_sched("") == (False, None)
-    assert _parse_tp_async_sched("1") == (True, None)
-    assert _parse_tp_async_sched("thinker, talker") == (
+    assert parse_tp_async_sched("0") == (False, None)
+    assert parse_tp_async_sched("") == (False, None)
+    assert parse_tp_async_sched("1") == (True, None)
+    assert parse_tp_async_sched("thinker, talker") == (
         True, frozenset({"thinker", "talker"}),
     )
 
@@ -212,7 +222,7 @@ def test_env_parses_master_switch_and_node_list():
     ("", True, (True, None)),  # empty env falls through to the config
 ])
 def test_config_key_and_env_override(env, config, want):
-    assert _tp_async_sched_setting(env, config) == want
+    assert tp_async_sched_setting(env, config) == want
 
 
 @pytest.mark.parametrize("env, config, want", [
@@ -225,26 +235,22 @@ def test_config_key_and_env_override(env, config, want):
     ("True", None, (True, None)),
 ])
 def test_boolean_words_are_the_switch_not_node_names(env, config, want):
-    assert _tp_async_sched_setting(env, config) == want
+    assert tp_async_sched_setting(env, config) == want
 
 
 def test_node_list_narrows_which_parallel_nodes_take_part():
     """Per-node control: a rank whose list excludes NODE behaves exactly as
     with the flag off for NODE — leader owes no marker, follower records
     nothing and queues heads verbatim for the serial path."""
-    ld = _leader_stub()
-    ld.tp_async_nodes = frozenset({"talker"})
-    assert not ld._tp_lead_needs_marker(_pending(4), None)
-    ld.tp_async_nodes = frozenset({NODE})
-    assert ld._tp_lead_needs_marker(_pending(4), None)
+    assert _markers(_leader(async_nodes=frozenset({"talker"})), _pending(4), None) == []
+    assert _markers(_leader(async_nodes=frozenset({NODE})), _pending(4), None) == [("w1", 4)]
 
-    s = _stub()
-    s.tp_async_nodes = frozenset({"talker"})
-    s._register_tp_nospec(_nospec(4))
-    assert 4 not in s._tp_nospec
+    s = _stub(async_sched=(True, frozenset({"talker"})))
+    s.lockstep.enqueue_no_spec(_nospec(4))
+    assert not s.lockstep.is_no_spec(4)
     h = _head(["r0"], seq=5, from_seq=4)
-    s._register_tp_follow(h)
-    assert s.scheduler.peek_tp_follow() is h
+    s.lockstep.enqueue_follow(h)
+    assert s.lockstep.follow_head() is h
 
 
 # ------------------------------------------------------- the leader's duty
@@ -254,73 +260,277 @@ def test_leader_owes_a_marker_whenever_no_head_went_out():
     one of them for EVERY lockstep step it looked at speculating from — also
     when it did speculate, but into a non-parallel node, which is never
     broadcast (tp_seq stays -1). Missing that marker hangs the followers."""
-    ld = _leader_stub()
+    ld = _leader()
     p = _pending(4)
-    assert ld._tp_lead_needs_marker(p, None)
-    assert ld._tp_lead_needs_marker(p, types.SimpleNamespace(tp_seq=-1))
-    assert not ld._tp_lead_needs_marker(p, types.SimpleNamespace(tp_seq=5))
+    assert _markers(ld, p, None) == [("w1", 4)]
+    assert _markers(ld, p, types.SimpleNamespace(tp_seq=-1)) == [("w1", 4)]
+    assert _markers(ld, p, types.SimpleNamespace(tp_seq=5)) == []
 
 
 def test_only_the_leader_of_a_lockstep_node_owes_a_marker():
-    ld = _leader_stub()
-    ld.parallel_leader_nodes = set()     # a follower shard of NODE
-    assert not ld._tp_lead_needs_marker(_pending(4), None)
-    ld = _leader_stub()
-    ld.tp_async_sched = False
-    assert not ld._tp_lead_needs_marker(_pending(4), None)
+    assert _markers(_leader(leads=False), _pending(4), None) == []
+    assert _markers(_leader(async_sched=False), _pending(4), None) == []
+
+
+def _tp_loop(monkeypatch, forward_raises=()):
+    """The real ``Worker.run`` on the leader of a TP-async instance of
+    test_loop_turns' node (``_looping_worker``), rows 0 and 1 ready and one row
+    per step. Step 0's seq is 0. Records the rows each forward ran, the
+    markers sent, the rows failed and what reached the loop's error handler.
+    A forward of a row in ``forward_raises`` raises."""
+    runtime = _Runtime()
+    loop_sched, state = _scheduler(runtime, StepOrder.TURNS)
+    engine = loop_sched.engine_manager.get_engine(LOOP_NODE)
+    engine.owes_moves = lambda: False  # the journal holds no moves, so no step with no rows goes out
+    sched = make_scheduler(
+        engine_manager=types.SimpleNamespace(get_engine=lambda name: engine),
+        parallel_leader_nodes={LOOP_NODE}, parallel_nodes={LOOP_NODE},
+        async_sched=(True, None),
+    )
+    bound(sched, runtime=runtime)
+    for rid in (0, 1):
+        runtime.requests[rid] = None
+        sched.lifecycle.add(rid, str(rid))
+    runtime.ready |= {0, 1}
+    w = _looping_worker(monkeypatch, sched, state)
+    w.parallel_nodes = {LOOP_NODE}
+    w.lockstep.verify_async_sched_agrees = lambda: None  # one rank here: nothing to agree with
+    w._graph_runtime = types.SimpleNamespace(
+        is_async_schedulable=lambda node, walk: True, push_back_node=lambda *a: None,
+    )
+    w._settle_speculation = lambda *a, **k: None
+    w.lockstep.broadcast = lambda node_batch, **k: 0
+    rec = types.SimpleNamespace(ran=[], markers=[], failed={}, errors=[])
+    w.lockstep.maybe_broadcast_nospec = lambda pending, speculation: rec.markers.append(pending.tp_seq)
+    w._handle_main_loop_error = lambda exc, *a: rec.errors.append(exc)
+    w._fail_requests = rec.failed.update
+    forward = w._execute_on_gpu_thread
+
+    def gpu(batch, node_batch, plan_future):
+        rids = list(batch.request_to_worker_graph)
+        rec.ran.append(rids)
+        if set(rids) & set(forward_raises):
+            raise RuntimeError("CUDA error")
+        return forward(batch, node_batch, plan_future)
+
+    w._execute_on_gpu_thread = gpu
+    return w, sched, state, rec
+
+
+def _builds_step_1(w, sched, state, head=False):
+    """``_build_speculation`` on a leader: from step 0, step 1 (row 1), sent
+    as seq 1, as a head or a yield-away; nothing after that."""
+    def build(pending, consecutive, fair):
+        if pending is None or pending.tp_seq != 0:
+            return None, None
+        spec = w._yield_away_speculation(sched.next_batch())
+        spec.is_yield_away = not head
+        spec.tp_seq = 1
+        return spec, None
+    return build
+
+
+@pytest.mark.parametrize("raise_in", ["build", "finish_step"])
+def test_a_leader_sends_the_marker_for_a_step_it_drops_before_its_decision(monkeypatch, raise_in):
+    """The real run loop on a TP leader: step 0 runs and the yield-away step 1
+    is built beside it. Then building step 1's successor raises (``build``),
+    or post-processing step 0 raises with step 1 already submitted
+    (``finish_step``). Either way no decision for step 1 went out, so its
+    marker must, or the followers await step 1 for good (and a drain deferred
+    behind it with them)."""
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    build_step_1 = _builds_step_1(w, sched, state)
+
+    def finish_step(pending, outputs):
+        if raise_in == "finish_step":
+            raise RuntimeError("boom")
+
+    def build(pending, consecutive, fair):
+        if pending is not None and pending.tp_seq == 1:
+            raise RuntimeError("boom")
+        return build_step_1(pending, consecutive, fair)
+
+    w._finish_step, w._build_speculation = finish_step, build
+    with pytest.raises(_StopLoopError):
+        w.run()
+
+    assert [str(e) for e in rec.errors] == ["boom"]
+    assert rec.markers == [1]
+
+
+def _raises(*a, **k):
+    raise RuntimeError("boom")
+
+
+def _raises_once(after=0):
+    """Raises on call ``after + 1`` only."""
+    calls = []
+
+    def call(*a, **k):
+        calls.append(None)
+        if len(calls) == after + 1:
+            raise RuntimeError("boom")
+    return call
+
+
+@pytest.mark.parametrize("head", [False, True], ids=["yield-away", "head"])
+def test_a_forward_that_raised_fails_its_rows_and_the_loop_goes_on(monkeypatch, head):
+    """Step 0's forward raises on every rank alike. Its rows fail as its
+    verdict, which voids a head built on it on every rank, while a yield-away
+    step (independent of step 0, and run by the followers whatever its
+    verdict) still runs. Nothing reaches the error handler or stops."""
+    w, sched, state, rec = _tp_loop(monkeypatch, forward_raises={0})
+    w._build_speculation = _builds_step_1(w, sched, state, head=head)
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert rec.errors == []
+    assert set(rec.failed) == {0}
+    assert rec.ran == ([[0]] if head else [[0], [1]])
+
+
+@pytest.mark.parametrize("raise_at", ["threading", "clearing N's flag", "settling"])
+def test_a_leader_that_drops_a_step_after_its_head_went_out_stops(monkeypatch, raise_at):
+    """Head 1 went out during step 0, step 0 ran clean, and something on the
+    leader alone raises before step 1 is submitted. The follower runs step 1,
+    so the leader can't drop it and go on: its next step would wait on a rank
+    that waits on step 1's collectives (#1171's live test). It stops."""
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w._build_speculation = _builds_step_1(w, sched, state, head=True)
+    if raise_at == "threading":
+        w._thread_outputs_to_speculative = _raises
+    else:
+        w._thread_outputs_to_speculative = lambda *a: None
+    if raise_at == "clearing N's flag":
+        w._clear_in_flight_flag = _raises_once()
+    if raise_at == "settling":
+        w._settle_speculation = _raises
+    with pytest.raises(SystemExit, match="seq 1"):
+        w.run()
+    assert rec.ran == [[0]]
+
+
+def test_a_leader_that_drops_a_step_it_broadcast_on_the_serial_path_stops(monkeypatch):
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w._build_speculation = lambda *a: (None, None)
+    w._submit_step = _raises
+    with pytest.raises(SystemExit, match="seq 0"):
+        w.run()
+
+
+@pytest.mark.parametrize("raise_in", ["post-processing", "clearing N's flag", "voiding the head"])
+def test_a_leader_goes_on_after_a_raise_past_a_head_every_rank_voided(monkeypatch, raise_in):
+    """Step 0 failed, so no rank runs head 1, and a raise that follows, even
+    while the leader is still dropping the head, costs step 0's rows alone."""
+    w, sched, state, rec = _tp_loop(monkeypatch, forward_raises={0})
+    w._build_speculation = _builds_step_1(w, sched, state, head=True)
+    if raise_in == "post-processing":
+        w._finish_step = _raises
+    elif raise_in == "clearing N's flag":
+        w._clear_in_flight_flag = _raises_once()
+    else:
+        w._settle_speculation = _raises
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert [str(e) for e in rec.errors] == ["boom"]
+
+
+def test_a_leader_goes_on_after_a_raise_past_a_head_whose_rows_every_rank_dropped(monkeypatch):
+    """Every row of head 1 was dropped on every rank, as a request's last step
+    routinely does, so nothing runs: the raise that follows costs step 0 only."""
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w._build_speculation = _builds_step_1(w, sched, state, head=True)
+
+    def thread(speculation, outputs):
+        for rid in list(speculation.scheduled_batch.request_to_worker_graph):
+            speculation.scheduled_batch.discard_rid(rid)
+
+    w._thread_outputs_to_speculative = thread
+    w._finish_step = _raises
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert [str(e) for e in rec.errors] == ["boom"]
+
+
+def test_a_leader_goes_on_after_a_raise_past_a_step_it_submitted(monkeypatch):
+    """Step 0 runs on every rank, so a raise after its submit drops nothing the
+    followers run: they get its marker instead."""
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w._build_speculation = lambda *a: (None, None)
+    hold = w._hold_rows
+
+    def hold_raising_once(lane, rids):
+        hold(lane, rids)
+        if rids and not rec.errors:
+            raise RuntimeError("boom")
+
+    w._hold_rows = hold_raising_once
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert [str(e) for e in rec.errors] == ["boom"] and rec.markers == [0]
+
+
+def test_a_followers_own_raise_does_not_stop_it(monkeypatch):
+    """Only a leader knows the step it dropped was broadcast. A follower stays
+    on the handler's path, however its step was taken."""
+    w, sched, state, rec = _tp_loop(monkeypatch)
+    w.is_tp_follower = True  # its step took seq 1 off the leader's FIFO
+    w._build_speculation = _builds_step_1(w, sched, state)
+    w._settle_speculation = _raises
+    with pytest.raises(_StopLoopError):
+        w.run()
+    assert [str(e) for e in rec.errors] == ["boom"]
 
 
 # ------------------------------------------------------------- registration
 
 def test_nospec_marker_is_recorded_and_never_queued():
     s = _stub()
-    s._register_tp_nospec(_nospec(4))
-    assert 4 in s._tp_nospec
-    assert s.scheduler.peek_tp_follow() is None
+    s.lockstep.enqueue_no_spec(_nospec(4))
+    assert s.lockstep.is_no_spec(4)
+    assert s.lockstep.follow_head() is None
 
 
 def test_a_head_for_a_closed_step_is_queued_as_a_step_of_moves_alone():
     """Rank 0 made the head's moves, and stamps the removals it makes next with the head's seq, before it
     learns the step failed."""
     s = _stub()
-    s._close_tp_follow_step(_pending(4))
-    s._register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    s.lockstep.close_follow_step(_pending(4))
+    s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
 
-    head = s.scheduler.peek_tp_follow()
+    head = s.lockstep.follow_head()
     assert head.spec_seq == 5 and not head.request_ids and not head.speculative, "the follower skipped rank 0's step"
 
 
 def test_close_turns_an_already_queued_head_for_that_step_alone_into_a_step_of_moves():
     s = _stub()
     other = _head(["r9"], seq=9, from_seq=8)
-    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
-    s.scheduler.register_tp_follow(other)
-    s._close_tp_follow_step(_pending(4))
-    head = s.scheduler.pop_tp_follow_head()
+    s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
+    s.lockstep.enqueue_follow(other)
+    s.lockstep.close_follow_step(_pending(4))
+    head = s.lockstep.pop_follow_head()
     assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
-    assert s.scheduler.peek_tp_follow() is other
-    assert "r0" not in s.scheduler.pending_tp_follow_count, "the voided head's rows still hold the drain"
+    assert s.lockstep.follow_head() is other
+    assert s.lockstep.pending_follow_count("r0") == 0, "the voided head's rows still hold the drain"
 
 
 def test_plain_and_unrelated_speculative_messages_queue_normally():
     s = _stub()
     plain = ScheduleTPNode(NODE, WALK, ["r0"], spec_seq=3)
     h = _head(["r0"], seq=5, from_seq=4)
-    s._register_tp_follow(plain)
-    s._register_tp_follow(h)
-    assert list(s.scheduler.tp_batches_pending_schedule) == [plain, h]
+    s.lockstep.enqueue_follow(plain)
+    s.lockstep.enqueue_follow(h)
+    assert list(s.lockstep._follow_fifo) == [plain, h]
 
 
 def test_flag_off_ignores_markers_and_queues_heads_verbatim():
     """A rank running with the flag off records nothing and never
     second-guesses a head: the serial path runs whatever the leader sent."""
-    s = _stub()
-    s.tp_async_sched = False
-    s._register_tp_nospec(_nospec(4))
-    assert 4 not in s._tp_nospec
+    s = _stub(async_sched=(False, None))
+    s.lockstep.enqueue_no_spec(_nospec(4))
+    assert not s.lockstep.is_no_spec(4)
     h = _head(["r0"], seq=5, from_seq=4)
-    s._register_tp_follow(h)
-    assert s.scheduler.peek_tp_follow() is h
+    s.lockstep.enqueue_follow(h)
+    assert s.lockstep.follow_head() is h
 
 
 def test_a_step_with_no_rows_or_moves_is_queued_and_consumed():
@@ -328,28 +538,30 @@ def test_a_step_with_no_rows_or_moves_is_queued_and_consumed():
     step with no rows and no moves. Rank 0 stamps its next removal with that step's seq, so this rank consumes the
     step too."""
     s = _stub()
-    s._register_tp_follow(ScheduleTPNode(NODE, WALK, [], spec_seq=3))
-    assert s.scheduler._try_schedule_tp_follow(None) is None
+    s.lockstep.enqueue_follow(ScheduleTPNode(NODE, WALK, [], spec_seq=3))
+    assert s.scheduler._try_schedule_tp_follow() is None
     removal = RemoveRequest(request_id="gone", after_tp_seq=3)
-    assert Worker._removal_step_reached(s, removal), "the removal waits until this rank admits the next step"
+    assert removal.after_tp_seq <= s.lockstep.last_consumed_seq, (
+        "the removal waits until this rank admits the next step"
+    )
 
 
 def test_a_message_of_moves_alone_is_queued():
     s = _stub()
     moves = ScheduleTPNode(NODE, WALK, [], spec_seq=3)
     moves.resident_delta.add(MoveKind.DROP, "r0", count=2, node=NODE)
-    s._register_tp_follow(moves)
+    s.lockstep.enqueue_follow(moves)
 
-    assert list(s.scheduler.tp_batches_pending_schedule) == [moves], "rank 0 ran a step this rank skips"
+    assert list(s.lockstep._follow_fifo) == [moves], "rank 0 ran a step this rank skips"
 
 
 def test_nospec_store_is_bounded():
     s = _stub()
-    for i in range(Worker._TP_NOSPEC_KEEP + 10):
-        s._register_tp_nospec(_nospec(i))
-    assert len(s._tp_nospec) == Worker._TP_NOSPEC_KEEP
-    assert 0 not in s._tp_nospec and 9 not in s._tp_nospec
-    assert Worker._TP_NOSPEC_KEEP + 9 in s._tp_nospec
+    for i in range(_TP_NOSPEC_KEEP + 10):
+        s.lockstep.enqueue_no_spec(_nospec(i))
+    assert len(s.lockstep._no_spec) == _TP_NOSPEC_KEEP
+    assert not s.lockstep.is_no_spec(0) and not s.lockstep.is_no_spec(9)
+    assert s.lockstep.is_no_spec(_TP_NOSPEC_KEEP + 9)
 
 
 # ------------------------------------------------------------------- await
@@ -362,7 +574,7 @@ def test_await_builds_a_queued_head_and_arms_it():
     s = _stub()
     spec = object()
     s.build_results = [spec]
-    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
     armed = []
     out = _output()
     assert _await(s, _pending(4, _future(s, out)), armed.append) == (out, spec)
@@ -372,7 +584,7 @@ def test_await_builds_a_queued_head_and_arms_it():
 
 def test_await_goes_serial_on_the_marker_without_waiting():
     s = _stub()
-    s._register_tp_nospec(_nospec(4))
+    s.lockstep.enqueue_no_spec(_nospec(4))
     out = _output()
     assert _await(s, _pending(4, _future(s, out))) == (out, None)
     assert s.communicator.waits == 0
@@ -409,7 +621,7 @@ def test_await_keeps_waiting_after_N_finished_until_a_decision():
     s.communicator.deliveries = {4: [_head(["r0"], seq=5, from_seq=4)]}
     assert _await(s, _pending(4, _future(s, out, done_after=2))) == (out, spec)
     assert s.communicator.waits == 4
-    assert s.scheduler.peek_tp_follow() is None   # consumed by the build
+    assert s.lockstep.follow_head() is None   # consumed by the build
 
 
 def test_await_waits_for_a_late_marker_then_goes_serial():
@@ -423,11 +635,11 @@ def test_await_waits_for_a_late_marker_then_goes_serial():
 def test_await_drops_the_head_on_allocation_failure_without_building():
     s = _stub()
     s.build_results = [object()]   # would build if asked — it must not be
-    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
     out = _output()
     pending = _pending(4, _future(s, out), admit_error="kv cache: out of pages")
     assert _await(s, pending) == (out, None)
-    head = s.scheduler.peek_tp_follow()
+    head = s.lockstep.follow_head()
     assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
     assert s.build_results, "the head was built"
 
@@ -438,11 +650,11 @@ def test_await_drops_the_head_on_failed_rids_without_building():
     not build (and then unwind) what the leader will not run."""
     s = _stub()
     s.build_results = [object()]
-    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
     out = _output()
     pending = _pending(4, _future(s, out), failed_requests=["r0"])
     assert _await(s, pending) == (out, None)
-    head = s.scheduler.peek_tp_follow()
+    head = s.lockstep.follow_head()
     assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
     assert s.build_results, "the head was built"
 
@@ -469,7 +681,7 @@ def test_with_the_prefix_cache_open_await_builds_and_arms_a_head_its_step_voids(
     s = _stub(cache_open=True)
     spec = object()
     s.build_results = [spec]
-    s.scheduler.register_tp_follow(_head(["r0"], seq=5, from_seq=4))
+    s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
     armed = []
     out = _output()
     assert _await(s, _pending(4, _future(s, out), **verdict), armed.append) == (out, spec)
@@ -482,7 +694,7 @@ def test_await_retries_until_the_head_is_buildable():
     s = _stub()
     spec = object()
     s.build_results = [None, None, spec]
-    s.scheduler.register_tp_follow(_head(["r0", "f1"], seq=5, from_seq=4))
+    s.lockstep.enqueue_follow(_head(["r0", "f1"], seq=5, from_seq=4))
     out = _output()
     assert _await(s, _pending(4, _future(s, out))) == (out, spec)
     assert s.communicator.waits == 2
@@ -495,21 +707,39 @@ def test_await_goes_serial_when_the_leader_moved_past_the_step():
     with the flag off — so the follower goes serial instead of spinning."""
     s = _stub()
     later = ScheduleTPNode(NODE, WALK, ["r0"], spec_seq=6)   # plain, later
-    s.scheduler.register_tp_follow(later)
+    s.lockstep.enqueue_follow(later)
     out = _output()
     assert _await(s, _pending(4, _future(s, out))) == (out, None)
     assert s.communicator.waits == 0
-    assert s.scheduler.peek_tp_follow() is later   # left for the serial path
-    assert 4 in s._tp_nospec
+    assert s.lockstep.follow_head() is later   # left for the serial path
+    assert s.lockstep.is_no_spec(4)
 
 
 def test_await_treats_a_later_head_at_the_front_the_same_way():
     s = _stub()
     later = _head(["r9"], seq=9, from_seq=8)
-    s.scheduler.register_tp_follow(later)
+    s.lockstep.enqueue_follow(later)
     got = _await(s, _pending(4, _future(s, _output(), done_after=10)))
     assert got == (None, None)                     # N still runs; caller awaits it
-    assert s.scheduler.peek_tp_follow() is later
+    assert s.lockstep.follow_head() is later
+
+
+def test_a_forward_that_raised_is_the_steps_verdict_and_voids_its_head():
+    """N's forward raised: every row of N fails and the head built on N becomes
+    a step of moves alone, as the leader drops it on the same verdict, instead
+    of the raise reaching the loop's handler."""
+    s = _stub()
+    s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
+
+    def raises():
+        raise RuntimeError("CUDA error")
+
+    p = _pending(4, types.SimpleNamespace(done=lambda: True, result=raises))
+    outputs, spec = _await(s, p)
+    assert spec is None and not outputs.per_rid_outputs
+    assert set(p.node_batch.failed_requests) == {"r0"}
+    head = s.lockstep.follow_head()
+    assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
 
 
 def test_await_never_returns_without_a_decision_once_N_finished():
@@ -531,13 +761,13 @@ def test_a_head_a_follower_drops_unbuilt_counts_as_consumed_only_once_its_moves_
     it."""
     s = _stub(cache_open=False)
     s.build_results = [object()]
-    s.scheduler.register_tp_follow(_head_with_moves(seq=5, from_seq=4))
+    s.lockstep.enqueue_follow(_head_with_moves(seq=5, from_seq=4))
     out = _output()
     assert _await(s, _pending(4, _future(s, out), failed_requests=["r0"])) == (out, None)
     assert s.build_results, "the head was built"
-    head = s.scheduler.peek_tp_follow()
+    head = s.lockstep.follow_head()
     assert (head.spec_seq, head.request_ids, head.speculative) == (5, [], False), "the head's seq counted as consumed"
-    assert s.scheduler.settle_tp_follow_delta(s.request_state, caught_up=True)
+    assert s.lockstep.settle_delta(caught_up=True)
     assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the dropped head's moves were lost"
 
 
@@ -546,12 +776,13 @@ def test_with_the_prefix_cache_open_a_follower_takes_a_voided_heads_moves_before
     The head's moves land at the settle before the build, whether the build goes ahead or not, and its pop
     doesn't take them again."""
     s = _stub(cache_open=True)
-    s.scheduler.register_tp_follow(_head_with_moves(seq=5, from_seq=4))
+    s.lockstep.enqueue_follow(_head_with_moves(seq=5, from_seq=4))
     pending = _pending(4, failed_requests=["r0"])
     pending.node_batch.commit_done = types.SimpleNamespace(is_set=lambda: True)
     pending.batch.request_to_worker_graph = {}   # nothing to continue, so nothing is built
+    bound(s.scheduler, runtime=types.SimpleNamespace(get_rid_handle=lambda wire_rid: wire_rid))
 
     assert Worker._try_follow_speculation(s, pending) is None
     assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the build ran ahead of the head's moves"
-    s.scheduler.pop_tp_follow_head()
+    s.lockstep.pop_follow_head()
     assert s.engine_manager.applied == [("r9", MoveKind.RESERVE)], "the pop applied the head's moves twice"

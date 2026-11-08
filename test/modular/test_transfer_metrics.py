@@ -36,15 +36,14 @@ from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers  # noqa: E402
-from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessageType,
     EnableMetrics,
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.worker.rebuild import Rebuilds  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
 
 DATA_WORKER = "api_server_preprocess_worker"
 TRANSFER_FAMILIES = {f.name for f in (catalog.TRANSFER_BYTES, catalog.TRANSFERS, catalog.TRANSFER_SECONDS)}
@@ -315,18 +314,19 @@ def test_seconds_land_in_inclusive_buckets_and_the_counts_are_cumulative():
 
 # ── worker -> conductor ──────────────────────────────────────────────────────
 
-def _bare_worker(tmp_path):
-    """The attributes ``Worker._start_metrics`` reads, for a rank leading no
-    node, with a real SHM manager."""
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "worker_1"
-    worker.parallel_leader_nodes = set()
-    worker.engine_manager = SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list))
-    worker._rebuilds = Rebuilds({}, {})
-    worker.communicator = _Sink()
-    worker.tensor_manager = _shm("worker_1", tmp_path)
-    worker._preemption = SimpleNamespace(counts={})
-    return worker
+def _bare_worker(tmp_path, scheduler):
+    """A rank leading no node, with a real SHM manager, and the metrics
+    ``Worker._start_metrics`` builds from its attributes, which its ingest
+    switches on with ENABLE_METRICS."""
+    fields = dict(
+        worker_id="worker_1",
+        engine_manager=SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list)),
+        communicator=_Sink(),
+        tensor_manager=_shm("worker_1", tmp_path),
+        scheduler=scheduler,
+    )
+    metrics = make_worker(**fields)._start_metrics(3600.0)
+    return make_worker(**fields, _metrics=metrics)
 
 
 def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path):
@@ -334,17 +334,15 @@ def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path
     transfers on the worker status; its lead rank reports the engine
     families. A read before ENABLE_METRICS (a warmup request's) is not
     counted."""
-    worker = _bare_worker(tmp_path)
-
     def not_on_a_follower():
         raise AssertionError("a rank leading nothing has no pending rows to report")
 
-    worker.scheduler = SimpleNamespace(pending_rows=not_on_a_follower)
-    metrics = worker._metrics = worker._start_metrics(3600.0)
+    worker = _bare_worker(tmp_path, SimpleNamespace(pending_rows=not_on_a_follower))
+    metrics = worker._metrics
     producer = _shm("worker_0", tmp_path)
     warmup = _send(producer, "warmup-0", {"h": [torch.randn(8, 8)]})
     _read(worker.tensor_manager, "warmup-0", [GraphEdge(next_node="llm", name="h", tensor_info=warmup["h"])])
-    worker._process_message_list([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
+    worker.ingest._dispatch([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
     infos = _send(producer, "r1", {"h": [torch.randn(4, 4)]})
     _read(worker.tensor_manager, "r1", [GraphEdge(next_node="llm", name="h", tensor_info=infos["h"])])
 
@@ -364,12 +362,9 @@ def test_a_rank_leading_no_node_reports_its_transfers_once_per_interval(tmp_path
 
 # ── the data worker ──────────────────────────────────────────────────────────
 
-class _TextModel:
+class _TextModel(StubModel):
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
 
 def test_the_data_worker_loop_publishes_the_results_it_reads(tmp_path, monkeypatch):

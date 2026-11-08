@@ -7,10 +7,8 @@ forwards each teardown stamped with the last step it has broadcast. A follower h
 until it has popped that step, and reads no message between popping a step and the admit
 fence at the top of the next pass, so it lands after that admit. Rank 0 lands it there too.
 When the follower drops a step it popped, it tears the held ones down before it takes the
-next. A removal deferred behind step N is retried once N is post-processed, when N+1 is
-speculated, broadcast and maybe not yet admitted; but ``_remove_request`` defers it again
-while N is still the step in flight, and the next pass tears it down behind N+1's admit
-fence. A removal that reaches rank 0 once N is done, with nothing in flight, lands before
+next. A removal deferred behind step N is torn down at the next pass's teardown point, behind
+N+1's admit fence. A removal that reaches rank 0 once N is done, with nothing in flight, lands before
 N+1 is sent; a follower still running N defers it, and tears it down once N is done, before
 it takes N+1. The order matters as well: the free list hands pages back out in the order
 they were freed, so another order gives a follower other page ids than rank 0's.
@@ -24,7 +22,6 @@ from __future__ import annotations
 import contextlib
 import sys
 import threading
-from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,13 +30,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
-from mstar.utils.containers import RecentSet  # noqa: E402
-from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
+from mstar.testing_utils.worker import make_worker
+from mstar.utils.ipc_format import (  # noqa: E402
+    MessageSource,
+    RemoveRequest,
+    ScheduleTPNode,
+    WorkerMessageType,
+)
 from mstar.worker import worker as worker_mod  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
 
 NODE, WALK = "LLM", "decode"
 # wire id -> handle. All but "idle" run in step N (seq 0); only "kept" goes on into N+1
@@ -75,38 +75,26 @@ def _speculation(seq: int, rids: list[int]):
     )
 
 
+def _step_message(seq: int, **kwargs) -> ScheduleTPNode:
+    return ScheduleTPNode(node_name=NODE, graph_walk=WALK, request_ids=["kept"], spec_seq=seq, **kwargs)
+
+
 class _Scheduler:
-    """N comes off the serial path. N+1 is the speculative head rank 0 sends from N, or
-    with ``serial`` a step it sends after N, off the serial path too."""
+    """Takes each plain step off the real FIFO, the rows of ``steps[seq]``."""
 
-    def __init__(self, serial: bool = False):
-        self.heads = [] if serial else [SimpleNamespace(
-            node_name=NODE, graph_walk=WALK, speculative=True, spec_seq=1, spec_from_seq=0,
-        )]
+    def __init__(self, lockstep, serial: bool = False):
+        self.lockstep = lockstep
         self.steps = [STEP_N] + ([[HANDLES["kept"]]] if serial else [])
-        self.last_consumed_tp_seq = -1
 
-    def get_next_batch(self, request_state, **kwargs):
-        if self.heads and not self.heads[0].speculative:
+    def next_batch(self, **kwargs):
+        head = self.lockstep.follow_head()
+        if head is None or head.speculative:
+            return None
+        self.lockstep.pop_follow_head()
+        if not head.request_ids:
             # a step of moves alone, popped after its settle with no batch to build
-            self.pop_tp_follow_head()
             return None
-        if self.last_consumed_tp_seq + 1 >= len(self.steps):
-            return None
-        self.last_consumed_tp_seq += 1
-        return _batch(self.last_consumed_tp_seq, self.steps[self.last_consumed_tp_seq])[0]
-
-    def peek_tp_follow(self):
-        return self.heads[0] if self.heads else None
-
-    def pop_tp_follow_head(self):
-        self.last_consumed_tp_seq = self.heads.pop(0).spec_seq
-
-    def void_tp_follow_head(self):
-        self.heads[0].speculative = False
-
-    def take_admit_errors(self):
-        return {}
+        return _batch(head.spec_seq, self.steps[head.spec_seq])[0]
 
     def note_ran(self, batch):
         del batch
@@ -114,14 +102,7 @@ class _Scheduler:
     def remember_ready(self):
         return contextlib.nullcontext()
 
-    def clear_batch_limit(self, node_name, graph_walk, rows, walks=()):
-        # an admitted step lifts its refusal limit; this stub has none
-        del node_name, graph_walk, rows, walks
-
-    def clear_rid(self, rid, wire_rid):
-        pass
-
-    def clear_wire_rid(self, wire_rid):
+    def clear_rid(self, rid):
         pass
 
 
@@ -130,39 +111,15 @@ def _rank(
 ):
     """A worker at TP rank ``tp_rank`` that runs N and then N+1, speculated or, with
     ``serial``, sent after rank 0 marked N as not speculated from. Each pass of
-    ``_process_messages`` takes the next entry of ``inbox``. Returns the worker and its
+    ``process_messages`` takes the next entry of ``inbox``. Returns the worker and its
     log of admits, teardowns and forwarded removals, in the order they happened."""
     monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
         collect=lambda: None, freeze=lambda: None, get_freeze_count=lambda: 0,
     ))
     log: list[tuple] = []
     torn_down = threading.Event()
-    w = Worker.__new__(Worker)
-    w.worker_id = f"rank{tp_rank}"
-    w.is_tp_follower = tp_rank > 0
-    w.enable_nvtx, w._phase_period, w._phase_buf = False, 0, {}
-    w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
-    w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
-    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
-    w.streaming_buffers = {}
-    w._rebuilds = Rebuilds({}, {})
-    w._preemption = SimpleNamespace(
-        preempt=lambda node_batch: False, remove_request=lambda rid: None, make_room=lambda: None,
-    )
-    w._tp_broadcast_seq = 0
-    w._tp_nospec = RecentSet(16)
-    if serial:
-        w._tp_nospec.add(0)
-    w.scheduler = _Scheduler(serial)
-
     group = SimpleNamespace(tp_size=2, _tp_rank=tp_rank, _workers=["rank0", "rank1"])
     wire = {handle: rid for rid, handle in HANDLES.items()}
-    w._graph_runtime = SimpleNamespace(
-        get_rid_handle=HANDLES.get, get_rid_string=wire.get,
-        get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
-        remove_request=lambda rid: None,
-    )
 
     def _tear_down(handle):
         log.append(("teardown", wire[handle]))
@@ -172,26 +129,44 @@ def _rank(
         if msg.message_type == WorkerMessageType.REMOVE_REQUEST:
             log.append(("forward", msg.body.request_id, msg.body.after_tp_seq))
 
-    w.engine_manager = SimpleNamespace(
-        warmup_all=lambda: None, remove_request=_tear_down,
-    )
-    w.communicator = SimpleNamespace(send=_send, wait_for_work=lambda timeout: None)
-    w.request_state = SimpleNamespace(
+    request_state = SimpleNamespace(
         remove_request=lambda rid: None, get_partition_for_node=lambda node: "p",
     )
-    w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w.parallel_groups = SimpleNamespace(
-        barrier_all=lambda: None, restore_default_timeout=lambda: None,
+    tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+    w = make_worker(
+        worker_id=f"rank{tp_rank}", is_tp_follower=tp_rank > 0,
+        _graph_runtime=SimpleNamespace(
+            get_rid_handle=HANDLES.get, get_rid_string=wire.get,
+            get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
+            remove_request=lambda rid: None,
+        ),
+        engine_manager=SimpleNamespace(warmup_all=lambda: None, remove_request=_tear_down),
+        communicator=SimpleNamespace(send=_send, wait_for_work=lambda timeout: None),
+        request_state=request_state, tensor_manager=tensor_manager,
+        streams=StreamBufferManager(request_state, tensor_manager, []),
+        wakeup_event=SimpleNamespace(register_future=lambda future: None),
+        parallel_groups=SimpleNamespace(
+            barrier_all=lambda: None, restore_default_timeout=lambda: None,
+        ),
     )
-    w.wakeup_event = SimpleNamespace(register_future=lambda future: None)
+    w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
+    w._in_flight_rids = set()
+    for rid, handle in HANDLES.items():
+        w.lifecycle.add(handle, rid)
+    w.scheduler = _Scheduler(w.lockstep, serial)
+    w.lockstep.enqueue_follow(_step_message(0))
+    if serial:
+        w.lockstep._no_spec.add(0)
+        w.lockstep.enqueue_follow(_step_message(1))
+    elif tp_rank:
+        w.lockstep.enqueue_follow(_step_message(1, speculative=True, spec_from_seq=0))
+    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
 
     def _broadcast(node_batch, **kwargs):
         if tp_rank:
             return -1
-        w._tp_broadcast_seq += 1
-        return w._tp_broadcast_seq - 1
+        w.lockstep._broadcast_seq += 1
+        return w.lockstep._broadcast_seq - 1
 
     def _build_speculation(pending, consecutive, fair):
         if pending is not None and pending.tp_seq == 1:
@@ -203,7 +178,7 @@ def _rank(
         return spec, None
 
     def _follow(pending):
-        w.scheduler.pop_tp_follow_head()
+        w.lockstep.pop_follow_head()
         w._in_flight_rids |= {HANDLES["kept"]}
         return _speculation(1, [HANDLES["kept"]])
 
@@ -220,24 +195,25 @@ def _rank(
 
     def _process_messages():
         for body in next(passes, []):
-            w._remove_request(body)
+            w.ingest._remove_request(body)
 
-    w._process_messages = _process_messages
+    w.ingest.process_messages = _process_messages
     w._build_executing_batch = lambda batch: _batch(
         batch.tp_seq, list(batch.request_to_worker_graph))[1]
-    w.maybe_send_zmq_to_tp_followers = _broadcast
+    w.lockstep.broadcast = _broadcast
     w._build_speculation = _build_speculation
     w._try_follow_speculation = _follow
     w._is_tp_follow_pending = lambda pending: bool(tp_rank)
     w._execute_on_gpu_thread = _gpu
     w._preplan_spec = lambda pending, spec: False
     for name in (
-        "_verify_tp_async_sched_agrees", "_init_engine_thread", "_fail_requests",
-        "_check_ready_tensors", "_poll_stream_buffers", "_set_in_flight_flag",
+        "_init_engine_thread", "_report_failures", "_set_in_flight_flag",
         "_clear_in_flight_flag", "_thread_outputs_to_speculative", "_settle_speculation",
         "_postprocess_batch",
     ):
         setattr(w, name, lambda *a, **k: None)
+    for name in ("check_ready_tensors", "poll_stream_buffers"):
+        setattr(w.ingest, name, lambda *a, **k: None)
 
     def _fail_loudly(error, *args):
         raise error
@@ -271,11 +247,10 @@ def test_rank_0_holds_a_removal_until_a_step_carries_its_journal(monkeypatch):
     holds the removal until N goes out with the drop."""
     w, log = _rank(monkeypatch, tp_rank=0, inbox=[[RemoveRequest(request_id="idle")]])
     w.parallel_nodes = w.parallel_leader_nodes = {NODE}
-    w._lockstep_led, w._lockstep_unread = frozenset({NODE}), {}
+    w.lockstep._led, w.lockstep._followers = frozenset({NODE}), {NODE: ["rank1"]}
     owed = set()
-    w._tp_followers = {NODE: ["rank1"]}
     w.engine_manager.get_engine = lambda node: SimpleNamespace(owes_moves=lambda: bool(owed))
-    broadcast, process = w.maybe_send_zmq_to_tp_followers, w._process_messages
+    broadcast, process = w.lockstep.broadcast, w.ingest.process_messages
 
     def _logged(node_batch, **kwargs):
         owed.clear()
@@ -286,7 +261,7 @@ def test_rank_0_holds_a_removal_until_a_step_carries_its_journal(monkeypatch):
         owed.add(NODE)  # the drop, journaled at the refusal of the step before N
         process()
 
-    w.maybe_send_zmq_to_tp_followers, w._process_messages = _logged, _process_messages
+    w.lockstep.broadcast, w.ingest.process_messages = _logged, _process_messages
     _run(w)
 
     assert log.index(("broadcast", 0, len(STEP_N))) < log.index(("teardown", "idle")), log
@@ -298,21 +273,23 @@ def test_a_follower_tears_down_what_a_head_with_no_rows_released_before_it_build
     freed. A follower whose first try at a step away from its own chain takes the step with no rows tears "gone"
     down before its second try builds N+1, as rank 0 did before it sent N+1."""
     log = []
-    w = Worker.__new__(Worker)
-    w.request_state, w._removes_awaiting_step = None, {0: ["gone"]}
-    w._remove_request = lambda body: log.append(("teardown", body.request_id))
+    w = make_worker(is_tp_follower=True)
+    w.lifecycle.add(HANDLES["gone"], "gone")
+    removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=0)
+    w.lifecycle.remove(HANDLES["gone"], removal, w.lockstep.last_consumed_seq)
+    w._tear_down_request = lambda rid: log.append(("teardown", w.lifecycle.wire_of(rid)))
 
-    def _get_next_batch(request_state, exclude_target=None):
+    def _next_batch(exclude_target=None):
         if exclude_target is not None:
-            w.scheduler.last_consumed_tp_seq = 0
+            w.lockstep._last_popped_seq = 0
             log.append(("took", 0))
             return None
         log.append(("built", 1))
         return "N+1"
 
-    w.scheduler = SimpleNamespace(get_next_batch=_get_next_batch, last_consumed_tp_seq=-1)
+    w.scheduler = SimpleNamespace(next_batch=_next_batch)
 
-    assert Worker._next_batch(w, (NODE, WALK)) == "N+1"
+    assert w._next_batch((NODE, WALK)) == "N+1"
     assert log == [("took", 0), ("teardown", "gone"), ("built", 1)], "N+1 would admit with gone's pages held here"
 
 
@@ -324,6 +301,26 @@ def test_a_follower_tears_down_after_admitting_the_step_rank_0_stamped(monkeypat
     _run(w)
 
     assert log.index(("admit", 1)) < log.index(("teardown", "gone")), log
+
+
+def test_a_follower_holds_a_stamped_removal_until_it_has_consumed_the_step(monkeypatch):
+    """Rank 0 tore "idle" down after sending N+1 (seq 1), so it released pages between the
+    two steps. This rank, with nothing in flight, would otherwise tear it down at once,
+    before it has even popped N+1; it waits for the step."""
+    removal = RemoveRequest(request_id="idle", source=MessageSource.TP_RANK_0, after_tp_seq=1)
+    w, log = _rank(monkeypatch, tp_rank=1, inbox=[])
+    w.ingest._remove_request(removal)
+
+    w._teardown(w._in_flight_rids)
+    assert ("teardown", "idle") not in log, log
+
+    w.lockstep.pop_follow_head()  # N
+    w._teardown(w._in_flight_rids)
+    assert ("teardown", "idle") not in log, log
+
+    w.lockstep.pop_follow_head()  # N+1
+    w._teardown(w._in_flight_rids)
+    assert [entry for entry in log if entry[0] == "teardown"] == [("teardown", "idle")], log
 
 
 def test_a_follower_tears_down_in_the_order_rank_0_did(monkeypatch):
@@ -406,6 +403,7 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     )
     # N+1 is voided, so after it the serial path's next step is N+2
     w.scheduler.steps += [None, [HANDLES["kept"]]]
+    w.lockstep.enqueue_follow(_step_message(2))
     build_executing, build_speculation = w._build_executing_batch, w._build_speculation
 
     def _executing(batch):
@@ -451,9 +449,7 @@ def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
             admitted.set()  # the admit lands during the third interval
 
     monkeypatch.setattr(worker_mod.logger, "warning", warn)
-    w = Worker.__new__(Worker)
-    w.worker_id = "rank0"
-    w._span = lambda name: nullcontext()
+    w = make_worker(worker_id="rank0")
     _, executing = _batch(tp_seq, [HANDLES["kept"]])
     executing.launch_started_event = admitted
     pending = SimpleNamespace(

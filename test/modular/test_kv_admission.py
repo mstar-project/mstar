@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import random
 import sys
-from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -36,6 +35,7 @@ from test_kv_prefix_lease import (
 )
 from test_sampler_admission import _resource as _sampler
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
 from mstar.engine.resources.kv import manager as manager_mod
@@ -871,7 +871,8 @@ def _cfg_parallel_pool(node: str, world_size: int = 1, rank: int = 0) -> KVManag
         resource_key="kv", nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"}, leader="LLM",
         config=PagedKVConfig(num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=4096, max_num_pages=9, page_size=16),
     )
-    group = None if world_size == 1 else SimpleNamespace(rank=rank, world_size=world_size)
+    tp = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world_size)))
+    group = None if world_size == 1 else JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp)
     return KVManager.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.float32, nodes=frozenset({node}), joint_comm_group=group,
     ))

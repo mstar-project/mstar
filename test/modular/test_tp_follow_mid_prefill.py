@@ -14,8 +14,10 @@ sys.path.insert(0, ".")
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ScheduleTPNode
-from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.chunk_loops import ChunkLoops
+from mstar.worker.scheduled_batch import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
@@ -26,17 +28,20 @@ _ENGINE = SimpleNamespace(residency=lambda node, rid: Residency.RESIDENT)
 def _follower(head: ScheduleTPNode) -> Worker:
     """A real ``Worker`` with only what ``_try_follow_speculation`` reads, as
     far as assembling the step."""
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "worker_1"
-    worker.scheduler = MicroScheduler(
+    capped = []
+    scheduler = make_scheduler(
         engine_manager=SimpleNamespace(get_engine=lambda node: _ENGINE), parallel_leader_nodes=set(),
+        chunk_loops=ChunkLoops([(NODE, "prefill_text")]),
+        graph_runtime=SimpleNamespace(
+            get_rid_handle=lambda wire_rid: wire_rid,
+            set_loop_caps=lambda node, rids, walks, loops, caps: capped.extend(zip(rids, caps, strict=True)),
+        ),
     )
-    worker.scheduler.register_tp_follow(head)
-    worker.scheduler.chunk_loop_walks = {NODE: frozenset({"prefill_text"})}
-    worker.capped = []
-    worker.scheduler.runtime = SimpleNamespace(
-        set_loop_caps=lambda node, rids, walks, loops, caps: worker.capped.extend(zip(rids, caps, strict=True)),
+    worker = make_worker(
+        worker_id="worker_1", scheduler=scheduler, lockstep=scheduler.lockstep, admission=scheduler.admission,
     )
+    worker.lockstep.enqueue_follow(head)
+    worker.capped = capped
     worker.prepped = []
 
     def prep(prep_input):
@@ -55,7 +60,6 @@ def _follower(head: ScheduleTPNode) -> Worker:
     )
     worker.request_state = SimpleNamespace(per_request_info={})
     worker._in_flight_rids = set()
-    worker._poll_stream_buffers_for_speculation = lambda rid, node: []
     worker.assembled = {}
 
     # no connections: nothing to poll, and the step's edges read as they are
@@ -139,7 +143,7 @@ def test_a_follower_refuses_a_speculative_head_whose_chunks_do_not_match_its_row
         follower._try_follow_speculation(_pending(_batch_n()))
 
     assert follower.prepped == []
-    assert follower.scheduler.peek_tp_follow() is head
+    assert follower.lockstep.follow_head() is head
 
 
 def test_a_follower_caps_a_fresh_rows_loop_on_its_first_chunk_as_the_leader_does():
@@ -152,7 +156,7 @@ def test_a_follower_caps_a_fresh_rows_loop_on_its_first_chunk_as_the_leader_does
         chunk_starts=[-1, 4, 2], chunk_ends=[-1, 8, 6], chunk_totals=[-1, 10, 12], chunk_strides=[-1, 4, 6],
     )
     follower = _follower(head)
-    follower.scheduler.pop_ready_rids = lambda *args, **kwargs: SimpleNamespace(
+    follower.lockstep.pop_ready_rids = lambda *args, **kwargs: SimpleNamespace(
         wg_ids={"p1": 0}, edge_specs=ColumnarEdgeSpecs.empty(),
     )
 
