@@ -577,12 +577,17 @@ def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, caplog,
 
 def test_a_stream_moved_report_of_a_walk_its_plan_is_past_moves_nothing():
     """Only a lagging TP rank's report can name such a walk; with no pass number on the wire it
-    can't be told apart, so it neither fails the request nor moves the plan, as before the plans."""
+    can't be told apart, so it neither fails the request nor moves the plan. A walk the plan
+    never ran is a bug, and fails it."""
     c = Conductor.__new__(Conductor)
     c.producer_triggered_partitions = {"B"}
     c._walk_inputs, c._repeating_walks = {"x": (), "y": (("t", "n"),)}, frozenset()
     # the plan is at its last step; the report names its first
     pstate = PartitionState("B", plan=[WalkStep("x"), WalkStep("y"), WalkStep("z")], cursor=2)
+    request = SimpleNamespace(partition_states={"B": pstate}, persist_signals={})
     pstate.graph_walk = "x"
-    args = c._next_plan_args(SimpleNamespace(partition_states={"B": pstate}, persist_signals={}), "B", done=False)
+    args = c._next_plan_args(request, "B", done=False)
     assert not args.request_done and not args.inputs and pstate.cursor == 2
+    pstate.graph_walk = "w"
+    with pytest.raises(RuntimeError, match="which its plan doesn't run"):
+        c._next_plan_args(request, "B", done=False)

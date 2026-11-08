@@ -1374,29 +1374,29 @@ class Conductor:
             # that isn't an input of the step's walk. A model bug, so a 500.
             for k, step in enumerate(pstate.plan):
                 if step.walk not in p.graph_walks:
-                    raise RuntimeError((
+                    raise RuntimeError(
                         f"{type(self.model).__name__}'s plan for partition {p.name!r} runs {step.walk!r}, "
                         f"which is not one of its walks {sorted(p.graph_walks)}"
-                    ))
+                    )
                 inputs = {name for name, _ in self._walk_inputs[step.walk]}
                 if unknown := sorted(set(step.bind) - inputs):
-                    raise RuntimeError((
+                    raise RuntimeError(
                         f"{type(self.model).__name__}'s plan binds {unknown} on {step.walk!r}, which are not "
                         f"inputs of that walk; its inputs are {sorted(inputs)}"
-                    ))
+                    )
                 # a repeating step ends only on the worker's final-chunk report, which ends the partition
                 if k and not stream_moved and pstate.plan[k - 1].walk in self._repeating_walks:
-                    raise RuntimeError((
+                    raise RuntimeError(
                         f"{type(self.model).__name__}'s plan for partition {p.name!r} puts {step.walk!r} after "
                         f"{pstate.plan[k - 1].walk!r}, which runs once per chunk until the stream ends the partition, "
                         "so it would never run"
-                    ))
+                    )
                 # the conductor moves a worker onto a later step only by sending it inputs
                 if k and not stream_moved and not inputs:
-                    raise RuntimeError((
+                    raise RuntimeError(
                         f"{type(self.model).__name__}'s plan for partition {p.name!r} moves on to {step.walk!r}, "
                         "which takes no input the conductor sends, so its worker would never run it"
-                    ))
+                    )
             pstate.is_done = not pstate.plan
         if all(pstate.is_done for pstate in partition_states.values()):
             # no worker would ever report, so nothing would end the request
@@ -2104,6 +2104,8 @@ class Conductor:
         if partition_name in self.producer_triggered_partitions:
             k = next((j for j in range(k, len(plan)) if plan[j].walk == walk), None)
             if k is None:
+                if all(step.walk != walk for step in plan[:pstate.cursor]):
+                    raise RuntimeError(f"partition {partition_name!r} ran walk {walk!r}, which its plan doesn't run")
                 # a walk the plan is past: only a lagging TP rank's report can name one, and with
                 # no pass number on the wire it can't be told apart, so it moves nothing
                 logger.debug("partition %s reported walk %s, which its plan is past", partition_name, walk)
