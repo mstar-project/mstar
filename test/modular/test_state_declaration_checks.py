@@ -40,6 +40,7 @@ from mstar.engine.state.analysis import declaration_digest, state_declaration_pr
 from mstar.engine.state.contract import Mask
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy
 
 _ATTEND = Attend(q_heads=8)
@@ -364,6 +365,48 @@ def test_a_chunked_walk_reads_causally_and_another_nodes_reads_stay_free():
 def test_a_chunked_walk_outside_a_reads_walks_is_free():
     array = _array(reads={"r": _read(mask=Bidirectional(), walks={"decode"})})
     assert state_declaration_problems(_chunked(array)) == []
+
+
+_REBUILD = {"LLM": RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="token", loop="loop")}
+
+
+def _keyed(growth=False) -> dict:
+    keys = PrefixKeys("text_inputs", ("prefill",), growth=growth)
+    return {"kv": {"main": KVLabel(growth=(("decode", "loop"),), keys=keys)}}
+
+
+@pytest.mark.parametrize("kwargs, cause", [
+    ({"kv_labels": _keyed()}, "kv_labels()['kv']['main'] keys for prefix reuse"),
+    ({"rebuild": _REBUILD}, "LLM's rebuild policy runs again in one step"),
+], ids=["prefix_keys", "rebuild"])
+def test_a_walk_a_prefix_hit_or_a_rebuild_regroups_cant_read_this_steps_adds_as_a_whole(kwargs, cause):
+    """A hit can end inside one step's adds, and a rebuild runs the prompt again beside the ids sampled after it."""
+    problem = _one_problem(_array(reads={"r": _read(mask=Bidirectional())}), **kwargs)
+    assert problem.startswith("Array 'kv'.reads['r']: Bidirectional on walk 'prefill'") and cause in problem
+
+
+@pytest.mark.parametrize("growth, refused", [(True, 1), (False, 0)])
+def test_a_keyed_growth_walk_cant_read_this_steps_adds_as_a_whole(growth, refused):
+    """A growth step can add several entries per row, and with growth its sampled ids extend the keys."""
+    array = _array(reads={"p": _read(walks={"prefill"}), "d": _read(mask=Bidirectional(), walks={"decode"})})
+    problems = state_declaration_problems(_StubModel(array, kv_labels=_keyed(growth)))
+    assert len(problems) == refused
+    assert all(problem.startswith("Array 'kv'.reads['d']: Bidirectional on walk 'decode'") for problem in problems)
+
+
+@pytest.mark.parametrize("other, mask", [
+    (_array("image_kv", reads={"o": _read(mask=Bidirectional())}), "Bidirectional"),
+    (_within("vision", reads={"o": _read(mask=Block())}), "Block"),
+], ids=["kept", "within_step"])
+def test_another_arrays_read_on_a_keyed_node_cant_read_this_steps_adds_as_a_whole(other, mask):
+    """A hit trims the step for every array on the node, and the keyed entries came from layers that read the rest."""
+    problem = _one_problem(_array(reads={"r": _read()}), other, kv_labels=_keyed())
+    assert problem.startswith(f"Array {other.name!r}.reads['o']: {mask} on walk 'prefill'")
+
+
+def test_keyed_and_rebuilt_walks_read_causally_have_no_problems():
+    model = _StubModel(_array(reads={"r": _read()}), kv_labels=_keyed(growth=True), rebuild=_REBUILD)
+    assert state_declaration_problems(model) == []
 
 
 @pytest.mark.parametrize("arrays, where, cause", [
