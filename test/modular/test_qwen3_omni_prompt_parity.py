@@ -30,6 +30,7 @@ from mstar.api_server.openai.adapters import flatten_messages
 
 # Qwen3OmniModel imports transformers at module level.
 pytest.importorskip("transformers")
+from mstar.model.multimodal import span_name  # noqa: E402
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel  # noqa: E402
 
 SYSTEM_PROMPT = (
@@ -421,5 +422,7 @@ def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, heig
     model._kv_layout = lambda *args: {}  # reads the checkpoint config; not what this checks
     image = torch.randint(0, 256, (3, height, 128), dtype=torch.uint8)
     out = model.process_prompt("Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [image]})
-    (_, rows, cols), = (g.tolist() for g in out.new_input_tensors["image_grid_thw"])
+    # each attachment is a signal of its own (`split_spans`)
+    (grid,) = out.new_input_tensors[span_name("image_grid_thw", 0)]
+    _, rows, cols = grid.tolist()
     assert rows < cols, "a wide image's patch grid is wide"
