@@ -517,7 +517,11 @@ a deployment's own ladder too, so a ladder needs at least one of those.
 ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048,
 1152-1792, and 2176 as slack, since the LLM's 2048-token step budget
 (``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
-reached. Each bucket adds captures and startup time.
+reached. Each bucket adds captures and startup time. The default ladder is
+sized for that budget: 4096 and 8192 serve a deployment that raises
+``max_batch_tokens`` or turns chunking off, where a step just past a power of
+two pads to the next one and a step past 8192 runs eagerly, so such a deployment
+adds its own slack rungs (and the mixed slack, which stays 2176).
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay

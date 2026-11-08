@@ -74,11 +74,14 @@ class LLMSubmodule(SampledTokenDecoder):
     # few tokens over the 2048-token step budget. 1152-1792 hold a prompt a
     # little past 1024 tokens (1024 plus its chat template) without padding it
     # to 2048. Only a text-prefill step, one with no decode rows beside it,
-    # uses them; a mixed step doesn't capture them. There is no slack above
-    # 4096 or 8192: the step budget never reaches them, and each bucket is one
-    # more compile against Dynamo's recompile limit. A deployment sets its own
-    # with `model_kwargs.prefill_token_buckets` (static buffers are sized by
-    # the largest bucket).
+    # uses them; a mixed step doesn't capture them. The ladder is sized for
+    # the default step budget, which no step past 2176 reaches. 4096 and 8192
+    # serve a deployment that raises `max_batch_tokens` or turns chunking off,
+    # where a step up to a power of two fills one; a step just past one pads to
+    # the next, and past 8192 runs eagerly. Such a deployment adds its own slack
+    # rungs with `model_kwargs.prefill_token_buckets` (static buffers are sized
+    # by the largest bucket): each bucket is one more compile against Dynamo's
+    # recompile limit, so the default doesn't carry rungs it never reaches.
     PREFILL_TOKEN_BUCKETS = [
         32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048, 2176, 4096, 8192,
     ]
@@ -105,8 +108,8 @@ class LLMSubmodule(SampledTokenDecoder):
     # ITL p99 at c48
     MAX_BATCH_TOKENS = 2048
     # A mixed step captures only the ladder's powers of two and one slack
-    # bucket, a decode batch's width above the budget, for a step a few tokens
-    # over it (2176). Every (rows, tokens) pair here is one more recompile of the
+    # bucket, a decode batch's width above the default budget, for a step a few
+    # tokens over it (2176). Every (rows, tokens) pair here is one more recompile of the
     # forward all these captures share, and past Dynamo's limit the buckets
     # compiled last run uncompiled inside their graphs.
     MIXED_SLACK_TOKENS = MAX_BATCH_TOKENS + SampledTokenDecoder.MIXED_CAPTURE_BATCH_SIZES[-1]
