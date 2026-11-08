@@ -74,8 +74,8 @@ class FlashInferRaggedManager(_FlashInferRaggedManagerBase, _RaggedSelfManagerBa
     backend's one row), each wrapper runs the row its first layout's longest
     query segment falls in, for its lifetime: a captured graph can't switch
     kernels, and an eager wrapper keeps the captured ones' rule. A ``cudnn``
-    row needs equal-length segments; a first layout of unequal ones runs on
-    FlashInfer instead."""
+    row needs equal-length segments, and under capture a config that declares
+    ``fixed_bucket_layouts``; otherwise the wrapper runs on FlashInfer."""
 
     wrapper_class = FlashInferRaggedPrefillWrapper
 
@@ -103,7 +103,9 @@ class FlashInferRaggedManager(_FlashInferRaggedManagerBase, _RaggedSelfManagerBa
 
         seq_len = int(torch.diff(cu_seqlens.to(device="cpu", dtype=torch.int64)).max()) if cu_seqlens.numel() > 1 else 0
         choice = choice_for(self._kernel_rows, seq_len)
-        if choice.impl == "cudnn" and uniform_segments(cu_seqlens) is not None:
+        captured = bool(graph_kwargs.get("accelerator_graph"))
+        if (choice.impl == "cudnn" and uniform_segments(cu_seqlens) is not None
+                and (not captured or self._config.fixed_bucket_layouts)):
             fallback = None if graph_kwargs else functools.partial(super()._build_wrapper, label, slot)
             return CudnnRaggedPrefillWrapper(
                 num_qo_heads=self._config.num_qo_heads, num_kv_heads=self._config.num_kv_heads,

@@ -10,7 +10,15 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from mstar.engine.resources import AttentionStep, RaggedAttentionConfig, RaggedAttentionSpec, Segment, StepContext
+from mstar.engine.resources import (
+    AttentionStep,
+    BucketKey,
+    RaggedAttentionConfig,
+    RaggedAttentionSpec,
+    Segment,
+    SlotLease,
+    StepContext,
+)
 from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper
 from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
 from mstar.engine.resources.attn.workspace import Workspace
@@ -23,8 +31,9 @@ DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
 D = 128
 # heads, segment length: klein 4B / 9B joint attention (512 text + 4096 image tokens), Z-Image's
-# main, image and caption spans (its captions are padded to a multiple of 32)
-SIZES = [(24, 4608), (32, 4608), (30, 4192), (30, 4096), (30, 96)]
+# main, image and caption spans (its captions are padded to a multiple of 32), and Wan2.2-5B's
+# self-attention at 832x480x33, the other dit whose geometry the sm_103 table covers
+SIZES = [(24, 4608), (32, 4608), (30, 4192), (30, 4096), (30, 96), (24, 3510)]
 # bf16 kernels sit at ~0.23% rel L2 from fp32 here; the fp32 reference rounded to bf16 is 0.17%
 REL_L2 = 5e-3
 
@@ -155,15 +164,19 @@ def test_eager_cudnn_runs_unequal_segments_on_its_fallback():
 
 @pytest.mark.skipif(not torch.cuda.is_available() or current_platform.arch() != "sm_103",
                     reason="the shipped table covers sm_103")
+@pytest.mark.parametrize("captured", [False, True], ids=["eager", "captured"])
 @pytest.mark.parametrize(("heads", "seq"), [(24, 4608), (30, 96)])
-def test_the_resource_runs_the_tables_kernel(heads, seq):
+def test_the_resource_runs_the_tables_kernel(heads, seq, captured):
     spec = RaggedAttentionSpec(resource_key="dit_attn", nodes={"dit"}, config=RaggedAttentionConfig(
-        num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE))
+        num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE, fixed_bucket_layouts=True))
     manager = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
     step = AttentionStep(segments=tuple(Segment(request_id=f"r{i}", label="main", span=seq) for i in range(2)),
                          causal=False)
+    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="image_gen", bs=2, num_tokens=2 * seq)) if captured else None
     manager.plan(step, StepContext(request_ids=["r0", "r1"], graph_walk="image_gen", slot=0, capture=False,
-                                   is_preplan=False, slot_lease=None))
-    assert type(manager._current_plan_states["main"]) is CudnnRaggedPrefillWrapper
+                                   is_preplan=False, slot_lease=lease))
+    wrapper = manager._current_plan_states["main"]
+    assert type(wrapper) is CudnnRaggedPrefillWrapper and wrapper.accelerator_graph is captured
     q, k, v = qkv(2 * seq, heads)
-    assert rel_l2(manager.run(q, k, v, label="main"), reference(q, k, v, cu(2, seq))) < REL_L2
+    out = replay(lambda: manager.run(q, k, v, label="main")) if captured else manager.run(q, k, v, label="main")
+    assert rel_l2(out, reference(q, k, v, cu(2, seq))) < REL_L2

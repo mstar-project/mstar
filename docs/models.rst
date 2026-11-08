@@ -1866,9 +1866,13 @@ conditioning tokens, in order).
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``attention_backend``
-   ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``flashinfer`` runs the
-   DiT's joint attention on the engine's ragged FlashInfer resource; both are CUDA-graph
-   replayable.
+   ``sdpa`` (the shipped configs) is the reference kernel: torch's SDPA called by the model,
+   cuDNN on an H100 and a B300. ``flashinfer`` (the model's default when a config names none)
+   runs the DiT's joint attention on the engine's ragged attention resource, whose kernel the
+   GPU's ``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's
+   ragged prefill (FA3 on Hopper) where no table covers the GPU. ``resources: dit_attn:
+   backend: flashinfer`` keeps FlashInfer. Both are CUDA-graph replayable. Z-Image takes the
+   same knob.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.

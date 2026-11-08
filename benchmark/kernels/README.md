@@ -79,6 +79,13 @@ gets faster on a GPU without a change to model code.
 - `moe_decode`: the small-batch fp8 MoE's per-pair kernels (`--dtype float8_e4m3fn --shape
   H=...,E=...,I=...,K=...`: hidden, experts, one rank's intermediate, top-k). Its rows are the
   per-pair tiles by token count, then the grouped `"*"` row.
+- `ragged_attention`: a cacheless self-attention's kernel by one rank's head geometry
+  (`--shape num_qo_heads=...,num_kv_heads=...,head_dim=...`), rows by the longest query segment:
+  torch's cuDNN SDPA (`cudnn`) or a FlashInfer ragged backend (`flashinfer`, `{"backend": ...}`),
+  each timed through the resource's graph-mode wrapper at 1 and 8 segments of the bucket's length.
+  `python -m benchmark.kernels.ragged_attention --heads 24 --seq 4608` prints a wider table at
+  one size, with kernels the resource can't replay (FlashInfer cutlass, torch's FA2). The sm_103
+  table was written with `--arch`, which names the file for the architecture, not the GPU model.
 - `fp8_linear`: the block-fp8 dense linear's kernel by token count (`mstar.utils.dense_fp8`:
   `w8a16`, `flashinfer` or `cublas`; `--shape N=...,K=...,glu=0|1`, N per half with glu). Tables
   only for now: its sweep is not ported.

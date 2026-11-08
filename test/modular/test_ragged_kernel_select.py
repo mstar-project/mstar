@@ -182,9 +182,10 @@ def stub_flashinfer(monkeypatch):
     monkeypatch.setattr(FlashInferRaggedManager, "wrapper_class", _StubFlashInfer)
 
 
-def manager_with(rows, device=torch.device("cpu")):
-    return FlashInferRaggedManager(device=device, dtype=torch.bfloat16, key="dit_attn",
-                                   config=RaggedAttentionConfig(num_qo_heads=24, num_kv_heads=24, head_dim=128),
+def manager_with(rows, fixed_bucket_layouts=True):
+    config = RaggedAttentionConfig(num_qo_heads=24, num_kv_heads=24, head_dim=128,
+                                   fixed_bucket_layouts=fixed_bucket_layouts)
+    return FlashInferRaggedManager(device=torch.device("cpu"), dtype=torch.bfloat16, key="dit_attn", config=config,
                                    kernel_rows=rows)
 
 
@@ -216,6 +217,38 @@ def test_a_captured_wrapper_is_sized_like_the_flashinfer_one(stub_flashinfer):
     assert type(w) is CudnnRaggedPrefillWrapper
     assert w.accelerator_graph and w.max_total_tokens == 4608
     assert w._make_fallback is None
+
+
+def test_a_captured_bucket_needs_fixed_layouts_for_cudnn(stub_flashinfer):
+    """A captured cuDNN wrapper bakes its layout in; a resource whose buckets replay other
+    layouts stays on FlashInfer under capture, and takes cuDNN eagerly."""
+    m = manager_with(CUDNN_ROWS, fixed_bucket_layouts=False)
+    graph = dict(accelerator_graph=True, max_num_segments=2, max_total_tokens=2 * 4608)
+    assert type(m._build_wrapper("main", 0, cu(4608, 4608), **graph)) is _StubFlashInfer
+    assert type(m._build_wrapper("main", 0, cu(4608, 4608))) is CudnnRaggedPrefillWrapper
+
+
+def _image_dit(model: str):
+    if model == "flux2_klein":
+        from mstar.model.flux2_klein.config import Flux2KleinConfig
+        from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
+
+        m = Flux2KleinModel(model_path_hf="test/flux2_klein", skip_weight_loading=True, attention_backend="flashinfer")
+        m.set_config(Flux2KleinConfig())
+        return m
+    from mstar.model.z_image.config import ZImageConfig
+    from mstar.model.z_image.z_image_model import ZImageModel
+
+    m = ZImageModel(model_path_hf="test/z_image", skip_weight_loading=True, attention_backend="flashinfer")
+    m.set_config(ZImageConfig())
+    return m
+
+
+@pytest.mark.parametrize("model", ["flux2_klein", "z_image"])
+def test_the_image_dits_declare_fixed_bucket_layouts(model):
+    (resource,) = _image_dit(model).get_node_resources()
+    assert resource.config.fixed_bucket_layouts
+    assert resource.config.backend is RaggedAttnBackend.AUTO and resource.config.flashinfer_backend == "auto"
 
 
 def test_an_eager_cudnn_wrapper_falls_back_for_unequal_segments(stub_flashinfer):
