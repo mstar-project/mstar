@@ -369,7 +369,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
             (lt / "offer.json").write_text(json.dumps(o))
             print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
             return
-        tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
+        tried.append(f"{o['id']}: {gpu_py.tail_lines(r.stderr or r.stdout, 400)}")
     everything = json.loads(gpu("offers", "--gpus", str(gpus), "--json", "--all-regions", check=False).stdout)
     lines = [f"No GPUs for the live test: it needs {gpus} Hopper-class GPU(s), at most ${cap}/hr."]
     lines += [f"- tried {t}" for t in tried]
@@ -526,7 +526,7 @@ def approval_facts(pr, sha, verdict, since, review):
         untestable=tuple(untestable(pull, changes or [], review)),
         too_many_files=changes is None,
         blocked=(*blocked, *gitlinks),
-        runtime=bool(runtime),
+        runtime=bool(set(runtime) - set(blocked)),  # a gated file already has its own reason
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
         questions=len(review.get("questions") or ()),
         to_fix_first=tuple(to_fix_first(review, pr, "stacked-above.json")),

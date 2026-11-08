@@ -242,7 +242,7 @@ class TestMonitor(unittest.TestCase):
                  "reviews": {"nodes": [{"author": BOT_AUTHOR}]}}]}}}}
         return answer
 
-    def run_monitor(self, body, bug_title="crash in decode", **routes_over):
+    def run_monitor(self, body, bug_title="crash in decode", app_id="app-id", **routes_over):
         calls = {"body": None}
 
         def issue_status(argv, stdin):
@@ -269,7 +269,8 @@ class TestMonitor(unittest.TestCase):
                         f'{"d" * 40}\x1f{"b" * 40}\x1fFaster decode (#7)\x1f\x1e\n'),
             "git diff": "a.py\n", "git show": "", "git blame": "", "GET repos/o/r/labels/*": {}, **routes_over,
         }
-        with mock.patch.object(bot, "utcnow", lambda: NOW):
+        with mock.patch.object(bot, "utcnow", lambda: NOW), \
+                mock.patch.dict(os.environ, {"REVIEW_APP_CLIENT_ID": app_id}):
             out, fake = step(bot.monitor, routes, repo="o/r", approvals="on")
         return calls["body"], fake
 
@@ -286,6 +287,10 @@ class TestMonitor(unittest.TestCase):
         _, fake = self.run_monitor(body)
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a signal already reported would notify subscribers every day")
+
+    def test_approvals_read_off_when_no_app_can_approve(self):
+        body, _ = self.run_monitor(STATUS["body"], app_id="")
+        self.assertIn("Approvals: **off**", body, "the status issue would claim approvals are on with no app")
 
     def test_the_first_run_creates_the_status_issue_and_the_label(self):
         created = []

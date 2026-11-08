@@ -97,6 +97,24 @@ class TestSlurm(unittest.TestCase):
                  for name, port in (("node1", 21), ("node2", 22))]
         self.assertNotEqual(*files, "one node's pinned key would overwrite the other's, and ssh would refuse it")
 
+    def test_a_slurm_ssh_failure_is_whole_lines_and_a_changed_pin_says_what_to_do(self):
+        self.addCleanup(self.globals.update, {"STATE": self.globals["STATE"]})
+        self.globals["STATE"] = Path(tempfile.mkdtemp())
+
+        def fails_with(stderr, **node):
+            failed = subprocess.CompletedProcess([], 255, stdout="", stderr=stderr)
+            with unittest.mock.patch.object(subprocess, "run", return_value=failed), \
+                    self.assertRaises(GPU["ApiError"]) as caught:
+                GPU["slurm_run"]({"name": "n", "host": "root@n", **node}, "sinfo -h")
+            return caught.exception.body
+
+        changed = "x" * 300 + "\n  ssh-keygen -f known_hosts -R '[n]:22'\nHost key verification failed.\n"
+        pinned = fails_with(changed, host_key="ssh-ed25519 AAAA")
+        self.assertIn("REVIEW_SLURM_NODES", pinned, "a changed pinned key wouldn't say which setting to update")
+        self.assertNotIn("ssh-keygen", pinned, "it would advise dropping the pin")
+        self.assertEqual(fails_with("x" * 300 + "\n" + "y" * 300 + "\nlast line\n"),
+                         "slurm: sinfo: " + "y" * 300 + "\nlast line", "ssh's error would be cut mid-word")
+
     def test_a_bad_slurm_config_is_refused_with_a_reason(self):
         for slurm in ({"host": "h", "name": "n"}, [{"host": "h"}], [{"host": "h", "name": "a:b"}],
                       [{"host": "h", "name": "n", "enabled": False}]):

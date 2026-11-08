@@ -1018,8 +1018,11 @@ def monitor(out, repo, approvals=""):
     reported = set(state.get("signals") or [])
     current = {s["key"]: s for s in signals}
     fresh = [current[k]["text"] for k in sorted(current) if k not in reported]
+    switch = f"**{'on' if approvals == 'on' else 'off'}** (`REVIEW_APPROVALS`)."
+    if approvals == "on" and not os.environ.get("REVIEW_APP_CLIENT_ID"):  # the app reads the switch and approves
+        switch = "**off**: `REVIEW_APPROVALS` is on, but `REVIEW_APP_CLIENT_ID` isn't set, so no app can approve."
     head = [STATUS_ISSUE, "### Review bot status", f"Updated {now.strftime('%Y-%m-%d %H:%M')} UTC.", "",
-            f"Approvals: **{'on' if approvals == 'on' else 'off'}** (`REVIEW_APPROVALS`).", "",
+            f"Approvals: {switch}", "",
             f"#### PRs merged with the bot's approval, last {MONITOR_DAYS} days", "| PR | Signals |", "| --- | --- |"]
     tail = ["", f"New PRs since the last report: {len(new_prs)}.",
             "#### New bug reports not linked to an approved PR"]

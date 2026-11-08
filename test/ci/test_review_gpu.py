@@ -122,6 +122,10 @@ class TestApproval(unittest.TestCase):
         runtime = ("docs/models.rst", "mstar/worker/worker.py")
         self.assertEqual(why("skipped", "none", runtime), [f"no GPU run on runtime code ({gpu_review.COUNTED})"],
                          "a model's `none` alone would approve runtime code no GPU ran")
+        gated = ".github/PULL_REQUEST_TEMPLATE.md"
+        self.assertEqual(why("skipped", "none", (gated,)),
+                         [f"touches the review's rules or dependencies ({gpu_review.COUNTED}): {gated}"],
+                         "a file the gate already refuses would also be called runtime code")
         self.assertEqual(why("skipped", "none", runtime, since="f" * 40), [],
                          "a change since a passing live test could never be approved without a GPU")
 
