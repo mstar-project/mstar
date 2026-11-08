@@ -5,7 +5,7 @@ Nothing here runs a model or the PR's code: the live-test session runs on the GP
 (gpu_review_box.sh), and this script only gets it GPUs, waits for it, collects what it wrote,
 decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config the workflow writes: the team's
-Slurm node when it has them free, else any open Eras listing under the hourly cap.
+Slurm node with the most GPUs free, else any open Eras listing under the hourly cap.
 
     gpu_review.py carry    --pr N --sha SHA --review review.json --earlier-report FILE --above stacked-above.json
                            --gate FILE [--rereview]
@@ -90,21 +90,28 @@ def gh_json(path):
 
 def cmd_configure(a):
     """gpu.py's config.local.json from the workflow's variables and secrets (env), and the ssh keys.
-    The Slurm node only with its key and host; Eras only with ERAS_API_KEY (gpu.py checks)."""
+    The Slurm nodes only with their key (one for all of them); Eras only with ERAS_API_KEY (gpu.py
+    checks). SLURM_NODES is a JSON list of nodes, each with its name, host, port and pinned host key,
+    and optionally any other field of gpu.py's node."""
     env = os.environ.get
     ssh = Path.home() / ".ssh"
     ssh.mkdir(mode=0o700, exist_ok=True)
     if not (ssh / "live_pr").exists():  # Eras boxes: this run's key, which gpu.py registers
         run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "live_pr"))
-    slurm = {}
-    if env("SLURM_KEY") and env("SLURM_HOST"):
+    nodes = json.loads(env("SLURM_NODES") or "[]")
+    if not isinstance(nodes, list) or not all(
+            isinstance(n, dict) and re.fullmatch(r"[A-Za-z0-9._-]+", str(n.get("name"))) and n.get("host")
+            for n in nodes):
+        raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]) and a host")
+    slurm = []
+    if env("SLURM_KEY") and nodes:
         key = ssh / "review_slurm"
         key.touch(mode=0o600)
         key.write_text(env("SLURM_KEY").strip() + "\n")
-        slurm = {"host": env("SLURM_HOST"), "port": int(env("SLURM_PORT") or 22), "host_key": env("SLURM_HOST_KEY", ""),
-                 "identity_file": str(key), "partition": env("SLURM_PARTITION") or "background", "nice": 100,
-                 "max_gpus": int(env("MAX_GPUS") or 4), "job_prefix": "review-bot", "workdir": "/workspace/review-bot",
-                 "gpu": "H200", "vram_gb": 141, "hf_home": "/workspace/shared/hf"}
+        defaults = {"port": 22, "partition": "background", "nice": 100, "max_gpus": int(env("MAX_GPUS") or 4),
+                    "job_prefix": "review-bot", "workdir": "/workspace/review-bot", "gpu": "H200", "vram_gb": 141,
+                    "hf_home": "/workspace/shared/hf"}
+        slurm = [{**defaults, **n, "identity_file": str(key)} for n in nodes]
     usd, hours = float(env("MAX_USD") or 30), float(env("HOURS") or 4)
     eras = {}
     if env("ERAS_SECRET"):
@@ -367,14 +374,14 @@ def cmd_cleanup(a):
     for key in list(state["ledger"]()):
         gpu("terminate", key, check=False)
     cfg = state["load_config"]()
-    if state["enabled"](cfg, "slurm"):
-        name = state["job_name"](cfg, "slurm", a.pr, a.tag)
+    for sl in state["slurm_nodes"](cfg):
+        name = state["job_name"](sl, a.pr, a.tag)
         try:
-            state["slurm_cancel"](cfg, f"--name={shlex.quote(name)}", state["job_dir"](cfg, name))
-        except (state["ApiError"], subprocess.TimeoutExpired) as err:  # still release what Eras holds
-            print(f"slurm: {err}")
+            state["slurm_cancel"](sl, f"--name={shlex.quote(name)}", state["job_dir"](sl, name))
+        except (state["ApiError"], subprocess.TimeoutExpired) as err:  # still release what the others hold
+            print(f"slurm {sl['name']}: {err}")
     if state["enabled"](cfg, "eras"):
-        name = state["job_name"](cfg, "eras", a.pr, a.tag)
+        name = state["job_name"](None, a.pr, a.tag)
         for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []:
             if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
