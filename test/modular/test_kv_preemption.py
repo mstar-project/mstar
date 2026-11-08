@@ -938,14 +938,59 @@ def test_a_rebuilt_request_isnt_dropped_again_until_it_writes_a_token():
     while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
         pass
 
-    # as the worker asks, through the engine's drop check
-    victims = _preempt(
-        kv, "a", outcome.reason.pages_short, droppable=lambda rid: kv.check_drop(rid, kv._laid_out_tokens(rid)) is None,
-    )
+    victims = _preempt(kv, "a", outcome.reason.pages_short, _droppable(kv))
 
     assert "v" not in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v's rebuild was thrown away unused"
     assert victims.waits, "a took room that v's next step needs"
     assert _step(kv, "v", 1).ok, "v's first step after its rebuild ran short"
+
+
+def _droppable(kv):
+    """Whether the KV allows a drop, as the worker asks through the engine."""
+    return lambda rid: kv.check_drop(rid, kv._laid_out_tokens(rid)) is None
+
+
+def test_an_older_request_short_of_pages_moves_a_rebuilt_one_to_the_host_rather_than_itself():
+    """A rebuilt request was held back from every move until it wrote a token, though a move to the host keeps its
+    rebuilt KV. An older request that ran short then copied itself to the host for the newer one."""
+    kv = _pool()
+    _rebuilt(kv)
+    kv._cpu_pool = host._HostPool(16)
+    while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
+        pass
+
+    victims = _preempt(kv, "a", outcome.reason.pages_short, _droppable(kv))
+
+    assert victims == Victims(["v"], [], []), "a moved itself to the host for a newer request"
+
+
+def test_a_rebuilt_request_back_from_the_host_gives_back_its_allotment_before_it_reloads():
+    """The hold read the tokens written past the rebuild, which an offload sets to 0 until the reload. A rebuilt
+    request that had moved to the host and been let back in then held its allotment against every older request
+    until it reloaded."""
+    kv = _pool()
+    _rebuilt(kv)
+    kv._cpu_pool = host._HostPool(16)
+    _offload(kv, "v")
+    assert _admitted(kv, "v") and kv.residency("v") is Residency.ON_HOST
+    while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
+        pass
+
+    victims = _preempt(kv, "a", outcome.reason.pages_short, _droppable(kv))
+
+    assert victims == Victims([], [], ["v"]), "v kept the allotment for a reload while an older request ran short"
+
+
+def test_a_rebuilt_request_stays_undroppable_through_a_trip_to_the_host_until_it_writes():
+    kv = _pool()
+    _rebuilt(kv)
+    kv._cpu_pool = host._HostPool(16)
+    _offload(kv, "v")
+    assert _ready(kv, "v")
+
+    assert not _droppable(kv)("v"), "a drop would throw away the rebuild before it kept a token"
+    assert _step(kv, "v", 1).ok
+    assert _droppable(kv)("v"), "v stayed undroppable after writing past its rebuild"
 
 
 def test_a_failed_reload_puts_a_request_back_from_the_host_on_the_host_again():

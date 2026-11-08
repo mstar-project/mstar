@@ -219,6 +219,38 @@ def test_a_victim_the_host_takes_keeps_its_log_for_a_later_drop():
     assert w._rebuilds.kept("v", NODE) is not None, "a drop after its return would find no log to rebuild it from"
 
 
+@pytest.mark.parametrize("sampled", [False, True], ids=["moved again before it samples", "samples between moves"])
+def test_a_request_moved_to_the_host_again_before_it_samples_is_counted(sampled):
+    """The count read the samples a request had kept when its rebuild landed, so a request moved to the host and
+    sent back before it sampled was never counted, and with drops held back until a rebuilt request writes a token
+    the count stayed 0."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(16)
+    _running(kv, "r", 5, arrival=1)
+    _running(kv, "v", 5, arrival=2)
+    w = _worker(kv)
+
+    def run_short(rid):
+        batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={rid: 0})
+        while (outcome := _step(kv, rid, PAGE_SIZE)).ok:
+            pass
+        w._handle_admit_failure(batch, _refused(batch, outcome.reason))
+
+    run_short("r")
+    assert kv.residency("v") is Residency.ON_HOST
+    _remove(kv, "r")
+    assert _ready(kv, "v")
+    if sampled:
+        w._rebuilds._kept[NODE]["v"].sampled.append(1)
+    _running(kv, "q", 3, arrival=0)
+    run_short("q")
+
+    assert kv.residency("v") is Residency.ON_HOST
+    assert w._preemption.counts[NODE].returns_preempted == (not sampled), (
+        "a request sent back to the host before it sampled went uncounted, or one that sampled was counted"
+    )
+
+
 def test_a_request_that_can_only_wait_waits_and_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="mstar.worker.admission"):
         kv, w = _preempting("nothing to drop")
