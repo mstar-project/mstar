@@ -15,7 +15,7 @@ host-side index arithmetic done at plan time.
 
 import torch
 
-from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim
+from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim, zero_unplanned_rows
 from mstar.engine.resources.attn.workspace import Workspace
 
 
@@ -105,7 +105,6 @@ class RaggedBlockCausalWrapper:
         self._workspace = workspace_buffer
 
         if not accelerator_graph:
-            self._out_buf = None
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                 self._workspace.tensor, "NHD", backend=backend,
             )
@@ -128,12 +127,6 @@ class RaggedBlockCausalWrapper:
             paged_kv_indices_buf=self._kv_indices_buf,
             paged_kv_last_page_len_buf=self._last_page_len_buf,
             backend=backend,
-        )
-        # Own the output so a replay's unplanned tail is a known value; see
-        # `_RaggedPrefillBase.__init__`.
-        self._out_buf = torch.zeros(
-            max_total_tokens, num_qo_heads, self.padded_head_dim,
-            dtype=q_data_type, device=device,
         )
         # FlashInfer latches its row ceilings on the first plan; prime at the
         # bucket's worst case so a small first plan can't cap it.
@@ -194,8 +187,6 @@ class RaggedBlockCausalWrapper:
             sm_scale=self.sm_scale,
             q_data_type=self.q_data_type,
         )
-        if self._out_buf is not None:
-            self._out_buf[total:].zero_()
 
     def _pad_head_dim(self, t: torch.Tensor) -> torch.Tensor:
         if t.shape[-1] == self.padded_head_dim:
@@ -214,7 +205,7 @@ class RaggedBlockCausalWrapper:
         qp, kp, vp = (self._pad_head_dim(t.to(self.q_data_type)) for t in (q, k, v))
         # each token is a page of one: [num_pages, page_size=1, H, D]
         kv = (kp.unsqueeze(1), vp.unsqueeze(1))
-        if self._out_buf is None:
+        if not self.accelerator_graph:
             out = self.attn_wrapper.run(qp, kv)
         else:
             n = qp.shape[0]
@@ -222,7 +213,8 @@ class RaggedBlockCausalWrapper:
                 f"RaggedBlockCausalWrapper: {n} rows exceeds the "
                 f"{self.max_total_tokens} this graph-mode wrapper was built for"
             )
-            out = self.attn_wrapper.run(qp, kv, out=self._out_buf[:n])
+            out = self.attn_wrapper.run(qp, kv, out=torch.empty_like(qp, memory_format=torch.contiguous_format))
+            zero_unplanned_rows(out, self._qo_indptr_buf)
         if self.padded_head_dim != self.head_dim and not padded_in:
             return out[..., : self.head_dim].contiguous()
-        return out.clone() if self._out_buf is not None else out
+        return out

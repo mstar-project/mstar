@@ -1279,7 +1279,8 @@ Chatterbox notes
   the playback time to produce a bigger one, so a stream costs three or four
   flow solves instead of one per 25 tokens. Each chunk re-runs
   the flow decoder over all tokens so far with a fixed noise field, holds back
-  the three look-ahead tokens and crossfades the vocoder tail, so the stream
+  the three look-ahead tokens and crossfades the vocoder tail (which a first chunk
+  of at least 7 tokens fills), so the stream
   is continuous but not sample-identical to the whole-utterance decode;
   ``stream_chunk_tokens: 0`` synthesises whole utterances (the reference
   path, bit-exact with the package at a fixed seed). ``stream_context_tokens``
@@ -1988,7 +1989,8 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 ``max_image_area``
    Pixels, default 2048². Bounds the output size a request may ask for; larger requests
    are rejected with a 400 before scheduling instead of occupying the worker for minutes
-   (an 8192² request means 262k tokens of quadratic attention).
+   (an 8192² request means 262k tokens of quadratic attention). Z-Image also refuses a side
+   over 8192 px, the 512 tokens its rotary table covers.
 
 With the klein defaults every served image was within 53 dB of the eager path on all 100
 protocol prompts, and with ``vae_compile: false`` it was bit-exact; both were measured while
