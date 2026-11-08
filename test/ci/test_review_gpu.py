@@ -65,7 +65,8 @@ class TestApproval(unittest.TestCase):
         for path in (".github/review/review-prompt.md", ".claude/skills/pr-review/SKILL.md", "AGENTS.md",
                      "CLAUDE.md", "uv.lock", "rust/server/Cargo.lock", "pyproject.toml", "setup.py",
                      "rust/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", "docs/requirements.txt",
-                     "scripts/ci/check.sh"):
+                     "scripts/ci/check.sh", "scripts/release.sh", "docker/Dockerfile", "tools/x.py",
+                     "packaging/deb.sh", "MANIFEST.in"):
             self.assertTrue(file_gate([path], REPO_ROOT)[0], f"a change to {path} could be approved")
         engine = ["mstar/engine/engine.py", "mstar/engine/resources/kv_cache.py"]
         self.assertEqual(file_gate(engine, REPO_ROOT)[:2], ([], engine),

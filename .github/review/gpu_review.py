@@ -35,8 +35,8 @@ REPO = os.environ.get("REPO", "mstar-project/mstar")
 os.environ.setdefault("LIVE_PR_STATE", str(Path(os.environ.get("RUNNER_TEMP", "/tmp"), "live-pr")))
 WRITE = bot.WRITE
 # Never approved, whatever the review says: the bot's own rules, CI, and the dependencies and toolchains.
-NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/ci/")
-NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py", "Cargo.toml", "rust-toolchain.toml",
+NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/", "docker/", "tools/", "packaging/")
+NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "MANIFEST.in", "pyproject.toml", "setup.py", "Cargo.toml", "rust-toolchain.toml",
                "requirements*.txt")
 # Approved only as a comment that doesn't count toward required reviews.
 NO_COUNT_AREAS = {"area/engine", "area/resources"}
