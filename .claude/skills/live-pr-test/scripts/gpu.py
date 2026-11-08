@@ -720,7 +720,7 @@ def eras_create(body: dict, pubkey: str) -> str:
         except ApiError as err:  # a key gone since the lookup: not found or not valid, by the spec's codes
             if again or err.status not in (404, 422) or (key := eras_ssh_key_id(pubkey, body["name"])) in keys:
                 raise
-            print(f"gpu.py: ssh key {keys[0]} was deleted mid-launch; registered it again as {key}", file=sys.stderr)
+            print(f"gpu.py: ssh key {keys[0]} was deleted mid-launch; now bound as {key}", file=sys.stderr)
             keys[:] = [key]
 
 
