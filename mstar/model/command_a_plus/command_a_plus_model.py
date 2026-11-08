@@ -102,9 +102,11 @@ class CommandAPlusModel(Model):
         if not input_signals.get("text_inputs"):
             raise ValueError("Command A+ prefill requires text_inputs")
         if input_signals.get("pixel_values"):
-            prefill = WalkStep(self.image_walk, step_metadata={
-                MEDIA_LAYOUT: model_kwargs[MEDIA_LAYOUT], FINAL_PREFILL: True,
-            })
+            layout = model_kwargs.get(MEDIA_LAYOUT)
+            if layout is None:
+                # process_prompt sets it; as media_prefill_step refuses the same case
+                raise ValueError("Command A+ image prefill needs the prompt's media layout, which process_prompt sets")
+            prefill = WalkStep(self.image_walk, step_metadata={MEDIA_LAYOUT: layout, FINAL_PREFILL: True})
         else:
             prefill = WalkStep("prefill", step_metadata={FINAL_PREFILL: True})
         # one prefill over the prompt, then decode until the stop check ends it
