@@ -38,8 +38,7 @@ from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThrea
 from mstar.api_server.entrypoint import request_id_in_use
 from mstar.api_server.request_types import APIServerMessage, RequestFailed, ResultChunk
 from mstar.communication.event import EventWakeup
-from mstar.model.base import Model
-from mstar.streaming.topology import PartitionTopology
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     NewRequestConductor,
@@ -52,16 +51,9 @@ from mstar.utils.ipc_format import (
 TEXT = dict(input_modalities=["text"], output_modalities=["text"])
 
 
-class _Model:
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
-
+class _Model(StubModel):
     def process_prompt(self, *args, **kwargs):
         return None
-
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()

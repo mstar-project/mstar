@@ -33,6 +33,7 @@ from mstar.utils.knobs import sampler_slots
 
 if TYPE_CHECKING:
     from mstar.engine.resources.sampler.config import LoopbackState
+    from mstar.engine.resources.sampler.resident import SamplerCells
 
 logger = logging.getLogger(__name__)
 
@@ -407,24 +408,28 @@ _SPLIT_CHUNK = 16384
 _SPLIT_MAX_BLOCK = 8192
 
 
-def _split_count(batch: int, vocab: int, device: torch.device) -> int:
-    """How many chunks to cut the vocab into.
+def _split_layout(batch: int, vocab: int, device: torch.device) -> tuple[int, int]:
+    """``(nsplit, chunk)``: how many chunks to cut the vocab into, and their width.
 
     The vocab's call alone: any vocab wider than one chunk splits, so for real
     LLM vocabularies the fused kernel is only reached from tests. ``batch`` is
-    accepted for a future rule.
+    accepted for a future rule. 16-aligned chunk starts let the loads vectorize
+    when the vocab (the row stride) is a multiple of 16 too, as Triton
+    specializes ints divisible by 16: an odd chunk (vocab 202,048 in 13 splits)
+    made the prep 3.8x slower.
     """
     del batch, device
-    return max(1, -(-vocab // _SPLIT_CHUNK))
+    nsplit = max(1, triton.cdiv(vocab, _SPLIT_CHUNK))
+    chunk = triton.cdiv(triton.cdiv(vocab, nsplit), 16) * 16
+    return triton.cdiv(vocab, chunk), chunk
 
 
 def _split_v_softmax(
-    logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
+    logits, temperature, pen_ptr, mask_ptr, probs, nsplit, chunk,
     apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
 ):
     """The three-kernel path; see the kernels above for why."""
     B, V = logits.shape
-    chunk = -(-V // nsplit)
     # sized to the chunk: a small block makes a long chunk many serial iterations
     block = min(_SPLIT_MAX_BLOCK, triton.next_power_of_2(chunk))
     hist_args, hist_flags = hist
@@ -510,10 +515,10 @@ def fused_temperature_softmax(
     mask_stride_v = seen_mask.stride(1) if apply_penalty else 0
     hist = _history_kernel_args(history, logits)
 
-    nsplit = _split_count(B, V, logits.device)
+    nsplit, chunk = _split_layout(B, V, logits.device)
     if nsplit > 1:
         _split_v_softmax(
-            logits, temperature, pen_ptr, mask_ptr, probs, nsplit,
+            logits, temperature, pen_ptr, mask_ptr, probs, nsplit, chunk,
             apply_penalty, include_greedy, mask_stride_b, mask_stride_v, hist,
         )
         return probs
@@ -754,6 +759,16 @@ def _fused_sample_kernel(
 FUSED_SAMPLE_MAX_VOCAB = 4096
 
 
+class FusedDrawArgs(NamedTuple):
+    """A step's per-row ``fused_sample`` parameters, for a kernel that draws as it does."""
+
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    seed: torch.Tensor
+    offset: torch.Tensor
+
+
 def fused_sample(
     logits: torch.Tensor, temperature: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor,
     seed: torch.Tensor, offset: torch.Tensor,
@@ -909,8 +924,7 @@ def _token_logprobs_cuda(logits: torch.Tensor, tokens: torch.Tensor, temperature
     """``token_logprobs`` in one fp32 pass, on the split-V softmax's partials.
     Plain torch doubled a captured sampler step at bs 128 on a 248k vocab."""
     B, V = logits.shape
-    nsplit = _split_count(B, V, logits.device)
-    chunk = -(-V // nsplit)
+    nsplit, chunk = _split_layout(B, V, logits.device)
     f32 = dict(device=logits.device, dtype=torch.float32)
     cmax = torch.empty((B, nsplit), **f32)
     csum = torch.empty((B, nsplit), **f32)
@@ -1079,6 +1093,63 @@ def canonical_sampling_values(
     # any top_k past the vocab is off; past int32 it would not even fit the buffers
     top_k = int(top_k) if int(top_k) < 2**31 else 0
     return float(temperature), top_k, float(top_p), float(min_p)
+
+
+class ScalarField(NamedTuple):
+    """One per-request scalar a captured sampler reads per row: a ``HostBuffer``
+    of ``SamplerBuffers`` by this name, and a cell of the resident rows."""
+    name: str
+    dtype: torch.dtype
+    default: float
+
+
+def scalar_fields(
+    enable_min_p: bool = False, windowed: bool = False, min_tokens: bool = False,
+    enable_top_p_first: bool = False, enable_logprobs: bool = False,
+    enable_processed_logprobs: bool = False,
+) -> tuple[ScalarField, ...]:
+    """The scalars a sampler's spec enables, in the order its per-step rows
+    pack them. Every field defaults to what ``SamplingConfig()`` reads as."""
+    fields = [
+        ScalarField("temperature", torch.float32, 1.0),
+        ScalarField("top_k", torch.int32, 0),
+        ScalarField("top_p", torch.float32, 1.0),
+        ScalarField("seed", torch.long, 0),
+        ScalarField("rep_penalty", torch.float32, 1.0),
+    ]
+    if enable_min_p:
+        fields.append(ScalarField("min_p", torch.float32, 0.0))
+    if windowed:
+        fields += [ScalarField("window", torch.int32, 0), ScalarField("window_penalty", torch.float32, 1.0)]
+    if min_tokens:
+        fields.append(ScalarField("min_tokens", torch.int32, 0))
+    if enable_top_p_first:
+        fields += [ScalarField("top_p_first", torch.bool, False), ScalarField("top_p_min_keep", torch.int32, 1)]
+    if enable_logprobs:
+        fields.append(ScalarField("return_logprobs", torch.bool, False))
+    if enable_processed_logprobs:
+        fields.append(ScalarField("processed_logprobs", torch.bool, False))
+    return tuple(fields)
+
+
+def scalar_values(cfg: "SamplingConfig", windowed: bool) -> dict[str, float | int | bool]:
+    """Each scalar's value for ``cfg``: the eager sampler's canonical values
+    (greedy: the prep kernel's one-hot at argmax, filters off), so both paths
+    read one meaning. A field the spec doesn't enable is never read."""
+    t, k, p, m = canonical_sampling_values(cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p)
+    return {
+        "temperature": t, "top_k": k, "top_p": p, "seed": cfg.seed,
+        # a windowed request's penalty is count-based, so the mask is inert for it
+        "rep_penalty": float(cfg.presence_penalty if windowed else cfg.repetition_penalty),
+        "min_p": m,
+        "window": int(cfg.repetition_window),
+        "window_penalty": float(cfg.window_penalty),
+        "min_tokens": int(cfg.min_tokens),
+        "top_p_first": bool(cfg.top_p_first),
+        "top_p_min_keep": int(cfg.top_p_min_keep),
+        "return_logprobs": bool(cfg.return_logprobs),
+        "processed_logprobs": cfg.logprobs_mode == "processed",
+    }
 
 
 @dataclass
@@ -1896,6 +1967,23 @@ class AcceleratorGraphableSampler(BaseSampler):
     # whether requests' seen token buffers should be synced post-replay
     applied_penalty_in_graph: bool = False
 
+    def fused_draw_args(self, apply_filters: bool) -> FusedDrawArgs | None:
+        """What `sample` hands `fused_sample`, or None when `sample` does more than that one draw. The copy to
+        ``last_token_buf`` is left out: the resource decides whether anything reads it."""
+        if (
+            self.offset_buf.device.type != "cuda" or self.min_p_buf is not None or self.history is not None
+            or self.order is not None or self.ingraph_scatter or self.logprob_buf is not None
+            or (self.tp_group is not None and self.tp_group.world_size > 1)
+        ):
+            return None
+        top_k, top_p = self.top_k_buf, self.top_p_buf
+        if not apply_filters:
+            top_k, top_p = torch.zeros_like(top_k), torch.ones_like(top_p)
+        return FusedDrawArgs(self.temperature_buf, top_k, top_p, self.seed_buf, self.offset_buf)
+
+    def advance_offsets(self, draws: int) -> None:
+        self.offset_buf.add_(draws)  # a fused draw runs on CUDA, where a draw takes one offset
+
     def gather_in_graph(self) -> None:
         """Offsets of this step's rows off the master, inside the graph."""
         torch.index_select(
@@ -2394,22 +2482,22 @@ class SamplerBuffers:
     )
     # (padded_bs, cg slot) -> the sampler over that slot's views; see sampler_for
     _samplers: dict = field(default_factory=dict, repr=False)
+    # (bucket, cg slot) -> a resident capture's sampler; see resident_sampler_for
+    _resident_samplers: dict = field(default_factory=dict, repr=False)
     # the scalar buffers' per-step rows, staged together; set by ``allocate``
     _scalar_rows: ScalarRows | None = field(default=None, repr=False)
+    # the scalars the spec enables, each a ``HostBuffer`` field by its name
+    scalar_fields: tuple[ScalarField, ...] = ()
+    # The node's resident rows, when its planner binds this sampler: a
+    # request's scalars as cells by resident slot (`sampler/resident.py`).
+    cells: "SamplerCells | None" = field(default=None, repr=False)
 
     @property
     def tracks_seen_tokens(self) -> bool:
         return self.seen_tokens is not None
 
     def _scalar_buffers(self) -> list[HostBuffer]:
-        bufs = [self.temperature, self.top_k, self.top_p, self.seed, self.rep_penalty]
-        for opt in (
-            self.min_p, self.window, self.window_penalty, self.min_tokens,
-            self.top_p_first, self.top_p_min_keep, self.return_logprobs, self.processed_logprobs,
-        ):
-            if opt is not None:
-                bufs.append(opt)
-        return bufs
+        return [getattr(self, f.name) for f in self.scalar_fields]
 
     @classmethod
     def allocate(
@@ -2469,21 +2557,21 @@ class SamplerBuffers:
             MaskBuffer.allocate(max_batch_size, rows, vocab_size, device, cg_slots=1)
             if vocab_size is not None else None
         )
-        windowed = history is not None and history.window > 0
         if history is not None:
             history.allocate_step_buffers(max_batch_size)
+        fields = cls.fields_for(
+            enable_min_p=enable_min_p, history=history, stop_ids=stop_ids,
+            enable_top_p_first=enable_top_p_first, enable_logprobs=enable_logprobs,
+            enable_processed_logprobs=enable_processed_logprobs,
+        )
         buffers = cls(
             max_batch_size=max_batch_size,
-            temperature=mk(torch.float32, 1.0),
-            top_k=mk(torch.int32, 0),
-            top_p=mk(torch.float32, 1.0),
-            seed=mk(torch.long, 0),
-            rep_penalty=mk(torch.float32, 1.0),
+            **{f.name: mk(f.dtype, f.default) for f in fields},
+            scalar_fields=fields,
             offset=Buffer.allocate(max_batch_size, graph_rows, device, torch.long, 0, 1),
             last_token=Buffer.allocate(max_batch_size, graph_rows, device, torch.long, 0, cg_slots),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
-            min_p=mk(torch.float32, 0.0) if enable_min_p else None,
             loopback={
                 name: RowBuffer.allocate(
                     max_batch_size, rows, device, state.dtype, state.default, cg_slots,
@@ -2491,15 +2579,8 @@ class SamplerBuffers:
                 for name, state in (loopback_state or {}).items()
             },
             history=history,
-            window=mk(torch.int32, 0) if windowed else None,
-            window_penalty=mk(torch.float32, 1.0) if windowed else None,
-            min_tokens=mk(torch.int32, 0) if stop_ids is not None else None,
             stop_ids=stop_ids,
-            top_p_first=mk(torch.bool, False) if enable_top_p_first else None,
-            top_p_min_keep=mk(torch.int32, 1) if enable_top_p_first else None,
-            return_logprobs=mk(torch.bool, False) if enable_logprobs else None,
             logprob=torch.zeros(cg_slots, max_batch_size, device=device) if enable_logprobs else None,
-            processed_logprobs=mk(torch.bool, False) if enable_processed_logprobs else None,
             _master_capacity=cap,
             _device_capacity=cap,
             ingraph_scatter=ingraph_scatter,
@@ -2513,51 +2594,73 @@ class SamplerBuffers:
         buffers._scalar_rows = ScalarRows(buffers._scalar_buffers(), max_batch_size, device)
         return buffers
 
-    def slice_for_bs(self, bs: int, cg_slot: int = 0) -> dict[str, Any]:
+    @staticmethod
+    def fields_for(
+        enable_min_p: bool = False,
+        history: GenerationHistory | None = None,
+        stop_ids: torch.Tensor | None = None,
+        enable_top_p_first: bool = False,
+        enable_logprobs: bool = False,
+        enable_processed_logprobs: bool = False,
+    ) -> tuple[ScalarField, ...]:
+        """The scalars ``allocate`` gives these options a buffer each."""
+        return scalar_fields(
+            enable_min_p=enable_min_p, windowed=history is not None and history.window > 0,
+            min_tokens=stop_ids is not None, enable_top_p_first=enable_top_p_first,
+            enable_logprobs=enable_logprobs, enable_processed_logprobs=enable_processed_logprobs,
+        )
+
+    def slice_for_bs(
+        self, bs: int, cg_slot: int = 0,
+        scalars: Mapping[str, torch.Tensor] | None = None, index: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
         """Return bs-sized views into one slot's buffers (zero-copy slices) plus
         the owning submodule's ``tp_group`` so the constructed sampler
-        broadcasts across TP ranks."""
+        broadcasts across TP ranks. A resident capture passes its own
+        per-step ``scalars`` (by field name), which its graph fills, and
+        ``index`` row (gather half, then scatter half), which its stage uploads."""
+        def scalar(name: str) -> torch.Tensor | None:
+            if scalars is not None:
+                return scalars[name][:bs] if name in scalars else None
+            buf = getattr(self, name)
+            return buf.slot_view(cg_slot, bs) if buf is not None else None
+
+        if index is None:
+            index = self._slot_idx_gpu[cg_slot]
         # slot_view clamps single-buffered buffers (offset, seen mask) to slot 0
         return {
-            "temperature_buf": self.temperature.slot_view(cg_slot, bs),
-            "top_k_buf": self.top_k.slot_view(cg_slot, bs),
-            "top_p_buf": self.top_p.slot_view(cg_slot, bs),
-            "seed_buf": self.seed.slot_view(cg_slot, bs),
+            "temperature_buf": scalar("temperature"),
+            "top_k_buf": scalar("top_k"),
+            "top_p_buf": scalar("top_p"),
+            "seed_buf": scalar("seed"),
             "offset_buf": self.offset.slot_view(cg_slot, bs),
-            "rep_penalty_buf": self.rep_penalty.slot_view(cg_slot, bs),
+            "rep_penalty_buf": scalar("rep_penalty"),
             "seen_tokens_buf": self.seen_tokens.slot_view(cg_slot, bs) if self.seen_tokens is not None else None,
-            "min_p_buf": self.min_p.slot_view(cg_slot, bs) if self.min_p is not None else None,
-            "history": self._history_rows(bs, cg_slot) if self.history is not None else None,
+            "min_p_buf": scalar("min_p"),
+            "history": self._history_rows(bs, scalar) if self.history is not None else None,
             "order": (
-                FilterOrder(self.top_p_first.slot_view(cg_slot, bs), self.top_p_min_keep.slot_view(cg_slot, bs))
+                FilterOrder(scalar("top_p_first"), scalar("top_p_min_keep"))
                 if self.top_p_first is not None else None
             ),
             "last_token_buf": self.last_token.slot_view(cg_slot, bs),
-            "return_logprobs_buf": (
-                self.return_logprobs.slot_view(cg_slot, bs) if self.return_logprobs is not None else None
-            ),
+            "return_logprobs_buf": scalar("return_logprobs"),
             "logprob_buf": self.logprob[cg_slot, :bs] if self.logprob is not None else None,
-            "processed_logprobs_buf": (
-                self.processed_logprobs.slot_view(cg_slot, bs) if self.processed_logprobs is not None else None
-            ),
+            "processed_logprobs_buf": scalar("processed_logprobs"),
             "tp_group": self.tp_group,
             "offset_master": self.offset.master,
             "last_token_master": self.last_token.master,
-            "slot_idx_view": self._slot_idx_gpu[cg_slot, :bs],
-            "scatter_idx_view": self._slot_idx_gpu[cg_slot, bs:2 * bs] if self.ingraph_scatter else None,
+            "slot_idx_view": index[:bs],
+            "scatter_idx_view": index[bs:2 * bs] if self.ingraph_scatter else None,
             "ingraph_scatter": self.ingraph_scatter,
         }
 
-    def _history_rows(self, bs: int, cg_slot: int) -> HistoryRows:
-        def view(buf: "HostBuffer | None") -> torch.Tensor | None:
-            return buf.slot_view(cg_slot, bs) if buf is not None else None
-
+    def _history_rows(self, bs: int, scalar) -> HistoryRows:
         return HistoryRows(
             count=self.history.step_count[:bs],
             tokens=self.history.step_tokens[:bs] if self.window is not None else None,
-            window=view(self.window),
-            window_penalty=view(self.window_penalty),
-            min_tokens=view(self.min_tokens),
+            window=scalar("window"),
+            window_penalty=scalar("window_penalty"),
+            min_tokens=scalar("min_tokens"),
             stop_ids=self.stop_ids,
         )
 
@@ -2573,33 +2676,10 @@ class SamplerBuffers:
         mask is NOT written here (it changes every step — see
         ``update_request_config``).
         """
-        # the eager sampler's canonical values (greedy: the prep kernel's
-        # one-hot at argmax, filters off), so both paths read one meaning
-        t, k, p, m = canonical_sampling_values(
-            cfg.temperature, cfg.top_k, cfg.top_p, cfg.min_p,
-        )
+        values = scalar_values(cfg, windowed=self.window is not None)
         with self._host_master_lock:
-            self.temperature.write_master_row(slot, t)
-            self.top_k.write_master_row(slot, k)
-            self.top_p.write_master_row(slot, p)
-            self.seed.write_master_row(slot, cfg.seed)
-            self.rep_penalty.write_master_row(slot, float(cfg.repetition_penalty))
-            if self.min_p is not None:
-                self.min_p.write_master_row(slot, m)
-            if self.window is not None:
-                # a windowed request's penalty is count-based, so the mask is inert for it
-                self.rep_penalty.write_master_row(slot, float(cfg.presence_penalty))
-                self.window.write_master_row(slot, int(cfg.repetition_window))
-                self.window_penalty.write_master_row(slot, float(cfg.window_penalty))
-            if self.min_tokens is not None:
-                self.min_tokens.write_master_row(slot, int(cfg.min_tokens))
-            if self.top_p_first is not None:
-                self.top_p_first.write_master_row(slot, bool(cfg.top_p_first))
-                self.top_p_min_keep.write_master_row(slot, int(cfg.top_p_min_keep))
-            if self.return_logprobs is not None:
-                self.return_logprobs.write_master_row(slot, bool(cfg.return_logprobs))
-            if self.processed_logprobs is not None:
-                self.processed_logprobs.write_master_row(slot, cfg.logprobs_mode == "processed")
+            for f in self.scalar_fields:
+                getattr(self, f.name).write_master_row(slot, values[f.name])
         self._config_version += 1
 
     def _grow_master(self, new_capacity: int) -> None:
@@ -2677,6 +2757,8 @@ class SamplerBuffers:
         self._cached_config[rid] = (
             sampling_config if sampling_config is not None else SamplingConfig()
         )
+        if self.cells is not None:
+            self.cells.set_config(rid, self._cached_config[rid], windowed=self.window is not None)
 
     def register_trash_row(self, rid: str) -> None:
         """Point ``rid`` at the trash row instead of a slot of its own.
@@ -2692,6 +2774,8 @@ class SamplerBuffers:
         if slot is None or slot == self._trash_slot:
             return
         self._cached_config.pop(rid, None)
+        if self.cells is not None:
+            self.cells.drop(rid)
         self._pending_init.discard(slot)
         self._free_slots.append(slot)
 
@@ -2718,6 +2802,9 @@ class SamplerBuffers:
         # A slot awaiting init writes this row at gather time instead.
         if slot not in self._pending_init:
             self._write_master_row(slot, sampling_config)
+        if self.cells is not None:
+            # its resident row is rewritten whole by the next step that reads it
+            self.cells.set_config(rid, sampling_config, windowed=self.window is not None, stale=True)
 
     def stage_seen_token_masks(
         self, request_ids: list[str], seen_masks: "Iterable[SeenTokenMask]",
@@ -2884,6 +2971,44 @@ class SamplerBuffers:
         if self.seen_tokens is not None and gather_seen_tokens:
             self.seen_tokens.gather(idx_view, padded_bs, cg_slot)
 
+    def gather_rows(
+        self, index: torch.Tensor, padded_bs: int, cg_slot: int, gather_seen_tokens: bool = True,
+    ) -> None:
+        """``gather_dynamic`` for a resident step: the same per-step state, by
+        ``index``, the step's rows its resident stage uploaded. Inline, for the
+        reason ``gather_dynamic`` gives; with ``ingraph_scatter`` and no
+        penalty, only a new row's offset reset is left to do."""
+        self._sync_device_capacity()
+        if self._pending_offset_reset:
+            self._drain_offset_resets()
+        if not self.ingraph_scatter:
+            self.offset.gather(index, padded_bs, cg_slot)
+        if self.seen_tokens is not None and gather_seen_tokens:
+            self.seen_tokens.gather(index, padded_bs, cg_slot)
+
+    def resident_sampler_for(
+        self, key, cg_slot: int, bs: int, scalars: Mapping[str, torch.Tensor], index: torch.Tensor,
+    ) -> "AcceleratorGraphableSampler":
+        """``sampler_for`` a resident capture ``key``: its per-step scalars and
+        index row are its own, filled by its graph and its resident stage."""
+        sampler = self._resident_samplers.get((key, cg_slot))
+        if sampler is None:
+            sampler = AcceleratorGraphableSampler(**self.slice_for_bs(bs, cg_slot, scalars=scalars, index=index))
+            self._resident_samplers[(key, cg_slot)] = sampler
+        sampler.applied_penalty_in_graph = False
+        return sampler
+
+    def attach_cells(self, cells: "SamplerCells") -> None:
+        """Keep ``cells`` with every registration and config update from now on,
+        and give them the requests registered so far."""
+        self.cells = cells
+        for rid, cfg in self._cached_config.items():
+            cells.set_config(rid, cfg, windowed=self.window is not None)
+
+    def slot_of(self, rid) -> int:
+        """``rid``'s master row, the trash row for an unregistered one."""
+        return self._rid_to_slot.get(rid, self._trash_slot)
+
     def _drain_offset_resets(self) -> None:
         """Zero the offsets of newly registered slots; GPU thread, before a read."""
         with self._offset_reset_lock:
@@ -2926,9 +3051,12 @@ class SamplerBuffers:
         sampler.applied_penalty_in_graph = False
         return sampler
 
-    def _scatter_idx(self, cg_slot: int) -> tuple[torch.Tensor, int]:
+    def _scatter_idx(self, cg_slot: int, index: torch.Tensor | None = None) -> tuple[torch.Tensor, int]:
         """The slot's device index row narrowed to the real rows, memoized per
-        (slot, rows) like ``Buffer.slot_view`` (the index buffer is static)."""
+        (slot, rows) like ``Buffer.slot_view`` (the index buffer is static).
+        ``index``: a resident step's real rows instead."""
+        if index is not None:
+            return index, index.shape[0]
         real_bs = self._last_real_bs[cg_slot]
         key = (cg_slot, real_bs)
         idx = self._scatter_idx_views.get(key)
@@ -2944,52 +3072,63 @@ class SamplerBuffers:
         return to_device_nonblocking(keep, self._slot_idx_gpu.device, dtype=torch.bool)
 
     def scatter_offset(
-        self, cg_slot: int = 0, keep: torch.Tensor | None = None,
+        self, cg_slot: int = 0, keep: torch.Tensor | None = None, index: torch.Tensor | None = None,
     ) -> None:
         """Persist the (in-graph advanced) per-step offsets back to their slot
         masters. Call once AFTER the graph replay for the gather on ``cg_slot``;
         GPU-only, real rows only (padding rows all map to the trash row).
         ``keep`` (from ``keep_mask``) skips the rows whose draw was dropped."""
-        idx, real_bs = self._scatter_idx(cg_slot)
+        idx, real_bs = self._scatter_idx(cg_slot, index)
         self.offset.scatter(idx, real_bs, cg_slot, keep=keep)
 
     # ------------------------------------------------------------------
     # Last sampled token: written by the sample, read by the next step
     # ------------------------------------------------------------------
     def scatter_last_token(
-        self, cg_slot: int = 0, keep: torch.Tensor | None = None,
+        self, cg_slot: int = 0, keep: torch.Tensor | None = None, index: torch.Tensor | None = None,
     ) -> None:
         """Persist the tokens the captured sample wrote into ``cg_slot``'s
         per-step row to their slot masters. Same contract as ``scatter_offset``:
         after the replay, real rows only."""
-        idx, real_bs = self._scatter_idx(cg_slot)
+        idx, real_bs = self._scatter_idx(cg_slot, index)
         self.last_token.scatter(idx, real_bs, cg_slot, keep=keep)
 
-    def gather_last_tokens(self, cg_slot: int, padded_bs: int) -> torch.Tensor:
+    def gather_last_tokens(
+        self, cg_slot: int, padded_bs: int, index: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """``[padded_bs]`` last tokens of the batch staged on ``cg_slot``, in
         its row order (padding rows read the trash row, like every other gather).
         A fresh tensor on the current stream; the runner stages it into the
         slot's static ``input_ids``. Call after ``gather_dynamic`` uploaded the
-        slot's index row for this step."""
+        slot's index row for this step, or with a resident step's ``index``."""
         return self.last_token.master.index_select(
-            0, self._slot_idx_gpu[cg_slot, :padded_bs]
+            0, self._slot_idx_gpu[cg_slot, :padded_bs] if index is None else index
         )
 
-    def _slots_of(self, request_ids: list[str]) -> torch.Tensor:
+    def _slots_of(
+        self, request_ids: list[str], kept_rids: "frozenset | None" = None,
+    ) -> torch.Tensor:
         slots = [
-            0 if isinstance(rid, int) and rid < 0 else self._rid_to_slot[rid]
+            0 if (isinstance(rid, int) and rid < 0)
+            or (kept_rids is not None and rid not in kept_rids)
+            else self._rid_to_slot[rid]
             for rid in request_ids
         ]
         return torch.tensor(slots, dtype=torch.long, device=self.last_token.master.device)
 
-    def write_last_tokens(self, request_ids: list[str], tokens: torch.Tensor) -> None:
+    def write_last_tokens(
+        self, request_ids: list[str], tokens: torch.Tensor,
+        kept_rids: "frozenset | None" = None,
+    ) -> None:
         """Eager-step write of ``tokens`` (``[len(request_ids)]``) to the
-        requests' master rows. Every request must be registered."""
+        requests' master rows. Every request must be registered. Rows outside
+        ``kept_rids`` go to the trash row, so their master rows stay unchanged."""
         if not request_ids:
             return
         self._sync_device_capacity()
         self.last_token.master.index_copy_(
-            0, self._slots_of(request_ids), tokens.to(self.last_token.master.dtype)
+            0, self._slots_of(request_ids, kept_rids),
+            tokens.to(self.last_token.master.dtype),
         )
 
     def last_tokens_for(self, request_ids: list[str]) -> torch.Tensor:
@@ -3016,12 +3155,14 @@ class SamplerBuffers:
             for buf in self.loopback.values():
                 buf.reset_row(slot)
 
-    def gather_loopback(self, name: str, cg_slot: int, padded_bs: int) -> torch.Tensor:
+    def gather_loopback(
+        self, name: str, cg_slot: int, padded_bs: int, index: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """``[padded_bs, width]`` rows of state ``name`` for the batch staged
         on ``cg_slot``, as ``gather_last_tokens``."""
         self._sync_loopback()
         return self.loopback[name].master.index_select(
-            0, self._slot_idx_gpu[cg_slot, :padded_bs]
+            0, self._slot_idx_gpu[cg_slot, :padded_bs] if index is None else index
         )
 
     def loopback_for(self, name: str, request_ids: list[str]) -> torch.Tensor:
@@ -3039,9 +3180,10 @@ class SamplerBuffers:
 
     def scatter_loopback(
         self, name: str, cg_slot: int = 0, keep: torch.Tensor | None = None,
+        index: torch.Tensor | None = None,
     ) -> None:
         """Persist state ``name``'s per-step rows on ``cg_slot`` to their
         slots, as ``scatter_last_token``."""
         self._sync_loopback()
-        idx, real_bs = self._scatter_idx(cg_slot)
+        idx, real_bs = self._scatter_idx(cg_slot, index)
         self.loopback[name].scatter(idx, real_bs, cg_slot, keep=keep)

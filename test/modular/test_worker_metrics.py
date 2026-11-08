@@ -23,6 +23,7 @@ from test_conductor_status import _conductor, _request, _to_api_server  # noqa: 
 from test_ingest_unpersist import _run  # noqa: E402
 from test_kv_prefix_lease import ROOT, _grow, _keys, _layout, _seed, _StubTransfer  # noqa: E402
 from test_micro_scheduler import _Engine, _Manager, _next_batch, _scheduler  # noqa: E402
+from test_rebuild_policy import POLICY, _graphs, _ran  # noqa: E402
 from test_serving_metrics import _labels, _serve, _wait  # noqa: E402
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the wire tags)
@@ -39,7 +40,9 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
-from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -49,7 +52,8 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerStatus,
 )
 from mstar.worker import worker_metrics  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.worker.host_pool import HostPool  # noqa: E402
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker_metrics import WorkerMetrics  # noqa: E402
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
@@ -104,12 +108,11 @@ def _hold(kv: KVManager, rid: str, tokens: int) -> None:
 def _engine(resources=(), sub=None, keyed=False) -> Engine:
     """The real ``Engine`` attributes its prefix probe and
     ``paged_kv_caches`` read; every resource here sits on ``NODE``."""
-    eng = Engine.__new__(Engine)
-    eng._resources = {r.name: r for r in resources}
-    eng._resource_nodes = {r.name: frozenset({NODE}) for r in resources}
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub or _Sub(), resources={})}
-    eng._enable_nvtx = False
-    eng._loopback_steps = {}
+    eng = make_engine(
+        _resources={r.name: r for r in resources},
+        _resource_nodes={r.name: frozenset({NODE}) for r in resources},
+        _submodules={NODE: make_mgmt(sub or _Sub())},
+    )
     eng._runner = StepRunner(eng._resources, node_resources={NODE: list(eng._resources)})
     eng._keyed_walks = {NODE: {PREFILL}} if keyed else {}
     eng._prefix_model = "Toy"
@@ -130,12 +133,12 @@ def _prepare(eng: Engine, walk: str, **lengths) -> ExecutingBatch:
     return batch
 
 
-def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None, counting=True) -> WorkerMetrics:
+def _metrics(eng=None, scheduler=None, components=(NODE,), sent=None, counting=True, rebuilds=None) -> WorkerMetrics:
     """``counting``: as after the API server's warmup requests."""
     if scheduler is None:
         scheduler = SimpleNamespace(pending_rows=lambda: {})
     m = WorkerMetrics(
-        "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler,
+        "worker_0", 3600.0, frozenset(components), eng or _engine(), scheduler, rebuilds or Rebuilds({}, {}),
         send=(sent if sent is not None else []).append, enable_transfers=lambda: EdgeTransfers("SHM"),
     )
     if counting:
@@ -198,6 +201,20 @@ def test_a_cache_only_follower_nodes_use_is_not_reported():
     m = _metrics(_engine([kv]), components=("talker",))
     snaps = m.snapshot()
     assert _values(snaps, "mstar_kv_pages_total") == {}
+
+
+# ── kept-id pool ─────────────────────────────────────────────────────────────
+
+def test_the_kept_id_pool_reports_its_fill_under_its_node():
+    rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(64, torch.device("cpu")))
+    m = _metrics(rebuilds=rebuilds)
+
+    rebuilds.keep_prompts(_ran(PREFILL, {"r": {"text_inputs": [torch.arange(3)]}}))
+
+    snaps = m.snapshot()
+    assert (_values(snaps, "mstar_rebuild_host_bytes_used"), _values(snaps, "mstar_rebuild_host_bytes_total")) == (
+        {(NODE,): 24}, {(NODE,): 64}
+    ), "a full pool, whose requests are never dropped, wouldn't show"
 
 
 # ── steps and batch sizes ───────────────────────────────────────────────────
@@ -325,21 +342,17 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     def stub(*a, **k):
         return None
 
-    w = Worker.__new__(Worker)
-    w.worker_id = "worker_0"
-    w.enable_nvtx = False
-    w._phase_period, w._phase_buf = 0, {}
-    w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
-    w.tp_async_sched, w.is_tp_follower = False, False
-    w._in_flight_rids = set()
-    w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
-    w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
-    w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
-    w.wakeup_event = SimpleNamespace(register_future=stub)
-    w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
-    w.scheduler = SimpleNamespace(
+    w = make_worker(
+        worker_id="worker_0",
+        parallel_groups=SimpleNamespace(barrier_all=stub, restore_default_timeout=stub),
+        engine_manager=SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng),
+        communicator=SimpleNamespace(send=stub, wait_for_work=stub),
+        wakeup_event=SimpleNamespace(register_future=stub),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
+        scheduler=SimpleNamespace(
         take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
         remember_ready=contextlib.nullcontext,
+    ),
     )
     for name in ("_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
                  "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
@@ -358,7 +371,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
 
     w._handle_main_loop_error = fail_loudly
     w._metrics = WorkerMetrics("worker_0", 0.0, frozenset({NODE}), eng,
-                               SimpleNamespace(pending_rows=dict), send=sent.append,
+                               SimpleNamespace(pending_rows=dict), Rebuilds({}, {}), send=sent.append,
                                enable_transfers=lambda: EdgeTransfers("SHM"))
     w._metrics.start_counting()
     return w, sent, postprocessed, iteration
@@ -488,8 +501,7 @@ def test_prefix_lookups_before_start_counting_are_not_counted():
 
 
 def test_the_worker_starts_counting_on_enable_metrics(clock):
-    w = Worker.__new__(Worker)
-    w._metrics = _metrics(counting=False)
+    w = make_worker(_metrics=_metrics(counting=False))
     clock.now = 1.0
     w._process_message_list([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
     clock.now = 1.25
@@ -536,12 +548,9 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
     from mstar.api_server.request_types import PreprocessInput
     from mstar.communication.event import EventWakeup
 
-    class _Model:
+    class _Model(StubModel):
         def process_prompt(self, *args, **kwargs):
             return None
-
-        def get_partition_topology(self):
-            return PartitionTopology(partitions=["default"])
 
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
@@ -657,7 +666,7 @@ def test_the_worker_status_crosses_the_wire_typed():
 
 
 def test_metrics_are_off_on_a_worker_built_without_an_interval():
-    assert Worker.__new__(Worker)._metrics is None
+    assert make_worker()._metrics is None
 
 
 def test_every_worker_process_gets_the_status_interval(tmp_path, monkeypatch):
@@ -712,7 +721,7 @@ def _worker_status(worker_id, used, steps=(), pending=0):
     clock = _Clock()
     m = WorkerMetrics(
         worker_id, 3600.0, frozenset({NODE}), _engine([kv]),
-        SimpleNamespace(pending_rows=lambda: {NODE: pending}), send=None,
+        SimpleNamespace(pending_rows=lambda: {NODE: pending}), Rebuilds({}, {}), send=None,
         enable_transfers=lambda: EdgeTransfers("SHM"),
     )
     with pytest.MonkeyPatch.context() as mp:

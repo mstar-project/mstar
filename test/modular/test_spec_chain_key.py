@@ -6,15 +6,8 @@ keying on it would count the chain's own parked rows as other work.
 
 from types import SimpleNamespace
 
+from mstar.worker.phase_timer import PhaseTimer
 from mstar.worker.worker import SpeculationTarget, Worker, _SpecFairness
-
-
-class _Span:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *exc):
-        return False
 
 
 def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozenset(), budgeted=True):
@@ -26,9 +19,8 @@ def _worker(target, other_ready=True, speculation=None, mid_prefill_walks=frozen
         _try_speculate_next=lambda pending, target: speculation,
         maybe_send_zmq_to_tp_followers=lambda node_batch, **kw: -1,
         _tp_lead_needs_marker=lambda pending, speculation: False,
-        _span=lambda name: _Span(),
+        timer=PhaseTimer(period=0),
         enable_nvtx=False,
-        _phase_period=0,
         request_state=None,
         scheduler=SimpleNamespace(
             has_ready_excluding=lambda state, key: peeked.append(key) or other_ready,

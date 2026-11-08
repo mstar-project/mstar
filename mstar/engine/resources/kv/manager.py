@@ -5,7 +5,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Collection
 from concurrent.futures import Future, wait
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
@@ -19,6 +19,8 @@ from mstar.engine.resources.base import (
     EngineResourceInfo,
     KeyedWalks,
     PublishedInfo,
+    Rebuild,
+    Residency,
 )
 from mstar.engine.resources.kv.arena import PageArena, StreamPages, columns_from_raw, new_page_arena, plan_columns
 from mstar.engine.resources.kv.cache import GroupPages, KVCache, held_pages, on_pages
@@ -31,11 +33,12 @@ from mstar.engine.resources.kv.config import (
     PagedKVConfig,
     PrefixSpan,
     RetentionPolicy,
+    SpanKind,
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
 from mstar.engine.resources.kv.host_writes import HostWrites
-from mstar.engine.resources.kv.keys import PageItem, fingerprint, page_items, page_key
+from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
     HostLens,
@@ -183,7 +186,9 @@ class SpanCursor:
 
     def next_step(self, walk: str) -> tuple[PrefixSpan, ...]:
         """The spans from ``done`` on that one step of ``walk`` writes: a row can
-        hold several, text around an attachment, up to the next span that opens a step."""
+        hold several, text around an attachment, up to the next span that opens a step.
+        A span that opens no step is of the walk of the span before it, which
+        ``LabelLayout.row`` checks, so a step never ends early at a change of walk."""
         end = self.done
         while end < len(self.spans) and self.spans[end].walk == walk and (
             end == self.done or not self.spans[end].opens_step
@@ -608,6 +613,8 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        # dropped request -> the tokens its laid-out label held, which its rebuild must write again
+        self._dropped: dict[str, int] = {}
         # A stream holds its pages in group g at `CacheStream.groups[g]`, and a plan's at
         # `KVPlanOutputs.groups[g]`; write addressing is keyed (label, g).
         self._groups: tuple[KVGroup, ...] = cfg.groups
@@ -2100,6 +2107,9 @@ class KVManager(AttentionResource):
                 labels = streams.get(rid)
                 stream = labels.get(label) if labels else None
                 if stream is None:
+                    if ctx.is_preplan:
+                        # as the fork loop above: an abandoned stage removes it
+                        self._preplan_new_labels.append((rid, label))
                     stream = self._ensure_label(rid, label)
                 marked.append((segment, stream))
                 # a chunked row reserves the rest of its walk up front, in every group
@@ -2644,10 +2654,11 @@ class KVManager(AttentionResource):
         )
 
     def _readonly_key(self, step: KVStep, ctx: StepContext) -> tuple[tuple, tuple]:
-        """(segments, bucket), and the epochs a plan under that key holds for."""
+        """(segments, bucket, eager_write), and the epochs a plan under that key
+        holds for: an eager-write plan is never staged, so it isn't another's."""
         lease = ctx.slot_lease
         return (
-            (tuple(step.segments), lease.bucket if lease is not None else None),
+            (tuple(step.segments), lease.bucket if lease is not None else None, step.eager_write),
             (self._plan_epoch, self._readonly_epoch),
         )
 
@@ -2667,7 +2678,7 @@ class KVManager(AttentionResource):
                     )
         else:
             for g, outputs in enumerate(res.groups):
-                self._setup_plan_states(outputs, ctx, lease, g)
+                self._setup_plan_states(outputs, ctx, lease, g, eager_write=step.eager_write)
         self._mark_preplanned(step, ctx, res)
         return res
 
@@ -3207,6 +3218,58 @@ class KVManager(AttentionResource):
         self._preplan_states = {}
         self._cached_plan_output = None
 
+    def correct_len(self, rid: str, label: str, delta: int) -> None:
+        """Move a stream's stored length by ``delta`` tokens, pages kept: a
+        speculative verify step commits its whole block and its rejected tail
+        is taken back here once the acceptance is known. The generation moves
+        so an offload claimed against the old length fails its guard."""
+        with self._lock:
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None:
+                raise KeyError(f"KV {self.name}: no stream {label!r} for request {rid}")
+            if len(self._groups) > 1:
+                # each group would rewind its own pages; no grouped cache serves MTP yet
+                raise NotImplementedError(f"KV {self.name}: correct_len on a cache with KV groups")
+            # an admitted step's addressing was planned from the old length
+            assert not stream.step_in_flight, (
+                f"KV {self.name}: correct_len on {rid}/{label} between admit and commit"
+            )
+            if delta == 0:
+                return
+            stream.stored_len = max(0, stream.stored_len + delta)
+            stream.generation += 1
+            # the plan caches assume the stream moved by a commit
+            self._touch_plan_cache(rid)
+            if delta < 0:
+                self._drop_sealed_tail(rid, label, stream)
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def _drop_sealed_tail(self, rid: str, label: str, stream: CacheStream) -> None:
+        """After a rewind the next write must not land on a sealed page other owners
+        still read: the pages from the write position on leave through `_release`, and
+        the one the length ends inside is replaced by a copy."""
+        page_size = self.config.tokens_per_page
+        first = stream.stored_len // page_size
+        tail = stream.page_indices[first:]
+        if not self._arena.any_sealed(tail):
+            return
+        keep: list[int] = []
+        if stream.stored_len % page_size:
+            keep = self._arena.acquire(1)
+            if keep is None:
+                raise RuntimeError(
+                    f"KV {self.name}: no free page to copy the sealed page "
+                    f"{rid}/{label} rewound into"
+                )
+            self.kv_cache.copy_pages(tail[:1], keep)
+        del stream.page_indices[first:]
+        stream.page_indices.extend(keep)
+        self._release(rid, stream, tail)
+        # its keys and cursor name pages this stream no longer holds
+        stream.chain = None
+        self._recount(rid)
+
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams
         retention = step.retention
@@ -3508,6 +3571,8 @@ class KVManager(AttentionResource):
     def supports_eviction(self):
         return self._cpu_pool is not None
 
+    supports_drop = True
+
     def is_offloaded(self, rid: str) -> bool:
         """True from the moment an offload claims the request, not just once
         its pages are on the host.
@@ -3527,6 +3592,109 @@ class KVManager(AttentionResource):
             return any(
                 stream.offloaded for stream in self._streams.get(rid, {}).values()
             )
+
+    def residency(self, rid: str) -> Residency:
+        if rid in self._dropped:
+            return Residency.DROPPED
+        return Residency.ON_HOST if self.is_offloaded(rid) else Residency.RESIDENT
+
+    def check_drop(self, rid: str, tokens: int) -> None:
+        if self._world_size > 1:
+            raise RuntimeError(
+                f"KV {self.name}: dropping {rid} on one of {self._world_size} ranks "
+                "would leave them holding different pages"
+            )
+        residency = self.residency(rid)
+        if residency is Residency.ON_HOST:
+            raise RuntimeError(f"KV {self.name}: {rid} has a host copy, which a drop would leave behind")
+        if residency is Residency.DROPPED:
+            raise RuntimeError(f"KV {self.name}: {rid} is dropped already, and its rebuild hasn't landed")
+        with self._lock:
+            if any(stream.step_in_flight or stream.read_pending for stream in self._streams[rid].values()):
+                raise RuntimeError(f"KV {self.name}: {rid} has a step or a read in flight on its pages")
+            laid_out = [layout for layout in (self._overrides[rid].kv_layout or {}).values() if layout.spans]
+            if any(span.kind != SpanKind.IDS for layout in laid_out for span in layout.spans):
+                raise RuntimeError(f"KV {self.name}: {rid} holds KV that can't be recomputed from token ids")
+            if len(laid_out) > 1 or any(len(layout.spans) != 1 or len(layout.growth) != 1 for layout in laid_out):
+                raise RuntimeError(
+                    f"KV {self.name}: {rid} writes more than one label, span or growth loop, which one rebuild "
+                    "row can't lay out again"
+                )
+            held = self._laid_out_tokens(rid)
+            if laid_out and held != tokens:
+                raise RuntimeError(
+                    f"KV {self.name}: {rid}'s rebuild would write {tokens} tokens, but its label holds {held}"
+                )
+
+    def _laid_out_tokens(self, rid: str) -> int:
+        # `check_drop` allows at most one laid-out label
+        laid_out = [label for label, layout in (self._overrides[rid].kv_layout or {}).items() if layout.spans]
+        return sum(self._streams[rid][label].stored_len for label in laid_out)
+
+    def drop(self, rid: str, tokens: int) -> int:
+        """Take ``rid``'s KV off the device without a host copy, and return the
+        number of pages freed. Pages the index also holds stay cached, where they
+        can be evicted, and the rest go back to the free list."""
+        with self._lock:
+            self.check_drop(rid, tokens)
+            # under the lock, so no other step allocates between the two counts
+            free = self._arena.num_free
+            held = self._laid_out_tokens(rid)
+            self.reset_request(rid, free=True)
+            self._dropped[rid] = held
+            return self._arena.num_free - free
+
+    def prepare_rebuild(self, rid: str, rebuild: Rebuild) -> None:
+        """Lay ``rid``'s label out again as one ids span of the rebuild's walk over its ids without the last
+        one, keyed as a prompt of those ids would be.
+
+        The growth loop's cap drops by the iterations the span now covers, so the footprint stays
+        the one at intake. The decode step that samples an id keys it, so a label that keys
+        generation also extends its chain by the last id.
+        """
+        overrides = self._overrides[rid]
+        laid_out = [label for label, layout in (overrides.kv_layout or {}).items() if layout.spans]
+        if not laid_out:
+            return
+        (label,) = laid_out
+        ids, walk = rebuild.ids, rebuild.walk
+        prompt, page_size = ids[:-1], self.config.tokens_per_page
+        length = len(prompt)
+        assert length == self._dropped[rid], (
+            f"KV {self.name}: {rid}'s rebuild writes {length} tokens, but its drop checked {self._dropped[rid]}"
+        )
+        pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
+        keyed = bool((overrides.prefix_keys or {}).get(label))
+        # hashed before the lock, as `resolve_cached_prefix` hashes outside it
+        keys = chain(pages, root=overrides.prefix_root) if keyed else None
+        with self._lock:
+            layout = overrides.kv_layout[label]
+            ((loop, slots),) = layout.growth
+            grown = length - sum(span.length for span in layout.spans)
+            changes = {}
+            if keyed:
+                changes["prefix_keys"] = {**overrides.prefix_keys, label: keys}
+                changes["prefix_tail"] = {
+                    **(overrides.prefix_tail or {}), label: list(pages[-1]) if length % page_size else [],
+                }
+            self._overrides[rid] = replace(
+                overrides,
+                kv_layout={
+                    **overrides.kv_layout,
+                    label: replace(layout, spans=(PrefixSpan(length, length, walk),), keyed_spans=int(keyed)),
+                },
+                loop_caps={**overrides.loop_caps, loop: overrides.loop_caps[loop] - grown // slots},
+                **changes,
+            )
+            stream = self._streams[rid][label]
+            stream.forget_chain()
+            self._lay_out(rid, label, stream)
+            self._seed_keys(rid, label, stream)
+            if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
+                stream.chain.extend([ids[-1]], page_size)
+
+    def land_rebuild(self, rid: str) -> None:
+        self._dropped.pop(rid, None)
 
     def offload(self, rid: str) -> int:
         """Move every stream of ``rid`` to host memory. Returns the device pages
@@ -4089,6 +4257,7 @@ class KVManager(AttentionResource):
             self._streams.pop(rid, None)
             self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
+            self._dropped.pop(rid, None)
             self._chain_lookup.pop(rid, None)
             self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:
@@ -4303,8 +4472,8 @@ class KVManager(AttentionResource):
             ]
         # Requests ask and are removed on one thread only, so ``rid`` still asks once the lock is
         # taken again.
-        for chain in chains:
-            self._root_chain(chain)
+        for prefix_chain in chains:
+            self._root_chain(prefix_chain)
         with self._lock:
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
             if pages > room:

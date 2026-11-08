@@ -40,7 +40,7 @@ from mstar.engine.resources.lora.identity import (  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore  # noqa: E402
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, ProcessPromptOutput, Span  # noqa: E402
 from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
-from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.testing_utils.model import StubModel
 
 PAGE_SIZE = 16
 NODE, WALK = "LLM", "prefill"
@@ -57,7 +57,7 @@ def _lora_spec() -> LoraSpec:
     )
 
 
-class _Model:
+class _Model(StubModel):
     """Declares one id-keyed label and a LoRA spec."""
 
     # names a checkpoint, so its prefix cache opens without a salt
@@ -65,12 +65,6 @@ class _Model:
 
     def kv_labels(self):
         return {"kv": {"main": KVLabel(keys=PrefixKeys(TENSOR, (WALK,)))}}
-
-    def max_input_files(self):
-        return {}
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
     def get_node_resources(self):
         return [KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(

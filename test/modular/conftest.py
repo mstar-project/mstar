@@ -13,6 +13,7 @@ Two stubs that exist purely so test imports survive on local macOS dev:
 
 And one autouse fixture that clears the cached platform around every test.
 """
+import os
 import sys
 import types
 from typing import NamedTuple
@@ -44,6 +45,13 @@ if "triton" not in sys.modules:
     triton = types.ModuleType("triton")
     triton.language = types.ModuleType("triton.language")
     triton.language.constexpr = int
+    # dtype annotations such as tl.int64 on kernel arguments
+    def _tl_attr(name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return object()
+
+    triton.language.__getattr__ = _tl_attr
     triton.jit = lambda *a, **k: (lambda f: f)
     triton.cdiv = lambda a, b: -(-a // b)
     triton.Config = lambda *a, **k: a
@@ -131,3 +139,16 @@ def _fresh_platform():
     resolve_platform.cache_clear()
     yield
     resolve_platform.cache_clear()
+
+
+# --- host GPUs -----------------------------------------------------------------
+
+@pytest.fixture
+def no_host_gpus(monkeypatch, tmp_path):
+    """Make ``nvidia-smi`` fail, as on a host with no GPU. For tests whose eval jobs start
+    only fake servers, which would otherwise wait on another process's GPU memory."""
+    bin_dir = tmp_path / "no_host_gpus"
+    bin_dir.mkdir()
+    (bin_dir / "nvidia-smi").write_text("#!/bin/sh\nexit 1\n")
+    (bin_dir / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")

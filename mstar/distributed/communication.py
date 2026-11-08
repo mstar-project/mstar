@@ -54,11 +54,39 @@ def _all_to_all_single(
     return recv
 
 
+# torch 2.13 renamed the into-tensor collectives to the *_single scheme.
+# Import-time selection keeps the fallback out of compiled call paths.
+_all_gather_single = getattr(dist, "all_gather_single", None)
+if _all_gather_single is None:
+    _all_gather_single = getattr(
+        getattr(dist, "distributed_c10d", None), "all_gather_single", None
+    )
+_all_gather_into_tensor = _all_gather_single or dist.all_gather_into_tensor
+
+
+def _barrier(group: dist.ProcessGroup | None = None) -> None:
+    """Barrier without torch 2.13's implicit-device warning on NCCL groups."""
+    if dist.get_backend(group) == dist.Backend.NCCL:
+        dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
+    else:
+        dist.barrier(group=group)
+
+
+def _rms_norm(r: torch.Tensor, weight: torch.Tensor, eps: float, weight_bias: float) -> torch.Tensor:
+    """The fused kernel's norm, unfused: fp32, scaling by ``weight + weight_bias``."""
+    v = r.float()
+    v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+    return (v * (weight.float() + weight_bias)).to(r.dtype)
+
+
 class ArFusionWorkspace(NamedTuple):
     """A fused all-reduce workspace of a ``CommGroup``: its id in
-    ``ar_fusion``'s registry, for inputs of up to ``max_tokens`` rows."""
+    ``ar_fusion``'s registry, for inputs of up to ``max_tokens`` rows, and
+    ``allreduce_rmsnorm``'s ``[max_tokens, hidden]`` zero residual (shared,
+    which is safe only because the fused op never writes its residual)."""
     ws_id: int
     max_tokens: int
+    zeros: torch.Tensor
 
 
 class CommGroup:
@@ -133,7 +161,7 @@ class CommGroup:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        _all_gather_into_tensor(output_tensor, input_, group=self.device_group)
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -147,7 +175,7 @@ class CommGroup:
     def barrier(self):
         if self.world_size == 1:
             return
-        dist.barrier(group=self.device_group)
+        _barrier(self.device_group)
 
     def all_reduce_buffer(
         self, shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
@@ -166,8 +194,10 @@ class CommGroup:
     def init_allreduce_fusion(
         self, hidden: int, dtype: torch.dtype, max_tokens: int = 2048,
     ) -> bool:
-        """Set up ``allreduce_add_rmsnorm``'s fused kernel for ``[<=max_tokens,
-        hidden]`` inputs of ``dtype``. Returns whether it is available for them.
+        """Set up the fused kernel of ``allreduce_add_rmsnorm`` and
+        ``allreduce_rmsnorm`` for ``[<=max_tokens, hidden]`` inputs of ``dtype``,
+        with ``allreduce_rmsnorm``'s zero residual (16 MiB per rank at 2048 x
+        4096, bf16). Returns whether it is available for them.
 
         Collective: every member calls it at load, in the same order with the
         same arguments. The lockstep nodes of an instance share its group, so
@@ -187,7 +217,9 @@ class CommGroup:
         ws_id = create_workspace(self, max_tokens, hidden, dtype)
         if ws_id is None:
             return False
-        self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(ws_id, max_tokens)
+        # on the device the workspace was just built on
+        zeros = torch.zeros(max_tokens, hidden, dtype=dtype, device=torch.accelerator.current_accelerator())
+        self._ar_fusion[(dtype, hidden)] = ArFusionWorkspace(ws_id, max_tokens, zeros)
         return True
 
     def allreduce_add_rmsnorm(
@@ -204,42 +236,21 @@ class CommGroup:
 
             return allreduce_add_rmsnorm(x, residual, weight, eps, weight_bias, ws.ws_id)
         r = self.all_reduce(x) + residual
-        v = r.float()
-        v = v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
-        return (v * (weight.float() + weight_bias)).to(r.dtype), r
+        return _rms_norm(r, weight, eps, weight_bias), r
 
-    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        world_size = self.world_size
-        # Bypass the function if we are using only 1 GPU.
-        if world_size == 1:
-            return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
+    def allreduce_rmsnorm(
+        self, x: torch.Tensor, weight: torch.Tensor, eps: float, weight_bias: float = 0.0,
+    ) -> torch.Tensor:
+        """``rms_norm(all_reduce(x))``, a norm before the residual add, in the
+        same fused kernel: it always adds a residual, so this adds zeros."""
+        ws = self._ar_fusion.get((x.dtype, x.shape[-1]))
+        if ws is not None and x.shape[0] <= ws.max_tokens and x.is_contiguous():
+            from mstar.distributed.ar_fusion import allreduce_add_rmsnorm
 
-        if dim < 0:
-            # Convert negative dim to positive.
-            dim += input_.dim()
-
-        # Note: This will produce an incorrect answer if we don't make
-        # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
-        input_tensor = input_.movedim(0, dim).contiguous()
-
-        assert input_tensor.shape[0] % world_size == 0
-        chunk_size = input_tensor.shape[0] // world_size
-        output_shape = (chunk_size,) + input_tensor.shape[1:]
-
-        output_tensor = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
-
-        # Perform reduce-scatter operation
-        dist.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
-        )
-
-        # Reshape before returning
-        return output_tensor.movedim(0, dim).contiguous()
+            return allreduce_add_rmsnorm(
+                x, ws.zeros[: x.shape[0]], weight, eps, weight_bias, ws.ws_id,
+            )[0]
+        return _rms_norm(self.all_reduce(x), weight, eps, weight_bias)
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
@@ -642,7 +653,7 @@ class WorkerParallelGroups:
         """
         if not self.any_parallelism:
             return
-        dist.barrier()
+        _barrier()
 
     def restore_default_timeout(self) -> None:
         """Give every group this rank holds torch's default timeout back."""

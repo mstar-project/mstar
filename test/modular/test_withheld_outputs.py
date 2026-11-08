@@ -15,10 +15,12 @@ import torch
 
 from mstar.communication.communicator import BaseCommunicator
 from mstar.communication.tensors import SharedMemoryCommunicationManager
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput, BatchedStopCheck, HostRows, NodeSubmodule, StopCheck
+from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker, _LazyPerRid
@@ -89,8 +91,7 @@ def _outputs():
 
 
 def _engine(submodule):
-    engine = Engine.__new__(Engine)
-    engine._submodules = {NODE: SimpleNamespace(submodule=submodule)}
+    engine = make_engine(_submodules={NODE: make_mgmt(submodule=submodule)})
     return engine
 
 
@@ -186,8 +187,7 @@ class _RecordingRuntime(PhasedPostprocess):
 
 def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
     engine = _engine(_Producer())
-    w = Worker.__new__(Worker)
-    w._phase_period = 0
+    w = make_worker()
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
     w._innermost_loop_by_node = {}

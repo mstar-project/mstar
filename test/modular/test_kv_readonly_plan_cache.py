@@ -69,13 +69,13 @@ def _write(kv: KVManager, rid: str, n: int, ingest: bool = True, **step_kw) -> N
 
 def _read(
     kv: KVManager, rids: tuple[str, ...], pad: int = 2, slot: int = 0, sink=frozenset(),
-    pad_name: str = "pad", preplan: bool = False,
+    pad_name: str = "pad", preplan: bool = False, **step_kw,
 ):
     """A captured read-only step over ``rids`` plus ``pad`` padding rows. A
     pre-plan is promoted by the step's own plan before the commit, as the
     worker's GPU thread does."""
     padded = rids + tuple(f"{pad_name}{i}" for i in range(pad))
-    step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded), sink=sink)
+    step = KVStep(segments=tuple(Segment(r, "main", 0) for r in padded), sink=sink, **step_kw)
     bucket = BucketKey(graph_walk="decode", bs=len(padded), num_tokens=len(padded))
 
     def ctx(is_preplan: bool) -> StepContext:
@@ -275,6 +275,19 @@ def test_an_eager_write_step_is_not_staged_and_write_target_addresses_it():
     assert pages[:n].tolist() == [stream.page_indices[i // PAGE] for i in range(6)]
     assert slots[:n].tolist() == [i % PAGE for i in range(6)]
     kv.commit(step, ctx)
+
+
+def test_a_reused_read_only_eager_write_plan_is_not_staged(kv):
+    """The reuse keeps ``eager_write`` out of the slot's static buffers, as the
+    plan it reuses did."""
+    first = _read(kv, ("a", "b"), eager_write=True)
+    assert _read(kv, ("a", "b"), eager_write=True) is first
+    assert (0, ("main", 0)) not in kv._staged_outputs
+    assert kv._current_plan_states["main", 0] is not kv._static_plan_state(0, ("main", 0), 4)
+    # nor is a plan the slot staged for the same rows reused for one
+    staged = _read(kv, ("a", "b"))
+    assert _read(kv, ("a", "b"), eager_write=True) is not staged
+    assert kv._current_plan_states["main", 0] is not kv._static_plan_state(0, ("main", 0), 4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="offload needs pinned host memory")
