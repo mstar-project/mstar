@@ -173,8 +173,8 @@ selected. Within the selected directories:
 Run the new file with CI's installation before opening the PR. Check ARM
 compatibility before extending the Mac exclusion list. CI prints the slowest
 tests and retains JUnit reports for seven days. Which checks
-the merge queue requires (**build**, **CPU Core**, ...) is a repository ruleset setting; every
-required check runs on the `merge_group` event too.
+must pass before a PR merges, in the queue or not, is set in `main`'s branch protection rule;
+every required check has to run on the `merge_group` event too.
 
 The randomized tests in `test/modular/test_kv_page_ownership.py` add their seed
 and recent operations to a failure; rerun one with the node id pytest prints.
