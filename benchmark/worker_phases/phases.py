@@ -5,7 +5,7 @@ string, which is what makes the segmentation reviewable (see ``test_phases.py``)
 
 A worker logs one record per ``MSTAR_PHASE_TIMING`` iterations::
 
-    <ts> INFO [worker_0] mstar.worker.worker: Worker worker_0 phase-timing \
+    <ts> INFO [worker_0] mstar.worker.phase_timer: Worker worker_0 phase-timing \
 iter=300 bs=15.94: await_gpu: p50=0.00ms p95=0.01ms mean=0.00ms n=100 | ...
 
 ``bs`` is the mean number of in-flight requests over the window. It is the

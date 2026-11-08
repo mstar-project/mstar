@@ -2171,6 +2171,7 @@ class PiecewiseAcceleratorGraphRunner:
         self, request_ids: list[int], seq_lens: list[int],
         bucket: BucketKey, capture: bool, slot: int,
         real_bs: int | None = None,
+        label_seq_lens: dict[str, list[int]] | None = None,
     ):
         """The region's step over the padded batch, addressed at its slot.
 
@@ -2180,7 +2181,7 @@ class PiecewiseAcceleratorGraphRunner:
         ``ctx.request_ids``: counting the tail there makes it scatter padding
         rows back over real state.
         """
-        step = self._region_step(request_ids, seq_lens)
+        step = self._region_step(request_ids, seq_lens, label_seq_lens)
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -2196,10 +2197,15 @@ class PiecewiseAcceleratorGraphRunner:
         step.set_ctx(ctx)
         return step
 
-    def _region_step(self, request_ids: list[int], seq_lens: list[int]):
+    def _region_step(
+        self, request_ids: list[int], seq_lens: list[int],
+        label_seq_lens: dict[str, list[int]] | None = None,
+    ):
         """The config's step for the region, with the node's LoRA rows laid out from its
         own segments (``lora_rows``)."""
-        return lora_rows(self._config.region_step(list(request_ids), list(seq_lens)), self._lora_keys)
+        return lora_rows(
+            self._config.region_step(list(request_ids), list(seq_lens), label_seq_lens), self._lora_keys,
+        )
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:
@@ -2303,12 +2309,14 @@ class PiecewiseAcceleratorGraphRunner:
         request_ids: list[int] | None = None,
         seq_lens: list[int] | None = None,
         real_bs: int | None = None,
+        label_seq_lens: dict[str, list[int]] | None = None,
     ) -> PiecewiseOutput:
         """Replay the captured region for these real inputs.
 
         Copies each real input into the runner-owned buffer of the same name,
         declares and plans the region's step over the padded batch, replays,
         then commits and returns the padded buffers behind a real-length view.
+        An input its buffer may round is refused.
 
         Only the static buffers carry data into a replay: the region's Python
         ran once, at capture, so whatever it read off ``PiecewiseCallInputs``
@@ -2317,6 +2325,11 @@ class PiecewiseAcceleratorGraphRunner:
         A ``one_row_per_step`` region replays the step as one row named by its
         first request, however many requests or segments it is passed, and base-only
         on a LoRA node (``can_lease``): no row may run an adapter.
+
+        ``label_seq_lens`` is for a region whose step plans several ragged
+        layouts over the same tokens (windows and whole frames): label ->
+        spans, padded as ``seq_lens`` is. Its total must be ``seq_lens``'s for
+        every label, so the bucket is the one ``seq_lens`` picked.
         """
         if self._config.one_row_per_step:
             if request_ids is not None and self._runs_adapters(request_ids):
@@ -2327,6 +2340,14 @@ class PiecewiseAcceleratorGraphRunner:
             real_bs = 1
             if request_ids is not None:
                 request_ids = request_ids[:1]
+        if label_seq_lens is not None and seq_lens is not None:
+            total = sum(seq_lens)
+            bad = {k: sum(v) for k, v in label_seq_lens.items() if sum(v) != total}
+            if bad:
+                raise ValueError(
+                    f"piecewise {self._label!r}: label_seq_lens totals {bad} differ from "
+                    f"seq_lens' {total}"
+                )
         if real_bs is None:
             if request_ids is not None:
                 real_bs = len(request_ids)
@@ -2351,6 +2372,18 @@ class PiecewiseAcceleratorGraphRunner:
             buffer = data.static_inputs.get(name)
             if buffer is None or not isinstance(value, torch.Tensor):
                 continue
+            # the copy casts silently: into a wider float or a wider int it is
+            # exact, but narrowing, or an integer into a float or complex, can round
+            if torch.promote_types(value.dtype, buffer.dtype) != buffer.dtype or (
+                (buffer.dtype.is_floating_point or buffer.dtype.is_complex)
+                and not (value.dtype.is_floating_point or value.dtype.is_complex)
+                and value.dtype != torch.bool
+            ):
+                raise ValueError(
+                    f"piecewise {self._label!r}: buffer {name!r} ({buffer.dtype}) would round "
+                    f"its {value.dtype} input; allocate it in the input's dtype in "
+                    "make_static_inputs"
+                )
             n = value.shape[0]
             # a pinned host input must not drain the stream; the copy is
             # stream-ordered ahead of the replay either way
@@ -2372,6 +2405,10 @@ class PiecewiseAcceleratorGraphRunner:
                 capture=False,
                 slot=self._current_slot,
                 real_bs=real_bs,
+                label_seq_lens=None if label_seq_lens is None else {
+                    label: self._config.replay_seq_lens(data.shape, spans, real_bs)
+                    for label, spans in label_seq_lens.items()
+                },
             )
         try:
             self._plan(step, data.shape)

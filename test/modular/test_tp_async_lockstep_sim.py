@@ -103,7 +103,7 @@ def test_scheduling_from_rank_0s_reads_alone_hangs_the_instance():
 
 def test_zero_fill_desyncs_the_step_when_the_input_sets_its_length():
     """Zeros of the advertised shape keep a data input's step whole, but an
-    input the step derives its length from (image_grid_thw) gives the follower
+    input the step derives its length from (a patch grid) gives the follower
     a different step than rank 0's."""
     assert explore_read_check("ZERO", "data").ok
     assert any(v == "lockstep" for v, _ in explore_read_check("ZERO", "shape").violations)
