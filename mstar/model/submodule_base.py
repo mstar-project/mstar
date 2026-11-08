@@ -532,6 +532,15 @@ class ChunkingPolicy:
     whole prefill needs, so a part-done row cannot wedge on a full arena.
     Counted in tokens, so a walk whose KV grows by something else sets False
     and reserves per chunk.
+
+    ``max_batch_tokens``: a combined walk's step may pass it beside a
+    speculation chain's rows, since a prompt they leave less than
+    ``min_chunk_tokens`` still runs that many. The engine bounds such a step
+    assuming each chain row is a one-token decode row
+    (``batch_builder.most_step_tokens``) and trims a serving config's
+    ``prefill_token_buckets`` to that bound. A walk whose decode rows run more
+    (an MTP verify row's k+1) passes it, and its steps past a trimmed ladder's
+    top run eagerly.
     """
     walks: tuple[str, ...] = ()
     # rows may be split: `split_inputs` cuts them, `get_input_sequence_len` measures them

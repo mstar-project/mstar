@@ -644,7 +644,7 @@ Two more methods control batching and CUDA graphs: `can_batch` with `forward_bat
 - `Model.get_chunking_policies()` returns `{node: (ChunkingPolicy, ...)}`, each policy naming the `walks` it covers. It is declared on the model, not the submodule, because the graph build reads it: `Model` wraps each chunkable node in its Loop wherever `get_graph_walk_graphs` is read, so the model returns its walks as usual. The fields:
 
   - `chunkable=True` lets the walk's rows be cut.
-  - `max_batch_tokens`: the most tokens a step runs. A combined walk that carries chunked rows sets one too, since its steps run under it.
+  - `max_batch_tokens`: the most tokens a step runs. A combined walk that carries chunked rows sets one too, since its steps run under it. Its step may pass it beside a speculation chain's decode rows, by at most those rows' tokens, and the engine trims a serving config's `prefill_token_buckets` assuming each such row runs one token. A walk whose decode rows run more (an MTP verify row's k+1) passes that bound, and its steps past a trimmed ladder's top run eagerly.
   - `accumulated_outputs`: output edges a consumer needs every chunk of. They arrive as one item per chunk, all when the prompt finishes.
   - `per_chunk_outputs`: streaming edges sent on every chunk as it runs, for a consumer that can start on a prefix. Any edge in neither set carries the final chunk's output alone.
   - `reuses_cached_prefix`: a callable saying whether a row may start past its cached prefix; `None` (the default) is always. Set it where a row may have to write its prefix again.
