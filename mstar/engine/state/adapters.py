@@ -321,16 +321,17 @@ def _apply_kernel_settings(
         if refused:
             raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
                              f"it may set only {sorted(allowed)}")
-        if key not in by_name:
-            for field, value in settings.items():
-                if spec is not None:
-                    setattr(spec.config, field, value)
-        elif settings:
+        if spec is None:
+            continue
+        # an array's sizes and a read's decode keys go through the spec's YAML path and its checks
+        yaml_keys = settings.keys() if key in by_name else settings.keys() & {"decode_tensor_cores", "decode_fmha"}
+        for field in settings.keys() - yaml_keys:
+            setattr(spec.config, field, settings[field])
+        if yaml_keys:
             try:
-                # the spec's own YAML path, so a value here means what the same key under `resources:` means
-                spec.apply_yaml_overrides(**settings)
+                spec.apply_yaml_overrides(**{field: settings[field] for field in yaml_keys})
             except ValueError as e:
-                raise ValueError(f"Array {key!r}: kernel_settings[{key!r}]: {e}") from e
+                raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{key!r}]: {e}") from e
 
 
 def node_handles(

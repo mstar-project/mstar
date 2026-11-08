@@ -663,6 +663,13 @@ def test_kernel_settings_picks_a_kept_reads_decode_kernel_and_yaml_overrides_it(
     assert specs[1].config.decode_tensor_cores is True, "YAML wins over the hook"
 
 
+@pytest.mark.parametrize("field", ["decode_tensor_cores", "decode_fmha"])
+def test_a_kept_reads_decode_setting_takes_the_yaml_paths_check(field):
+    """The string "false" would otherwise be stored as set, and read as true."""
+    with pytest.raises(ValueError, match=rf"Array 'kv': kernel_settings\['attn'\]: {field} must be true or false"):
+        build_specs([_kv()], kernel_settings={"attn": {field: "false"}})
+
+
 def test_decode_tensor_cores_on_a_within_step_read_is_refused():
     array = Array("a", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
                   reads={"r": _read(mask=Block(), op=Attend(q_heads=4))})
