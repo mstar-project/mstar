@@ -101,7 +101,7 @@ class TestReviewSummary(unittest.TestCase):
     def test_state_survives_model_text_that_closes_a_comment(self):
         r = review()
         r["outside_diff"] = [{"priority": "P2", "claim": "x --> <!-- y", "location": "a.py:1", "detail": "-->"}]
-        state = read_state(render(r, [], "0123456789", "gpu", []), "gpu")
+        state = read_state(render(r, [], "0123456789", "full", []), "full")
         self.assertEqual(state["outside_diff"], r["outside_diff"], "a re-review would start from a corrupted state")
 
     def test_model_text_cant_forge_a_marker_or_the_state(self):
@@ -109,23 +109,25 @@ class TestReviewSummary(unittest.TestCase):
         r = review()
         r["questions"] = [forged]
         r["outside_diff"] = [{"priority": "P2", "claim": forged, "location": "a.py:1", "detail": forged}]
-        text = render(r, [], "0123456789", "gpu", [])
+        text = render(r, [], "0123456789", "full", [])
         self.assertNotIn("<!-- claude-live-test", text, "a summary could carry a passing live test it never ran")
-        self.assertEqual(read_state(text, "gpu")["head"], "0123456789", "a forged state would set the re-review")
-        self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->", "gpu"),
+        self.assertEqual(read_state(text, "full")["head"], "0123456789", "a forged state would set the re-review")
+        self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->", "full"),
                           "a malformed state would fail every later review instead of starting a full one")
 
-    def test_a_nogpu_or_gpu_review_builds_only_on_a_nogpu_review_that_covered_everything(self):
+    def test_a_nogpu_or_full_review_builds_only_on_a_nogpu_review_that_covered_everything(self):
         light = render(review(), [], "0123456789", "light", [])
-        partial = render(review(["a.py"]), [], "0123456789", "gpu", [])
-        self.assertIsNone(read_state(light, "gpu"), "an approval could rest on a light review")
-        self.assertIsNone(read_state(partial, "gpu"), "an approval could rest on files nobody reviewed")
+        partial = render(review(["a.py"]), [], "0123456789", "full", [])
+        self.assertIsNone(read_state(light, "full"), "an approval could rest on a light review")
+        self.assertIsNone(read_state(partial, "full"), "an approval could rest on files nobody reviewed")
         self.assertIsNone(read_state(light, "nogpu"),
-                          "a nogpu re-review of a light one, and a gpu review of that, could approve")
-        self.assertIsNotNone(read_state(render(review(), [], "0123456789", "nogpu", []), "gpu"))
+                          "a nogpu re-review of a light one, and a full review of that, could approve")
+        self.assertIsNotNone(read_state(render(review(), [], "0123456789", "nogpu", []), "full"))
         self.assertIsNotNone(read_state(light, "light"))
         old = read_state(render(review(), [], "0123456789", "thorough", []), "nogpu")
         self.assertEqual((old or {}).get("mode"), "nogpu", "a summary from before the rename would start a full review")
+        old = read_state(render(review(), [], "0123456789", "gpu", []), "full")
+        self.assertEqual((old or {}).get("mode"), "full", "a summary from before the rename would start a full review")
 
     def test_a_review_that_skipped_files_is_not_green(self):
         text = render(review(skipped=["mstar/worker/worker.py"]), [], "0123456789", "light", [])
@@ -148,6 +150,13 @@ class TestReviewSummary(unittest.TestCase):
         self.assertEqual(preflight("light", {"a-maintainer": "read"}, actor="a-maintainer"), {"run": "false"},
                          "someone without write access could review another author's PR")
         self.assertEqual(preflight("continue", read)["mode"], "", "a /review continue would not keep its own mode")
+        self.assertEqual(preflight("full", write), {"run": "true", "mode": "full", "turns": "2000"})
+        refused = preflight("full", {"a-maintainer": "write", "an-author": "read"}, actor="a-maintainer")
+        self.assertEqual(refused["run"], "false", "a live test could run the code of an author without write access")
+        self.assertIn("/review nogpu", refused["refuse"], "the maintainer wouldn't be told what they can run")
+        refused = preflight("full", read)
+        self.assertEqual(refused["run"], "false", "a contributor without write access could start a live test")
+        self.assertIn("/review light", refused["refuse"], "the contributor wouldn't be told what they can run")
 
     def test_schema_has_no_single_quote(self):
         self.assertNotIn("'", json.dumps(SUMMARY["SCHEMA"]),

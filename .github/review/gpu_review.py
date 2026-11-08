@@ -277,7 +277,7 @@ def cmd_start(a):
         (out / "anthropic.key").unlink(missing_ok=True)
         if r.returncode == 4:  # budget.max_running, which holds on every provider
             msg = (f"The bot already has {cfg['budget']['max_running']} GPU runs going (REVIEW_GPU_MAX_RUNS); "
-                   "comment `/review gpu` again when one finishes.")
+                   "comment `/review` again when one finishes.")
             (out / "unavailable.md").write_text(msg + "\n")
             print(msg)
             sys.exit(3)

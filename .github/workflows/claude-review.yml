@@ -1,7 +1,7 @@
 name: Claude Review
 
-# LLM review of PRs: advisory in light and thorough mode; `/review gpu` can approve by
-# the rule in gpu_review.py. Rules live in AGENTS.md; the reviewer's operating
+# LLM review of PRs: advisory in light and nogpu mode; a bare `/review` (full mode)
+# can approve by the rule in gpu_review.py. Rules live in AGENTS.md; the reviewer's operating
 # instructions are in .github/review/review-prompt.md.
 #
 # Why issue_comment: a plain `pull_request` trigger withholds secrets from fork
@@ -22,18 +22,18 @@ name: Claude Review
 #      cannot rewrite the rules it is judged by.
 #   4. The job's token can write only to pull requests, and the review app's
 #      token (below) only to pull requests and issues of this repository, and
-#      in gpu mode to the media repository's contents (REVIEW_MEDIA_REPO).
+#      in full mode to the media repository's contents (REVIEW_MEDIA_REPO).
 #      The model has no shell and no mutation tools: it posts inline comments
 #      through the action's tool (which redacts secrets) and returns the summary
 #      as fields, which a workflow step renders, redacts and posts. In light
-#      and thorough mode the worst case for a prompt injection is a bad
-#      comment. In gpu mode the live test runs the PR's code with a shell on
+#      and nogpu mode the worst case for a prompt injection is a bad
+#      comment. In full mode the live test runs the PR's code with a shell on
 #      the GPU box, as root on the shared Slurm node; see the README's threat
 #      model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
 #
-# `/review gpu` adds a second job, live-test, that runs no model and no PR code
+# `/review` (full mode) adds a second job, live-test, that runs no model and no PR code
 # here either: it rents GPUs (the team's Slurm node, else an open Eras listing),
 # starts the live-test session on that box (gpu_review_box.sh), waits for it,
 # collects its report and media, posts them, and approves the PR when the rule
@@ -50,11 +50,14 @@ name: Claude Review
 #     has the `skip-ai-review` label. "Contributor" is the commenter's
 #     author_association: OWNER, MEMBER, COLLABORATOR or CONTRIBUTOR, i.e. the
 #     team plus anyone who has had a PR merged here, from a fork or not;
-#   - nogpu, when someone with write access comments `/review` or `/review nogpu`.
-#     A contributor without write access who comments `/review` on their own PR
-#     gets a one-line reply pointing to `/review light`, and nothing runs.
-#   - gpu, when someone with write access comments `/review gpu`: nogpu, then
-#     the live test, on a PR whose author also has write access.
+#   - nogpu, when someone with write access comments `/review nogpu`;
+#   - full, when someone with write access comments `/review` on a PR whose
+#     author also has write access: nogpu, then the live test, then approval
+#     if the rule holds.
+#     A `/review` or `/review nogpu` that lacks the write access it takes gets a
+#     one-line reply and nothing runs: a contributor without it, on their own
+#     PR, is pointed to `/review light`; a `/review` on a PR whose author lacks
+#     it, to `/review nogpu`.
 # A run someone with write access starts has a turn cap high enough only to stop
 # a loop (CLAUDE_REVIEW_MAX_TURNS_TEAM, 2000); a contributor's own light review
 # keeps CLAUDE_REVIEW_MAX_TURNS (40).
@@ -121,8 +124,7 @@ jobs:
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        (((github.event.comment.body == '/review' || github.event.comment.body == '/review nogpu' ||
-          github.event.comment.body == '/review light' || github.event.comment.body == '/review gpu' ||
-          github.event.comment.body == '/review continue') &&
+          github.event.comment.body == '/review light' || github.event.comment.body == '/review continue') &&
          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
         ((github.event.comment.body == '/review' || github.event.comment.body == '/review light' ||
           github.event.comment.body == '/review continue') &&
@@ -131,10 +133,10 @@ jobs:
          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association))))
     # Job-level, so an unrelated PR comment (which still starts a workflow run
     # that this `if` skips) can never cancel a review in progress.
-    # A `/review gpu` has a group of its own, so a later `/review` can't cancel a
-    # paid live test, and the reverse.
+    # A `/review` (full) has a group of its own, so a later `/review light` or
+    # `/review nogpu` can't cancel a paid live test, and the reverse.
     concurrency:
-      group: claude-review-${{ github.event.issue.number }}${{ github.event.comment.body == '/review gpu' && '-gpu' || '' }}
+      group: claude-review-${{ github.event.issue.number }}${{ github.event.comment.body == '/review' && '-full' || '' }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 330
@@ -163,8 +165,9 @@ jobs:
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
       # be the PR's author, a contributor, on `/review light` or `/review
-      # continue` (see the header). A contributor's `/review` on their own PR
-      # gets a one-line reply (`refuse`); anyone else exits green with a notice.
+      # continue`; a full review also needs an author with write access (see the
+      # header). A request that fails only those checks gets a one-line reply
+      # (`refuse`); anyone else exits green with a notice.
       # non_write_user is set only for that author, and only when they lack
       # write access, so a maintainer's run is unchanged.
       - name: Preflight
@@ -181,8 +184,8 @@ jobs:
           # The command, as one of these fixed words; the comment's text itself never reaches the shell.
           COMMAND: >-
             ${{ (github.event.comment.body == '/review light' && 'light') ||
-                ((github.event.comment.body == '/review' || github.event.comment.body == '/review nogpu') && 'nogpu') ||
-                (github.event.comment.body == '/review gpu' && 'gpu') ||
+                (github.event.comment.body == '/review nogpu' && 'nogpu') ||
+                (github.event.comment.body == '/review' && 'full') ||
                 (github.event.comment.body == '/review continue' && 'continue') || '' }}
         run: |
           if [ "$KEY_SET" != "true" ]; then
@@ -191,13 +194,28 @@ jobs:
             exit 0
           fi
           case "$COMMAND" in
-            light|nogpu|gpu) mode=$COMMAND ;;
+            light|nogpu|full) mode=$COMMAND ;;
             continue) mode="" ;;  # the stopped review's mode, from its handoff
             *) echo "run=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
           perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2> /dev/null || echo none)
           case "$perm" in
             admin|maintain|write)
+              # The live test runs the PR's code: only for an author with write access too,
+              # checked against their permission (author_association can't tell write from read).
+              if [ "$COMMAND" = full ]; then
+                author_perm=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq .permission 2> /dev/null || echo none)
+                case "$author_perm" in
+                  admin|maintain|write) ;;
+                  *)
+                    echo "::notice::$AUTHOR has '$author_perm' access, not write; a full review runs the PR's code."
+                    {
+                      echo "run=false"
+                      echo "refuse=\`/review\` runs this PR's code on GPUs, so it takes an author with write access; comment \`/review nogpu\` for the review without the live test."
+                    } >> "$GITHUB_OUTPUT"
+                    exit 0 ;;
+                esac
+              fi
               {
                 echo "run=true"
                 echo "mode=$mode"
@@ -211,7 +229,7 @@ jobs:
           esac
           own=false
           [ "$contributor" = "true" ] && [ -n "$ACTOR" ] && [ "$ACTOR" = "$AUTHOR" ] && [ "$SKIP_LABEL" != "true" ] && own=true
-          if [ "$own" = "true" ] && [ "$COMMAND" != "nogpu" ]; then
+          if [ "$own" = "true" ] && [[ "$COMMAND" =~ ^(light|continue)$ ]]; then
             echo "::notice::$ACTOR has '$perm' access; reviewing their own PR as its author ($ASSOC)."
             {
               echo "run=true"
@@ -220,10 +238,10 @@ jobs:
               echo "turns=${SELF_TURNS:-40}"
             } >> "$GITHUB_OUTPUT"
           elif [ "$own" = "true" ]; then
-            echo "::notice::$ACTOR has '$perm' access, not write; \`/review\` takes write access."
+            echo "::notice::$ACTOR has '$perm' access, not write; \`/review\` and \`/review nogpu\` take write access."
             {
               echo "run=false"
-              echo "refuse=\`/review\` takes write access to this repository; on your own PR, comment \`/review light\`."
+              echo "refuse=\`/review\` and \`/review nogpu\` take write access to this repository; on your own PR, comment \`/review light\`."
             } >> "$GITHUB_OUTPUT"
           else
             echo "::notice::$ACTOR has '$perm' access, not write; only people with write access, or a contributor on their own PR with \`/review light\`, can request a review."
@@ -290,7 +308,7 @@ jobs:
             # Without --effort, Claude Code uses its default for Opus (medium).
             # A /review continue takes the mode, effort and timeout of the review it continues.
             case "$MODE" in
-              nogpu|gpu) echo "mode=$MODE"; echo "effort=xhigh"; timeout=45 ;;
+              nogpu|full) echo "mode=$MODE"; echo "effort=xhigh"; timeout=45 ;;
               *) echo "mode=light"; echo "effort=high"; timeout=25 ;;
             esac
             [ "$TEAM" = "true" ] && timeout=300
@@ -348,7 +366,7 @@ jobs:
             nogpu)
               [ -z "$NON_WRITE" ] || fail "continuing a nogpu review takes write access, like \`/review nogpu\`"
               effort=xhigh; timeout=45 ;;
-            gpu) fail "a \`/review gpu\` that stopped can't be continued (its live test never started); comment \`/review gpu\` again" ;;
+            full) fail "a \`/review\` that stopped can't be continued (its live test never started); comment \`/review\` again" ;;
             *) fail "the saved handoff is malformed" ;;
           esac
           [ -n "$NON_WRITE" ] || timeout=300
@@ -432,7 +450,7 @@ jobs:
           # A re-review starts from this bot's last summary, when its commit is still an ancestor
           # of the head: the review re-checks those findings and reads only what changed since
           # (review-prompt.md, "Re-review"). After a force-push it reviews the whole PR again, and
-          # a nogpu or gpu review does too unless the last one was nogpu or gpu and skipped nothing.
+          # a nogpu or full review does too unless the last one was nogpu or full and skipped nothing.
           # The state is read only from the bot's own summaries: comments that start with the
           # summary's marker, in which model text can't open an HTML comment.
           oneline='.commits[] | "\(.sha[0:10]) \(if (.parents | length) > 1 then "[merge] " else "" end)\(.commit.message | split("\n")[0])"'
@@ -453,11 +471,11 @@ jobs:
             fi
           fi
 
-          # gpu mode: the diff and commits since the PR's last live test, when it passed on an ancestor of the
+          # full mode: the diff and commits since the PR's last live test, when it passed on an ancestor of the
           # head, for the review's live-test call (review-prompt.md, Re-review step 4). Read as gpu_review.py
           # carry reads it: the bot's own live-test comments, by their first line, the marker, alone.
           # Without both files (GitHub refused either) the review judges the whole PR.
-          if [ "$MODE" = gpu ]; then
+          if [ "$MODE" = full ]; then
             live=$(jq -r --argjson bots "$bots" '[.[] | select(.user as $u | any($bots[]; . + "[bot]" == $u))
                 | (.body // "" | split("\n")[0] // "")
                 | capture("\\A<!-- claude-live-test sha=(?<sha>[0-9a-f]{40}) verdict=(?<verdict>[a-z]+) -->\\z")]
@@ -846,13 +864,13 @@ jobs:
             gh pr comment "$PR" --repo "$REPO" --body-file failed.md
           fi
 
-  # `/review gpu`, after the review: the live test on GPUs, then the approval
+  # `/review` (full mode), after the review: the live test on GPUs, then the approval
   # rule. Fixed steps only; see the header. Its own group, so a later
-  # `/review gpu` on the PR replaces it and nothing else does.
+  # `/review` on the PR replaces it and nothing else does.
   live-test:
     name: Live test
     needs: review
-    if: needs.review.outputs.mode == 'gpu' && needs.review.outputs.complete == 'true'
+    if: needs.review.outputs.mode == 'full' && needs.review.outputs.complete == 'true'
     concurrency:
       group: claude-live-test-${{ github.event.issue.number }}
       cancel-in-progress: true
@@ -1133,4 +1151,4 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh pr comment "$PR" --repo "$REPO" \
-            --body "The live test didn't complete. [Log]($RUN_URL). Comment \`/review gpu\` to retry."
+            --body "The live test didn't complete. [Log]($RUN_URL). Comment \`/review\` to retry."

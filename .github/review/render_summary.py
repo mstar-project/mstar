@@ -11,7 +11,7 @@ lines. Run by claude-review.yml with the default branch checked out:
     python3 .github/review/render_summary.py --schema     # for --json-schema
     python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json \
         --above stacked-above.json < output.json
-    python3 .github/review/render_summary.py --state --mode gpu < summary-comment-body   # what a re-review reads
+    python3 .github/review/render_summary.py --state --mode full < summary-comment-body   # what a re-review reads
 """
 import argparse
 import base64
@@ -33,7 +33,7 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 # PR is one the review was given the diff of (stacked-above.json).
 STATUSES = ("fixed", "fixed_above", "open", "moot")
 # Summaries posted before the modes were renamed carry the old names in their state.
-RENAMED_MODES = {"thorough": "nogpu"}
+RENAMED_MODES = {"thorough": "nogpu", "gpu": "full"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
@@ -203,12 +203,12 @@ def render(review, pages, head, mode, stacked):
     if review["skipped"]:
         parts.append("Not reviewed: " + ", ".join(f"`{path}`" for path in review["skipped"]) + ".")
     live = review.get("live_test")
-    if live and mode == "gpu":
+    if live and mode == "full":
         checks = f" ({', '.join(live.get('checks') or [])})" if live["run"] != "none" and live.get("checks") else ""
         after = " Results follow in a separate comment." if live["run"] != "none" else ""
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
-    # Only gpu mode can lead to an approval, by gpu_review.py's rule.
-    role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "gpu"
+    # Only full mode can lead to an approval, by gpu_review.py's rule.
+    role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
     risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
@@ -222,7 +222,7 @@ def render(review, pages, head, mode, stacked):
 def read_state(body, mode):
     """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
     None, and that run reviews the whole PR. None too when it doesn't decode, and for a nogpu or
-    gpu review unless the earlier one was nogpu or gpu and skipped nothing, since a gpu review's
+    full review unless the earlier one was nogpu or full and skipped nothing, since a full review's
     result can approve and may build on a nogpu one."""
     found = STATE.findall(body)
     try:
@@ -233,7 +233,7 @@ def read_state(body, mode):
         return None
     state["mode"] = RENAMED_MODES.get(state.get("mode"), state.get("mode"))
     # A state from before `skipped` was kept counts as having skipped files.
-    if mode in ("nogpu", "gpu") and (state.get("mode") not in ("nogpu", "gpu") or state.get("skipped", [None])):
+    if mode in ("nogpu", "full") and (state.get("mode") not in ("nogpu", "full") or state.get("skipped", [None])):
         return None
     return state
 
