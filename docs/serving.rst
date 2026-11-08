@@ -361,8 +361,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        name that is no walk has a mapping. Warmup fails on a walk whose steps
        replay another walk's capture, naming that walk, on a walk the node captures
        by batch size alone (a ``decode`` capture), on a name that is neither
-       a walk nor a region of the node or is both, and on a region captured by
-       batch size alone; a walk or region the node captures nothing for at this
+       a walk nor a region of the node or is both (on a node whose model declares
+       no region, every name that is no walk), and on a region captured by batch
+       size alone; a walk or region the node captures nothing for at this
        deployment (a model that turns its captures off, such as GLM-5.2 with
        ``dsa_long_context``) is logged and skipped. The key replaces
        ``model_kwargs.prefill_token_buckets``, which fails loading.

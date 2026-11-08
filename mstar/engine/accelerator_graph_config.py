@@ -346,7 +346,7 @@ def apply_token_ladders(
 
 def apply_region_ladders(
     node: str, configs: Mapping[str, "PiecewiseAcceleratorGraphConfig"],
-    ladders: Mapping[str, list[int]], walk_ladders: Mapping[str, Any],
+    ladders: Mapping[str, list[int]], walk_ladders: Mapping[str, Any], declares_regions: bool,
 ) -> None:
     """Take a serving config's ``prefill_token_buckets`` for ``node`` that name
     no walk of it (`EngineManager` split them off) as the ``total_tokens`` of
@@ -354,7 +354,9 @@ def apply_region_ladders(
 
     A name that is neither a walk nor a region of the node is refused, as is a
     region the config also names as a walk, or one captured by batch size
-    alone. A node that declares no region at this deployment logs and skips.
+    alone. A node whose submodule ``declares_regions`` (overrides
+    `NodeSubmodule.get_piecewise_accelerator_graph_configs`) but returned none
+    at this deployment logs and skips.
     """
     both = sorted(set(configs) & set(walk_ladders))
     if both:
@@ -364,7 +366,7 @@ def apply_region_ladders(
         )
     for label, ladder in ladders.items():
         config = configs.get(label)
-        if config is None and not configs:
+        if config is None and not configs and declares_regions:
             logger.warning(
                 "%s: no piecewise region at this deployment, so prefill_token_buckets for %r "
                 "does nothing", node, label,

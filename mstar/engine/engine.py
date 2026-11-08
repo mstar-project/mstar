@@ -1086,7 +1086,11 @@ class Engine:
             node_dtype or torch.float32,
             submodule_mgmt.joint_comm_group.world_size,
         )
-        apply_region_ladders(node_name, configs, submodule_mgmt.region_ladders, submodule_mgmt.token_ladders)
+        apply_region_ladders(
+            node_name, configs, submodule_mgmt.region_ladders, submodule_mgmt.token_ladders,
+            declares_regions=getattr(type(submodule_mgmt.submodule), "get_piecewise_accelerator_graph_configs", None)
+            is not NodeSubmodule.get_piecewise_accelerator_graph_configs,
+        )
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         # One graph memory pool for all of the node's regions (see
         # ``PiecewiseCudaGraphRunner``): its captured-memory footprint becomes

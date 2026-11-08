@@ -864,6 +864,33 @@ def test_a_name_that_is_no_walk_sets_the_piecewise_region_it_labels():
         regions({"backbone_layer": [256]})
 
 
+@pytest.mark.parametrize("regions_off", [True, False])
+def test_a_name_on_a_node_with_no_region_here_is_skipped_only_if_it_declares_some(regions_off, caplog):
+    """OmniVoice's backbone declares its region but captures none with ``backbone_graphs``
+    off, so the ladder does nothing; Orpheus's LLM declares none at all, so the name is a
+    typo of a walk."""
+    import logging
+
+    from mstar.model.omnivoice.config import OmniVoiceConfig
+    from mstar.model.omnivoice.submodules import OmniVoiceBackboneSubmodule
+    from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    node = (
+        OmniVoiceBackboneSubmodule(torch.nn.Module(), OmniVoiceConfig(backbone_graphs=False)) if regions_off
+        else object.__new__(OrpheusLLMSubmodule)
+    )
+    mgmt = make_mgmt(node, joint_comm_group=SimpleNamespace(world_size=1), region_ladders={"prefil": [64]})
+    engine = make_engine(_submodules={"node": mgmt})
+    if regions_off:
+        with caplog.at_level(logging.WARNING):
+            assert engine._build_piecewise_runners("node", mgmt) == {}
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+    else:
+        with pytest.raises(ValueError, match="neither"):
+            engine._build_piecewise_runners("node", mgmt)
+
+
 # ── sampler: a non-final chunk's token is not kept ────────────────────
 
 
