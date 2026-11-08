@@ -41,13 +41,6 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
-   * - ``MSTAR_SHM_ARENA``
-     - ``0``
-     - SHM tensor-transport implementation. ``0``: per-uuid files.
-       ``1``: the Rust shared-memory arena (requires the ``rust/``
-       extension; raises if missing). ``AUTO``: the arena when the
-       extension imports, files otherwise. Must match across the
-       deployment — arena locations ride in the tensor descriptors.
    * - ``MSTAR_DEPLOYMENT_TOKEN``
      - random per launch
      - Mixed into the namespace of the SHM tensor files and arena segments,
@@ -78,7 +71,7 @@ Communication
        different nodes at one shared directory there: each would sweep the
        other's live directories.
    * - ``MSTAR_SHM_ARENA_SEGMENT_MB``
-     - ``256``
+     - ``256``, less on a small or crowded /dev/shm
      - Size of each arena segment. The arena grows segment by segment;
        existing segments never move (registrations stay valid). A
        segment's /dev/shm pages are committed when it is created (pinned
@@ -87,13 +80,34 @@ Communication
        /dev/shm by default. A segment /dev/shm cannot hold counts as arena
        full (sends spill, see ``MSTAR_SHM_ARENA_SPILL``).
    * - ``MSTAR_SHM_ARENA_MAX_SEGMENTS``
-     - ``32``
+     - ``32``, fewer on a small or crowded /dev/shm
      - Growth cap PER ENTITY. Every entity (workers + the api-server data
-       worker) creates its own arena, so node-wide /dev/shm demand can
-       reach ``MAX_SEGMENTS x SEGMENT_MB x num_entities`` — size against
-       ``df -h /dev/shm`` (tmpfs defaults to ~50% of RAM). Construction
+       worker) on CUDA or CPU creates its own arena, so node-wide /dev/shm
+       demand can reach ``MAX_SEGMENTS x SEGMENT_MB x num_entities`` — size
+       against ``df -h /dev/shm`` (tmpfs defaults to ~50% of RAM). With
+       neither this nor ``MSTAR_SHM_ARENA_SEGMENT_MB`` set, the API server
+       sizes every arena of the deployment once, before any exists (see
+       ``MSTAR_SHM_ARENA_PLAN``): /dev/shm's free space split evenly among
+       the arenas, plus one share left for spill files. Each gets 256 MiB
+       segments, 1 to 32 of them, or where a share is under 256 MiB, one
+       segment of the largest power-of-two MiB that fits (16 MiB at least),
+       logged at startup. An entity started without the API server takes a
+       quarter of the free space it finds. Where a share is under 16 MiB, or
+       when its first segment cannot be created, the entity has no arena and
+       sends every tensor as a file (it still reads its peers' arenas); a
+       warning says why. Entities on other accelerators (ROCm, XPU) do the
+       same until the arena is measured there. Set by hand, construction
        fails fast if one entity's ceiling exceeds /dev/shm. At the cap,
        sends spill (see ``MSTAR_SHM_ARENA_SPILL``).
+   * - ``MSTAR_SHM_ARENA_PLAN``
+     - set by the API server
+     - Internal: ``<segment MiB>x<max segments>`` for every arena of the
+       deployment (``0x0``: none, send by files), written by
+       :func:`mstar.communication.arena.export_arena_plan` before any arena
+       exists, measured after a dead run's files are swept, and inherited by the conductor and workers, so each arena gets
+       the same size whatever order the processes start in. Read by
+       ``_arena_sizing``; ``MSTAR_SHM_ARENA_SEGMENT_MB`` and
+       ``_MAX_SEGMENTS`` take precedence. Not meant to be set by hand.
    * - ``MSTAR_SHM_ARENA_FULL_TIMEOUT_S``
      - ``30``
      - Strict mode only (``MSTAR_SHM_ARENA_SPILL=0``): how long a send
@@ -105,7 +119,8 @@ Communication
        file transport's saturation behavior. ``0`` restores strict
        backpressure + timeout — only meaningful where ANOTHER thread
        drains consumer ACKs (the threaded api-server); on a worker the
-       ACKs arrive on the very thread that would be waiting.
+       ACKs arrive on the very thread that would be waiting. An entity
+       without an arena spills every send either way.
    * - ``MSTAR_SHM_ARENA_SPILL_AFTER_S``
      - ``0``
      - Optional grace before spilling, for deployments where another
@@ -165,7 +180,8 @@ Communication
        Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
-     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+     - PyTorch's variable for the Gloo groups next to each parallel group
+       and for each lockstep instance.
        Same rule: the conductor sets ``lo`` for its workers unless you set
        it, so Gloo does not listen on the address the hostname resolves to.
 
@@ -465,7 +481,7 @@ Worker scheduling
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
      - config's ``tp_async_sched``, else ``1``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+     - Async scheduling for lockstep-parallel (TP / SP / CFG) nodes; overrides the
        deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
@@ -587,10 +603,12 @@ Worker scheduling
        ``knobs.idle_hold``, applied by ``cpus.hold_idle``.
    * - ``MSTAR_DECODE_BUCKETS``
      - ``1,2,4,8,16,32,48,64,96,128``
-     - The decode batch sizes a model captures as CUDA graphs (Qwen3.5 reads
-       it; a model with its own ladder reads it the same way). A decode step
-       runs at the smallest bucket that holds its rows, so the ladder bounds
-       both the rows per step and the graph memory; narrow it (for example
+     - The decode batch sizes a model whose LLM node is a
+       ``SampledTokenDecoder`` captures as CUDA graphs, read at import in
+       ``mstar/model/components/sampled_token_decoder.py``; other decoders
+       keep their own ladders. A decode step runs at the smallest bucket
+       that holds its rows, so the ladder bounds both the rows per step and
+       the graph memory; narrow it (for example
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
        Qwen3.5 alone.
@@ -670,18 +688,6 @@ Worker scheduling
        ``max_seq_len`` (the model's context, or ``resources: <kv>: max_seq_len``;
        not the config's top-level key), at most the pool's pages, plus a few, 8
        bytes each. Read by ``knobs.resident_planning``.
-   * - ``MSTAR_KV_PLAN_CACHE``
-     - config's ``knobs: kv_plan_cache``, else ``0``
-     - The KV manager plans a captured decode step off the previous step's
-       plan when the batch is the same rows in the same order and nothing
-       but that step's commit touched the streams: every length is one
-       more, pages change only where a row crossed a page boundary, and the
-       five FlashInfer index arrays come from numpy instead of a per-row
-       Python pass. The first version measured a loss at c64/c128 on 0.8B
-       (batches change every step or two there, and a hit still rebuilt the
-       views); the reworked path keeps the views lazy and is off by default
-       until measured. ``0`` plans every step from the streams. ``2`` runs
-       both and logs a difference, for checking a run.
    * - ``MSTAR_DEVICE_LOOPBACK``
      - config's ``knobs: device_loopback``, else ``1``
      - Whether a decode node may keep its loop-back token on the device:

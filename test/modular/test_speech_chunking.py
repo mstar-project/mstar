@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from mstar.api_server.entrypoint import APIServer  # noqa: E402
 from mstar.api_server.openai import adapters  # noqa: E402
 from mstar.api_server.openai.speech_chunking import split_sentences  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 
 LONG_TEXT = (
     "The train to the coast leaves at seven tomorrow morning, so please pack your bag tonight. "
@@ -113,7 +114,7 @@ class _Chunk:
         self.metadata = metadata or {}
 
 
-class _StubModel:
+class _StubModel(StubModel):
     def get_output_sample_rate(self, modality="audio"):
         return 24000
 

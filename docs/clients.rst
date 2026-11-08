@@ -217,6 +217,55 @@ slowly (see :doc:`models`).
    }}))
    ws.send(msgpack.packb({"request_id": "call", "end_input": True}))
 
+openpi WebSocket ``/``
+----------------------
+
+A deployment whose config has an ``openpi:`` block (``configs/pi05_droid.yaml``) also
+serves openpi's policy protocol at the server's root, so robot clients written against
+openpi's ``openpi_client.WebsocketClientPolicy`` connect unchanged. Those include its
+DROID example and ``examples/simple_client --env DROID``. openpi's default port is 8000,
+as M*'s is. The protocol:
+
+* On connect the server sends one msgpack frame, the block's ``metadata`` (``{}`` by
+  default).
+* The client then sends one observation and waits for one reply, and repeats. Arrays
+  travel as ``openpi_client.msgpack_numpy`` encodes them, so camera frames arrive as raw
+  pixels and reach the model with no PNG and no file in between.
+* The reply is ``{"actions": float32 [H, action_dims], "server_timing": {"infer_ms",
+  "prev_total_ms"}}``. For ``pi05_droid`` that is ``(15, 8)``, as openpi's own
+  ``pi05_droid`` server returns. The DROID example's ``assert shape == (10, 8)`` was
+  written for pi0-FAST.
+* A call that fails is answered with a text frame holding the error, which the client
+  raises, and the socket closes with ``1011``.
+* An observation may carry ``seed`` (an int), which openpi does not have. It pins the
+  call's noise, as ``seed`` in ``/generate``'s ``model_kwargs`` does. Without it each call
+  gets a fresh seed.
+
+On a server with the block, ``GET /healthz`` answers ``OK`` without a key, as openpi's
+server does, and with ``--api-key`` the handshake takes ``Authorization: Api-Key <key>``
+(what the client sends for ``api_key``) as well as ``Bearer``. Every other route still
+takes only ``Bearer``. A server without the block has none of this: it refuses the
+handshake and has no ``/healthz``. Only the Python frontend serves this route;
+``--rust-frontend`` logs a warning and serves without it.
+
+``openpi_client`` sets no size limit on its messages, but the server does:
+``ws_max_message_mb`` (16 MiB by default, see :doc:`serving`). A larger observation closes
+the socket with ``1009`` and no error frame, so a deployment whose robots send several
+raw high-resolution cameras raises it.
+
+.. code-block:: python
+
+   from openpi_client import websocket_client_policy
+
+   policy = websocket_client_policy.WebsocketClientPolicy("localhost", 8000)
+   actions = policy.infer({
+       "observation/exterior_image_1_left": exterior,  # uint8 [224, 224, 3]
+       "observation/wrist_image_left": wrist,
+       "observation/joint_position": joints,           # 7 floats
+       "observation/gripper_position": gripper,        # 1 float
+       "prompt": "put the marker in the cup",
+   })["actions"]                                       # float32 (15, 8)
+
 Python SDK
 ----------
 

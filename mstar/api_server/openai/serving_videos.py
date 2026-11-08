@@ -44,8 +44,9 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    # Each video chunk is an mp4 (H.264); return it base64-encoded, mirroring the
-    # image endpoint's b64_json shape. A sound request additionally emits a raw
+    # Each video chunk is an mp4 (H.264); return it base64-encoded (bytes, which
+    # MediaJSONResponse writes as they are), mirroring the image endpoint's
+    # b64_json response. A sound request additionally emits a raw
     # 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one
     # playable file with sound); if the mux fails the plain video is returned.
     # The mux also rescales the video timestamps to the request frame rate: the
@@ -70,7 +71,7 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
                 )
             except Exception:  # noqa: BLE001 — degrade to video-only, keep serving
                 logger.exception("Muxing generated audio into the mp4 failed; returning video only")
-        data.append({"b64_json": base64.b64encode(video).decode("ascii"), "url": None})
+        data.append({"b64_json": base64.b64encode(video), "url": None})
     return {"created": now(), "data": data}
 
 

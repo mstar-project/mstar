@@ -22,7 +22,7 @@ from mstar.api_server.openai import (
     serving_transcriptions,
     serving_videos,
 )
-from mstar.api_server.openai._util import check_inline_result, error_type, now
+from mstar.api_server.openai._util import MediaJSONResponse, check_inline_result, error_type, now
 from mstar.api_server.openai.adapters import get_adapter
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
@@ -228,7 +228,7 @@ async def images_generations(request: ImageGenerationRequest, raw_request: Reque
         result = await serving_images.create_images(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/images/generations")
-    return JSONResponse(result)
+    return MediaJSONResponse(result)
 
 
 @router.post("/v1/videos/generations")
@@ -242,7 +242,7 @@ async def videos_generations(request: VideoGenerationRequest, raw_request: Reque
         return _exception_error(e, "/v1/videos/generations")
     if (request.model_extra or {}).get("stream_video"):
         return result  # serving_videos builds the streaming response
-    return JSONResponse(result)
+    return MediaJSONResponse(result)
 
 
 @router.post("/v1/images/edits")
@@ -299,4 +299,4 @@ async def images_edits(request: Request):
         )
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/images/edits")
-    return JSONResponse(result)
+    return MediaJSONResponse(result)

@@ -219,7 +219,7 @@ class Arm(NamedTuple):
 
 def parse_arms(spec: str) -> list[Arm]:
     """``label:tree[:ENV=V+ENV2=V2[:ARG+ARG[:mps]]],...``, e.g.
-    ``plain:change,kv:change:MSTAR_KV_PLAN_CACHE=1,split:change::--config+configs/x.yaml:mps``."""
+    ``plain:change,kv:change:MSTAR_KV_PINNED_INDPTRS=1,split:change::--config+configs/x.yaml:mps``."""
     arms = []
     for item in spec.split(","):
         parts = item.split(":") + ["", "", ""]
