@@ -166,7 +166,8 @@ CHAT = {
     "temperature": 0.5, "top_p": 0.8, "max_completion_tokens": 16, "max_tokens": 64, "seed": 3,
     "modalities": ["text", "audio"], "audio": {"voice": "Ethan"},
     "repetition_penalty": 1.05, "top_k": 20,
-    "chat_template_kwargs": {"enable_thinking": False, "current_date": "2026-11-08"},
+    # a template key named like a refused field reaches the model, as the flat off one is dropped first
+    "chat_template_kwargs": {"enable_thinking": False, "current_date": "2026-11-08", "logprobs": True},
     "tools": [], "tool_choice": "auto", "logprobs": False,
 }
 

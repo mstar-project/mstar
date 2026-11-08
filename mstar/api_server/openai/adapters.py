@@ -183,7 +183,8 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
     sequences, log probs, sampling penalties, a response format, or a tool call.
     ``mk`` is the request's :func:`_passthrough`; an off value of one of these
-    fields (``logprobs: false``) is dropped from it.
+    fields (``logprobs: false``) is dropped from it, before any
+    ``chat_template_kwargs`` key is merged in.
 
     Every chat adapter here returns one choice, ended at a stop token or
     max_tokens, as plain sampled text, so any of these dropped answers a

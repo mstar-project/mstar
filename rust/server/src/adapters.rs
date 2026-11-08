@@ -376,18 +376,18 @@ impl Adapter {
         upload_dir: &Path,
         allow_remote: bool,
     ) -> Result<SubmitArgs, String> {
-        refuse_unserved_chat(req)?;
-        let mut args = match self {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        refuse_unserved_chat(req, &mut mk)?;
+        match self {
             // BAGEL reads temperature / top_p from its model config; only
             // max_output_tokens and seed are honored.
-            Adapter::Bagel => text_chat(req, upload_dir, allow_remote),
+            Adapter::Bagel => text_chat(req, mk, upload_dir, allow_remote),
             Adapter::Qwen3_5 | Adapter::Cosmos3Edge => {
                 // How vLLM-style clients send template variables; a flat key wins.
                 // Read before the attachments are saved, since a malformed value
                 // refuses the request.
-                let template_kwargs = template_kwargs(req.extra.get("chat_template_kwargs"))?;
-                let mut args = text_chat(req, upload_dir, allow_remote)?;
-                args.model_kwargs.remove("chat_template_kwargs");
+                let template_kwargs = template_kwargs(mk.remove("chat_template_kwargs").as_ref())?;
+                let mut args = text_chat(req, mk, upload_dir, allow_remote)?;
                 for (key, value) in template_kwargs {
                     let value = if key == "enable_thinking" { Value::Bool(truthy(&value)) } else { value };
                     set_default(&mut args.model_kwargs, &key, value);
@@ -397,7 +397,6 @@ impl Adapter {
             Adapter::Qwen3Omni => {
                 let (text, file_paths, in_mods, parts) =
                     flatten_messages(&req.messages, upload_dir, allow_remote)?;
-                let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
                 // Speech output also emits text, so request both when audio asked.
                 let want_audio = req
                     .modalities
@@ -437,12 +436,7 @@ impl Adapter {
             Adapter::Orpheus | Adapter::Cosmos3 | Adapter::Qwen3TTS => {
                 Err("chat is not supported by this model".to_string())
             }
-        }?;
-        // what is left of these is off (`logprobs: false`), and dropped
-        for name in UNSERVED_CHAT_FIELDS.iter().chain(&["best_of", "response_format"]) {
-            args.model_kwargs.remove(*name);
         }
-        Ok(args)
     }
 
     pub fn speech_to_request(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
@@ -670,15 +664,15 @@ fn chat_max_tokens(req: &ChatCompletionRequest) -> Option<i64> {
     req.max_completion_tokens.or(req.max_tokens)
 }
 
-/// Text out of a chat's messages, with the standard sampling fields
-/// (`BagelAdapter` / `Qwen3_5Adapter.chat_to_request`).
+/// Text out of a chat's messages, with the standard sampling fields onto
+/// its passthrough `mk` (`BagelAdapter` / `Qwen3_5Adapter.chat_to_request`).
 fn text_chat(
     req: &ChatCompletionRequest,
+    mut mk: Map<String, Value>,
     upload_dir: &Path,
     allow_remote: bool,
 ) -> Result<SubmitArgs, String> {
     let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, allow_remote)?;
-    let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
     apply_sampling(
         &mut mk,
         Sampling {
@@ -732,8 +726,10 @@ const UNSERVED_CHAT_FIELDS: [&str; 6] =
 /// Refuse a chat that asks for more than one plain reply: more choices, stop
 /// sequences, log probs, sampling penalties, a response format, or a tool
 /// call. The rules are `_refuse_unserved_chat` in
-/// `api_server/openai/adapters.py`.
-fn refuse_unserved_chat(req: &ChatCompletionRequest) -> Result<(), String> {
+/// `api_server/openai/adapters.py`. `mk` is the request's passthrough; an off
+/// value of one of these fields (`logprobs: false`) is dropped from it, before
+/// any `chat_template_kwargs` key is merged in.
+fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut Map<String, Value>) -> Result<(), String> {
     if let Some(n) = req.n.filter(|&n| n != 1) {
         return Err(format!("n={n}: this model returns one choice"));
     }
@@ -742,34 +738,34 @@ fn refuse_unserved_chat(req: &ChatCompletionRequest) -> Result<(), String> {
             "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
         );
     }
-    if let Some(name) = UNSERVED_CHAT_FIELDS.iter().find(|&&f| req.extra.get(f).is_some_and(truthy)) {
+    if let Some(name) = UNSERVED_CHAT_FIELDS.iter().find(|&&f| mk.get(f).is_some_and(truthy)) {
         return Err(format!("{name} is not supported"));
     }
     // Python's `not in (None, 1)`, where 1.0 and True equal 1
-    if let Some(v) = req.extra.get("best_of") {
+    if let Some(v) = mk.get("best_of") {
         if !(v.is_null() || v.as_f64() == Some(1.0) || *v == Value::Bool(true)) {
             return Err("best_of is not supported; this model returns one choice".to_string());
         }
     }
-    if let Some(v) = req.extra.get("response_format") {
+    if let Some(v) = mk.get("response_format") {
         if !(v.is_null() || *v == serde_json::json!({"type": "text"})) {
             return Err(
                 "response_format needs constrained decoding; only {'type': 'text'} is served".to_string(),
             );
         }
     }
-    let listed = |field: &str| match req.extra.get(field) {
+    let listed = |field: &str| match mk.get(field) {
         None | Some(Value::Null) => false,
         Some(Value::Array(t)) => !t.is_empty(),
         Some(_) => true,
     };
-    let says_none = |field: &str| req.extra.get(field).and_then(Value::as_str) == Some("none");
-    let choice = match req.extra.get("tool_choice") {
+    let says_none = |field: &str| mk.get(field).and_then(Value::as_str) == Some("none");
+    let choice = match mk.get("tool_choice") {
         Some(Value::String(c)) => c == "required",
         Some(Value::Object(_)) => true,
         _ => false,
     };
-    let function_call = match req.extra.get("function_call") {
+    let function_call = match mk.get("function_call") {
         None | Some(Value::Null) => false,
         Some(Value::String(c)) => c != "none" && c != "auto",
         Some(_) => true,
@@ -780,6 +776,9 @@ fn refuse_unserved_chat(req: &ChatCompletionRequest) -> Result<(), String> {
         || function_call
     {
         return Err("tool calling is not supported for this model".to_string());
+    }
+    for name in UNSERVED_CHAT_FIELDS.iter().chain(&["best_of", "response_format"]) {
+        mk.remove(*name);
     }
     Ok(())
 }
