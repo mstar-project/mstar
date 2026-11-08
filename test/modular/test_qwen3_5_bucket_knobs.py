@@ -24,7 +24,7 @@ def _reload(monkeypatch, name, value):
 
 
 def test_prefill_ladder_from_model_kwargs():
-    from mstar.model.qwen3_5.config import LLM_MIXED
+    from mstar.model.keys import MIXED
     from mstar.model.qwen3_5.submodules import LLMSubmodule
     default = list(LLMSubmodule.PREFILL_TOKEN_BUCKETS)
     sub = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=[8192, 3072, 2048])
@@ -37,7 +37,7 @@ def test_prefill_ladder_from_model_kwargs():
     configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
     ladders = {c.capture_graph_walk: c.capture_token_lengths for c in configs if c.capture_graph_walk != "decode"}
     assert ladders["prefill_text"] == [2048, 3072, 8192]
-    assert ladders[LLM_MIXED] == [2048, 8192]
+    assert ladders[MIXED] == [2048, 8192]
 
 
 @pytest.mark.parametrize("buckets", [[], [512, 512], [0, 64], 2048])
@@ -63,6 +63,15 @@ def test_prefill_buckets_hold_near_power_of_two_batches(monkeypatch):
     assert 16 * 512 + 8 <= buckets[-1]
     # a batch that fills a power of two doesn't pad past it
     assert {256, 512, 1024, 2048, 4096, 8192} <= set(buckets)
+
+
+def test_a_ladder_with_no_mixed_bucket_captures_no_mixed_step():
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+    s = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)), prefill_token_buckets=[3000, 6000])
+    assert s.MIXED_TOKEN_BUCKETS == []
+    configs = s.get_accelerator_graph_configs(torch.device("cpu"))
+    (mixed,) = [c for c in configs if c.capture_graph_walk == "mixed"]
+    assert mixed.capture_token_lengths == []
 
 
 def _configs_with_prefill_ladders():
@@ -94,10 +103,11 @@ def _shipped_prefill_ladders():
 def test_every_shipped_prefill_ladder_is_a_model_argument(config):
     """A config's ladder is a named argument of its model, not lost in ``**kwargs``;
     Qwen3-Omni's Thinker captures its prefill on it."""
+    from mstar.model.glm52.glm52_model import Glm52Model
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     cls, buckets = _configs_with_prefill_ladders()[config]
-    assert cls in (Qwen3_5DenseModel, Qwen3OmniModel), (
+    assert cls in (Qwen3_5DenseModel, Qwen3OmniModel, Glm52Model), (
         f"a {cls.__name__} config sets prefill_token_buckets, which no test checks")
     assert "prefill_token_buckets" in inspect.signature(cls.__init__).parameters, (
         f"prefill_token_buckets isn't a named argument of {cls.__name__}.__init__")
@@ -106,6 +116,10 @@ def test_every_shipped_prefill_ladder_is_a_model_argument(config):
         node = ThinkerSubmodule(None, SimpleNamespace(im_end_token_id=1), prefill_token_buckets=buckets)
         configs = {c.capture_graph_walk: c for c in node.get_accelerator_graph_configs(torch.device("cpu"))}
         assert configs["prefill_text"].capture_token_lengths == sorted(buckets)
+    if cls is Glm52Model:
+        # the submodule's prefill captures take it (test_glm52_prefill checks the configs)
+        assert Glm52Model("", tokenizer_mode="byte", config_variant="reduced",
+                          prefill_token_buckets=buckets).config.prefill_token_buckets == buckets
 
 
 @pytest.mark.parametrize("buckets", _shipped_prefill_ladders().values(), ids=_shipped_prefill_ladders().keys())
@@ -135,13 +149,16 @@ def test_shipped_ladders_stay_inside_dynamos_recompile_limit(monkeypatch, bucket
     compiles = (
         len(s.DECODE_CAPTURE_BATCH_SIZES) + len(s.PREFILL_TOKEN_BUCKETS)
         + pairs(s.MIXED_CAPTURE_BATCH_SIZES, s.MIXED_TOKEN_BUCKETS)
-        + pairs(s.PREFILL_VISION_CAPTURE_BATCH_SIZES, s.PREFILL_VISION_TOKEN_BUCKETS)
+        + pairs(s.PREFILL_MEDIA_CAPTURE_BATCH_SIZES, s.PREFILL_MEDIA_TOKEN_BUCKETS)
     )
     assert compiles < recompile_limit()
 
 
 def _compile_modes(m):
+    from mstar.model.multimodal import vision_encoder
+
     submodule = m.LLMSubmodule.__new__(m.LLMSubmodule)
+    submodule._encoders = (vision_encoder((5,)),)
     configs = m.LLMSubmodule.get_accelerator_graph_configs(submodule, torch.device("cpu"))
     return {c.capture_graph_walk: c.compile_mode for c in configs}
 
@@ -185,4 +202,4 @@ def test_only_qwen3_5_text_walks_read_the_switch():
         for fn in cls.body if isinstance(fn, ast.FunctionDef)
         and any(isinstance(n, ast.Name) and n.id == "compile_deterministic" for n in ast.walk(fn))
     ]
-    assert methods == ["LLMSubmodule.get_accelerator_graph_configs"]
+    assert methods == ["LLMSubmodule.capture_compile_mode"]

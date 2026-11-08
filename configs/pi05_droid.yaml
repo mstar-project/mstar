@@ -29,6 +29,15 @@ model_kwargs:
       q99: [0.4476, 0.7652000000000001, 0.4480000000000002, 0.7944, 0.6484000000000001, 0.6628000000000001,
             0.7344000000000002, 0.9998]
 
+# The openpi WebSocket at ws://<host>:<port>/, which openpi's DROID client
+# (openpi_client.WebsocketClientPolicy) connects to unchanged. These are openpi's
+# DroidInputs and DroidOutputs: the cameras in slot order, the joints then the
+# gripper as the state, and the first 8 action dims in the reply.
+openpi:
+  images: [observation/exterior_image_1_left, observation/wrist_image_left]
+  state: [observation/joint_position, observation/gripper_position]
+  action_dims: 8
+
 node_groups:
   - node_names:
       - vit_encoder

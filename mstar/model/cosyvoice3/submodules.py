@@ -827,7 +827,7 @@ class HiFTSubmodule(NodeSubmodule):
             wav = mel.new_zeros(0)
         else:
             wav = stream_vocode(self.hift, stream, mel, final, self.config.hift_context_frames)
-        return (wav.clamp(-1, 1) * 32767).to(torch.int16)
+        return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
         del batch

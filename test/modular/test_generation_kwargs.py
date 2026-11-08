@@ -14,7 +14,7 @@ from mstar.api_server import entrypoint
 from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.request_types import ResultChunk
 from mstar.conductor.conductor import Conductor
-from mstar.model.base import Model
+from mstar.testing_utils.model import StubModel, make_model
 from mstar.utils.generation_kwargs import check_seed, normalize_generation_kwargs
 
 
@@ -97,10 +97,7 @@ def test_length_aliases_fold_into_max_output_tokens_in_order():
         normalize_generation_kwargs({"max_tokens": 0})
 
 
-class _Model:
-    ENGINE_KWARGS = Model.ENGINE_KWARGS
-    LENGTH_KWARGS = Model.LENGTH_KWARGS
-
+class _Model(StubModel):
     def request_kwargs(self):
         return frozenset({"temperature"})
 
@@ -223,7 +220,7 @@ def test_a_client_gone_before_the_first_chunk_is_aborted():
 
 def _conductor(default=64):
     c = Conductor.__new__(Conductor)
-    c.model = types.SimpleNamespace(
+    c.model = make_model(
         get_max_output_tokens=lambda **kw: kw.get("max_output_tokens", default),
     )
     return c

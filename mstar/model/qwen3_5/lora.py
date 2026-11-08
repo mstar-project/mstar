@@ -16,7 +16,8 @@ states is what the modules cannot:
   (``ignore``).
 
 Adapters land where the roots' ``checkpoint_rules()`` load the checkpoint. Every
-embedding call is in the step (a vision prompt's ids are embedded in ``preprocess``),
+embedding call is in the step (a vision prompt's ids, media pads included, are embedded
+in the forward, ``SampledTokenDecoder._forward``, and the media rows spliced in after),
 so the token embedding is an ordinary target.
 """
 
