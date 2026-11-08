@@ -711,7 +711,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/gpu_review.py incomplete
 
-  # The one writer of the spend ledger: one comment per run, after the review and the
+  # The one writer of the spend ledger: one comment per attempt of a run, after the review and the
   # live test whatever became of them, so the caps see every run that spent anything.
   # A job of its own, so the job token's `issues: write` stays out of the job that runs the model.
   spend:

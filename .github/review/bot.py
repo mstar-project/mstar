@@ -56,12 +56,13 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
       pageInfo { hasNextPage endCursor }
       nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
     } } } }"""
-# A run's record, base64 JSON, in a ledger comment: one comment per run, so concurrent runs can't lose updates.
+# A run's record, base64 JSON, in a ledger comment: one comment per attempt of a run, so concurrent runs can't lose
+# updates.
 SPEND = re.compile(r"<!-- review-spend ([A-Za-z0-9+/=]+) -->")
 # USD the bot may spend per UTC day and month on review tokens and Eras GPU time, a change to main like the
 # approval rule. Slurm GPUs are free.
 CAPS = {"day": 10_000, "month": 50_000}
-ISSUES = {"ledger": ("Review bot spend ledger", "The review bot's spend, one comment per run. Read by code."),
+ISSUES = {"ledger": ("Review bot spend ledger", "The review bot's spend, one comment per run attempt. Read by code."),
           "status": ("Review bot status", "The review bot's status: a daily report in this body, alerts as comments.")}
 EJECTIONS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $pr) {

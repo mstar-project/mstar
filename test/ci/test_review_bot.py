@@ -161,7 +161,7 @@ class TestSpend(unittest.TestCase):
         with mock.patch.object(bot, "run", FakeGh(routes)):
             return bot.spend("o/r", NOW)
 
-    def test_spend_sums_this_day_and_month_once_per_run_from_the_bots_comments_alone(self):
+    def test_spend_sums_this_day_and_month_once_per_run_and_attempt_from_the_bots_comments_alone(self):
         self.assertEqual(self.spend([spent(1.5), spent(2, "2026-11-01T23:59:59Z", run="2"),
                                      spent(99, "2026-10-31T23:59:59Z", run="3")]), {"day": 1.5, "month": 3.5})
         self.assertEqual(self.spend([spent(1), spent(1)]), {"day": 1, "month": 1},
