@@ -114,6 +114,17 @@ if [ -f "$CACHE_TAR" ]; then
 fi
 
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+# torchaudio has no 2.12 release, so a plain resolve pairs torch 2.12 with torchaudio 2.11 and libtorchaudio
+# can't load: `mstar serve` exits on every fresh box. Pin one matching family (run on an H200, 2026-11-08) until
+# torchaudio catches up, then delete this.
+mkdir -p "$WORKDIR"
+cat > "$WORKDIR/constraints.txt" <<'PINS'
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
+torchcodec==0.11.1
+PINS
+export UV_CONSTRAINT=$WORKDIR/constraints.txt
 command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 
 checkout() {  # checkout <dir> <ref> <refspec>

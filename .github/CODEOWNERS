@@ -1,0 +1,2 @@
+# A person must approve anything under .github/: workflows there can read the review-bot environment.
+/.github/ @dghosef @NSagan271 @merceod

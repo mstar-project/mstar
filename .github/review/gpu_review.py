@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -385,7 +386,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
             unavailable(out, lt, f"The bot already has {cfg['budget']['max_running']} GPU runs going "
                                  "(REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
         if r.returncode:
-            tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
+            tried.append(f"{o['id']}: {gpu_py.tail_lines(r.stderr or r.stdout, 400)}")
         return r
 
     o, r = launch_first([o for o in free if o["provider"] not in keyless], launch)
@@ -587,7 +588,7 @@ def approval_facts(pr, sha, verdict, since, review):
         untestable=tuple(untestable(pull, changes or [], review)),
         too_many_files=changes is None,
         blocked=(*blocked, *gitlinks),
-        runtime=bool(runtime),
+        runtime=bool(set(runtime) - set(blocked)),  # a gated file already has its own reason
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
         questions=len(review.get("questions") or ()),
         to_fix_first=tuple(to_fix_first(review, pr, "stacked-above.json")),
@@ -743,7 +744,8 @@ def render_comment(sha, lt, media_url=""):
         bang, text, rel = m[1], m[2], m[3].replace("\u200b", "")  # `inert` splits a name like a@2x.png too
         if rel not in rels or not media_url:
             return m[0]
-        url = f"{media_url.rstrip('/')}/{rel}"
+        # The box picks the name, so a `](` in it stays dead.
+        url = f"{media_url.rstrip('/')}/{urllib.parse.quote(rel, safe='/@')}"
         image = bang or MEDIA.get(Path(rel).suffix.lower()) == "img"
         return f"![{text}]({url})" if image else f"[{text}]({url})"
 
