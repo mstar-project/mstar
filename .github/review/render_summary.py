@@ -3,9 +3,9 @@
 The review returns the fields in SCHEMA rather than Markdown, so every summary
 has the same shape: a status line, then only the sections that have something
 in them. The status line counts the open findings (`open_findings`), so a finding
-from an earlier run counts until a later review judges it fixed, fixed above or moot, or a commit
-changes its lines. bot.py passes SCHEMA to the review, posts what `render` makes of
-its fields, and starts a re-review from what `read_state` reads back.
+from an earlier run counts until a later review judges it fixed, fixed above or moot.
+bot.py passes SCHEMA to the review, posts what `render` makes of its fields, and starts
+a re-review from what `read_state` reads back.
 """
 import base64
 import json
@@ -126,22 +126,32 @@ def judged(review, stacked):
                                for f in review.get("prior_findings", [])]}
 
 
+def carried(review, earlier):
+    """`review` with the earlier findings outside the diff it hasn't cleared added to its own: `earlier` is
+    the last review's outside_diff. "A finding left out stays open", and stays in the state for the next
+    re-review to judge."""
+    cleared = {f["ref"] for f in review["prior_findings"] if f["status"] != "open"}
+    locations = {f["location"] for f in review["outside_diff"]}
+    return {**review, "outside_diff": [*review["outside_diff"], *[
+        f for f in earlier if f["location"] not in cleared and f["location"] not in locations]]}
+
+
 def open_findings(review, pages, stacked):
-    """(where, priority, what) of every open finding: the bot's inline threads, this run's findings outside
-    the diff, and the earlier findings a later review judged still open. A thread someone resolved stays
-    open: only a later review that judged it fixed, fixed above or moot, or a commit that outdated it,
-    clears it. An untagged bot thread counts as a P2, since its priority is unknown. A finding a PR
-    stacked above fixes isn't open: it lands with that PR, when that PR is one of `stacked` (judged).
-    `pages` are the pages of the PR's review threads (GraphQL)."""
+    """(where, priority, what) of every open finding: the bot's inline threads, outdated ones too, this
+    run's findings outside the diff and the earlier ones `carried` added to them, and anything else a
+    later review judged still open. A thread someone resolved stays open: only a later review that judged
+    it fixed, fixed above or moot clears it. An untagged bot thread counts as a P2, since its priority is
+    unknown. A finding a PR stacked above fixes isn't open: it lands with that PR, when that PR is one of
+    `stacked` (judged). `pages` are the pages of the PR's review threads (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
     cleared = {f["ref"] for f in prior if f["status"] != "open"}
-    found, counted = [], set()
+    found, counted = [], {f["location"] for f in review["outside_diff"]}
     for page in pages:
         for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
             first = thread["comments"]["nodes"][0]
             ref = str(first.get("databaseId", ""))
-            if thread["isOutdated"] or ref in cleared or not (first["author"] and first["author"]["login"] in INLINE_BOTS):
+            if ref in cleared or not (first["author"] and first["author"]["login"] in INLINE_BOTS):
                 continue
             match = TAG.match(first["body"])
             where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
@@ -150,7 +160,7 @@ def open_findings(review, pages, stacked):
             counted.add(ref)
     found += [(f"outside the diff, {f['location']}", f["priority"], f["claim"]) for f in review["outside_diff"]
               if not f.get("fixed_in")]
-    # Judged still open, though its thread went outdated or it was outside the diff.
+    # Judged still open, with no thread or outside_diff item here to count it by.
     found += [(f"earlier {f['ref']}", f["priority"], f["why"]) for f in prior
               if f["status"] == "open" and f["ref"] not in counted]
     return found
@@ -223,12 +233,13 @@ def render(review, pages, head, mode, stacked):
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
+    outside = {f["location"] for f in review["outside_diff"]}
     if prior:
         tally = ", ".join(f"{sum(f['status'] == s for f in prior)} {s.replace('_', ' ')}" for s in STATUSES)
         parts.append(f"Earlier findings: {tally}.")
     sections = [
         ("Still open from earlier", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
-                                     for f in prior if f["status"] == "open"]),
+                                     for f in prior if f["status"] == "open" and f["ref"] not in outside]),
         ("Outside the diff", [f"**[{f['priority']}]** `{f['location']}`: {f['claim']}\n\n  {f['detail']}"
                               for f in review["outside_diff"] if not f.get("fixed_in")]),
         ("Fixed in a PR above", [f"**[{f['priority']}]** {f['ref']}: {f['why']} {above(f)}"
