@@ -477,11 +477,13 @@ before results, reference parity, both frontends where they apply. It gets the P
 to test, and the review's findings.
 
 **The review decides whether and what the live test runs**, on every review and re-review, from
-what the change can affect, and says why:
+what the change can affect, and says why. "The change" is what changed since the PR's last passing
+live test (the bot's live-test comments), or the whole PR when there is none: on a re-review that
+can be more than the commits since the last review.
 - `run`:
   - `full`: plan the live test over the whole change;
-  - `targeted`: only the checks the change reaches (on a re-review, the new commits), plus the "how
-    to confirm" lines of open P0–P2 findings;
+  - `targeted`: only the checks the change reaches, plus the "how to confirm" lines of open P0–P2
+    findings;
   - `none`: nothing in the change needs a GPU run to settle it; the reason says why in one sentence.
 - `checks`, the kinds of check: `correctness` (served output, parity, regressions) and/or
   `performance` (throughput and latency A/Bs). Leave `performance` out when the change can't
@@ -491,8 +493,8 @@ what the change can affect, and says why:
 The bot holds one line of its own: when the PR's last live test didn't pass on an ancestor of the
 head (it failed, was partial or unavailable, or ran on a commit since rebased away), the live test
 runs in full, with both kinds of check, whatever the review asked for, so a failure is never hidden
-behind a narrower run.
-After a pass on an ancestor, a `targeted` run is told that commit and given its report. A `none`
+behind a narrower run; and so does a re-review's `targeted` or `none` when no live test ran before
+it, since no GPU run covered the commits that review built on. After a pass on an ancestor, a `targeted` run is told that commit and given its report. A `none`
 starts no box; the PR's comment says "No GPU run" with your reason, and it counts as a pass for
 approval.
 

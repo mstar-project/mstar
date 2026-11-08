@@ -7,7 +7,7 @@ decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config the workflow writes: the team's
 Slurm node when it has them free, else any open Eras listing under the hourly cap.
 
-    gpu_review.py carry    --pr N --sha SHA --review review.json --earlier-report FILE
+    gpu_review.py carry    --pr N --sha SHA --review review.json --earlier-report FILE [--rereview]
     gpu_review.py start    --pr N --sha SHA --main-sha SHA [--base BRANCH] --gpus G --hours H --run full|targeted
                            --checks correctness,performance [--since SHA --earlier-report FILE] --review review.json
                            --out DIR
@@ -151,7 +151,9 @@ def cmd_carry(a):
     """What the live test runs, printed as the step's outputs: the review's call, read as its enums only
     (model output on its way to a shell and the brief). It stands unless the PR's last live test didn't
     pass on an ancestor of the head; then the run is full, with every kind of check, whatever the review
-    asked for, so a failure is never hidden behind a narrower run."""
+    asked for, so a failure is never hidden behind a narrower run. A re-review with no live test before
+    it judged only the commits since the last review, which no GPU run has covered: its `none` or
+    `targeted` is full too."""
     live = json.loads(Path(a.review).read_text()).get("live_test") or {}
     run = live.get("run") if live.get("run") in ("none", "targeted", "full") else "full"
     asked = live.get("checks") if isinstance(live.get("checks"), list) else []
@@ -163,6 +165,10 @@ def cmd_carry(a):
     if last and not passed:
         print(f"::notice::The review asked for a {run} live test, but the last one didn't pass on an ancestor; "
               "running it in full, every kind of check.")
+        out.update(run="full", checks=",".join(CHECKS))
+    elif not last and a.rereview and run != "full":
+        print(f"::notice::The review asked for a {run} live test of the commits since its last review, but no live "
+              "test ran before them; running it in full, every kind of check.")
         out.update(run="full", checks=",".join(CHECKS))
     elif run == "none":
         out["verdict"] = "skipped"
@@ -514,6 +520,7 @@ def main():
     for name in ("--sha", "--review", "--earlier-report"):
         p.add_argument(name, required=True)
     p.add_argument("--pr", type=int, required=True)
+    p.add_argument("--rereview", action="store_true", help="the review built on an earlier one (since.diff)")
     p = sub.add_parser("start")
     for name in ("--sha", "--main-sha", "--review", "--out", "--tag"):
         p.add_argument(name, required=True)

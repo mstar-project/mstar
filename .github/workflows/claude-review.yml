@@ -137,6 +137,8 @@ jobs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
       main_sha: ${{ steps.base.outputs.commit }}
       result: ${{ steps.review.outputs.structured_output }}
+      # Built on an earlier review: the live test's `none` or `targeted` needs a live test before it.
+      rereview: ${{ steps.diff.outputs.rereview }}
       # Finished and returned its summary itself: a salvaged or stopped review never approves.
       complete: ${{ steps.review.outcome == 'success' && steps.post.outcome == 'success' }}
     permissions:
@@ -812,18 +814,21 @@ jobs:
           { echo "gpus=$gpus"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
       # The review's call stands unless the PR's last live test didn't pass on an ancestor of this
-      # head (gpu_review.py carry): then the live test runs in full, every kind of check, whatever
-      # the review asked for, so a failure is never hidden. After a pass on an ancestor, a `targeted` run is told that commit and
-      # given that report. A `none` that stands runs nothing, and counts as a pass for approval
-      # (verdict `skipped`). It posts no live-test marker: it isn't a live test, so the next run still
-      # checks against the last real one. A failed read of the PR's comments fails this step.
+      # head, or a re-review's `none` or `targeted` has no live test before it (gpu_review.py carry):
+      # then the live test runs in full, every kind of check, so a failure is never hidden. After a
+      # pass on an ancestor, a `targeted` run is told that commit and given that report. A `none`
+      # that stands runs nothing, and counts as a pass for approval (verdict `skipped`). It posts no
+      # live-test marker: it isn't a live test, so the next run still checks against the last real
+      # one. A failed read of the PR's comments fails this step.
       - name: Check the last live test
         if: steps.cfg.outputs.trusted == 'true'
         id: carry
+        env:
+          REREVIEW: ${{ needs.review.outputs.rereview }}
         run: |
           set -o pipefail  # an error in the decision fails this step, rather than tee's exit 0 hiding it
           python3 .github/review/gpu_review.py carry --pr "$PR" --sha "$HEAD_SHA" --review review.json \
-            --earlier-report earlier-live-test.md | tee carry.log
+            --earlier-report earlier-live-test.md ${REREVIEW:+--rereview} | tee carry.log
           grep '^[a-z]*=' carry.log >> "$GITHUB_OUTPUT"
 
       - name: Get GPUs and start the live test

