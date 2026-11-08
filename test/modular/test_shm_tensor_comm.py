@@ -925,6 +925,8 @@ def test_a_slice_does_not_join_another_nodes_gather(tmp_path, monkeypatch, proto
 # ---------------------------------------------------------------------------
 
 def test_factory_returns_shm_manager():
+    from mstar.communication.arena import ArenaShmCommunicationManager
+
     comm = MockCommunicator()
     with tempfile.TemporaryDirectory() as tmpdir:
         mgr = create_tensor_communication_manager(
@@ -935,7 +937,7 @@ def test_factory_returns_shm_manager():
             communicator=comm,
             shm_dir=tmpdir,
         )
-        assert isinstance(mgr, SharedMemoryCommunicationManager)
+        assert type(mgr) is ArenaShmCommunicationManager
 
 
 def test_factory_returns_mooncake_for_rdma():

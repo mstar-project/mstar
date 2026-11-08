@@ -24,7 +24,6 @@ from __future__ import annotations
 import contextlib
 import sys
 import threading
-from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,11 +32,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
 
 NODE, WALK = "LLM", "decode"
 # wire id -> handle. All but "idle" run in step N (seq 0); only "kept" goes on into N+1
@@ -54,11 +54,8 @@ class _Stop(BaseException):
 
 def _batch(seq: int, rids: list[int]):
     """A step's scheduled and executing halves."""
-    scheduled = SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, tp_seq=seq,
-        request_to_worker_graph={rid: 0 for rid in rids},
-        chunk_ranges={}, incomplete_node_rids=set(),
-        rids_by_walk=lambda: {WALK: list(rids)},
+    scheduled = ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, tp_seq=seq, request_to_worker_graph={rid: 0 for rid in rids},
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},
@@ -131,15 +128,11 @@ def _rank(
     ))
     log: list[tuple] = []
     torn_down = threading.Event()
-    w = Worker.__new__(Worker)
-    w.worker_id = f"rank{tp_rank}"
-    w.is_tp_follower = tp_rank > 0
-    w.enable_nvtx, w._phase_period, w._phase_buf = False, 0, {}
+    w = make_worker(worker_id=f"rank{tp_rank}", is_tp_follower=tp_rank > 0)
     w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
     w._in_flight_rids, w._pending_removes, w._removes_awaiting_step = set(), {}, {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
     w._removed_rids, w._unprocessed_messages = RecentSet(16), {}
-    w.streaming_buffers = {}
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(16)
     if serial:
@@ -389,9 +382,7 @@ def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
             admitted.set()  # the admit lands during the third interval
 
     monkeypatch.setattr(worker_mod.logger, "warning", warn)
-    w = Worker.__new__(Worker)
-    w.worker_id = "rank0"
-    w._span = lambda name: nullcontext()
+    w = make_worker(worker_id="rank0")
     _, executing = _batch(tp_seq, [HANDLES["kept"]])
     executing.launch_started_event = admitted
     pending = SimpleNamespace(
