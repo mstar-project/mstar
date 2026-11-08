@@ -27,7 +27,9 @@ scheduler tick, the data worker):
 
 ## Standard techniques first
 
-A missing one on a default path is a finding (SKILL.md §4.2 gives the priority). Name the shared
+A missing one is an opportunity, so P3 unless the PR claims the gain (SKILL.md §4.2). These are
+what to look for, not rules: `AGENTS.md`'s "Performance ideas from past work" aren't citable, and
+capture on an eager MVP is a judgement call per model. Name the shared
 component that already does it (the engine's KV pool, `mstar/model/components/`, the ragged
 attention resources) when the PR rolls its own or skips it.
 

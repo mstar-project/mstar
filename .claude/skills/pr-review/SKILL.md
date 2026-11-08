@@ -253,11 +253,12 @@ the PR adds or changes, the standard serving techniques first, then the shape of
 (placement, interface granularity, state ownership, shape policy, fit with the fast paths, static
 reservations, scaling).
 
-- **Priority**, for regressions and opportunities alike: P1 for more than about 10% end to end, or a
-  cliff (stall, OOM, collapse to eager), on a default deployment; P2 for 3–10%, or a large gain only
-  on non-default configs or models; P3 when speculative or a large build with an unproven payoff. A
-  missing standard technique on a default path is usually P1. Never P0 unless it is a hang or stall;
-  then it is a correctness finding.
+- **Priority.** A regression: P1 for more than about 10% end to end, or a cliff (stall, OOM, collapse
+  to eager), on a default deployment; P2 for 3–10%, or a large loss only on non-default configs or
+  models; P3 when speculative. An opportunity, a missing standard technique included, is P3 unless
+  the PR claims the gain: then a shortfall against the claim is a finding at the regression bar.
+  `AGENTS.md`'s "Performance ideas from past work" and stacking capture on an eager MVP are never
+  requirements. Never P0 unless it is a hang or stall; then it is a correctness finding.
 - **Each performance finding states:** the mechanism; **est.** with its arithmetic ("4.2 GB of extra
   HBM reads per step at 3.3 TB/s ≈ 1.3 ms of a ~40 ms step ≈ 3%") and whether the path is CPU- or
   GPU-bound and how you know; the **probability** of a good speedup (high, medium or low, roughly as a
