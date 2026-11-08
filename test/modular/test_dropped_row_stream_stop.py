@@ -146,13 +146,14 @@ def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
     w = make_worker(
         device=torch.device("cpu"),
         _graph_runtime=runtime,
-        scheduler=SimpleNamespace(failed_rids=set()),
+        scheduler=SimpleNamespace(),
         tensor_manager=SimpleNamespace(
         cleanup_collectable=lambda *a: None,
         store_and_return_tensor_info_batch=_store,
         drop_host_copies=lambda: None,
         dereference_batch_uniform=lambda uuids: None,
     ),
+        streams=SimpleNamespace(assign_consumer_walks=lambda batch: None),
         engine_manager=SimpleNamespace(get_engine=lambda n: eng),
         _innermost_loop_by_node={(WALK, NODE): loop} if in_loop else {},
     )

@@ -9,7 +9,6 @@ API server's message thread (``test_serving_metrics``).
 """
 from __future__ import annotations
 
-import contextlib
 import queue
 import threading
 from types import SimpleNamespace
@@ -313,7 +312,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
                                      graph_walk=batch.graph_walk, slot=0, capture=False),
         )
 
-    def next_batch(request_state, exclude_target=None):
+    def next_batch(exclude_target=None):
         if not schedule:
             raise _StopLoopError
         step = schedule.pop(0)
@@ -349,18 +348,15 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
         communicator=SimpleNamespace(send=stub, wait_for_work=stub),
         wakeup_event=SimpleNamespace(register_future=stub),
         request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
-        scheduler=SimpleNamespace(
-        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
-        remember_ready=contextlib.nullcontext,
-    ),
+        scheduler=SimpleNamespace(next_batch=next_batch, note_ran=stub),
     )
-    for name in ("_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
-                 "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
-                 "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
-                 "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
+    for name in ("_init_engine_thread", "_await_admit_settled",
+                 "_apply_removes", "_fail_requests", "_apply_drains", "_report_failures", "_teardown",
+                 "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_settle_speculation", "_drop_rows_whose_loop_stopped", "_handle_admit_failure"):
         setattr(w, name, stub)
-    w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
+    for name in ("process_messages", "check_ready_tensors", "poll_stream_buffers"):
+        setattr(w.ingest, name, stub)
     w._build_executing_batch = executing
     w._build_speculation = build_speculation
     w._execute_on_gpu_thread = gpu
@@ -503,7 +499,7 @@ def test_prefix_lookups_before_start_counting_are_not_counted():
 def test_the_worker_starts_counting_on_enable_metrics(clock):
     w = make_worker(_metrics=_metrics(counting=False))
     clock.now = 1.0
-    w._process_message_list([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
+    w.ingest._dispatch([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
     clock.now = 1.25
     w._metrics.step_done(NODE, DECODE, _prepare(_engine(), DECODE, r1=1).inputs, submitted_at=1.0)
     assert _hist(w._metrics.snapshot(), "mstar_step_seconds")[(NODE, DECODE)][1] == pytest.approx(0.25)
@@ -613,8 +609,9 @@ def test_pending_rows_are_the_backlog_and_the_ready_rows_not_in_a_step():
     queue["r6"] = {"talker"}  # ready for a node this rank does not schedule
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 4
 
-    sched.fail_rids({"r2"})
-    sched.pending_removes["r5"] = None
+    sched.lifecycle.failed_rids.add("r2")
+    sched.drop_backlogged({"r2"})
+    sched.lifecycle.pending_removes["r5"] = -1
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 2
 
 

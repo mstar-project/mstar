@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from mstar.utils.client_errors import client_error_text
+from mstar.worker.micro_scheduler import SIDE_LANE
 
 if TYPE_CHECKING:
     from mstar.utils.threads import ThreadPool
@@ -37,9 +38,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-# The one side lane a worker runs; the chain is ``CHAIN_LANE``
-SIDE_LANE = 1
 
 
 class SideStepLane:
@@ -80,7 +78,7 @@ class SideStepLane:
         if self.pending is not None:
             return
         worker = self._worker
-        batch = worker.scheduler.get_next_batch(worker.request_state, lane=self.lane)
+        batch = worker.scheduler.next_batch(lane=self.lane)
         if batch is None:
             return
         if self._stream is None:
