@@ -43,7 +43,7 @@ class WorkerServices:
     tensor_manager: TensorCommunicationManager
     request_state: RequestStateManager
     communicator: BaseCommunicator
-    # TP, SP and joint process groups
+    # per-axis (TP, SP, CFG) and lockstep-instance process groups
     parallel_groups: WorkerParallelGroups
     # what this worker rebuilds a dropped request's KV from
     rebuilds: Rebuilds
