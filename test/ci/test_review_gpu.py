@@ -407,6 +407,12 @@ class TestApprove(unittest.TestCase):
                       "the approval would stand on a commit nobody tested")
         self.assertNotIn("approval", out, "the ledger would record an approval that was withdrawn")
         self.assertIn("Not approved", text)
+        text, out, _ = self.approve({"value": "on"}, head_after="fedcba9876", extra={
+            f"GET repos/{R}/pulls/7/reviews?per_page=100": [
+                {"id": 3, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
+            f"PUT repos/{R}/pulls/7/reviews/3/dismissals": Fail("HTTP 502")})
+        self.assertEqual(out.get("exit"), 1, "a failed dismissal would pass silently")
+        self.assertIn("couldn't be withdrawn", text, "the comment would say not approved with the approval standing")
 
     def test_a_finding_counts_as_fixed_above_only_while_that_pr_still_holds_the_fix(self):
         finding = {"priority": "P1", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}
