@@ -971,6 +971,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
         run: |
+          set -o pipefail  # an error in the rule fails this step, rather than tee's exit 0 hiding it
           python3 .github/review/gpu_review.py approve --pr "$PR" --sha "$HEAD_SHA" --review review.json \
             --complete true --verdict "$VERDICT" --why "$RUNNER_TEMP/why.txt" | tee approve.log
           grep -q '^approved' approve.log && echo "approved=true" >> "$GITHUB_OUTPUT" || true
@@ -986,7 +987,9 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           NOTE: ${{ steps.carry.outputs.note }}
           APPROVED: ${{ steps.approve.outputs.approved }}
+          APPROVE_OUTCOME: ${{ steps.approve.outcome }}
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           lt="$RUNNER_TEMP/lt"
           if [ "$TRUSTED" != "true" ]; then
@@ -999,6 +1002,8 @@ jobs:
             printf '\n**Approved** on `%s` by the rule in `.github/review/gpu_review.py`.\n' "${HEAD_SHA:0:7}" >> post.md
           elif [ -s "$RUNNER_TEMP/why.txt" ]; then
             printf '\nNot approved: %s.\n' "$(cat "$RUNNER_TEMP/why.txt")" >> post.md
+          elif [ "$APPROVE_OUTCOME" = "failure" ]; then
+            printf '\nNot approved: the approval check failed. [Log](%s).\n' "$RUN_URL" >> post.md
           fi
           sed -E -i "$REDACT" post.md
           gh pr comment "$PR" --repo "$REPO" --body-file post.md
@@ -1024,7 +1029,7 @@ jobs:
       - name: Report a live test that didn't complete
         if: >-
           failure() || (always() &&
-            (steps.redact.outcome == 'failure' ||
+            (steps.redact.outcome == 'failure' || steps.render.outcome == 'failure' ||
              (steps.start.outcome == 'failure' && steps.start.outputs.unavailable != 'true') ||
              (steps.wait.outcome == 'failure' && steps.wait.outputs.unavailable != 'true')))
         continue-on-error: true
