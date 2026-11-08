@@ -51,6 +51,16 @@ class TestReviewSummary(unittest.TestCase):
         fixed = [{"ref": "7", "priority": "P1", "status": "fixed", "why": "guard added"}]
         self.assertEqual(open_findings(review(prior=fixed), pages, []), [], "a fixed finding would keep the status red")
 
+    def test_a_finding_cleared_by_argument_alone_stays_open_for_a_person(self):
+        prior = [{"ref": "7", "priority": "P1", "status": "disputed", "why": "the author says it can't happen"}]
+        pages = threads(thread("P1", comment_id=7))
+        self.assertEqual(open_findings(review(prior=prior), pages, []),
+                         [("inline 7", "P1", "disputed, you decide: the author says it can't happen")],
+                         "an author's reply alone would clear a P1")
+        text = render(review(prior=prior), pages, "0123456789", "nogpu", [])
+        self.assertIn("\n🔴 **1 P1**", text)
+        self.assertIn("- [ ] **[P1]** `inline 7`: disputed, you decide:", text, "no person would be told to decide it")
+
     def test_an_earlier_finding_this_run_left_out_stays_open(self):
         carried = SUMMARY["carried"]
         earlier = [{"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"},

@@ -28,7 +28,9 @@ TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
 # PR is one the review was given the diff of (stacked-above.json).
-STATUSES = ("fixed", "fixed_above", "open", "moot")
+STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
+# disputed: a P0-P2 the author argues against with no code change. It stays open, for a person to decide.
+STILL_OPEN = ("open", "disputed")
 # Summaries and handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
@@ -130,7 +132,7 @@ def carried(review, earlier):
     """`review` with the earlier findings outside the diff it hasn't cleared added to its own: `earlier` is
     the last review's outside_diff. "A finding left out stays open", and stays in the state for the next
     re-review to judge."""
-    cleared = {f["ref"] for f in review["prior_findings"] if f["status"] != "open"}
+    cleared = {f["ref"] for f in review["prior_findings"] if f["status"] not in STILL_OPEN}
     locations = {f["location"] for f in review["outside_diff"]}
     return {**review, "outside_diff": [*review["outside_diff"], *[
         f for f in earlier if f["location"] not in cleared and f["location"] not in locations]]}
@@ -145,7 +147,12 @@ def open_findings(review, pages, stacked):
     `stacked` (judged). `pages` are the pages of the PR's review threads (GraphQL)."""
     review = judged(review, stacked)
     prior = review["prior_findings"]
-    cleared = {f["ref"] for f in prior if f["status"] != "open"}
+    cleared = {f["ref"] for f in prior if f["status"] not in STILL_OPEN}
+    disputed = {f["ref"]: f["why"] for f in prior if f["status"] == "disputed"}
+
+    def what(ref, text):
+        return f"disputed, you decide: {disputed[ref]}" if ref in disputed else text
+
     found, counted = [], {f["location"] for f in review["outside_diff"]}
     for page in pages:
         for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
@@ -156,13 +163,13 @@ def open_findings(review, pages, stacked):
             match = TAG.match(first["body"])
             where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
             found.append((where, match[1] if match else "P2",
-                          first["body"][match.end() if match else 0:].strip().split("\n")[0]))
+                          what(ref, first["body"][match.end() if match else 0:].strip().split("\n")[0])))
             counted.add(ref)
-    found += [(f"outside the diff, {f['location']}", f["priority"], f["claim"]) for f in review["outside_diff"]
-              if not f.get("fixed_in")]
+    found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))
+              for f in review["outside_diff"] if not f.get("fixed_in")]
     # Judged still open, with no thread or outside_diff item here to count it by.
-    found += [(f"earlier {f['ref']}", f["priority"], f["why"]) for f in prior
-              if f["status"] == "open" and f["ref"] not in counted]
+    found += [(f"earlier {f['ref']}", f["priority"], what(f["ref"], f["why"])) for f in prior
+              if f["status"] in STILL_OPEN and f["ref"] not in counted]
     return found
 
 
@@ -240,6 +247,8 @@ def render(review, pages, head, mode, stacked):
     sections = [
         ("Still open from earlier", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
                                      for f in prior if f["status"] == "open" and f["ref"] not in outside]),
+        ("Disputed: a person decides", [f"**[{f['priority']}]** {f['ref']}: {f['why']}"
+                                        for f in prior if f["status"] == "disputed"]),
         ("Outside the diff", [f"**[{f['priority']}]** `{f['location']}`: {f['claim']}\n\n  {f['detail']}"
                               for f in review["outside_diff"] if not f.get("fixed_in")]),
         ("Fixed in a PR above", [f"**[{f['priority']}]** {f['ref']}: {f['why']} {above(f)}"
