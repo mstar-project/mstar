@@ -870,6 +870,13 @@ _QWEN3_REPOS = {
         "rms_norm_eps": 1e-6, "rope_theta": 1000000, "max_position_embeddings": 40960,
         "tie_word_embeddings": False, "eos_token_id": 151645, "torch_dtype": "bfloat16",
     },
+    "deepseek-ai/dspark_qwen3_8b_block7": {
+        "model_type": "qwen3", "block_size": 7, "markov_rank": 256, "mask_token_id": 151669,
+        "target_layer_ids": [1, 9, 17, 25, 33], "hidden_size": 4096, "num_hidden_layers": 5,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128, "intermediate_size": 12288,
+        "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_parameters": {"rope_theta": 1000000, "rope_type": "default"},
+        "max_position_embeddings": 40960, "tie_word_embeddings": False, "dtype": "bfloat16",
+    },
 }
 
 
@@ -924,6 +931,10 @@ _STUBBED_IMPORTS: list[set[str]] = []
 SHIPPED_CONFIGS = sorted((ROOT / "configs").glob("*.yaml"))
 
 
+def _has_draft_block(path: Path) -> bool:
+    return "draft" in (yaml.safe_load(path.read_text()).get("model_kwargs") or {})
+
+
 @pytest.fixture
 def _drop_stubbed_imports():
     """Modules imported against the flashinfer stub must not outlive it."""
@@ -933,6 +944,36 @@ def _drop_stubbed_imports():
         for mod in set(sys.modules) - before:
             if mod.startswith("mstar.model.qwen3_omni"):
                 del sys.modules[mod]
+
+
+@pytest.mark.parametrize("name", [p.name for p in SHIPPED_CONFIGS if _has_draft_block(p)])
+def test_a_shipped_drafters_layer_sets_survive_the_serving_overrides(
+    name, tmp_path, monkeypatch, _drop_stubbed_imports,
+):
+    """The drafter's layers join the pool when the model declares it; the serving path then applies
+    the config's `resources:` overrides and sizes and shards the pool, all in place: the layer sets,
+    the drafter's first layer and the pool's layers come out as the join made them."""
+    from mstar.model.base import serving_resources
+
+    config = yaml.safe_load((ROOT / "configs" / name).read_text())
+    model_name = config["model"]
+    if model_name not in MODEL_REGISTRY:
+        pytest.skip(f"model {model_name!r} is not in MODEL_REGISTRY")
+    factory = _FACTORIES.get(MODEL_REGISTRY[model_name][1], _default)
+    model = factory(model_name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
+    (decl,) = model.verify_nodes()
+    kv = {spec.resource_key: spec for spec in serving_resources(model, config)}["kv_cache"].config
+    joined = decl.needs.kv
+    # the target's own KV layers: Qwen3.5's full-attention layers, every layer of Qwen3's
+    full = getattr(model.config, "full_layer_indices", None)
+    target = len(full) if full is not None else model.config.num_hidden_layers
+    assert kv.num_layers == target + joined.num_layers
+    assert kv.layer_sets == {"target": (0, target), joined.name: (target, joined.num_layers)}
+    if "resources" in config and "max_num_pages" in config["resources"].get("kv_cache", {}):
+        assert kv.max_num_pages == config["resources"]["kv_cache"]["max_num_pages"]
+    kv.shard(2)
+    assert kv.layer_sets[joined.name] == (target, joined.num_layers)
+    assert [list(group.layers) for group in kv.groups] == [list(range(kv.num_layers))]
 
 
 @pytest.mark.parametrize("config_path", SHIPPED_CONFIGS, ids=lambda p: p.name)
