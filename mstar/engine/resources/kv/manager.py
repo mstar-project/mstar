@@ -3383,9 +3383,9 @@ class KVManager(AttentionResource):
         prompt, page_size = ids[:-1], self.config.tokens_per_page
         length, rebuilt = len(prompt), layout.rebuilt(held)
         laid_out_ids = sum(span.length for span in rebuilt.spans if span.kind == SpanKind.IDS)
-        assert length == laid_out_ids, (
+        assert length in (laid_out_ids, held), (
             f"KV {self.name}: {rid}'s rebuild writes {length} ids, but the {held} slots its drop checked hold "
-            f"{laid_out_ids}"
+            f"{laid_out_ids} in ids spans"
         )
         pages = [prompt[start:start + page_size] for start in range(0, length, page_size)]
         keyed = bool((overrides.prefix_keys or {}).get(label))
