@@ -39,10 +39,8 @@ def _old_zlib_parallel(data: bytes, level: int, workers: int, min_block: int = 1
 
 def _old_png(image: torch.Tensor, level: int, workers: int) -> bytes:
     rows = image.permute(1, 2, 0).contiguous().numpy()
-    height, width, channels = rows.shape
-    raw = np.empty((height, 1 + width * channels), dtype=np.uint8)
-    raw[:, 0] = 0
-    raw[:, 1:] = rows.reshape(height, width * channels)
+    height, width, _ = rows.shape
+    raw = image_io._png_rows(rows, level)
     return b"".join((
         b"\x89PNG\r\n\x1a\n",
         image_io._png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),

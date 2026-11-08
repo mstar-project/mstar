@@ -530,7 +530,9 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        return encode_mp4(output.cpu().numpy(), fps)
+        # as Cosmos3 and LTX-2.5 encode: the multithreaded ultrafast preset is several
+        # times faster than libx264's default, on the request's critical path
+        return encode_mp4(output.cpu().numpy(), fps, options={"crf": "18", "preset": "ultrafast", "threads": "0"})
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration

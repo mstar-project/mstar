@@ -9,7 +9,6 @@ and through each model's ``postprocess``.
 
 from __future__ import annotations
 
-import functools
 import io
 from fractions import Fraction
 
@@ -19,12 +18,11 @@ import torch
 
 av = pytest.importorskip("av")
 
-from mstar.model.components import video_encode  # noqa: E402
 from mstar.model.components.video_encode import converted_frames, encode_mp4  # noqa: E402
 
 # 30000/1001 exactly, as encode_mp4 writes it
 NTSC = 30000 / 1001
-# LTX-2.5's settings, and Cosmos3's PyAV path at its default preset
+# LTX-2.5's and Wan2.2's settings, and Cosmos3's PyAV path at its default preset
 ULTRAFAST = {"crf": "18", "preset": "ultrafast", "threads": "0"}
 
 
@@ -56,12 +54,6 @@ def _clip(frames: int, height: int, width: int) -> np.ndarray:
     clip = np.stack([(x + 3 * t + y // 2) % 256 for t in range(frames)])[..., None].repeat(3, -1)
     noise = rng.integers(0, 24, size=clip.shape)
     return ((clip + noise) % 256).astype(np.uint8)
-
-
-def _x264_settings(data: bytes) -> bytes:
-    """The settings libx264 writes into the stream (preset, crf, threads, lookahead...)."""
-    start = data.index(b"x264 - core")
-    return data[start:data.index(b"\x00", start)]
 
 
 def _stored_frames(frames: np.ndarray, height: int, width: int, converted: bool) -> list[bytes]:
@@ -124,8 +116,8 @@ def test_a_conversion_failure_reaches_the_caller():
         encode_mp4(np.zeros((2, 16, 16, 3), dtype=np.float32), 24)
 
 
-# Each model's postprocess against its old writer. Wan2.2 encodes with libx264's
-# defaults: its bytes are compared under ultrafast, and its settings as written.
+# Each model's postprocess against its old writer, under the ultrafast settings
+# they all encode with.
 
 def _wan22():
     from mstar.model.wan22.config import Wan22Config
@@ -136,20 +128,10 @@ def _wan22():
     return model
 
 
-def test_wan22_writes_the_old_bytes(monkeypatch):
-    from mstar.model.wan22 import wan22_model
-
-    monkeypatch.setattr(wan22_model, "encode_mp4", functools.partial(video_encode.encode_mp4, options=ULTRAFAST))
+def test_wan22_writes_the_old_bytes():
     clip = _clip(9, 48, 64)
     data = _wan22().postprocess(torch.from_numpy(clip), "video", {"fps": NTSC})
     assert data == _plain(clip, NTSC, ULTRAFAST)
-
-
-def test_wan22_keeps_libx264s_defaults():
-    clip = _clip(9, 48, 64)
-    data = _wan22().postprocess(torch.from_numpy(clip), "video", {"fps": 24})
-    assert b" crf=23.0 " in _x264_settings(data)  # libx264's default, where the others pass 18
-    assert _x264_settings(data) == _x264_settings(_plain(clip, 24, None))
 
 
 def test_ltx2_5_writes_the_old_bytes():

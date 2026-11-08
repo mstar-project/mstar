@@ -95,12 +95,11 @@ def uint8_to_png(
 ) -> bytes:
     """Encode one uint8 ``[3, H, W]`` (or ``[1, 3, H, W]``) tensor as PNG bytes, losslessly.
 
-    The default writer emits every scanline with PNG filter 0 and deflates the image in
+    The default writer filters the scanlines (:func:`_png_rows`) and deflates the image in
     ``workers`` independent blocks (default: the CPU plan's ``png_threads``) stitched into one
     zlib stream (pigz-style: each block ends on a byte boundary with a sync flush, one adler32
-    over the whole image). At level 1 on
-    8 threads a 1024x1024 image encodes in ~15 ms against ~440 ms for PIL's default
-    (adaptive filters, zlib 6), which was half of a served request, at ~30% larger files.
+    over the whole image). PIL's default (adaptive filters, zlib 6) took ~440 ms for a
+    1024x1024 image, half of a served request.
     ``adaptive_filters=True`` hands the encode to PIL at the same zlib level for the smaller
     file when latency matters less. Every variant decodes to the same pixels.
     """
@@ -115,10 +114,8 @@ def uint8_to_png(
         buffer = io.BytesIO()
         Image.fromarray(rows, mode="RGB").save(buffer, format="PNG", compress_level=compress_level)
         return buffer.getvalue()
-    height, width, channels = rows.shape
-    raw = np.empty((height, 1 + width * channels), dtype=np.uint8)
-    raw[:, 0] = 0  # filter type "None" for every scanline
-    raw[:, 1:] = rows.reshape(height, width * channels)
+    height, width, _ = rows.shape
+    raw = _png_rows(rows, compress_level)
     return b"".join((
         b"\x89PNG\r\n\x1a\n",
         _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),  # 8-bit RGB
@@ -127,6 +124,24 @@ def uint8_to_png(
         )),
         _png_chunk(b"IEND", b""),
     ))
+
+
+def _png_rows(rows: np.ndarray, compress_level: int) -> np.ndarray:
+    """``[H, W, C]`` uint8 pixels as PNG scanlines, each led by its filter type. Above level 0,
+    filter 1 ("Sub", each byte minus the same channel one pixel left, mod 256): on FLUX.2
+    klein's 1024x1024 images at level 1 those rows deflate ~30% faster and ~30% smaller than
+    unfiltered ones. Level 0 writes stored blocks, which a filter cannot shrink, so filter 0."""
+    height, width, channels = rows.shape
+    flat = rows.reshape(height, width * channels)
+    raw = np.empty((height, 1 + width * channels), dtype=np.uint8)
+    if compress_level == 0:
+        raw[:, 0] = 0
+        raw[:, 1:] = flat
+    else:
+        raw[:, 0] = 1
+        raw[:, 1:1 + channels] = flat[:, :channels]
+        np.subtract(flat[:, channels:], flat[:, :-channels], out=raw[:, 1 + channels:])
+    return raw
 
 
 def _zlib_parallel(data, level: int, workers: int, min_block: int = 1 << 18) -> bytes:
