@@ -326,11 +326,10 @@ Judge the PR as a whole, before the line-level design passes.
   it is generic over, how far the PR is from it, and the cheapest thing the PR could do now so it
   doesn't block it (a name, a seam, a field in the right place).
 
-A concern that would change what gets built is a finding: P1 when the approach is wrong for a shared
-layer or commits mstar to a shape that is hard to retract; P2 when a clearly better approach exists
-but this one works; P2 at least when the PR's mechanism is narrower than the problem other models
-will have (a cosmetic gap is P3). The gap to the north star is a finding too, not only a verdict
-line. A judgement call on direction is a question, not a finding.
+A concern that would change what gets built goes in `questions` or the risk's `look_at` (§6), not in
+findings: a clearly better approach, a mechanism narrower than the problem other models will have, the
+gap to the north star. It becomes a finding only when an `AGENTS.md` invariant is actually broken, at
+the bar's priority. A judgement call on direction is a question.
 
 ### 4.5 Abstraction fit and Phase B (all modes)
 
@@ -376,8 +375,8 @@ the PR adds, name the mstar abstraction that owns it and check the PR uses it:
 A misfit is a finding even if it works and is tested. **Priority:** P1 in a shared layer or public
 surface (the cap for a disguise-check hit there), when it hits invariant 1's "nothing under
 `mstar/model/` should" list, when it blocks a known optimization, or for a loop or stop decision in
-`forward` that blocks streaming or continuous batching for the model's family; P2 inside one model
-otherwise. When the right abstraction doesn't exist yet, the finding names the missing engine piece
+`forward` that blocks streaming or continuous batching for the model's family; inside one model
+otherwise, P2 when an `AGENTS.md` invariant is broken and a question when it isn't. When the right abstraction doesn't exist yet, the finding names the missing engine piece
 (mstar philosophy §2) and, with a shell, any open PR providing it, and says whether to block on that
 PR or stack this one on it.
 
@@ -432,9 +431,9 @@ lines that change would copy or special-case), sketches the better shape, and sa
 costs now versus after merge. **Priority:** P0 when the design breaks a contract other code on `main`
 relies on, or makes correct behaviour impossible to express (rare); P1 for an `AGENTS.md` invariant
 violation, a model-specific concept in a shared layer or public surface, or a blocker for a known
-high-value optimization there; P2 when it works but the next extension needs copy-paste, a leaky
-abstraction, misplaced responsibilities or duplicated state, or a blocker inside one model; P3 for a
-cleaner shape that is cheap to leave.
+high-value optimization there; P2 only when an `AGENTS.md` invariant is actually broken, and
+otherwise a design that works goes in `questions` or the risk's `look_at` (§6); P3 for a cleaner
+shape that is cheap to leave.
 
 ### 4.8 Minimality (all modes)
 
@@ -499,7 +498,7 @@ is a finding, or folds into one with the same root cause, citing "mstar philosop
 concrete fix (the hook, the resource, the A/B to run, the test to register). Rank
 it by the bar: a system-level violation on a plausible path (§1, §5, §6, §12) is usually P1;
 unproven complexity (§7) or missing evidence (§8) is P1 when the description makes the claim, P2
-otherwise; scope, docs and readability (§13, §15) are P2 or P3. When the PR sits on one side of a
+otherwise; docs and readability (§15) are P2 or P3; scope (§13) goes in `questions`, a note that never blocks (`AGENTS.md`). When the PR sits on one side of a
 listed tension, say which, and ask why if the PR doesn't say. If the PR rests on a value the file
 doesn't state, say so in `checked`.
 
