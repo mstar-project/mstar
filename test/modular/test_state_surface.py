@@ -311,6 +311,13 @@ def test_a_handles_calls_equal_the_snapshot(handle):
     assert surface == HANDLE_SNAPSHOT, "`add`, `read` and `write` are the surface a layer calls"
 
 
+def test_set_start_equals_the_snapshot():
+    surface = [[p.name, p.kind.name, _default(p)] for p in inspect.signature(ArrayHandle.set_start).parameters.values()]
+    assert surface == [
+        ["self", "POSITIONAL_OR_KEYWORD", None], ["start", "POSITIONAL_OR_KEYWORD", None],
+    ], "`set_start` is the call a submodule makes at bind for a Value's start state"
+
+
 def test_every_field_after_the_first_is_keyword_only():
     positional = {
         name: [p[0] for p in params[1:] if p[1] != "KEYWORD_ONLY"]

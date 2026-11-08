@@ -1124,6 +1124,24 @@ def test_set_start_on_an_array_that_isnt_a_value_is_refused():
              lambda: _kv_handle().set_start({"k": torch.ones(1)}))
 
 
+def test_set_start_after_the_first_step_is_refused():
+    """A captured read keeps the start tensors it read, so a start set later would differ from that read's replay."""
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    h.end_step(step)
+    _refused(r"Array 'state': set_start after the handle's first step", lambda: h.set_start({"x": torch.zeros(2, 3)}))
+
+
+@pytest.mark.parametrize("start, cause", [
+    ({"y": torch.ones(1)}, r"start names fields \['y'\], of \['n', 'x'\]"),
+    ({"x": torch.ones(2, 4)}, r"start of field 'x' on layer 0 is \(2, 4\)"),
+    ({"x": torch.ones(2, 3).double()}, r"start of field 'x' on layer 0 is .*float64"),
+], ids=["an undeclared field", "a shape", "a dtype"])
+def test_set_start_refuses_what_the_field_cant_hold(start, cause):
+    h, _ = _plain_value()
+    _refused(rf"Array 'state': {cause}", lambda: h.set_start(start))
+
+
 def test_keep_false_on_a_plain_value_is_refused():
     h, pool = _plain_value()
     _, ctx = _plan(pool, [Segment(1, "main", 1)])
