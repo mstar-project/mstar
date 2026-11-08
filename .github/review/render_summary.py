@@ -73,8 +73,11 @@ SCHEMA = {
             "run": {"type": "string", "enum": ["none", "targeted", "full"]},
             "reason": {"type": "string"},
             "confirm": STRINGS,
+            # The kinds of check the box runs; ignored for `none`.
+            "checks": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": True,
+                       "items": {"type": "string", "enum": ["correctness", "performance"]}},
             "gpus": {"type": "integer", "minimum": 1, "maximum": 8},
-        }, "required": ["run", "reason", "confirm", "gpus"]},
+        }, "required": ["run", "reason", "confirm", "checks", "gpus"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "risk"],
@@ -151,7 +154,8 @@ def render(review, pages, head, mode):
         parts.append("Not reviewed: " + ", ".join(f"`{path}`" for path in review["skipped"]) + ".")
     live = review.get("live_test")
     if live and mode == "gpu":
-        parts.append(f"Live test: **{live['run']}**. {live['reason']}")
+        checks = f" ({', '.join(live.get('checks') or [])})" if live["run"] != "none" and live.get("checks") else ""
+        parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}")
     parts.append(FOOTER)
     risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],

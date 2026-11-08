@@ -89,6 +89,12 @@ class TestReviewSummary(unittest.TestCase):
         text = render(review(skipped=["mstar/worker/worker.py"]), [], "0123456789", "light")
         self.assertIn("\n🟡 **No findings**", text, "a partial review would read as a clean one")
 
+    def test_a_live_test_call_says_which_kinds_of_check_the_box_runs(self):
+        live = SUMMARY["SCHEMA"]["properties"]["live_test"]
+        gpu_review = runpy.run_path(str(REPO_ROOT / ".github/review/gpu_review.py"))
+        self.assertEqual(live["properties"]["checks"]["items"]["enum"], list(gpu_review["CHECKS"]),
+                         "the review could choose a kind of check the box's brief can't name")
+
     def test_schema_has_no_single_quote(self):
         self.assertNotIn("'", json.dumps(SUMMARY["SCHEMA"]),
                          "claude-review.yml passes the schema to --json-schema in single quotes")

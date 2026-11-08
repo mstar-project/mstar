@@ -137,6 +137,8 @@ jobs:
       head_sha: ${{ steps.pr.outputs.head_sha }}
       main_sha: ${{ steps.base.outputs.commit }}
       result: ${{ steps.review.outputs.structured_output }}
+      # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
+      rereview: ${{ steps.diff.outputs.rereview }}
       # Finished and returned its summary itself: a salvaged or stopped review never approves.
       complete: ${{ steps.review.outcome == 'success' && steps.post.outcome == 'success' }}
     permissions:
@@ -401,6 +403,7 @@ jobs:
           # a thorough or gpu review does too unless the last one was thorough or gpu and skipped nothing.
           # The state is read only from the bot's own summaries: comments that start with the
           # summary's marker, in which model text can't open an HTML comment.
+          oneline='.commits[] | "\(.sha[0:10]) \(if (.parents | length) > 1 then "[merge] " else "" end)\(.commit.message | split("\n")[0])"'
           if [ -z "$PREV" ]; then
             jq -r '[.[] | select(.user == "mstar-review[bot]" or .user == "github-actions[bot]")
                     | select(.body | startswith("<!-- claude-review-summary -->"))] | last | .body // empty' \
@@ -409,13 +412,29 @@ jobs:
             # A diff GitHub won't give (too large, say) means a full review, never an empty since.diff.
             if [ -n "$last" ] && [ "$(gh api "repos/$REPO/compare/$last...$HEAD_SHA" --jq .status 2> /dev/null)" = "ahead" -o "$last" = "$HEAD_SHA" ] &&
               gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$last...$HEAD_SHA" > since.diff; then
-              gh api --paginate "repos/$REPO/compare/$last...$HEAD_SHA" --jq '.commits[] |
-                "\(.sha[0:10]) \(if (.parents | length) > 1 then "[merge] " else "" end)\(.commit.message | split("\n")[0])"' \
-                > since-commits.txt || : > since-commits.txt
+              gh api --paginate "repos/$REPO/compare/$last...$HEAD_SHA" --jq "$oneline" > since-commits.txt \
+                || : > since-commits.txt
               echo "::notice::Re-review: this PR was last reviewed at ${last:0:10}."
               echo "rereview=true" >> "$GITHUB_OUTPUT"
             else
               rm -f last-review.json since.diff
+            fi
+          fi
+
+          # gpu mode: the diff and commits since the PR's last live test, when it passed on an ancestor of the
+          # head, for the review's live-test call (review-prompt.md, Re-review step 4). Read as gpu_review.py
+          # carry reads it: the bot's own live-test comments, by their first line, the marker, alone.
+          # Without both files (GitHub refused either) the review judges the whole PR.
+          if [ "$MODE" = gpu ]; then
+            live=$(jq -r --argjson bots "$bots" '[.[] | select(.user as $u | any($bots[]; . + "[bot]" == $u))
+                | (.body // "" | split("\n")[0] // "")
+                | capture("\\A<!-- claude-live-test sha=(?<sha>[0-9a-f]{40}) verdict=(?<verdict>[a-z]+) -->\\z")]
+                | last | select(.verdict == "pass") | .sha' pr-conversation.json)
+            if [ -n "$live" ] &&
+              [[ "$(gh api "repos/$REPO/compare/$live...$HEAD_SHA" --jq .status 2> /dev/null)" =~ ^(ahead|identical)$ ]]; then
+              gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$live...$HEAD_SHA" > since-live-test.diff &&
+                gh api --paginate "repos/$REPO/compare/$live...$HEAD_SHA" --jq "$oneline" > since-live-test-commits.txt \
+                || rm -f since-live-test.diff since-live-test-commits.txt
             fi
           fi
 
@@ -810,60 +829,49 @@ jobs:
           perm=$(gh api "repos/$REPO/collaborators/$author/permission" --jq .permission 2> /dev/null || echo none)
           case "$perm" in admin|maintain|write) echo "trusted=true" >> "$GITHUB_OUTPUT" ;; esac
           gpus=$(jq -r --argjson cap "$MAX_GPUS" '[.live_test.gpus // 1, $cap] | min' review.json)
-          run=$(jq -r '.live_test.run // "full"' review.json)
-          case "$run" in none|targeted|full) ;; *) run=full ;; esac   # model output: only the enum reaches a shell
-          { echo "gpus=$gpus"; echo "run=$run"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
+          { echo "gpus=$gpus"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
-      # `none` and `targeted` build on the last live test: only when it passed, on a commit
-      # that is an ancestor of this head. Otherwise the live test runs in full. A `none` that
-      # holds carries that pass; a `targeted` one is told that commit and given that report.
+      # The review's call stands unless the PR's last live test didn't pass on an ancestor of this
+      # head, or a re-review's `targeted`, or its `none` on runtime code, has no live test before it
+      # (gpu_review.py carry):
+      # then the live test runs in full, every kind of check, so a failure is never hidden. After a
+      # pass on an ancestor, a `targeted` run is told that commit and given that report. A `none`
+      # that stands runs nothing (verdict `skipped`), and counts as a pass for approval after that
+      # pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
+      # test, so the next run still checks against the last real one. A failed read of the PR's
+      # comments fails this step.
       - name: Check the last live test
-        if: steps.cfg.outputs.run != 'full' && steps.cfg.outputs.trusted == 'true'
+        if: steps.cfg.outputs.trusted == 'true'
         id: carry
         env:
-          RUN: ${{ steps.cfg.outputs.run }}
+          REREVIEW: ${{ needs.review.outputs.rereview }}
         run: |
-          # The marker is only the first line of the bot's live-test comments: the report below it
-          # is the box's text, which goes to a targeted run as data.
-          gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
-              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
-                (.body | startswith("<!-- claude-live-test sha="))) | {marker: (.body | split("\n")[0]), body}' \
-            | jq -s '[.[] | select(.marker | test("^<!-- claude-live-test sha=[0-9a-f]{40} verdict=[a-z]+ -->$"))] | last // {}' \
-            > earlier.json
-          marker=$(jq -r '.marker // empty' earlier.json)
-          sha=$(sed -E 's/.*sha=([0-9a-f]*).*/\1/' <<< "$marker"); verdict=$(sed -E 's/.*verdict=([a-z]*).*/\1/' <<< "$marker")
-          status=$( [ -n "$sha" ] && gh api "repos/$REPO/compare/$sha...$HEAD_SHA" --jq .status 2> /dev/null || true )
-          if [ "$verdict" != "pass" ] || { [ "$status" != "ahead" ] && [ "$status" != "identical" ]; }; then
-            echo "::notice::The review asked for a $RUN live test, but the last one didn't pass on an ancestor; running it in full."
-            echo "run=full" >> "$GITHUB_OUTPUT"
-          elif [ "$RUN" = "none" ]; then
-            echo "run=none" >> "$GITHUB_OUTPUT"
-            echo "verdict=pass" >> "$GITHUB_OUTPUT"
-            echo "note=No GPU run: nothing since the passing live test of \`${sha:0:7}\` reaches code it exercised." >> "$GITHUB_OUTPUT"
-          else
-            echo "run=targeted" >> "$GITHUB_OUTPUT"
-            echo "since=$sha" >> "$GITHUB_OUTPUT"
-            jq -r .body earlier.json > earlier-live-test.md
-          fi
+          set -o pipefail  # an error in the decision fails this step, rather than tee's exit 0 hiding it
+          python3 .github/review/gpu_review.py carry --pr "$PR" --sha "$HEAD_SHA" --review review.json \
+            --earlier-report earlier-live-test.md ${REREVIEW:+--rereview} | tee carry.log
+          grep '^[a-z_]*=' carry.log >> "$GITHUB_OUTPUT"
 
       - name: Get GPUs and start the live test
-        if: >-
-          steps.cfg.outputs.trusted == 'true' &&
-          (steps.cfg.outputs.run == 'full' || (steps.carry.outputs.run != '' && steps.carry.outputs.run != 'none'))
+        if: steps.carry.outputs.run == 'full' || steps.carry.outputs.run == 'targeted'
         id: start
         continue-on-error: true
         env:
           # The box's own key, never the review's: the box runs PR code with a shell.
           LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
-          RUN: ${{ steps.carry.outputs.run || steps.cfg.outputs.run }}
+          RUN: ${{ steps.carry.outputs.run }}
+          CHECKS: ${{ steps.carry.outputs.checks }}
           SINCE: ${{ steps.carry.outputs.since }}
+          FORCED: ${{ steps.carry.outputs.forced }}
+          ASKED: ${{ steps.carry.outputs.asked }}
+          ASKED_CHECKS: ${{ steps.carry.outputs.asked_checks }}
         run: |
           set +e
           python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
             --base "$BASE" \
             --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
-            --run "$RUN" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
+            --run "$RUN" --checks "$CHECKS" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
+            ${FORCED:+--forced "$FORCED" --asked "$ASKED" --asked-checks "$ASKED_CHECKS"} \
             --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
           code=$?
           [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
@@ -975,10 +983,11 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
+          SINCE: ${{ steps.carry.outputs.since }}
         run: |
           set -o pipefail  # an error in the rule fails this step, rather than tee's exit 0 hiding it
           python3 .github/review/gpu_review.py approve --pr "$PR" --sha "$HEAD_SHA" --review review.json \
-            --complete true --verdict "$VERDICT" --why "$RUNNER_TEMP/why.txt" | tee approve.log
+            --complete true --verdict "$VERDICT" ${SINCE:+--since "$SINCE"} --why "$RUNNER_TEMP/why.txt" | tee approve.log
           grep '^approval=' approve.log >> "$GITHUB_OUTPUT" || true
 
       # Model output from untrusted input, posted only from the redacted copies.
@@ -990,7 +999,6 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          NOTE: ${{ steps.carry.outputs.note }}
           APPROVAL: ${{ steps.approve.outputs.approval }}
           APPROVE_OUTCOME: ${{ steps.approve.outcome }}
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
@@ -1001,7 +1009,9 @@ jobs:
             echo "The live test runs only on a PR whose author has write access; this review stands without it." > post.md
           elif [ -s "$lt/comment.md" ]; then cp "$lt/comment.md" post.md
           elif [ -s "$lt/unavailable.md" ]; then { echo "<!-- claude-live-test sha=$HEAD_SHA verdict=unavailable -->"; cat "$lt/unavailable.md"; } > post.md
-          else printf '<!-- claude-live-test-carried -->\n%s\n' "$NOTE" > post.md
+          else   # the review chose `none` and it stood: its reason is model text, so it can't open a comment
+            printf '<!-- claude-live-test-none -->\nNo GPU run: %s\n' \
+              "$(jq -r '.live_test.reason // ""' review.json | sed 's/<!--/\&lt;!--/g')" > post.md
           fi
           if [ "$APPROVAL" = "approve" ]; then
             printf '\n**Approved** on `%s` by the rule in `.github/review/gpu_review.py`.\n' "${HEAD_SHA:0:7}" >> post.md
