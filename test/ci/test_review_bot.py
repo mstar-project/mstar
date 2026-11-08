@@ -291,7 +291,7 @@ class TestMonitor(unittest.TestCase):
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a PR read again after a failed read would re-post its old signals")
 
-    def test_a_dismissed_approval_is_not_one_that_stood(self):
+    def test_a_dismissed_approval_is_not_counted(self):
         body, fake = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": [
             {"state": "DISMISSED", "user": {"login": "mstar-review[bot]"}}]})
         self.assertNotIn("Faster decode", body, "a PR whose approval was withdrawn would count as approved")
