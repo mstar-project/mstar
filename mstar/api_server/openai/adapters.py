@@ -219,13 +219,17 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
         raise ValueError("tool calling is not supported for this model")
 
 
-def _template_enable_thinking(mk: dict) -> None:
-    """``chat_template_kwargs.enable_thinking`` onto a flat ``enable_thinking``,
-    which wins. vLLM-style clients toggle thinking this way."""
+def _flatten_template_kwargs(mk: dict) -> None:
+    """Each ``chat_template_kwargs`` key onto a flat one, which wins. vLLM-style
+    clients send template variables this way (``enable_thinking``, Muse
+    Glimmer's ``reasoning_strength``); the model reads them flat, and logs a
+    key it does not read as ignored."""
     template_kwargs = mk.pop("chat_template_kwargs", None) or {}
-    if "enable_thinking" in template_kwargs:
+    if not isinstance(template_kwargs, dict):
+        raise ValueError("chat_template_kwargs must be an object")
+    for key, value in template_kwargs.items():
         # bool(), as Cosmos3's reasoner and the Rust frontend read it: Qwen3.5's template thinks only on a true
-        mk.setdefault("enable_thinking", bool(template_kwargs["enable_thinking"]))
+        mk.setdefault(key, bool(value) if key == "enable_thinking" else value)
 
 
 def _apply_sampling(
@@ -518,10 +522,11 @@ class Qwen3_5Adapter(OpenAIAdapter):
       checkpoint's generation_config sets one.
     * ``repetition_penalty`` — counts the prompt's tokens as well as the
       generated ones unless ``penalize_prompt`` is false.
-    * ``enable_thinking`` (default true; or ``chat_template_kwargs.enable_thinking``)
-      — Qwen's template opens a ``<think>`` block; for Muse Glimmer false means
-      reasoning strength low.
+    * ``enable_thinking`` (default true) — Qwen's template opens a ``<think>``
+      block; for Muse Glimmer false means reasoning strength low.
     * ``reasoning_effort`` — Muse Glimmer's reasoning strength.
+
+    ``chat_template_kwargs`` keys are read as flat ones, and a flat key wins.
     """
 
     supports_chat = True
@@ -529,9 +534,10 @@ class Qwen3_5Adapter(OpenAIAdapter):
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
         _refuse_unserved_chat(req, mk)
-        _template_enable_thinking(mk)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         _apply_sampling(req, mk)
+        # before the attachments are saved, since a malformed value refuses the request
+        _flatten_template_kwargs(mk)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,
             file_paths=file_paths or None,
@@ -1088,7 +1094,7 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
         _refuse_unserved_chat(req, mk)
         _apply_sampling(req, mk)
         # Read before the attachments are saved, since a malformed value refuses the request.
-        _template_enable_thinking(mk)
+        _flatten_template_kwargs(mk)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         return SubmitArgs(
             text=text,

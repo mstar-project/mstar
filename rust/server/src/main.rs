@@ -1911,7 +1911,7 @@ mod tests {
             (
                 "Cosmos3EdgeAdapter",
                 json!({"messages": [{"role": "user", "content": [image]}], "chat_template_kwargs": true}),
-                "argument of type 'bool' is not iterable",
+                "chat_template_kwargs must be an object",
             ),
         ] {
             st.python_adapter = adapter.into();

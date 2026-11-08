@@ -382,14 +382,15 @@ impl Adapter {
             // max_output_tokens and seed are honored.
             Adapter::Bagel => text_chat(req, upload_dir, allow_remote),
             Adapter::Qwen3_5 | Adapter::Cosmos3Edge => {
-                // How vLLM-style clients toggle thinking; a flat enable_thinking wins.
+                // How vLLM-style clients send template variables; a flat key wins.
                 // Read before the attachments are saved, since a malformed value
                 // refuses the request.
-                let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
+                let template_kwargs = template_kwargs(req.extra.get("chat_template_kwargs"))?;
                 let mut args = text_chat(req, upload_dir, allow_remote)?;
                 args.model_kwargs.remove("chat_template_kwargs");
-                if let Some(on) = thinking {
-                    set_default(&mut args.model_kwargs, "enable_thinking", Value::Bool(on));
+                for (key, value) in template_kwargs {
+                    let value = if key == "enable_thinking" { Value::Bool(truthy(&value)) } else { value };
+                    set_default(&mut args.model_kwargs, &key, value);
                 }
                 Ok(args)
             }
@@ -701,29 +702,13 @@ fn text_chat(
     })
 }
 
-/// `chat_template_kwargs.enable_thinking` read as `_template_enable_thinking` does:
-/// `(kwargs or {})`, then `bool(kwargs["enable_thinking"])` when it has the
-/// key. A falsy value is no kwargs; a value Python cannot look the key up in
-/// is the `TypeError` that answers 400 there.
-fn template_enable_thinking(kwargs: Option<&Value>) -> Result<Option<bool>, String> {
-    const KEY: &str = "enable_thinking";
+/// `chat_template_kwargs` read as `_flatten_template_kwargs` does: a falsy
+/// value is no kwargs, and anything else but an object is refused.
+fn template_kwargs(kwargs: Option<&Value>) -> Result<Map<String, Value>, String> {
     match kwargs {
-        None => Ok(None),
-        Some(v) if !truthy(v) => Ok(None),
-        Some(Value::Object(m)) => Ok(m.get(KEY).map(truthy)),
-        Some(Value::Array(items)) if items.iter().any(|i| i.as_str() == Some(KEY)) => {
-            Err("list indices must be integers or slices, not str".to_string())
-        }
-        Some(Value::String(s)) if s.contains(KEY) => {
-            Err("string indices must be integers, not 'str'".to_string())
-        }
-        Some(Value::Array(_) | Value::String(_)) => Ok(None),
-        Some(Value::Bool(_)) => Err("argument of type 'bool' is not iterable".to_string()),
-        Some(Value::Number(n)) => Err(format!(
-            "argument of type '{}' is not iterable",
-            if n.is_f64() { "float" } else { "int" }
-        )),
-        Some(Value::Null) => Ok(None),
+        Some(Value::Object(m)) => Ok(m.clone()),
+        Some(v) if truthy(v) => Err("chat_template_kwargs must be an object".to_string()),
+        _ => Ok(Map::new()),
     }
 }
 
@@ -1000,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thinking_chat_reads_enable_thinking_from_the_template_kwargs() {
+    fn a_thinking_chat_reads_the_template_kwargs_flat() {
         for adapter in [Adapter::Qwen3_5, Adapter::Cosmos3Edge] {
             template_kwargs_cases(adapter);
         }
@@ -1018,22 +1003,29 @@ mod tests {
             (r#""chat_template_kwargs":{}"#, None),
             (r#""chat_template_kwargs":null"#, None),
             (r#""chat_template_kwargs":0"#, None),
-            (r#""chat_template_kwargs":["other"]"#, None),
-            (r#""chat_template_kwargs":"other""#, None),
         ] {
             assert_eq!(thinking(fields), want, "{fields}");
             assert!(!chat(fields).unwrap().model_kwargs.contains_key("chat_template_kwargs"), "{fields}");
         }
-        // what Python's TypeError says for a value it cannot look the key up in
-        for (fields, err) in [
-            (r#""chat_template_kwargs":["enable_thinking"]"#, "list indices must be integers or slices, not str"),
-            (r#""chat_template_kwargs":"enable_thinking=1""#, "string indices must be integers, not 'str'"),
-            (r#""chat_template_kwargs":true"#, "argument of type 'bool' is not iterable"),
-            (r#""chat_template_kwargs":3"#, "argument of type 'int' is not iterable"),
-            (r#""chat_template_kwargs":1.5"#, "argument of type 'float' is not iterable"),
+        for fields in [
+            r#""chat_template_kwargs":["enable_thinking"]"#,
+            r#""chat_template_kwargs":"enable_thinking=1""#,
+            r#""chat_template_kwargs":true"#,
+            r#""chat_template_kwargs":1.5"#,
         ] {
-            assert_eq!(chat(fields).unwrap_err(), err, "{fields}");
+            assert_eq!(chat(fields).unwrap_err(), "chat_template_kwargs must be an object", "{fields}");
         }
+        let mk = chat(
+            r#""chat_template_kwargs":{"reasoning_strength":"low","current_date":"2026-11-08","enable_thinking":0},
+               "reasoning_strength":"high""#,
+        )
+        .unwrap()
+        .model_kwargs;
+        assert_eq!(
+            Value::Object(mk),
+            serde_json::json!({"reasoning_strength": "high", "current_date": "2026-11-08", "enable_thinking": false}),
+            "a template variable other than enable_thinking was dropped, or won over the flat key"
+        );
     }
 
     fn chat_with(fields: &str) -> ChatCompletionRequest {
