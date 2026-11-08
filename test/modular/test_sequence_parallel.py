@@ -1,4 +1,4 @@
-"""Ulysses sequence parallelism on CPU processes over gloo.
+"""Ulysses sequence parallelism on CPU, over gloo processes unless noted.
 
 ``CommGroup.all_to_all`` and ``gather_sequence`` against the layout they promise, on
 even and uneven splits and over negative dims, and of several tensors at once against
@@ -7,8 +7,9 @@ one at a time; and
 sequence (with fewer key/value heads than query heads too), for the
 ``[S, H, D]`` and ``[B, S, H, D]`` layouts; ``attention_over_sharded_keys``, a
 replicated query over sharded keys merged by log-sum-exp, against one rank attending
-all the keys; a compiled stack over packs of new lengths, without recompiling; and the
-Wan2.2 DiT under Ulysses against the same DiT on one rank.
+all the keys; a compiled stack over packs of new lengths, without recompiling;
+``gather_sequence`` compiled with ``dynamic=False`` in one graph, over a stand-in group in
+one process; and the Wan2.2 DiT under Ulysses against the same DiT on one rank.
 """
 
 from __future__ import annotations
@@ -184,7 +185,7 @@ def test_compiled_sequence_parallel_stack_takes_new_pack_lengths_without_recompi
 
 
 def test_a_static_compile_gathers_the_sequence_in_one_graph():
-    """Wan2.2 compiles its dit with ``dynamic=False``, so the shares are plain ints there:
+    """Wan2.2 and LTX-2.5 compile their DiTs with ``dynamic=False``, so the shares are plain ints there:
     the output gather must not break the graph (``torch.sym_max`` on ints does)."""
     group = SimpleNamespace(world_size=2, all_gather=lambda x, dim: torch.cat([x, x], dim=dim))
     sizes = sp_seq_split(9, 2)
