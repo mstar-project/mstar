@@ -13,8 +13,8 @@ on:
         description: "Volume ids to fill, space-separated (empty: every one in ERAS_CACHE_VOLUMES)"
         default: ""
       models:
-        description: "Models to warm: `all` (every name in mstar serve's registry) or names, space-separated"
-        default: all
+        description: "Models to warm, space-separated (default: the most-used ones, mostly for their compile caches), or `all` (every name in mstar serve's registry)"
+        default: qwen3_5_0.8b qwen3_5_9b qwen3_tts kokoro whisper_large_v3_turbo flux2_klein
       skip:
         description: Names to leave out (checkpoints too big for the volumes)
         default: glm52 glm5_next
