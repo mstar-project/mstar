@@ -1185,7 +1185,9 @@ class MiniMaxH3Adapter(OpenAIAdapter):
         if getattr(req, "n", None) not in (None, 1):
             raise ValueError(f"MiniMax-H3 generates one video per request; got n={req.n!r}")
         mk = _passthrough(req)
-        with_audio = mk.pop("audio", True)
+        with_audio = mk.pop("audio", None)
+        if with_audio is None:  # unset or null: the default, sound
+            with_audio = True
         if not isinstance(with_audio, bool):
             raise ValueError(f"extra_body 'audio' must be true or false; got {with_audio!r}")
         last_image = mk.pop("last_image", None)

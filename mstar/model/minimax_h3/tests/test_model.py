@@ -352,6 +352,8 @@ def test_openai_adapter(tmp_path):
         VideoGenerationRequest(prompt="a dog", size="1344x768", seed=3, num_frames=124), None,
     )
     assert args.output_modalities == ["video", "audio"]
+    with_null = adapter.video_to_request(VideoGenerationRequest(prompt="a dog", audio=None), None)
+    assert with_null.output_modalities == ["video", "audio"] and "audio" not in with_null.model_kwargs
     assert {k: args.model_kwargs[k] for k in ("width", "height", "seed", "num_frames")} == {
         "width": 1344, "height": 768, "seed": 3, "num_frames": 124}
     url = PNG_URL
