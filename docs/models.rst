@@ -758,10 +758,10 @@ Qwen3-Omni notes
   runs no per-pair GEMVs: it takes the grouped GEMMs, aligned, from 1 token.
   At 1-2 tokens per-pair decode was 5-11% slower than grouped on one H200 box
   (torch 2.10, Triton 3.6) and 4-5% faster on another (torch 2.12.1, Triton
-  3.7.1); at 4 tokens grouped beat the built-in 7 on both. The cause isn't
-  isolated, but a crossover keyed by GPU name can't suit both boxes. The
-  Thinker at TP2 (expert width 384) has no H200 entry yet, so it keeps 7
-  there, unmeasured.
+  3.7.1); at 4 tokens grouped beat the built-in 7 on both. A crossover keyed
+  by GPU name can't suit both boxes, so it takes grouped, which ran within
+  about 2% on both. The Thinker at TP2 (expert width 384) has no H200 entry
+  yet, so it keeps 7 there, unmeasured.
 - ``configs/qwen3omni_pd_2gpu.yaml`` runs ``qwen3omni_pd_disaggregated.yaml``'s
   prefill/decode split on two GPUs: the prefill Thinker shares rank 0 with the
   encoders, the Talker and Code2Wav, and rank 1 runs the Thinker's decode. At
