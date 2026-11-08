@@ -231,7 +231,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     live = review.get("live_test")
     if live and mode == "full":
         checks = f" ({', '.join(live.get('checks') or [])})" if live["run"] != "none" and live.get("checks") else ""
-        after = (" No live test runs: the review didn't finish." if salvaged
+        after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
     # Only full mode can lead to an approval, by gpu_review.py's rule.
