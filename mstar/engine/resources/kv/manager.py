@@ -3317,9 +3317,11 @@ class KVManager(AttentionResource):
         with self._lock:
             if not self._movable(rid):
                 return (
-                    f"KV {self.name}: {rid} is guaranteed, has a step or a read in flight on its pages, holds a "
-                    "lease no walk's admit has taken over, or has written nothing since its rebuild landed"
+                    f"KV {self.name}: {rid} is guaranteed, has a step or a read in flight on its pages, or holds a "
+                    "lease no walk's admit has taken over"
                 )
+            if self._rebuilt.get(rid, -1) >= self._written(rid):
+                return f"KV {self.name}: {rid} has written nothing since its rebuild landed, which a drop would waste"
             if not self._overrides[rid].rebuildable:
                 return f"KV {self.name}: {rid} can't be rebuilt on this worker"
             held = self._laid_out_tokens(rid)
@@ -4564,13 +4566,12 @@ class KVManager(AttentionResource):
 
     def _movable(self, rid: str) -> bool:
         """Whether a move can take ``rid`` as soon as it is chosen: it isn't guaranteed, no step or read is in flight on
-        its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. A
-        rebuilt request stays until a step writes past its rebuild, so every rebuild keeps at least one token, and that
-        step runs on the page its return reserved. ``rid`` also stays while it holds a lease, until a walk's admit
-        takes the lease over. The probe that took the lease moved the position counter, which a smaller hit after a
-        move couldn't move back, and a walk the cache served keeps its KV only in the lease."""
+        its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. ``rid``
+        also stays while it holds a lease, until a walk's admit takes the lease over. The probe that took the lease
+        moved the position counter, which a smaller hit after a move couldn't move back, and a walk the cache served
+        keeps its KV only in the lease."""
         return (
-            rid not in self._guaranteed and rid not in self._dropped and self._rebuilt.get(rid, -1) < self._written(rid)
+            rid not in self._guaranteed and rid not in self._dropped
             and not any(
                 stream.step_in_flight or stream.read_pending or stream.lease is not None
                 for stream in self._streams[rid].values()

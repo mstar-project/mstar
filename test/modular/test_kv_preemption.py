@@ -929,7 +929,7 @@ def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
     assert "v" in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v held back pages an older request needed"
 
 
-def test_a_rebuilt_request_isnt_chosen_again_until_it_writes_a_token():
+def test_a_rebuilt_request_isnt_dropped_again_until_it_writes_a_token():
     """A rebuilt request lands as the newest request holding pages, so the next older request that ran short dropped
     it again before it kept a token, and the whole rebuild was wasted. With requests going around more than once,
     that could repeat for as long as older requests ran short."""
@@ -938,7 +938,10 @@ def test_a_rebuilt_request_isnt_chosen_again_until_it_writes_a_token():
     while (outcome := _step(kv, "a", PAGE_SIZE)).ok:
         pass
 
-    victims = _preempt(kv, "a", outcome.reason.pages_short, droppable=lambda rid: True)
+    # as the worker asks, through the engine's drop check
+    victims = _preempt(
+        kv, "a", outcome.reason.pages_short, droppable=lambda rid: kv.check_drop(rid, kv._laid_out_tokens(rid)) is None,
+    )
 
     assert "v" not in (*victims.to_host, *victims.to_drop, *victims.to_ask), "v's rebuild was thrown away unused"
     assert victims.waits, "a took room that v's next step needs"
