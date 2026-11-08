@@ -85,7 +85,7 @@ jobs:
           echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
           export LIVE_PR_STATE=$RUNNER_TEMP/live-pr
           python3 .github/review/gpu_review.py configure
-          out="$RUNNER_TEMP/cache" && mkdir -p "$out"
+          out="$RUNNER_TEMP/lt" && mkdir -p "$out"  # where gpu_review.py wait finds the box
           jq -n --arg r "$GITHUB_REPOSITORY" --arg s "$(git rev-parse HEAD)" --arg m "$MODELS" --arg k "$SKIP" \
             --arg w "$WEIGHTS" '{repo: $r, main_sha: $s, models: $m, skip: $k, weights: $w}' > "$out/run.json"
           S=.claude/skills/live-pr-test/scripts/gpu.py
@@ -101,11 +101,11 @@ jobs:
 
       - name: Wait for it
         timeout-minutes: 700
-        run: python3 .github/review/gpu_review.py wait --out "$RUNNER_TEMP/cache"
+        run: python3 .github/review/gpu_review.py wait
 
       - name: Check that it finished
         run: |
-          last=$(tail -n 1 "$RUNNER_TEMP/cache/results/refresh.log" 2> /dev/null)
+          last=$(tail -n 1 "$RUNNER_TEMP/lt/results/refresh.log" 2> /dev/null)
           [ "$last" = "refresh done" ] || { echo "::error::The refresh of $VOLUME didn't finish: ${last:-no log}"; exit 1; }
 
       - name: Keep the log
@@ -113,9 +113,11 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: review-cache-${{ github.run_id }}-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/cache/results/refresh.log
+          path: ${{ runner.temp }}/lt/results/refresh.log
           if-no-files-found: ignore
 
       - name: Release the box
         if: always()
-        run: python3 .github/review/gpu_review.py cleanup --pr 0 --tag "$TAG"
+        env:
+          PR: 0
+        run: python3 .github/review/gpu_review.py cleanup

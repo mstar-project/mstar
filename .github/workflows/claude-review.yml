@@ -32,6 +32,11 @@ name: Claude Review
 #      model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
+#   6. Every step that isn't an action runs main's .github/review/bot.py (or,
+#      in the live-test job, gpu_review.py), never bash. Untrusted text reaches
+#      it through env vars and files, never a shell; a command line gets only
+#      values checked against a fixed pattern (a branch name, a label from the
+#      fixed list), and what it posts goes to gh on stdin.
 #
 # `/review` (full mode) adds a second job, live-test, that runs no model and no PR code
 # here either: it rents GPUs (the team's Slurm nodes, else an open Eras listing),
@@ -102,14 +107,8 @@ on:
 permissions: {}
 
 env:
-  # Credential-shaped strings, removed (sed -E "$REDACT") from everything
-  # the workflow posts or saves.
-  REDACT: |
-    s/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g
-    s/(gh[opsur]_|github_pat_)[A-Za-z0-9_]{20,}/[REDACTED]/g
-    s/hf_[A-Za-z0-9]{20,}/[REDACTED]/g
-    s/AKIA[0-9A-Z]{16}/[REDACTED]/g
-    s/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/[REDACTED]/g
+  # No __pycache__ in the tree the model reads.
+  PYTHONDONTWRITEBYTECODE: 1
 
 jobs:
   # Decides whether a comment starts a review, in which mode and with which
@@ -137,6 +136,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      # Main's copy of the bot's scripts.
+      contents: read
       # The one-line reply to a refused request.
       pull-requests: write
     env:
@@ -149,15 +150,21 @@ jobs:
       non_write_user: ${{ steps.pre.outputs.non_write_user }}
       turns: ${{ steps.pre.outputs.turns }}
     steps:
+      # Trusted: main's scripts, never the PR's.
+      - name: Check out main's scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/review
+          persist-credentials: false
+
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
       # be the PR's author, a contributor, on `/review light` or `/review
       # continue`; a full review also needs an author with write access (see the
-      # header). A request that fails only those checks gets a one-line reply
-      # (`refuse`); anyone else exits green with a notice.
-      # non_write_user is set only for that author, and only when they lack
-      # write access, so a maintainer's run is unchanged.
+      # header). A request that fails only those checks gets a one-line reply;
+      # anyone else exits green with a notice (bot.py, preflight).
       - name: Preflight
         id: pre
         env:
@@ -169,80 +176,13 @@ jobs:
           SKIP_LABEL: ${{ contains(github.event.issue.labels.*.name, 'skip-ai-review') }}
           TEAM_TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM }}
           SELF_TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS }}
-          # The command, as one of these fixed words; the comment's text itself never reaches the shell.
+          # The command, as one of these fixed words; the comment's text itself never reaches the script.
           COMMAND: >-
             ${{ (github.event.comment.body == '/review light' && 'light') ||
                 (github.event.comment.body == '/review nogpu' && 'nogpu') ||
                 (github.event.comment.body == '/review' && 'full') ||
                 (github.event.comment.body == '/review continue' && 'continue') || '' }}
-        run: |
-          if [ "$KEY_SET" != "true" ]; then
-            echo "::warning::ANTHROPIC_API_KEY is not set; skipping the review."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          case "$COMMAND" in
-            light|nogpu|full) mode=$COMMAND ;;
-            continue) mode="" ;;  # the stopped review's mode, from its handoff
-            *) echo "run=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
-          esac
-          perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2> /dev/null || echo none)
-          case "$perm" in
-            admin|maintain|write)
-              # The live test runs the PR's code: only for an author with write access too,
-              # checked against their permission (author_association can't tell write from read).
-              if [ "$COMMAND" = full ]; then
-                author_perm=$(gh api "repos/$REPO/collaborators/$AUTHOR/permission" --jq .permission 2> /dev/null || echo none)
-                case "$author_perm" in
-                  admin|maintain|write) ;;
-                  *)
-                    echo "::notice::$AUTHOR has '$author_perm' access, not write; a full review runs the PR's code."
-                    {
-                      echo "run=false"
-                      echo "refuse=\`/review\` runs this PR's code on GPUs, so it takes an author with write access; comment \`/review nogpu\` for the review without the live test."
-                    } >> "$GITHUB_OUTPUT"
-                    exit 0 ;;
-                esac
-              fi
-              {
-                echo "run=true"
-                echo "mode=$mode"
-                echo "turns=${TEAM_TURNS:-2000}"
-              } >> "$GITHUB_OUTPUT"
-              exit 0 ;;
-          esac
-          case "$ASSOC" in
-            OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR) contributor=true ;;
-            *) contributor=false ;;
-          esac
-          own=false
-          [ "$contributor" = "true" ] && [ -n "$ACTOR" ] && [ "$ACTOR" = "$AUTHOR" ] && [ "$SKIP_LABEL" != "true" ] && own=true
-          if [ "$own" = "true" ] && [[ "$COMMAND" =~ ^(light|continue)$ ]]; then
-            echo "::notice::$ACTOR has '$perm' access; reviewing their own PR as its author ($ASSOC)."
-            {
-              echo "run=true"
-              echo "mode=$mode"
-              echo "non_write_user=$ACTOR"
-              echo "turns=${SELF_TURNS:-40}"
-            } >> "$GITHUB_OUTPUT"
-          elif [ "$own" = "true" ]; then
-            echo "::notice::$ACTOR has '$perm' access, not write; this review needs write access."
-            {
-              echo "run=false"
-              echo "refuse=This review needs write access; on your own PR, comment \`/review light\`."
-            } >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::$ACTOR has '$perm' access, not write; only people with write access, or a contributor on their own PR with \`/review light\`, can request a review."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # A request the preflight turned down with a reason the commenter can act on.
-      - name: Reply to a refused request
-        if: steps.pre.outputs.refuse != ''
-        continue-on-error: true
-        env:
-          REFUSE: ${{ steps.pre.outputs.refuse }}
-        run: gh pr comment "$PR" --repo "$REPO" --body "$REFUSE" > /dev/null
+        run: python3 .github/review/bot.py preflight
 
   review:
     name: Review
@@ -296,54 +236,10 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
 
-      # Tell the commenter their /review was picked up; a comment-triggered run
-      # is otherwise invisible from the PR.
-      - name: Acknowledge the /review comment
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          COMMENT_ID: ${{ github.event.comment.id }}
-        run: gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes > /dev/null
-
-      # The PR's refs and title (an issue_comment event doesn't carry the PR's
-      # head or base). The title is untrusted; it only ever reaches the prompt.
-      - name: Resolve the PR
-        id: pr
-        continue-on-error: true
-        env:
-          MODE: ${{ needs.preflight.outputs.mode }}
-          CONTINUE: ${{ needs.preflight.outputs.mode == '' }}
-          # Someone with write access: a timeout that only stops a runaway, like the turn cap.
-          TEAM: ${{ needs.preflight.outputs.non_write_user == '' }}
-        run: |
-          gh api "repos/$REPO/pulls/$PR" > pr.json
-          if [ -z "$(jq -r '.head.repo.full_name // empty' pr.json)" ]; then
-            echo "::warning::The PR's head repository no longer exists; can't check it out."
-            echo "why=its head repository (the fork) no longer exists" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
-          {
-            echo "continue=$CONTINUE"
-            echo "head_sha=$(jq -r .head.sha pr.json)"
-            echo "head_repo=$(jq -r .head.repo.full_name pr.json)"
-            # Mode sets the prompt's reporting bar and the reasoning effort.
-            # Without --effort, Claude Code uses its default for Opus (medium).
-            # A /review continue takes the mode, effort and timeout of the review it continues.
-            case "$MODE" in
-              nogpu|full) echo "mode=$MODE"; echo "effort=xhigh"; timeout=45 ;;
-              *) echo "mode=light"; echo "effort=high"; timeout=25 ;;
-            esac
-            [ "$TEAM" = "true" ] && timeout=300
-            echo "timeout=$timeout"
-            delim="TITLE_$(openssl rand -hex 8)"
-            echo "title<<$delim"; jq -r .title pr.json; echo "$delim"
-          } >> "$GITHUB_OUTPUT"
-
       # Trusted: main's tip, pinned by name, never the PR's base branch or
       # base.sha, which for a stacked or old PR would be stale rules.
-      # AGENTS.md and the review prompt come from here.
+      # AGENTS.md, the review prompt and the bot's scripts come from here.
       - name: Check out main
-        if: steps.pr.outcome == 'success'
         id: base
         continue-on-error: true
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -351,69 +247,36 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
+      # React 👀 to the /review comment, since a comment-triggered run is otherwise
+      # invisible from the PR; then the PR's refs and title (an issue_comment event
+      # doesn't carry the PR's head or base) and the review's settings.
+      - name: Resolve the PR
+        if: steps.base.outcome == 'success'
+        id: pr
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          MODE: ${{ needs.preflight.outputs.mode }}
+          NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
+        run: python3 .github/review/bot.py resolve
+
       # /review continue: fetch the handoff a stopped review saved (see "Write
-      # the handoff" below); it waits in $RUNNER_TEMP until the diff step. The newest
-      # unexpired artifact for this PR wins, and only from this workflow on a
-      # trigger that runs the base repository's copy of it. The handoff's mode
-      # is kept; a nogpu one needs write access to continue, like `/review
-      # nogpu`. Values from handoff.json are checked before use. A stopped
-      # review can be continued only while its "didn't complete" comment is
-      # still open: any later run that finishes rewrites that comment as
-      # resolved, so a handoff it superseded is never used.
+      # the handoff" below); it waits in $RUNNER_TEMP until the diff step
+      # (bot.py, restore, says which handoffs it trusts).
       - name: Restore the stopped review
-        if: steps.base.outcome == 'success' && steps.pr.outputs.continue == 'true'
+        if: steps.pr.outcome == 'success' && steps.pr.outputs.continue == 'true'
         id: prev
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           NON_WRITE: ${{ needs.preflight.outputs.non_write_user }}
-        run: |
-          name="claude-review-handoff-$PR"
-          fail() { echo "why=$1" >> "$GITHUB_OUTPUT"; echo "::notice::$1"; exit 1; }
-          open_ids=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
-              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
-                (.body | startswith("<!-- claude-review-incomplete -->"))) | .id') \
-            || fail "the PR's comments couldn't be read; try \`/review continue\` again"
-          [ -n "$open_ids" ] || fail "there is no stopped review of this PR to continue: none stopped part-way, or a later run already finished (handoffs are kept for 7 days); ask for a new review with \`/review light\` or \`/review\`"
-          found=""
-          for run_id in $(gh api "repos/$REPO/actions/artifacts?name=$name&per_page=30" --jq '
-              [.artifacts[] | select(.expired | not)] | sort_by(.created_at) | reverse | .[].workflow_run.id'); do
-            read -r path event < <(gh api "repos/$REPO/actions/runs/$run_id" --jq '"\(.path) \(.event)"') || continue
-            case "$path:$event" in
-              .github/workflows/claude-review.yml*:issue_comment)
-                found=$run_id; break ;;
-            esac
-          done
-          [ -n "$found" ] || fail "there is no stopped review of this PR to continue (handoffs are kept for 7 days); ask for a new review with \`/review light\` or \`/review\`"
-          dir="$RUNNER_TEMP/prev"
-          gh run download "$found" --repo "$REPO" -n "$name" -D "$dir" \
-            || fail "the saved handoff couldn't be downloaded; try \`/review continue\` again"
-          meta="$dir/handoff.json"
-          mode=$(jq -r '.mode // empty' "$meta" 2> /dev/null) || fail "the saved handoff is malformed"
-          # A handoff saved before the modes were renamed carries the old name.
-          mode=$(python3 -c 'import runpy, sys; print(runpy.run_path(".github/review/render_summary.py")["current_mode"](sys.argv[1]))' "$mode")
-          [ -s "$dir/handoff.md" ] || fail "the saved handoff is malformed"
-          [ "$(jq -r '.pr' "$meta")" = "$PR" ] || fail "the saved handoff is for another PR"
-          [ "$(jq -r '.head_sha' "$meta")" = "$HEAD_SHA" ] \
-            || fail "the PR has new commits since that review stopped; ask for a new review of the current head with \`/review light\` or \`/review\`"
-          case "$mode" in
-            light) effort=high; timeout=25 ;;
-            nogpu)
-              [ -z "$NON_WRITE" ] || fail "continuing a nogpu review takes write access, like \`/review nogpu\`"
-              effort=xhigh; timeout=45 ;;
-            full) fail "a \`/review\` that stopped can't be continued (its live test never started); comment \`/review\` again" ;;
-            *) fail "the saved handoff is malformed" ;;
-          esac
-          [ -n "$NON_WRITE" ] || timeout=300
-          {
-            echo "dir=$dir"
-            echo "mode=$mode"; echo "effort=$effort"; echo "timeout=$timeout"
-          } >> "$GITHUB_OUTPUT"
+        run: python3 .github/review/bot.py restore
 
       # Untrusted: the PR's tree, for reading changed files in full context.
       # Never executed.
       - name: Check out the PR into pr-head/
-        if: steps.base.outcome == 'success' && steps.prev.outcome != 'failure'
+        if: steps.pr.outcome == 'success' && steps.prev.outcome != 'failure'
         id: head
         continue-on-error: true
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -432,133 +295,7 @@ jobs:
           PREV: ${{ steps.prev.outputs.dir }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
-        run: |
-          if [ -n "$PREV" ]; then cp "$PREV/handoff.md" handoff.md; fi
-          # GitHub refuses `gh pr diff` past 20,000 lines or 300 files. Fall back
-          # to the files API (up to 3,000 files; it omits the patch of a file
-          # that is too large on its own). A removed file's new side is /dev/null,
-          # as in git's own diff.
-          if ! gh pr diff "$PR" --repo "$REPO" > pr.diff 2> diff.err; then
-            echo "::warning::gh pr diff failed ($(head -c 300 diff.err)); building pr.diff from the files API."
-            gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[] |
-              (.previous_filename // .filename) as $old |
-              (if .status == "removed" then "/dev/null" else "b/\(.filename)" end) as $new |
-              "diff --git a/\($old) b/\(.filename)\n--- a/\($old)\n+++ \($new)\n\(.patch // "(no patch from GitHub: binary, or too large to show)")"' > pr.diff
-          fi
-          gh pr view "$PR" --repo "$REPO" --json body --jq .body > pr-body.md
-
-          # Inline review comments, each marked with its thread's resolved and
-          # outdated state (only GraphQL has those), and `mine` when this bot posted it.
-          gh api --paginate "repos/$REPO/pulls/$PR/comments" \
-            --jq '.[] | {id, user: .user.login, path, line, side, in_reply_to_id, body}' | jq -s . > review-comments.json
-          gh api graphql --paginate -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
-            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
-              repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-                reviewThreads(first: 100, after: $endCursor) {
-                  pageInfo { hasNextPage endCursor }
-                  nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId } } }
-                } } } }' \
-            --jq '.data.repository.pullRequest.reviewThreads.nodes[] |
-              {id: .comments.nodes[0].databaseId, resolved: .isResolved, outdated: .isOutdated}' | jq -s . > threads.json
-          bots=$(python3 -c 'import json, runpy; print(json.dumps(runpy.run_path(".github/review/render_summary.py")["BOTS"]))')
-          jq --slurpfile t threads.json --argjson bots "$bots" '
-            ($t[0] | map({key: (.id | tostring), value: {resolved, outdated}}) | from_entries) as $m
-            | map(. + ($m[(.in_reply_to_id // .id) | tostring] // {})
-                  + {mine: (.user as $u | any($bots[]; . + "[bot]" == $u))})' review-comments.json > pr-comments.json
-
-          # The conversation tab: replies to the summary, and the author's answers.
-          gh api --paginate "repos/$REPO/issues/$PR/comments" \
-            --jq '.[] | {id, user: .user.login, created_at, body}' | jq -s . > pr-conversation.json
-
-          # A re-review starts from this bot's last summary, when its commit is still an ancestor
-          # of the head: the review re-checks those findings and reads only what changed since
-          # (review-prompt.md, "Re-review"). After a force-push it reviews the whole PR again, and
-          # a nogpu or full review does too unless the last one was nogpu or full and skipped nothing.
-          # The state is read only from the bot's own summaries: comments that start with the
-          # summary's marker, in which model text can't open an HTML comment.
-          oneline='.commits[] | "\(.sha[0:10]) \(if (.parents | length) > 1 then "[merge] " else "" end)\(.commit.message | split("\n")[0])"'
-          if [ -z "$PREV" ]; then
-            jq -r '[.[] | select(.user == "mstar-review[bot]" or .user == "github-actions[bot]")
-                    | select(.body | startswith("<!-- claude-review-summary -->"))] | last | .body // empty' \
-              pr-conversation.json | python3 .github/review/render_summary.py --state --mode "$MODE" > last-review.json
-            last=$(jq -r '.head // empty' last-review.json 2> /dev/null)
-            # A diff GitHub won't give (too large, say) means a full review, never an empty since.diff.
-            if [ -n "$last" ] && [ "$(gh api "repos/$REPO/compare/$last...$HEAD_SHA" --jq .status 2> /dev/null)" = "ahead" -o "$last" = "$HEAD_SHA" ] &&
-              gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$last...$HEAD_SHA" > since.diff; then
-              gh api --paginate "repos/$REPO/compare/$last...$HEAD_SHA" --jq "$oneline" > since-commits.txt \
-                || : > since-commits.txt
-              echo "::notice::Re-review: this PR was last reviewed at ${last:0:10}."
-              echo "rereview=true" >> "$GITHUB_OUTPUT"
-            else
-              rm -f last-review.json since.diff
-            fi
-          fi
-
-          # full mode: the diff and commits since the PR's last live test, when it passed on an ancestor of the
-          # head, for the review's live-test call (review-prompt.md, Re-review step 4). Read as gpu_review.py
-          # carry reads it: the bot's own live-test comments, by their first line, the marker, alone.
-          # Without both files (GitHub refused either) the review judges the whole PR.
-          if [ "$MODE" = full ]; then
-            live=$(jq -r --argjson bots "$bots" '[.[] | select(.user as $u | any($bots[]; . + "[bot]" == $u))
-                | (.body // "" | split("\n")[0] // "")
-                | capture("\\A<!-- claude-live-test sha=(?<sha>[0-9a-f]{40}) verdict=(?<verdict>[a-z]+) -->\\z")]
-                | last | select(.verdict == "pass") | .sha' pr-conversation.json)
-            if [ -n "$live" ] &&
-              [[ "$(gh api "repos/$REPO/compare/$live...$HEAD_SHA" --jq .status 2> /dev/null)" =~ ^(ahead|identical)$ ]]; then
-              gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$live...$HEAD_SHA" > since-live-test.diff &&
-                gh api --paginate "repos/$REPO/compare/$live...$HEAD_SHA" --jq "$oneline" > since-live-test-commits.txt \
-                || rm -f since-live-test.diff since-live-test-commits.txt
-            fi
-          fi
-
-          # The PRs stacked above this one, for a finding one of them fixes (fixed_above): every open PR
-          # based on this PR's branch, then on theirs, up to 5. above-<n>.diff is the change from this
-          # head to PR n's head, and stacked-above.json lists them as [{number, head_sha}]; the summary
-          # counts a finding as fixed above only in one of them. Only a branch of this repository can
-          # have PRs based on it, so only PRs from this repository count and have their branches walked
-          # (a fork's branch name can match a branch here), and a PR counts only when its head descends
-          # from this head. Branch names and commits reach a command line only after jq has checked them.
-          # A failed fetch leaves none of these files, so a finding said to be fixed above stays open, and
-          # the review still runs.
-          stacked_above() {
-            local branches=() ref list n sha next status
-            ref=$(gh api "repos/$REPO/pulls/$PR" --jq 'select(.head.repo.full_name == .base.repo.full_name)
-                | .head.ref | select(test("^[A-Za-z0-9._/][A-Za-z0-9._/-]*$"))') || return 1
-            [ -z "$ref" ] || branches=("$ref")
-            echo '[]' > stacked-above.json
-            while [ ${#branches[@]} -gt 0 ] && [ "$(jq length stacked-above.json)" -lt 5 ]; do
-              list=$(gh pr list --repo "$REPO" --base "${branches[0]}" --state open \
-                --json number,headRefName,headRefOid,isCrossRepository \
-                --jq '.[] | select((.isCrossRepository | not) and (.number | type == "number") and (.headRefOid | test("^[0-9a-f]{40}$"))
-                  and (.headRefName | test("^[A-Za-z0-9._/][A-Za-z0-9._/-]*$"))) | "\(.number) \(.headRefOid) \(.headRefName)"') \
-                || return 1
-              branches=("${branches[@]:1}")
-              while read -r n sha next; do
-                [ -n "$n" ] && [ "$(jq length stacked-above.json)" -lt 5 ] || continue
-                status=$(gh api "repos/$REPO/compare/$HEAD_SHA...$sha" --jq .status) || return 1
-                [ "$status" = ahead ] || continue
-                gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$HEAD_SHA...$sha" > "above-$n.diff" \
-                  || return 1
-                jq --argjson n "$n" --arg sha "$sha" '. + [{number: $n, head_sha: $sha}]' stacked-above.json > above.json \
-                  && mv above.json stacked-above.json || return 1
-                branches+=("$next")
-              done <<< "$list"
-            done
-          }
-          stacked_above || rm -f above-*.diff above.json stacked-above.json
-          [ ! -f stacked-above.json ] || echo "above=$(jq -c . stacked-above.json)" >> "$GITHUB_OUTPUT"
-
-          # The open issues, [{number, title}], so a latent bug on main can name the one that tracks it.
-          # Titles are user text: the model reads them as untrusted data, and no command line gets them.
-          # A failed fetch leaves no file, and the review says it couldn't check.
-          gh issue list --repo "$REPO" --state open --limit 1000 --json number,title > open-issues.json \
-            || rm -f open-issues.json
-
-          echo "lines=$(wc -l < pr.diff)" >> "$GITHUB_OUTPUT"
-          # The summary's fields, from main, for --json-schema. Assigned first so
-          # a failure ends the step rather than passing an empty schema.
-          schema=$(python3 .github/review/render_summary.py --schema)
-          echo "schema=$schema" >> "$GITHUB_OUTPUT"
+        run: python3 .github/review/bot.py collect
 
       - name: Review
         if: steps.diff.outcome == 'success'
@@ -595,7 +332,7 @@ jobs:
             pr.diff is ${{ steps.diff.outputs.lines }} lines.
             Turn cap: ${{ needs.preflight.outputs.turns }}.
             ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
-            ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json, since.diff and since-commits.txt are present. Follow the prompt''s Re-review section.' || '' }}
+            ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json is present, with since.diff and since-commits.txt or, after a rebase, interdiff.diff. Follow the prompt''s Re-review section.' || '' }}
           # No shell or edits; web reads only from the sites listed here (GitHub, the
           # vLLM and SGLang docs, Hugging Face, PyTorch, arXiv) and Claude Code's
           # built-in documentation sites, so the review can read how other projects do it. The only write tool is the inline-
@@ -639,43 +376,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
-        run: |
-          f="$RUNNER_TEMP/claude-execution-output.json"
-          if [ ! -s "$f" ]; then
-            echo "why=it stopped before Claude Code returned (a timeout or a setup error)" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Out of API credit: a one-line answer instead of a "didn't complete"
-          # comment, since there's nothing to retry or continue until it's
-          # topped up.
-          if jq -e 'any(.[]; .type == "assistant" and (.error == "billing_error" or
-                ([.message.content[]? | select(.type == "text") | .text] | join("") | startswith("Credit balance is too low"))))' \
-              "$f" > /dev/null; then
-            echo "::warning::The Anthropic API account is out of credit; skipping the review."
-            echo "billing=true" >> "$GITHUB_OUTPUT"
-            gh pr comment "$PR" --repo "$REPO" \
-              --body "The review didn't run: the API account for the review bot is out of credit." > /dev/null
-            exit 0
-          fi
-          res=$(jq -c '[.[] | select(.type == "result")] | last // {}' "$f")
-          turns=$(jq -r '.num_turns // "?"' <<< "$res")
-          subtype=$(jq -r '.subtype // empty' <<< "$res")
-          output=$(jq -c 'select(.subtype == "success" and (.is_error | not) and (.structured_output | type == "object"))
-            | .structured_output' <<< "$res")
-          {
-            echo "detail=$turns turns"
-            if [ -n "$output" ]; then
-              delim="OUT_$(openssl rand -hex 8)"
-              echo "structured_output<<$delim"; printf '%s\n' "$output"; echo "$delim"
-            else
-              case "$subtype" in
-                error_max_turns) echo "why=it ran out of turns" ;;
-                error_during_execution) echo "why=Claude Code stopped on an error" ;;
-                success) echo "why=it finished without returning a summary" ;;
-                *) echo "why=Claude Code ended without a result" ;;
-              esac
-            fi
-          } >> "$GITHUB_OUTPUT"
+        run: python3 .github/review/bot.py salvage
 
       # What the run used, from the execution file or, after a timeout, the
       # session transcript: a table in the job summary, and a small artifact to
@@ -687,13 +388,9 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
-          CONTINUE: ${{ steps.prev.outputs.dir != '' }}
+          PREV: ${{ steps.prev.outputs.dir }}
           OUTCOME: ${{ steps.review.outcome }}
-        run: |
-          python3 .github/review/session.py usage --pr "$PR" --head "$HEAD_SHA" --mode "$MODE" \
-            --continue "$CONTINUE" --outcome "$OUTCOME" --summary "$GITHUB_STEP_SUMMARY" \
-            --out "$RUNNER_TEMP/usage/review-usage-$PR-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT.json" \
-            "$RUNNER_TEMP/claude-execution-output.json" "$HOME/.claude/projects"
+        run: python3 .github/review/bot.py usage
 
       - name: Upload the usage record
         if: always() && steps.usage.outcome == 'success'
@@ -705,13 +402,9 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
 
-      # The summary is model output from untrusted input. It reaches the shell
+      # The summary is model output from untrusted input. It reaches the script
       # only through an env var, is rendered by main's render_summary.py, and
-      # credential-shaped strings are redacted before it's posted. Each run
-      # posts its own summary comment, so a re-review doesn't overwrite the last
-      # one. A "didn't complete" comment left by an earlier run is then
-      # rewritten to point here, and loses its marker so a later failure starts
-      # a fresh one.
+      # credential-shaped strings are redacted before it's posted (bot.py, post).
       # Parsed by the script, not fromJSON(): a template error in `env` would
       # fail the step outright, past continue-on-error.
       - name: Post the summary
@@ -725,97 +418,32 @@ jobs:
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
-        run: |
-          # Read after the review posted its inline comments, so the status line
-          # counts them along with earlier ones still open.
-          gh api graphql --paginate --slurp -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
-            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
-              repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-                reviewThreads(first: 100, after: $endCursor) {
-                  pageInfo { hasNextPage endCursor }
-                  nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body } } }
-                } } } }' > threads-now.json
-          salvaged=()
-          [ "$SALVAGED" != "true" ] || salvaged=(--salvaged)
-          printf '%s' "$OUTPUT" | python3 .github/review/render_summary.py --head "$HEAD_SHA" --mode "$MODE" \
-            --threads threads-now.json --above stacked-above.json "${salvaged[@]}" | sed -E "$REDACT" > summary.md
-          # A summary the script can't render leaves the file empty.
-          grep -q '[^[:space:]]' summary.md || { echo "::warning::The review returned no summary to render."; exit 1; }
-          if [ "$SALVAGED" = "true" ]; then
-            printf '\n<sub>This review finished but went past the workflow'"'"'s turn limit (%s), so the action reported it as failed.</sub>\n' "$DETAIL" >> summary.md
-          fi
-          url=$(gh pr comment "$PR" --repo "$REPO" --body-file summary.md)
-          echo "id=${url##*-}" >> "$GITHUB_OUTPUT"
-          for id in $(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
-              select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
-                (.body | startswith("<!-- claude-review-incomplete -->"))) | .id' 2> /dev/null); do
-            printf '<!-- claude-review-incomplete-resolved -->\nAn earlier review run didn'"'"'t complete; a later run finished: %s\n' "$url" > resolved.md
-            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@resolved.md > /dev/null || true
-          done
+        run: python3 .github/review/bot.py post
 
       # Hide the earlier summaries as outdated, so the PR shows only the latest
-      # one and each earlier one stays a click away. Summaries from before the
-      # marker start with the heading instead. Only GraphQL says which comments
-      # are already hidden.
+      # one and each earlier one stays a click away.
       - name: Hide earlier summaries
         if: steps.post.outcome == 'success'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
           NEW_ID: ${{ steps.post.outputs.id }}
-        run: |
-          gh api graphql --paginate -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
-            query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
-              repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-                comments(first: 100, after: $endCursor) {
-                  pageInfo { hasNextPage endCursor }
-                  nodes { id databaseId isMinimized author { login } body }
-                } } } }' > comments.json
-          for node in $(jq -r --arg new "$NEW_ID" '.data.repository.pullRequest.comments.nodes[] |
-              select((.author.login == "mstar-review" or .author.login == "github-actions") and (.isMinimized | not) and (.databaseId | tostring) != $new and
-                ((.body | startswith("<!-- claude-review-summary -->")) or (.body | startswith("### Automated review"))))
-              | .id' comments.json); do
-            gh api graphql -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }' \
-              -f id="$node" > /dev/null
-          done
+        run: python3 .github/review/bot.py hide
 
-      # The PR's type/* labels, from the review's structured output. Model
-      # output, so each is checked against the fixed list before it reaches
-      # the API; type/* labels the review no longer returns are removed. Area
-      # and size labels come from pr-labels.yml.
+      # The PR's type/* labels, from the review's structured output, each checked
+      # against the fixed list. Area and size labels come from pr-labels.yml.
       - name: Set the type labels
         if: steps.post.outcome == 'success'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
           OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
-        run: |
-          types=()
-          while IFS= read -r t; do
-            case "$t" in
-              new-model|bug|perf|feature|refactor|test|docs|ci) types+=("type/$t") ;;
-            esac
-          done < <(printf '%s' "$OUTPUT" | jq -r '.types // [] | .[] | strings')
-          if [ ${#types[@]} -eq 0 ]; then
-            echo "::warning::The review returned no valid type; leaving the type labels alone."
-            exit 0
-          fi
-          for old in $(gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name | select(startswith("type/"))'); do
-            [[ " ${types[*]} " == *" $old "* ]] || gh api -X DELETE "repos/$REPO/issues/$PR/labels/${old//\//%2F}" > /dev/null
-          done
-          for label in "${types[@]}"; do
-            gh api "repos/$REPO/labels/${label//\//%2F}" > /dev/null 2>&1 ||
-              gh api -X POST "repos/$REPO/labels" -f name="$label" -f color=fbca04 > /dev/null
-            gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$label" > /dev/null
-          done
+        run: python3 .github/review/bot.py labels
 
       # A review that stopped before it finished: write the handoff a
-      # `/review continue` starts from, from the execution file or, after a
-      # timeout, the transcript Claude Code writes as it goes. A continued run
-      # that stops too merges its handoff onto the one it started from. Also
-      # writes partial.md, what the "didn't complete" comment shows. Model
-      # notes on the PR's own content; credential-shaped strings are redacted
-      # as for the summary. Artifacts are public on a public repo.
+      # `/review continue` starts from, and partial.md, what the "didn't
+      # complete" comment shows (bot.py, handoff). Model notes on the PR's own
+      # content, redacted as the summary is. Artifacts are public on a public repo.
       - name: Write the handoff for /review continue
         if: >-
           always() && steps.review.outcome == 'failure' &&
@@ -826,15 +454,7 @@ jobs:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
           PREV: ${{ steps.prev.outputs.dir }}
-        run: |
-          out="$RUNNER_TEMP/handoff"
-          prev=()
-          [ -z "$PREV" ] || prev=(--previous "$PREV/handoff.json")
-          python3 .github/review/session.py handoff --pr "$PR" --head "$HEAD_SHA" --mode "$MODE" \
-            --diff pr.diff --out "$out" --comment partial.md "${prev[@]}" \
-            "$RUNNER_TEMP/claude-execution-output.json" "$HOME/.claude/projects"
-          sed -E -i "$REDACT" "$out/handoff.json" "$out/handoff.md" partial.md
-          echo "dir=$out" >> "$GITHUB_OUTPUT"
+        run: python3 .github/review/bot.py handoff
 
       - name: Upload the handoff
         if: always() && steps.save.outcome == 'success'
@@ -849,51 +469,25 @@ jobs:
 
       # Anything above failed: say so on the PR rather than leaving silence.
       # A run the preflight skipped never gets here. Repeated failures update
-      # one comment, found by its marker, so retries don't stack up comments.
-      # A refused /review continue has a marker of its own, so it never writes
-      # over a stopped review's comment (its partial results, and that it can
-      # still be continued by someone else).
+      # one comment, so retries don't stack up comments; a refused /review
+      # continue has a comment of its own (bot.py, incomplete). It runs main's
+      # script, so a failure to check out main stays in the log.
       - name: Report a review that didn't complete
         if: >-
           always() && steps.salvage.outputs.billing != 'true' &&
           (steps.pr.outcome == 'failure' || steps.prev.outcome == 'failure' ||
-           steps.base.outcome == 'failure' || steps.head.outcome == 'failure' ||
+           steps.head.outcome == 'failure' ||
            steps.diff.outcome == 'failure' || steps.post.outcome == 'failure' ||
            (steps.review.outcome == 'failure' && steps.salvage.outputs.structured_output == ''))
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
-          WHY: ${{ steps.prev.outputs.why || steps.salvage.outputs.why || steps.pr.outputs.why || 'a step failed' }}
+          WHY: ${{ steps.prev.outputs.why || steps.salvage.outputs.why || steps.pr.outputs.why }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
           CAN_CONTINUE: ${{ steps.upload.outcome == 'success' }}
           REFUSED: ${{ steps.prev.outcome == 'failure' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          if [ "$REFUSED" = "true" ]; then
-            # /review continue that had nothing usable to continue from; WHY says what to do.
-            marker='<!-- claude-review-continue-refused -->'
-            printf '%s\n`/review continue` didn'"'"'t run: %s. [Log](%s).\n' "$marker" "$WHY" "$RUN_URL" > failed.md
-          elif [ "$CAN_CONTINUE" = "true" ]; then
-            next='Comment `/review continue` to continue from its notes in a fresh session (kept for 7 days), or the same `/review` command to start over.'
-          else
-            next='Comment the same `/review` command to retry.'
-          fi
-          if [ "$REFUSED" != "true" ]; then
-            marker='<!-- claude-review-incomplete -->'
-            printf '<!-- claude-review-incomplete -->\nThe automated review didn'"'"'t complete: %s%s. [Log](%s). %s\n' \
-              "$WHY" "${DETAIL:+ ($DETAIL)}" "$RUN_URL" "$next" > failed.md
-          fi
-          if [ -s partial.md ]; then
-            printf '\nWhat it had so far:\n\n' >> failed.md
-            cat partial.md >> failed.md
-          fi
-          id=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq ".[] |
-            select((.user.login == \"mstar-review[bot]\" or .user.login == \"github-actions[bot]\") and (.body | startswith(\"$marker\"))) | .id" 2> /dev/null | tail -n 1)
-          if [ -n "$id" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$id" -F body=@failed.md > /dev/null
-          else
-            gh pr comment "$PR" --repo "$REPO" --body-file failed.md
-          fi
+        run: python3 .github/review/bot.py incomplete
 
   # `/review` (full mode), after the review: the live test on GPUs, then the approval
   # rule. Fixed steps only; see the header. Its own group, so a later
@@ -927,56 +521,43 @@ jobs:
       # gpu.py's settings, from repository variables; the Slurm nodes' key from a secret, and
       # each node's host and pinned host key from REVIEW_SLURM_NODES. Nothing here reaches the box.
       - name: Configure the GPUs
-        id: cfg
         env:
           SLURM_KEY: ${{ secrets.REVIEW_SLURM_SSH_KEY }}
           SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
-          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS || '4' }}
-          HOURS: ${{ vars.REVIEW_GPU_HOURS || '4' }}
-          MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
-          MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS || '2' }}
+          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
+          HOURS: ${{ vars.REVIEW_GPU_HOURS }}
+          MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
+          MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS }}
           ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
           ERAS_CACHE_VOLUMES: ${{ vars.ERAS_CACHE_VOLUMES }}
+        run: python3 .github/review/gpu_review.py configure
+
+      # The review's fields as files for the steps below, whether the PR's author has write access
+      # (the live test runs the PR's code: only then), and the box's size.
+      - name: Read the review
+        id: cfg
+        env:
           RESULT: ${{ needs.review.outputs.result }}
           ABOVE: ${{ needs.review.outputs.above }}
-        run: |
-          # gpu.py's ledger, for this run only. Set here: a job's env can't read `runner`.
-          echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/live-pr"
-          python3 .github/review/gpu_review.py configure
-          printf '%s' "$RESULT" > review.json
-          [ -z "$ABOVE" ] || printf '%s' "$ABOVE" > stacked-above.json
-          # The live test runs the PR's code: only for an author with write access, checked
-          # against their permission (author_association can't tell write from read).
-          gh api "repos/$REPO/pulls/$PR" > pr.json
-          author=$(jq -r .user.login pr.json)
-          perm=$(gh api "repos/$REPO/collaborators/$author/permission" --jq .permission 2> /dev/null || echo none)
-          case "$perm" in admin|maintain|write) echo "trusted=true" >> "$GITHUB_OUTPUT" ;; esac
-          gpus=$(jq -r --argjson cap "$MAX_GPUS" '[.live_test.gpus // 1, $cap] | min' review.json)
-          { echo "gpus=$gpus"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
+          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
+          HOURS: ${{ vars.REVIEW_GPU_HOURS }}
+        run: python3 .github/review/gpu_review.py inputs
 
       # Nothing runs while the review left an open P0–P2 finding (counted as the approval rule counts
-      # them) or a skipped file (`gated`; the reasons go to gate.txt, as they hold
-      # model text): the comment says what to fix first. Otherwise the review's call stands unless the
-      # PR's last live test didn't pass on an ancestor of this head, or a re-review's `targeted`, or
-      # its `none` on runtime code, has no live test before it (gpu_review.py carry):
-      # then the live test runs in full, every kind of check, so a failure is never hidden. After a
-      # pass on an ancestor, a `targeted` run is told that commit and given that report. A `none`
-      # that stands runs nothing (verdict `skipped`), and counts as a pass for approval after that
-      # pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
-      # test, so the next run still checks against the last real one. A failed read of the PR's
-      # comments fails this step.
+      # them) or a skipped file (`gated`): the comment says what to fix first. Otherwise the review's
+      # call stands unless the PR's last live test didn't pass on an ancestor of this head, or a
+      # re-review's `targeted`, or its `none` on runtime code, has no live test before it: then the live
+      # test runs in full, every kind of check, so a failure is never hidden (gpu_review.py, carry). A
+      # `none` that stands runs nothing (verdict `skipped`), and counts as a pass for approval after
+      # that pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
+      # test, so the next run still checks against the last real one. A failed read of the PR's comments
+      # fails this step.
       - name: Check the last live test
         if: steps.cfg.outputs.trusted == 'true'
         id: carry
         env:
           REREVIEW: ${{ needs.review.outputs.rereview }}
-        run: |
-          set -o pipefail  # an error in the decision fails this step, rather than tee's exit 0 hiding it
-          python3 .github/review/gpu_review.py carry --pr "$PR" --sha "$HEAD_SHA" --review review.json \
-            --earlier-report earlier-live-test.md --above stacked-above.json --gate "$RUNNER_TEMP/gate.txt" \
-            ${REREVIEW:+--rereview} | tee carry.log
-          grep '^[a-z_]*=' carry.log >> "$GITHUB_OUTPUT"
+        run: python3 .github/review/gpu_review.py carry
 
       - name: Get GPUs and start the live test
         if: steps.carry.outputs.run == 'full' || steps.carry.outputs.run == 'targeted'
@@ -986,39 +567,27 @@ jobs:
           # The box's own key, never the review's: the box runs PR code with a shell.
           LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
+          GPUS: ${{ steps.cfg.outputs.gpus }}
+          HOURS: ${{ steps.cfg.outputs.hours }}
           RUN: ${{ steps.carry.outputs.run }}
           CHECKS: ${{ steps.carry.outputs.checks }}
           SINCE: ${{ steps.carry.outputs.since }}
           FORCED: ${{ steps.carry.outputs.forced }}
           ASKED: ${{ steps.carry.outputs.asked }}
           ASKED_CHECKS: ${{ steps.carry.outputs.asked_checks }}
-        run: |
-          set +e
-          python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
-            --base "$BASE" \
-            --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
-            --run "$RUN" --checks "$CHECKS" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
-            ${FORCED:+--forced "$FORCED" --asked "$ASKED" --asked-checks "$ASKED_CHECKS"} \
-            --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
-          code=$?
-          [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
-          exit $code
+          TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM }}
+        run: python3 .github/review/gpu_review.py start
 
       - name: Wait for the live test
         if: steps.start.outcome == 'success'
         id: wait
         continue-on-error: true
         timeout-minutes: 340
-        run: |
-          set +e
-          python3 .github/review/gpu_review.py wait --out "$RUNNER_TEMP/lt"
-          code=$?
-          [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
-          exit $code
+        run: python3 .github/review/gpu_review.py wait
 
-      # What the box and the providers wrote, redacted in place before anything reads it, so
-      # the comment, the kept report and the artifact all get the redacted copy: the patterns
-      # above and the exact values of the secrets and hosts this job holds.
+      # What the box and the providers wrote, redacted in place before anything reads it, so the
+      # comment, the kept report and the artifact all get the redacted copy: bot.py's patterns and
+      # the exact values of the secrets and hosts this job holds.
       - name: Redact the live test's output
         if: always() && steps.cfg.outcome == 'success'
         id: redact
@@ -1028,16 +597,7 @@ jobs:
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
           NODES: ${{ vars.REVIEW_SLURM_NODES }}
-        run: |
-          # Each node's host, as configured (user@host) and bare, as ssh's errors print it.
-          mapfile -t hosts < <(jq -r '.[].host // empty | ., (split("@") | last)' <<< "${NODES:-[]}")
-          for f in "$RUNNER_TEMP/lt/results/report.md" "$RUNNER_TEMP/lt/results/result.json" "$RUNNER_TEMP/lt/unavailable.md"; do
-            [ -f "$f" ] || continue
-            for v in "$S1" "$S2" "$S3" "${hosts[@]}"; do
-              [ -z "$v" ] || python3 -c 'import sys; p, v = sys.argv[1:]; s = open(p).read().replace(v, "[REDACTED]"); open(p, "w").write(s)' "$f" "$v"
-            done
-            sed -E -i "$REDACT" "$f"
-          done
+        run: python3 .github/review/gpu_review.py redact
 
       # The media go to the gallery repository (GitHub Pages), never into this
       # repository, whose every clone would carry them. Only audio, images and
@@ -1046,11 +606,7 @@ jobs:
         if: steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
         id: render
         continue-on-error: true
-        run: |
-          python3 .github/review/gpu_review.py comment --pr "$PR" --sha "$HEAD_SHA" --out "$RUNNER_TEMP/lt" \
-            --site "$RUNNER_TEMP/site"
-          echo "verdict=$(cat "$RUNNER_TEMP/lt/verdict")" >> "$GITHUB_OUTPUT"
-          [ -e "$RUNNER_TEMP/site/index.html" ] && echo "media=true" >> "$GITHUB_OUTPUT" || true
+        run: python3 .github/review/gpu_review.py comment
 
       - name: Mint a token for the media repository
         if: steps.render.outputs.media == 'true' && vars.REVIEW_MEDIA_REPO != ''
@@ -1064,9 +620,8 @@ jobs:
           repositories: ${{ vars.REVIEW_MEDIA_REPO }}
           permission-contents: write
 
-      # The gallery keeps the newest runs that fit in 900 MB, under Pages' 1 GB site limit, as a
-      # single commit, so neither the site nor the repository grows without bound. A push that loses a race with another run fails rather
-      # than overwrite it. The comment links the gallery only once the push went through.
+      # The newest runs that fit in 900 MB, as one commit; a push that loses a race fails rather
+      # than overwrite it, and the comment links the gallery only once the push went through.
       - name: Publish the media
         if: steps.media-app.outcome == 'success'
         continue-on-error: true
@@ -1074,22 +629,7 @@ jobs:
           MEDIA_REPO: ${{ vars.REVIEW_MEDIA_REPO }}
           MEDIA_TOKEN: ${{ steps.media-app.outputs.token }}
           OWNER: ${{ github.repository_owner }}
-        run: |
-          git clone -q --depth 1 "https://x-access-token:$MEDIA_TOKEN@github.com/$OWNER/$MEDIA_REPO.git" "$RUNNER_TEMP/media"
-          cd "$RUNNER_TEMP/media"
-          branch=$(git symbolic-ref --short HEAD); old=$(git rev-parse -q --verify HEAD || true)
-          mkdir -p "pr-$PR/$TAG" && cp -r "$RUNNER_TEMP/site/." "pr-$PR/$TAG/"
-          total=0
-          for run in $(ls -d pr-*/*/ | sort -t/ -k2 -nr); do   # newest first: tags start with the run id
-            total=$((total + $(du -sb "$run" | cut -f1)))
-            [ "$total" -le 900000000 ] || rm -rf "$run"
-          done
-          git checkout -q --orphan gallery && git add -A
-          git -c user.name=mstar-review -c user.email=mstar-review@users.noreply.github.com commit -qm "Live-test media, the newest runs"
-          git push -q --force-with-lease="$branch:$old" origin "HEAD:$branch"
-          cd "$GITHUB_WORKSPACE"
-          python3 .github/review/gpu_review.py comment --pr "$PR" --sha "$HEAD_SHA" --out "$RUNNER_TEMP/lt" \
-            --media-url "https://${OWNER,,}.github.io/$MEDIA_REPO/pr-$PR/$TAG"
+        run: python3 .github/review/gpu_review.py publish
 
       # Minted here, after the live test, since the app's token lasts an hour:
       # everything below that posts or approves uses it.
@@ -1113,12 +653,7 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
           SINCE: ${{ steps.carry.outputs.since }}
-        run: |
-          set -o pipefail  # an error in the rule fails this step, rather than tee's exit 0 hiding it
-          python3 .github/review/gpu_review.py approve --pr "$PR" --sha "$HEAD_SHA" --review review.json \
-            --complete true --verdict "$VERDICT" ${SINCE:+--since "$SINCE"} --above stacked-above.json \
-            --why "$RUNNER_TEMP/why.txt" | tee approve.log
-          grep '^approval=' approve.log >> "$GITHUB_OUTPUT" || true
+        run: python3 .github/review/gpu_review.py approve
 
       # Model output from untrusted input, posted only from the redacted copies.
       - name: Post the live test
@@ -1135,30 +670,7 @@ jobs:
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
           GATED: ${{ steps.carry.outputs.gated }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          lt="$RUNNER_TEMP/lt"
-          if [ "$TRUSTED" != "true" ]; then
-            echo "The live test runs only on a PR whose author has write access; this review stands without it." > post.md
-          elif [ "$GATED" = "true" ]; then   # the reasons hold model text, so they can't open a comment
-            printf 'No live test yet: fix what the review left open first (%s), then comment `/review` again.\n' \
-              "$(sed 's/<!--/\&lt;!--/g' "$RUNNER_TEMP/gate.txt")" > post.md
-          elif [ -s "$lt/comment.md" ]; then cp "$lt/comment.md" post.md
-          elif [ -s "$lt/unavailable.md" ]; then { echo "<!-- claude-live-test sha=$HEAD_SHA verdict=unavailable -->"; cat "$lt/unavailable.md"; } > post.md
-          else   # the review chose `none` and it stood: its reason is model text, so it can't open a comment
-            printf '<!-- claude-live-test-none -->\nNo GPU run: %s\n' \
-              "$(jq -r '.live_test.reason // ""' review.json | sed 's/<!--/\&lt;!--/g')" > post.md
-          fi
-          if [ "$APPROVAL" = "approve" ]; then
-            printf '\n**Approved** on `%s` by the rule in `.github/review/gpu_review.py`.\n' "${HEAD_SHA:0:7}" >> post.md
-          elif [ "$APPROVAL" = "comment" ]; then
-            printf '\n**Would approve** `%s` by the rule in `.github/review/gpu_review.py`; doesn'"'"'t count toward required reviews: touches area/engine or area/resources.\n' "${HEAD_SHA:0:7}" >> post.md
-          elif [ -s "$RUNNER_TEMP/why.txt" ]; then
-            printf '\nNot approved: %s.\n' "$(cat "$RUNNER_TEMP/why.txt")" >> post.md
-          elif [ "$APPROVE_OUTCOME" = "failure" ]; then
-            printf '\nNot approved: the approval check failed. [Log](%s).\n' "$RUN_URL" >> post.md
-          fi
-          sed -E -i "$REDACT" post.md
-          gh pr comment "$PR" --repo "$REPO" --body-file post.md
+        run: python3 .github/review/gpu_review.py post
 
       - name: Keep the report
         if: always() && steps.wait.outcome == 'success' && steps.redact.outcome == 'success'
@@ -1176,7 +688,7 @@ jobs:
       - name: Release the GPUs
         if: always() && steps.cfg.outcome == 'success'
         continue-on-error: true
-        run: python3 .github/review/gpu_review.py cleanup --pr "$PR" --tag "$TAG"
+        run: python3 .github/review/gpu_review.py cleanup
 
       - name: Report a live test that didn't complete
         if: >-
@@ -1188,6 +700,4 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          gh pr comment "$PR" --repo "$REPO" \
-            --body "The live test didn't complete. [Log]($RUN_URL). Comment \`/review\` to retry."
+        run: python3 .github/review/gpu_review.py incomplete

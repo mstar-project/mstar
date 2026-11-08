@@ -1,23 +1,13 @@
-#!/usr/bin/env python3
 """What a review run used, and the handoff a stopped run leaves for `/review continue`.
 
 Both read Claude Code's record of the run: the action's execution file (a JSON
 array of messages) and the session transcripts under ~/.claude/projects (one
 message per line), in any mix; a directory is searched for transcripts. One API
 response spans several messages, one per content block, so responses are
-counted by their message id. Run by claude-review.yml with the default branch
-checked out:
-
-    python3 .github/review/session.py usage --pr N --head SHA --mode light \\
-        --out usage.json --summary "$GITHUB_STEP_SUMMARY" SOURCE...
-    python3 .github/review/session.py handoff --pr N --head SHA --mode light --diff pr.diff \\
-        --out DIR --comment partial.md [--previous handoff.json] SOURCE...
+counted by their message id. bot.py's `usage` and `handoff` steps call these.
 """
-import argparse
 import json
-import os
 import re
-import sys
 from pathlib import Path
 
 TOKENS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
@@ -301,70 +291,3 @@ def partial_md(h):
         return ""
     return f"**Inline comments it made ({len(made)}):**\n" + "\n".join(
         f"- `{c['path']}:{c['line']}` {c['body']}" for c in made) + "\n"
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=("usage", "handoff"))
-    ap.add_argument("sources", nargs="*", help="execution files, transcripts, or directories of transcripts")
-    ap.add_argument("--pr", required=True)
-    ap.add_argument("--head", required=True)
-    ap.add_argument("--mode", required=True)
-    ap.add_argument("--out", required=True, help="usage: the JSON record; handoff: a directory")
-    ap.add_argument("--continue", dest="cont", default="false", help="usage: whether this was /review continue")
-    ap.add_argument("--outcome", default="", help="usage: the review step's outcome")
-    ap.add_argument("--summary", help="usage: a Markdown file to append the table to, e.g. $GITHUB_STEP_SUMMARY")
-    ap.add_argument("--diff", help="handoff: pr.diff")
-    ap.add_argument("--previous", help="handoff: the handoff.json this run continued from")
-    ap.add_argument("--comment", help="handoff: where to write the \"didn't complete\" comment's part")
-    a = ap.parse_intermixed_args()
-    if a.command == "usage":
-        return record_usage(a)
-    previous = None
-    if a.previous:
-        try:
-            previous = json.loads(Path(a.previous).read_text())
-        except (OSError, ValueError) as e:
-            print(f"::warning::Couldn't read the earlier handoff, so this one starts afresh: {e}")
-    if not isinstance(previous, dict):
-        previous = None
-    diff = Path(a.diff).read_text(errors="replace") if a.diff and Path(a.diff).is_file() else ""
-    # Tool paths are absolute, under the workspace the workflow runs this from.
-    h = handoff(load(a.sources), os.getcwd(), diff_paths(diff), previous)
-    # A continued run that stopped before Claude said anything still passes on the handoff it
-    # started from, which is still valid for this head.
-    if not h.pop("seen_assistant") and previous is None:
-        print("No Claude Code messages to hand off.", file=sys.stderr)
-        return 1
-    out = Path(a.out)
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "handoff.json").write_text(json.dumps({"pr": a.pr, "head_sha": a.head, "mode": a.mode, **h}))
-    (out / "handoff.md").write_text(handoff_md(h, a.pr, a.head, a.mode))
-    if a.comment:
-        Path(a.comment).write_text(partial_md(h))
-    return 0
-
-
-def record_usage(a):
-    """Never fails: a record that couldn't be read says why in its ``error`` field."""
-    record = {"pr": a.pr, "head_sha": a.head, "mode": a.mode, "continue": a.cont == "true",
-              "run_id": os.environ.get("GITHUB_RUN_ID", ""), "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
-              "outcome": a.outcome}
-    try:
-        record.update(usage(load(a.sources)))
-    except Exception as e:
-        record["error"] = f"{type(e).__name__}: {e}"
-        print(f"::warning::Couldn't read the review's usage: {record['error']}")
-    try:
-        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(a.out).write_text(json.dumps(record, indent=1) + "\n")
-        if a.summary:
-            with open(a.summary, "a") as f:
-                f.write(usage_table(record))
-    except Exception as e:
-        print(f"::warning::Couldn't write the usage record: {e}")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

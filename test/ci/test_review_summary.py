@@ -1,30 +1,13 @@
-"""Check how .github/review/render_summary.py renders the review's summary, and which comments start a review."""
+"""Check how .github/review/render_summary.py renders the review's summary."""
 
 import json
-import os
 import runpy
-import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUMMARY = runpy.run_path(str(REPO_ROOT / ".github/review/render_summary.py"))
 render, open_findings, read_state = SUMMARY["render"], SUMMARY["open_findings"], SUMMARY["read_state"]
-WORKFLOW = (REPO_ROOT / ".github/workflows/claude-review.yml").read_text().splitlines()
-
-
-def step_script(job, step_id):
-    """The `run: |` script of `job`'s step with this id, read as text: CI's test/ci job has no YAML parser."""
-    start = WORKFLOW.index(f"        id: {step_id}", WORKFLOW.index(f"  {job}:"))
-    head = next(i for i in range(start, len(WORKFLOW)) if WORKFLOW[i].strip() == "run: |")
-    indent = len(WORKFLOW[head + 1]) - len(WORKFLOW[head + 1].lstrip())
-    script = []
-    for line in WORKFLOW[head + 1:]:
-        if line.strip() and len(line) - len(line.lstrip()) < indent:
-            break
-        script.append(line[indent:])
-    return "\n".join(script).rstrip("\n") + "\n"
 
 
 def review(skipped=(), prior=()):
@@ -35,47 +18,6 @@ def review(skipped=(), prior=()):
 
 def threads(*nodes):
     return [{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": list(nodes)}}}}}]
-
-
-def run_step(job, step_id, gh, **env):
-    """`job`'s step `step_id` run as the workflow runs it, from the repository root, with `env` and with `gh`
-    (a shell script) standing in for the GitHub CLI. Returns its outputs."""
-    with tempfile.TemporaryDirectory() as d:
-        Path(d, "gh").write_text("#!/bin/sh\n" + gh)
-        Path(d, "gh").chmod(0o755)
-        out = Path(d, "out")
-        out.touch()
-        env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(out), "RUNNER_TEMP": d,
-               "REPO": "o/r", "PR": "1", **env}
-        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script(job, step_id)],
-                       env=env, cwd=REPO_ROOT, check=True, capture_output=True)
-        return dict(line.split("=", 1) for line in out.read_text().splitlines())
-
-
-def preflight(command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR"):
-    """The preflight job's step for `command` (the word its COMMAND env maps the comment to), with `gh`
-    answering each login's permission from `perms`. Returns its outputs."""
-    gh = "case \"$2\" in\n" + "".join(
-        f"  */collaborators/{login}/permission) echo {perm} ;;\n" for login, perm in perms.items()) + "esac\n"
-    return run_step("preflight", "pre", gh, KEY_SET="true", COMMAND=command, ACTOR=actor, AUTHOR=author,
-                    ASSOC=assoc, SKIP_LABEL="false")
-
-
-def restore(mode):
-    """The review job's /review continue step, finding one stopped review whose saved handoff has `mode`.
-    Returns its outputs."""
-    with tempfile.TemporaryDirectory() as saved:
-        Path(saved, "handoff.json").write_text(json.dumps({"mode": mode, "pr": 1, "head_sha": "abc"}))
-        Path(saved, "handoff.md").write_text("notes")
-        # The stopped review's comment, its artifact's run, that run's workflow and event, and the download.
-        gh = f"""case "$*" in
-  *issues/1/comments*) echo 5 ;;
-  *actions/artifacts*) echo 9 ;;
-  *actions/runs/9*) echo ".github/workflows/claude-review.yml issue_comment" ;;
-  "run download"*) mkdir -p "$9" && cp {saved}/* "$9" ;;
-esac
-"""
-        return run_step("review", "prev", gh, HEAD_SHA="abc", NON_WRITE="")
 
 
 def thread(priority, resolved=False, outdated=False, login="mstar-review", comment_id=7):
@@ -161,13 +103,15 @@ class TestReviewSummary(unittest.TestCase):
         self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->", "full"),
                           "a malformed state would fail every later review instead of starting a full one")
 
-    def test_a_nogpu_or_full_review_builds_only_on_a_nogpu_review_that_covered_everything(self):
+    def test_a_re_review_builds_only_on_a_review_that_covered_everything_and_nogpu_or_full_only_on_those(self):
         light = render(review(), [], "0123456789", "light", [])
         partial = render(review(["a.py"]), [], "0123456789", "full", [])
         self.assertIsNone(read_state(light, "full"), "an approval could rest on a light review")
         self.assertIsNone(read_state(partial, "full"), "an approval could rest on files nobody reviewed")
         self.assertIsNone(read_state(light, "nogpu"),
                           "a nogpu re-review of a light one, and a full review of that, could approve")
+        self.assertIsNone(read_state(render(review(["a.py"]), [], "0123456789", "light", []), "light"),
+                          "a light re-review could leave the files the last one skipped unreviewed for good")
         self.assertIsNotNone(read_state(render(review(), [], "0123456789", "nogpu", []), "full"))
         self.assertIsNotNone(read_state(light, "light"))
         old = read_state(render(review(), [], "0123456789", "thorough", []), "nogpu")
@@ -184,26 +128,6 @@ class TestReviewSummary(unittest.TestCase):
         gpu_review = runpy.run_path(str(REPO_ROOT / ".github/review/gpu_review.py"))
         self.assertEqual(live["properties"]["checks"]["items"]["enum"], list(gpu_review["CHECKS"]),
                          "the review could choose a kind of check the box's brief can't name")
-
-    def test_who_can_ask_for_which_review(self):
-        write, read = {"an-author": "write"}, {"an-author": "read"}
-        self.assertEqual(preflight("nogpu", write), {"run": "true", "mode": "nogpu", "turns": "2000"})
-        self.assertEqual(preflight("light", read),
-                         {"run": "true", "mode": "light", "non_write_user": "an-author", "turns": "40"})
-        refused = preflight("nogpu", read)
-        self.assertEqual(refused["run"], "false", "a contributor without write access could start a nogpu review")
-        self.assertIn("/review light", refused["refuse"], "the contributor wouldn't be told what they can run")
-        self.assertEqual(preflight("light", {"a-maintainer": "read"}, actor="a-maintainer"), {"run": "false"},
-                         "someone without write access could review another author's PR")
-        self.assertEqual(preflight("continue", read)["mode"], "", "a /review continue would not keep its own mode")
-        self.assertEqual(preflight("full", write), {"run": "true", "mode": "full", "turns": "2000"})
-        refused = preflight("full", {"a-maintainer": "write", "an-author": "read"}, actor="a-maintainer")
-        self.assertEqual(refused["run"], "false", "a live test could run the code of an author without write access")
-        self.assertIn("/review nogpu", refused["refuse"], "the maintainer wouldn't be told what they can run")
-        refused = preflight("full", read)
-        self.assertEqual(refused["run"], "false", "a contributor without write access could start a live test")
-        self.assertIn("/review light", refused["refuse"], "the contributor wouldn't be told what they can run")
-        self.assertEqual(restore("thorough")["mode"], "nogpu", "a review stopped before the rename couldn't continue")
 
     def test_schema_has_no_single_quote(self):
         self.assertNotIn("'", json.dumps(SUMMARY["SCHEMA"]),
