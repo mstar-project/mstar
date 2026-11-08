@@ -61,6 +61,7 @@ from mstar.engine.resources.lora.store import check_adapter_file, check_adapters
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
 from mstar.model.base import KVLabel, PrefixKeys  # noqa: E402
+from mstar.testing_utils.engine import make_engine  # noqa: E402
 from mstar.testing_utils.model import make_model  # noqa: E402
 from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
@@ -466,7 +467,7 @@ class _Deployment:
                 pool.store._read = broken  # the worker's background read fails
             self.workers[worker_id] = make_worker(
                 worker_id=worker_id,
-                engine_manager=SimpleNamespace(engine=SimpleNamespace(lora_pools=lambda p=pool: [p])),
+                engine_manager=SimpleNamespace(engine=make_engine(_resources={"lora": pool})),
                 communicator=SimpleNamespace(send=self._from_worker),
             )
 
@@ -607,6 +608,8 @@ def test_requests_on_an_unloaded_adapter_finish_and_new_ones_are_refused(paths):
         ingest(pool, "r1", "a1")
         assert run_step(pool, ["r1"]).ok
     slots = {w: pool.slot_of("r1") for w, pool in d.pools.items()}
+    for pool in d.pools.values():
+        pool.drop("r1", 3)  # preempted (#870): it keeps its adapter and slot through the unload
     d.unload("a1")
     for w, pool in d.pools.items():
         assert run_step(pool, ["r1"]).ok  # still running on its slot
