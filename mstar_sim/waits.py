@@ -99,6 +99,7 @@ _poked: set[Wait] = set()
 _told_blocked = [False]  # the table says this process is blocked
 _native: dict = {}  # each watched child: its CPU clock, its last CPU time, its tasks
 _native_busy = [False]  # observed native activity contributes one running participant
+_local_busy = [False]  # it is the process's own uncounted threads: one counted thread's running ends that
 _looked = [0.0, 0.0]  # the mover's last look: when, and what the process's other threads had used
 _moved = [0.0, 0.0]  # the last move on the bound: when, and how far
 _CPU_ALLOWANCE = 1e-3  # CPU time a look lets pass as nothing: zmq's and gloo's own threads ticking over
@@ -133,7 +134,10 @@ def _run_one(thaw: bool = True) -> None:
     """A thread runs. ``thaw`` False: the mover's delivery, whose thread has yet to get a CPU. It
     counts as running, so nothing jumps over it, but the clock waits for it (:func:`leave`):
     how long the box takes to run it is no host time of mstar's."""
-    _running[0] += 1
+    if _local_busy[0]:  # the running participant it counted was this, and a counted thread now runs
+        _local_busy[0] = _native_busy[0] = False
+    else:
+        _running[0] += 1
     if thaw:
         if clock.PARKED[0]:
             _unpark()
@@ -435,6 +439,7 @@ def _watch_activity() -> None:
     if working != _native_busy[0]:
         _native_busy[0] = working
         _run_one() if working else _block_one()
+    _local_busy[0] = working and not child_busy
 
 
 def _others_cpu() -> float:
@@ -912,7 +917,7 @@ def _after_fork() -> None:
     for state in (_waits, _fds, _native, _poked):
         state.clear()
     _running[0] = 1
-    _told_blocked[0] = _native_busy[0] = clock.PARKED[0] = False
+    _told_blocked[0] = _native_busy[0] = _local_busy[0] = clock.PARKED[0] = False
     _ahead[0], _seen[0] = math.inf, -1
     _settling[:], _looked[:], _moved[:] = [0, 0.0], [0.0, 0.0], [0.0, 0.0]
     for ident in list(clock._OPEN):

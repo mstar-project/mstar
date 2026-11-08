@@ -748,14 +748,25 @@ def test_a_region_alone_holds_the_clock_still_whatever_took_its_time():
     """With no other thread running, a region's whole wall time is the emulator's, CPU or not: a
     loaded box moves no clock. (So native work on an uncounted thread beside it is hidden too.)"""
     out = run_sim("""
-        import time
+        import threading, time
         from mstar_sim import clock, waits
         t0 = time.perf_counter()
         with clock.computing():
             waits._real_sleep(0.3)  # as if the box had taken the CPU away
         print(time.perf_counter() - t0)
+        spinning = [True]
+        def spin():
+            while spinning[0]:
+                pass
+        threading.Thread(target=spin, name=waits.OWN + "spin").start()
+        threading.Event().wait(0.05)  # only the spin runs: uncounted work, which the mover counts as running
+        t0 = time.perf_counter()
+        with clock.computing():  # a counted thread runs now, so that work no longer counts
+            waits._real_sleep(0.3)
+        print(time.perf_counter() - t0)
+        spinning[0] = False
     """)
-    assert float(out) < 0.05, out
+    assert all(float(t) < 0.05 for t in out.split()), out
 
 
 def test_a_thread_woken_by_another_runs_before_the_clock_can_jump():
