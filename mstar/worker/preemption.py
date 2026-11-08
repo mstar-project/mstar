@@ -71,7 +71,7 @@ class Preemption:
             return False
         if victims.waits:
             for node in kv.nodes:
-                self._engine_manager.get_engine(node).readmit_request(node, reason.request_id, queued=False)
+                self._engine_manager.get_engine(node).readmit_request(node, reason.request_id)
             self._log(
                 self._waits_logged, (node_name, node_batch.step_context.graph_walk),
                 "KV short on node=%s walk=%s: %s waits for %d pages past its allotment, since moving "
@@ -194,7 +194,7 @@ class Preemption:
                 )
         for rid in victims.to_ask:
             for node_name in kv.nodes:
-                self._engine_manager.get_engine(node_name).readmit_request(node_name, rid, queued=True)
+                self._engine_manager.get_engine(node_name).readmit_request(node_name, rid)
                 self._log(
                     self._moves_logged, node_name,
                     "KV short on node=%s: %s, holding no page of its own, gave back its allotment for %s, "

@@ -75,13 +75,13 @@ def _worker(kv):
     """The real handlers over one pool, with the engine's drop going straight to the pool and its runner."""
     def drop_request(node, rid, tokens):
         freed = kv.drop(rid, tokens)
-        _runner(kv).readmit(rid, node, queued=True)
+        _runner(kv).readmit(rid, node)
         return freed
 
     engine = _Engine(
         drop_refusal=lambda node, rid, tokens: kv.check_drop(rid, tokens), drop_request=drop_request,
         offload_request=lambda node, rid: _offload(kv, rid),
-        readmit_request=lambda node, rid, queued: _runner(kv).readmit(rid, node, queued),
+        readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
         newer_than=lambda rid: _runner(kv).newer_than(rid),
         refusals=lambda: _runner(kv).refusals(),
         paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)],
@@ -290,7 +290,7 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
     _running(kv, "o", 4, arrival=1)
     _running(kv, "z", 6, arrival=3)
     assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
-    _runner(kv).readmit("z", NODE, queued=False)
+    _runner(kv).readmit("z", NODE)
     _request(kv, "p", 5, arrival=2)
     assert not _ready(kv, "p") and not _admitted(kv, "z")
     _remove(kv, "x")
@@ -313,7 +313,7 @@ def test_make_room_helps_the_oldest_refused_request_moves_can_let_in():
     kv._streams["p"]["main"].step_in_flight = False
     assert _preempt(kv, "p", _short(kv, "p"), droppable=lambda rid: False).waits
     for rid in ("y", "p"):
-        _runner(kv).readmit(rid, NODE, queued=False)
+        _runner(kv).readmit(rid, NODE)
     _request(kv, "o", 9, arrival=1)
     assert not _ready(kv, "o") and not _admitted(kv, "y")
     w = _worker(kv)
@@ -359,7 +359,7 @@ def test_a_request_admitted_on_a_node_it_never_parked_on_is_unparked():
     nodes = ("LLM", "LLM_cfg")
     assert all(admission.admit("q", node, "decode", None, ["kv"]) is None for node in nodes)
     for node in nodes:
-        admission.readmit("q", node, ["kv"], queued=False)
+        admission.readmit("q", node, ["kv"])
     engine = _Engine(admit_waiting=admission.admit_waiting)
     request_state = SimpleNamespace(
         get_partition_for_node=lambda node: "p",
