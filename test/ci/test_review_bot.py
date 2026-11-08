@@ -163,48 +163,48 @@ class TestSpend(unittest.TestCase):
         with mock.patch.object(bot, "run", FakeGh(routes)):
             return bot.spend("o/r", NOW)
 
-    def test_spend_sums_this_day_and_month_once_per_run_and_attempt_from_the_bots_comments_alone(self):
-        self.assertEqual(self.spend([spent(1.5), spent(2, "2026-11-01T23:59:59Z", run="2"),
-                                     spent(99, "2026-10-31T23:59:59Z", run="3")]), {"day": 1.5, "month": 3.5})
-        self.assertEqual(self.spend([spent(1), spent(1)]), {"day": 1, "month": 1},
-                         "a re-recorded run would count twice")
+    def test_spend_sums_this_utc_week_once_per_run_and_attempt_from_the_bots_comments_alone(self):
+        self.assertEqual(self.spend([spent(1.5), spent(2, "2026-11-02T00:00:00Z", run="2"),
+                                     spent(99, "2026-11-01T23:59:59Z", run="3")]), 3.5,
+                         "the week runs from Monday 00:00 UTC")
+        self.assertEqual(self.spend([spent(1), spent(1)]), 1, "a re-recorded run would count twice")
         first = spent(1, usage={"run_attempt": "1"})
-        self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "1"})])["day"], 1,
+        self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "1"})]), 1,
                          "re-running only a run's spend job would count its costs twice")
-        self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "2"})])["day"], 2,
+        self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "2"})]), 2,
                          "re-running all a run's jobs spends again, and that would go uncounted")
         live = {"usage": {"run_attempt": "1"}, "gpu_usd": 2, "box_usd": 1, "live_attempt": "1"}
         rerun = {**live, "gpu_usd": 5, "live_attempt": "2"}
         self.assertEqual(self.spend([spent(13, **live), spent(16, attempt="2", **rerun),
-                                     spent(16, attempt="3", **rerun)])["day"], 19,
+                                     spent(16, attempt="3", **rerun)]), 19,
                          "re-running only the live test spends GPUs again, its review tokens are already counted, "
                          "and re-running only the spend job after that adds nothing")
         free = {"usage": {"run_attempt": "1"}, "gpu_usd": 0.0, "box_usd": 0.0}
         comments = [spent(1, **free, live_attempt="1", approval="approve"),
                     spent(1, attempt="2", **free, live_attempt="2", approval="approve"),
                     spent(1, attempt="3", **free, live_attempt="2", approval="approve")]
-        self.assertEqual(self.spend(comments)["day"], 1, "a free live test re-run would count its review tokens again")
+        self.assertEqual(self.spend(comments), 1, "a free live test re-run would count its review tokens again")
         with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [LEDGER],
                                                    "GET repos/o/r/issues/1/comments*": comments})):
             kept = [r["approval"] for _, r in bot.ledger("o/r", "2026-11-01T00:00:00Z")]
         self.assertEqual(kept, ["approve", "approve"], "a live test re-run costing the same as the first would be lost")
-        self.assertEqual(self.spend([spent(1, attempt="1"), spent(1, attempt="2")])["day"], 2,
+        self.assertEqual(self.spend([spent(1, attempt="1"), spent(1, attempt="2")]), 2,
                          "a record with no usage counts by its own attempt")
-        self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
+        self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")]), 1,
                          "anyone could add a record to a public issue and reach the cap")
 
-    def test_the_caps_read_the_job_tokens_ledger_with_the_app_configured(self):
+    def test_the_cap_reads_the_job_tokens_ledger_with_the_app_configured(self):
         configure_review_app(self)
-        self.assertEqual(self.spend([spent(1)])["day"], 1, "the spend caps would read nothing and never trip")
+        self.assertEqual(self.spend([spent(1)]), 1, "the spend cap would read nothing and never trip")
 
     def test_spend_reads_every_ledger_issue_and_starts_at_the_lowest_for_writes(self):
-        self.assertEqual(self.spend([spent(1)], issues=(LEDGER, {**STATUS, "body": LEDGER["body"]}))["day"], 1,
+        self.assertEqual(self.spend([spent(1)], issues=(LEDGER, {**STATUS, "body": LEDGER["body"]})), 1,
                          "the same run recorded in two issues would double")
         comments = {1: [spent(1, run="1")], 2: [spent(2, run="2")]}
         with mock.patch.object(bot, "run", FakeGh({
                 "GET repos/o/r/issues[?]*": [{**STATUS, "body": LEDGER["body"]}, LEDGER],
                 "GET repos/o/r/issues/1/comments*": comments[1], "GET repos/o/r/issues/2/comments*": comments[2]})):
-            self.assertEqual(bot.spend("o/r", NOW)["day"], 3, "a run in the second ledger issue would be missed")
+            self.assertEqual(bot.spend("o/r", NOW), 3, "a run in the second ledger issue would be missed")
             self.assertEqual(bot.issue("o/r", "ledger"), 1, "writers would split across ledger issues")
 
     def test_a_full_ledger_issue_rolls_over_and_a_failed_record_alerts(self):
@@ -241,7 +241,7 @@ class TestSpend(unittest.TestCase):
                          pr="7", github_run_id="9", github_run_attempt="1", usage=usage, gpu_usd="3", box_usd="1.5",
                          approval="approve")
         self.assertEqual(self.spend([{"user": {"login": "github-actions[bot]"}, "created_at": "2026-11-08T01:00:00Z",
-                                      "body": recorded["body"]}]), {"day": 7.0, "month": 7.0},
+                                      "body": recorded["body"]}]), 7.0,
                          "a run's GPU and box cost would not count toward the cap")
         self.assertEqual(self.spend_of(recorded["body"]).get("approval"), "approve")
         self.assertTrue(all(recorded["body"] not in arg for argv, _ in fake.calls for arg in argv),
@@ -262,22 +262,18 @@ class TestCaps(unittest.TestCase):
                              actor="an-author", author="an-author", assoc="MEMBER", skip_label="false")
         return out, fake.writes()
 
-    def test_past_a_cap_nothing_starts_it_says_so_on_the_pr_and_alerts_once(self):
+    def test_past_the_cap_nothing_starts_it_says_so_on_the_pr_and_alerts_once(self):
         out, writes = self.preflight([spent(10_000.5)])
-        self.assertEqual(out, {"run": "false"}, "a review would start past the day's cap")
+        self.assertEqual(out, {"run": "false"}, "a review would start past the week's cap")
         said = dict(writes)
         self.assertEqual(sorted(said), ["issue comment", "pr comment"])
-        self.assertIn("daily spend cap ($10,000 of $10,000)", said["pr comment"])
-        self.assertIn("resets at 00:00 UTC", said["pr comment"])
+        self.assertIn("weekly spend cap ($10,000 of $10,000)", said["pr comment"])
+        self.assertIn("resets Monday at 00:00 UTC", said["pr comment"])
         marker = said["issue comment"].split("\n")[0]
         again = [{"user": {"login": "github-actions[bot]"}, "body": f"{marker}\nalready"}]
         self.assertEqual([k for k, _ in self.preflight([spent(10_000.5)], again)[1]], ["pr comment"],
                          "every refused request would alert the status issue's subscribers")
-        out, writes = self.preflight([spent(50_000, "2026-11-02T01:00:00Z")])
-        said = dict(writes)
-        self.assertIn("monthly spend cap", said["pr comment"])
-        self.assertIn("resets on the 1st", said["pr comment"])
-        self.assertEqual(self.preflight([spent(9_999)])[0]["run"], "true", "a run under the caps would be refused")
+        self.assertEqual(self.preflight([spent(9_999)])[0]["run"], "true", "a run under the cap would be refused")
 
     def test_an_unreadable_ledger_refuses_rather_than_spends(self):
         with mock.patch.object(bot, "utcnow", lambda: NOW):
@@ -748,21 +744,18 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertEqual((saved["questions"], saved["risk"]["level"]), ([question], "medium"),
                          "post would approve past a question and a risk nobody answered")
 
-    def test_only_a_maintainer_other_than_the_author_answers_an_earlier_review(self):
-        for name, comment, answered in (
-                ("a member", {"user": {"login": "m", "type": "User"}, "author_association": "MEMBER",
-                              "body": "keep it"}, True),
-                ("the author", {"user": {"login": "an-author", "type": "User"}, "author_association": "OWNER",
-                                "body": "it's fine"}, False),
-                ("an outsider", {"user": {"login": "o", "type": "User"}, "author_association": "NONE",
-                                 "body": "it's fine"}, False),
-                ("a /review command", {"user": {"login": "m", "type": "User"}, "author_association": "MEMBER",
-                                       "body": "/review nogpu"}, False)):
+    def test_only_write_access_other_than_the_author_answers_an_earlier_review(self):
+        for name, login, perm, body, answered in (("write access", "m", "write", "keep it", True),
+                                                  ("read access, a COLLABORATOR too", "m", "read", "keep it", False),
+                                                  ("the author", "an-author", "admin", "it's fine", False),
+                                                  ("a /review command", "m", "write", "/review nogpu", False)):
+            comment = {"user": {"login": login, "type": "User"}, "body": body, "created_at": "u"}
             with self.subTest(name), workspace(), mock.patch.object(bot, "run", FakeGh({
-                    "GET repos/o/r/issues/7/comments": [summary(LAST), {**comment, "created_at": "u"}],
+                    "GET repos/o/r/issues/7/comments": [summary(LAST), comment],
                     "GET repos/o/r/pulls/7": {"user": {"login": "an-author"}},
                     "GET repos/o/r/pulls/7/comments": [],
-                    "GET repos/o/r/pulls/7/reviews*": []})):
+                    "GET repos/o/r/pulls/7/reviews*": [],
+                    "GET repos/o/r/collaborators/*/permission": {"permission": perm}})):
                 self.assertEqual(bot.earlier_review("o/r", "7")[1], answered)
 
     def test_only_the_fixed_type_labels_reach_the_api(self):

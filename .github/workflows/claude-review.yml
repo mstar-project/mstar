@@ -105,7 +105,7 @@ name: Claude Review
 #
 # Every run that reaches Claude records its API calls, tokens, turns and cost
 # in the job summary and in one comment on the spend ledger issue (bot.py,
-# record), read by the preflight and the live test to enforce the spend caps.
+# record), read by the preflight and the live test to enforce the spend cap.
 
 on:
   issue_comment:
@@ -724,7 +724,7 @@ jobs:
         run: python3 .github/review/gpu_review.py incomplete
 
   # The one writer of the spend ledger: one comment per attempt of a run, after the review and the
-  # live test whatever became of them, so the caps see every run that spent anything.
+  # live test whatever became of them, so the cap sees every run that spent anything.
   # A job of its own, so the job token's `issues: write` stays out of the job that runs the model.
   spend:
     name: Record spend

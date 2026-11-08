@@ -95,9 +95,12 @@ jobs:
           jq -n --arg r "$GITHUB_REPOSITORY" --arg s "$(git rev-parse HEAD)" --arg m "$MODELS" --arg k "$SKIP" \
             --arg w "$WEIGHTS" '{repo: $r, main_sha: $s, models: $m, skip: $k, weights: $w}' > "$out/run.json"
           S=.claude/skills/live-pr-test/scripts/gpu.py
-          offers=$(python3 "$S" offers --gpus "$GPUS" --json | jq -r --argjson cap "$MAX_USD" \
-            '.offers[] | select(.provider == "eras" and .availability == "now" and .usd_per_hour <= ($cap * 2)) | .id')
-          [ -n "$offers" ] || { echo "::error::No Eras listing with $GPUS GPUs free now."; exit 1; }
+          # `offers` exits 1 when no provider has one, and still prints its JSON, with why in `.errors`.
+          listing=$(python3 "$S" offers --gpus "$GPUS" --json) || true
+          offers=$(jq -r --argjson cap "$MAX_USD" \
+            '.offers[] | select(.provider == "eras" and .availability == "now" and .usd_per_hour <= ($cap * 2)) | .id' \
+            <<< "$listing") || true
+          [ -n "$offers" ] || { echo "::error::No Eras listing with $GPUS GPUs free now: $(jq -c .errors <<< "$listing")"; exit 1; }
           for offer in $offers; do  # the other refresh job can take a listing first: then the next one
             python3 "$S" launch "$offer" --pr 0 --hours "$HOURS" --tag "$TAG" --cache-write "$VOLUME" \
               --allow-over-budget \

@@ -138,9 +138,10 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
 - **A request field or input file that can crash or wedge a worker is P0**, however unlikely the
   input: one client takes the deployment down for everyone (mstar philosophy §12).
 - **A test that can fail under CI load, xdist or another order is at least P2** (behaviour lens 7).
-- **A shared-layer mechanism built beside an existing mstar primitive is at most P1** (a disguise-check
-  hit, §4.5), even though it may break nothing on `main` yet. It is the foundation later PRs build on, so
-  it is the most expensive thing to get wrong. Look hardest for loops: a node re-queued for
+- **A shared-layer mechanism built beside an existing mstar primitive** (a disguise-check hit, §4.5) goes
+  in `questions` or the risk's `look_at`, and is a finding only when an `AGENTS.md` invariant is actually
+  broken, then at most P1. It is the foundation later PRs build on, so it is the most expensive thing to
+  get wrong. Look hardest for loops: a node re-queued for
   the same request, a per-request cursor, outputs held until a last pass. (#365 built chunked
   prefill exactly that way, and its first review called the scattered state a cleanup.)
 - **Reachability is grepped, not guessed.** Before calling a finding reachable or latent, find which
@@ -343,8 +344,9 @@ Set Phase A beside the code: one row per design area with what the derivation gi
 does, which is better and why, and the cost to converge. A row where the derivation is better goes in
 `questions` or the risk's `look_at` as §4.4 says, and is a finding only when an `AGENTS.md` invariant is
 actually broken, at the bar's priority; note where the PR beats it. Run the disguise, altitude and seam checks
-in [mstar-way.md](references/mstar-way.md) on the code; each hit is a finding naming the primitive,
-the altitude or the type it should be, and a disguise-check hit in a shared layer is at most P1 (§2).
+in [mstar-way.md](references/mstar-way.md) on the code; each hit names the primitive, the altitude or
+the type it should be, and goes the same way: in `questions` or the risk's `look_at`, a finding only
+when an invariant is actually broken (a disguise-check hit in a shared layer is then at most P1, §2).
 
 Then, for every piece of per-request state, computation, data path and batching or capture decision
 the PR adds, name the mstar abstraction that owns it and check the PR uses it:
@@ -365,9 +367,9 @@ the PR adds, name the mstar abstraction that owns it and check the PR uses it:
 - **One implementation per computation.** A second copy of the same math for streaming, capture or a
   test oracle is a misfit unless the PR says why; the usual fix is one forward with optional state
   (`forward(x, cache=None)`). A streaming class that re-implements each layer's forward is a
-  finding even when parity tests tie the copies together. Search the base tree for another
+  misfit even when parity tests tie the copies together. Search the base tree for another
   implementation of each component the PR adds (an encoder family, codec, vocoder, sampler,
-  attention variant, loader), and with a shell the open PRs too; a second copy is a finding naming
+  attention variant, loader), and with a shell the open PRs too; a second copy is a misfit naming
   the one both should converge on. When the other copy is in another open PR, say so and suggest
   agreeing the shared shape with its author first.
 - **Hard-wired to the motivating checkpoint:** left-context only, one featurizer geometry, one
@@ -382,8 +384,8 @@ the PR adds, name the mstar abstraction that owns it and check the PR uses it:
 A misfit that actually breaks an `AGENTS.md` invariant (invariant 1's "nothing under `mstar/model/`
 should" list, say) is a finding at the bar's priority, even if it works and is tested. One that breaks
 none goes in `questions` or the risk's `look_at` (§6), naming what it blocks: a known optimization,
-or streaming or continuous batching for the model's family. When the right abstraction doesn't exist yet, the finding names the missing engine piece
-(mstar philosophy §2) and, with a shell, any open PR providing it, and says whether to block on that
+or streaming or continuous batching for the model's family. When the right abstraction doesn't exist yet, name the missing engine piece
+(mstar philosophy §2) and, with a shell, any open PR providing it, and say whether to block on that
 PR or stack this one on it.
 
 ### 4.6 Factoring (all modes)
@@ -406,9 +408,9 @@ For every new file, class and function, ask where it should live. The examples a
   or a method on the class owning the data? A9 a file where the repo doesn't expect it? A10 a
   `hasattr`/`getattr` a base-class hook would remove, or a base bug patched in a subclass?
 
-New code that duplicates a helper already on `main` is always its own finding, even if another
-finding's fix would delete it. Usually P2 for a whole architecture or a second copy of a shared
-component (the next model copies it again), P3 for a small helper.
+New code that duplicates a helper already on `main` is reported on its own, even if another
+finding's fix would delete it. A whole architecture or a second copy of a shared component (the next
+model copies it again) follows §4.5's rule for a misfit; a small helper is P3.
 
 ### 4.7 Design (all modes)
 
@@ -426,13 +428,13 @@ API field, registry entry):
   caching, CFG batching, disaggregation, streaming. Typical blockers: per-request Python objects
   where a batched tensor was needed, an API returning host values, state the cache or pool can't
   reach, a fused node that can't be split across GPUs, uncapturable shapes, an interface assuming
-  one step per call. Weigh this heavily. A blocker finding sketches the shape that keeps the door
+  one step per call. Weigh this heavily. A blocker sketches the shape that keeps the door
   open and gives est., probability and expected speedup (§4.2) for the optimization it would
   unlock.
 - **Cost of changing it later:** public HTTP fields, config keys, on-disk formats and hooks other
   models implement get the most scrutiny.
 
-Each design finding names the concrete pain (the realistic next change it makes hard, shown as the
+Each design finding or question names the concrete pain (the realistic next change it makes hard, shown as the
 lines that change would copy or special-case), sketches the better shape, and says what converging
 costs now versus after merge. **Priority:** P0 when the design breaks a contract other code on `main`
 relies on, or makes correct behaviour impossible to express (rare); an `AGENTS.md` invariant actually
@@ -463,8 +465,8 @@ the wrong layer.
   invariant is actually broken, at the bar's priority.
 - **Per-model adoption cost.** A cross-cutting feature (LoRA, quantization, a cache kind, a sampler
   variant) should cost each model declarations only: a config field, a resource declaration, a list
-  of module names. Methods every model must implement are a finding when the engine could derive the
-  answer.
+  of module names. Methods every model must implement, when the engine could derive the answer, follow
+  §4.5's rule for a misfit.
 - **One mechanism per root cause.** Several guards, states or retries for one bug: check whether one
   root-cause fix makes the rest unnecessary, and ask to delete the ones that didn't work (AGENTS.md
   preamble).
@@ -472,9 +474,8 @@ the wrong layer.
   parameters, docs and tests in the same PR: no shims, parallel paths or fallbacks kept "just in
   case".
 
-**Priority:** P1 in a shared layer or public surface, or a hook every model must implement; P2
-inside one model or subsystem; P3 for a small helper. Record
-`concepts added: N; deletable: M (finding ids)`.
+**Priority:** at the bar's priority (§2), when §4.5's rule makes it a finding; P3 for a small helper. Record
+`concepts added: N; deletable: M (finding or question ids)`.
 
 ### 4.9 Style (all modes)
 
@@ -499,10 +500,12 @@ numbers (B11).
 ### 4.10 Philosophy (all modes)
 
 Ask each principle's questions in [philosophy.md](references/philosophy.md) of the diff, including
-parts other passes covered, since a principle often shows why a smaller miss matters. Each violation
-is a finding, or folds into one with the same root cause, citing "mstar philosophy §N" and naming the
-concrete fix (the hook, the resource, the A/B to run, the test to register). Rank
-it by the bar: a system-level violation on a plausible path (§1, §5, §6, §12) is usually P1;
+parts other passes covered, since a principle often shows why a smaller miss matters. A violation
+that is a defect on a traced path or actually breaks an `AGENTS.md` invariant is a finding, or folds
+into one with the same root cause, citing "mstar philosophy §N" and naming the
+concrete fix (the hook, the resource, the A/B to run, the test to register); a design preference that
+is neither goes in `questions` or the risk's `look_at` (§4.4). Rank
+a finding by the bar: a system-level violation on a plausible path (§1, §5, §6, §12) is usually P1;
 unproven complexity (§7) or missing evidence (§8) is P1 when the description makes the claim, P2
 otherwise; docs and readability (§15) are P2 or P3; scope (§13) goes in `questions`, a note that never blocks (`AGENTS.md`). When the PR sits on one side of a
 listed tension, say which, and ask why if the PR doesn't say. If the PR rests on a value the file
@@ -594,12 +597,13 @@ the last review.
   `what` (an input, a claim to measure, or a config or path the change only shows on) and `why`
   (one line): the input your trace found, the config that takes the changed branch. Short strings,
   no commands. Empty when you have none. The live test folds them into its risk map.
-- `untestable`: what in this PR the bot's GPUs can't exercise, as a short string; empty when there is
-  nothing. Set it for code or configs whose path runs only on hardware the live test doesn't have
-  (AMD/ROCm, XPU, Apple, anything else). When nothing the bot's GPUs can run is reached, `run` is
-  `none`, even for a change to what a model does on that hardware; when shared code changes too, the
-  live test still runs for what it can reach. It doesn't gate the GPU run. It stops the bot's approval:
-  such a PR gets the normal review and checklist, and a person approves it.
+- `untestable`: what in this PR the live test can't exercise, as a short string; empty when there is
+  nothing. It names anything of the kind: hardware the bot's GPUs aren't (AMD, Intel, Apple, TPU, a
+  GPU type no offer provides), more GPUs or nodes than a run gets (`REVIEW_GPU_MAX_GPUS`, a multi-node
+  layout), weights or services it can't get, anything else. When the live test can reach none of the
+  change, `run` is `none`, even for a change to what a model does on that hardware; when shared code
+  changes too, the live test still runs for what it can reach. It doesn't gate the GPU run. It stops
+  the bot's approval: such a PR gets the normal review and checklist, and a person approves it.
 
 The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
 counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first

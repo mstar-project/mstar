@@ -60,9 +60,9 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
 # A run's record, base64 JSON, in a ledger comment: one comment per attempt of a run, so concurrent runs can't lose
 # updates.
 SPEND = re.compile(r"<!-- review-spend ([A-Za-z0-9+/=]+) -->")
-# USD the bot may spend per UTC day and month on review tokens and Eras GPU time, a change to main like the
-# approval rule. Slurm GPUs are free.
-CAPS = {"day": 10_000, "month": 50_000}
+# USD the bot may spend per UTC week (Monday 00:00 UTC on) on review tokens and Eras GPU time, a change to main
+# like the approval rule. Slurm GPUs are free.
+WEEKLY_CAP = 10_000
 ISSUES = {"ledger": ("Review bot spend ledger", "The review bot's spend, one comment per run attempt. Read by code."),
           "status": ("Review bot status", "The review bot's status: a daily report in this body, alerts as comments.")}
 EJECTIONS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
@@ -260,14 +260,9 @@ def ledger(repo, since):
 
 
 def spend(repo, now):
-    """{"day": USD, "month": USD} spent so far in `now`'s UTC day and month."""
-    day, month = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m")
-    used = {"day": 0, "month": 0}
-    for created, record in ledger(repo, f"{month}-01T00:00:00Z"):
-        usd = finite_usd(record)
-        used["month"] += usd if created.startswith(month) else 0
-        used["day"] += usd if created.startswith(day) else 0
-    return used
+    """USD spent so far in `now`'s UTC week, which starts Monday 00:00 UTC."""
+    monday = (now - datetime.timedelta(days=now.weekday())).strftime("%Y-%m-%dT00:00:00Z")
+    return sum(finite_usd(record) for created, record in ledger(repo, monday) if created >= monday)
 
 
 def finite_usd(record, key="usd"):
@@ -277,24 +272,20 @@ def finite_usd(record, key="usd"):
 
 
 def over_cap(repo):
-    """Why nothing new may start, or None: the first cap reached, with one alert on the status issue for it
-    per day or month, or a failed read of the ledger. Checked at every step that starts spending."""
+    """Why nothing new may start, or None: the weekly cap reached, with one alert on the status issue for it
+    per week, or a failed read of the ledger. Checked at every step that starts spending."""
     now = utcnow()
     try:
         used = spend(repo, now)
     except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
         print(f"::warning::Couldn't read the spend ledger: {e}")
         return "The review bot couldn't read its spend ledger, so no new review or GPU run starts; try again later."
-    for window, cap in CAPS.items():
-        if used[window] < cap:
-            continue
-        word, resets, stamp = ("daily", "at 00:00 UTC", now.strftime("%Y-%m-%d")) if window == "day" \
-            else ("monthly", "on the 1st", now.strftime("%Y-%m"))
-        why = (f"The review bot's {word} spend cap (${used[window]:,.0f} of ${cap:,}) is reached; it resets {resets}. "
-               "No new review or GPU run starts until then.")
-        alert(repo, f"{window}-{stamp}", why)
-        return why
-    return None
+    if used < WEEKLY_CAP:
+        return None
+    why = (f"The review bot's weekly spend cap (${used:,.0f} of ${WEEKLY_CAP:,}) is reached; it resets Monday at "
+           "00:00 UTC. No new review or GPU run starts until then.")
+    alert(repo, f"week-{now.strftime('%G-W%V')}", why)
+    return why
 
 
 def alert(repo, key, text):
@@ -328,7 +319,7 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
     mode = "" if command == "continue" else command  # the stopped review's mode, from its handoff
 
     def start(**outputs):
-        """The request is allowed: run it, unless the bot is past a spend cap or can't tell."""
+        """The request is allowed: run it, unless the bot is past the spend cap or can't tell."""
         stop = over_cap(repo)
         if stop:
             print(f"::notice::{stop}")
@@ -732,8 +723,6 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
 
 # ---------------------------------------------------------------- review job: after the review
 
-# Whose comment can answer an earlier review's risk or questions (GitHub's author_association).
-MAINTAINERS = ("OWNER", "MEMBER", "COLLABORATOR")
 
 def salvage(out, repo, pr, runner_temp):
     """The action fails a run that went past --max-turns even when Claude finished and returned its
@@ -794,7 +783,8 @@ def earlier_review(repo, pr):
     last-review.json showed this run, or the last summary's when it had no last-review.json (no earlier
     diff, a partial review, or a /review continue); and whether a person other than the author has
     commented since that review. Not knowing reads as not answered; not being able to read the state fails.
-    Answering takes a maintainer (MAINTAINERS) who isn't the author, and a comment that isn't a `/review` command."""
+    Answering takes someone with write access (the bar `/review` uses) who isn't the author, and a comment that
+    isn't a `/review` command."""
     path, state = Path("last-review.json"), None
     if path.exists():
         state = json.loads(path.read_text())
@@ -814,11 +804,10 @@ def earlier_review(repo, pr):
         if state is None:
             raise
         return state, False
-    answered = any((c.get("submitted_at") or c.get("created_at") or "") > since
-                   and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") != author
-                   and c.get("author_association") in MAINTAINERS
-                   and not (c.get("body") or "").startswith("/review") for c in spoken)
-    return state, answered
+    answering = {u["login"] for c in spoken if (c.get("submitted_at") or c.get("created_at") or "") > since
+                 and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") not in (author, None)
+                 and not (c.get("body") or "").startswith("/review")}
+    return state, any(permission(repo, login) in WRITE for login in answering)
 
 
 def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
@@ -967,7 +956,7 @@ def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_conti
 def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="", box_usd="", approval="",
            live_attempt=""):
     """Append one record for this run to the ledger issue (`spend` job, after the review and the live test),
-    so the caps and the monitor read what each run cost: the review's tokens and the live test's GPUs and
+    so the cap and the monitor read what each run cost: the review's tokens and the live test's GPUs and
     box session. Nothing spent, nothing written."""
     try:
         review = json.loads(usage) if usage else {}
@@ -987,7 +976,7 @@ def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="
         comment_on_issue(repo, issue(repo, "ledger"), f"{what}: ${usd:,.2f}.\n<!-- review-spend {b64} -->\n")
     except (RuntimeError, ValueError, KeyError, TypeError) as e:
         alert(repo, f"ledger-{github_run_id}-{github_run_attempt}",
-              f"Run {github_run_id}'s spend (${usd:,.2f}) didn't reach the ledger, so the caps don't count it: "
+              f"Run {github_run_id}'s spend (${usd:,.2f}) didn't reach the ledger, so the cap doesn't count it: "
               f"{safe(e)}")
         raise
 
@@ -1175,8 +1164,7 @@ def monitor(out, repo, approvals=""):
     current = {s["key"]: s for s in signals}
     fresh = [current[k]["text"] for k in sorted(current) if k not in reported]
     head = [issue_marker("status"), "### Review bot status", f"Updated {now.strftime('%Y-%m-%d %H:%M')} UTC.", "",
-            f"Spend today: ${used['day']:,.0f} of ${CAPS['day']:,}; "
-            f"this month: ${used['month']:,.0f} of ${CAPS['month']:,}. "
+            f"Spend this week: ${used:,.0f} of ${WEEKLY_CAP:,}. "
             f"Approvals: **{'on' if approvals == 'on' else 'off'}** (`REVIEW_APPROVALS`).", "",
             f"#### PRs the bot approved, last {MONITOR_DAYS} days", "| PR | State | Signals |", "| --- | --- | --- |"]
     tail = ["", f"New PRs since the last report: {len(new_prs)}.",
@@ -1250,7 +1238,7 @@ def pr_evidence(repo, pr, since, records):
 def improve_inputs(out, repo, key_set):
     """The evidence for the weekly improvement run (review-improve.yml), in improve-evidence/: one file per PR the
     bot reviewed in the last three weeks with anything from the last 7 days, and status.json, the status
-    issue's signals and alerts. `run` stays false without an API key, past a spend cap, once this week's run
+    issue's signals and alerts. `run` stays false without an API key, past the spend cap, once this week's run
     has finished (a failed one can be retried by hand), or with nothing to read."""
     out["run"] = "false"
     if key_set != "true":

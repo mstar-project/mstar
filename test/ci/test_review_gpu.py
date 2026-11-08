@@ -161,7 +161,7 @@ class TestCarry(unittest.TestCase):
     ]
 
     def carry(self, rereview, run, checks, comments, status, files=("mstar/worker/worker.py",), review=None,
-              threads=()):
+              threads=(), untestable=""):
         """carry's outputs and the earlier report it kept; comments None: the fetch fails. files: the
         PR's changed files. review: more of the review's fields; threads: the PR's review threads."""
         routes = {"POST graphql": threads_page(*threads), f"GET repos/{R}/pulls/7": {"base": {"sha": "b" * 40}},
@@ -170,12 +170,20 @@ class TestCarry(unittest.TestCase):
                   f"GET repos/{R}/issues/7/comments": Fail() if comments is None else comments}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws, contextlib.redirect_stdout(io.StringIO()):
             (ws / "review.json").write_text(json.dumps({"outside_diff": [], **(review or {}),
-                                                        "live_test": {"run": run, "checks": checks}}))
+                                                        "live_test": {"run": run, "checks": checks,
+                                                                      "untestable": untestable}}))
             out, _ = step(gpu_review.carry, routes, pr="7", head_sha="1" * 40, runner_temp=temp,
                           rereview="true" if rereview else "")
             self.gate = Path(temp, "gate.txt").read_text() if Path(temp, "gate.txt").exists() else None
             earlier = ws / "earlier-live-test.md"
             return out, earlier.read_text() if earlier.exists() else None
+
+    def test_a_re_review_that_cant_approve_isnt_made_full(self):
+        for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
+                             ("none", {"run": "none", "checks": "correctness", "verdict": "skipped"})):
+            with self.subTest(run):
+                self.assertEqual(self.carry(True, run, ["correctness"], [], "", untestable="AMD kernels")[0], outputs,
+                                 "a full run would rent a box for a PR that can't be approved")
 
     def test_the_review_call_stands_only_on_a_passing_live_test_of_an_ancestor(self):
         for name, rereview, run, checks, comments, status, expected in self.CASES:
@@ -282,10 +290,10 @@ class TestStart(unittest.TestCase):
                       "the PR would read that there were no GPUs")
 
     def test_past_a_spend_cap_no_box_starts_and_the_pr_is_told(self):
-        with unittest.mock.patch.object(bot, "over_cap", lambda repo: "The review bot's daily spend cap is reached."):
+        with unittest.mock.patch.object(bot, "over_cap", lambda repo: "The review bot's weekly spend cap is reached."):
             out, launched = self.start("sk-test", {"eras": {"run_secret_id": "s"}})
         self.assertEqual(launched, [], "a live test would start past the cap")
-        self.assertIn("daily spend cap", (out / "unavailable.md").read_text(), "the PR wouldn't be told why")
+        self.assertIn("weekly spend cap", (out / "unavailable.md").read_text(), "the PR wouldn't be told why")
 
     def test_a_stacked_pr_is_tested_against_its_base_branch(self):
         self.assertIn("--base joe/cp-stack-1", gpu_review.brief(7, "0123456789", "abcdef", "joe/cp-stack-1", "full",
@@ -419,17 +427,25 @@ class TestApprove(unittest.TestCase):
                                    ("a blocked file", {"files": [{"filename": ".github/workflows/ci.yml"}]}, "rules"),
                                    ("a blocked file renamed away", {"files": [blocked]}, "rules"),
                                    ("the review says the GPUs can't run it", {"untestable": "AMD kernels"},
-                                    "needs a test on AMD kernels: the bot's GPUs can't run it"),
+                                    "the bot's live test can't cover this: AMD kernels"),
                                    ("a changed line names AMD hardware", {"files": [
                                        {"filename": "docs/x.rst", "changes": 1,
                                         "patch": "@@ -1 +1 @@\n+runs on ROCm"}]},
-                                    "needs a test on rocm"),
+                                    "can't cover this: rocm"),
                                    ("a diff that can't be read", {"files": [
                                        {"filename": "docs/x.rst", "changes": 9000}]}, "couldn't read the diff")):
             with self.subTest(name):
                 text, out, writes = self.approve({"value": "on"}, **kwargs)
                 self.assertEqual((writes, out.get("approval")), ([], None), f"{name} would still approve")
                 self.assertIn(says, text)
+
+    def test_the_fixed_check_finds_hardware_words_and_leaves_ordinary_ones(self):
+        for text, hit in (("amdsmi.gpu", True), ("if isAMD():", True), ("MI300A nodes", True), ("hipcc -c x", True),
+                          ("torch.xpu", True), ("Intel Gaudi", True), ("TPU", True), ("Apple Silicon", True),
+                          ("amd64 builds", False), ("AuthenticAMD", False), ("hipster", False),
+                          ("test_bare_metal", False), ("bare-metal hosts", False), ("MPS on and off", False)):
+            with self.subTest(text):
+                self.assertEqual(bool(gpu_review.UNTESTABLE_HARDWARE.search(text)), hit)
         text, out, writes = self.approve({"value": "On"})
         self.assertEqual((writes, out.get("approval")), ([], None), "only the exact word `on` turns approvals on")
 

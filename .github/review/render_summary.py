@@ -117,9 +117,11 @@ SCHEMA = {
                                                           "the change only shows on"},
                 "why": {"type": "string", "description": "one line"},
             }, "required": ["what", "why"]}},
-            # What the bot's GPUs can't run in this PR; it stops the bot's approval, not the GPU run.
-            "untestable": {"type": "string", "description": "the hardware or path the live test can not exercise, "
-                                                            "short; empty when there is nothing"},
+            # What the live test can't exercise in this PR; it stops the bot's approval, not the GPU run.
+            "untestable": {"type": "string", "description": "what in this PR the live test cannot exercise: hardware "
+                                                            "other than the GPUs the bot runs on, more GPUs or nodes "
+                                                            "than a run gets, weights or services it cannot get, "
+                                                            "anything else. Short; empty when there is nothing"},
         }, "required": ["run", "reason", "checks", "gpus", "focus", "untestable"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
@@ -136,15 +138,16 @@ def stacked_above(path):
 def judged(review, stacked):
     """The review's findings as they count. One said to be fixed in a PR stacked above is fixed there only
     when that PR is one of `stacked` (stacked_above); otherwise the claim wasn't checked, and the finding
-    is open and says so."""
-    def unchecked(f):
-        return f"Said to be fixed in #{f.get('fixed_in', '?')}, not checked."
+    is open and says so. The note is saved with an outside-the-diff item, so a later run doesn't repeat it."""
+    def unchecked(f, text):
+        note = f"Said to be fixed in #{f.get('fixed_in', '?')}, not checked."
+        return text if note in text else f"{text} {note}"
     return {**review,
             "outside_diff": [f if not f.get("fixed_in") or f["fixed_in"] in stacked else
                              {**{k: v for k, v in f.items() if k != "fixed_in"},
-                              "detail": f"{f['detail']} {unchecked(f)}"} for f in review["outside_diff"]],
+                              "detail": unchecked(f, f["detail"])} for f in review["outside_diff"]],
             "prior_findings": [f if f["status"] != "fixed_above" or f.get("fixed_in") in stacked else
-                               {**f, "status": "open", "why": f"{f['why']} {unchecked(f)}"}
+                               {**f, "status": "open", "why": unchecked(f, f["why"])}
                                for f in review.get("prior_findings", [])]}
 
 
