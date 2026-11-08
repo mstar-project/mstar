@@ -955,7 +955,7 @@ jobs:
           { echo "gpus=$gpus"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
       # Nothing runs while the review left an open P0–P2 finding (counted as the approval rule counts
-      # them), an open question or a skipped file (`gated`; the reasons go to gate.txt, as they hold
+      # them) or a skipped file (`gated`; the reasons go to gate.txt, as they hold
       # model text): the comment says what to fix first. Otherwise the review's call stands unless the
       # PR's last live test didn't pass on an ancestor of this head, or a re-review's `targeted`, or
       # its `none` on runtime code, has no live test before it (gpu_review.py carry):

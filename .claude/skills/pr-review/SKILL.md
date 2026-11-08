@@ -587,8 +587,9 @@ the last review.
   no commands. Empty when you have none. The live test folds them into its risk map.
 
 The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
-counts them), no open question and no skipped file. Otherwise no box starts, and the comment lists
-what to fix first and asks for `/review` again; the design risk doesn't hold it back.
+counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first
+and asks for `/review` again; an open question and the design risk don't hold it back, though both
+still stop approval.
 
 The bot overrides the review's call in two cases: when the PR's last live test didn't pass on an
 ancestor of the head (it failed, was partial or unavailable, or ran on a commit since rebased away),
