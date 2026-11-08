@@ -1226,7 +1226,7 @@ model: the server refuses to start on another value. See <a class="reference int
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">knobs</span></code></p></td>
 <td><p><em>(optional)</em> Engine knobs for this deployment, by name: <code class="docutils literal notranslate"><span class="pre">device_loopback</span></code>,
 <code class="docutils literal notranslate"><span class="pre">sampler_ingraph_scatter</span></code>, <code class="docutils literal notranslate"><span class="pre">sampler_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">ingraph_decode_rope</span></code>,
-<code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_plan_cache</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
+<code class="docutils literal notranslate"><span class="pre">kv_chain_lazy_steps</span></code>, <code class="docutils literal notranslate"><span class="pre">kv_pinned_indptrs</span></code>,
 <code class="docutils literal notranslate"><span class="pre">gc_gen0_threshold</span></code>, <code class="docutils literal notranslate"><span class="pre">pre_plan</span></code>, <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code>, <code class="docutils literal notranslate"><span class="pre">idle_hold</span></code>,
 <code class="docutils literal notranslate"><span class="pre">compile_deterministic</span></code> and <code class="docutils literal notranslate"><span class="pre">resident_planning</span></code> (<code class="docutils literal notranslate"><span class="pre">true</span></code>/<code class="docutils literal notranslate"><span class="pre">false</span></code> or an integer;
 <code class="docutils literal notranslate"><span class="pre">step_thread_core</span></code> takes <code class="docutils literal notranslate"><span class="pre">auto</span></code>, the default, <code class="docutils literal notranslate"><span class="pre">off</span></code>, <code class="docutils literal notranslate"><span class="pre">always</span></code>, <code class="docutils literal notranslate"><span class="pre">siblings</span></code> or a CPU number,
@@ -1235,7 +1235,7 @@ model: the server refuses to start on another value. See <a class="reference int
 Qwen3.5’s text walks and no other model (see <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>). Each one’s environment variable
 (<code class="docutils literal notranslate"><span class="pre">MSTAR_DEVICE_LOOPBACK</span></code> and so on; see
 <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>) overrides it when set, and an unknown name
-fails at startup. For example <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">{kv_plan_cache:</span> <span class="pre">1,</span>
+fails at startup. For example <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">{kv_chain_lazy_steps:</span> <span class="pre">4,</span>
 <span class="pre">kv_pinned_indptrs:</span> <span class="pre">true}</span></code>, or <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">{pre_plan:</span> <span class="pre">false}</span></code>
 (<code class="docutils literal notranslate"><span class="pre">whisper_large_v3_turbo.yaml</span></code>).</p></td>
 </tr>

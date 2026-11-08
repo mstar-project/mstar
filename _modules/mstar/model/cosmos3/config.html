@@ -1571,9 +1571,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># options (-O2: max-autotune).</span>
     <span class="n">denoise_compile_mode</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"deterministic"</span>
     <span class="c1"># Compile the cross-request denoise step (two or more requests in one</span>
-    <span class="c1"># forward) too, with the same mode: the video, image and sound steps; the</span>
-    <span class="c1"># action step (``denoise_step_action_batched``) runs eager. Eager, the</span>
-    <span class="c1"># norms, rotary and residuals cost about 80 ms of GPU per extra row at</span>
+    <span class="c1"># forward) too, with the same mode: the video, image, sound and action</span>
+    <span class="c1"># steps share one compiled layer stack. Eager, the norms, rotary and</span>
+    <span class="c1"># residuals cost about 80 ms of GPU per extra row at</span>
     <span class="c1"># 832x480x121 on a B300. Only its layer stack compiles, once, at startup,</span>
     <span class="c1"># with the pack length dynamic, so no batch size or mix of resolutions</span>
     <span class="c1"># compiles mid-traffic; the per-request patchify, rotary tables and</span>

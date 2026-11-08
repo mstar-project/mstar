@@ -22,7 +22,6 @@ mstar.utils.knobs
       ingraph_decode_rope
       kv_chain_lazy_steps
       kv_pinned_indptrs
-      kv_plan_cache
       pre_plan_enabled
       resident_planning
       sampler_ingraph_scatter

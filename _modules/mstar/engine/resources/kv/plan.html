@@ -1280,11 +1280,11 @@ window.runMermaid = runMermaid;</script>
     <span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">cpu_indptrs</span> <span class="o">=</span> <span class="n">cpu_indptrs</span>
         <span class="c1"># packing in plan order w/h 1 view per segment covered by plan; a plan</span>
-        <span class="c1"># off the KV manager's cache hands a builder instead and the views are</span>
-        <span class="c1"># made on first use (the FlashInfer path never asks for them)</span>
+        <span class="c1"># built from columns hands a builder instead and the views are made on</span>
+        <span class="c1"># first use (the FlashInfer path never asks for them)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_views</span> <span class="o">=</span> <span class="n">views</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_view_builder</span> <span class="o">=</span> <span class="n">view_builder</span>
-        <span class="c1"># a decode step planned off the previous one (KVManager's plan cache):</span>
+        <span class="c1"># a decode step's (every row one token, each with a page to write):</span>
         <span class="c1"># each row's write page and offset in it, so staging need not walk the views</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decode_pages</span> <span class="o">=</span> <span class="n">decode_pages</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decode_offsets</span> <span class="o">=</span> <span class="n">decode_offsets</span>

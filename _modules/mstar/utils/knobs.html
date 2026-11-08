@@ -1017,7 +1017,6 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"sampler_slots"</span><span class="p">:</span> <span class="s2">"MSTAR_SAMPLER_SLOTS"</span><span class="p">,</span>
     <span class="s2">"ingraph_decode_rope"</span><span class="p">:</span> <span class="s2">"MSTAR_INGRAPH_DECODE_ROPE"</span><span class="p">,</span>
     <span class="s2">"kv_chain_lazy_steps"</span><span class="p">:</span> <span class="s2">"MSTAR_KV_CHAIN_LAZY_STEPS"</span><span class="p">,</span>
-    <span class="s2">"kv_plan_cache"</span><span class="p">:</span> <span class="s2">"MSTAR_KV_PLAN_CACHE"</span><span class="p">,</span>
     <span class="s2">"kv_pinned_indptrs"</span><span class="p">:</span> <span class="s2">"MSTAR_KV_PINNED_INDPTRS"</span><span class="p">,</span>
     <span class="s2">"gc_gen0_threshold"</span><span class="p">:</span> <span class="s2">"MSTAR_GC_GEN0_THRESHOLD"</span><span class="p">,</span>
     <span class="s2">"pre_plan"</span><span class="p">:</span> <span class="s2">"MSTAR_PRE_PLAN_SPEC"</span><span class="p">,</span>
@@ -1188,21 +1187,6 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    c64/c128 on 0.8B (the extension is a small part of the stop check's</span>
 <span class="sd">    tail)."""</span>
     <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="n">_setting</span><span class="p">(</span><span class="s2">"kv_chain_lazy_steps"</span><span class="p">,</span> <span class="s2">"1"</span><span class="p">)))</span></div>
-
-
-
-<div class="viewcode-block" id="kv_plan_cache">
-<a class="viewcode-back" href="../../../_autosummary/mstar.utils.knobs.html#mstar.utils.knobs.kv_plan_cache">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">kv_plan_cache</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""``kv_plan_cache`` / ``MSTAR_KV_PLAN_CACHE`` (default 0): the KV manager</span>
-<span class="sd">    plans a leased decode step from the previous step's plan when the batch</span>
-<span class="sd">    is the same rows in the same order and nothing but that step's commit</span>
-<span class="sd">    touched the streams: lengths advance by one, pages change only where a</span>
-<span class="sd">    row crossed a page boundary, and the five index arrays come from numpy</span>
-<span class="sd">    instead of a per-row Python pass. ``0`` plans every step from the</span>
-<span class="sd">    streams; ``2`` does both and logs any difference (a correctness check for</span>
-<span class="sd">    runs)."""</span>
-    <span class="k">return</span> <span class="nb">int</span><span class="p">(</span><span class="n">_setting</span><span class="p">(</span><span class="s2">"kv_plan_cache"</span><span class="p">,</span> <span class="s2">"0"</span><span class="p">))</span></div>
 
 
 
