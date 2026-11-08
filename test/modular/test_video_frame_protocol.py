@@ -120,7 +120,7 @@ def _form_request(**fields):
     async def form():
         return fields
 
-    return SimpleNamespace(form=form)
+    return SimpleNamespace(form=form, headers={})
 
 
 def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypatch):

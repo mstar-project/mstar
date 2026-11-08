@@ -51,6 +51,7 @@ Response formats
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import threading
@@ -67,6 +68,8 @@ from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.utils.utf8_stream import Utf8Stream
+
+logger = logging.getLogger(__name__)
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
 RESPONSE_FORMATS = ("json", "text", *_TIMED_FORMATS)
@@ -725,13 +728,14 @@ def _error_event(message: str, status: int | None) -> str:
     })
 
 
-def _cutting_error_event(exc: Exception) -> str:
-    """In band, since the stream has sent its 200: cutting the upload failed
-    for the upload's reason (an HTTPException) or the server's (no FFmpeg, no
-    memory)."""
+def _stream_error_event(exc: Exception) -> str:
+    """In band, since the stream has sent its 200: the request's reason (an
+    HTTPException: a bad upload, a timeout), or a server error (no FFmpeg, no
+    memory, a bug), which is logged."""
     if isinstance(exc, HTTPException):
         return _error_event(str(exc.detail), exc.status_code)
-    return _error_event(f"the server could not decode the upload ({type(exc).__name__})", 500)
+    logger.exception("Streamed transcription failed")
+    return _error_event(f"transcription failed ({type(exc).__name__})", 500)
 
 
 async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_request=None):
@@ -742,12 +746,7 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
     inflight: set[str] = set()
     try:
         if mode == "parallel" or planner.single:
-            try:
-                windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
-            except (HTTPException, ImportError, MemoryError) as exc:
-                yield _cutting_error_event(exc)
-                yield SSE_DONE
-                return
+            windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
             # The stream carries text only, and a window decoded with timestamps
             # can stop early and leave its tail to the next one (see _tail).
             window_req = req if planner.single else req.model_copy(
@@ -792,26 +791,24 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                 spoken = spoken or bool(emitted.strip())
                 await asyncio.sleep(0)
         else:
-            try:
-                spoken = False
-                async for window in _sequential(api, adapter, req, planner, inflight, raw_request):
-                    windows.append(window)
-                    if window.transcript.text:
-                        if spoken:
-                            yield sse({"type": "transcript.text.delta", "delta": " "})
-                        yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
-                        spoken = True
-                    await asyncio.sleep(0)
-            except (HTTPException, ImportError, MemoryError) as exc:
-                yield _cutting_error_event(exc)
-                yield SSE_DONE
-                return
+            spoken = False
+            async for window in _sequential(api, adapter, req, planner, inflight, raw_request):
+                windows.append(window)
+                if window.transcript.text:
+                    if spoken:
+                        yield sse({"type": "transcript.text.delta", "delta": " "})
+                    yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
+                    spoken = True
+                await asyncio.sleep(0)
         transcript = merge_windows(windows, adapter, req)
         yield sse({
             "type": "transcript.text.done",
             "text": transcript.text,
             "usage": _usage(planner.duration),
         })
+        yield SSE_DONE
+    except Exception as exc:
+        yield _stream_error_event(exc)
         yield SSE_DONE
     finally:
         _release(api, inflight)

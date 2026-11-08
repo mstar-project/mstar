@@ -373,7 +373,7 @@ def test_captured_iterations_match_eager(durations, bs):
         cg = AcceleratorGraphRunner(
             submodule_name="transducer", submodule=harness.node, resources=harness.resources,
             step_runner=harness.runner, device=torch.device("cuda", 0), autocast_dtype=None,
-            joint_comm_group=JointGroups(CommGroup.trivial(), CommGroup.trivial()), num_slots=2,
+            joint_comm_group=JointGroups(CommGroup.trivial(), CommGroup.trivial(), CommGroup.trivial()), num_slots=2,
         )
         with fp32_precision_scope(harness.precision):
             cg.warmup_and_capture(None)

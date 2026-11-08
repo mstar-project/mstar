@@ -1348,7 +1348,8 @@ class Qwen3OmniModel(Model):
         # modality outputs.  These don't touch text_inputs.
         for img in pil_images:
             img_proc = self._processor.image_processor
-            img_out = img_proc(images=[img], return_tensors="pt")
+            # inferred, a 1, 3 or 4 px tall image would be read as channels first
+            img_out = img_proc(images=[img], return_tensors="pt", input_data_format="channels_last")
             result["pixel_values"].append(img_out["pixel_values"])
             result["image_grid_thw"] += img_out["image_grid_thw"]
 
