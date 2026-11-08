@@ -57,6 +57,8 @@ Procedural knowledge — how to run a benchmark, how to debug a hang — belongs
 6. **`ERAS_RUN_SECRET_ID`**: save the box's Anthropic key (`LIVE_TEST_ANTHROPIC_KEY`'s value) as an Eras secret and put its id in this repository variable.
 7. **Both Anthropic keys in one Anthropic workspace with a spend limit.** The bot has no cap of its own.
 
+**Also before merge:** turn on "Require review from Code Owners" in `main`'s branch protection. `.github/CODEOWNERS` names who must approve a change under `.github/`, so a pushed workflow can't reach the `review-bot` environment's keys on a bot approval alone (bot approvals don't count for code owners, and pushes don't dismiss them).
+
 **After merge:** `gh variable set REVIEW_APPROVALS --body on`.
 
 **Optional**, none of it needed for the above to work:

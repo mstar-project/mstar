@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -681,7 +682,8 @@ def render_comment(sha, lt, media_url=""):
         bang, text, rel = m[1], m[2], m[3].replace("\u200b", "")  # `inert` splits a name like a@2x.png too
         if rel not in rels or not media_url:
             return m[0]
-        url = f"{media_url.rstrip('/')}/{rel}"
+        # The box picks the name, so a `](` in it stays dead.
+        url = f"{media_url.rstrip('/')}/{urllib.parse.quote(rel, safe='/@')}"
         image = bang or MEDIA.get(Path(rel).suffix.lower()) == "img"
         return f"![{text}]({url})" if image else f"[{text}]({url})"
 

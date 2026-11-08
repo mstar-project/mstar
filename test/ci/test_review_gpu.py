@@ -365,6 +365,7 @@ class TestComment(unittest.TestCase):
         (out / "results/report.md").write_text(report)
         (out / "results/result.json").write_text('{"verdict": "fail", "summary": "x <!-- y"}')
         for name, size in files:
+            (out / "results/media" / name).parent.mkdir(parents=True, exist_ok=True)
             (out / "results/media" / name).write_bytes(b"0" * size)
         with contextlib.redirect_stdout(io.StringIO()):
             gpu_review.write_gallery(7, "0123456789", out / "results", out / "site")
@@ -385,6 +386,9 @@ class TestComment(unittest.TestCase):
         self.assertIn("## Results\n", text, "headings would break")
         self.assertIn("![a](https://o.github.io/m/pr-7/1/media/a.png)", text, "the gallery's image would stop showing")
         self.assertIn("![b](https://o.github.io/m/pr-7/1/media/a@2x.png)", text, "a file named with `@` wouldn't link")
+        name = "x](http:/evil.example/y.png"
+        _, text = self.comment(f"![a](media/{name})\n", [(name, 10)], media_url="https://o.github.io/m/pr-7/1")
+        self.assertIn("media/x%5D%28http%3A/evil.example/y.png)", text, "a file's name would make a link to anywhere")
         self.assertIn("`List<\u200bint>`", text, "a code span should still read right")
 
     def test_the_gallery_serves_only_media_within_the_cap_and_is_linked_once_published(self):
