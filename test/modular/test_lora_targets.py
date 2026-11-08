@@ -120,6 +120,9 @@ CASES = {
                       partial=("in_proj_z", "in_proj_b")),
     "fused_column": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
                          {"to_q": 8, "to_k": 4, "to_v": 4}, (1,), FUSED_RULES, bias=True, partial=("to_k",)),
+    # the same module, its adapter stored fused (no shard id), as Qwen3.5's ViT `qkv` adapters are
+    "fused_column_whole": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
+                               {"qkv": 16}, (1,), bias=True),
     # one row per segment (its last token's), each rank its vocab columns
     "lm_head": Case(lambda g: ColumnParallelLinear(g, HIDDEN, 32), "lm_head", {"lm_head": 32}, (1, 2, 4),
                     top=True, rows={"lm_head": PER_SEGMENT}),
@@ -369,7 +372,8 @@ def _old_embedding(self, input_):
 OLD = {
     "column": _old_column, "column_gather": _old_column, "merged": _old_column, "qkv": _old_column,
     "gdn_packs": _old_column, "lm_head": _old_column, "row": _old_row,
-    "fused_column": lambda self, x: F.linear(x, self.weight, self.bias), "embedding": _old_embedding,
+    "fused_column": lambda self, x: F.linear(x, self.weight, self.bias),
+    "fused_column_whole": lambda self, x: F.linear(x, self.weight, self.bias), "embedding": _old_embedding,
     "linear": nn.Linear.forward, "patch_conv": nn.Conv3d.forward,
 }
 
