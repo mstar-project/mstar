@@ -3263,9 +3263,11 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     # and graph memory beside the DiT's, and one more Dynamo recompile of the
     # layer code the DiT prefill shares. A prompt with one 512x341 image is
     # ~220 tokens; a step past a ladder runs eagerly.
-    # MSTAR_DECODE_BUCKETS narrows the decode ladder, as for every model.
+    # MSTAR_DECODE_BUCKETS narrows the decode ladder, as for every model. 24 and
+    # 48 halve the padding of a step between the powers of two, which a busy
+    # server's decode batches mostly are (+7% at c=32, +14% at c=64).
     DECODE_CAPTURE_BATCH_SIZES = [
-        int(x) for x in os.environ.get("MSTAR_DECODE_BUCKETS", "1,2,4,8,16,32,64").split(",")
+        int(x) for x in os.environ.get("MSTAR_DECODE_BUCKETS", "1,2,4,8,16,24,32,48,64").split(",")
     ]
     PREFILL_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
