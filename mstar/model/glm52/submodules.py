@@ -76,7 +76,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.lm_head = language_model.lm_head
         self.config = config
         self._capture_block_warned = False
-        # what get_accelerator_graph_configs fits to its captures
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
         # at prepare_inputs time, so the host cuts each verdict without engine
