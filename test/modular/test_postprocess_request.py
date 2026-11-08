@@ -2,6 +2,7 @@
 signals."""
 from types import SimpleNamespace
 
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
 
@@ -10,14 +11,11 @@ SIGNALS = {"decode": ["text_inputs"], "prefill_text": ["text_inputs", "new_token
 
 
 def _worker() -> Worker:
-    w = Worker.__new__(Worker)
-    w._graph_runtime = SimpleNamespace(
+    w = make_worker(
+        _graph_runtime=SimpleNamespace(
         get_output_signals=lambda node, walk: SIGNALS[walk], supports_inline_emit=False,
+    ),
     )
-    w._stop_token_signal = {}
-    w._innermost_loop_by_node = {}
-    w._device_loopback = {}
-    w.enable_prof = False
     return w
 
 

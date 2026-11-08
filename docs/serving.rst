@@ -296,6 +296,16 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``max_call_input_mb`` it counts what the model was handed, not bytes uploaded.
    * - ``model_kwargs``
      - *(optional)* Server-init model parameters (see below).
+   * - ``openpi``
+     - *(optional)* For a robot policy, a model that declares ``Model.robot_io`` and
+       ``Model.load_decoded_image`` (pi0.5 today). Serves openpi's policy WebSocket at ``/`` (see
+       :doc:`clients`), mapping an openpi observation onto the request, as openpi's
+       per-robot input and output transforms do. ``images``: the observation keys of the
+       cameras, in slot order. ``state``: the keys whose values are joined, in order,
+       into the robot state. ``action_dims``: how many leading action dims a reply keeps
+       (default all). ``metadata``: the frame sent on connect (default ``{}``). A block
+       the model can't serve (more cameras than ``num_cameras``, an unknown key) stops
+       the server at startup.
    * - ``ws_per_message_deflate``
      - *(optional, default true)* Whether the server offers per-message deflate on its
        WebSocket routes (``/generate/ws``, ``/v1/realtime``); it applies to every route.
@@ -304,6 +314,12 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
        event loop, not the network, is the bottleneck.
+   * - ``ws_max_message_mb``
+     - *(optional, default 16)* The largest WebSocket message the server reads, in MiB,
+       on every WebSocket route. A larger one closes its socket with ``1009`` before any
+       handler sees it, so the client gets no error frame. Raise it for clients that send
+       big uncompressed frames, such as several raw camera images in one openpi
+       observation.
    * - ``speculation_mixes_walks``
      - *(optional)* Per node, ``true``/``false`` for every walk of the node's combined
        walks, or a mapping of walk -> ``true``/``false``. On for a walk, a speculation
@@ -339,6 +355,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
        chunked walk. See *Chunked prefill budgets* below.
+   * - ``rebuild_host_mb``
+     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
+       declares a rebuild policy sets aside at startup for its requests' prompt ids, 8 B a token (int64),
+       which a request dropped from the KV cache is rebuilt from. A request the pool can't hold
+       keeps no ids, so it is never dropped on that node, though it can still move to the host
+       with ``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it
+       keeps no ids and sets no memory aside. A non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -1067,6 +1090,10 @@ or ``increase()``.
 - ``mstar_kv_pages_cached{model_name, component, resource}``: pages the prefix cache
   names. Some may also be in use by running requests; the cache frees the others when a
   request needs the room.
+- ``mstar_rebuild_host_bytes_used{model_name, component}``,
+  ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
+  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
+  A prompt the pool has no room for keeps no ids, so its request is never dropped.
 - ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
   steps that ran a forward. A step counts from when the worker hands it to its GPU
   thread, or from the end of the previous step if that was later, to the end of its
@@ -1109,7 +1136,9 @@ walks or nodes) is one read per producing node, with its read time split between
 bytes.
 ``api_server`` stands for the request's inputs (as ``src``) and its results (as ``dst``),
 which the API server's data worker sends and reads. ``transport`` is the protocol:
-``SHM`` (per-tensor files or the arena, see ``MSTAR_SHM_ARENA``), ``TCP`` or ``RDMA``. A
+``SHM`` (the arena on CUDA and CPU, and the tensors it spills to files; other
+accelerators send every tensor as a file until the arena is measured there), ``TCP``
+or ``RDMA``. A
 tensor already on the reader (one it made, or one it read once
 for two of its nodes) moves nothing and is not counted. With tensor parallelism every
 rank counts its own read, of its slice or of the whole tensor when the edge is
