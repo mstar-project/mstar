@@ -515,7 +515,7 @@ class _LaidOut(_Model):
     def preprocess_fingerprint(self):
         return "stub"
 
-    def load_image(self, filepath, device):
+    def load_image(self, filepath, device, **kwargs):
         if self._rewrites is not None:
             with open(filepath, "wb") as file:
                 file.write(self._rewrites)

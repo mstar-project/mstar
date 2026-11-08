@@ -738,7 +738,8 @@ def test_a_16_bit_png_reads_as_uint8(tmp_path, color_type, channels):
     assert 0.0 <= loaded.min() and loaded.max() <= 1.0
 
 
-def test_omni_audio_only_container_is_not_a_video(tmp_path, monkeypatch):
+@pytest.mark.parametrize("model", ["omni", "cosmos"])
+def test_audio_only_container_is_not_a_video(tmp_path, monkeypatch, model):
     pytest.importorskip("av")
     vision = types.ModuleType("qwen_omni_utils.v2_5.vision_process")
     vision.smart_nframes = lambda *args, **kwargs: 4
@@ -753,7 +754,12 @@ def test_omni_audio_only_container_is_not_a_video(tmp_path, monkeypatch):
         f.setframerate(16000)
         f.writeframes(bytes(3200))
     with pytest.raises(ValueError, match="video"):
-        read_video_whole_budgeted({"video": str(path)})
+        if model == "omni":
+            read_video_whole_budgeted({"video": str(path)})
+        else:
+            from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+            Cosmos3Model.load_video(None, str(path), "cpu")
 
 
 @pytest.mark.parametrize("failure", ["open", "frames", "empty"])

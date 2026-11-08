@@ -1117,6 +1117,8 @@ class Cosmos3Model(Model):
         budget = VideoBudget()
         total = 0
         with av.open(filepath) as container:
+            if not container.streams.video:
+                raise ValueError("video upload has no video stream")
             stream = container.streams.video[0]
             rate = stream.average_rate or stream.guessed_rate or stream.base_rate
             fps = float(rate) if rate else None
