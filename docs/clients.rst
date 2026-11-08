@@ -116,6 +116,12 @@ send the next observation before the current action chunk has returned — and t
 ``request_id`` tells the replies apart. Pipelined messages are submitted in the order
 they were sent, so of two under one ``request_id`` it is the later one that gets the
 ``409`` while the earlier one runs; their replies may interleave. Closing the socket aborts whatever is still in flight.
+A JSON message over 1 MiB, or a msgpack one over 32 MiB, is parsed and its files decoded
+and saved in a separate process rather than on the server's event loop. Taking the message
+in still runs on the loop, and every other request on the server waits for it: about
+2 ms per MiB as JSON and 1 as msgpack, and with deflate on about 9 and 2. Text and
+``model_kwargs`` come back through the loop, so only ``files`` should be large. A
+deployment taking large messages should turn ``ws_per_message_deflate`` off.
 
 .. code-block:: python
 
@@ -249,9 +255,10 @@ handshake and has no ``/healthz``. Only the Python frontend serves this route;
 ``--rust-frontend`` logs a warning and serves without it.
 
 ``openpi_client`` sets no size limit on its messages, but the server does:
-``ws_max_message_mb`` (16 MiB by default, see :doc:`serving`). A larger observation closes
-the socket with ``1009`` and no error frame, so a deployment whose robots send several
-raw high-resolution cameras raises it.
+``ws_max_message_mb`` (by default ``MSTAR_MAX_BODY_MB``, see :doc:`serving`). A larger
+observation closes the socket with ``1009`` and no error frame, so a deployment whose robots
+send several raw high-resolution cameras raises it. An observation is parsed on the server's
+event loop, so a very large one holds up the server's other requests while it is parsed.
 
 .. code-block:: python
 
