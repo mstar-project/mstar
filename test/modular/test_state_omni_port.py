@@ -33,7 +33,7 @@ from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
 from mstar.model.components.code_predictor_kernels import DepthKV
 from mstar.model.components.norm import RMSNorm
-from mstar.model.qwen3_omni.components.attention import _norm_rotate_add
+from mstar.model.qwen3_omni.components.attention import _norm_rotate_attend
 from mstar.model.qwen3_omni.config import (
     AUDIO_ATTN,
     AUDIO_TOKENS,
@@ -445,8 +445,13 @@ def test_the_reference_equals_the_unfused_norm_and_rotation():
     norm = RMSNorm(8)
     torch.nn.init.normal_(norm.weight)
     cos, sin = torch.randn(5, 8), torch.randn(5, 8)
-    added = {}
-    kv = SimpleNamespace(add=lambda layer, k, v: added.update(layer=layer, k=k, v=v))
+    calls = []
+
+    def read(layer, q):
+        calls.append(("read", layer, q.clone()))
+        return q * 2
+
+    kv = SimpleNamespace(add=lambda layer, k, v: calls.append(("add", layer, k, v)), read=read)
 
     def rotate(x):
         half = x.shape[-1] // 2
@@ -455,10 +460,16 @@ def test_the_reference_equals_the_unfused_norm_and_rotation():
 
     want_q, want_k = rotate(q), rotate(k)
     k_before, v_before = k.clone(), v
-    _norm_rotate_add(kv, 2, q, k, v, norm.weight, norm.weight, cos, sin, norm.variance_epsilon, norm.variance_epsilon)
+    out = _norm_rotate_attend(
+        kv, 2, q, k, v, norm.weight, norm.weight, cos, sin, norm.variance_epsilon, norm.variance_epsilon,
+    )
+    assert [call[0] for call in calls] == ["add", "read"], "the read comes after the add"
+    (_, layer, added_k, added_v), (_, read_layer, read_q) = calls
     assert torch.equal(q, want_q), "the fused op mutates q, so its reference does too"
-    assert torch.equal(added["k"], want_k) and added["v"] is v_before and added["layer"] == 2
+    assert torch.equal(added_k, want_k) and added_v is v_before and layer == 2
     assert torch.equal(k, k_before), "the fused op leaves k as it was"
+    assert read_layer == 2 and torch.equal(read_q, want_q), "the read takes the rotated q"
+    assert torch.equal(out, want_q * 2), "the reference returns what the read returns"
 
 
 # Scratch at load
