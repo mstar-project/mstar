@@ -780,8 +780,9 @@ class Engine:
 
         return [r for r in self._resources.values() if isinstance(r, LoraAdapterPool)]
 
-    def _compile_submodules(self) -> None:
-        """Apply torch.compile to submodule forward paths.
+    def _compile_submodules(self, recompile_limits: Mapping[str, int | None] | None = None) -> None:
+        """Apply torch.compile to submodule forward paths, each under its node's
+        ``recompile_limits`` entry (the capture runner's, whose code objects it shares).
 
         Compiles each submodule's ``forward`` and ``forward_batched`` with the
         default mode (fullgraph=False, dynamic=None), which in general provides
@@ -808,16 +809,17 @@ class Engine:
             dynamic = True if item_encoder and not getattr(submodule, "marks_dynamic_dims", False) else None
             try:
                 # no token count, these serve eager batches of any size
+                limit = (recompile_limits or {}).get(node_name)
                 submodule_mgmt.forward = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward,
                     fullgraph=False,
                     dynamic=dynamic,
-                )), submodule)
+                )), limit)
                 submodule_mgmt.forward_batched = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
                     dynamic=dynamic,
-                )), submodule)
+                )), limit)
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
                 logger.warning(
@@ -955,7 +957,7 @@ class Engine:
 
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
-        self._compile_submodules()
+        self._compile_submodules({node: runner.recompile_limit for node, runner in ag_runners.items()})
         for submodule_mgmt in self._submodules.values():
             with fp32_precision_scope(submodule_mgmt.fp32_precision), _outside_steps(submodule_mgmt):
                 submodule_mgmt.submodule.warmup_compiles()

@@ -311,19 +311,20 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     torch.testing.assert_close(logits[1], logits[0], rtol=1e-5, atol=1e-5)
 
 
-def test_capture_configs_ask_for_the_recompile_limit_they_need(monkeypatch):
-    # every captured token count costs a decoder layer's frames up to three entries
+def test_the_runner_sizes_the_recompile_limit_for_a_config_s_ladder():
+    """Every captured token count costs a decoder layer's frames up to three entries; the
+    runner counts the serving config's ladder, not the model's default."""
+    from mstar.engine import recompile_limit
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    def runner(ladders):
+        return AcceleratorGraphRunner(
+            submodule_name="LLM", submodule=_submodule(Glm52ModelConfig(prefill_capture_batch_sizes=[1, 4, 16])),
+            resources={}, step_runner=None, device=torch.device("cpu"), autocast_dtype=None,
+            joint_comm_group=SimpleNamespace(world_size=1), num_slots=1, token_ladders=ladders,
+        )
+
+    assert runner({}).recompile_limit is None  # the default buckets fit the engine's limit
     buckets = list(range(64, 2049, 64))
-    default = _submodule(Glm52ModelConfig())
-    default.get_accelerator_graph_configs(torch.device("cpu"))
-    monkeypatch.setattr(Glm52LLMSubmodule, "PREFILL_TOKEN_BUCKETS", buckets)
-    cfg = Glm52ModelConfig(prefill_capture_batch_sizes=[1, 4, 16])
-    before = torch._dynamo.config.recompile_limit
-    sub = _submodule(cfg)
-    sub.get_accelerator_graph_configs(torch.device("cpu"))
     shapes = len(buckets) + 7  # + the decode batch sizes
-    assert sub.dynamo_recompile_limit() >= 3 * shapes
-    assert torch._dynamo.config.recompile_limit == before  # the engine applies it, per call
-    assert default.dynamo_recompile_limit() <= 84  # the default buckets fit
-
-
+    assert runner({"prefill": buckets}).recompile_limit >= 3 * shapes > recompile_limit()

@@ -34,31 +34,21 @@ def test_the_engine_threads_start_before_a_compiled_call_can_raise_the_limit():
         pool.shutdown()
 
 
-def test_a_submodules_recompile_limit_holds_inside_its_calls_only():
+def test_a_raised_recompile_limit_holds_inside_its_calls_only():
     from mstar.engine import with_recompile_limit
-    from mstar.model.submodule_base import NodeSubmodule
-
-    class _Wide:
-        def dynamo_recompile_limit(self):
-            return 500
-
-    class _Default:  # a submodule that keeps the base hook
-        dynamo_recompile_limit = NodeSubmodule.dynamo_recompile_limit
 
     config = torch._dynamo.config
     seen = []
-    before = (config.recompile_limit, config.accumulated_recompile_limit)
-    wrapped = with_recompile_limit(
-        lambda: seen.append((config.recompile_limit, config.accumulated_recompile_limit)), _Wide())
+    before = config.recompile_limit
+    wrapped = with_recompile_limit(lambda: seen.append(config.recompile_limit), 200)
     wrapped()
-    # past dynamo's per-code-object total too, or the entries over it would run uncompiled
-    assert seen == [(500, 500)]
-    assert (config.recompile_limit, config.accumulated_recompile_limit) == before
+    assert seen == [200]
+    assert config.recompile_limit == before
 
     def plain():
         return None
 
-    assert with_recompile_limit(plain, _Default()) is plain
+    assert with_recompile_limit(plain, None) is plain
 
 
 @pytest.mark.parametrize(

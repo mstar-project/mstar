@@ -12,7 +12,7 @@ from torch.distributed import ReduceOp
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine import with_recompile_limit
+from mstar.engine import recompile_limit, with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
@@ -787,6 +787,7 @@ class AcceleratorGraphRunner:
             (max(self._batch_sizes(config)) for config in self._capture_configs),
             default=1,
         )
+        self.recompile_limit = self._recompile_limit()
 
     @property
     def any_graphs(self):
@@ -794,6 +795,25 @@ class AcceleratorGraphRunner:
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+
+    def _recompile_limit(self) -> int | None:
+        """The dynamo recompile limit this node's compiled calls run under, None where the
+        engine's holds: an entry per compiled capture's token count
+        (``compiled_entries_per_shape`` of them), and some for the engine's compiled forward,
+        which shares the code objects. A capture past the limit would run uncompiled inside
+        its graph. Dynamo's cap of 256 entries per code object in all bounds it."""
+        shapes = {
+            (idx, n) for idx, config in enumerate(self._capture_configs) if config.compile
+            for bs in self._batch_sizes(config) for n in config.get_total_tokens(bs)
+        }
+        need = self._submodule.compiled_entries_per_shape * len(shapes) + 16
+        if need > 256:
+            logger.warning(
+                "AcceleratorGraphRunner[%s]: %d captured token counts need a recompile limit of "
+                "%d, past dynamo's 256; the captures compiled last run uncompiled",
+                self._submodule_name, len(shapes), need,
+            )
+        return min(need, 256) if need > recompile_limit() else None
 
     def max_capture_bs(self, walks: Collection[str]) -> int:
         """The widest capture of any of ``walks``, 0 when none of them has one."""
@@ -1288,7 +1308,7 @@ class AcceleratorGraphRunner:
             )
         return with_recompile_limit(with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
-        ), self._submodule)
+        ), self.recompile_limit)
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,

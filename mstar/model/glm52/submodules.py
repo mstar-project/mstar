@@ -17,7 +17,6 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
     distribute_tokens,
 )
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionStep,
@@ -78,7 +77,6 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         self.config = config
         self._capture_block_warned = False
         # what get_accelerator_graph_configs fits to its captures
-        self._recompile_limit: int | None = None
         # MTP per-request state: total emitted tokens (incl. the prefill-
         # emitted one — max_tokens counts it) and the stop parameters stashed
         # at prepare_inputs time, so the host cuts each verdict without engine
@@ -128,6 +126,9 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
 
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # a decoder layer's frames are traced once per layer kind: dense, MoE, and the last one
+    # on the sampled rows
+    compiled_entries_per_shape = 3
     # an MTP row costs k+1 tokens, so the decode capture pads less coarsely
     MTP_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32, 48, 64]
 
@@ -305,26 +306,7 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 **flags,
             ),
         ]
-        self._fit_recompile_limit(configs)
         return configs
-
-    def _fit_recompile_limit(self, configs: list[AcceleratorGraphConfig]) -> None:
-        """The recompile limit these captures take: a decoder layer's frames hold an entry per
-        captured token count and layer kind (dense, MoE, the last one on sampled rows), and
-        the shapes past the limit capture uncompiled."""
-        tokens = {
-            n for config in configs
-            for bs in config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES
-            for n in config.get_total_tokens(bs)
-        }
-        need = 3 * len(tokens) + 16  # and the engine's compiled fallback
-        if torch._dynamo.config.recompile_limit < need:
-            logger.info("Glm52LLMSubmodule: dynamo recompile_limit %d for %d captured token counts "
-                        "(the engine's is %d)", need, len(tokens), torch._dynamo.config.recompile_limit)
-        self._recompile_limit = need
-
-    def dynamo_recompile_limit(self) -> int | None:
-        return self._recompile_limit
 
     # ── per-step contract ──
 

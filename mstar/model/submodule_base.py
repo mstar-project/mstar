@@ -826,11 +826,11 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # engines skip compiling such submodules (CUDA-graph capture is unaffected).
     disable_torch_compile: bool = False
 
-    def dynamo_recompile_limit(self) -> int | None:
-        """Entries dynamo may keep per code object of this submodule's compiled forwards, when
-        its captures need more than the engine's ``MSTAR_RECOMPILE_LIMIT``. The engine applies
-        it around this submodule's compiled calls only. None keeps the engine's."""
-        return None
+    # Entries dynamo keeps per code object of the compiled forward for each token count a
+    # compiled capture takes, e.g. one per kind of layer a frame is traced for. The runner
+    # raises the recompile limit around this node's compiled calls to hold every capture
+    # (`AcceleratorGraphRunner.recompile_limit`).
+    compiled_entries_per_shape: int = 1
 
     # Set True on a submodule that must run in its own parameter dtype — e.g. a
     # numerically sensitive fp32 vocoder. The engine then neither casts its
