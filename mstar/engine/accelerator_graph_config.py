@@ -277,30 +277,31 @@ def check_token_ladder(where: str, ladder: Any) -> None:
         )
 
 
-def _trim(ladder: list[int], budget: int | None, at_least: int = 0) -> list[int]:
-    """``ladder`` up to its first rung that holds ``budget`` and ``at_least``."""
+def _trim(ladder: list[int], tokens: int | None, at_least: int = 0) -> list[int]:
+    """``ladder`` up to its first rung that holds ``tokens`` and ``at_least``."""
     rungs = sorted(ladder)
-    if budget is None:
+    if tokens is None:
         return rungs
-    bound = max(budget, at_least)
+    bound = max(tokens, at_least)
     held = next((i for i, n in enumerate(rungs) if n >= bound), len(rungs) - 1)
     return rungs[:held + 1]
 
 
 def apply_token_ladders(
     node: str, configs: list[AcceleratorGraphConfig], ladders: Mapping[str, Any],
-    step_budget: Callable[[str], int | None],
+    step_tokens: Callable[[PackedAcceleratorGraphConfig, str], int | None],
 ) -> None:
     """Take a serving config's ``prefill_token_buckets`` for ``node`` (capture
     walk -> ladder or ``{min batch size: ladder}``, which `EngineManager`
     checked) as the ``capture_token_lengths`` of the node's packed captures of
     that walk.
 
-    A ladder runs to the first rung that holds the token budget of the steps
-    its capture replays (``step_budget`` of each replay walk; none where any of
-    them has none): the scheduler builds no step past it, so a rung beyond
-    would never replay. A larger batch size's ladder also runs at least as far
-    as a smaller one's, which share its static buffers.
+    A ladder runs to the first rung that holds the most tokens the scheduler
+    gives a step its capture replays (``step_tokens`` of the capture and each
+    replay walk: its token budget, or a little past it beside decode rows;
+    none where any walk has no budget): a rung beyond would never replay. A
+    larger batch size's ladder also runs at least as far as a smaller one's,
+    which share its static buffers.
 
     A walk whose steps only replay another walk's capture is refused, naming
     that walk, as is one the node captures by batch size alone. A walk the
@@ -329,17 +330,17 @@ def apply_token_ladders(
             )
             continue
         for config in targets:
-            budgets = [step_budget(w) for w in config.replay_graph_walks]
-            budget = None if None in budgets else max(budgets)
+            bounds = [step_tokens(config, w) for w in config.replay_graph_walks]
+            bound = None if None in bounds else max(bounds)
             trimmed, top, dropped = {}, 0, []
             for k, rungs in sorted(ladders_by_batch_size(ladder).items()):
-                trimmed[k] = _trim(rungs, budget, top)
+                trimmed[k] = _trim(rungs, bound, top)
                 top = trimmed[k][-1]
                 dropped += sorted(set(rungs) - set(trimmed[k]))
             if dropped:
                 logger.info(
-                    "%s/%s: drops prefill_token_buckets %s, past the first that holds its "
-                    "%d-token step budget", node, walk, dropped, budget,
+                    "%s/%s: drops prefill_token_buckets %s, past the first that holds the "
+                    "%d tokens its steps run at most", node, walk, dropped, bound,
                 )
             config.capture_token_lengths = trimmed
 

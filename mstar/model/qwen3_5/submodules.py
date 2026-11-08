@@ -109,10 +109,13 @@ class LLMSubmodule(SampledTokenDecoder):
     # ITL p99 at c48
     MAX_BATCH_TOKENS = 2048
     # A mixed step captures only the ladder's powers of two and one slack
-    # bucket, a decode batch's width above the default budget, for a step a few
-    # tokens over it (2176). Every (rows, tokens) pair here is one more recompile of the
-    # forward all these captures share, and past Dynamo's limit the buckets
-    # compiled last run uncompiled inside their graphs. The slack reads the
+    # bucket, a decode batch's width above the default budget (2176): where a
+    # step's decode rows leave its prompt less than `min_chunk_tokens` of the
+    # budget, the prompt still runs that many, so the step passes the budget by
+    # up to its decode rows. At the default 128-token floor no step does.
+    # Every (rows, tokens) pair here is one more recompile of the forward all
+    # these captures share, and past Dynamo's limit the buckets compiled last
+    # run uncompiled inside their graphs. The slack reads the
     # scaffold's MIXED_CAPTURE_BATCH_SIZES by name (an inherited name isn't in
     # scope in a class body), so a class that sets its own sets this too.
     MIXED_SLACK_TOKENS = MAX_BATCH_TOKENS + SampledTokenDecoder.MIXED_CAPTURE_BATCH_SIZES[-1]

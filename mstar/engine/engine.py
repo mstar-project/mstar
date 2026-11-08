@@ -898,7 +898,7 @@ class Engine:
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
                 token_ladders=submodule_mgmt.token_ladders,
-                step_budget=functools.partial(self._chunking.step_budget, node_name),
+                step_tokens=functools.partial(self._chunking.max_step_tokens, node_name),
             )
             self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(

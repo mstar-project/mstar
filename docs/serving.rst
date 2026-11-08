@@ -346,11 +346,13 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        mapping of min batch size -> list for a ladder per range of batch sizes:
        ``{1: [...], 2: [...]}`` captures one request on the first and every larger
        batch on the second (a larger batch size's ladder must reach at least as
-       far). A walk's ladder runs to the first rung that holds the token budget of
-       the steps its capture replays (``max_batch_tokens``; a walk inside a
-       combined walk runs under the combined walk's), and the rungs past it, which
-       no step would reach, are dropped and logged; a region takes its ladder
-       whole. A vision tower's ``vision_block_loop`` and an AuT encoder's
+       far). A walk's ladder runs to the first rung that holds the most tokens a
+       step its capture replays runs: its token budget (``max_batch_tokens``; a walk
+       inside a combined walk runs under the combined walk's), or past it where the
+       capture's widest batch of one-token decode rows leaves a prompt less than
+       ``min_chunk_tokens``, which then still runs that many. The rungs past it,
+       which no step would reach, are dropped and logged; a region takes its
+       ladder whole. A vision tower's ``vision_block_loop`` and an AuT encoder's
        ``aut_encode`` (Qwen3-Omni, Qwen3-ASR) pack a step up to their ladder's top;
        every other region keeps its own batch cap. A tower's attention resource is
        sized from the model's own top rung, and a batch with more attention segments

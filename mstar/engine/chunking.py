@@ -106,13 +106,22 @@ class ChunkingManagement:
                 return self._overrides[key]
         return budget
 
-    def step_budget(self, node_name: str, graph_walk: str) -> int | None:
-        """The budget a step of ``graph_walk`` was scheduled under: that of
-        the combined walk it runs in, if any. A combined batch whose rows share
-        one real walk runs relabelled to it (`ScheduledBatch.relabel_if_uniform`)
-        and still ran under the combined walk's budget."""
+    def max_step_tokens(self, node_name: str, graph_walk: str, max_rows: int) -> int | None:
+        """The most tokens the scheduler gives a step of ``graph_walk`` of at
+        most ``max_rows`` rows, None where it runs under no budget.
+
+        That is the budget it was scheduled under: that of the combined walk
+        it runs in, if any (a combined batch whose rows share one real walk
+        runs relabelled to it, `ScheduledBatch.relabel_if_uniform`, and still
+        ran under the combined walk's budget). Or more, by what the step's
+        speculated rows, one-token decode rows, take of ``min_chunk_tokens``:
+        where they leave a prompt less than that, the prompt still runs that
+        many (`batch_builder._run_head`) beside them."""
         walk = self._combined_walk_of.get((node_name, graph_walk), graph_walk)
-        return self.max_batch_tokens(node_name, walk)
+        budget = self.max_batch_tokens(node_name, walk)
+        if budget is None:
+            return None
+        return max(budget, max_rows - 1 + self.min_chunk_tokens(budget))
 
     def set_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],

@@ -703,11 +703,12 @@ class AcceleratorGraphRunner:
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
         token_ladders: Mapping[str, Any] | None = None,
-        step_budget: Callable[[str], int | None] = lambda walk: None,
+        step_tokens: Callable[[str, int], int | None] = lambda walk, max_rows: None,
     ):
         """``token_ladders``: the serving config's ``prefill_token_buckets``
-        for this node, applied to its packed captures under ``step_budget``
-        (walk -> the token budget its steps run under; `apply_token_ladders`)."""
+        for this node, applied to its packed captures under ``step_tokens``
+        ((walk, the capture's widest batch) -> the most tokens the scheduler
+        gives such a step, None for no budget; `apply_token_ladders`)."""
         self._submodule_name = submodule_name
         self._capture_stream = capture_stream
         self._submodule = submodule
@@ -720,7 +721,10 @@ class AcceleratorGraphRunner:
             )
         )
         if token_ladders:
-            apply_token_ladders(submodule_name, self._capture_configs, token_ladders, step_budget)
+            apply_token_ladders(
+                submodule_name, self._capture_configs, token_ladders,
+                lambda config, walk: step_tokens(walk, max(self._batch_sizes(config))),
+            )
         self._resources = resources
         self._step_runner = step_runner
         self._device = device

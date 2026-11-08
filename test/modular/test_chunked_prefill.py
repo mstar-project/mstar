@@ -703,9 +703,9 @@ def test_a_step_relabelled_to_one_walk_is_checked_against_its_combined_budget(ca
 # ── engine: the serving config's prefill_token_buckets ─────────────────
 
 
-def _captured_buckets(submodule, walk, ladders, engine) -> list[int]:
+def _captured_buckets(submodule, walk, ladders, engine, bs=1) -> list[int]:
     """The token counts the engine's runner captures ``submodule``'s ``walk``
-    at (batch size 1), given the serving config's ladders and ``engine``'s budgets."""
+    at (batch size ``bs``), given the serving config's ladders and ``engine``'s budgets."""
     import functools
 
     from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
@@ -714,11 +714,11 @@ def _captured_buckets(submodule, walk, ladders, engine) -> list[int]:
         submodule_name="LLM", submodule=submodule, resources={}, step_runner=None,
         device=torch.device("cpu"), autocast_dtype=None,
         joint_comm_group=SimpleNamespace(world_size=1), num_slots=1,
-        token_ladders=ladders, step_budget=functools.partial(engine._chunking.step_budget, "LLM"),
+        token_ladders=ladders, step_tokens=functools.partial(engine._chunking.max_step_tokens, "LLM"),
     )
     return sorted({
         spec.bucket.num_tokens for spec in runner._get_slot_specs()
-        if spec.bucket.graph_walk == walk and spec.bucket.bs == 1
+        if spec.bucket.graph_walk == walk and spec.bucket.bs == bs
     })
 
 
@@ -758,6 +758,36 @@ def test_rungs_past_the_first_that_holds_the_step_budget_are_dropped():
     assert buckets({"LLM": {"mixed": 4096}}) == [1024, 2048, 3000, 4096]
     assert buckets({"LLM": {"mixed": 2500}}) == [1024, 2048, 3000]
     assert buckets({"LLM": None}) == [1024, 2048, 3000, 4096, 8192]
+
+
+def test_a_mixed_ladder_keeps_the_rung_a_prompt_beside_decode_rows_runs_past_the_budget():
+    """Where a mixed step's decode rows leave a prompt less than
+    ``min_chunk_tokens`` of the budget, the prompt still runs that many beside
+    them: 127 decode rows and a 2048-token chunk replay at 2176, which stays.
+    At the default floor no step passes the budget, so 2176 is dropped."""
+    from mstar.model.qwen3_5.submodules import LLMSubmodule
+    from mstar.worker.batch_builder import fill_token_budget_in_start_order
+
+    walks, combined = {"prefill_text", "decode"}, {("LLM", "prefill_text"): "mixed", ("LLM", "decode"): "mixed"}
+    llm = LLMSubmodule(None, SimpleNamespace(stop_token_ids=(1,)))
+    rows = llm.MIXED_CAPTURE_BATCH_SIZES[-1]
+
+    def buckets(min_chunk_tokens):
+        engine = _budgeted_engine()
+        engine.set_chunking_policies({
+            ("LLM", "prefill_text"): ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=2048),
+            ("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=2048),
+        })
+        engine.set_token_budgets({}, walks, combined, min_chunk_tokens=min_chunk_tokens)
+        # the scheduler's step: the decode rows a speculation brought, then a long prompt
+        take, _ = fill_token_budget_in_start_order(
+            [0], {0: 5000}, {0}, 2048 - (rows - 1), engine.min_chunk_tokens(2048),
+        )
+        ladder = {"mixed": [1024, 2048, 2176, 4096]}
+        return rows - 1 + take[0], _captured_buckets(llm, "mixed", ladder, engine, bs=rows)
+
+    assert buckets(128) == (2048, [1024, 2048])
+    assert buckets(2048) == (2175, [1024, 2048, 2176])
 
 
 @pytest.mark.parametrize("walk, match", [

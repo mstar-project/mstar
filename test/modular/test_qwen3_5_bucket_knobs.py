@@ -57,7 +57,8 @@ def _captured_ladders(submodule, ladders) -> dict[str, PackedAcceleratorGraphCon
     from mstar.engine.accelerator_graph_config import apply_token_ladders
     configs = submodule.get_accelerator_graph_configs(torch.device("cpu"))
     if ladders:
-        apply_token_ladders("LLM", configs, ladders, lambda walk: submodule.MAX_BATCH_TOKENS)
+        # at the default min_chunk_tokens no step passes the budget
+        apply_token_ladders("LLM", configs, ladders, lambda config, walk: submodule.MAX_BATCH_TOKENS)
     return {c.capture_graph_walk: c for c in configs if isinstance(c, PackedAcceleratorGraphConfig)}
 
 
