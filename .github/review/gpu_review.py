@@ -83,34 +83,38 @@ def slurm_allowed(pr, slurm_authors, commenter):
     return commenter in listed and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in listed
 
 
-def configure(out, runner_temp, pr="0", slurm_key="", slurm_nodes="", slurm_authors="", commenter="",
+def configure(out, runner_temp, pr="0", ssh_key="", slurm_nodes="", slurm_authors="", commenter="",
               max_gpus="4", hours="4", max_usd="30", max_runs="2", eras_secret=""):
-    """gpu.py's config.local.json from the workflow's variables and secrets, and the ssh keys. The Slurm
-    nodes only with their key (one for all of them) and for a run `slurm_allowed` lets use them; Eras
-    only with ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of nodes, each with its name, host,
-    port and pinned host key, and optionally any other field of gpu.py's node. Nothing here reaches the box."""
+    """gpu.py's config.local.json from the workflow's variables and secrets, and the runner's ssh key
+    (`ssh_key`, REVIEW_SSH_KEY, stored in the environment, one for every Slurm node and Eras; it stays on
+    the runner and never reaches the box). The Slurm nodes only with that key and for a run `slurm_allowed`
+    lets use them; Eras only with that key and ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of
+    nodes, each with its name, host, port and pinned host key, and optionally any other field of gpu.py's
+    node."""
     pr = int(pr)
     Path(os.environ["LIVE_PR_STATE"]).mkdir(parents=True, exist_ok=True)
     ssh = Path.home() / ".ssh"
     ssh.mkdir(mode=0o700, exist_ok=True)
-    if not (ssh / "live_pr").exists():  # Eras boxes: this run's key, which gpu.py registers
-        bot.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "live_pr")])
+    key = ssh / "live_pr"
+    if ssh_key:
+        key.touch(mode=0o600)
+        key.write_text(ssh_key.strip() + "\n")
+        (ssh / "live_pr.pub").write_text(bot.run(["ssh-keygen", "-y", "-f", str(key)]).stdout)
+    else:
+        print("::warning::REVIEW_SSH_KEY is not set, so the live test has no GPUs to reach.")
     nodes = json.loads(slurm_nodes or "[]")
     if not isinstance(nodes, list) or not all(
             isinstance(n, dict) and re.fullmatch(r"[A-Za-z0-9._-]+", str(n.get("name"))) and n.get("host")
             for n in nodes):
         raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]) and a host")
     slurm = []
-    if slurm_key and nodes and slurm_allowed(pr, slurm_authors, commenter):
-        key = ssh / "review_slurm"
-        key.touch(mode=0o600)
-        key.write_text(slurm_key.strip() + "\n")
+    if ssh_key and nodes and slurm_allowed(pr, slurm_authors, commenter):
         defaults = {"port": 22, "partition": "background", "nice": 100, "max_gpus": int(max_gpus),
                     "job_prefix": "review-bot", "workdir": "/workspace/review-bot", "gpu": "H200", "vram_gb": 141,
                     "hf_home": "/workspace/shared/hf"}
         slurm = [{**defaults, **n, "identity_file": str(key)} for n in nodes]
     usd, hours = float(max_usd), float(hours)
-    eras = {}
+    eras = {} if ssh_key else {"enabled": False}
     if eras_secret:
         eras["run_secret_id"] = eras_secret
     cfg = {"mode": "cloud", "results_dir": "results", "ssh_public_key": str(ssh / "live_pr.pub"),

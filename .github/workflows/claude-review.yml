@@ -534,11 +534,12 @@ jobs:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
 
-      # gpu.py's settings, from repository variables; the Slurm nodes' key from a secret, and
-      # each node's host and pinned host key from REVIEW_SLURM_NODES. Nothing here reaches the box.
+      # gpu.py's settings, from repository variables; the ssh key every box is reached with from a
+      # secret, and each node's host and pinned host key from REVIEW_SLURM_NODES. The key stays on
+      # the runner: it never reaches the box.
       - name: Configure the GPUs
         env:
-          SLURM_KEY: ${{ secrets.REVIEW_SLURM_SSH_KEY }}
+          SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
           SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
           SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
           COMMENTER: ${{ github.event.comment.user.login }}

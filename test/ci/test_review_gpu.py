@@ -60,7 +60,7 @@ class TestApproval(unittest.TestCase):
                     unittest.mock.patch.object(gpu_review, "GPU", Path(d, "s/gpu.py")), \
                     unittest.mock.patch.object(Path, "home", return_value=Path(d)), \
                     unittest.mock.patch.object(bot, "run", fake):
-                gpu_review.configure({}, d, pr=7, slurm_key="k", slurm_nodes='[{"name": "n", "host": "h"}]',
+                gpu_review.configure({}, d, pr=7, ssh_key="k", slurm_nodes='[{"name": "n", "host": "h"}]',
                                      slurm_authors=authors, commenter=commenter)
                 return json.loads(Path(d, "config.local.json").read_text())["slurm"]
 
