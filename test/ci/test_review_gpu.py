@@ -54,6 +54,13 @@ class TestApproval(unittest.TestCase):
         for expected in ("inline 1", "inline 3", "inline 5", "engine.py:10"):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")
 
+    def test_only_a_listed_author_can_use_the_slurm_nodes(self):
+        with unittest.mock.patch.object(bot, "api", return_value={"user": {"login": "someone"}}):
+            self.assertFalse(gpu_review.slurm_allowed(7, ""), "with the variable unset, nobody may use Slurm")
+            self.assertFalse(gpu_review.slurm_allowed(7, "alice bob"),
+                             "any write-access author would run code as root on the shared nodes")
+            self.assertTrue(gpu_review.slurm_allowed(7, "alice someone"))
+
     def test_rules_and_dependencies_never_approve_and_engine_approvals_dont_count(self):
         for path in (".github/review/review-prompt.md", ".claude/skills/pr-review/SKILL.md", "AGENTS.md",
                      "CLAUDE.md", "uv.lock", "rust/server/Cargo.lock", "pyproject.toml", "setup.py",

@@ -69,12 +69,19 @@ def gpu_py():
 
 # ---------------------------------------------------------------- GPUs
 
-def configure(out, runner_temp, slurm_key="", slurm_nodes="", max_gpus="4", hours="4", max_usd="30", max_runs="2",
-              eras_secret=""):
+def slurm_allowed(pr, slurm_authors):
+    """Whether this PR's live test may use the Slurm nodes: only when its author is one of `slurm_authors`
+    (REVIEW_SLURM_AUTHORS, the people already on the nodes). Unset means no Slurm; everyone else with write
+    access still gets a live test, on Eras. The nodes have no job containers and the box runs PR code as root."""
+    return bool(slurm_authors.split()) and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in slurm_authors.split()
+
+
+def configure(out, runner_temp, pr: int, slurm_key="", slurm_nodes="", slurm_authors="", max_gpus="4", hours="4",
+              max_usd="30", max_runs="2", eras_secret=""):
     """gpu.py's config.local.json from the workflow's variables and secrets, and the ssh keys. The Slurm
-    nodes only with their key (one for all of them); Eras only with ERAS_API_KEY (gpu.py checks).
-    SLURM_NODES is a JSON list of nodes, each with its name, host, port and pinned host key, and
-    optionally any other field of gpu.py's node. Nothing here reaches the box."""
+    nodes only with their key (one for all of them) and for an author `slurm_allowed` lets use them; Eras
+    only with ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of nodes, each with its name, host,
+    port and pinned host key, and optionally any other field of gpu.py's node. Nothing here reaches the box."""
     Path(os.environ["LIVE_PR_STATE"]).mkdir(parents=True, exist_ok=True)
     ssh = Path.home() / ".ssh"
     ssh.mkdir(mode=0o700, exist_ok=True)
@@ -86,7 +93,7 @@ def configure(out, runner_temp, slurm_key="", slurm_nodes="", max_gpus="4", hour
             for n in nodes):
         raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]) and a host")
     slurm = []
-    if slurm_key and nodes:
+    if slurm_key and nodes and slurm_allowed(pr, slurm_authors):
         key = ssh / "review_slurm"
         key.touch(mode=0o600)
         key.write_text(slurm_key.strip() + "\n")
