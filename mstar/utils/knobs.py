@@ -15,7 +15,6 @@ KNOBS: dict[str, str] = {
     "sampler_slots": "MSTAR_SAMPLER_SLOTS",
     "ingraph_decode_rope": "MSTAR_INGRAPH_DECODE_ROPE",
     "kv_chain_lazy_steps": "MSTAR_KV_CHAIN_LAZY_STEPS",
-    "kv_plan_cache": "MSTAR_KV_PLAN_CACHE",
     "kv_pinned_indptrs": "MSTAR_KV_PINNED_INDPTRS",
     "gc_gen0_threshold": "MSTAR_GC_GEN0_THRESHOLD",
     "pre_plan": "MSTAR_PRE_PLAN_SPEC",
@@ -163,18 +162,6 @@ def kv_chain_lazy_steps() -> int:
     c64/c128 on 0.8B (the extension is a small part of the stop check's
     tail)."""
     return max(1, int(_setting("kv_chain_lazy_steps", "1")))
-
-
-def kv_plan_cache() -> int:
-    """``kv_plan_cache`` / ``MSTAR_KV_PLAN_CACHE`` (default 0): the KV manager
-    plans a leased decode step from the previous step's plan when the batch
-    is the same rows in the same order and nothing but that step's commit
-    touched the streams: lengths advance by one, pages change only where a
-    row crossed a page boundary, and the five index arrays come from numpy
-    instead of a per-row Python pass. ``0`` plans every step from the
-    streams; ``2`` does both and logs any difference (a correctness check for
-    runs)."""
-    return int(_setting("kv_plan_cache", "0"))
 
 
 def kv_pinned_indptrs() -> bool:

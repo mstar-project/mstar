@@ -166,13 +166,14 @@ You must implement these abstract methods:
    (``request_done=True``). A simple prefill-decode model sets ``is_prefill`` to false
    once, then repeats the decode walk until EOS.
 
-``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None) -> NodeSubmodule | None``
+``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None, cfg_group=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load
    weights here, on ``device``. Return ``None`` for dummy mode.
 
    ``tp_group`` and ``sp_group`` are the node's tensor-parallel and sequence-parallel
    communicators when the node is sharded. Pass ``tp_group`` to the parallel-linear
-   constructors. See :ref:`Step 6 <tensor-parallelism>`.
+   constructors. See :ref:`Step 6 <tensor-parallelism>`. ``cfg_group`` is passed only to a
+   node whose group sets ``cfg_size > 1``; see `Guidance (CFG) parallelism`_.
 
    ``moe_parallel`` is the node group's ``ep_config``, parsed into a
    ``MoeParallelConfig``. It is passed only to an EP-enabled node whose group sets one,
@@ -595,7 +596,7 @@ these common members:
   config carries ``splits`` must return them here. ``AttentionSpec`` and
   ``LinearAttnSpec`` return their config's ``splits``.
 
-Two lockstep-parallel nodes on one worker (TP or SP nodes placed on the same ranks) must not
+Two lockstep-parallel nodes on one worker (TP, SP or CFG nodes placed on the same ranks) must not
 share a resource whose state rank 0 decides for the other ranks outside the step that uses it:
 a resource implementing ``supports_eviction``, ``lease_cached_prefix`` or ``page_trail``, which
 the paged KV cache does with or without host offload. The other ranks replay each decision
@@ -1916,7 +1917,7 @@ each row with ``mstar.engine.resources.sampler.fused_draw.draw_row``, which pick
 ``fused_sample`` would. After the launch, ``sampler.advance_offsets(draws)`` moves the offsets
 as that many ``sample`` calls would. ``fused_draw_args()`` returns None when ``sample`` would
 do more than that draw (an eager step, the penalty, min-p, logprobs, a kept last token,
-TP); the model then calls ``sample``.
+a TP, SP or CFG node); the model then calls ``sample``.
 
 .. warning::
 
@@ -2033,7 +2034,7 @@ batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture
 of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
 walk that nothing on the chain reads, such as a codec. Where the config asks,
 ``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
-speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
+speculated nor planned ahead and lands between two chain steps: a TP, SP or CFG node, a node
 alone on its worker, a device without streams, a node with chain walks or resources, and a
 side walk that is not the node's alone, sits in a combined walk, or has output spans or a
 stop check. A config without the field keeps the node on the chain, whatever it declares.
@@ -2626,7 +2627,9 @@ Two separate mechanisms split work across the TP group. Keep them distinct:
   the tensor is replicated to every rank. You need an entry only for edges where the
   producer and the consumer both keep the data sharded. The common case is replicated
   activations, which needs no entry. You can also set ``shard_dim`` per run, under a
-  ``sharding_config`` block in the YAML.
+  ``sharding_config`` block in the YAML. A sharded signal is split over the node's whole
+  lockstep instance, so placement refuses one on a node group with ``sp_size`` or
+  ``cfg_size`` above 1.
 
 If a node group has ``tp_size > 1`` and names a node that is not in ``tp_enabled_nodes``,
 loading fails. See ``configs/qwen3omni_thinker_tp2.yaml`` for an example with several node
@@ -2641,6 +2644,36 @@ without the group norms an unreduced partial sum, which is wrong only under TP. 
 the module whose ``forward`` calls the norms, as ``Qwen3_5LanguageModel`` and
 ``MuseGlimmerTextModel`` do. ``MultimodalDecoderModel`` builds the kernel's workspace for its
 TP node.
+
+.. _Guidance (CFG) parallelism:
+
+Guidance (CFG) parallelism
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A diffusion node that runs its classifier-free-guidance branches as one batch can split
+them over a node group's ``cfg_size`` ranks, a mesh axis of its own beside ``tp_size``
+and ``sp_size`` (see :doc:`serving`). Declare the node and the most branches it runs in
+``cfg_enabled_nodes``; placement refuses a ``cfg_size`` that doesn't divide that count:
+
+.. code-block:: python
+
+   def get_default_sharding_config(self):
+       return ShardingConfig(
+           groups=[], tp_enabled_nodes=set(), shard_dim={},
+           cfg_enabled_nodes={"dit": 2},
+       )
+
+The submodule receives ``cfg_group`` from ``get_submodule``, takes its rows of the branch
+batch with ``my_rows(cfg_group, branches)``
+(``mstar/model/components/distributed/sequence_parallel.py``), and after the forward
+reassembles them with ``cfg_group.all_gather(out, dim=0)``. Every rank then runs the same
+guidance combine and solver step on replicated latents. CFG ranks keep every attention
+head; only TP and SP ranks split them. The ranks run in lockstep on the same requests, so
+any per-request resource the node declares must stay the same shape on every rank, and a
+node with ``cfg_size > 1`` can't hold a paged KV cache (placement refuses one before
+any worker starts): branches that hold different KV are separate nodes in a graph ``Parallel``
+instead, on a node group with ``cfg_size: 1``, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are.
+``Wan22DitSubmodule`` is the reference.
 
 .. _Expert parallelism (MoE):
 
