@@ -31,7 +31,7 @@ from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, S
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK
-from mstar.engine.state.adapters import state_steps
+from mstar.engine.state.adapters import check_capture, state_steps
 from mstar.engine.state.contract import EMPTY
 from mstar.model.submodule_base import (
     BatchedModelOutput,
@@ -715,6 +715,10 @@ class AcceleratorGraphRunner:
                 device, joint_comm_group.world_size
             )
         )
+        for config in self._capture_configs:
+            check_capture(
+                getattr(submodule, "state_handles", {}), {config.capture_graph_walk, *config.replay_graph_walks},
+            )
         self._resources = resources
         self._step_runner = step_runner
         self._device = device

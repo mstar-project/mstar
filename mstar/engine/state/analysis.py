@@ -28,13 +28,17 @@ def state_declaration_problems(model: "Model") -> list[str]:
     problems = _name_problems(arrays, samplers)
     walks = {walk: set(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
     nodes = sorted(set().union(*walks.values()))
-    combined = {walk for by_name in model.get_combined_graph_walks().values() for walk in by_name}
+    combined_by_node = model.get_combined_graph_walks()
+    combined = {walk for by_name in combined_by_node.values() for walk in by_name}
     for array in arrays:
         problems += [
             f"Array {array.name!r}.nodes: {node!r} is not a node of the model, which has {nodes}"
             for node in sorted(array.nodes - set(nodes))
         ]
         problems += _read_problems(array, walks, combined)
+        problems += _combined_walk_problems(array, {
+            walk: members for node in sorted(array.nodes) for walk, members in combined_by_node.get(node, {}).items()
+        })
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
@@ -223,6 +227,29 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
             if other != key and (other, key) not in clashes:
                 clashes.add((other, key))
                 problems.append(f"{where}.layers: layer {layer} on walk {walk!r} is also read through reads[{other!r}]")
+    return problems
+
+
+def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]]) -> list[str]:
+    """A combined walk's rows read by their own walks, and a combined step plans one mask per resource."""
+    if all(read.walks is None for read in array.reads.values()):
+        return []
+    problems: list[str] = []
+    for walk, members in sorted(combined.items()):
+        for layer in sorted(array.layers):
+            reads = [
+                (member, key, read.mask) for member in sorted(members) for key, read in array.reads.items()
+                if layer in (read.layers or array.layers) and (read.walks is None or member in read.walks)
+            ]
+            clash = next(((a, b) for a in reads for b in reads if a[2] != b[2]), None)
+            if clash is not None:
+                (one, key, mask), (other, other_key, other_mask) = clash
+                problems.append(
+                    f"Array {array.name!r}: combined walk {walk!r} runs {one!r} through reads[{key!r}] "
+                    f"({type(mask).__name__}) and {other!r} through reads[{other_key!r}] ({type(other_mask).__name__}) "
+                    f"on layer {layer}; a combined step plans one mask per resource"
+                )
+                break
     return problems
 
 

@@ -5,7 +5,7 @@ on a replay, and its checks live in it.
 """
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from itertools import groupby
 from typing import Any
 
@@ -40,12 +40,14 @@ class ArrayHandle(StepHandle):
     label comes from the step's segments. A handle holds each layer's state views, built once at bind, and the
     resources hold the step's plan.
 
-    ``queried`` is the array whose segments lay out the queries of a cross read.
+    ``queried`` is the array whose segments lay out the queries of a cross read. ``read_resources`` gives the resource
+    each read runs on where reads share one, and ``combined`` the walks each combined walk batches.
     """
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], positions_key: str | None,
         host_fields: HostFields | None = None, *, queried: Array | None = None,
+        read_resources: Mapping[str, str] = EMPTY, combined: Mapping[str, Collection[str]] = EMPTY,
     ):
         self.array = array
         self.host_fields = host_fields
@@ -54,7 +56,7 @@ class ArrayHandle(StepHandle):
         self.fused_ops: frozenset[str] = frozenset()
         self.name = array.name
         self.label = self._query_label = "main"
-        self.reads = {key: resources[key] for key in array.reads}
+        self.reads = {key: resources[read_resources.get(key, key)] for key in array.reads}
         self.first_read = next(iter(self.reads.values()), None)
         self.positions_key = positions_key
         self.positions = None if positions_key is None else resources[positions_key]
@@ -66,8 +68,31 @@ class ArrayHandle(StepHandle):
             layer: self.reads[key]
             for key, read in array.reads.items() for layer in read.layers or array.layers
         }
-        # each read's `AttentionStep.causal`, built once since `state_steps` runs on every step, replays too
-        self.causal_reads = {key: not isinstance(read.mask, Bidirectional) for key, read in array.reads.items()}
+        # Each resource's `AttentionStep.causal`, built once since `state_steps` runs on every step, replays too. On an
+        # array whose reads name walks, `walk_reads` holds the read each walk runs on each resource instead, and
+        # `_covers` the layers they cover, under None for a walk no read names. A combined walk's rows read by their own
+        # walks, which agree on each mask.
+        self.causal_reads: dict[str, bool] = {}
+        self.walk_reads: dict[str | None, dict[str, str]] = {}
+        self._covers: dict[str | None, frozenset[int]] = {}
+        if all(read.walks is None for read in array.reads.values()):
+            self.causal_reads = {
+                read_resources.get(key, key): not isinstance(read.mask, Bidirectional)
+                for key, read in array.reads.items()
+            }
+        else:
+            for walk in (None, *{walk for read in array.reads.values() for walk in read.walks or ()}):
+                covering = [key for key, read in array.reads.items() if read.walks is None or walk in read.walks]
+                self.walk_reads[walk] = {read_resources.get(key, key): key for key in covering}
+                self._covers[walk] = frozenset().union(*(array.reads[key].layers or array.layers for key in covering))
+            for walk, members in combined.items():
+                self.walk_reads[walk] = {
+                    resource: key for member in sorted(members)
+                    for resource, key in self.walk_reads.get(member, self.walk_reads[None]).items()
+                }
+                self._covers[walk] = frozenset.intersection(*(
+                    self._covers.get(member, self._covers[None]) for member in members
+                ))
         self._kv = None if is_value(array) or not array.max_len else resources[array.name]
         self._views = {} if self._kv is None else {
             layer: self._kv.layer_view(i) for layer, i in self._pool_layer.items()
@@ -85,8 +110,11 @@ class ArrayHandle(StepHandle):
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
         # `_kept` holds the layers whose kept add has run, `_scratch` those with a scratch add, `_read` those read,
         # `_updated` the update calls run, and `_written` the fields each layer's write set. `_grows` says whether
-        # `check_step` needs an add, for a step that lists a row on the pages at span above 0.
+        # `check_step` needs an add, for a step that lists a row on the pages at span above 0. `_covered` holds the
+        # layers some read covers on the step's walk `_walk`, on an array whose reads name walks.
         self._open = False
+        self._walk: str | None = None
+        self._covered: frozenset[int] | None = None
         self._segments: Sequence[Segment] = ()
         self._keep = True
         self._capturing = False
@@ -140,6 +168,9 @@ class ArrayHandle(StepHandle):
         if step.ctx.replays:
             return
         self._check_step(declared, segments or (), step.ctx)
+        if self._covers:
+            self._walk = step.ctx.graph_walk
+            self._covered = self._covers.get(self._walk, self._covers[None])
         # a capture opens the handles once around `preprocess`, where `eager_add` adds run, and again around the forward
         self._grows = self._kv is not None and not (declared.eager_add and step.ctx.capture) and any(
             segment.span and (segment.request_id, segment.label) not in declared.placeholders
@@ -277,6 +308,8 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"read on layer {layer}, which the array doesn't declare")
         if self._held_layer not in (None, layer):
             raise self._refusal(f"a read on layer {layer} would take the add of layer {self._held_layer}")
+        if self._covered is not None and layer not in self._covered:
+            raise self._refusal(f"a read on layer {layer}, which no read covers on walk {self._walk!r}")
         self._read.add(layer)
 
     def _record_update(self, field: str, layer: int) -> None:

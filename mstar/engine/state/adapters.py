@@ -129,10 +129,11 @@ def _kv_specs(array: Array, by_name: Mapping[str, Array]) -> list[NodeResourceSp
         if not isinstance(read.mask, Causal | Window | Bidirectional):
             raise _no_layout(array, f"reads[{key!r}].mask must be Causal, Window or Bidirectional, the masks "
                                     "AttentionConfig has")
-        if read.walks is not None:
-            raise _no_layout(array, f"reads[{key!r}].walks must be None, since AttentionConfig has no walk")
         if read.queries is None:
             continue
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None on a cross read, since CrossAttentionConfig "
+                                    "has no walk")
         if len(array.labels) != 1:
             raise _no_layout(array, f"a cross read's array declares one label, CrossAttentionConfig's one "
                                     f"context_label, and it has {sorted(array.labels)}")
@@ -153,27 +154,60 @@ def _kv_specs(array: Array, by_name: Mapping[str, Array]) -> list[NodeResourceSp
             num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,
         ),
     )]
+    specs += [
+        CrossAttentionSpec(
+            resource_key=key, nodes=array.nodes,
+            config=CrossAttentionConfig(
+                kv_cache=array.name, query_kv_cache=read.queries, context_label=min(array.labels),
+            ),
+        )
+        for key, read in array.reads.items() if read.queries is not None
+    ]
+    configs, _ = _read_specs(array)
+    specs += [AttentionSpec(resource_key=key, nodes=array.nodes, config=config) for key, config in configs.items()]
+    return specs
+
+
+def _read_specs(array: Array) -> tuple[dict[str, AttentionConfig], dict[str, str]]:
+    """The config of each `AttentionSpec` the kept reads of ``array`` build, under its key, and the key of each read's
+    spec. Reads of one config share the spec of the first of them, in declaration order, unless a walk runs two of them
+    with different masks. A cross read keeps its own key.
+
+    Raises ``ValueError`` on two specs over one layer, since a layer reads through one resource on every walk.
+    """
     # the pool holds only the array's layers, so AttentionConfig.layers counts among them
     kv_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
+    configs: dict[str, AttentionConfig] = {}
+    spec_of: dict[str, str] = {}
     for key, read in array.reads.items():
         if read.queries is not None:
-            specs.append(CrossAttentionSpec(
-                resource_key=key, nodes=array.nodes,
-                config=CrossAttentionConfig(
-                    kv_cache=array.name, query_kv_cache=read.queries, context_label=min(array.labels),
-                ),
-            ))
+            spec_of[key] = key
             continue
         windowed = isinstance(read.mask, Window)
-        specs.append(AttentionSpec(
-            resource_key=key, nodes=array.nodes,
-            config=AttentionConfig(
-                kv_cache=array.name,
-                sliding_window=read.mask.size if windowed else None,
-                layers=tuple(kv_layer[layer] for layer in sorted(read.layers or array.layers)) if windowed else None,
-            ),
-        ))
-    return specs
+        config = AttentionConfig(
+            kv_cache=array.name,
+            sliding_window=read.mask.size if windowed else None,
+            layers=tuple(kv_layer[layer] for layer in sorted(read.layers or array.layers)) if windowed else None,
+        )
+        spec_of[key] = next((
+            first for first, shared in configs.items() if shared == config and not any(
+                array.reads[member].mask != read.mask and _share_a_walk(array.reads[member], read)
+                for member, spec in spec_of.items() if spec == first
+            )
+        ), key)
+        configs.setdefault(spec_of[key], config)
+    reader: dict[int, str] = {}
+    for key, read in array.reads.items():
+        for layer in sorted(read.layers or array.layers):
+            other = reader.setdefault(layer, key)
+            if spec_of[other] != spec_of[key]:
+                raise _no_layout(array, f"reads[{other!r}] and reads[{key!r}] build different specs and both cover "
+                                        f"layer {layer}, which reads through one resource on every walk")
+    return configs, spec_of
+
+
+def _share_a_walk(a: Read, b: Read) -> bool:
+    return a.walks is None or b.walks is None or not a.walks.isdisjoint(b.walks)
 
 
 def _within_step_specs(arrays: Sequence[Array]) -> dict[str, NodeResourceSpec]:
@@ -337,12 +371,18 @@ def _apply_kernel_settings(
     deltas = {key: array for array in arrays for key, op in array.updates.items() if isinstance(op, GatedDeltaNet)}
     owners = by_name | reads | deltas
     by_key = {spec.resource_key: spec for spec in specs}
+    spec_of = {
+        key: spec for array in arrays if array.max_len and not array.rewritable
+        for key, spec in _read_specs(array)[1].items()
+    } | {key: spec.resource_key for key, spec in by_read.items()}
+    # (spec, field) -> the read that set it and its value
+    set_by: dict[tuple[str, str], tuple[str, Any]] = {}
     for key, settings in kernel_settings.items():
         if key not in owners:
             raise ValueError(f"kernel_settings[{key!r}] names no read, GatedDeltaNet update or array of the "
                              f"declarations, which have {sorted(owners)}")
         # a read on a node in ``sdpa_nodes`` has no spec to set
-        spec = by_key.get(by_read[key].resource_key if key in by_read else key)
+        spec = by_key.get(spec_of.get(key, key))
         if isinstance(spec, CrossAttentionSpec) and settings:
             raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{key!r}] sets {sorted(settings)}; a cross "
                              "read on a kept array takes no setting yet")
@@ -363,6 +403,11 @@ def _apply_kernel_settings(
         if key not in by_name:
             for field, value in settings.items():
                 if spec is not None:
+                    other, earlier = set_by.setdefault((spec.resource_key, field), (key, value))
+                    if earlier != value:
+                        raise ValueError(f"Array {owners[key].name!r}: kernel_settings[{other!r}] and "
+                                         f"kernel_settings[{key!r}] set {field} to {earlier!r} and {value!r}, and "
+                                         f"both reads run on {spec.resource_key!r}")
                     setattr(spec.config, field, value)
         elif settings:
             try:
@@ -394,7 +439,12 @@ def node_handles(
             key = None if declared.positions is None else position_key(declared)
             # `_kv_specs` refuses a read beside a cross read, so the first read says
             queries = next((read.queries for read in declared.reads.values()), None)
-            handles[declared.name] = ArrayHandle(declared, resources, key, queried=arrays.get(queries))
+            handles[declared.name] = ArrayHandle(
+                declared, resources, key, queried=arrays.get(queries), read_resources=_read_specs(declared)[1],
+                combined=model.get_combined_graph_walks().get(node, EMPTY) if any(
+                    read.walks is not None for read in declared.reads.values()
+                ) else EMPTY,
+            )
         else:
             ((read_key, read),) = declared.reads.items()
             resource_key = by_read[read_key].resource_key
@@ -405,10 +455,12 @@ def node_handles(
     return handles
 
 
-def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle]) -> SubmoduleStep | None:
-    """``step`` as a new step, with what its ``state`` declares expanded into today's step objects, built afresh for
-    each step because `SubmoduleStep` writes the segments onto them. None when every read it lists runs SDPA with no
-    exchange, which leaves the step nothing to do."""
+def state_steps(
+    step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle], *, graph_walk: str | None = None,
+) -> SubmoduleStep | None:
+    """``step`` on ``graph_walk`` as a new step, with what its ``state`` declares expanded into today's step objects,
+    built afresh for each step because `SubmoduleStep` writes the segments onto them. None when every read it lists
+    runs SDPA with no exchange, which leaves the step nothing to do."""
     if step is None or not step.state:
         return step
     if all(getattr(handles.get(name), "plans_nothing", False) for name in step.state):
@@ -432,7 +484,7 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
                 if not handle.runs_sdpa:
                     _plan_within_step(handle, declared, step, plans.setdefault(handle.resource_key, _WithinStepPlan()))
             else:
-                _array_steps(handle, declared, step, steps)
+                _array_steps(handle, declared, step, steps, graph_walk)
         else:
             raise ValueError(
                 f"a step's state[{name!r}] is a {type(declared).__name__}, and on this node {name!r} is "
@@ -443,6 +495,19 @@ def state_steps(step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | 
     expanded = replace(step, steps=steps)
     expanded.set_state_handles(tuple(handles[name] for name in step.state))
     return expanded
+
+
+def check_capture(handles: Mapping[str, ArrayHandle | SamplerHandle], walks: Collection[str]) -> None:
+    """Raise if a capture replayed on ``walks`` would run one resource's reads with different masks. FlashInfer fixes
+    the mask when it plans, so every replay would run the capture walk's."""
+    for handle in handles.values():
+        if not isinstance(handle, ArrayHandle) or not handle.walk_reads:
+            continue
+        for resource in {resource for reads in handle.walk_reads.values() for resource in reads}:
+            keys = {handle.walk_reads.get(walk, handle.walk_reads[None]).get(resource) for walk in walks} - {None}
+            if len({handle.array.reads[key].mask for key in keys}) > 1:
+                raise _no_layout(handle.array, f"a capture replayed on walks {sorted(walks)} runs reads {sorted(keys)} "
+                                               f"on {resource!r} with different masks, and a capture plans one")
 
 
 class _WithinStepPlan:
@@ -487,7 +552,9 @@ def _plan_within_step(
     plan.pairs.append((q_label, plan.add(name, handle.key_share(segments))))
 
 
-def _array_steps(handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
+def _array_steps(
+    handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any], graph_walk: str | None,
+) -> None:
     array, segments = handle.array, declared.segments
     pre, post, rows = _forks(array, declared)
     if is_value(array):
@@ -507,8 +574,14 @@ def _array_steps(handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, 
             sink=declared.placeholders, eager_write=declared.eager_add,
             combined_labels={labels: "+".join(labels)} if labels else {},
         )
-    for key, causal in handle.causal_reads.items():
-        steps[key] = AttentionStep(segments=segments, causal=causal)
+    if not handle.walk_reads:
+        for key, causal in handle.causal_reads.items():
+            steps[key] = AttentionStep(segments=segments, causal=causal)
+    elif graph_walk is None:
+        raise _no_layout(array, "a step with no walk, on an array whose reads differ by walk")
+    else:
+        for key, read in handle.walk_reads.get(graph_walk, handle.walk_reads[None]).items():
+            steps[key] = AttentionStep(segments=segments, causal=not isinstance(array.reads[read].mask, Bidirectional))
     if array.positions is not None:
         # a step that keeps nothing doesn't advance the counter
         advance = declared.advance if declared.keep else (0,) * len(segments or step.segments)

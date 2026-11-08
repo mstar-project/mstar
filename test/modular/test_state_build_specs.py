@@ -30,6 +30,7 @@ from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides, spe
 from mstar.engine.state import (
     Array,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
@@ -258,7 +259,10 @@ _MIXED = _read(op=Attend(q_heads=4))
 # The array each refusal names, its declarations, and what the message says is missing.
 NO_LAYOUT = {
     "a read through no op": ("kv", lambda: [_kv(reads={"r": _read(op=None)})], "reads['r'].op"),
-    "a read of one walk": ("kv", lambda: [_kv(reads={"r": _read(walks={"decode"})})], "reads['r'].walks"),
+    "a cross read of one walk": ("ctx", lambda: [_kv(), Array(
+        "ctx", nodes={"llm"}, layers={2, 5, 7, 9}, entry=KVEntry(heads=4, head_dim=16), max_len=512,
+        reads={"x": _read(mask=Bidirectional(), queries="kv", walks={"decode"})},
+    )], "reads['x'].walks"),
     "a mask of no known name": ("kv", lambda: [_kv(reads={"r": _read(mask=_OtherMask())})], "reads['r'].mask"),
     "two query head counts": ("kv", lambda: [_kv(reads={"a": _read(layers={2}), "b": _MIXED})], "q_heads"),
     "no reads": ("kv", lambda: [_kv(reads={})], "reads is empty"),
