@@ -74,6 +74,16 @@ class TestReviewSummary(unittest.TestCase):
         self.assertEqual(len(state["outside_diff"]), 2, "the finding would be gone at the next re-review")
         judged = [{"ref": "a.py:1", "priority": "P1", "status": "fixed", "why": "guard added"}]
         self.assertEqual(carried(review(prior=judged), earlier)["outside_diff"], [earlier[1]])
+        reopened = carried(review(prior=[{"ref": "a.py:1", "priority": "P1", "status": "open", "why": "no fix"}]),
+                           [{**earlier[0], "fixed_in": 12}])
+        self.assertEqual([f[:2] for f in open_findings(reopened, [], [12])], [("outside the diff, a.py:1", "P1")],
+                         "a stale fixed_in would hide a finding this run judged still open, and the status go green")
+        above = carried(review(prior=[{"ref": "a.py:1", "priority": "P1", "status": "fixed_above", "fixed_in": 12,
+                                       "why": "guard added"}]), [earlier[0]])
+        self.assertEqual(read_state(render(above, [], "0123456789", "nogpu", []))["outside_diff"][0]["location"],
+                         "a.py:1", "a finding fixed in a PR that isn't stacked would be gone from the next re-review")
+        self.assertEqual(render(above, [], "0123456789", "nogpu", [12]).count("Fixed in #12 above"), 1,
+                         "a finding kept in both lists would be reported twice")
 
     def test_a_finding_a_pr_above_fixes_is_reported_but_doesnt_block(self):
         above = [{"ref": "7", "priority": "P1", "status": "fixed_above", "fixed_in": 12, "why": "guard added"}]

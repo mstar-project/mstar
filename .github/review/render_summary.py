@@ -32,6 +32,8 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
 # disputed: a P0-P2 the author argues against with no code change. It stays open, for a person to decide.
 STILL_OPEN = ("open", "disputed")
+# What takes an earlier finding outside the diff out of the state (`carried`).
+CLEARS = ("fixed", "moot")
 # Summaries and handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
@@ -131,12 +133,23 @@ def judged(review, stacked):
 
 def carried(review, earlier):
     """`review` with the earlier findings outside the diff it hasn't cleared added to its own: `earlier` is
-    the last review's outside_diff. "A finding left out stays open", and stays in the state for the next
-    re-review to judge."""
-    cleared = {f["ref"] for f in review["prior_findings"] if f["status"] not in STILL_OPEN}
+    the last review's outside_diff. Only `fixed` and `moot` clear one: "a finding left out stays open", and
+    stays in the state for the next re-review to judge. One this run judged fixed above carries that
+    `fixed_in` (judged checks it), and one it judged still open loses any `fixed_in` from before."""
+    verdicts = {f["ref"]: f for f in review["prior_findings"]}
     locations = {f["location"] for f in review["outside_diff"]}
+
+    def with_verdict(f):
+        verdict = verdicts.get(f["location"])
+        if verdict is None:
+            return f
+        kept = {k: v for k, v in f.items() if k != "fixed_in"}
+        fixed_in = verdict["status"] == "fixed_above" and verdict.get("fixed_in")
+        return {**kept, "fixed_in": fixed_in} if fixed_in else kept
+
     return {**review, "outside_diff": [*review["outside_diff"], *[
-        f for f in earlier if f["location"] not in cleared and f["location"] not in locations]]}
+        with_verdict(f) for f in earlier if f["location"] not in locations
+        and verdicts.get(f["location"], {}).get("status") not in CLEARS]]}
 
 
 def open_findings(review, pages, stacked):
@@ -184,7 +197,8 @@ def status(review, pages, head, mode, stacked):
         icon = "🟡"
     else:
         icon = "🟢"
-    fixed_above = sum(f["status"] == "fixed_above" for f in review["prior_findings"]) \
+    outside = {f["location"] for f in review["outside_diff"]}  # `carried` keeps one judged fixed above in both lists
+    fixed_above = sum(f["status"] == "fixed_above" and f["ref"] not in outside for f in review["prior_findings"]) \
         + sum(bool(f.get("fixed_in")) for f in review["outside_diff"])
     text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No open findings" + (
         f"; {fixed_above} fixed above" if fixed_above else "")
@@ -253,7 +267,7 @@ def render(review, pages, head, mode, stacked):
         ("Outside the diff", [f"**[{f['priority']}]** `{f['location']}`: {f['claim']}\n\n  {f['detail']}"
                               for f in review["outside_diff"] if not f.get("fixed_in")]),
         ("Fixed in a PR above", [f"**[{f['priority']}]** {f['ref']}: {f['why']} {above(f)}"
-                                 for f in prior if f["status"] == "fixed_above"]
+                                 for f in prior if f["status"] == "fixed_above" and f["ref"] not in outside]
          + [f"**[{f['priority']}]** `{f['location']}`: {f['claim']} {above(f)}\n\n  {f['detail']}"
             for f in review["outside_diff"] if f.get("fixed_in")]),
         ("Description", review["description_problems"]),
