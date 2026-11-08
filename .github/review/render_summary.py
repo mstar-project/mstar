@@ -152,9 +152,9 @@ def carried(review, earlier, answered):
     """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
     outside the diff this one hasn't cleared ("a finding left out stays open"; only `fixed` and `moot` clear
     one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
-    still open loses any `fixed_in` from before), its risk level as a floor, and its questions, unless a
-    person other than the author has commented since (`answered`), when this review's judgement stands.
-    Everything here is carried into the next state too."""
+    still open loses any `fixed_in` from before); and its risk level as a floor, with the `look_at` that names
+    the decision, and its questions, unless a maintainer other than the author has commented since
+    (`answered`), when this review's judgement stands. Everything here is carried into the next state too."""
     earlier = earlier or {}
     verdicts = {f["ref"]: f for f in review["prior_findings"]}
     locations = {f["location"] for f in review["outside_diff"]}
@@ -170,10 +170,11 @@ def carried(review, earlier, answered):
     review = {**review, "outside_diff": [*review["outside_diff"], *[
         with_verdict(f) for f in earlier.get("outside_diff", []) if f["location"] not in locations
         and verdicts.get(f["location"], {}).get("status") not in CLEARS]]}
-    old, new = earlier.get("risk"), review.get("risk")
-    if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
-        review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}"}
     if not answered:
+        old, new = earlier.get("risk"), review.get("risk")
+        if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
+            review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}",
+                              "look_at": [*new.get("look_at", []), *old.get("look_at", [])]}
         asked = {q["text"] for q in review["questions"]}
         review["questions"] = [*review["questions"], *[q for q in earlier.get("questions", [])
                                                        if q["text"] not in asked]]
@@ -334,9 +335,10 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
-    risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
+    risk = review.get("risk")
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
-             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": review.get("latent", []),
+             "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
+             "latent": review.get("latent", []),
              "questions": review["questions"],
              "live_test": live, "moot": [f for f in prior if f["status"] == "moot"]}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.

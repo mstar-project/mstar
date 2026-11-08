@@ -95,6 +95,12 @@ class TestReviewSummary(unittest.TestCase):
         self.assertEqual(r["questions"], earlier["questions"], "a re-review could drop a question nobody answered")
         self.assertEqual(read_state(render(r, [], "0123456789", "full", []))["questions"], earlier["questions"])
         self.assertEqual(carried(review(), earlier, True)["questions"], [], "a person's answer would change nothing")
+        self.assertEqual(carried(review(), earlier, True)["risk"]["level"], "low",
+                         "a maintainer's answer would leave the earlier risk standing")
+        decision = {"location": "a.py:1", "why": "new lifecycle state"}
+        floored = carried(review(), {"risk": {**earlier["risk"], "look_at": [decision]}}, False)
+        self.assertEqual(floored["risk"]["look_at"], [decision], "the checklist wouldn't name the decision kept")
+        self.assertEqual(read_state(render(floored, [], "0123456789", "full", []))["risk"]["look_at"], [decision])
 
     def test_a_finding_a_pr_above_fixes_is_reported_but_doesnt_block(self):
         above = [{"ref": "7", "priority": "P1", "status": "fixed_above", "fixed_in": 12, "why": "guard added"}]

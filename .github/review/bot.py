@@ -605,12 +605,14 @@ def discussion(repo, pr):
         comments.append({"id": c["id"], "user": user, "user_type": (c.get("user") or {}).get("type"),
                          "path": c.get("path"), "line": c.get("line"), "side": c.get("side"),
                          "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
+                         "author_association": c.get("author_association"),
                          "created_at": c.get("created_at"), "url": c.get("html_url"),
                          **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in POSTING_BOT_USERS})
     # The conversation tab: replies to the summary, and the author's answers.
     conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"),
                      "user_type": (c.get("user") or {}).get("type"), "created_at": c.get("created_at"),
-                     "url": c.get("html_url"), "body": c.get("body")}
+                     "author_association": c.get("author_association"), "url": c.get("html_url"),
+                     "body": c.get("body")}
                     for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
     return comments, conversation
 
@@ -730,6 +732,9 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
 
 # ---------------------------------------------------------------- review job: after the review
 
+# Whose comment can answer an earlier review's risk or questions (GitHub's author_association).
+MAINTAINERS = ("OWNER", "MEMBER", "COLLABORATOR")
+
 def salvage(out, repo, pr, runner_temp):
     """The action fails a run that went past --max-turns even when Claude finished and returned its
     summary, and on a real failure it still writes everything Claude said to its execution file. Read
@@ -788,7 +793,8 @@ def earlier_review(repo, pr):
     """(state, answered): the state of the last review, what render_summary.carried carries over: what
     last-review.json showed this run, or the last summary's when it had no last-review.json (no earlier
     diff, a partial review, or a /review continue); and whether a person other than the author has
-    commented since that review. Not knowing reads as not answered; not being able to read the state fails."""
+    commented since that review. Not knowing reads as not answered; not being able to read the state fails.
+    Answering takes a maintainer (MAINTAINERS) who isn't the author, and a comment that isn't a `/review` command."""
     path, state = Path("last-review.json"), None
     if path.exists():
         state = json.loads(path.read_text())
@@ -809,7 +815,9 @@ def earlier_review(repo, pr):
             raise
         return state, False
     answered = any((c.get("submitted_at") or c.get("created_at") or "") > since
-                   and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") != author for c in spoken)
+                   and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") != author
+                   and c.get("author_association") in MAINTAINERS
+                   and not (c.get("body") or "").startswith("/review") for c in spoken)
     return state, answered
 
 
