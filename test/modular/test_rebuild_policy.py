@@ -440,6 +440,56 @@ def test_a_media_copy_past_the_steps_allowance_waits_for_the_next_steps():
     assert allowance.left == 24 - 8, "the cached pages' writes would get less than the copies left them"
 
 
+class _Landing:
+    """A copy's event that lands only once it is waited on."""
+
+    def __init__(self) -> None:
+        self.landed = False
+
+    def query(self) -> bool:
+        return self.landed
+
+    def synchronize(self) -> None:
+        self.landed = True
+
+
+class _LandingPool(HostPool):
+    """Records, at each copy to the host it starts, whether a copy it started earlier is still in flight."""
+
+    def __init__(self) -> None:
+        super().__init__(1 << 10, torch.device("cpu"))
+        self.events: list[_Landing] = []
+        self.overlapped: list[bool] = []
+
+    def copy_out(self, src, into, after):
+        self.overlapped.append(not all(event.landed for event in self.events))
+        self.events.append(event := _Landing())
+        return super().copy_out(src, into, None)._replace(landed=event)
+
+
+def test_passes_that_run_no_step_start_one_allowance_at_a_time():
+    """Each pass of the worker's loop that ran no step refilled the allowance, so a burst of passes, as a burst of
+    messages makes, queued several allowances of copies at once behind the next step's output copy."""
+    pool = _LandingPool()
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, StepAllowance(8))
+    rebuilds._kept[NODE][R], rebuilds._droppable[NODE][R] = _media(), LogRoom(pool.take(64), 0, 0)
+    step = _vision_step((R,), {}, completion_event=None)
+    step.per_request_input_tensors[R]["embeds"] = [torch.arange(8, dtype=torch.float32)]
+    rebuilds.keep_copies(step)
+
+    for _ in range(4):
+        rebuilds.flush_idle()
+
+    assert pool.overlapped == [False] * 4, "a pass started copies while the last allowance's were still in flight"
+
+
+def test_a_node_that_copies_to_the_host_needs_the_engines_allowance():
+    """`Rebuilds` built an allowance of its own when none was passed, so a caller that left out the engine's gave the
+    copy engine a second budget."""
+    with pytest.raises(AssertionError, match="StepAllowance"):
+        Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")))
+
+
 def test_an_empty_input_queues_no_copy_and_holds_back_none_behind_it():
     """`flush` took a copy off the queue only once it spent some of the step's allowance. A row that read an empty
     tensor queued a copy that spent nothing, so it stayed at the head of the queue and no copy behind it ever

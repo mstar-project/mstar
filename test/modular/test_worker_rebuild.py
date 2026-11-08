@@ -31,6 +31,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import make_model
 from mstar.testing_utils.worker import make_worker
+from mstar.worker import worker as worker_mod
 from mstar.worker.host_pool import HostCopy, HostPool
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.preemption import Preemption
@@ -265,16 +266,30 @@ def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
     )
 
 
-def test_rebuild_host_mb_0_rebuilds_no_request_there():
-    """``rebuild_host_mb: 0`` set no pool aside but left the node among the ones whose requests rebuild here, so
-    preemption still treated the node as one that drops requests."""
+def _make_media_rebuilds(config: dict) -> Rebuilds:
+    """`_make_rebuilds` on a worker whose node copies media."""
     from test_rebuild_policy import MEDIA, VISION
     from test_rebuild_policy import _graphs as media_graphs
 
     model = SimpleNamespace(rebuild_policies=lambda: {NODE: MEDIA}, get_graph_walk_graphs=media_graphs)
     my_walks = {(NODE, PREFILL), (NODE, VISION), (NODE, DECODE)}
-    engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
-    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 0}, my_walks, set(), torch.device("cpu"), engine)
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
+    return _make_rebuilds(model, config, my_walks, set(), torch.device("cpu"), engine)
+
+
+@pytest.mark.parametrize("config, mb", [({}, 1024), ({"rebuild_host_mb": 2}, 2)])
+def test_rebuild_host_mb_alone_sizes_the_pool_of_a_node_that_copies_media(monkeypatch, config, mb):
+    """``rebuild_media_host_mb`` was added to ``rebuild_host_mb`` where a node copies media, so two keys sized one
+    pool and only ever added up."""
+    monkeypatch.setattr(worker_mod, "HostPool", lambda nbytes, device: SimpleNamespace(nbytes=nbytes))
+
+    assert _make_media_rebuilds(config).pool.nbytes == mb << 20, "the pool would be another size than the key says"
+
+
+def test_rebuild_host_mb_0_rebuilds_no_request_there():
+    """``rebuild_host_mb: 0`` set no pool aside but left the node among the ones whose requests rebuild here, so
+    preemption still treated the node as one that drops requests."""
+    rebuilds = _make_media_rebuilds({"rebuild_host_mb": 0})
 
     assert rebuilds.pool is None and not rebuilds.nodes, "a node with no pool would still count as one that drops"
 
@@ -480,20 +495,29 @@ def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
 
 def test_a_pass_that_runs_no_step_starts_the_queued_host_copies(monkeypatch):
     """Queued host copies started only once a step's outputs were sent, and a drop waits for them. With every request
-    waiting on the pool, no step ran, so no copy started and nothing could be dropped to let one run."""
+    waiting on the pool, no step ran, so no copy started and nothing could be dropped to let one run. Each such pass
+    refills the allowance, so a copy larger than one allowance lands over two passes, with no tick between them."""
     from test_loop_turns import TURNS, _looping_worker, _Runtime, _scheduler, _StopLoopError
     from test_rebuild_policy import _copying, _vision_step
 
     rebuilds = _copying(R)
+    # half of the row's 16-byte copy
+    rebuilds._allowance = StepAllowance(8)
     rebuilds.keep_copies(_vision_step((R,), {}, completion_event=None))
     w = _looping_worker(monkeypatch, *_scheduler(_Runtime(), TURNS))
-    w._rebuilds = rebuilds
+    w._rebuilds, waits = rebuilds, []
 
-    # the loop ends on its first idle wait
+    def wait_for_work(timeout_ms):
+        waits.append(timeout_ms)
+        if len(waits) == 2:
+            raise _StopLoopError
+
+    w.communicator = SimpleNamespace(send=lambda *a, **k: None, wait_for_work=wait_for_work)
     with pytest.raises(_StopLoopError):
         w.run()
 
     assert rebuilds._kept[NODE][R].copies.ready(), "the request would wait for its copies with no step to start them"
+    assert waits == [0, 10], "the loop would wait its tick while copies are queued"
 
 
 def test_the_scheduler_sees_the_rows_every_lane_holds():
