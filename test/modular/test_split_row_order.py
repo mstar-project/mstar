@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from mstar.engine.engine import Engine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
@@ -19,14 +18,14 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.spec import CombinedSplit
+from mstar.testing_utils.engine import make_engine
 from mstar.worker.executing_batch import make_executing_batch
 
 SPLIT = CombinedSplit("mixed", ("prefill_text",))
 
 
 def _engine(*specs):
-    engine = Engine.__new__(Engine)
-    engine._split_prompt_walks = {}
+    engine = make_engine()
     for spec in specs:
         engine._add_split_row_order(spec, spec.nodes)
     return engine

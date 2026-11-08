@@ -9,30 +9,24 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
+from mstar.model import keys
 
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
-# text prefill and decode rows batched in one step (Model.get_combined_graph_walks)
-LLM_MIXED = "mixed"
-# Prompt rows a mixed step may carry: its GDN runs them on the chunked kernel,
-# which gathers and scatters each one's whole state (`GDNMixedWrapper`), and
-# the decode rows on the decode kernel.
-MIXED_MAX_PREFILL_ROWS = 4
-
-# resource keys this model declares
-KV_CACHE = "kv_cache"
+# resource keys this model declares; the shared scaffolds read `keys`' ones
+KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
 GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
-ROPE = "rope"
-SAMPLER = "sampler"
+ROPE = keys.ROPE
+SAMPLER = keys.SAMPLER
 # per-request LoRA adapters, declared only when the serving YAML turns them on: the
 # LLM's, and the vision encoder's (sized by the same YAML block)
 LORA = LORA_RESOURCE_KEY
 VISION_LORA = f"vision_{LORA_RESOURCE_KEY}"
 # the ViT tower's cacheless attention, on the `vision_encoder` node
-VISION_ATTN = "vision_attn"
+VISION_ATTN = keys.VISION_ATTN
 
 
 @dataclass

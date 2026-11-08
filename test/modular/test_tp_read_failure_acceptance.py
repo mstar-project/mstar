@@ -13,17 +13,19 @@ run as rank 0 runs it. Whatever the fix, these must hold:
       leasable, so a later request with the same prefix doesn't reuse them
   A4  a request running beside the failed one gives bit-identical outputs
       to the same run with no failure
-  A5  the same for a text-only row, which has no image grid
+  A5  the same for a text-only row, which has no media
 
 Each run is two real ranks of one TP=2 instance, each in its own process
 with a gloo process group, running the real ``Worker.run`` loop, the real
 ``MicroScheduler``, the real shared-memory tensor manager, the real
 ``Engine`` (prepare, admit, forward, commit through the real ``StepRunner``
-and ``KVManager``) and Qwen3.5's real ``prepare_inputs``, which sizes the image
-span from the step's host grid while ``vision_embeds`` is still read in. The LLM forward is a
-stand-in that all-reduces each rank's partial over the TP group, as a
-row-parallel layer does, so a rank that never joins a step, or joins it with
-another token count, shows up as a collective timeout or a gloo abort.
+and ``KVManager``) and Qwen3.5's real ``prepare_inputs``, which checks a
+media row's ``vision_embeds`` against the walk's ``MEDIA_LAYOUT`` and places
+its MRoPE positions from it. The LLM forward is a stand-in that splices the
+media rows in at their pads and all-reduces each rank's partial over the TP
+group, as a row-parallel layer does, so a rank that never joins a step, or
+joins it with another token count, shows up as a collective timeout or a gloo
+abort.
 
 Fakes: the graph runtime and request state (inputs land through
 ``ingest_inputs_batch``; what a rank routes and sends is recorded off
@@ -66,25 +68,32 @@ HERE = Path(__file__).resolve().parent
 
 WORKERS = ("worker_0", "worker_1")
 NODE = "LLM"
-VISION_WALK, TEXT_WALK = "prefill_vision", "prefill"
+VISION_WALK, TEXT_WALK = "prefill_vision", "prefill_text"
 KV = "kv"
 HIDDEN = 16
 VOCAB = 512
 MERGE = 2
+# the image pad and its sentinels, all below the ids `_ids` draws
+PAD, VISION_START, VISION_END = 0, 1, 2
 PAGE_SIZE = 16
 ROOT = b"tp read failure"
 SIGNALS = ("new_token", "hidden")
 # A rank waiting this long in a collective for its partner is the hang.
 COLLECTIVE_S = 8.0
+# Spawned ranks can reach init_process_group seconds apart on a loaded box;
+# that skew is not a hang, so the rendezvous gets its own, longer timeout.
+RENDEZVOUS_S = 60.0
 # The follower's late read resolves at its first SCHEDULE_TP, or after this.
 TRIGGER_S = 2.0
-# The whole run; a run still going past this hung.
+# The whole run, from when both ranks have rendezvoused; a run still going
+# past this hung.
 DEADLINE_S = 30.0
 # Per-rank setup a fix adds to Worker.__init__ (see the module docstring).
 _DESIGN_SETUP = ("_setup_read_gate", "_setup_tp_read_check")
 
-# What each request reads. A grid prompt is Qwen3.5's prefill_vision layout:
-# text, image, text; an image of grid (t, h, w) takes t*(h/2)*(w/2) tokens.
+# What each request reads. A grid prompt is Qwen3.5's prefill_vision row: the
+# whole prompt, text, image and text, its image of grid (t, h, w) expanded to
+# t*(h/2)*(w/2) pads between its sentinels.
 _PROMPTS = {
     "grid": {
         "r0": dict(texts=(5, 7), grid=(1, 16, 24)),
@@ -107,16 +116,35 @@ def _inputs(kind: str, rid: str) -> dict[str, list[torch.Tensor]]:
     """The tensors each rank reads for ``rid``, by signal."""
     spec = _PROMPTS[kind][rid]
     seed = int(rid[1:]) + 1
-    texts = [torch.tensor(_ids(n, seed * 10 + i)) for i, n in enumerate(spec["texts"])]
+    texts = [_ids(n, seed * 10 + i) for i, n in enumerate(spec["texts"])]
     if kind == "text":
-        return {"text_inputs": texts}
-    t, h, w = spec["grid"]
-    span = t * (h // MERGE) * (w // MERGE)
+        return {"text_inputs": [torch.tensor(texts[0])]}
+    span = _span(kind, rid)
     gen = torch.Generator().manual_seed(seed)
+    ids = texts[0] + [VISION_START] + [PAD] * span + [VISION_END] + texts[1]
     return {
-        "text_inputs": texts,
+        "text_inputs": [torch.tensor(ids)],
         "vision_embeds": [torch.randn(span, HIDDEN, generator=gen)],
     }
+
+
+def _span(kind: str, rid: str) -> int:
+    t, h, w = _PROMPTS[kind][rid]["grid"]
+    return t * (h // MERGE) * (w // MERGE)
+
+
+def _step_metadata(kind: str, rid: str) -> dict:
+    """The walk's step metadata: a grid prompt's ``MEDIA_LAYOUT``, as intake
+    lays it out."""
+    from mstar.model.multimodal import MEDIA_LAYOUT
+
+    if kind == "text":
+        return {}
+    spec = _PROMPTS[kind][rid]
+    return {MEDIA_LAYOUT: {
+        "offset": [spec["texts"][0] + 1], "tokens": [_span(kind, rid)],
+        "output": ["vision_embeds"], "grid": [list(spec["grid"])],
+    }}
 
 
 def _walk(kind: str) -> str:
@@ -207,17 +235,19 @@ class _Rope:
 def _submodule_class():
     from mstar.engine.resources.kv.config import KVStep
     from mstar.engine.resources.step import Segment, SubmoduleStep
+    from mstar.model.multimodal import splice_media, vision_encoder
     from mstar.model.qwen3_5.config import ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     class _LLM(LLMSubmodule):
         """Qwen3.5's LLM node: everything but the model is the real submodule
-        (``prepare_inputs``, which reads the image grid on the host, and the
-        capture configs' dummy rows), so a fix that builds a row the way the
-        submodule does gets the real code. The forward is a stand-in: each
-        rank's partial of every token's embedding is summed over the TP group,
-        and a row's output is its mean, which every rank then holds whole. A
-        row's output depends on nothing but its own tokens."""
+        (``prepare_inputs``, which checks a media row against its layout and
+        places its positions, and the capture configs' dummy rows), so a fix
+        that builds a row the way the submodule does gets the real code. The
+        forward is a stand-in: each rank's partial of every token's embedding,
+        media rows spliced in at their pads, is summed over the TP group, and a
+        row's output is its mean, which every rank then holds whole. A row's
+        output depends on nothing but its own tokens and media."""
 
         def __init__(self, group, rank):
             torch.manual_seed(1234)
@@ -227,10 +257,11 @@ def _submodule_class():
             super().__init__(
                 model=model,
                 config=SimpleNamespace(
-                    vision_start_token_id=1, vision_end_token_id=2, hidden_size=HIDDEN,
-                    stop_token_ids=(),
+                    vision_start_token_id=VISION_START, vision_end_token_id=VISION_END,
+                    hidden_size=HIDDEN, stop_token_ids=(),
                 ),
                 vision_config=SimpleNamespace(spatial_merge_size=MERGE),
+                encoders=(vision_encoder((PAD,)),),
             )
             self.head = torch.randn(HIDDEN, VOCAB)
             self.requires_grad_(False)
@@ -272,13 +303,12 @@ def _submodule_class():
             )
 
         def preprocess(self, graph_walk, engine_inputs, inputs):
-            # embeds each row on its own, so every row runs its own collective (the
-            # real `preprocess` embeds the step at once)
-            return {"embeds": [
-                self._vision_embeds([inp]) if inp.input_ids is None
-                else self.model.model.embed_tokens(inp.input_ids)
-                for inp in inputs
-            ]}
+            embeds = []
+            for inp in inputs:
+                rows = self.model.model.embed_tokens(inp.input_ids)
+                media = inp.tensor_inputs.get("vision_embeds")
+                embeds.append(rows if media is None else splice_media(rows, inp.input_ids == PAD, media))
+            return {"embeds": embeds}
 
         def forward(self, graph_walk, engine_inputs, **kwargs):
             raise AssertionError("every step here runs batched")
@@ -617,7 +647,7 @@ def _tp_group(rank):
     from mstar.distributed.communication import CommGroup
 
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
-    group.device_group = group.cpu_group = dist.group.WORLD
+    group.device_group = group.cpu_group = dist.new_group([0, 1], timeout=datetime.timedelta(seconds=COLLECTIVE_S))
     group.initialized = True
     group._all_reduce = AllReduce(group.device_group)
     return group
@@ -627,24 +657,18 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     import torch.distributed as dist
 
     from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.testing_utils.worker import make_worker
     from mstar.utils.containers import RecentSet
     from mstar.worker.micro_scheduler import MicroScheduler
     from mstar.worker.stream_buffers import StreamBufferManager
-    from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
+    from mstar.worker.worker import _REMOVED_RIDS_KEEP
 
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.worker_id = WORKERS[rank]
-    w.device = torch.device("cpu")
+    w = make_worker(worker_id=WORKERS[rank], device=torch.device("cpu"))
     w.enable_nvtx = w.enable_prof = False
     w._launch_wait_s = 1.0
     w._max_consecutive_spec = 1
     w._device_loopback = {}
     w._host_rows_slot = 0
-    w._phase_period = 0
-    w._phase_buf = {}
-    w._gpu_spans = []
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.parallel_groups = SimpleNamespace(
         barrier_all=dist.barrier,
@@ -671,7 +695,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(64)
     w._tp_leader_gap_warned = False
-    w.scheduler = MicroScheduler(w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)
+    w.scheduler = MicroScheduler(engine_manager=w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)
     w.scheduler.runtime = graph
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(_REMOVED_RIDS_KEEP)
@@ -680,12 +704,9 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._pending_removes = {}
     w._removes_awaiting_step = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w.streaming_buffers = {}
     w.partition_topology = None
     w._my_consumer_connections = []
     w._streaming_edge_names = set()
-    w._consumer_node_cache = {}
-    w._stream_partition = {}
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._innermost_loop_by_node = {}
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
@@ -710,6 +731,20 @@ def _probe(engine, rid, tokens):
     return {label: list(pages) for label, pages in leases.items()}
 
 
+def _reporting_failures(all_reduce, rank, outbox):
+    """Report an all-reduce that raises: a worker turns a collective's timeout into a
+    failed step and goes on, so the parent can't see it from how the run ended. Every
+    collective these ranks run in a step is an all-reduce; a design that adds another
+    kind has to be wrapped here too."""
+    def reporting(*args, **kwargs):
+        try:
+            return all_reduce(*args, **kwargs)
+        except RuntimeError as e:
+            outbox.put(("collective_failed", rank, str(e)))
+            raise
+    return reporting
+
+
 def _rank_main(rank, scenario, inbox, outbox):
     sys.path[:0] = [str(HERE), str(HERE.parents[1])]
     os.environ.setdefault("MSTAR_PRE_PLAN_SPEC", "0")
@@ -722,13 +757,14 @@ def _rank_main(rank, scenario, inbox, outbox):
         import mstar.communication.wire_types  # noqa: F401  (registers the tags)
         from mstar.communication.tensors import SharedMemoryCommunicationManager
         from mstar.conductor.request_info import CurrentForwardPassInfo
-        from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, STEP_GRIDS_KEY, TEXT_PART
 
         dist.init_process_group(
             "gloo", init_method=f"file://{scenario.store}", rank=rank, world_size=2,
-            timeout=datetime.timedelta(seconds=COLLECTIVE_S),
+            timeout=datetime.timedelta(seconds=RENDEZVOUS_S),
         )
+        dist.all_reduce = _reporting_failures(dist.all_reduce, rank, outbox)
         group = _tp_group(rank)
+        outbox.put(("ready", rank))
         kind = scenario.kind
         report = outbox.put
         graph = _Graph(rank, kind, report)
@@ -738,15 +774,10 @@ def _rank_main(rank, scenario, inbox, outbox):
             WORKERS[rank], "localhost", "cpu", None, shm_dir=os.path.join(scenario.shm_root, str(rank)),
         )
         graph.tensor_manager = tm
-        order = [TEXT_PART, IMAGE_PART, TEXT_PART] if kind == "grid" else [TEXT_PART]
         for rid in ("r0", "r1"):
-            step_metadata = {"prefill_order": order}
-            if kind == "grid":
-                # the host grid the conductor hands the step (see `process_prompt`)
-                step_metadata[STEP_GRIDS_KEY] = [_PROMPTS[kind][rid]["grid"]]
             graph.admit(rid, CurrentForwardPassInfo(
                 request_id=rid, graph_walk=_walk(kind), fwd_index=0, random_seed=0, max_tokens=1,
-                step_metadata=step_metadata,
+                step_metadata=_step_metadata(kind, rid),
             ))
             tokens = _prompt_tokens(kind, rid)
             engine.add_request(rid, {KV: _kv_config(tokens)} if scenario.prefix_cache else None)
@@ -776,6 +807,13 @@ def _rank_main(rank, scenario, inbox, outbox):
             healthy_prefix = _prompt_tokens(kind, "r0")[:2 * PAGE_SIZE] + _ids(9, 78)
             final["probe_failed_prefix"] = _probe(engine, "p1", failed_prefix)
             final["probe_healthy_prefix"] = _probe(engine, "p0", healthy_prefix)
+        # Gloo's threads let go of a collective's tensors after its wait()
+        # returns, taking the GIL to do it, and one that does so while the
+        # interpreter finalizes aborts the process. A group joins its threads
+        # only when its last reference goes: one left over keeps them running
+        # past destroy_process_group.
+        group.device_group = group.cpu_group = group._all_reduce = None
+        dist.destroy_process_group()
         report(("final", rank, final))
     except BaseException:
         report(("crash", rank, traceback.format_exc()))
@@ -800,6 +838,8 @@ class Run:
     sent: dict = field(default_factory=lambda: {0: set(), 1: set()})
     # messages a rank sent anywhere but the other rank and the conductor
     other_sends: list = field(default_factory=list)
+    # (rank, error) of every all-reduce that raised
+    collective_failures: list = field(default_factory=list)
     final: dict = field(default_factory=dict)
     elapsed: float = 0.0
 
@@ -817,6 +857,7 @@ class Run:
             f"hung={self.hung} crashed={sorted(self.crashed)} exit={self.exitcodes} "
             f"failed={ {r: e[:120] for r, e in self.failed.items()} } "
             f"reads_done={self.reads_done} routed={ {k: sorted(v) for k, v in self.routed.items()} } "
+            f"collective_failures={self.collective_failures} "
             f"after {self.elapsed:.1f}s"
         )
 
@@ -844,6 +885,10 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         p.start()
     run = Run()
     start = time.monotonic()
+    # Until both ranks report "ready", a rank that never rendezvouses is the
+    # other's init_process_group timeout (it crashes), not a hang.
+    deadline = start + RENDEZVOUS_S + DEADLINE_S
+    ready = set()
     stopping_since = None
 
     def to_both(message):
@@ -854,7 +899,7 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         now = time.monotonic()
         if stopping_since is None:
             settled = all(run.completed(r) or run.torn_down(r) for r in ("r0", "r1"))
-            if settled or now - start > DEADLINE_S:
+            if settled or now > deadline:
                 run.hung = not settled
                 stopping_since = now
                 for box in inboxes:
@@ -872,7 +917,12 @@ def _run(tmp_path, scenario: Scenario) -> Run:
         except queue.Empty:
             continue
         tag = item[0]
-        if tag == "send":
+        if tag == "ready":
+            ready.add(item[1])
+            if len(ready) == 2:
+                start = time.monotonic()
+                deadline = start + DEADLINE_S
+        elif tag == "send":
             _, src, dest, data = item
             if dest in WORKERS:
                 inboxes[WORKERS.index(dest)].put(data)
@@ -909,16 +959,27 @@ def _run(tmp_path, scenario: Scenario) -> Run:
             run.final[item[1]] = item[2]
         elif tag == "crash":
             run.crashed[item[1]] = item[2]
-    for p in procs:
-        p.join(timeout=2)
+        elif tag == "collective_failed":
+            run.collective_failures.append(item[1:])
+    run.elapsed = time.monotonic() - start
+    # A loaded host can take seconds over an exit that is going fine.
+    killed = set()
+    for r, p in enumerate(procs):
+        p.join(timeout=COLLECTIVE_S)
         if p.is_alive():
+            killed.add(r)
             p.kill()
             p.join(timeout=2)
     run.exitcodes = {r: p.exitcode for r, p in enumerate(procs)}
     for r, code in run.exitcodes.items():
-        if code not in (0, None) and r not in run.crashed:
+        if r in run.crashed:
+            continue
+        if r in killed:
+            run.crashed[r] = f"still running {COLLECTIVE_S:.0f} s after the run stopped, so the harness killed it"
+        elif code not in (0, None):
             run.crashed[r] = f"exit code {code} (a gloo abort is a collective with another shape)"
-    run.elapsed = time.monotonic() - start
+        elif r not in run.final:
+            run.crashed[r] = "exited without its final report reaching the parent"
     return run
 
 
@@ -926,7 +987,7 @@ def _run(tmp_path, scenario: Scenario) -> Run:
 
 KINDS = [
     pytest.param("grid", id="grid"),
-    # A5: a text-only row has no grid, so its step has rank 0's shape anyway
+    # A5: a text-only row has no media, so its step has rank 0's shape anyway
     pytest.param("text", id="text_only"),
 ]
 
@@ -934,12 +995,13 @@ KINDS = [
 def _healthy_ok(run: Run):
     assert not run.crashed, run.summary() + "\n" + "\n".join(map(str, run.crashed.values()))
     assert not run.hung, "the instance hung: " + run.summary()
+    assert not run.collective_failures, run.summary()
     assert run.completed("r0"), "r0, beside the failed request, did not complete: " + run.summary()
 
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_followers_failed_read_fails_only_its_request_and_nothing_hangs(tmp_path, kind):
-    """A1 (and A5 for text_only). The follower's read of r1's image grid (or
+    """A1 (and A5 for text_only). The follower's read of r1's vision rows (or
     text) fails after rank 0 read its own copy: the run settles before the
     deadline, r1 fails and is torn down on both ranks, and r0 completes."""
     run = _run(tmp_path, Scenario(kind=kind))

@@ -8,10 +8,10 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -45,8 +45,14 @@ class KVConfig(ABC):
     num_qo_heads: int | None = None
 
     def __post_init__(self):
+        if self.num_layers < 1:
+            raise ValueError(f"a KV cache must declare a layer; got num_layers={self.num_layers}")
         if self.num_qo_heads is None:
             self.num_qo_heads = self.num_kv_heads
+        if self.num_kv_heads < 1 or self.num_qo_heads < 1 or self.num_qo_heads % self.num_kv_heads:
+            raise ValueError(
+                f"num_qo_heads={self.num_qo_heads} must be a positive multiple of num_kv_heads={self.num_kv_heads}"
+            )
         self._unsharded_kv_heads = self.num_kv_heads
         self._unsharded_qo_heads = self.num_qo_heads
 
@@ -115,6 +121,7 @@ class PagedKVConfig(KVConfig):
     groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self):
+        self._check_sizes()
         if self.layout == KVLayout.MLA:
             if self.kv_lora_rank is None or self.qk_rope_head_dim is None:
                 raise ValueError("KVLayout.MLA needs kv_lora_rank and qk_rope_head_dim")
@@ -125,6 +132,12 @@ class PagedKVConfig(KVConfig):
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
         self.keep_window(None, ())
+
+    def _check_sizes(self) -> None:
+        check_sizes({"max_seq_len": self.max_seq_len, "max_num_pages": self.max_num_pages})
+        check_sizes({"cpu_offload_pages": self.cpu_offload_pages}, smallest=0)
+        if self.page_size is not None:
+            check_sizes({"page_size": self.page_size})
 
     def keep_window(self, window: int | None, layers: tuple[int, ...]) -> None:
         """Keep about ``window`` tokens per request of ``layers``, some of the pool's, and every
@@ -243,6 +256,7 @@ class PagedKVConfig(KVConfig):
         ):
             if value is not None:
                 setattr(self, name, value)
+        self._check_sizes()
         if prefix_cache is not None:
             self.prefix_cache_given = prefix_cache
         if page_size is not None:
@@ -321,15 +335,22 @@ class RingKVConfig(KVConfig):
             self.num_sessions = num_sessions
 
 
+class SpanKind(StrEnum):
+    """What a span writes: token ``IDS``, a file's KV keyed by its ``DIGEST``, or ``ROWS`` of anything else."""
+    IDS = "ids"
+    DIGEST = "digest"
+    ROWS = "rows"
+
+
 @dataclass(frozen=True)
 class PrefixSpan:
     """One write to a keyed stream, as the preprocess worker laid it out.
 
     ``length`` is how many slots the write fills and ``advance`` is how far it
-    moves the position counter. ``digest`` is an item's digest, and None for
-    ids. ``end_key`` is set for an item that ends inside a page, and keys that
-    page up to the item's end. ``opens_step`` is False for a span the step of the
-    span before it writes too, in one row.
+    moves the position counter. ``kind`` is the span's `Span.kind`. ``digest`` is
+    an item's digest, and None for ids. ``end_key`` is set for an item that ends
+    inside a page, and keys that page up to the item's end. ``opens_step`` is
+    False for a span the step of the span before it writes too, in one row.
     """
     length: int
     advance: int
@@ -338,6 +359,11 @@ class PrefixSpan:
     digest: bytes | None = None
     end_key: bytes | None = None
     opens_step: bool = True
+    kind: SpanKind = SpanKind.IDS
+
+    def __post_init__(self):
+        # a layout row carries the kind as its string
+        object.__setattr__(self, "kind", SpanKind(self.kind))
 
 
 @dataclass

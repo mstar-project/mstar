@@ -1,5 +1,6 @@
 """TP/EP selection from a node group's ``ep_config``, exercised on the Thinker, and
-that its forward leaves its input embeddings unwritten.
+that its forward leaves its input embeddings unwritten and hands the Talker the
+layer transformers does.
 
 Uses a shrunken Thinker config on CPU; no checkpoint or GPU needed.
 """
@@ -28,6 +29,7 @@ from mstar.model.components import (
 from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerLayer, Qwen3OmniThinkerModel
 from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
 from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.testing_utils.model import make_model
 
 NUM_EXPERTS = 8
 _LOGGER = "mstar.model.components.moe_parallel"
@@ -188,7 +190,7 @@ def test_node_configs_reject_per_walk_disagreement():
 def _sharding_config(tmp_path, node_groups):
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump({"node_groups": node_groups}))
-    model = SimpleNamespace(get_default_sharding_config=lambda: ShardingConfig(
+    model = make_model(get_default_sharding_config=lambda: ShardingConfig(
         groups=[], tp_enabled_nodes={"Thinker", "Talker"}, shard_dim={},
         ep_enabled_nodes={"Thinker"},
     ))
@@ -240,3 +242,24 @@ def test_the_forward_leaves_its_input_embeds_as_staged():
 
     assert torch.equal(input_embeds, staged), "the forward wrote into its input embeddings"
     assert torch.equal(layer_0_embed, staged)
+
+
+def test_the_talker_takes_the_stream_entering_its_accept_layer():
+    """transformers conditions the Talker on ``hidden_states[accept_hidden_layer]``,
+    where index 0 is the embeddings and index k the stream entering layer k."""
+    config = _config(num_layers=3)
+    config.talker.accept_hidden_layer = 2
+    model = Qwen3OmniThinkerModel(config)
+    for layer in model.model.layers:
+        layer.self_attn, layer.mlp = _Through(), _Through()
+    entering = []
+
+    def record(module, args):
+        hidden_states, residual = args  # the layer's input stream is their sum
+        entering.append(hidden_states + residual)
+
+    model.model.layers[2].register_forward_pre_hook(record)
+
+    _, _, layer_n_hidden = model(torch.randn(3, model.hidden_size))
+
+    assert torch.equal(layer_n_hidden, entering[0])

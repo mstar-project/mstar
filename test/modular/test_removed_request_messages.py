@@ -22,6 +22,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, TensorPointerInfo
 from mstar.model.base import WorkerGraph
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     DrainRequest,
@@ -69,10 +70,7 @@ def _worker(is_tp_follower=False) -> Worker:
     worker_graph = WorkerGraph(
         section=section, graph_walks={WALK}, ranks=[0], worker_graph_id=WG_ID,
     )
-    w = Worker.__new__(Worker)
-    w.worker_id = WORKER
-    w.is_tp_follower = is_tp_follower
-    w.tensor_manager = _TensorManager()
+    w = make_worker(worker_id=WORKER, is_tp_follower=is_tp_follower, tensor_manager=_TensorManager())
     w._graph_runtime = build_runtime(
         bookkeeping=w.tensor_manager.tensor_store.bookkeeping,
         my_worker_id=WORKER,
@@ -107,7 +105,6 @@ def _worker(is_tp_follower=False) -> Worker:
     w._in_flight_rids = set()
     w._pending_removes = {}
     w._removes_awaiting_step = {}
-    w.streaming_buffers = {}
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(16)
     w.enable_nvtx = False
