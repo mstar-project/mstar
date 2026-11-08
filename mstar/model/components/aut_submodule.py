@@ -196,12 +196,13 @@ class AuTEncoderSubmodule(NodeSubmodule):
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         # A packed step holds at most the largest capture's tokens (of the
-        # ladder the region takes). Past it the clips run one by one, each
-        # replayed if it fits a bucket, so an eager step's activations are one
-        # clip's rather than the whole batch's.
+        # ladder the region takes) and the windows a replay's attention plan
+        # holds. Past either the clips run one by one, each replayed if it
+        # fits, so an eager step's activations are one clip's rather than the
+        # whole batch's.
         buckets = self.ENCODE_TOKEN_BUCKETS if self._encode_region is None else self._encode_region.total_tokens
         tokens = sum(inp.input_seq_len for inp in model_inputs)
-        return len(model_inputs) <= 1 or tokens <= max(buckets)
+        return len(model_inputs) <= 1 or (tokens <= max(buckets) and self._fits_replay(model_inputs))
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         del graph_walk

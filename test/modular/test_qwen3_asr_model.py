@@ -402,7 +402,11 @@ def test_encoder_replays_exactly_when_leased():
 def test_encoder_packs_a_step_only_up_to_its_largest_capture():
     """Past the largest captured token count a step runs its clips one by one,
     so an eager step's activations are one clip's, not the whole batch's."""
-    sub = _encoder_submodule(_tiny_config())
+    model = _make_model()
+    sub = _encoder_submodule(model.config)
+    # the windows a row holds, as the model sizes its resource (a step's windows gate it too)
+    (ragged,) = (s for s in model.get_node_resources() if isinstance(s, RaggedAttentionSpec))
+    sub.node_resources = {AUT_ATTN: ragged.config}
     top = sub.ENCODE_TOKEN_BUCKETS[-1]
 
     def rows(*lens):

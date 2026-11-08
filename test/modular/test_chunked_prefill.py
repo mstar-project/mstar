@@ -908,6 +908,8 @@ def test_an_audio_clip_past_the_window_ceiling_runs_eagerly_however_long_the_lad
     assert not runner.can_lease(rows[1:], ["b"])
     # a batch the longer ladder holds packs, past the class's top bucket
     assert node.can_batch(None, [SimpleNamespace(input_seq_len=3000)] * 2)
+    # clips over the ceiling run one by one, not as one eager step of them all
+    assert not node.can_batch(None, [SimpleNamespace(input_seq_len=5000)] * 2)
 
 
 @pytest.mark.parametrize("regions_off", [True, False])
