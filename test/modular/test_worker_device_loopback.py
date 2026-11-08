@@ -4,7 +4,7 @@ nothing and routes zero tensors per (request, signal)."""
 from types import SimpleNamespace
 
 from mstar.communication.tensors import StoredOutputs
-from mstar.worker.worker import Worker
+from mstar.testing_utils.worker import make_worker
 
 
 class _Engine:
@@ -18,9 +18,7 @@ class _Engine:
 
 
 def _worker(inline_emit=True):
-    w = Worker.__new__(Worker)
-    w._device_loopback = {}
-    w._graph_runtime = SimpleNamespace(supports_inline_emit=inline_emit)
+    w = make_worker(_graph_runtime=SimpleNamespace(supports_inline_emit=inline_emit))
     return w
 
 
