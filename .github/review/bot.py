@@ -75,9 +75,10 @@ MONITOR_DAYS = 60
 ISSUE_COMMENTS = 2_000  # a bot issue past this rolls over to a new one; GitHub stops an issue at 2,500
 # How a PR's body says it fixes or reverts another, and the subjects `szz` treats as fixes.
 FIXES = re.compile(r"\b(?:fix(?:e[sd])?|revert(?:s|ed)?)\s+#(\d+)\b", re.IGNORECASE)
-# A fix-word that isn't straight away about a typo, a comment, docs or lint.
-FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd])?|bug(?:fix)?|revert(?:s|ed)?)\b"
-                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?|comments?|docs?|lint|format\w*)\b)", re.IGNORECASE)
+# A fix-word, unless all it fixes is a typo, a comment, docs or lint: such a word ending the subject.
+FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s|ed|ing)?)\b"
+                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?|comments?|docs?|lint|format\w*)\s*(?:\(#\d+\)\s*)?$)",
+                         re.IGNORECASE)
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
 # The weekly improvement run: how much a reader needs (PRs read, and comments kept per PR; characters of a
@@ -221,8 +222,9 @@ def comment_on_issue(repo, number, body):
 
 
 def ledger(repo, since):
-    """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments, each run once
-    (re-running its spend job records the same costs again), from every ledger issue. A failed read raises."""
+    """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments from every ledger
+    issue, once per run and attempt of what they cost. Re-running only a run's spend job records the same costs
+    again, with the attempt its usage came from; re-running all its jobs spends again. A failed read raises."""
     records, seen = [], set()
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
@@ -233,8 +235,9 @@ def ledger(repo, since):
                 record = json.loads(base64.b64decode(m[1]))
             except ValueError:
                 continue
-            if record.get("run") not in seen:
-                seen.add(record.get("run"))
+            key = record.get("run"), (record.get("usage") or {}).get("run_attempt") or record.get("attempt")
+            if key not in seen:
+                seen.add(key)
                 records.append((c["created_at"], record))
     return records
 
@@ -1004,7 +1007,7 @@ def szz(commits, shas, number, files, bug_prs=(), since=""):
         if fix_pr == number or not (FIX_SUBJECT.search(c["subject"]) or fix_pr in bug_prs):
             continue
         path = None
-        for line in run(["git", "show", "--format=", "-U0", c["sha"]], check=False).stdout.splitlines():
+        for line in run(["git", "show", "--format=", "-U0", c["sha"]], check=False).stdout.split("\n"):
             if line.startswith("--- "):
                 path = line[6:] if line.startswith("--- a/") else None
             hunk = re.match(r"@@ -(\d+)(?:,(\d+))? \+", line) if path in files else None
@@ -1012,7 +1015,7 @@ def szz(commits, shas, number, files, bug_prs=(), since=""):
                 continue
             blame = run(["git", "blame", "-l", "-s", *([f"--since={since}"] if since else []), "-L",
                          f"{hunk[1]},+{hunk[2] or 1}", f"{c['sha']}^", "--", path], check=False).stdout
-            for offset, row in enumerate(blame.splitlines()):
+            for offset, row in enumerate(blame.split("\n")):
                 if row.lstrip("^").split(" ")[0] in shas:
                     name = f"`#{fix_pr}`" if fix_pr else f"`{c['sha'][:10]}`"
                     at = int(hunk[1]) + offset
@@ -1081,7 +1084,7 @@ def monitor(out, repo, approvals=""):
     bug_prs = {i["number"] for i in api_list(f"repos/{repo}/issues?state=closed&labels=type%2Fbug&since={window}"
                                              "&per_page=100")
                if (i.get("pull_request") or {}).get("merged_at")}
-    rows, signals, linked = [], [], set()
+    rows, signals, linked, unread = [], [], set(), set()
     for pr in approved:
         try:
             pull = api(f"repos/{repo}/pulls/{pr}")
@@ -1093,6 +1096,7 @@ def monitor(out, repo, approvals=""):
             found, mentions = pr_signals(repo, {**pull, "number": pr}, commits, bug_prs, window)
         except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
             rows.append(f"| `#{pr}` | ? | couldn't read: {safe(e).replace('|', '/')} |")
+            unread.add(str(pr))
             continue
         signals += found
         linked |= {s["key"].split(":")[-1] for s in found if ":ref:" in s["key"]} | {m.lstrip("#") for m in mentions}
@@ -1117,7 +1121,8 @@ def monitor(out, repo, approvals=""):
     tail = ["", f"New PRs since the last report: {len(new_prs)}.",
             "#### New bug reports not linked to an approved PR"]
     tail += [f"- `#{i['number']}` {safe(i.get('title'))}" for i in bugs] or ["None."]
-    saved = {"last": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "signals": sorted(current)}
+    kept = {k for k in reported if k.split(":")[0] in unread}  # a failed read isn't a signal gone
+    saved = {"last": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "signals": sorted(set(current) | kept)}
     tail.append(f"\n<!-- review-monitor-state {base64.b64encode(json.dumps(saved).encode()).decode()} -->")
     while len("\n".join(head + rows + tail)) > 60_000 and rows:
         rows.pop()  # the oldest PRs go first: `approved` is newest first
@@ -1190,7 +1195,7 @@ def improve_inputs(out, repo, key_set):
     if key_set != "true":
         print("::warning::ANTHROPIC_API_KEY is not set; skipping the improvement run.")
         return
-    stop = over_cap(repo)
+    stop = over_cap(repo)  # its alert is best effort: this job's token can only read issues
     if stop:
         print(f"::notice::{stop}")
         return

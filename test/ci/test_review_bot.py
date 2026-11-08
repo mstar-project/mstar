@@ -166,8 +166,13 @@ class TestSpend(unittest.TestCase):
                                      spent(99, "2026-10-31T23:59:59Z", run="3")]), {"day": 1.5, "month": 3.5})
         self.assertEqual(self.spend([spent(1), spent(1)]), {"day": 1, "month": 1},
                          "a re-recorded run would count twice")
-        self.assertEqual(self.spend([spent(1, attempt="2"), spent(1, attempt="1")])["day"], 1,
-                         "re-running a run's spend job would count its costs twice")
+        first = spent(1, usage={"run_attempt": "1"})
+        self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "1"})])["day"], 1,
+                         "re-running only a run's spend job would count its costs twice")
+        self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "2"})])["day"], 2,
+                         "re-running all a run's jobs spends again, and that would go uncounted")
+        self.assertEqual(self.spend([spent(1, attempt="1"), spent(1, attempt="2")])["day"], 2,
+                         "a record with no usage counts by its own attempt")
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
                          "anyone could add a record to a public issue and reach the cap")
 
@@ -295,9 +300,11 @@ class TestMonitor(unittest.TestCase):
         self.assertEqual(sorted(mentions), ["#11", "#14", "#16"], "an unrelated mention or the bot's own would count")
 
     def test_only_a_bug_fix_subject_counts_as_a_fix(self):
-        for subject in ("Fix a crash (#9)", "[Worker][Critical fix] Drop late messages", "Revert \"x\"", "bugfix: y"):
+        for subject in ("Fix a crash (#9)", "[Worker][Critical fix] Drop late messages", "Revert \"x\"", "bugfix: y",
+                        "Fixing a race", "Bugs in decode", "Bugfixes for x", "Reverting x", "Fix format string crash",
+                        "fix docs build", "fix typo in README"):
             self.assertTrue(bot.FIX_SUBJECT.search(subject), subject)
-        for subject in ("fix typo in README", "Fix a typo", "fix: docs for x", "prefix cache"):
+        for subject in ("Fix a typo", "fix: docs", "fix lint (#12)", "fix the comments", "prefix cache"):
             self.assertFalse(bot.FIX_SUBJECT.search(subject), subject)
 
     def test_a_fix_that_changes_a_prs_lines_is_blamed_on_it(self):
@@ -382,6 +389,7 @@ class TestMonitor(unittest.TestCase):
         self.assertIn("reverted", comments[0])
         self.assertNotIn("@someone", body + comments[0], "a PR's title could ping someone from the status issue")
         self.assertNotIn("<!-- x", body, "a title could open an HTML comment")
+        self.assertNotIn("#99", body, "a title could mark another issue's timeline")
         _, fake = self.run_monitor(body)
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a signal already reported would notify subscribers every day")
@@ -389,15 +397,18 @@ class TestMonitor(unittest.TestCase):
     def test_a_failed_post_leaves_the_state_unwritten_so_the_signal_goes_out_tomorrow(self):
         patched = []
         with self.assertRaises(RuntimeError):
-        self.assertNotIn("#99", body, "a title could mark another issue's timeline")
             self.run_monitor(STATUS["body"], **{"issue comment": Fail("HTTP 502"),
                                                 "PATCH repos/o/r/issues/2": lambda a, i: patched.append(i) or {}})
         self.assertEqual(patched, [], "the day's signals would count as reported though the post failed")
 
     def test_a_pr_that_cant_be_read_is_reported_and_the_rest_goes_on(self):
-        body, _ = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": Fail("HTTP 502")})
+        reported, _ = self.run_monitor(STATUS["body"])
+        body, _ = self.run_monitor(reported, **{"GET repos/o/r/pulls/7/reviews*": Fail("HTTP 502")})
         self.assertIn("couldn't read", body)
         self.assertIn("`#7`", body)
+        _, fake = self.run_monitor(body)
+        self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
+                         "a PR read again after a failed read would re-post its old signals")
 
     def test_a_dismissed_approval_is_not_one_that_stood(self):
         body, fake = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": [
@@ -699,7 +710,6 @@ class TestImprove(unittest.TestCase):
             out, fake = self.inputs(routes)
             self.assertFalse((d / "improve-evidence").exists(), "evidence was collected past the cap")
         self.assertEqual(out, {"run": "false"}, "the model would run past the cap")
-        self.assertEqual([k for k, _ in fake.writes()], ["issue comment"])
 
     def test_a_finished_run_this_week_starts_nothing_and_a_failed_one_can_be_retried(self):
         routes = {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/2/comments*": []}
