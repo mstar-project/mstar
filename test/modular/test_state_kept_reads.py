@@ -186,7 +186,7 @@ def test_a_kept_cross_read_builds_todays_spec_over_its_arrays_one_label():
                 "own": Read(mask=Causal(), op=Attend(q_heads=HEADS), layers={1}),
             },
         )],
-        "a handle's queried array is per array",
+        "a cross read's array takes no other read yet",
     ),
     (
         [

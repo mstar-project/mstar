@@ -281,6 +281,9 @@ class Array:
                              f"position, Block or Bidirectional, and {type(read.mask).__name__} does")
         if read.queries is not None and read.op is None:
             raise ValueError(f"{where}.queries: a read with no op lays out no queries")
+        if read.queries == self.name:
+            raise ValueError(f"{where}.queries names this array, and a read without queries lays out its own queries; "
+                             "leave it None")
         if read.op is not None:
             self._check_op(f"{where}.op", read.op)
 
