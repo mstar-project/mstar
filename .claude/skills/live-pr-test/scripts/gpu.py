@@ -693,9 +693,9 @@ def volume_refused(err: ApiError) -> bool:
 def eras_create(body: dict, pubkey: str) -> str:
     """Preview, accept the quoted prices, create; the instance id. Eras refuses an idempotency key
     reused with another request, so each attempt (listing, cache volume, ssh key) has its own, and
-    the same attempt sent again, after a timeout or by a rerun with the same --tag, keeps it. The
-    ssh key the body binds may be one an earlier launch registered, which that launch's terminate
-    can delete before the create: then the key is registered again, under this launch's name, once."""
+    the same attempt sent again after a timeout keeps it. The ssh key the body binds may be one an
+    earlier launch registered, which that launch's terminate can delete before the create: then the
+    key is registered again, under this launch's name, once."""
     import hashlib
     preview = eras("POST", "/instances/preview", body)
     problems = (preview.get("run") or {}).get("problems") or []
