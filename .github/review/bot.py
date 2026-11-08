@@ -181,32 +181,36 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
 
 # ---------------------------------------------------------------- review job: before the review
 
-def resolve(out, repo, pr, mode, comment_id, non_write=""):
-    """React 👀 to the /review comment (best effort), then the PR's head, its title and the review's
-    settings. A /review continue (`mode` empty) takes the mode and timeout of the review it
-    continues (restore). The title is untrusted; it only ever reaches the prompt."""
+def react(out, repo, comment_id):
+    """React 👀 to the /review comment (best effort), so a comment-triggered run isn't invisible from the
+    PR. Its own step, because it takes the app token, which can't read the handoff `resolve` fetches."""
     try:
         gh("api", "-X", "POST", f"repos/{repo}/issues/comments/{comment_id}/reactions", "-f", "content=eyes")
     except RuntimeError as e:
         print(f"::warning::Couldn't react to the comment: {e}")
+
+
+def resolve(out, repo, pr, mode, runner_temp, non_write=""):
+    """The PR's head, its title and the review's settings. A /review continue (`mode` empty) takes the
+    mode of the review it continues (restore). The title is untrusted; it only ever reaches the prompt."""
     pull = api(f"repos/{repo}/pulls/{pr}")
     head_repo = (pull["head"].get("repo") or {}).get("full_name")
     if not head_repo:
         print("::warning::The PR's head repository no longer exists; can't check it out.")
         out["why"] = "its head repository (the fork) no longer exists"
         sys.exit(1)
-    out["continue"] = "true" if mode == "" else "false"
-    out.update(head_sha=pull["head"]["sha"], head_repo=head_repo)
-    # Mode sets the prompt's reporting bar.
-    out["mode"] = "nogpu" if mode == "nogpu" else "light"
+    out.update(head_sha=pull["head"]["sha"], head_repo=head_repo, title=pull["title"])
     # Someone with write access: a timeout that only stops a runaway, like the turn cap.
     out["timeout"] = 25 if non_write else 300
-    out["title"] = pull["title"]
+    if mode == "":
+        restore(out, repo, pr, pull["head"]["sha"], runner_temp, non_write)
+    else:
+        out["mode"] = "nogpu" if mode == "nogpu" else "light"  # sets the prompt's reporting bar
 
 
 def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
     """/review continue: fetch the handoff a stopped review saved (handoff) into $RUNNER_TEMP/prev, and
-    that review's mode and timeout. The newest unexpired artifact for this PR wins, and only
+    that review's mode. The newest unexpired artifact for this PR wins, and only
     from this workflow on issue_comment, a trigger that runs the base repository's copy of it: a fork's
     own workflow can upload an artifact with any name. Only while the stopped review's "didn't
     complete" comment is still open, since any later run that finishes rewrites it as resolved. The
@@ -214,7 +218,7 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
     name = f"claude-review-handoff-{pr}"
 
     def fail(why):
-        out["why"] = why
+        out.update(why=why, refused="true")
         print(f"::notice::{why}")
         sys.exit(1)
 
@@ -265,7 +269,7 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
         fail("the saved handoff is malformed")
     if mode == "nogpu" and non_write:
         fail("continuing a nogpu review takes write access, like `/review nogpu`")
-    out.update(dir=str(saved), mode=mode, timeout=25 if non_write else 300)
+    out.update(dir=str(saved), mode=mode)
 
 
 def file_patch(f):
@@ -725,7 +729,7 @@ def main(steps):
                     f.write(f"{key}={value}\n")
 
 
-STEPS = {"preflight": preflight, "resolve": resolve, "restore": restore, "collect": collect, "salvage": salvage,
+STEPS = {"preflight": preflight, "react": react, "resolve": resolve, "collect": collect, "salvage": salvage,
          "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete}
 
 if __name__ == "__main__":
