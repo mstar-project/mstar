@@ -499,13 +499,15 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     if prev:
         shutil.copyfile(Path(prev, "handoff.md"), "handoff.md")
     pull = api(f"repos/{repo}/pulls/{pr}")
-    # GitHub refuses `gh pr diff` past 20,000 lines or 300 files. Fall back to the files API (up to
-    # 3,000 files; it omits the patch of a file that is too large on its own).
-    r = gh("pr", "diff", str(pr), "--repo", repo, check=False)
+    # The commit `resolve` fixed, not the PR's live head: three dots, as the PR's own diff. GitHub refuses
+    # a diff past 20,000 lines or 300 files. Fall back to the files API (up to 3,000 files; it omits the
+    # patch of a file that is too large on its own).
+    r = gh("api", "-H", "Accept: application/vnd.github.diff",
+           f"repos/{repo}/compare/{pull['base']['sha']}...{head_sha}", check=False)
     if r.returncode == 0:
         diff = r.stdout
     else:
-        print(f"::warning::gh pr diff failed ({r.stderr[:300]}); building pr.diff from the files API.")
+        print(f"::warning::The diff failed ({r.stderr[:300]}); building pr.diff from the files API.")
         diff = "".join(map(file_patch, api_list(f"repos/{repo}/pulls/{pr}/files")))
     write("pr.diff", diff)
     write("pr-body.md", (pull["body"] or "") + "\n")
