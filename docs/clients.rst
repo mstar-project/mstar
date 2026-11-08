@@ -469,22 +469,22 @@ Per-model notes:
   ``language`` / ``segments`` by the server; Higgs-Audio emits no timestamps, so its
   ``verbose_json`` / ``srt`` / ``vtt`` get one segment per window, timed to the
   windows. A streaming client receives only the spoken words. Uploads longer than 30 s
-  are served as consecutive windows. By default Whisper's run in order, openai-whisper
-  style: each window gets the transcript so far as ``initial_prompt`` and the first
-  window's detected language, is decoded with timestamps so the next window can start
-  where its last closed segment ended (no word is split by a boundary), and is decoded
-  again when its text is a repetition loop (gzip compression ratio above 2.4): first
-  without the conditioning text, then at rising temperatures — after which the
-  transcript so far stops conditioning later windows. Leave ``temperature`` at 0 to
-  get that fallback; a pinned temperature is used as is. ``long_form="parallel"`` in
-  ``extra_body`` submits fixed windows all at once, each cut at the quietest moment
-  before its boundary; Higgs-Audio's run that way by default. Segment timestamps are
-  offset to the whole file. ``window_seconds`` in ``extra_body`` (5 to 30) sets the
-  window length for one request, and an upload longer than it is windowed. An upload,
-  like any audio a request attaches, is refused once it decodes past 30 min, whatever
-  its header says (a 413 here, a 400 from the data worker). The decode up to that
-  point still runs, so this bounds memory, not time: refusing a 31 min file takes
-  about as long as decoding it.
+  are cut into fixed windows, each at the quietest moment before its boundary, and
+  submitted at once. ``long_form="sequential"`` in ``extra_body`` runs them in order
+  instead; Whisper's then run openai-whisper style: each window gets the transcript so
+  far as ``initial_prompt`` and the first window's detected language, is decoded with
+  timestamps so the next window can start where its last closed segment ended (no word
+  is split by a boundary), and is decoded again when its text is a repetition loop
+  (gzip compression ratio above 2.4): first without the conditioning text, then at
+  rising temperatures, after which the transcript so far stops conditioning later
+  windows. Leave ``temperature`` at 0 to get that fallback; a pinned temperature is
+  used as is. It is several times slower, and only it has that repetition guard.
+  Segment timestamps are offset to the whole file. ``window_seconds`` in
+  ``extra_body`` (5 to 30) sets the window length for one request, and an upload
+  longer than it is windowed. An upload, like any audio a request attaches, is refused
+  once it decodes past 30 min, whatever its header says (a 413 here, a 400 from the
+  data worker). The decode up to that point still runs, so this bounds memory, not
+  time: refusing a 31 min file takes about as long as decoding it.
 - **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
   its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
   clip of up to 20 s is one request; a longer upload is cut into windows of about equal

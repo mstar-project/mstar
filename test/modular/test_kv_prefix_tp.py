@@ -145,15 +145,15 @@ def _follow(follower: KVManager, head: ScheduleTPNode, caught_up: bool = True) -
 
 def _abandon(kv: KVManager, rid: str, walk: str = WALK) -> None:
     engine = _engine(kv)
-    worker = SimpleNamespace(
+    worker = make_worker(
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
-        _graph_runtime=SimpleNamespace(commit_speculation=lambda *args, **kwargs: None),
+        graph_runtime=SimpleNamespace(commit_speculation=lambda *args, **kwargs: None),
     )
     speculation = SimpleNamespace(
         scheduled_batch=SimpleNamespace(node_name=NODE), node_batch=_batch(rid, walk), spec_id=0,
         consumed_streaming_edges={},
     )
-    Worker._settle_speculation(worker, speculation, success=False)
+    worker.speculator.settle(speculation, success=False)
 
 
 def _follower_worker(follower: KVManager) -> Worker:
@@ -347,7 +347,7 @@ def test_a_follower_whose_adopt_raises_stops_the_worker(monkeypatch):
     def _caught(error, *args):
         raise _Stop
 
-    worker._handle_main_loop_error = _caught
+    worker.pipeline._handle_error = _caught
     with pytest.raises(SystemExit, match="diverged"):
         worker.run()
 
@@ -372,24 +372,28 @@ def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
         tp_seq=4, node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(commit_done=threading.Event()),
     )
 
-    assert worker._try_follow_speculation(step_n) is None, "a page N could still index was called lost"
+    assert worker.speculator.follow(step_n) is None, "a page N could still index was called lost"
     step_n.node_batch.commit_done.set()
     with pytest.raises(SystemExit, match=r"here \(1\)"):
-        worker._try_follow_speculation(step_n)
+        worker.speculator.follow(step_n)
 
 
 @pytest.mark.parametrize("cache_open", [True, False])
 def test_a_tp_leader_admits_a_yield_away_step_unplanned_as_its_followers_do(cache_open):
-    leader = SimpleNamespace(parallel_nodes={NODE}, _prefix_cache_open=lambda node: cache_open)
+    engine = SimpleNamespace(prefix_cache_open=lambda node: cache_open)
+    leader = make_worker(
+        parallel_nodes={NODE}, parallel_leader_nodes={NODE},
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+    ).speculator
 
     def spec(node, yield_away):
         return SimpleNamespace(
             is_yield_away=yield_away, node_batch=SimpleNamespace(node_name=node, read_check_rids=None),
         )
 
-    assert Worker._plans_ahead(leader, spec(NODE, True)) is not cache_open, "only the cache reads page ids"
-    assert Worker._plans_ahead(leader, spec(NODE, False)), "the head is pre-planned on every rank"
-    assert Worker._plans_ahead(leader, spec("other", True)), "a node with no followers keeps its pre-plan"
+    assert leader.plans_ahead(spec(NODE, True)) is not cache_open, "only the cache reads page ids"
+    assert leader.plans_ahead(spec(NODE, False)), "the head is pre-planned on every rank"
+    assert leader.plans_ahead(spec("other", True)), "a node with no followers keeps its pre-plan"
 
 
 def test_a_chunked_row_starts_past_the_prefix_rank_0_measured_on_every_rank():

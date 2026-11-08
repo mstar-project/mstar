@@ -52,7 +52,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
     registered, processed, reads = [], [], []
     parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
     w = make_worker(
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
             register_stop_limits=lambda rid, info: None,
         ),
@@ -66,6 +66,7 @@ def test_the_worker_fails_only_the_request_whose_ingest_raised(raises_in):
         streams=SimpleNamespace(add_request=lambda rid, info: None),
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
         tensor_manager=SimpleNamespace(
+            get_tensor=None,
             register_request=lambda rid, sharding: registered.append(rid),
             start_read_tensors=lambda *a, **kw: (
                 reads.append(a[0]) or _raise(RuntimeError("CUDA out of memory")) if raises_in == "input_read"
