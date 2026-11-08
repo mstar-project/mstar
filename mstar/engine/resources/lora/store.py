@@ -18,6 +18,7 @@ from mstar.engine.resources.lora.checkpoint import (
     normalize_lora_key,
     parse_lora_key,
     read_lora_file,
+    require_regular_file,
 )
 from mstar.engine.resources.lora.config import (
     AdapterInfo,
@@ -107,6 +108,7 @@ def adapter_targets(spec: LoraSpec, path: str) -> set[str]:
     if spec.convert_keys is None:
         from safetensors import safe_open
 
+        require_regular_file(path)
         with safe_open(path, "pt") as f:
             keys = list(f.keys())
         modules = set()
