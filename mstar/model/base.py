@@ -959,15 +959,15 @@ class Model(ABC):
         reads it, and ends the partition after the last step reports. The step
         that samples the reply's first token sets `FINAL_PREFILL` in its
         ``step_metadata``. A step whose
-        walk a stream feeds, and that is a bare node (or its chunk loop), runs
+        walk a stream feeds, and that runs no Loop but chunk loops, runs
         once per chunk until the worker reports the stream's final chunk, its
         inputs' tensors sent with the first chunk only. A
         ``ValueError`` refuses the request with a 400, and so does a plan of
-        ``[]`` for every partition; an ``HTTPException`` below 500 refuses the
-        request with its own status and detail. A plan the conductor can't run
-        is a model bug, refused with a 500: a step whose walk is not the partition's, a
-        ``bind`` key that is not an input of the step's walk, or a later step
-        whose walk takes no input the conductor sends. In a partition a stream
+        ``[]`` for every partition. A plan the conductor can't run is a model
+        bug, refused with a 500: a step whose walk is not the partition's, a
+        ``bind`` key that is not an input of the step's walk, a step after one
+        that runs once per chunk, or a later step whose walk takes no input
+        the conductor sends. In a partition a stream
         moves, the conductor moves past a step on its first report when it is
         the last step or the next step takes inputs it sends, so such a step
         must run once.

@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
-from fastapi import HTTPException
 
 torch = pytest.importorskip("torch")
 
@@ -103,8 +102,6 @@ class _ToyModel(StubModel):
 
     def walk_plan(self, partition_name, input_modalities, output_modalities, input_signals, model_kwargs):
         plan = self._plans[partition_name]
-        if isinstance(plan, Exception):
-            raise plan
         return list(plan)
 
 
@@ -545,20 +542,19 @@ _REFUSED = {
                                     "not one of its walks"),
     "a bind key the walk doesn't take": ({"default": [WalkStep("a", bind={"y": "x"})]}, None, (), 500,
                                          "not inputs of that walk"),
-    # a status the model chose, with the text it meant the client to see
-    "a model's own refusal": ({"default": HTTPException(status_code=409, detail="adapter busy")}, None, (), 409,
-                              "adapter busy"),
     # nothing tells B's worker its walk changed
     "a later step only a stream feeds": ({"A": [WalkStep("a")], "B": [WalkStep("b"), WalkStep("c")]}, _STREAMED,
                                          _tok_stream(), 500, "takes no input the conductor sends"),
+    # c runs once per chunk until the stream's end, which ends B's partition: b would never run
+    "a step after one that runs per chunk": ({"A": [WalkStep("a")], "B": [WalkStep("c"), WalkStep("b")]}, _STREAMED,
+                                             _tok_stream(), 500, "so it would never run"),
 }
 
 
 @pytest.mark.parametrize("case", list(_REFUSED))
 def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, caplog, case):
     """Before any worker hears of the request: a 400 when the request leads
-    there, a 500 whose text only the log has when the model's plan is wrong,
-    and the status and text of an ``HTTPException`` below 500.
+    there, and a 500 whose text only the log has when the model's plan is wrong.
     With ``connections``, A's walk streams ``tok`` to B's walk ``c``, a bare
     node run once per chunk."""
     plans, groups, connections, status, message = _REFUSED[case]
@@ -577,3 +573,16 @@ def test_a_plan_the_conductor_cant_run_is_refused(tmp_path, monkeypatch, caplog,
     assert [(f.request_id, f.status) for f in failed] == [("r", status)]
     assert message in (failed[0].error_message if status < 500 else caplog.text)
     assert not _sends(c, ("NEW_REQUEST",)) and "r" not in c.requests
+
+
+def test_a_stream_moved_report_of_a_walk_its_plan_is_past_moves_nothing():
+    """Only a lagging TP rank's report can name such a walk; with no pass number on the wire it
+    can't be told apart, so it neither fails the request nor moves the plan, as before the plans."""
+    c = Conductor.__new__(Conductor)
+    c.producer_triggered_partitions = {"B"}
+    c._walk_inputs, c._repeating_walks = {"x": (), "y": (("t", "n"),)}, frozenset()
+    # the plan is at its last step; the report names its first
+    pstate = PartitionState("B", plan=[WalkStep("x"), WalkStep("y"), WalkStep("z")], cursor=2)
+    pstate.graph_walk = "x"
+    args = c._next_plan_args(SimpleNamespace(partition_states={"B": pstate}, persist_signals={}), "B", done=False)
+    assert not args.request_done and not args.inputs and pstate.cursor == 2

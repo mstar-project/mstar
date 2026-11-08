@@ -12,7 +12,6 @@ from dataclasses import dataclass, field, replace
 
 import torch
 import yaml
-from fastapi import HTTPException
 
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -87,8 +86,9 @@ def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict
     """What the conductor needs of each walk to run a plan: the ``(name, node)``
     inputs it sends on entry (the walk's external and loop-back inputs, less
     the streamed ones and the loop-backs a node ahead of their Loop feeds), the
-    names the walk persists, and the walks a stream feeds that are bare nodes
-    (a chunk loop aside), which run once per chunk."""
+    names the walk persists, and the walks a stream feeds that run no Loop
+    but chunk loops (a bare node, or a Sequential such as CosyVoice3's
+    token2wav), which run once per chunk."""
     inputs, persists, repeating = {}, {}, set()
     for walk, graph in model.get_graph_walk_graphs().items():
         io = graph.get_inputs_outputs()
@@ -1288,9 +1288,8 @@ class Conductor:
 
         An exception here would otherwise reach the run loop, which only logs
         it, and the client would wait for its timeout. Before any worker heard
-        of the request, a ``ValueError`` is the client's fault, a 400; an
-        ``HTTPException`` keeps its status, and below 500 its detail too;
-        anything else is a 500.
+        of the request, a ``ValueError`` is the client's fault, a 400; anything
+        else, a plan the conductor can't run included, is a 500.
         """
         try:
             self._do_ingest_request(body)
@@ -1302,14 +1301,10 @@ class Conductor:
                 if isinstance(exc, ValueError):
                     self._reject_request(body.request_id, scrub_paths(str(exc)), status=400)
                     return
-                if isinstance(exc, HTTPException) and exc.status_code < 500:
-                    self._reject_request(body.request_id, scrub_paths(str(exc.detail)), status=exc.status_code)
-                    return
                 text, _ = client_error_text(
                     exc, f"Ingest failed for request {body.request_id}", log=logger,
                 )
-                status = exc.status_code if isinstance(exc, HTTPException) else 500
-                self._reject_request(body.request_id, f"Ingest failed: {text}", status=status)
+                self._reject_request(body.request_id, f"Ingest failed: {text}", status=500)
             elif body.request_id not in self.draining:
                 text, _ = client_error_text(
                     exc, f"Ingest failed for request {body.request_id}", log=logger,
@@ -1379,19 +1374,26 @@ class Conductor:
             # that isn't an input of the step's walk. A model bug, so a 500.
             for k, step in enumerate(pstate.plan):
                 if step.walk not in p.graph_walks:
-                    raise HTTPException(status_code=500, detail=(
+                    raise RuntimeError((
                         f"{type(self.model).__name__}'s plan for partition {p.name!r} runs {step.walk!r}, "
                         f"which is not one of its walks {sorted(p.graph_walks)}"
                     ))
                 inputs = {name for name, _ in self._walk_inputs[step.walk]}
                 if unknown := sorted(set(step.bind) - inputs):
-                    raise HTTPException(status_code=500, detail=(
+                    raise RuntimeError((
                         f"{type(self.model).__name__}'s plan binds {unknown} on {step.walk!r}, which are not "
                         f"inputs of that walk; its inputs are {sorted(inputs)}"
                     ))
+                # a repeating step ends only on the worker's final-chunk report, which ends the partition
+                if k and not stream_moved and pstate.plan[k - 1].walk in self._repeating_walks:
+                    raise RuntimeError((
+                        f"{type(self.model).__name__}'s plan for partition {p.name!r} puts {step.walk!r} after "
+                        f"{pstate.plan[k - 1].walk!r}, which runs once per chunk until the stream ends the partition, "
+                        "so it would never run"
+                    ))
                 # the conductor moves a worker onto a later step only by sending it inputs
                 if k and not stream_moved and not inputs:
-                    raise HTTPException(status_code=500, detail=(
+                    raise RuntimeError((
                         f"{type(self.model).__name__}'s plan for partition {p.name!r} moves on to {step.walk!r}, "
                         "which takes no input the conductor sends, so its worker would never run it"
                     ))
@@ -1931,7 +1933,9 @@ class Conductor:
         # source_tp_rank); accumulate across ranks, do not dedup. What an
         # earlier pass left held under the name is replaced: the tensors sent
         # are released at their reader counts, and one never sent stays with
-        # its producer until the request ends.
+        # its producer until the request ends. A pass is known by
+        # `fwd_pass_number`, which moves only once a routing cycle ends, so two
+        # passes a partition reports in one cycle both land under the name.
         if body.persist_signals:
             held, writer = request_data.persist_signals, (partition_name, pstate.fwd_pass_number)
             for name, infos in body.persist_signals.items():
@@ -2084,7 +2088,7 @@ class Conductor:
     def _next_plan_args(self, request_data: RequestData, partition_name: str, done: bool) -> ForwardPassArgs:
         """Where a report moves a partition's plan, as the args of its next step.
 
-        A walk a stream feeds and that is a bare node runs once per chunk: its
+        A walk a stream feeds that runs no Loop but chunk loops runs once per chunk: its
         step is sent again, and only the worker's final-chunk report ends it.
         Any other step advances on its report (a Loop walk reports once, when
         it ends), and the partition is done past the last step. In a partition
@@ -2100,9 +2104,10 @@ class Conductor:
         if partition_name in self.producer_triggered_partitions:
             k = next((j for j in range(k, len(plan)) if plan[j].walk == walk), None)
             if k is None:
-                raise HTTPException(status_code=500, detail=(
-                    f"partition {partition_name!r} ran walk {walk!r}, which its plan has no more of"
-                ))
+                # a walk the plan is past: only a lagging TP rank's report can name one, and with
+                # no pass number on the wire it can't be told apart, so it moves nothing
+                logger.debug("partition %s reported walk %s, which its plan is past", partition_name, walk)
+                return stay
             pstate.cursor = k
             if k + 1 < len(plan) and not self._walk_inputs[plan[k + 1].walk]:
                 return stay

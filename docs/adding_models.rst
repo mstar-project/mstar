@@ -167,15 +167,16 @@ You must implement these abstract methods:
    first token, the last prefill before decode, sets ``FINAL_PREFILL`` (from
    ``mstar.conductor.request_info``) in its step metadata; ``media_prefill_step`` does
    this for a ``MultimodalDecoderModel``.
-   A step whose walk a stream feeds and that is a bare node runs once per chunk until the
-   worker reports the stream's final chunk, its inputs' tensors sent with the first chunk
-   only; any other step advances when its walk reports, and the partition is done after
-   its last step. A ``ValueError`` here refuses the request with a 400, and so does a plan
-   of ``[]`` for every partition (nothing would ever run); an ``HTTPException`` below 500
-   refuses the request with its own status and detail. A plan the conductor can't run is
-   a model bug, refused with a 500: a step whose walk is not one of its partition's, a
-   ``bind`` key that is not an input of the step's walk, or a later step whose walk takes
-   no input the conductor sends (it moves a worker onto a step only by sending it inputs).
+   A step whose walk a stream feeds and that runs no Loop but chunk loops runs once per
+   chunk until the worker reports the stream's final chunk, its inputs' tensors sent with
+   the first chunk only; any other step advances when its walk reports, and the partition
+   is done after its last step. A ``ValueError`` here refuses the request with a 400, and
+   so does a plan of ``[]`` for every partition (nothing would ever run). A plan the
+   conductor can't run is a model bug, refused with a 500: a step whose walk is not one of
+   its partition's, a ``bind`` key that is not an input of the step's walk, a step after
+   one that runs once per chunk (only the stream's end, which ends the partition, moves
+   past it), or a later step whose walk takes no input the conductor sends (it moves a
+   worker onto a step only by sending it inputs).
    In a partition a stream moves (``Connection.consumer_walk``), the stream decides how
    many passes each step runs, but the conductor moves past a step on its first report
    when it is the last step (the partition ends) or the next step takes inputs it sends,
@@ -3319,7 +3320,7 @@ Override these methods:
   target_partition=...)`` instead of a plain ``GraphEdge``.
 
 A consuming partition's plan needs nothing about the stream. A step whose walk a stream
-feeds, and that is a bare node (or its chunk loop), runs once per chunk the stream brings,
+feeds, and that runs no Loop but chunk loops, runs once per chunk the stream brings,
 and the partition ends when the worker reports the pass that consumed the stream's final
 chunk. For a stream from another partition, the conductor tells the consumer
 ``producer_done`` once the producer partition is done; the data worker ends a stream from
