@@ -254,3 +254,136 @@ def test_compiled_step_runs_steady_calls_compiled_after_a_warm_up_on_a_cache_cop
     assert torch.equal(cache[0], torch.full_like(x, 3))
     step(x.float(), cache)  # fp32 never warms
     assert len(compiled) == 4
+
+
+def test_a_pool_feat_cache_writes_in_place_and_refuses_a_value_its_buffer_cannot_hold() -> None:
+    cache = wan_vae.PoolFeatCache.fresh([(1, 4, 2, 3, 5), None], torch.float32, "cpu")
+    one = torch.randn(1, 4, 1, 3, 5)
+    cache[0] = one  # a stream's first call: a smaller value, at the start of its buffer
+    assert cache[0].data_ptr() == cache.buffers[0].data_ptr() and torch.equal(cache[0], one)
+    two = torch.randn(1, 4, 2, 3, 5).contiguous(memory_format=torch.channels_last_3d)
+    cache[0] = two
+    held = cache[0]
+    again = torch.randn(1, 4, 2, 3, 5)
+    cache[0] = again  # same shape: in place, the layout kept
+    assert cache[0] is held and torch.equal(held, again) and held.stride() == two.stride()
+    cache[1] = "Rep"
+    assert cache[1] == "Rep"
+    with pytest.raises(RuntimeError, match="slot 1 .* no buffer"):
+        cache[1] = one
+    with pytest.raises(RuntimeError, match="slot 0"):
+        cache[0] = torch.randn(1, 4, 3, 3, 5)
+
+
+def test_a_pool_feat_cache_says_whether_a_call_left_every_slot_as_it_was() -> None:
+    """What comparing a cache before and after a call that replaces its slots finds,
+    without the before: each write is compared with the value it overwrites."""
+    cache = wan_vae.PoolFeatCache.fresh([(2, 3), (2, 3), None], torch.float32, "cpu")
+    a, b = torch.randn(2, 3), torch.randn(2, 3)
+    cache.watch()
+    cache[0], cache[1] = a, b
+    assert not cache.unchanged()  # first values
+    cache.watch()
+    cache[0], cache[1] = a.clone(), b.clone()
+    assert cache.unchanged()
+    cache.watch()
+    cache[0], cache[1] = a.clone(), b + 1
+    assert not cache.unchanged()
+    cache.watch()
+    cache[0] = a.clone()  # slot 1 not written: no longer what a call leaves
+    assert not cache.unchanged()
+    cache.watch()
+    cache[2] = "Rep"
+    cache[0], cache[1] = a.clone(), b + 1
+    assert not cache.unchanged()  # a marker appeared
+    cache.watch()
+    cache[2] = "Rep"
+    cache[0], cache[1] = a.clone(), b + 1
+    assert cache.unchanged()
+
+
+def _encoder_stream_run(vae, image, cache, calls: int) -> tuple[list, list]:
+    outs = []
+    with torch.no_grad():
+        outs.append(vae.encoder(image, feat_cache=cache, feat_idx=[0]))
+        for _ in range(calls):
+            outs.append(vae.encoder(torch.zeros(1, image.shape[1], 4, *image.shape[3:]), feat_cache=cache,
+                                    feat_idx=[0]))
+    return outs, [t.clone() if torch.is_tensor(t) else t for t in cache]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_encoder_blocks_that_save_uncopied_encode_and_cache_as_diffusers(kind) -> None:
+    """Bit for bit, with a plain cache (they clone, as diffusers does) and with a
+    ``PoolFeatCache`` (each slot written once, into its buffer)."""
+    import copy
+
+    vae = tiny_wan_vae(kind)
+    gen = torch.Generator().manual_seed(2)
+    image = torch.randn(1, vae.config.in_channels, 1, 16, 32, generator=gen)  # Wan2.2's is patchified
+    n = sum(isinstance(m, wan_vae.WanCausalConv3d) for m in vae.encoder.modules())
+    ref_out, ref_cache = _encoder_stream_run(vae, image, [None] * n, 3)
+    swapped = copy.deepcopy(vae)
+    wan_vae.encoder_saves_uncopied(swapped)
+    assert any(type(m).__name__.startswith("_Uncopied") for m in swapped.encoder.modules())
+    assert not any(type(m).__name__.startswith("_Uncopied") for m in swapped.decoder.modules())
+    out, cache = _encoder_stream_run(swapped, image, [None] * n, 3)
+    shapes = [tuple(t.shape) if torch.is_tensor(t) else None for t in ref_cache]
+    pool = wan_vae.PoolFeatCache.fresh(shapes, torch.float32, "cpu")
+    pool_out, pool_cache = _encoder_stream_run(swapped, image, pool, 3)
+    for got_out, got_cache in ((out, cache), (pool_out, pool_cache)):
+        assert all(torch.equal(a, b) for a, b in zip(ref_out, got_out, strict=True))
+        assert all((torch.equal(a, b) if torch.is_tensor(a) else a == b)
+                   for a, b in zip(ref_cache, got_cache, strict=True))
+    assert all(t.data_ptr() == b.data_ptr() for t, b in zip(pool, pool.buffers, strict=True) if torch.is_tensor(t))
+
+
+@pytest.mark.parametrize("compile", [False, True])
+@pytest.mark.parametrize("kind", KINDS)
+def test_decoder_blocks_that_save_uncopied_decode_the_feat_cache_stream_into_a_pool_feat_cache(kind, compile) -> None:
+    """``decoder_saves_uncopied`` with a ``PoolFeatCache``: the same frames and cache as
+    diffusers' blocks with a ``FeatCache``, every slot kept in its own buffer (taken
+    from the conv's input once built). With a plain cache the blocks run as diffusers'."""
+    import copy
+
+    vae = tiny_wan_vae(kind)
+    z = _latents(vae, 8)
+    wan_vae.to_channels_last(vae)
+    swapped = copy.deepcopy(vae)
+    wan_vae.decoder_saves_uncopied(swapped)
+    assert type(swapped.decoder).__name__ == "_UncopiedDecoder3d"
+    calls = ((0, 2), (2, 5), (5, 8))
+
+    def stream(model, cache):
+        step = wan_vae.DecoderStep(model, compile=compile)
+        with torch.no_grad():
+            return torch.cat([wan_vae.decode_causal(model, z[:, :, a:b], cache, step, clip_start=a == 0)
+                              for a, b in calls], 2)
+
+    ref_cache = wan_vae.new_feat_cache(vae)
+    ref = stream(vae, ref_cache)
+    plain_cache = wan_vae.new_feat_cache(swapped)
+    torch.testing.assert_close(stream(swapped, plain_cache), ref, rtol=0, atol=0)
+    shapes = [tuple(t.shape) if torch.is_tensor(t) else None for t in ref_cache]
+    pool = wan_vae.PoolFeatCache.fresh(shapes, torch.float32, "cpu")
+    torch.testing.assert_close(stream(swapped, pool), ref, rtol=0, atol=0)
+    assert all(torch.equal(a, b) for a, b in zip(ref_cache, pool, strict=True) if torch.is_tensor(a))
+    assert all(t.data_ptr() == b.data_ptr() for t, b in zip(pool, pool.buffers, strict=True) if torch.is_tensor(t))
+
+
+def test_a_pool_feat_cache_warm_up_copy_is_laid_out_as_it_is_in_memory_of_its_own() -> None:
+    """``DecoderStep`` warms a new call signature on a copy: for a ``PoolFeatCache``, one
+    laid out as it is (pieces of one block), so the warm-up runs the served graph."""
+    cache = wan_vae.PoolFeatCache.fresh([(1, 4, 2, 3, 5), None, (1, 2, 2, 3, 5)], torch.float32, "cpu")
+    cache[0] = torch.randn(1, 4, 2, 3, 5).contiguous(memory_format=torch.channels_last_3d)
+    cache[1] = "Rep"
+    cache[2] = torch.randn(1, 2, 1, 3, 5)
+    copy = wan_vae._scratch(cache)
+    assert isinstance(copy, wan_vae.PoolFeatCache) and copy[1] == "Rep"
+    for i in (0, 2):
+        assert torch.equal(copy[i], cache[i]) and copy[i].stride() == cache[i].stride()
+        assert copy[i].data_ptr() == copy.buffers[i].data_ptr() != cache[i].data_ptr()
+    gap = cache.buffers[2].data_ptr() - cache.buffers[0].data_ptr()
+    assert copy.buffers[2].data_ptr() - copy.buffers[0].data_ptr() == gap
+    wan_vae.compact_feat_cache(cache)  # the caller's memory: left where it is
+    assert cache[0].data_ptr() == cache.buffers[0].data_ptr()

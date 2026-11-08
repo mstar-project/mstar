@@ -1,8 +1,7 @@
 model: "lingbot_world_1_3b"
 
-# No node holds an engine KV cache (the rolling K/V is per-request state in
-# the dit); max_seq_len only satisfies the conductor's config check and matches
-# the UMT5 text length.
+# max_seq_len only satisfies the conductor's config check and matches the UMT5
+# text length; the dit's K/V and VAE caches live in its request pool (below).
 max_seq_len: 512
 
 # Numerics (model_kwargs), shown at their defaults. reference_numerics: true runs
@@ -16,9 +15,14 @@ max_seq_len: 512
 #   reference_numerics: false
 #   dit_compile_autotune: false
 
-# One rollout per GPU: the dense K/V and the VAE caches are per request, so the
-# model refuses any other value (LingBotWorldModel.validate_config_yaml).
-max_concurrent_requests: 1
+# Each rollout keeps its rolling K/V, text K/V and VAE caches in the dit's request
+# pool, reserved at startup, and waits for room there when it is full (the wait
+# counts against the API server's request timeout, --timeout). The default pool,
+# 20.1 GiB with a bf16 decode, holds one rollout at the largest size (720x1280) or
+# two at the default size (464x832, 8.5 GiB each). To change it, set
+#   resources:
+#     dit_pool:
+#       pool_bytes: 34359738368   # 32 GiB
 
 # Single-GPU colocated; the Wan VAE encode and decode are fused into the dit forward.
 node_groups:

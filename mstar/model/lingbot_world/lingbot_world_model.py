@@ -1,6 +1,6 @@
 """LingBotWorldModel: LingBot-World-V2 causal-fast, camera-controlled image-to-world.
 
-Architecture (2 nodes; the dit's attention is the one engine resource):
+Architecture (2 nodes; the dit's rolling K/V and its attention are engine resources):
     text_encoder - UMT5-XXL prompt encoder (wan22's submodule, reused)
     dit          - the 1.3B causal DiT. One rollout iteration is one chunk of
                    4 latent frames: the chunk's I2V condition (a warm-cache
@@ -32,7 +32,9 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec
+from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec, ResourceReqConfig
+from mstar.engine.resources.kv.rolling import RollingKVSpec
+from mstar.engine.resources.request_pool import RequestPoolConfig, RequestPoolReqConfig, RequestPoolSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
@@ -44,7 +46,17 @@ from mstar.model.lingbot_world.config import (
     UMT5_DIFFUSERS_REPO,
     WAN21_VAE_DIFFUSERS_REPO,
 )
-from mstar.model.lingbot_world.submodules import DIT_ATTN, ROLLOUT_LOOP_NAME, ROLLOUT_WALK, LingBotDitSubmodule
+from mstar.model.lingbot_world.submodules import (
+    DIT_ATTN,
+    DIT_KV,
+    DIT_POOL,
+    ROLLOUT_LOOP_NAME,
+    ROLLOUT_WALK,
+    LingBotDitSubmodule,
+    rolling_config,
+    rolling_extent,
+    rollout_state_buffers,
+)
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
 
@@ -96,48 +108,50 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        if self.config.reference_numerics:
-            return []
+        """The request pool that holds each rollout's rolling K/V, text K/V and VAE
+        caches, the rolling K/V window over the first, and the ragged attention over the
+        K/V unless ``reference_numerics`` attends with the reference's FA2 instead."""
         cfg = self.config
-        return [RaggedCrossAttentionSpec(
-            resource_key=DIT_ATTN, nodes={"dit"},
-            config=RaggedAttentionConfig(
-                num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                dtype=torch.bfloat16,
-            ),
-        )]
+        specs: list[NodeResourceSpec] = [
+            # inference tensors: the dit's forward runs in inference mode, and its compiled
+            # blocks and decode take views of the pool (text K/V, decoder cache) as they are
+            RequestPoolSpec(resource_key=DIT_POOL, nodes={"dit"},
+                            config=RequestPoolConfig(pool_bytes=self.default_pool_bytes(), inference_tensors=True)),
+            RollingKVSpec(resource_key=DIT_KV, nodes={"dit"}, config=rolling_config(cfg)),
+        ]
+        if not cfg.reference_numerics:
+            specs.append(RaggedCrossAttentionSpec(
+                resource_key=DIT_ATTN, nodes={"dit"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
+                    dtype=torch.bfloat16,
+                ),
+            ))
+        return specs
 
-    def kv_cache_bytes(self, lat_h: int, lat_w: int) -> int:
-        """The rolling self-attention plus text K/V one request allocates at
-        that latent size (``LingBotCausalDiT.new_cache`` and its cross K/V)."""
+    def max_window_tokens(self) -> int:
+        """Tokens of rolling K/V one rollout keeps per layer at the largest area
+        a request may ask for: ``local_attn_size`` latent frames of at most
+        ``max_area / 256`` tokens each, whatever the aspect (see ``geometry``)."""
         cfg = self.config
-        frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
-        tokens = frame_seqlen * cfg.local_attn_size + cfg.text_len
-        return cfg.num_layers * 2 * tokens * cfg.dim * torch.bfloat16.itemsize
+        cell = cfg.vae_stride[1] * cfg.vae_stride[2] * cfg.patch_size[1] * cfg.patch_size[2]
+        frames = cfg.local_attn_size if cfg.local_attn_size > -1 else cfg.max_chunks * cfg.chunk_size
+        return frames * (cfg.max_area // cell)
 
-    def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse to serve more than one rollout at a time.
-
-        The dit allocates each request's rolling K/V and VAE caches itself, at
-        its first chunk, outside the engine's resources, so the only bound on
-        how many are live is the conductor's admit queue, which exists only
-        when ``max_concurrent_requests`` is set. Several at once run the GPU
-        out of memory mid-rollout instead of queueing.
-        """
-        limit = config.get("max_concurrent_requests")
-        if limit == 1 and not isinstance(limit, bool):
-            return
+    def largest_latent(self) -> tuple[int, int]:
+        """A latent with the most pixels any output aspect has at the area limit
+        (90 x 160 = 14400), as square as the VAE allows: the VAE caches scale with
+        the latent's pixels, whatever its aspect."""
         cfg = self.config
-        side = int(np.sqrt(cfg.max_area))
-        gib = [self.kv_cache_bytes(*self.geometry((h, w), h, w)) / 2**30
-               for h, w in ((cfg.default_height, cfg.default_width), (side, side))]
-        raise ValueError(
-            f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
-            f"Each request holds its own rolling K/V ({gib[0]:.1f} GiB at "
-            f"{cfg.default_height}x{cfg.default_width}, up to {gib[1]:.1f} GiB at the "
-            f"{cfg.max_area}-pixel area limit) plus its VAE caches, allocated by the dit outside the "
-            "engine's resources, so the admit queue that this key enables is the only bound on them."
-        )
+        side = cfg.max_area // (cfg.vae_stride[1] * cfg.vae_stride[2])
+        lat_w = 2 * int(np.sqrt(side / 4))
+        return (side // lat_w) // 2 * 2, lat_w
+
+    def default_pool_bytes(self) -> int:
+        """Room for one rollout at the largest area: its K/V at the most tokens any
+        aspect keeps, its caches at the most latent pixels any aspect has."""
+        buffers = rollout_state_buffers(self.config, self.largest_latent(), self.max_window_tokens())
+        return RequestPoolReqConfig.of(buffers).nbytes()
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
@@ -332,12 +346,17 @@ class LingBotWorldModel(Model):
             if not input_signals.get(name):
                 raise ValueError(f"LingBot-World is missing its {name!r} input; process_prompt emits it.")
         lat_f = int(input_signals["camera_poses"][0].dims[0])
+        height, width = input_signals["image_inputs"][0].dims[1:]
         metadata = CurrentForwardConductorMetadata(
             input_modalities=input_modalities,
             output_modalities=output_modalities,
             graph_walk=_SCHEDULE[0],
             is_prefill=True,
-            kwargs={"walk_step": 0, "num_latent_frames": lat_f},
+            kwargs={
+                "walk_step": 0, "num_latent_frames": lat_f,
+                "dit_kv_tokens": sum(rolling_extent(self.config, (int(height), int(width)), lat_f)),
+                "dit_lat_hw": [int(height) // self.config.vae_stride[1], int(width) // self.config.vae_stride[2]],
+            },
         )
         inputs = self._walk_inputs(_SCHEDULE[0], input_signals)
         return ForwardPassArgs(
@@ -346,6 +365,20 @@ class LingBotWorldModel(Model):
             unpersist_tensors=sum([e.tensor_info for e in inputs], start=[]),
             step_metadata=self._step_metadata(metadata),
         )
+
+    def get_request_resource_configs(
+        self, partition_fwd_args: dict[str, ForwardPassArgs], model_kwargs: dict | None = None,
+    ) -> dict[str, ResourceReqConfig]:
+        """The rollout's state in the pool, declared up front so it waits in the
+        engine's queue for room, and a size the pool can never hold is a 400."""
+        del model_kwargs
+        for fwd in partition_fwd_args.values():
+            kwargs = fwd.full_metadata.kwargs
+            tokens, lat_hw = kwargs.get("dit_kv_tokens"), kwargs.get("dit_lat_hw")
+            if tokens is not None and lat_hw is not None:
+                buffers = rollout_state_buffers(self.config, tuple(lat_hw), int(tokens))
+                return {DIT_POOL: RequestPoolReqConfig.of(buffers)}
+        return {}
 
     def get_partition_forward_pass_args(
         self, partition_name: str, partition_metadata: CurrentForwardConductorMetadata,
