@@ -262,6 +262,19 @@ class TestStart(unittest.TestCase):
         self.assertIn(out.get("exit"), (None, 3))
         return lt / "lt", launched
 
+    def test_a_refresh_says_why_every_launch_failed(self):
+        routes = {"gpu.py launch": Fail("the wallet is empty"), "git rev-parse": "abcdef\n",
+                  "gpu.py offers": {"offers": [{"id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1,
+                                                "usd_per_hour": 3.0, "availability": "now"}],
+                                    "errors": [], "max_usd_per_hour": 30}}
+        printed = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, workspace(), contextlib.redirect_stdout(printed), \
+                unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}):
+            out, _ = step(gpu_review.refresh, routes, runner_temp=temp, tag="1", volume="v1", gpus="1", hours="1",
+                          models="m", skip="", weights="", max_usd="10", github_repository="o/r")
+        self.assertEqual(out.get("exit"), 1)
+        self.assertIn("eras:l1: the wallet is empty", printed.getvalue(), "the reason would be lost with the run")
+
     def test_no_model_text_in_the_brief_and_no_box_without_its_key(self):
         out, launched = self.start(None, {"eras": {}})
         self.assertEqual(launched, [], "a box with no Anthropic key would be paid for and sit idle")

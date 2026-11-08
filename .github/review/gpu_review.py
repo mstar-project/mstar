@@ -422,14 +422,19 @@ def refresh(out, runner_temp, tag, volume, gpus, hours, models, skip, weights, m
         print(f"::error::No Eras listing with {gpus} GPUs free now: {json.dumps(listing['errors'])}")
         sys.exit(1)
 
+    tried = []
+
     def launch(o):
-        return gpu("launch", o["id"], "--pr", "0", "--hours", hours, "--tag", tag, "--cache-write", volume,
-                   "--allow-over-budget", "--run", str(REFRESH_BOX), "--input", str(lt / "run.json"),
-                   "--input", str(BOX_COMMON), check=False)
+        r = gpu("launch", o["id"], "--pr", "0", "--hours", hours, "--tag", tag, "--cache-write", volume,
+                "--allow-over-budget", "--run", str(REFRESH_BOX), "--input", str(lt / "run.json"),
+                "--input", str(BOX_COMMON), check=False)
+        if r.returncode:
+            tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
+        return r
 
     o, r = launch_first(free, launch)
     if not o:
-        print(f"::error::No Eras listing with {gpus} GPUs launched.")
+        print(f"::error::No Eras listing with {gpus} GPUs launched: " + "; ".join(tried).replace("\n", " "))
         sys.exit(1)
     (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])  # where `wait` finds the box
 
