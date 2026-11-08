@@ -436,7 +436,9 @@ jobs:
           # The review app's token, or the job's own. Without a token the action
           # tries to mint a Claude GitHub App token over OIDC, which needs
           # `id-token: write` and that app installed, and fails before reviewing.
-          github_token: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          # A team run can outlast the app token's hour, so it posts its inline
+          # comments with the job's token, which lasts as long as the job.
+          github_token: ${{ steps.pre.outputs.non_write_user == '' && secrets.GITHUB_TOKEN || steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           # Empty for anyone with write access. Otherwise the PR author alone,
           # set by the preflight; the action then also scrubs secrets from any
           # subprocess environment.
@@ -469,6 +471,20 @@ jobs:
             --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Skill
             --json-schema '${{ steps.diff.outputs.schema }}'
 
+      # The app's token lasts an hour and the review can take five: a fresh one
+      # for everything posted from here on.
+      - name: Mint the review app's token again
+        if: always() && steps.pre.outputs.run == 'true' && vars.REVIEW_APP_CLIENT_ID != ''
+        id: post-app
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+
       # The action fails a run that went past --max-turns even when Claude
       # finished and returned its summary, and on a real failure it still
       # writes everything Claude said to its execution file. Read the result
@@ -478,7 +494,7 @@ jobs:
         id: salvage
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
         run: |
           f="$RUNNER_TEMP/claude-execution-output.json"
           if [ ! -s "$f" ]; then
@@ -559,7 +575,7 @@ jobs:
         id: post
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
           OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
@@ -599,7 +615,7 @@ jobs:
         if: steps.post.outcome == 'success'
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
           NEW_ID: ${{ steps.post.outputs.id }}
         run: |
           gh api graphql --paginate -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
@@ -625,7 +641,7 @@ jobs:
         if: steps.post.outcome == 'success'
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
           OUTPUT: ${{ steps.review.outputs.structured_output || steps.salvage.outputs.structured_output }}
         run: |
           types=()
@@ -700,7 +716,7 @@ jobs:
            (steps.review.outcome == 'failure' && steps.salvage.outputs.structured_output == ''))
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
           WHY: ${{ steps.prev.outputs.why || steps.salvage.outputs.why || steps.pr.outputs.why || 'a step failed' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
           CAN_CONTINUE: ${{ steps.upload.outcome == 'success' }}
@@ -761,18 +777,6 @@ jobs:
         with:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
-
-      - name: Mint the review app's token
-        if: vars.REVIEW_APP_CLIENT_ID != ''
-        id: app
-        continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
-          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
-          permission-contents: read
-          permission-issues: write
-          permission-pull-requests: write
 
       # gpu.py's settings, from repository variables; the Slurm node's key and
       # pinned host key from secrets and variables. Nothing here reaches the box.
@@ -944,6 +948,20 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           python3 .github/review/gpu_review.py comment --pr "$PR" --sha "$HEAD_SHA" --out "$RUNNER_TEMP/lt" \
             --media-url "https://${OWNER,,}.github.io/$MEDIA_REPO/pr-$PR/$TAG"
+
+      # Minted here, after the live test, since the app's token lasts an hour:
+      # everything below that posts or approves uses it.
+      - name: Mint the review app's token
+        if: always() && vars.REVIEW_APP_CLIENT_ID != ''
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
 
       - name: Decide approval
         if: always() && (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '')
