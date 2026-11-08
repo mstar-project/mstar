@@ -1,6 +1,6 @@
 ---
 name: live-pr-test
-description: Live-test an M* pull request on real GPUs — read the PR, size the cheapest Hopper-or-newer box for it, provision it on the team's Slurm node, Eras Cloud, RunPod or Lambda (or use the persistent cluster), test the PR's claims plus regressions against main, copy media back, tear the box down, and report in markdown. Use when asked to live-test, GPU-test, smoke-test or benchmark a PR, or to "run the PR on a real box".
+description: Live-test an M* pull request on real GPUs — read the PR, size the cheapest Hopper-or-newer box for it, provision it on the team's Slurm nodes, Eras Cloud, RunPod or Lambda (or use the persistent cluster), test the PR's claims plus regressions against main, copy media back, tear the box down, and report in markdown. Use when asked to live-test, GPU-test, smoke-test or benchmark a PR, or to "run the PR on a real box".
 ---
 
 # Live-testing a PR
@@ -27,7 +27,7 @@ Read alongside this:
 - **cloud** (default): provision with `scripts/gpu.py`, work over ssh, copy results back with scp, terminate.
 - **cluster** (`cluster` in the request, or `mode: cluster` in the config): no provisioning, ssh or scp. Run on the cluster directly and write results to `cluster.results_dir/pr-<n>-<timestamp>/`, which the requester opens in VS Code. Everything else is the same.
 
-Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY`, `LAMBDA_API_KEY` and `ERAS_API_KEY` in the environment. Never print them, write them to the box, or put them in a command line that gets logged. The Slurm node is reached over ssh (`slurm` in the config). `offers` lists a Slurm node first when it has the GPUs free: there an instance is a batch job holding them, `gpu.py ssh` runs inside it, and servers start with `mserve` (the node's wrapper, installed there, that runs `mstar serve --gpus $CUDA_VISIBLE_DEVICES` inside a Slurm job), never `--gpus`. `launch --run SCRIPT` makes a script the job itself, with its `--input` files in the job's working directory (on Eras, in `/run/live-pr`); on Slurm, `terminate` and the deadline watchdog delete that directory, so pull results first.
+Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY`, `LAMBDA_API_KEY` and `ERAS_API_KEY` in the environment. Never print them, write them to the box, or put them in a command line that gets logged. The Slurm nodes are reached over ssh (`slurm` in the config: a list of named nodes, each with its host, port, pinned host key and partition). `offers` lists every Slurm node that has the GPUs free first, the one with the most free at the top, and says why a node it couldn't reach is missing: there an instance is a batch job holding them, `gpu.py ssh` runs inside it, and servers start with `mserve` (the node's wrapper, installed there, that runs `mstar serve --gpus $CUDA_VISIBLE_DEVICES` inside a Slurm job), never `--gpus`. `launch --run SCRIPT` makes a script the job itself, with its `--input` files in the job's working directory (on Eras, in `/run/live-pr`); on Slurm, `terminate` and the deadline watchdog delete that directory, so pull results first.
 
 ## Several PRs at once
 

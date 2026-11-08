@@ -16,13 +16,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GPU = runpy.run_path(str(REPO_ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"))
-SLURM_CFG = {"slurm": {"host": "root@node", "job_prefix": "live-pr", "workdir": "/workspace/live-pr"}}
+SLURM_CFG = {"slurm": [{"name": "node1", "host": "root@node", "job_prefix": "live-pr",
+                        "workdir": "/workspace/live-pr"}]}
 
 
 def fake_slurm(replies, calls=None):
     """Stands in for gpu.py's slurm_run: each command gets the first reply whose key it contains, and
     an exception is a failed command (empty stdout with check=False)."""
-    def slurm_run(cfg, command, check=True):
+    def slurm_run(sl, command, check=True):
         if calls is not None:
             calls.append(command)
         reply = next(r for k, r in replies.items() if k in command)
@@ -43,7 +44,7 @@ class TestSlurm(unittest.TestCase):
         self.globals["slurm_run"] = self.saved
 
     def test_a_failed_ssh_is_not_a_job_that_ended(self):
-        e = {"provider": "slurm", "instance_id": "42", "run": True}
+        e = {"provider": "slurm", "instance_id": "42", "run": True, "region": "node1"}
         self.globals["slurm_run"] = fake_slurm({"squeue": GPU["ApiError"](255, "ssh: connect to host node: timed out")})
         with self.assertRaises(GPU["ApiError"], msg="a flaky ssh would end a running live test"):
             GPU["status"](e, SLURM_CFG)
@@ -61,7 +62,7 @@ class TestSlurm(unittest.TestCase):
                             STATE=state, LEDGER=state / "instances.json")
         jobdir = "/workspace/live-pr/live-pr-7-1-1"
         GPU["terminate"]("slurm:42", {"provider": "slurm", "instance_id": "42", "dir": jobdir, "launched_at": 0,
-                                      "usd_per_hour": 0.0})
+                                      "usd_per_hour": 0.0, "region": "node1"})
         self.assertTrue(any("scancel 42" in c and f"rm -rf {jobdir}" in c for c in calls),
                         f"the job's directory (the Anthropic key, venvs, builds) would stay on the node: {calls}")
 
@@ -102,7 +103,7 @@ class TestSlurm(unittest.TestCase):
         key = Path(tempfile.mkdtemp()) / "key.pub"
         key.write_text("ssh-ed25519 AAAA test")
         cfg = {**SLURM_CFG, "ssh_public_key": str(key), "budget": {"max_usd_per_hour": 0, "max_hours": 4},
-               "slurm": {**SLURM_CFG["slurm"], "hf_home": "/workspace/shared/hf"}}
+               "slurm": [{**SLURM_CFG["slurm"][0], "hf_home": "/workspace/shared/hf"}]}
         self.globals["slurm_run"] = fake_slurm({"sinfo": "node1 gpu:8 gpu:0 idle\n"})
         args = argparse.Namespace(offer="slurm:node1:1", pr=7, hours=1, tag="1-1", run="job.sh",
                                   input=[], allow_over_budget=False, dry_run=True)
@@ -110,6 +111,39 @@ class TestSlurm(unittest.TestCase):
             GPU["cmd_launch"](args, cfg)
         self.assertIn("HF_HOME=/workspace/shared/hf", out.getvalue(),
                       "each run would download the weights again into its own directory")
+
+    def test_offers_cover_every_node_and_the_freest_comes_first(self):
+        """Node a has 2 GPUs free, b has 6, and c doesn't answer: offers lists b, then a, says why c is
+        missing, and launching the first offer starts the job on b."""
+        key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
+        key.write_text("ssh-ed25519 AAAA test")
+        saved = {k: self.globals[k] for k in ("STATE", "LEDGER")}
+        self.addCleanup(self.globals.update, saved)
+        nodes = {"a": fake_slurm({"sinfo": "a1 gpu:8 gpu:6 mixed\n", "sbatch": "41\n"}),
+                 "b": fake_slurm({"sinfo": "b1 gpu:8 gpu:2 mixed\n", "sbatch": "42\n"}),
+                 "c": fake_slurm({"": GPU["ApiError"](255, "slurm: sinfo: ssh: connect to host c: refused")})}
+
+        def slurm_run(sl, command, check=True):
+            calls.append((sl["name"], command))
+            return nodes[sl["name"]](sl, command, check)
+        self.globals.update(slurm_run=slurm_run, STATE=state, LEDGER=state / "instances.json")
+        cfg = {"slurm": [{"name": n, "host": f"root@{n}"} for n in nodes], "ssh_public_key": str(key),
+               "eras": {"enabled": False}, "runpod": {"enabled": False}, "lambda": {"enabled": False},
+               "budget": {"max_usd_per_hour": 0, "max_hours": 4}}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            GPU["cmd_offers"](argparse.Namespace(gpus=2, min_vram=80, all_regions=False, allow_arm=False, json=True),
+                              cfg)
+        listing = json.loads(out.getvalue())
+        self.assertEqual([o["id"] for o in listing["offers"]], ["slurm:b:2", "slurm:a:2"],
+                         "a live test would queue behind people's jobs on the busier node")
+        self.assertEqual([e for e in listing["errors"] if e.startswith("slurm")],
+                         ["slurm c: HTTP 255: slurm: sinfo: ssh: connect to host c: refused"],
+                         "a node that is down would stop the others' offers, or vanish without a reason")
+        args = argparse.Namespace(offer=listing["offers"][0]["id"], pr=7, hours=1, tag="1-1", run=None, input=[],
+                                  cache="ro", allow_over_budget=False, dry_run=False)
+        with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()):
+            GPU["cmd_launch"](args, cfg)
+        self.assertEqual([n for n, c in calls if c.startswith("sbatch")], ["b"])
 
 
 class TestEras(unittest.TestCase):
