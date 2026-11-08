@@ -217,14 +217,15 @@ class LLMSubmodule(SampledTokenDecoder):
         self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The rotary tables of a decode step from the position resource's
-        planned positions: one token per row, no custom grids."""
+        planned positions: one token per row, no custom grids. Every row is
+        text, whose three MRoPE grids are one position, so the tables are plain
+        RoPE over the 1D positions (`compute_text_cos_sin`)."""
         pos_ids = self.node_resources[ROPE].pos_ids("main")
         assert pos_ids is not None, (
             "position resource has no plan for this step; `plan` must run "
             "before the forward"
         )
-        pos = pos_ids[:num_tokens].unsqueeze(0).expand(3, -1)
-        return self.model.model.build_cos_sin(pos, dtype=self.model.embed_dtype)
+        return self.model.model.build_text_cos_sin(pos_ids[:num_tokens], dtype=self.model.embed_dtype)
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
         return mrope_position_ids(self.node_resources[ROPE].pos_ids("main"), inputs)
