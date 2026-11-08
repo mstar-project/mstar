@@ -76,6 +76,26 @@ FIXES = re.compile(r"\b(?:fix(?:e[sd])?|revert(?:s|ed)?)\s+#(\d+)\b", re.IGNOREC
 FIX_SUBJECT = re.compile(r"\b(?:fix|bug|revert)", re.IGNORECASE)
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
+# The weekly improvement run: how much a reader needs (PRs read, and comments kept per PR; characters of a
+# comment), and what the model returns.
+IMPROVE_ITEMS = 30
+IMPROVE_TEXT = 800
+IMPROVE_SCHEMA = {
+    "type": "object",
+    "properties": {"improvements": {"type": "array", "maxItems": 10, "description": "most useful first; may be empty",
+                                    "items": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "change": {"type": "string", "description": "what to change, concretely"},
+            "where": {"type": "string", "description": "the skill or code file, and its section or function"},
+            "evidence": {"type": "array", "minItems": 1, "maxItems": 5, "items": {"type": "string"},
+                         "description": "`url` values from the evidence files"},
+        },
+        "required": ["title", "change", "where", "evidence"],
+    }}},
+    "required": ["improvements"],
+}
 
 
 def run(argv, input=None, check=True, timeout=None):
@@ -513,6 +533,31 @@ def interdiff(old, new):
     return "".join(parts)
 
 
+def discussion(repo, pr):
+    """(inline review comments, conversation-tab comments) of the PR. An inline comment is marked with its
+    thread's resolved and outdated state (only GraphQL has those), and `mine` when this bot posted it."""
+    threads = {}
+    for page in graphql(THREADS, repo, pr):
+        for t in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
+            first = t["comments"]["nodes"][:1]
+            if first:
+                threads[first[0]["databaseId"]] = {"resolved": t["isResolved"], "outdated": t["isOutdated"]}
+    comments = []
+    for c in api_list(f"repos/{repo}/pulls/{pr}/comments"):
+        user = (c.get("user") or {}).get("login")
+        comments.append({"id": c["id"], "user": user, "user_type": (c.get("user") or {}).get("type"),
+                         "path": c.get("path"), "line": c.get("line"), "side": c.get("side"),
+                         "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
+                         "created_at": c.get("created_at"), "url": c.get("html_url"),
+                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in BOT_USERS})
+    # The conversation tab: replies to the summary, and the author's answers.
+    conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"),
+                     "user_type": (c.get("user") or {}).get("type"), "created_at": c.get("created_at"),
+                     "url": c.get("html_url"), "body": c.get("body")}
+                    for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
+    return comments, conversation
+
+
 def collect(out, repo, pr, head_sha, mode, prev=""):
     """The review's inputs, in the workspace: pr.diff, pr-body.md, pr-comments.json (with each thread's
     resolved and outdated state, and `mine` on the bot's own), pr-conversation.json, a re-review's
@@ -534,25 +579,8 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     write("pr.diff", diff)
     write("pr-body.md", (pull["body"] or "") + "\n")
 
-    # Inline review comments, each marked with its thread's resolved and outdated state (only GraphQL
-    # has those), and `mine` when this bot posted it.
-    threads = {}
-    for page in graphql(THREADS, repo, pr):
-        for t in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
-            first = t["comments"]["nodes"][:1]
-            if first:
-                threads[first[0]["databaseId"]] = {"resolved": t["isResolved"], "outdated": t["isOutdated"]}
-    comments = []
-    for c in api_list(f"repos/{repo}/pulls/{pr}/comments"):
-        user = (c.get("user") or {}).get("login")
-        comments.append({"id": c["id"], "user": user, "path": c.get("path"), "line": c.get("line"),
-                         "side": c.get("side"), "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
-                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in BOT_USERS})
+    comments, conversation = discussion(repo, pr)
     write_json("pr-comments.json", comments)
-
-    # The conversation tab: replies to the summary, and the author's answers.
-    conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"), "created_at": c.get("created_at"),
-                     "body": c.get("body")} for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
     write_json("pr-conversation.json", conversation)
 
     # A re-review starts from this bot's last summary and reviews only what changed since
@@ -854,7 +882,8 @@ def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="
              "attempt": github_run_attempt, "usage": review, "gpu_usd": gpu, "box_usd": box, "approval": approval,
              "usd": usd}
     b64 = base64.b64encode(json.dumps(entry).encode()).decode()
-    comment_on_issue(repo, issue(repo, "ledger"), f"PR #{pr}: ${usd:,.2f}.\n<!-- review-spend {b64} -->\n")
+    what = f"PR #{pr}" if pr else "Weekly improvement run"
+    comment_on_issue(repo, issue(repo, "ledger"), f"{what}: ${usd:,.2f}.\n<!-- review-spend {b64} -->\n")
 
 
 # ---------------------------------------------------------------- monitor (a daily job; no model)
@@ -1039,6 +1068,125 @@ def monitor(out, repo, approvals=""):
                          + "\n".join(f"- {text}" for text in fresh) + "\n")
 
 
+# ---------------------------------------------------------------- improve (a weekly job)
+
+def scrub(text):
+    """Comment or model text for the weekly improvement run: `safe`, clipped, and without names, links or
+    #references, so it can't name anyone, load an image or mark a PR's timeline."""
+    text = re.sub(r"https?://\S+", "[link]", re.sub(r"@[\w-]+", "@someone", str(text or "")))
+    return safe(text).replace("#", "#\u200b")[:IMPROVE_TEXT]
+
+
+def monday(now):
+    """The date this week started, which names its issue."""
+    return (now - datetime.timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+
+
+def pr_evidence(repo, pr, since, records):
+    """What happened on PR `pr` since `since`, for the improvement run: its runs from the ledger (cost, outcome),
+    the findings a later review judged moot, its reviews, inline comments and conversation. Logins become a role.
+    A finding someone resolved stays however old it is: GitHub doesn't say when a thread was resolved."""
+    author = (api(f"repos/{repo}/pulls/{pr}").get("user") or {}).get("login")
+    inline, conversation = discussion(repo, pr)
+    reviews = [{"user": (r.get("user") or {}).get("login"), "user_type": (r.get("user") or {}).get("type"),
+                "created_at": r.get("submitted_at"), "url": r.get("html_url"), "body": r.get("body")}
+               for r in api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
+               if (r.get("user") or {}).get("login") not in BOT_USERS]
+
+    def kept(comments):
+        rows = []
+        for c in comments:
+            mine = c["user"] in BOT_USERS
+            if not c.get("body") or (c.get("user_type") == "Bot" and not mine):
+                continue
+            if (c.get("created_at") or "") >= since or (mine and c.get("resolved")):
+                rows.append({**{k: c[k] for k in ("id", "path", "line", "in_reply_to_id", "resolved", "outdated",
+                                                  "url") if k in c},
+                             "role": "bot" if mine else "author" if c["user"] == author else "other",
+                             "body": scrub(c["body"])})
+        return rows[-IMPROVE_ITEMS:]
+
+    runs = [{"mode": r.get("mode"), "outcome": (r.get("usage") or {}).get("outcome"),
+             "subtype": (r.get("usage") or {}).get("subtype"), "turns": (r.get("usage") or {}).get("num_turns"),
+             "usd": r.get("usd"), "gpu_usd": r.get("gpu_usd"), "box_usd": r.get("box_usd"),
+             "approval": r.get("approval"), "url": f"https://github.com/{repo}/actions/runs/{r.get('run')}"}
+            for created, r in records if created >= since and str(r.get("pr")) == str(pr)]
+    moot = [{"ref": scrub(f.get("ref")), "why": scrub(f.get("why")), "url": c["url"]}
+            for c in conversation
+            if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)
+            and (c.get("created_at") or "") >= since
+            for f in (render_summary.saved_state(c["body"]) or {}).get("moot", [])]
+    return {"runs": runs, "moot": moot, "reviews": kept(reviews), "inline": kept(inline),
+            "conversation": kept(conversation)}
+
+
+def improve_inputs(out, repo, key_set):
+    """The evidence for the weekly improvement run (review-improve.yml), in improve-evidence/: one file per PR the
+    bot reviewed in the last three weeks with anything from the last 7 days, and status.json, the status
+    issue's signals and alerts. `run` stays false without an API key, past a spend cap, once this week's run
+    has finished (a failed one can be retried by hand), or with nothing to read."""
+    out["run"] = "false"
+    if key_set != "true":
+        print("::warning::ANTHROPIC_API_KEY is not set; skipping the improvement run.")
+        return
+    stop = over_cap(repo)
+    if stop:
+        print(f"::notice::{stop}")
+        return
+    now = utcnow()
+    stamp = "%Y-%m-%dT%H:%M:%SZ"
+    records = ledger(repo, (now - datetime.timedelta(days=21)).strftime(stamp))
+    if any(r.get("mode") == "improve" and (r.get("usage") or {}).get("outcome") == "success"
+           and created >= f"{monday(now)}T00:00:00Z" for created, r in records):
+        print("::notice::This week's improvement run has already finished.")
+        return
+    since = (now - datetime.timedelta(days=7)).strftime(stamp)
+    newest_first = dict.fromkeys(int(r["pr"]) for _, r in reversed(records) if str(r.get("pr")).isdigit())
+    files = {}
+    for pr in list(newest_first)[:IMPROVE_ITEMS]:
+        evidence = pr_evidence(repo, pr, since, records)
+        if any(evidence.values()):
+            files[f"{pr}.json"] = {"pr": pr, **evidence}
+    status = [{"url": c.get("html_url"), "text": scrub(line)}
+              for i in issues(repo, "status")
+              for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100")
+              if (c.get("user") or {}).get("login") in BOT_USERS
+              for line in (c.get("body") or "").splitlines() if line.strip()]
+    if status:
+        files["status.json"] = status[-IMPROVE_ITEMS:]
+    if not files:
+        print("::notice::The bot did nothing this week; no improvement run.")
+        return
+    Path("improve-evidence").mkdir()
+    for name, value in files.items():
+        write_json(f"improve-evidence/{name}", value)
+    out.update(run="true", schema=json.dumps(IMPROVE_SCHEMA, separators=(",", ":")))
+
+
+def improve_post(out, repo, github_run_id, github_run_attempt, output="", usage=""):
+    """Record what the improvement run cost, first, so a failed post can't lose it; then open the week's issue
+    from its structured output, redacted, on stdin. Evidence links stay inside this repository and go through
+    redirect.github.com, which keeps them off the PRs' timelines. An empty list opens nothing; a run that
+    returned no list fails. Never touches code, PRs or the bot."""
+    record(out, repo, "", github_run_id, github_run_attempt, usage=usage)
+    try:
+        items = json.loads(output)["improvements"]
+    except (ValueError, KeyError, TypeError):
+        sys.exit("The improvement run returned no list, so no issue was opened.")
+    if not items:
+        print("::notice::Nothing worth raising this week; no issue opened.")
+        return
+    link = re.compile(rf"https://github\.com/({re.escape(repo)}/[\w./?=#&%-]+)")
+    parts = ["What the review bot could improve about itself, most useful first. It changes nothing on its own."]
+    for n, item in enumerate(items, 1):
+        links = [f"- https://redirect.github.com/{m[1]}" for m in map(link.fullmatch, item["evidence"]) if m]
+        parts.append("\n".join([f"### {n}. {scrub(item['title'])}", "", f"**Change:** {scrub(item['change'])}", "",
+                                f"**Where:** {scrub(item['where'])}", "", "**Evidence:**", *links]))
+    body = json.dumps({"title": f"Review bot: what to improve, week of {monday(utcnow())}",
+                       "body": redact("\n\n".join(parts)) + "\n"})
+    gh("api", "-X", "POST", f"repos/{repo}/issues", "--input", "-", input=body)
+
+
 # ---------------------------------------------------------------- dispatcher
 
 def main(steps):
@@ -1070,7 +1218,7 @@ def main(steps):
 
 STEPS = {"preflight": preflight, "resolve": resolve, "restore": restore, "collect": collect, "salvage": salvage,
          "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete,
-         "record": record, "monitor": monitor}
+         "record": record, "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post}
 
 if __name__ == "__main__":
     main(STEPS)
