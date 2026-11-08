@@ -37,22 +37,45 @@ def threads(*nodes):
     return [{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": list(nodes)}}}}}]
 
 
-def preflight(command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR"):
-    """The preflight job's step run as the workflow runs it, for `command` (the word its COMMAND env
-    maps the comment to), with `gh` answering each login's permission from `perms`. Returns its outputs."""
+def run_step(job, step_id, gh, **env):
+    """`job`'s step `step_id` run as the workflow runs it, from the repository root, with `env` and with `gh`
+    (a shell script) standing in for the GitHub CLI. Returns its outputs."""
     with tempfile.TemporaryDirectory() as d:
-        gh = Path(d, "gh")
-        gh.write_text("#!/bin/sh\ncase \"$2\" in\n" + "".join(
-            f"  */collaborators/{login}/permission) echo {perm} ;;\n" for login, perm in perms.items()) + "esac\n")
-        gh.chmod(0o755)
+        Path(d, "gh").write_text("#!/bin/sh\n" + gh)
+        Path(d, "gh").chmod(0o755)
         out = Path(d, "out")
         out.touch()
-        env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(out), "REPO": "o/r",
-               "KEY_SET": "true", "COMMAND": command, "ACTOR": actor, "AUTHOR": author, "ASSOC": assoc,
-               "SKIP_LABEL": "false"}
-        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script("preflight", "pre")],
-                       env=env, check=True, capture_output=True)
+        env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(out), "RUNNER_TEMP": d,
+               "REPO": "o/r", "PR": "1", **env}
+        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script(job, step_id)],
+                       env=env, cwd=REPO_ROOT, check=True, capture_output=True)
         return dict(line.split("=", 1) for line in out.read_text().splitlines())
+
+
+def preflight(command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR"):
+    """The preflight job's step for `command` (the word its COMMAND env maps the comment to), with `gh`
+    answering each login's permission from `perms`. Returns its outputs."""
+    gh = "case \"$2\" in\n" + "".join(
+        f"  */collaborators/{login}/permission) echo {perm} ;;\n" for login, perm in perms.items()) + "esac\n"
+    return run_step("preflight", "pre", gh, KEY_SET="true", COMMAND=command, ACTOR=actor, AUTHOR=author,
+                    ASSOC=assoc, SKIP_LABEL="false")
+
+
+def restore(mode):
+    """The review job's /review continue step, finding one stopped review whose saved handoff has `mode`.
+    Returns its outputs."""
+    with tempfile.TemporaryDirectory() as saved:
+        Path(saved, "handoff.json").write_text(json.dumps({"mode": mode, "pr": 1, "head_sha": "abc"}))
+        Path(saved, "handoff.md").write_text("notes")
+        # The stopped review's comment, its artifact's run, that run's workflow and event, and the download.
+        gh = f"""case "$*" in
+  *issues/1/comments*) echo 5 ;;
+  *actions/artifacts*) echo 9 ;;
+  *actions/runs/9*) echo ".github/workflows/claude-review.yml issue_comment" ;;
+  "run download"*) mkdir -p "$9" && cp {saved}/* "$9" ;;
+esac
+"""
+        return run_step("review", "prev", gh, HEAD_SHA="abc", NON_WRITE="")
 
 
 def thread(priority, resolved=False, outdated=False, login="mstar-review", comment_id=7):
@@ -162,6 +185,7 @@ class TestReviewSummary(unittest.TestCase):
         self.assertEqual(preflight("light", {"a-maintainer": "read"}, actor="a-maintainer"), {"run": "false"},
                          "someone without write access could review another author's PR")
         self.assertEqual(preflight("continue", read)["mode"], "", "a /review continue would not keep its own mode")
+        self.assertEqual(restore("thorough")["mode"], "nogpu", "a review stopped before the rename couldn't continue")
 
     def test_schema_has_no_single_quote(self):
         self.assertNotIn("'", json.dumps(SUMMARY["SCHEMA"]),

@@ -31,7 +31,7 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
 # PR is one the review was given the diff of (stacked-above.json).
 STATUSES = ("fixed", "fixed_above", "open", "moot")
-# Summaries posted before the modes were renamed carry the old names in their state.
+# Summaries and handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
@@ -221,6 +221,11 @@ def render(review, pages, head, mode, stacked):
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
 
 
+def current_mode(mode):
+    """`mode` by its current name: summaries and handoffs saved before the modes were renamed carry the old one."""
+    return RENAMED_MODES.get(mode, mode)
+
+
 def read_state(body, mode):
     """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
     None, and that run reviews the whole PR. None too when it doesn't decode, and for a nogpu
@@ -232,7 +237,7 @@ def read_state(body, mode):
         return None
     if not isinstance(state, dict):
         return None
-    state["mode"] = RENAMED_MODES.get(state.get("mode"), state.get("mode"))
+    state["mode"] = current_mode(state.get("mode"))
     # A state from before `skipped` was kept counts as having skipped files.
     if mode == "nogpu" and (state.get("mode") != "nogpu" or state.get("skipped", [None])):
         return None
