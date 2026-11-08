@@ -477,6 +477,7 @@ def cmd_launch(args, cfg):
                          f"--gres=gpu:{n}", f"-c {sl.get('cpus_per_gpu', 24) * n}",
                          f"--mem={sl.get('mem_gb_per_gpu', 180) * n}G", f"--time={max(1, int(hours * 60))}",
                          f"--nice={sl.get('nice', 100)}", "--no-requeue", f"-J {shlex.quote(name)}",
+                         shlex.quote(f"--export=ALL,HF_HOME={hf_home(cfg, 'slurm', None)}"),
                          *([f"--chdir={shlex.quote(jobdir)}", f"-o {shlex.quote(jobdir)}/job.log",
                             shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
                            else ["-o /dev/null", "--wrap 'sleep infinity'"])])

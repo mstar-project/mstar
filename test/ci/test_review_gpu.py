@@ -1,5 +1,8 @@
 """Check the approval rule in .github/review/gpu_review.py, which decides whether the review bot approves."""
 
+import argparse
+import contextlib
+import io
 import runpy
 import tempfile
 import unittest
@@ -93,6 +96,19 @@ class TestSlurm(unittest.TestCase):
                                       "usd_per_hour": 0.0})
         self.assertTrue(any("scancel 42" in c and f"rm -rf {jobdir}" in c for c in calls),
                         f"the job's directory (the Anthropic key, venvs, builds) would stay on the node: {calls}")
+
+    def test_the_job_uses_the_shared_hf_cache(self):
+        key = Path(tempfile.mkdtemp()) / "key.pub"
+        key.write_text("ssh-ed25519 AAAA test")
+        cfg = {**SLURM_CFG, "ssh_public_key": str(key), "budget": {"max_usd_per_hour": 0, "max_hours": 4},
+               "slurm": {**SLURM_CFG["slurm"], "hf_home": "/workspace/shared/hf"}}
+        self.globals["slurm_run"] = fake_slurm({"sinfo": "node1 gpu:8 gpu:0 idle\n"})
+        args = argparse.Namespace(offer="slurm:node1:1", pr=7, hours=1, tag="1-1", run="gpu_review_box.sh",
+                                  input=[], allow_over_budget=False, dry_run=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            GPU["cmd_launch"](args, cfg)
+        self.assertIn("HF_HOME=/workspace/shared/hf", out.getvalue(),
+                      "each run would download the weights again into its own directory")
 
 
 if __name__ == "__main__":
