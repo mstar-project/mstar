@@ -117,7 +117,7 @@ def _plain_rope_args(handle: ArrayHandle, layer: int, tokens: int) -> tuple:
 # How to call each op on a real handle.
 ARGUMENTS = {
     omni_attention.qk_norm_rope_table_attend: _thinker_args,
-    qwen3_lm.qk_norm_rope_kv_write: _plain_rope_args,
+    qwen3_lm.qk_norm_rope_attend: _plain_rope_args,
 }
 
 
@@ -159,4 +159,4 @@ def test_the_debug_check_passes_the_thinkers_kernel_on_real_pages(monkeypatch):
 def test_the_debug_check_passes_the_plain_rope_kernel_on_real_pages(monkeypatch):
     monkeypatch.setattr(sys.modules["mstar.engine.state.state_op"], "_DEBUG_ASSERTS", True)
     handle = _opened_step(_manager(), {1: 3, 2: 4})
-    qwen3_lm.qk_norm_rope_kv_write(*_plain_rope_args(handle, 1, 7))
+    qwen3_lm.qk_norm_rope_attend(*_plain_rope_args(handle, 1, 7))

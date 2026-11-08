@@ -292,7 +292,11 @@ def test_the_ops_reference_is_plain_rope_after_rmsnorm_and_leaves_k_alone(dtype)
     k, v = torch.randn(tokens, kv_heads, dim, dtype=dtype), torch.randn(tokens, kv_heads, dim, dtype=dtype)
     q_weight, k_weight = torch.randn(dim, dtype=dtype), torch.randn(dim, dtype=dtype)
     pos_ids = torch.tensor([0, 1, 2, 7, 100, 999, 999], dtype=torch.int32)
-    added = {}
+    calls = []
+
+    def read(layer, q):
+        calls.append(("read", layer, q.clone()))
+        return q * 2
 
     def textbook(x, weight):
         x = x.float()
@@ -303,20 +307,23 @@ def test_the_ops_reference_is_plain_rope_after_rmsnorm_and_leaves_k_alone(dtype)
         return torch.cat((rotated.real, rotated.imag), -1)
 
     want_q, want_k, k_before = textbook(q, q_weight), textbook(k, k_weight), k.clone()
-    kv = SimpleNamespace(add=lambda layer, k, v: added.update(layer=layer, k=k, v=v))
-    qwen3_lm._norm_rope_add(kv, 3, q, k, v, q_weight, k_weight, pos_ids, theta, 1e-6, 1e-6)
+    kv = SimpleNamespace(add=lambda layer, k, v: calls.append(("add", layer, k, v)), read=read)
+    out = qwen3_lm._norm_rope_attend(kv, 3, q, k, v, q_weight, k_weight, pos_ids, theta, 1e-6, 1e-6)
     tolerance = 1e-5 if dtype is torch.float32 else 2e-2
+    assert [call[0] for call in calls] == ["add", "read"], "the read comes after the add"
+    (_, layer, added_k, added_v), (_, read_layer, read_q) = calls
     assert torch.allclose(q.float(), want_q, atol=tolerance), "q is rotated in place, as the kernel does"
-    assert torch.allclose(added["k"].float(), want_k, atol=tolerance), "the stored k is normed and rotated"
+    assert torch.allclose(added_k.float(), want_k, atol=tolerance), "the stored k is normed and rotated"
     assert torch.equal(k, k_before), "the kernel leaves its k argument as it was"
-    assert added["v"] is v and added["layer"] == 3
-    assert added["k"].dtype is dtype, "a backend that takes K/V at its read refuses a k of another dtype than its v"
+    assert added_v is v and layer == 3
+    assert added_k.dtype is dtype, "a backend that takes K/V at its read refuses a k of another dtype than its v"
+    assert read_layer == 3 and torch.equal(read_q, q) and torch.equal(out, q * 2), "the read takes the rotated q"
 
 
 def test_the_state_op_takes_its_reference_without_a_fused_kernel():
-    assert "qk_norm_rope_kv_write" in STATE_OPS
-    assert qwen3_lm.qk_norm_rope_kv_write.op.reference is qwen3_lm._norm_rope_add
-    assert {fmt.devices for fmt in qwen3_lm.qk_norm_rope_kv_write.op.formats} == {frozenset({"cuda"})}
+    assert "qk_norm_rope_attend" in STATE_OPS
+    assert qwen3_lm.qk_norm_rope_attend.op.reference is qwen3_lm._norm_rope_attend
+    assert {fmt.devices for fmt in qwen3_lm.qk_norm_rope_attend.op.formats} == {frozenset({"cuda"})}
 
 
 @pytest.mark.parametrize("overrides, head_dim, fused", [
