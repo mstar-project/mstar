@@ -6,6 +6,7 @@ reference are the oracle-gated parity harness's job
 (``test/lingbot_world/run_parity.py``).
 """
 
+import math
 import sys
 
 import numpy as np
@@ -16,26 +17,45 @@ sys.path.insert(0, ".")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import RaggedCrossAttentionSpec, RaggedCrossAttentionStep, cross_label  # noqa: E402
-from mstar.graph.base import GraphNode, Loop  # noqa: E402
+from mstar.engine.resources.kv.rolling import (  # noqa: E402
+    RollingKVConfig,
+    RollingKVSpec,
+    RollingKVStep,
+)
+from mstar.engine.resources.kv.rolling.manager import RollingKVManager  # noqa: E402
+from mstar.engine.resources.request_pool import (  # noqa: E402
+    RequestPoolConfig,
+    RequestPoolReqConfig,
+    RequestPoolSpec,
+    RequestPoolStep,
+)
+from mstar.engine.resources.request_pool.manager import RequestPool  # noqa: E402
+from mstar.engine.resources.step import Segment, StepContext  # noqa: E402
+from mstar.graph.base import GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
+from mstar.model.components import wan_vae  # noqa: E402
+from mstar.model.lingbot_world import submodules  # noqa: E402
 from mstar.model.lingbot_world.components.dit import (  # noqa: E402
     REFERENCE_ATTENTION,
-    RollingKVCache,
-    attended_frames,
+    ChunkOnlyStore,
 )
 from mstar.model.lingbot_world.components.schedule import make_fast_schedule  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
     DIT_ATTN,
+    DIT_KV,
+    DIT_POOL,
+    ENCODER_OUT,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
-    ChunkSpans,
+    TEXT_KV,
     EncoderStream,
     LingBotDitSubmodule,
     encode_condition_chunk,
     first_frame_mask,
+    rollout_state_buffers,
 )
-from mstar.model.submodule_base import NodeInputs  # noqa: E402
+from mstar.model.submodule_base import NodeInputs, PerRequestState  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -59,36 +79,67 @@ def test_colliding_timesteps_resolve_first_for_x0_and_second_for_noise():
     assert schedule.noise_sigma(t).item() == schedule.sigmas[matches[1]].item()
 
 
-def _simulate(cache: RollingKVCache, frame_seqlen: int, chunk: int, num_chunks: int, passes: int):
-    """Write each chunk ``passes`` times (denoise steps, then the commit), tagging
-    every token with its absolute latent frame, as the self-attention does."""
-    for c in range(num_chunks):
-        start = c * chunk * frame_seqlen
-        tags = torch.arange(c * chunk, (c + 1) * chunk).repeat_interleave(frame_seqlen).float()
+def _pool_and_window(num_layers: int, tokens: int, num_heads: int = 1, head_dim: int = 1, dtype=torch.float32):
+    """A CPU request pool holding one rollout's K/V buffer of ``tokens`` a layer, the
+    rolling window over it, and the rollout (request 7) opened in it."""
+    window = RollingKVManager(RollingKVConfig(num_layers=num_layers, num_heads=num_heads, head_dim=head_dim,
+                                              pool=DIT_POOL, dtype=dtype), torch.device("cpu"), name=DIT_KV)
+    wants = RequestPoolReqConfig.of({DIT_KV: window.config.buffer(tokens)})
+    pool = RequestPool(RequestPoolConfig(pool_bytes=wants.nbytes()), torch.device("cpu"), name=DIT_POOL)
+    window.bind_dependencies({DIT_POOL: pool})
+    pool.ingest_request(7, wants)
+    assert pool.reserve(7, "dit", ROLLOUT_WALK, None) is None
+    return pool, window
+
+
+def _step_chunk(sub, spans, pool, window, rid: int = 7):
+    """Admit and plan the chunk the dit declares, pool first, as the engine does."""
+    steps = sub.declare_step(ROLLOUT_WALK, [rid], [NodeInputs(resource_step_info=spans)]).steps
+    ctx = StepContext(request_ids=(rid,), graph_walk=ROLLOUT_WALK, slot=0, capture=False)
+    assert pool.admit(steps[DIT_POOL], ctx).ok and window.admit(steps[DIT_KV], ctx).ok
+    pool.plan(steps[DIT_POOL], ctx)
+    window.plan(steps[DIT_KV], ctx)
+    return steps[DIT_KV], ctx
+
+
+def _rollout_frames(model, image_hw, num_chunks: int, passes: int = 5):
+    """Step a CPU store as the dit declares its chunks, writing each chunk
+    ``passes`` times (denoise steps, then the commit) tagged with its latent
+    frames; yields the latent frames each chunk attends."""
+    cfg = model.config
+    sub = _bare_dit_submodule(model, {})
+    spans = [sub.chunk_spans(c, image_hw, num_chunks * cfg.chunk_size) for c in range(num_chunks)]
+    fs = spans[0].chunk // cfg.chunk_size
+    tokens = max(s.position.sink + s.position.window for s in spans)
+    pool, store = _pool_and_window(cfg.num_layers, tokens)
+    sub.node_resources = {DIT_POOL: pool, DIT_KV: store}
+    for c, s in enumerate(spans):
+        step, ctx = _step_chunk(sub, s, pool, store)
+        tags = torch.arange(c * cfg.chunk_size, (c + 1) * cfg.chunk_size).repeat_interleave(fs).float()
         for _ in range(passes):
-            plan = cache.plan(start, chunk * frame_seqlen)
-            cache.write(0, tags.view(1, -1, 1, 1), tags.view(1, -1, 1, 1), plan)
-            cache.global_end, cache.local_end = plan.current_end, plan.local_end
-        yield c, cache.k[0][0, :cache.local_end, 0, 0]
+            store.write(0, tags.view(1, -1, 1, 1), tags.view(1, -1, 1, 1))
+        store.commit(step, ctx)
+        held = store.window(0)[0].flatten()
+        assert held.numel() == s.window
+        yield c, held.view(-1, fs)[:, 0].long().tolist()
 
 
-def test_rolling_cache_keeps_the_sink_and_the_latest_window():
-    frame_seqlen, chunk, window, sink = 3, 4, 18, 6
-    cache = RollingKVCache.allocate(1, window * frame_seqlen, 1, 1, sink_tokens=sink * frame_seqlen,
-                                    windowed=True, device="cpu", dtype=torch.float32)
-    for c, held in _simulate(cache, frame_seqlen, chunk, num_chunks=8, passes=5):
-        frames = held.view(-1, frame_seqlen)[:, 0].long().tolist()
-        end = (c + 1) * chunk
+def test_the_store_keeps_the_sink_and_the_latest_window():
+    model = LingBotWorldModel(skip_weight_loading=True)
+    cfg, (window, sink) = model.config, (model.config.local_attn_size, model.config.sink_size)
+    for c, frames in _rollout_frames(model, (48, 64), num_chunks=8):
+        end = (c + 1) * cfg.chunk_size
         if end <= window:
             assert frames == list(range(end))
         else:
             assert frames == list(range(sink)) + list(range(end - (window - sink), end))
 
 
-def test_unwindowed_cache_appends_without_eviction():
-    cache = RollingKVCache.allocate(1, 24 * 2, 1, 1, sink_tokens=0, windowed=False, device="cpu", dtype=torch.float32)
-    *_, (_, held) = _simulate(cache, 2, 4, num_chunks=6, passes=5)
-    assert held.view(-1, 2)[:, 0].long().tolist() == list(range(24))
+def test_without_a_window_the_store_keeps_every_frame():
+    model = LingBotWorldModel(skip_weight_loading=True)
+    model.config.local_attn_size = -1
+    *_, (c, frames) = _rollout_frames(model, (48, 64), num_chunks=6)
+    assert frames == list(range(24))
 
 
 def test_first_frame_mask_marks_only_the_first_video_frame():
@@ -392,10 +443,14 @@ def one_thread():
     torch.set_num_threads(threads)
 
 
-def test_the_condition_chunk_by_chunk_is_the_whole_clip_encode(one_thread):
+@pytest.mark.parametrize("pooled", [False, True])
+def test_the_condition_chunk_by_chunk_is_the_whole_clip_encode(one_thread, pooled):
     """The streamed encode the dit runs per chunk against the reference's one
     ``vae.encode`` of the image followed by black frames, on a tiny Wan VAE,
-    long enough that the black frames drive the cache to its fixed point."""
+    long enough that the black frames drive the cache to its fixed point.
+    ``pooled`` encodes the dit's way: the encoder saves uncopied into a
+    ``PoolFeatCache`` that compares each slot as it overwrites it; it settles on
+    the same chunk as a plain cache."""
     from diffusers import AutoencoderKLWan
 
     from mstar.model.lingbot_world.config import LingBotWorldConfig
@@ -414,10 +469,28 @@ def test_the_condition_chunk_by_chunk_is_the_whole_clip_encode(one_thread):
         latent = ((latent - 0.1) / 2.0)[0]
     whole = torch.concat([first_frame_mask(lat_f, 2, 3, "cpu"), latent])
 
-    stream = EncoderStream(vae)
-    chunks = [encode_condition_chunk(vae, image, stream, k * cfg.chunk_size, cfg.chunk_size, cfg)
-              for k in range(lat_f // cfg.chunk_size)]
-    assert stream.steady is not None and stream.cache is None
+    def encode(stream):
+        chunks, settled = [], None
+        for k in range(lat_f // cfg.chunk_size):
+            chunks.append(encode_condition_chunk(vae, image, stream, k * cfg.chunk_size, cfg.chunk_size, cfg))
+            if settled is None and stream.steady is not None:
+                settled = k
+        return chunks, settled
+
+    plain, settled = encode(EncoderStream(vae))
+    chunks = plain
+    if pooled:
+        probe = EncoderStream(vae)
+        with torch.inference_mode():
+            vae.encoder(image[None, :, None], feat_cache=probe.cache, feat_idx=[0])
+            vae.encoder(torch.zeros(1, 3, 4, 16, 24), feat_cache=probe.cache, feat_idx=[0])
+        shapes = [tuple(t.shape) if torch.is_tensor(t) else None for t in probe.cache]
+        wan_vae.encoder_saves_uncopied(vae)
+        with torch.inference_mode():
+            stream = EncoderStream.over(wan_vae.PoolFeatCache.fresh(shapes, torch.float32, "cpu"), None)
+        chunks, pooled_settled = encode(stream)
+        assert pooled_settled == settled
+    assert settled is not None and settled < lat_f // cfg.chunk_size - 1
     torch.testing.assert_close(torch.cat(chunks, dim=1), whole, rtol=0, atol=0)
 
 
@@ -482,13 +555,137 @@ def test_the_engine_attention_dit_builds_without_flash_attn(monkeypatch):
         LingBotWorldModel().get_submodule("dit")
 
 
-def test_the_dit_declares_one_ragged_cross_attention(model):
-    (spec,) = model.get_node_resources()
-    assert isinstance(spec, RaggedCrossAttentionSpec)
-    assert spec.resource_key == DIT_ATTN and spec.nodes == {"dit"}
-    assert (spec.config.num_qo_heads, spec.config.num_kv_heads, spec.config.head_dim) == (12, 12, 128)
-    assert spec.config.dtype == torch.bfloat16
-    assert LingBotWorldModel(skip_weight_loading=True, reference_numerics=True).get_node_resources() == []
+def test_the_dit_declares_a_request_pool_the_rolling_kv_over_it_and_a_ragged_cross_attention(model):
+    pool, kv, attn = model.get_node_resources()
+    assert isinstance(pool, RequestPoolSpec) and pool.resource_key == DIT_POOL and pool.nodes == {"dit"}
+    assert pool.config.pool_bytes == model.default_pool_bytes() and pool.config.inference_tensors
+    assert isinstance(kv, RollingKVSpec) and kv.resource_key == DIT_KV and kv.nodes == {"dit"}
+    assert (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim) == (30, 12, 128)
+    assert kv.config.dtype == torch.bfloat16 and kv.config.pool == DIT_POOL and kv.depends_on() == {DIT_POOL}
+    assert isinstance(attn, RaggedCrossAttentionSpec)
+    assert attn.resource_key == DIT_ATTN and attn.nodes == {"dit"}
+    assert (attn.config.num_qo_heads, attn.config.num_kv_heads, attn.config.head_dim) == (12, 12, 128)
+    assert attn.config.dtype == torch.bfloat16
+    # the reference's FA2 attends the same store
+    (ref_pool, ref_kv) = LingBotWorldModel(skip_weight_loading=True, reference_numerics=True).get_node_resources()
+    assert isinstance(ref_pool, RequestPoolSpec) and isinstance(ref_kv, RollingKVSpec) and ref_kv.resource_key == DIT_KV
+
+
+def test_the_default_pool_holds_one_rollout_at_the_largest_area_or_two_at_the_default(model):
+    """A rollout keeps its rolling K/V (18 latent frames of at most max_area / 256 tokens,
+    whatever the aspect), its text K/V and its encoder cache in the pool. The default
+    pool, 16.0 GiB, holds one at 720x1280 (11.1 GiB of K/V, 4.8 GiB of encoder cache)
+    or two at the default 464x832."""
+    cfg = model.config
+    assert model.max_window_tokens() == 18 * (720 * 1280 // 256)
+    sub = _bare_dit_submodule(model, {})
+    largest = model.largest_latent()
+    for image_hw in [(720, 1280), (1280, 720), (960, 960), (408, 2256), (2256, 408), (480, 832)]:
+        lat = model.geometry(image_hw, 720, 1280)
+        last = sub.chunk_spans(cfg.max_chunks - 1, (lat[0] * 8, lat[1] * 8)).position
+        assert last.sink + last.window <= model.max_window_tokens(), image_hw
+        assert lat[0] * lat[1] <= largest[0] * largest[1] == 90 * 160, image_hw  # the cache scales with pixels
+    assert round(model.default_pool_bytes() / 2**30, 1) == 16.0
+    first = sub.chunk_spans(0, (464, 832)).position
+    default = RequestPoolReqConfig.of(rollout_state_buffers(cfg, (58, 104), first.sink + first.window)).nbytes()
+    assert model.default_pool_bytes() // default == 2
+
+
+def test_a_rollouts_state_is_its_kv_text_kv_and_every_encoder_cache_slot(model):
+    """At 464x832 (a 58x104 latent): 4.7 GiB of rolling K/V, 90 MiB of text K/V and
+    2.0 GiB of encoder cache (fp32), as measured on an H100."""
+    layout = submodules.encoder_cache_layout()
+    assert len(layout.slots) == 26 and sum(s is not None for s in layout.slots) == 24
+    buffers = rollout_state_buffers(model.config, (58, 104), 27144)
+    gib = {prefix: sum(math.prod(shape) * dtype.itemsize for name, (shape, dtype) in buffers.items()
+                       if name.startswith(prefix)) / 2**30 for prefix in (DIT_KV, TEXT_KV, "enc.")}
+    assert {k: round(v, 2) for k, v in gib.items()} == {DIT_KV: 4.66, TEXT_KV: 0.09, "enc.": 2.02}
+    assert buffers[ENCODER_OUT] == ((1, 32, 1, 58, 104), torch.float32)
+    assert all(dtype == torch.float32 for name, (_, dtype) in buffers.items() if name.startswith("enc."))
+
+
+def test_the_encode_stream_follows_its_region_when_the_pool_moves_it(model):
+    """Kept between chunks as views of the pool, and taken again, with what it holds,
+    after a rearrange has slid the region to another place; once settled, the one
+    output it keeps moves with it too."""
+    lat_hw = (2, 2)
+    buffers = {name: spec for name, spec in rollout_state_buffers(model.config, lat_hw, 1).items()
+               if name.startswith("enc.")}
+    wants = RequestPoolReqConfig.of(buffers)
+    pool = RequestPool(RequestPoolConfig(pool_bytes=3 * wants.nbytes(), inference_tensors=True),
+                       torch.device("cpu"), name=DIT_POOL)
+    sub = _bare_dit_submodule(model, {DIT_POOL: pool})
+
+    def step(*rids):
+        segs = tuple(Segment(request_id=rid, label="chunk", span=1) for rid in rids)
+        ctx = StepContext(request_ids=rids, graph_walk=ROLLOUT_WALK, slot=0, capture=False)
+        assert pool.admit(RequestPoolStep(segments=segs), ctx).ok
+        pool.plan(RequestPoolStep(segments=segs), ctx)
+
+    def slide_request_2():
+        pool.remove_request(1)
+        pool.ingest_request(3, RequestPoolReqConfig.of({"big": ((2 * wants.nbytes() // 4,), torch.float32)}))
+        assert pool.reserve(3, "dit", ROLLOUT_WALK, None) is None
+        step(3)  # only fits once request 2 slides to the start
+        step(2)
+
+    for rid in (1, 2):
+        pool.ingest_request(rid, wants)
+        assert pool.reserve(rid, "dit", ROLLOUT_WALK, None) is None
+    step(1, 2)
+    step(2)  # the stream is request 2's
+    state = PerRequestState()
+    state.add_all(encoder_stream=None, encoder_stream_at=None)
+    stream = sub._encoder_stream(state)
+    cache = stream.cache
+    filled = [i for i, b in enumerate(cache.buffers) if b is not None]
+    with torch.inference_mode():  # as the dit encodes
+        for i in filled:
+            cache[i] = torch.full(cache.buffers[i].shape, float(i))
+    assert sub._encoder_stream(state) is stream  # nothing moved
+    slide_request_2()
+    moved = sub._encoder_stream(state)
+    assert moved is not stream and state["encoder_stream"] is moved
+    for i in filled:
+        assert moved.cache[i].data_ptr() == pool.view(f"enc.{i}").data_ptr() != cache[i].data_ptr()
+        assert torch.equal(moved.cache[i], torch.full(cache.buffers[i].shape, float(i)))
+    # settled: the output is kept in the pool, once, and follows the region from then on
+    out = torch.randn(1, 32, 1, *lat_hw)
+    with torch.inference_mode():
+        sub._keep_settled_output(state, EncoderStream.over(None, out))
+    kept = state["encoder_stream"].steady
+    assert kept.data_ptr() == pool.view(ENCODER_OUT).data_ptr() and torch.equal(kept, out)
+    pool.remove_request(3)
+    pool.ingest_request(1, wants)
+    assert pool.reserve(1, "dit", ROLLOUT_WALK, None) is None
+    step(1)
+    step(2)
+    assert torch.equal(sub._encoder_stream(state).steady, out)
+
+
+def _signal(*dims: int) -> list[TensorPointerInfo]:
+    return [TensorPointerInfo(dims=list(dims), dtype=torch.float32, nbytes=0, address=0, stride=[], uuid=0,
+                              source_session_id="", source_entity="")]
+
+
+@pytest.mark.parametrize("image_hw", [(464, 832), (720, 1280)])
+def test_a_rollout_declares_its_rolling_kv_so_it_waits_in_line_for_the_pool(model, image_hw):
+    """The sink and window its steps will keep, at the output size: the engine
+    queues the request until the pool has that room, and refuses one that can
+    never fit before it reaches a worker."""
+    signals = {"text_inputs": _signal(512), "image_inputs": _signal(3, *image_hw),
+               "camera_poses": _signal(64, 4, 4), "intrinsics": _signal(64, 4)}
+    fwd = model.get_initial_forward_pass_args("main", ["image"], ["video_frame"], signals)
+    configs = model.get_request_resource_configs({"main": fwd})
+    first = _bare_dit_submodule(model, {}).chunk_spans(0, image_hw).position
+    lat_hw = (image_hw[0] // 8, image_hw[1] // 8)
+    wants = RequestPoolReqConfig.of(rollout_state_buffers(model.config, lat_hw, first.sink + first.window))
+    assert configs == {DIT_POOL: wants}
+    (pool, _, _) = model.get_node_resources()
+    configs[DIT_POOL].validate(pool)
+    pool.apply_yaml_overrides(pool_bytes=configs[DIT_POOL].nbytes() - 1)
+    with pytest.raises(ValueError, match="pool_bytes"):
+        configs[DIT_POOL].validate(pool)
 
 
 SWITCHES = ("reference_numerics", "dit_compile_autotune")
@@ -539,13 +736,20 @@ def test_a_chunks_step_pairs_its_queries_with_its_window_and_the_text(model):
     assert isinstance(step, RaggedCrossAttentionStep)
     assert [(s.label, s.span) for s in step.segments] == [("chunk", 4 * frame), ("window", 18 * frame), ("text", 512)]
     assert step.pairs == (("chunk", "window"), ("chunk", "text"))
+    # with the store bound, the same step declares the chunk's write and its place in the stream
+    sub.node_resources = {DIT_ATTN: object(), DIT_KV: object()}
+    kv = sub.declare_step(ROLLOUT_WALK, ["r"], inputs).steps[DIT_KV]
+    assert isinstance(kv, RollingKVStep) and [(s.label, s.span) for s in kv.segments] == [("chunk", 4 * frame)]
+    assert kv.positions["r"] == (5 * 4 * frame, 6 * frame, 12 * frame)
 
 
 def test_without_the_resource_only_the_reference_numerics_attend(model):
     sub = _bare_dit_submodule(model, {})
     with pytest.raises(RuntimeError, match=DIT_ATTN):
         sub.attention()  # a silent FA2 fallback would hide a deployment without the resource
-    assert sub.declare_step(ROLLOUT_WALK, ["r"], [NodeInputs(resource_step_info=ChunkSpans(1, 1, 1))]) is None
+    assert sub.declare_step(ROLLOUT_WALK, ["r"], [NodeInputs(resource_step_info=sub.chunk_spans(0, (16, 16)))]) is None
+    with pytest.raises(RuntimeError, match=DIT_KV):
+        sub.kv_store()  # the rolling K/V live only in the engine's store
     reference = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True, reference_numerics=True), {})
     assert reference.attention() is REFERENCE_ATTENTION
 
@@ -566,18 +770,6 @@ def test_the_engine_attention_binds_both_pairs(model):
     assert sub.attention() is attention  # one set of callables per binding
 
 
-def test_the_declared_window_is_what_the_rolling_cache_attends(model):
-    cfg, frame_seqlen = model.config, 3
-    cache = RollingKVCache.allocate(1, cfg.local_attn_size * frame_seqlen, 1, 1,
-                                    sink_tokens=cfg.sink_size * frame_seqlen, windowed=True, device="cpu",
-                                    dtype=torch.float32)
-    for c in range(9):
-        plan = cache.plan(c * cfg.chunk_size * frame_seqlen, cfg.chunk_size * frame_seqlen)
-        window = cache.window(plan)
-        assert window.stop - window.start == attended_frames(cfg, c) * frame_seqlen
-        cache.global_end, cache.local_end = plan.current_end, plan.local_end
-
-
 def test_the_fast_config_only_adds_the_autotuned_compile():
     from pathlib import Path
 
@@ -591,18 +783,30 @@ def test_the_fast_config_only_adds_the_autotuned_compile():
     LingBotWorldModel(skip_weight_loading=True).validate_config_yaml(fast, "lingbot_world_1_3b_fast.yaml")
 
 
-def test_the_shipped_config_serves_one_rollout_at_a_time(model):
+def test_a_config_must_run_one_rollout_at_a_time(model):
+    """The pool doesn't bound the rollouts' VAE decoder caches, so until they are
+    engine resources the conductor runs one rollout at a time."""
+    model.validate_config_yaml({"max_concurrent_requests": 1}, "lingbot.yaml")
+    for limit in (None, 0, 2, 16, True, "1", 1.0):
+        config = {"max_concurrent_requests": limit} if limit is not None else {}
+        with pytest.raises(ValueError, match="requires `max_concurrent_requests: 1`") as err:
+            model.validate_config_yaml(config, "lingbot.yaml")
+    assert "VAE decoder cache is allocated by the dit outside" in str(err.value)
+
+
+def test_the_shipped_config_runs_one_rollout_at_a_time_over_the_default_pool(model):
+    """Concurrency is the conductor's max_concurrent_requests; the K/V memory is
+    the request pool's default, room for one rollout at the largest area."""
     from pathlib import Path
 
     import yaml
 
     path = Path(__file__).parents[2] / "configs" / "lingbot_world_1_3b.yaml"
-    model.validate_config_yaml(yaml.safe_load(path.read_text()), str(path))
-    for limit in (None, 0, 2, 16, True, "1"):
-        config = {"max_concurrent_requests": limit} if limit is not None else {}
-        with pytest.raises(ValueError, match="max_concurrent_requests: 1") as err:
-            model.validate_config_yaml(config, "lingbot.yaml")
-    assert "4.7 GiB at 480x832" in str(err.value) and "up to 11.2 GiB" in str(err.value)
+    config = yaml.safe_load(path.read_text())
+    assert config["max_concurrent_requests"] == 1 and not config.get("resources")
+    model.validate_config_yaml(config, str(path))
+    (pool, _, _) = model.get_node_resources()
+    assert pool.config.pool_bytes == model.default_pool_bytes()
 
 
 def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
@@ -623,21 +827,31 @@ def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
 
     attention = DitAttention(window=attend, text=attend)
     frame_seqlen, cs = 4, cfg.chunk_size
-    cache = dit.new_cache(frame_seqlen, chunks * cs, "cpu")
-    cache.k = [t.float() for t in cache.k]
-    cache.v = [t.float() for t in cache.v]
+    text_kv = dit.text_kv(torch.randn(3, 8))
+    # warmup traces against a store that keeps nothing, as the submodule's does at load
+    conditioning = dit.chunk_conditioning(torch.zeros(1, 384, cs, 4, 4), 0)
+    dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), text_kv, torch.randn(20, cs, 4, 4),
+        conditioning, ChunkOnlyStore(), attention)
+    pool, store = _pool_and_window(num_layers, cfg.local_attn_size * frame_seqlen, cfg.num_heads, cfg.head_dim)
+    sub = _bare_dit_submodule(LingBotWorldModel(skip_weight_loading=True), {DIT_POOL: pool, DIT_KV: store})
+    sub.config = cfg
     for chunk in range(chunks):
+        spans = sub.chunk_spans(chunk, (32, 32))
+        step, ctx = _step_chunk(sub, spans, pool, store)
         conditioning = dit.chunk_conditioning(torch.zeros(1, 384, cs, 4, 4), chunk * cs)
         for _ in range(2):
-            dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), torch.randn(3, 8), torch.randn(20, cs, 4, 4),
-                conditioning, cache, chunk * cs * frame_seqlen, attention)
+            dit(torch.randn(16, cs, 4, 4), torch.tensor([500.0]), text_kv, torch.randn(20, cs, 4, 4),
+                conditioning, store, attention)
+        store.commit(step, ctx)
     return torch._dynamo.utils.counters["stats"]["unique_graphs"]
 
 
 def test_compiled_blocks_trace_once_for_every_layer_and_chunk():
-    """The cache offsets and the layer index stay out of the compiled blocks,
+    """The store's offsets and the layer index stay out of the compiled blocks,
     so a rollout compiles them once, not once per layer or per chunk (five
-    chunks run past the first eviction)."""
+    chunks run past the first eviction), and the warmup's scratch store traces
+    the same graphs as the engine's."""
     one_chunk = _compiled_rollout_graphs(num_layers=2, chunks=1)
     assert one_chunk > 0
     assert _compiled_rollout_graphs(num_layers=4, chunks=5) == one_chunk
+
