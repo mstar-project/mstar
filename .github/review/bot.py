@@ -75,9 +75,11 @@ MONITOR_DAYS = 60
 ISSUE_COMMENTS = 2_000  # a bot issue past this rolls over to a new one; GitHub stops an issue at 2,500
 # How a PR's body says it fixes or reverts another, and the subjects `szz` treats as fixes.
 FIXES = re.compile(r"\b(?:fix(?:e[sd])?|revert(?:s|ed)?)\s+#(\d+)\b", re.IGNORECASE)
-# A fix-word, unless all it fixes is a typo, a comment, docs or lint: such a word ending the subject.
+# A fix-word, unless what follows is a typo, or all it fixes is a comment, docs or lint: such a word ending the
+# subject, before a `.` or a PR number.
 FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s|ed|ing)?)\b"
-                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?|comments?|docs?|lint|format\w*)\s*(?:\(#\d+\)\s*)?$)",
+                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?\b|(?:comments?|docs?|lint|format\w*)\s*\.?\s*"
+                         r"(?:\(#\d+\)\s*)?$))",
                          re.IGNORECASE)
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")

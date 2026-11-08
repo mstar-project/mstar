@@ -306,9 +306,10 @@ class TestMonitor(unittest.TestCase):
     def test_only_a_bug_fix_subject_counts_as_a_fix(self):
         for subject in ("Fix a crash (#9)", "[Worker][Critical fix] Drop late messages", "Revert \"x\"", "bugfix: y",
                         "Fixing a race", "Bugs in decode", "Bugfixes for x", "Reverting x", "Fix format string crash",
-                        "fix docs build", "fix typo in README"):
+                        "fix docs build", "Fix typography crash"):
             self.assertTrue(bot.FIX_SUBJECT.search(subject), subject)
-        for subject in ("Fix a typo", "fix: docs", "fix lint (#12)", "fix the comments", "prefix cache"):
+        for subject in ("Fix a typo", "fix typo in README", "fix: docs", "fix lint (#12)", "fix docs.",
+                        "fix lint. (#12)", "fix the comments", "prefix cache"):
             self.assertFalse(bot.FIX_SUBJECT.search(subject), subject)
 
     def test_a_fix_that_changes_a_prs_lines_is_blamed_on_it(self):
