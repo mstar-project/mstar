@@ -2,7 +2,7 @@
 
 These tests do not spin up a worker — instead they exercise the
 ``ingest_for_speculation`` API in the exact shape that
-``Worker._try_speculate_next`` relies on: one call taking the producer's whole
+``Speculator._try_speculate_next`` relies on: one call taking the producer's whole
 output list plus its node name, returning the nodes that became ready.
 
   - Per-rid wgios (deep-copied from the same graph) maintain independent
