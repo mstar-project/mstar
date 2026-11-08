@@ -7,8 +7,6 @@ An adapter's tensors are laid out exactly like one device slot (rank padded to t
 from __future__ import annotations
 
 import logging
-import os
-import stat
 from collections import OrderedDict
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
@@ -20,6 +18,7 @@ from mstar.engine.resources.lora.checkpoint import (
     parse_lora_key,
     read_lora_file,
     refuse_non_adapter,
+    require_regular_file,
 )
 from mstar.engine.resources.lora.config import (
     AdapterInfo,
@@ -108,6 +107,7 @@ def inspect_adapter(spec: LoraSpec, path: str) -> AdapterInfo:
     if spec.convert_keys is None:
         from safetensors import safe_open
 
+        require_regular_file(path)
         with safe_open(path, "pt") as f:
             return inspect_keys(spec, ((key, f.get_slice(key).get_shape()) for key in f.keys()))
     adapter = read_lora_file(path, convert_keys=spec.convert_keys)
@@ -122,6 +122,7 @@ def adapter_targets(spec: LoraSpec, path: str) -> set[str]:
     if spec.convert_keys is None:
         from safetensors import safe_open
 
+        require_regular_file(path)
         with safe_open(path, "pt") as f:
             keys = list(f.keys())
         modules = set()
@@ -174,10 +175,6 @@ def check_adapter_file(
     from the checkpoint's header; returns its digest. The digest is read once per way the
     specs convert the checkpoint (``convert_keys``), so once for specs that read it alike.
     Raises ``ValueError`` for an adapter the deployment cannot serve."""
-    # anything but a regular file is unreadable, and not opened: a FIFO's open waits for
-    # a writer, with every later runtime load and unload queued behind it
-    if not stat.S_ISREG(os.stat(path).st_mode):
-        raise OSError(f"{path} is not a regular file")
     digests: dict = {}  # convert_keys -> the digest of the file read that way
     for each in (spec, *others):
         each.check_adapter(name, inspect_adapter(each, path))

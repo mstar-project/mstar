@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
@@ -65,9 +67,17 @@ class LoraAdapter:
         return len(self.layers)
 
 
+def require_regular_file(path: str) -> None:
+    """Refuse anything but a regular file before it is opened: safetensors' open of a FIFO
+    waits for a writer while holding the GIL, which freezes the whole process."""
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        raise OSError(f"{path} is not a regular file")
+
+
 def load_lora_file(path: str, device="cpu") -> dict[str, torch.Tensor]:
     from safetensors.torch import load_file
 
+    require_regular_file(path)
     return load_file(path, device=str(device))
 
 
