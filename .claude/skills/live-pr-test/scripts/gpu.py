@@ -592,7 +592,7 @@ ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Noteboo
 
 def eras_ssh_key_id(pubkey: str, name: str) -> str:
     """The organization's id for this public key. A key it doesn't know yet is registered under the
-    instance's name, and terminate tries to delete it after the release."""
+    instance's name, and a terminate after that instance ends deletes it (eras_sweep_keys)."""
     import base64
     import hashlib
     blob = base64.b64decode(pubkey.split()[1])
@@ -825,15 +825,29 @@ def terminate(key: str, e: dict) -> None:
             raise
     with ledger_txn() as d:
         d.pop(key, None)
-    if e["provider"] == "eras":  # best effort: the key may still be bound to the instance while it releases
-        try:
-            for k in eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []:
-                if k.get("name") == e["name"]:
-                    eras("DELETE", f"/ssh-keys/{k['id']}")
-        except ApiError as err:
-            print(f"gpu.py: ssh key {e['name']} not deleted: {err}", file=sys.stderr)
+    if e["provider"] == "eras":
+        eras_sweep_keys()
     hours = (time.time() - e["launched_at"]) / 3600
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
+
+
+def eras_sweep_keys() -> None:
+    """Best effort: delete the ssh keys launches registered (each named after its instance) whose
+    instance has ended or is gone. A key can't go while its instance releases, so each terminate
+    deletes those earlier ones left."""
+    try:
+        live = {i.get("name") for i in eras("GET", "/instances", params={"page_size": 100}).get("items") or []
+                if i.get("status") != "ended"}
+        keys = eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []
+    except ApiError as err:
+        print(f"gpu.py: ssh keys not swept: {err}", file=sys.stderr)
+        return
+    for k in keys:
+        if str(k.get("name")).startswith(job_prefix({}, "eras")) and k["name"] not in live:
+            try:  # one a later launch reuses (same public key) stays while that instance holds it
+                eras("DELETE", f"/ssh-keys/{k['id']}")
+            except ApiError as err:
+                print(f"gpu.py: ssh key {k['name']} not deleted: {err}", file=sys.stderr)
 
 
 def cmd_terminate(args, cfg):

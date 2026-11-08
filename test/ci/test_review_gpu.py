@@ -278,14 +278,18 @@ class TestEras(unittest.TestCase):
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
 
 
-    def test_terminate_deletes_the_ssh_key_the_launch_registered(self):
+    def test_terminate_deletes_the_ssh_keys_of_ended_launches(self):
         calls, state = [], Path(tempfile.mkdtemp())
 
         def eras(method, path, body=None, params=None):
             calls.append((method, path))
             if method == "DELETE" and in_use:
                 raise GPU["ApiError"](409, "resource_in_use")
-            return {"items": [{"id": "k1", "name": "live-pr-7-1-1"}, {"id": "k2", "name": "someone's laptop"}]}
+            if path == "/instances":  # this one is releasing, an earlier one ended, another is gone
+                return {"items": [{"name": "live-pr-7-1-1", "status": "releasing"},
+                                  {"name": "live-pr-6-1-1", "status": "ended"}]}
+            return {"items": [{"id": "k1", "name": "live-pr-7-1-1"}, {"id": "k2", "name": "someone's laptop"},
+                              {"id": "k3", "name": "live-pr-6-1-1"}, {"id": "k4", "name": "live-pr-5-1-1"}]}
 
         globs = GPU["terminate"].__globals__
         saved = {k: globs[k] for k in ("eras", "STATE", "LEDGER")}
@@ -295,8 +299,9 @@ class TestEras(unittest.TestCase):
         in_use = False
         with contextlib.redirect_stdout(io.StringIO()):
             GPU["terminate"]("eras:i-1", e)
-        self.assertEqual([c for c in calls if c[0] == "DELETE"], [("DELETE", "/ssh-keys/k1")])
-        # The key is still bound to the releasing instance: the release stands, and the watchdog stops.
+        self.assertEqual([c[1] for c in calls if c[0] == "DELETE"], ["/ssh-keys/k3", "/ssh-keys/k4"],
+                         "a key Eras wouldn't delete while its instance released would stay forever")
+        # A key Eras won't delete yet: the release stands, and the watchdog stops.
         in_use = True
         GPU["save_ledger"]({"eras:i-1": e})
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

@@ -266,6 +266,7 @@ def cmd_cleanup(a):
         for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []:
             if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
+        state["eras_sweep_keys"]()
 
 
 # ---------------------------------------------------------------- approval
