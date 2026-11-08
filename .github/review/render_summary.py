@@ -154,6 +154,16 @@ def judged(review, stacked):
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
+def over_gpu_cap(review, max_gpus):
+    """`review` with `live_test.untestable` naming a GPU count above what a run gets (`max_gpus`): a pass on the
+    smaller box doesn't cover it. Before `carried`, so the saved state keeps it for later reviews."""
+    live = review.get("live_test") or {}
+    gpus, cap = live.get("gpus"), int(max_gpus)
+    if gpus and gpus > cap:
+        live["untestable"] = "; ".join(x for x in (live.get("untestable"), f"needs {gpus} GPUs, runs get {cap}") if x)
+    return review
+
+
 def carried(review, earlier, answered):
     """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
     outside the diff this one hasn't cleared ("a finding left out stays open"; only `fixed` and `moot` clear

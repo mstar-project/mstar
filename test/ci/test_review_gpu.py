@@ -178,18 +178,6 @@ class TestCarry(unittest.TestCase):
             earlier = ws / "earlier-live-test.md"
             return out, earlier.read_text() if earlier.exists() else None
 
-    def test_a_review_asking_for_more_gpus_than_runs_get_cant_approve(self):
-        routes = {f"GET repos/{R}/pulls/7": {"user": {"login": "an-author"}, "base": {"ref": "main"}},
-                  f"GET repos/{R}/collaborators/an-author/permission": {"permission": "write"}}
-        for gpus, named, expected in ((8, "", "needs 8 GPUs, runs get 4"), (8, "AMD", "AMD; needs 8 GPUs, runs get 4"),
-                                      (4, "AMD", "AMD")):
-            with self.subTest(gpus=gpus, named=named), workspace() as ws:
-                result = {"live_test": {"run": "full", "gpus": gpus, "untestable": named}}
-                out, _ = step(gpu_review.inputs, routes, pr="7", result=json.dumps(result), max_gpus="4")
-                self.assertEqual(out["gpus"], min(gpus, 4))
-                self.assertEqual(json.loads((ws / "review.json").read_text())["live_test"]["untestable"], expected,
-                                 "a pass on a smaller box would approve what it couldn't run")
-
     def test_a_re_review_that_cant_approve_isnt_made_full(self):
         for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
                              ("none", {"run": "none", "checks": "correctness", "verdict": "skipped"})):

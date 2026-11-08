@@ -61,6 +61,16 @@ class TestReviewSummary(unittest.TestCase):
         self.assertIn("\n🔴 **1 P1**", text)
         self.assertIn("- [ ] **[P1]** `inline 7`: disputed, you decide:", text, "no person would be told to decide it")
 
+    def test_a_gpu_ask_above_the_cap_stays_untestable_after_a_smaller_re_review(self):
+        for gpus, named, expected in ((8, "", "needs 8 GPUs, runs get 4"), (8, "AMD", "AMD; needs 8 GPUs, runs get 4"),
+                                      (4, "AMD", "AMD")):
+            with self.subTest(gpus=gpus, named=named):
+                first = over_gpu_cap({"live_test": {"run": "full", "gpus": gpus, "untestable": named}}, "4")
+                self.assertEqual(first["live_test"]["untestable"], expected)
+                again = over_gpu_cap({**review(), "live_test": {"run": "targeted", "gpus": 1, "untestable": ""}}, "4")
+                self.assertEqual(carried(again, first, False)["live_test"]["untestable"], expected,
+                                 "a pass on a smaller box would approve what it couldn't run")
+
     def test_an_earlier_finding_this_run_left_out_stays_open(self):
         carried = SUMMARY["carried"]
         earlier = [{"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"},

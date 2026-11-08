@@ -810,7 +810,7 @@ def earlier_review(repo, pr):
     return state, any(permission(repo, login) in WRITE for login in answering)
 
 
-def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
+def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", max_gpus="4"):
     """Post the summary, rendered from the review's fields by render_summary and redacted: model output from
     untrusted input. Read the PR's threads after the review posted its inline comments, so the status line
     counts them along with earlier ones still open. Each run posts its own summary comment, so a re-review
@@ -818,7 +818,8 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
     point here, and loses its marker so a later failure starts a fresh one."""
     pages = graphql(THREADS, repo, pr)
     try:
-        review = render_summary.carried(json.loads(output), *earlier_review(repo, pr))
+        review = render_summary.over_gpu_cap(json.loads(output), max_gpus)
+        review = render_summary.carried(review, *earlier_review(repo, pr))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:
