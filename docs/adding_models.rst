@@ -3184,7 +3184,7 @@ layout as ``MEDIA_LAYOUT`` metadata and ``"kv_layout": self.kv_layout(layout, le
 The layout's runs say which encoders the prompt runs (``media_encoders``), for the prefill
 schedule's walk and the KV layout's alike. ``kv_layout`` lays a media prompt's text out as
 ``ids`` spans and each run of pads as a ``rows`` span, which moves the position counter by
-``media_advance``, the run's tokens by default; under Qwen-style MRoPE it is the positions'
+``media_advance``, the run's tokens by default. Under Qwen-style MRoPE it is the positions'
 extent instead, an image spanning ``max(h', w')`` positions rather than its tokens, which
 Qwen3.5's override computes from the run's grid. ``process_prompt`` also empties each sent
 attachment's raw ``<modality>_inputs``, spent once prepared. The encoders' inputs are
