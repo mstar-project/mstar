@@ -19,7 +19,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import Residency, StepContext
+from mstar.engine.resources import AllocationFailed, Residency, StepContext
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.testing_utils.engine import make_engine
@@ -237,7 +237,11 @@ def test_the_graph_runtime_never_sees_a_rebuild_row(site):
     speculation = Speculation(scheduled_batch=batch, node_batch=None, consumed_edges=set(), continuing_rids=set(),
                               partition="p", is_new_iter=False, is_same_node=False)
     if site == "push back":
-        w._push_back_batch(batch)
+        refused = SimpleNamespace(request_ids=[R, A], cached_rids=set(), no_forward_rids=set(),
+                                  admit_error=AllocationFailed(
+            message="out of pages", pages_short=1, label="main", request_id=A,
+        ))
+        w.admission.requeue(batch, refused)
     elif site == "in flight":
         w._set_in_flight_flag(batch, True)
     elif site == "settle":
@@ -255,22 +259,27 @@ def test_a_terminal_refusal_of_a_rebuild_row_fails_only_its_request():
     w, _ = _worker()
     batch = ScheduledBatch(NODE, PREFILL, {R: 0, A: 1}, rebuild_rids=frozenset({R}))
 
-    w._handle_unservable(batch, SimpleNamespace(request_ids=(R,), message="too long"))
+    w.admission.requeue(batch, SimpleNamespace(
+        request_ids=[R, A], cached_rids=set(), no_forward_rids=set(),
+        admit_error=SimpleNamespace(terminal=True, request_ids=(R,), message="too long"),
+    ))
 
-    assert w.failed.keys() == {R} and w.seen == [A], "the other row would fail, or go back as a row it never was"
+    assert w.admission.take_admit_errors().keys() == {R} and w.seen == [A], (
+        "the other row would fail, or go back as a row it never was"
+    )
 
 
 def test_a_refused_rebuild_row_is_held_like_any_row():
-    from test_admit_failure_handling import _alloc_failed, _HoldingWorker
+    from test_admit_failure_handling import _alloc_failed, _refusal_worker, _refused
 
-    worker, held = _HoldingWorker(), []
-    worker.scheduler.hold_requests = held.extend
+    worker = _refusal_worker()
     batch = ScheduledBatch(NODE, PREFILL, {R: 0, A: 1}, rebuild_rids=frozenset({R}))
 
-    worker._handle_allocation_failure(batch, SimpleNamespace(node_name=NODE, failed_resource="kv",
-                                                             admit_error=_alloc_failed(R)))
+    worker._handle_admit_failure(batch, _refused(batch, _alloc_failed(R)))
 
-    assert held == [R] and worker._graph_runtime.pushed_back == [A], "the retry would be refused the same way"
+    assert list(worker.admission.held_until) == [R] and worker._graph_runtime.pushed_back == [A], (
+        "the retry would be refused the same way"
+    )
 
 
 def test_a_rebuild_row_stays_out_of_the_runtime_and_publishes_nothing():
@@ -279,7 +288,7 @@ def test_a_rebuild_row_stays_out_of_the_runtime_and_publishes_nothing():
     assert list(node_batch.request_ids) == [R, A] and batch.graph_rows() == {A: 0}, (
         "the runtime would route the rebuild row"
     )
-    assert w._publishable_request_ids(node_batch) == [A], "the rebuild row would publish with MSTAR_LAZY_PUBLISH=0"
+    assert w.lifecycle.publishable(node_batch) == [A], "the rebuild row would publish with MSTAR_LAZY_PUBLISH=0"
 
 
 def test_a_yield_away_to_rebuild_rows_alone_runs_them(monkeypatch):

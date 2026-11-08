@@ -471,20 +471,24 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
 
     from mstar.testing_utils.worker import make_worker
 
-    w = make_worker()
     asked = []
     engine = SimpleNamespace(
         evictable=lambda node, resources=None: resources is None or "kv" in resources,
         reclaimable=lambda *a, **k: asked.append(a) or 0, residency=lambda *a: Residency.RESIDENT,
     )
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    w.scheduler = SimpleNamespace(arrival={1: 0})
+    w = make_worker(engine_manager=SimpleNamespace(get_engine=lambda node: engine))
+
+    def evict(resource):
+        return w.admission._evict(
+            "LLM", {1}, {1: 0}, last_in_line=max, affected_resources={resource},
+        )
+
     with caplog.at_level(logging.WARNING):
-        assert w._try_offload_cold_request("LLM", "decode", {1}, affected_resources={"lora"}) is None
+        assert evict("lora") is None
     assert asked == [] and "No eviction candidate" not in caplog.text
     # control: a KV refusal with nothing reclaimable looks for a victim and warns
     with caplog.at_level(logging.WARNING):
-        assert w._try_offload_cold_request("LLM", "decode", {1}, affected_resources={"kv"}) is None
+        assert evict("kv") is None
     assert asked and "No eviction candidate" in caplog.text
 
 
