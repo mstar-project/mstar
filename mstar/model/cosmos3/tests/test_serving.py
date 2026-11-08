@@ -810,3 +810,46 @@ def test_vae_decode_fast_must_be_a_bool() -> None:
 
     with pytest.raises(ValueError, match="vae_decode_fast must be true or false"):
         Cosmos3Config(vae_decode_fast="false").check_streaming_decode()
+
+
+@pytest.mark.parametrize("kwargs, inputs, outputs", [
+    ({"size": "256x256", "num_inference_steps": 7}, ["text"], ["image"]),
+    ({"num_frames": 17, "flow_shift": 12.0}, ["image", "text"], ["video"]),
+    ({"window_mode": "chained", "num_frames": 189}, [], ["video"]),
+    ({"window_mode": "kv", "num_frames": 61}, ["text"], ["video"]),
+    ({"action_mode": "policy", "domain_id": 8, "raw_action_dim": 10}, ["image", "text"], ["action"]),
+], ids=["t2i", "i2v", "chained", "kv", "action"])
+def test_the_denoise_loops_cap_is_the_dits_step_count(kwargs, inputs, outputs) -> None:
+    """The loop's cap (``_denoise_cap``) and the DiT's schedule are computed apart; a loop past the
+    schedule indexes off its end mid-request, and one short of it returns noisy latents."""
+    from types import SimpleNamespace
+
+    from diffusers import UniPCMultistepScheduler
+
+    from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
+    from mstar.model.cosmos3.tests.test_dit_step_guard import EDGE_SCHEDULER
+    from mstar.model.cosmos3.tests.test_windowed import _stand_in
+
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True)
+    p = model._resolve_gen_params(kwargs, inputs, outputs)
+    ((loop, _),) = model._denoise_cap(outputs, p).items()
+    cap = model.get_loop_caps(**{model.DENOISE_CAP: model._denoise_cap(outputs, p)})[loop]
+    signals = {"text_inputs": [], **({"image_inputs": [object()]} if "image" in inputs else {})}
+    md = model.walk_plan("default", inputs, outputs, signals, kwargs)[-1].step_metadata
+    dit = Cosmos3DiTSubmodule(
+        transformer=None, config=model.config, scheduler=UniPCMultistepScheduler.from_config(EDGE_SCHEDULER),
+    )
+    sampler = dit._new_scheduler(
+        int(md["num_inference_steps"]), "cpu", flow_shift=md.get("flow_shift"),
+        use_karras_sigma=md.get("use_karras_sigma"),
+    )
+    if md.get("window_mode") is None:
+        assert cap == len(sampler.host_timesteps)
+        return
+    dit.transformer = _stand_in(dit)
+    fwd = SimpleNamespace(request_id="r", rid_handle="r")
+    dit._prepare_windowed_prefill(
+        fwd, md, [1, 2], [3], p["height"], p["width"], 24.0, 6.0, int(md["num_inference_steps"]), "cpu",
+    )
+    st = dit.request_states["r"]
+    assert len(st["scheduler"].host_timesteps) == st["ar_steps"] and cap == st["ar_total_iters"]
