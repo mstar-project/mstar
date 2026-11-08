@@ -24,8 +24,9 @@ name: Claude Review
 #      ledger and its alerts, to issues (preflight, live-test and spend jobs),
 #      and the review app's token (below) only to pull requests and issues of
 #      this repository, and in full mode to the media repository's contents
-#      (REVIEW_MEDIA_REPO). The review job, which runs the model, has no
-#      issues: write. The job token can't read repository variables.
+#      (REVIEW_MEDIA_REPO). The job token of the review job, which runs the
+#      model, has no issues: write (the app token it mints does, to post and
+#      react). The job token can't read repository variables.
 #      The model has no shell and no mutation tools: it posts inline comments
 #      through the action's tool (which redacts secrets) and returns the summary
 #      as fields, which a workflow step renders, redacts and posts. In light
@@ -712,7 +713,7 @@ jobs:
 
   # The one writer of the spend ledger: one comment per run, after the review and the
   # live test whatever became of them, so the caps see every run that spent anything.
-  # A job of its own, so `issues: write` stays out of the job that runs the model.
+  # A job of its own, so the job token's `issues: write` stays out of the job that runs the model.
   spend:
     name: Record spend
     needs: [preflight, review, live-test]
