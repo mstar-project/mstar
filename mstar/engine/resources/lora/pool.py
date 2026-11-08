@@ -281,6 +281,8 @@ class LoraAdapterPool(Resource):
     idle_capture = True
     # a node's rows are its segments' tokens, so it declares nothing for the pool
     steps_from_segments = True
+    # a dropped request keeps its adapter and slot, and its rebuild runs under that adapter
+    supports_drop = True
 
     @classmethod
     def build(cls, spec: LoraSpec, info: EngineResourceInfo) -> "LoraAdapterPool":

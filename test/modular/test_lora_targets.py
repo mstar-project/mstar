@@ -54,6 +54,7 @@ from mstar.model.components.lora.modules import (  # noqa: E402
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
 from mstar.model.submodule_base import NodeSubmodule, engine_step  # noqa: E402
+from mstar.testing_utils.model import make_model  # noqa: E402
 
 HIDDEN = 8
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4)]
@@ -117,6 +118,9 @@ CASES = {
                       partial=("in_proj_z", "in_proj_b")),
     "fused_column": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
                          {"to_q": 8, "to_k": 4, "to_v": 4}, (1,), FUSED_RULES, bias=True, partial=("to_k",)),
+    # the same module, its adapter stored fused (no shard id), as Qwen3.5's ViT `qkv` adapters are
+    "fused_column_whole": Case(lambda g: FusedColumnLinear(HIDDEN, {"q": 8, "k": 4, "v": 4}, bias=True), "qkv",
+                               {"qkv": 16}, (1,), bias=True),
     # one row per segment (its last token's), each rank its vocab columns
     "lm_head": Case(lambda g: ColumnParallelLinear(g, HIDDEN, 32), "lm_head", {"lm_head": 32}, (1, 2, 4),
                     top=True, rows={"lm_head": PER_SEGMENT}),
@@ -402,7 +406,8 @@ def _guards(module, x) -> list[str]:
     return [str(g) for g in torch._dynamo.explain(module)(x).out_guards]
 
 
-@pytest.mark.parametrize("name", sorted(CASES))
+# fused_column_whole is fused_column's module under another checkpoint layout, which this never reads
+@pytest.mark.parametrize("name", sorted(set(CASES) - {"fused_column_whole"}))
 def test_unbound_module_runs_the_pre_lora_forward(name):
     """Same aten ops and outputs (under TP its collectives too), dynamo graph, and no guard
     on LoRA: a deployment without a lora block traces as it did before."""
@@ -641,8 +646,6 @@ def test_an_adapter_on_a_module_the_walk_refuses_is_refused_with_the_reason(name
 def test_a_deployment_without_a_lora_block_never_builds_the_root():
     """Every deployment of a model declares its LoRA spec; the root is built and walked
     only once the spec is read, which only a deployment opting into LoRA does."""
-    from types import SimpleNamespace
-
     from mstar.model.base import serving_resources
 
     built = []
@@ -654,7 +657,7 @@ def test_a_deployment_without_a_lora_block_never_builds_the_root():
         root.layers[0].fc = nn.Linear(HIDDEN, HIDDEN)
         return root
 
-    model = SimpleNamespace(get_node_resources=lambda: [module_lora_spec(build, nodes={"N"}, root_path="")])
+    model = make_model(get_node_resources=lambda: [module_lora_spec(build, nodes={"N"}, root_path="")])
     assert serving_resources(model, {"resources": {}}) == [] and not built
     (spec,) = serving_resources(model, {"resources": {"lora": {}}})
     assert set(spec.targets) == {"fc"} and len(built) == 1

@@ -33,14 +33,16 @@ from mstar.engine.resources.lora.serving import lora_spec  # noqa: E402
 from mstar.engine.resources.lora.store import inspect_keys  # noqa: E402
 from mstar.engine.resources.spec import instance_key  # noqa: E402
 from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, SlotLease, StepContext  # noqa: E402
+from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
 from mstar.model.components.lora.modules import _check  # noqa: E402
+from mstar.model.multimodal import MEDIA_LAYOUT  # noqa: E402
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM  # noqa: E402
 from mstar.model.qwen3_5.components.vision import Qwen3_5VisionModel  # noqa: E402
 from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5Config, Qwen3_5VisionConfig  # noqa: E402
 from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
-from mstar.model.qwen3_5.qwen3_5_model import STEP_GRIDS_KEY, Qwen3_5DenseModel  # noqa: E402
-from mstar.model.qwen3_5.submodules import VISION_BLOCK_LOOP, VisionEncoderSubmodule  # noqa: E402
+from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
+from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule  # noqa: E402
 from mstar.model.submodule_base import engine_step, with_segment_steps  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -283,7 +285,7 @@ class _FrameAttend:
     def __init__(self):
         self.lengths: list[int] = []
 
-    def run(self, q, k, v):
+    def run(self, q, k, v, label=None):
         out, at = torch.zeros_like(q), 0
         for n in self.lengths:
             s = slice(at, at + n)
@@ -295,7 +297,7 @@ class _FrameAttend:
 def _vision_node(model, resources=None) -> VisionEncoderSubmodule:
     # byte patches to [-1, 1], as the processors' mean and std of 0.5 do
     half = torch.full((PATCH_NUMEL,), 127.5)
-    sub = VisionEncoderSubmodule(model, vision_config(), (half, half))
+    sub = VisionEncoderSubmodule(model, vision_config(), "vision_embeds", (half, half))
     sub._frames = _FrameAttend()
     sub.bind_node_resources({VISION_ATTN: sub._frames, **(resources or {})})
     return sub
@@ -305,7 +307,8 @@ def _prompt(sub, grids=GRIDS):
     patches = sum(t * h * w for t, h, w in grids)
     pixels = torch.randint(0, 256, (patches, PATCH_NUMEL), generator=torch.Generator().manual_seed(5),
                            dtype=torch.uint8)
-    fwd_info = SimpleNamespace(step_metadata={STEP_GRIDS_KEY: grids})
+    layout = {"grid": [list(g) for g in grids], "output": ["vision_embeds"] * len(grids)}
+    fwd_info = SimpleNamespace(step_metadata={MEDIA_LAYOUT: layout})
     return sub.prepare_inputs("encode", fwd_info, {"pixel_values": [pixels]})
 
 
@@ -315,7 +318,7 @@ def _engine(rid):
 
 def _encode(sub, rid="r"):
     inp = _prompt(sub)
-    sub._frames.lengths = list(inp.tensor_inputs["seq_lengths"])
+    sub._frames.lengths = list(inp.resource_step_info["main"])
     kwargs = sub.preprocess("encode", _engine(rid), [inp])
     with torch.no_grad():
         return sub.forward_batched("encode", _engine(rid), **kwargs)[rid]["vision_embeds"][0]
@@ -358,7 +361,7 @@ def _encode_leased(sub, lora_pool):
         hidden, cos, sin = sub.model.embed(
             kwargs["pixel_values"], kwargs["indices"], kwargs["weights"], kwargs["position_ids"],
         )
-        seq_lens = list(kwargs["seq_lengths"])
+        seq_lens = list(kwargs["segment_lengths"]["main"])
         # the runner's step for the region (`with_segment_steps` over `region_step`)
         region = with_segment_steps(region_cfg.region_step(["r"], seq_lens), sub.segment_keys)
         assert sum(seg.span for seg in region.steps[VISION_POOL].segments) == PATCHES
@@ -461,40 +464,52 @@ def test_qwen3_5_tied_head_and_embedding_keep_each_delta_on_its_own_side(tmp_pat
 
 def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(tmp_path):
     """A vision prompt's text and sentinels take their adapter's embedding delta in the
-    step, also when a capture bucket pads the step with a dummy row: three image prompts
-    on the bs-4 bucket, against merged weights. The image rows pass through as they are."""
-    from mstar.model.qwen3_5.config import ROPE
-    from mstar.model.qwen3_5.qwen3_5_model import IMAGE_PART, TEXT_PART
+    step's forward, also when a capture bucket pads the step with a dummy row: three image
+    prompts on the bs-4 bucket, against merged weights. The image rows are spliced in at
+    their pads as they are."""
+    from mstar.model.multimodal import vision_encoder
+    from mstar.model.qwen3_5.config import ATTN, ROPE, SAMPLER
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     embed = f"{H.TEXT}embed_tokens"
     path, ref = H.make_adapter(tmp_path / "e.safetensors", {embed: (H.HIDDEN, 64)}, 4, 8.0, 41, embedding=(embed,))
-    start, end = 60, 61
+    start, end, pad = 60, 61, 62
     config = dataclasses.replace(H.tiny_config(), vision_start_token_id=start, vision_end_token_id=end,
-                                 mrope_section=[2, 1, 1])
+                                 image_token_id=pad, mrope_section=[2, 1, 1])
     base = H.hf_text_weights()
     lora_pool = H.pool(H.lora_spec({"e": path}))
-    llm = LLMSubmodule(H.build_stack(base, config=config), config, vision_config())
+    encoder = vision_encoder((pad,))
+    llm = LLMSubmodule(H.build_stack(base, config=config), config, vision_config(), (encoder,))
     llm.bind_node_resources({LORA_RESOURCE_KEY: lora_pool})
-    llm.node_resources[ROPE] = SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: None)
+    llm.node_resources[ROPE] = SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: torch.zeros(64))
 
     table = H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"]
     rows, want = [], []
     for i, grid in enumerate([(1, 4, 4), (1, 2, 4), (1, 4, 2)]):
         texts = [torch.tensor([1 + i, 5]), torch.tensor([7, 8 + i, 9])]
-        image = H.rand(grid[1] * grid[2] // 4, H.HIDDEN, seed=50 + i)
-        fwd_info = SimpleNamespace(request_id=f"r{i}", step_metadata={
-            "prefill_order": (TEXT_PART, IMAGE_PART, TEXT_PART), STEP_GRIDS_KEY: [grid],
-        })
+        n = grid[1] * grid[2] // 4
+        image = H.rand(n, H.HIDDEN, seed=50 + i)
+        ids = torch.cat([texts[0], torch.tensor([start]), torch.full((n,), pad), torch.tensor([end]), texts[1]])
+        layout = {"offset": [3], "tokens": [n], "output": [encoder.output], "grid": [list(grid)]}
+        fwd_info = SimpleNamespace(request_id=f"r{i}", rid_handle=i, step_metadata={MEDIA_LAYOUT: layout})
         # prepare_inputs runs outside the planned step, before the plan below
-        rows.append(llm._vision_inputs(fwd_info, {"text_inputs": texts, "vision_embeds": [image]}))
+        rows.append(llm._media_inputs(fwd_info, {"text_inputs": [ids], encoder.output: [image]}))
         want += [table[texts[0]], table[[start]], image, table[[end]], table[texts[1]]]
     (config_v,) = [c for c in llm.get_accelerator_graph_configs(torch.device("cpu"))
                    if c.capture_graph_walk == "prefill_vision"]
     padded = [*rows, *config_v.get_node_inputs(1, 0)]
     assert len(padded) == 4 and padded[-1].input_seq_len == 0
 
+    # the decoder stack, head, last-token select and sampler stubbed: the forward's
+    # embedded and spliced step is what reaches the stack
+    seen = []
+    llm.model.forward = lambda embeds, **_: seen.append(embeds) or embeds
+    llm.model.logits = lambda hidden: hidden
+    engine = SimpleNamespace(captured=False, request_ids=[f"r{i}" for i in range(4)], resources={
+        SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
+        ATTN: SimpleNamespace(select_last_hidden=lambda hidden: hidden),
+    })
     H.plan([lora_pool], [(f"r{i}", "e", row.input_seq_len) for i, row in enumerate(rows)])
     with torch.no_grad():
-        out = llm.preprocess("prefill_vision", SimpleNamespace(captured=False), padded)
-    torch.testing.assert_close(out["input_embeds"], torch.cat(want))
+        llm._forward("prefill_vision", engine, **llm.preprocess("prefill_vision", engine, padded))
+    torch.testing.assert_close(seen[0], torch.cat(want))

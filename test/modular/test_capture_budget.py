@@ -34,8 +34,8 @@ from mstar.engine.accelerator_graph_runner import (
     WarmedSpec,
     plan_captures,
 )
-from mstar.engine.engine import Engine
 from mstar.engine.resources import BucketKey, CGSlotSpec, SubmoduleStep
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 _GIB = 2**30
 _MIB = 2**20
@@ -44,7 +44,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a thro
 
 
 # a node with no float32 or cuDNN-search setting of its own
-_NO_PRECISION = SimpleNamespace(fp32_precision=None, submodule=SimpleNamespace(capture_cudnn_benchmark=False))
+_NO_PRECISION = make_mgmt(SimpleNamespace(capture_cudnn_benchmark=False))
 
 
 def _bucket(walk: str, bs: int, tokens: int) -> BucketKey:
@@ -215,11 +215,9 @@ def test_a_plan_that_leaves_a_graph_out_sizes_each_bucket_by_its_own_capture(
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: ((3544 + room) * _MIB, 80 * _GIB))
     runner = _StubMeasuredRunner(torch.device("cuda", 0), walk)
     runner._num_slots = 1
-    engine = SimpleNamespace(
-        _device=torch.device("cuda", 0), _submodules={"Code2Wav": _NO_PRECISION}, _gpu_memory_fraction=None,
-    )
+    engine = make_engine(_device=torch.device("cuda", 0), _submodules={"Code2Wav": _NO_PRECISION})
 
-    plan = Engine._plan_captures(engine, {"Code2Wav": runner}, {"Code2Wav": {}})
+    plan = engine._plan_captures({"Code2Wav": runner}, {"Code2Wav": {}})
 
     assert len(measured) == captured, "two captures size the walk while every graph fits, and each its own when not"
     assert plan.buckets["Code2Wav"] == set(list(walk)[-planned:])
@@ -308,12 +306,10 @@ def test_a_sizing_step_that_fails_fails_the_boot(measured):
         raise RuntimeError("CUDA error: unknown error")
 
     runner._warmed = dead_context
-    engine = SimpleNamespace(
-        _device=torch.device("cuda", 0), _submodules={"Thinker": _NO_PRECISION}, _gpu_memory_fraction=None,
-    )
+    engine = make_engine(_device=torch.device("cuda", 0), _submodules={"Thinker": _NO_PRECISION})
 
     with pytest.raises(RuntimeError, match="slot=0 eagerly to size its capture, with 51200 MiB free before it: CUDA"):
-        Engine._plan_captures(engine, {"Thinker": runner}, {"Thinker": {}})
+        engine._plan_captures({"Thinker": runner}, {"Thinker": {}})
 
 
 def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
@@ -375,11 +371,9 @@ def test_every_bucket_is_sized_whatever_the_pools_size(measured, monkeypatch):
     runner.prepare_for_capture = lambda: [
         CGSlotSpec(bucket=b, slot=s, config=config) for b in (wide, fits) for s in (0, 1)
     ]
-    engine = SimpleNamespace(
-        _device=torch.device("cuda", 0), _submodules={"LLM": _NO_PRECISION}, _gpu_memory_fraction=None,
-    )
+    engine = make_engine(_device=torch.device("cuda", 0), _submodules={"LLM": _NO_PRECISION})
 
-    plan = Engine._plan_captures(engine, {"LLM": runner}, {"LLM": {}})
+    plan = engine._plan_captures({"LLM": runner}, {"LLM": {}})
 
     assert set(runner._capture_costs) == {wide, fits}, "every bucket must be sized, so the floor covers it"
     assert plan.buckets["LLM"] == {wide, fits}, "a bucket a served step pads into must be captured"
@@ -394,9 +388,9 @@ def test_a_cpu_device_never_asks_the_driver(monkeypatch):
     for name in ("mem_get_info", "empty_cache", "graph_pool_handle", "memory_reserved"):
         monkeypatch.setattr(torch.cuda, name, lambda *args, name=name, **kwargs: driver_calls.append(name))
     runner = _StubMeasuredRunner(torch.device("cpu"), {_DECODE: CaptureCost(_GIB, 2 * _GIB, 0, 2)})
-    engine = SimpleNamespace(_device=torch.device("cpu"), _submodules={"Thinker": None})
+    engine = make_engine(_submodules={"Thinker": None})
 
-    plan = Engine._plan_captures(engine, {"Thinker": runner}, {"Thinker": {}})
+    plan = engine._plan_captures({"Thinker": runner}, {"Thinker": {}})
 
     assert plan is None
     assert driver_calls == [], "a CPU worker must not ask the CUDA driver for memory"
@@ -614,11 +608,11 @@ def test_a_capped_worker_reuses_the_copies_only_within_its_cap(monkeypatch, frac
     # a 2 GiB eager step, and graphs of 1 GiB in their pool and 512 MiB outside it
     costs = {bs: CaptureCost(2 * _GIB, _GIB, _GIB, 1, _GIB // 2, talker) for bs in range(8)}
     runner = SimpleNamespace(size_captures=lambda: costs, size_lent_captures=lambda wanted: costs)
-    engine = SimpleNamespace(
+    engine = make_engine(
         _device=torch.device("cuda", 0), _submodules={"Talker": _NO_PRECISION}, _gpu_memory_fraction=fraction,
     )
 
-    plan = Engine._plan_captures(engine, {"Talker": runner}, {"Talker": {}})
+    plan = engine._plan_captures({"Talker": runner}, {"Talker": {}})
 
     assert len(plan.buckets["Talker"]) == planned, "the graphs must fit in free memory and under the cap"
 
@@ -883,11 +877,11 @@ def test_the_cap_bounds_the_plan(monkeypatch, fraction, reserved, planned):
     # graphs that share no scratch, so each takes its full GiB
     costs = {bs: CaptureCost(peak=2 * _GIB, graph=_GIB, kept=_GIB, slots=1) for bs in range(8)}
     talker = SimpleNamespace(size_captures=lambda: costs, size_lent_captures=lambda wanted: costs)
-    engine = SimpleNamespace(
+    engine = make_engine(
         _device=torch.device("cuda", 0), _submodules={"Talker": _NO_PRECISION}, _gpu_memory_fraction=fraction,
     )
 
-    plan = Engine._plan_captures(engine, {"Talker": talker}, {"Talker": {}})
+    plan = engine._plan_captures({"Talker": talker}, {"Talker": {}})
 
     assert len(plan.buckets["Talker"]) == planned, "the worker's graphs and eager step must fit under its cap"
 
@@ -895,13 +889,12 @@ def test_the_cap_bounds_the_plan(monkeypatch, fraction, reserved, planned):
 def test_a_runner_with_no_graphs_keeps_its_largest_bucket_as_its_batch_cap():
     """A runner that captured nothing runs every bucket eager, and the floor
     covers eager steps only up to its largest bucket."""
-    code2wav = SimpleNamespace(
-        submodule=SimpleNamespace(max_batch_size=lambda walk: None),
-        accelerator_graph_runner=None,
+    code2wav = make_mgmt(
+        SimpleNamespace(max_batch_size=lambda walk: None),
         capture_runner=SimpleNamespace(max_batch_size_for=lambda walk: 32),
     )
-    engine = SimpleNamespace(_submodules={"Code2Wav": code2wav})
+    engine = make_engine(_submodules={"Code2Wav": code2wav})
 
-    cap = Engine.get_max_batch_size(engine, "Code2Wav", "code2wav_chunk")
+    cap = engine.get_max_batch_size("Code2Wav", "code2wav_chunk")
 
     assert cap == 32, "a batch past the largest bucket is an eager step the floor never measured"

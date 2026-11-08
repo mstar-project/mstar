@@ -58,6 +58,9 @@ from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.lora.store import LoraAdapterStore, check_adapters  # noqa: E402
 from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
+from mstar.testing_utils.engine import make_engine  # noqa: E402
+from mstar.testing_utils.model import make_model  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -68,7 +71,6 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.worker.worker import Worker  # noqa: E402
 
 BASE = "qwen3_5_0.8b"
 LORA_CONFIG = {"resources": {"lora": {"adapters": {"sql": "/a"}}}}
@@ -110,7 +112,7 @@ def paths(tmp_path):
 class _StubAPI:
     def __init__(self, config):
         self.model_name = BASE
-        self.model = SimpleNamespace(get_output_sample_rate=lambda modality="audio": 24000)
+        self.model = make_model(get_output_sample_rate=lambda modality="audio": 24000)
         self.served_models = _served(config)
         self.lora_admin = None
         self.upload_dir = Path(tempfile.mkdtemp())
@@ -223,14 +225,14 @@ def test_a_deployment_without_lora_leaves_its_resources_block_to_the_conductor(r
     config = {"resources": resources}
     served = ServedModels.of(BASE, config)
     assert not served.lora and served.adapters == ()
-    assert resolve_lora_spec(SimpleNamespace(get_node_resources=list), config) is None
+    assert resolve_lora_spec(make_model(), config) is None
 
 
 @pytest.mark.parametrize("block", [None, ["sql"]], ids=["bare", "list"])
 def test_a_lora_block_that_is_not_a_mapping_is_left_to_the_conductor(block):
     """``validate_deployment`` reports it as a refused `resources: lora:` override."""
     config = {"resources": {LORA_RESOURCE_KEY: block}}
-    assert resolve_lora_spec(SimpleNamespace(get_node_resources=list), config) is None
+    assert resolve_lora_spec(make_model(), config) is None
 
 
 def test_submit_request_refuses_an_unserved_adapter_kwarg():
@@ -405,7 +407,7 @@ def test_a_request_on_an_adapter_being_loaded_or_unloaded_is_refused(paths):
     open the request and another refuse it."""
     spec = make_spec({}, runtime_updates=True)
     conductor = object.__new__(Conductor)
-    conductor.model = SimpleNamespace(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
+    conductor.model = make_model(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
     conductor.model_config = {"resources": {LORA_RESOURCE_KEY: {}}}
     conductor._kv_labels, conductor.requests = {}, {}
     conductor._lora_ops_cache = ops = LoraAdapterOps(spec, ["worker_0", "worker_1"], _Outbox())
@@ -473,10 +475,11 @@ class _Deployment:
                 def broken(name, path):
                     raise OSError(f"{name}: cannot read /srv/secret on this rank")
                 pool.store._read = broken  # the worker's background read fails
-            w = self.workers[worker_id] = Worker.__new__(Worker)
-            w.worker_id = worker_id
-            w.engine_manager = SimpleNamespace(engine=SimpleNamespace(resources={LORA_RESOURCE_KEY: pool}))
-            w.communicator = SimpleNamespace(send=self._from_worker)
+            self.workers[worker_id] = make_worker(
+                worker_id=worker_id,
+                engine_manager=SimpleNamespace(engine=make_engine(_resources={LORA_RESOURCE_KEY: pool})),
+                communicator=SimpleNamespace(send=self._from_worker),
+            )
 
     def _to_conductor(self, message: ConductorMessage):
         message = _wire(message)
@@ -615,6 +618,8 @@ def test_requests_on_an_unloaded_adapter_finish_and_new_ones_are_refused(paths):
         ingest(pool, "r1", "a1")
         assert run_step(pool, ["r1"]).ok
     slots = {w: pool.slot_of("r1") for w, pool in d.pools.items()}
+    for pool in d.pools.values():
+        pool.drop("r1", 3)  # preempted (#870): it keeps its adapter and slot through the unload
     d.unload("a1")
     for w, pool in d.pools.items():
         assert run_step(pool, ["r1"]).ok  # still running on its slot

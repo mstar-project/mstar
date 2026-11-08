@@ -51,7 +51,7 @@ curl -sf http://127.0.0.1:$PORT/health
 
 If another server still holds the port, uvicorn logs startup-complete and only *afterwards* logs `[Errno 98] address already in use`. A log-grep readiness check sails straight past that and every request then fails with connection-refused.
 
-**Transport:** benchmark over SHM, which is the default `--tensor-comm-protocol` and the safe single-node choice — **and set `MSTAR_SHM_ARENA=1` explicitly, because it is off by default.** That variable picks the SHM *implementation*, not the protocol: `0` (the default) is per-uuid files, `1` is the Rust shared-memory arena, `AUTO` is the arena when the `rust/` extension imports. It must match across the deployment, since arena locations ride in the tensor descriptors. Benchmarking the default without setting it measures the file path, which is not what production should be running. **TCP is very high variance — never use it for numbers.** Do run an untimed functional smoke test with `--tensor-comm-protocol TCP` occasionally to confirm the path works.
+**Transport:** benchmark over SHM, which is the default `--tensor-comm-protocol` and the safe single-node choice. SHM is the Rust shared-memory arena. Its segment size and count come from the size of `/dev/shm` unless `MSTAR_SHM_ARENA_SEGMENT_MB` / `MSTAR_SHM_ARENA_MAX_SEGMENTS` are set (each process logs them at startup), and a tensor that does not fit spills to a per-tensor file, with an `ARENA: spilling` warning in the server log. **TCP is very high variance — never use it for numbers.** Do run an untimed functional smoke test with `--tensor-comm-protocol TCP` occasionally to confirm the path works.
 
 ## Stop a server
 
