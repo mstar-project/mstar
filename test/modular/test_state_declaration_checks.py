@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Tuple
 
 sys.path.insert(0, ".")
@@ -36,12 +37,17 @@ from mstar.engine.state import (
     Value,
     Window,
 )
-from mstar.engine.state.analysis import declaration_digests, state_declaration_problems
+from mstar.engine.state.analysis import (
+    declaration_digests,
+    digest_mismatch,
+    state_declaration_problems,
+)
 from mstar.engine.state.contract import Mask
-from mstar.graph.base import GraphNode
+from mstar.graph.base import GraphNode, Parallel
 from mstar.model.base import KVLabel, PrefixKeys
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy
+from mstar.worker import engine_manager
 
 _ATTEND = Attend(q_heads=8)
 
@@ -409,6 +415,48 @@ def test_keyed_and_rebuilt_walks_read_causally_have_no_problems():
     assert state_declaration_problems(model) == []
 
 
+def test_a_keyed_walk_whose_node_reads_another_tensor_is_left_to_each_request():
+    """Bagel keys each image on prefill_vit by its digest, where its LLM reads the image's embeddings and not the keyed
+    ids, so one item fills each step. The data worker checks each request's spans there instead."""
+    keys = PrefixKeys("caption_ids", ("prefill",))
+    model = _StubModel(_array(reads={"r": _read(mask=Bidirectional())}), kv_labels={"kv": {"main": KVLabel(keys=keys)}})
+    assert state_declaration_problems(model) == [], "a keyed walk was refused where its node reads no keyed ids"
+
+
+class _TwoNodes(_StubModel):
+    """Runs its prefill on two nodes, as Bagel's CFG branches each run one."""
+
+    def get_graph_walk_graphs(self):
+        return {**super().get_graph_walk_graphs(), "prefill": Parallel(sections=[
+            GraphNode(name="LLM", input_names=["text_inputs"], outputs=[]),
+            GraphNode(name="LLM_cfg", input_names=["text_inputs"], outputs=[]),
+        ])}
+
+
+def test_a_refused_read_of_an_array_on_two_nodes_is_reported_once():
+    array = _array(nodes={"LLM", "LLM_cfg"}, reads={"r": _read(mask=Bidirectional())})
+    problems = state_declaration_problems(_TwoNodes(array, kv_labels=_keyed()))
+    assert len(problems) == 1, f"one refusal per node of the array: {problems}"
+
+
+@pytest.mark.parametrize("masks, refused", [
+    ((Causal(), Bidirectional()), True),
+    ((Causal(), Causal()), False),
+], ids=["two_masks", "one_mask"])
+def test_a_combined_walk_whose_walks_read_a_layer_with_two_masks_is_refused(masks, refused):
+    """A combined step plans one causal flag per resource, and its rows each read by their own walk."""
+    array = _array(reads={
+        "attn": _read(mask=masks[0], walks={"prefill"}), "attn_image": _read(mask=masks[1], walks={"decode"}),
+    })
+    problems = state_declaration_problems(_StubModel(array, combined={"LLM": {"mixed": {"prefill", "decode"}}}))
+    assert bool(problems) == refused, problems
+    if refused:
+        assert problems == [
+            "Array 'kv': combined walk 'mixed' runs 'decode' through reads['attn_image'] (Bidirectional) and "
+            "'prefill' through reads['attn'] (Causal) on layer 0; a combined step plans one mask per resource"
+        ]
+
+
 @pytest.mark.parametrize("arrays, where, cause", [
     ((_cross(queries="nothing"),), "reads['text_attn'].queries", "'nothing' is not a declared array"),
     ((_within("video", nodes={"vision"}), _cross()), "reads['text_attn'].queries", "isn't on nodes ['LLM']"),
@@ -469,6 +517,38 @@ def test_the_digest_ignores_the_order_of_arrays_and_keys():
     swapped = Array(a.name, nodes=a.nodes, layers=a.layers, entry=a.entry, max_len=a.max_len,
                     reads=dict(reversed(list(a.reads.items()))))
     assert declaration_digests([b, swapped]) == declaration_digests([a, b])
+
+
+def test_a_mismatch_names_each_declaration_that_differs_or_one_side_lacks():
+    a, b = _declarations()
+    ours = declaration_digests([a, b])
+    changed = declaration_digests([replace(a, max_len=a.max_len + 1), _sampler()])
+    assert digest_mismatch(ours, declaration_digests([b, a]), here="worker w0", there="conductor") is None
+    message = digest_mismatch(ours, changed, here="worker w0", there="conductor")
+    assert message.startswith(
+        "the worker w0 and the conductor declare different state: gdn (only on the worker w0), kv, s (only on the "
+        "conductor)."
+    ), message
+    assert "get_worker_graphs" in message, "the message should say where a declaration that follows placement reads it"
+
+
+def test_the_digests_cover_the_kernel_settings_since_a_pool_size_can_follow_the_deployment():
+    a, b = _declarations()
+    ours = declaration_digests([a, b], {"kv": {"max_num_pages": 64}})
+    theirs = declaration_digests([a, b], {"kv": {"max_num_pages": 128}})
+    message = digest_mismatch(ours, theirs, here="API server", there="conductor")
+    assert message is not None and "declare different state: kernel_settings()." in message, message
+
+
+def test_a_worker_whose_declarations_differ_from_the_conductors_fails_before_it_builds(monkeypatch):
+    monkeypatch.setattr(engine_manager, "serving_resources", lambda *args: pytest.fail("built specs before the check"))
+    model = SimpleNamespace(declare_state=lambda: [_sampler()], kernel_settings=dict)
+    with pytest.raises(RuntimeError, match=r"the worker w0 and the conductor declare different state: s \(only on "
+                                           r"the worker w0\)"):
+        engine_manager.EngineManager.build(
+            {"LLM"}, torch.device("cpu"), {}, None, SimpleNamespace(my_entity_id="w0"), model, None,
+            conductor_digests={},
+        )
 
 
 def test_the_digest_matches_across_processes_with_different_hash_seeds():

@@ -740,8 +740,8 @@ class _EngineNode(NodeSubmodule):
         self.declared_handles = handles
 
 
-def _load_engine(monkeypatch, node, model):
-    monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources, **kwargs: {"kv": name})
+def _load_engine(monkeypatch, nodes, model, handles=lambda model, name, resources, **kwargs: {"kv": name}):
+    monkeypatch.setattr(engine_module, "node_handles", handles)
     joint = SimpleNamespace(world_size=1, tp_group=SimpleNamespace(barrier=lambda: None))
     groups = SimpleNamespace(
         get_joint_group_for_node=lambda name: joint, get_instance_world_size_for_node=lambda name: 1,
@@ -749,20 +749,31 @@ def _load_engine(monkeypatch, node, model):
     )
     engine = Engine(None, autocast_dtype=None)
     engine.load_model(
-        submodules={"LLM": node}, specs=[], parallel_groups=groups, device=torch.device("cpu"),
+        submodules=nodes, specs=[], parallel_groups=groups, device=torch.device("cpu"),
         transfer_engine_info=None, model=model,
     )
 
 
 def test_the_engine_binds_a_nodes_handles_when_it_loads_a_model(monkeypatch):
     node = _EngineNode()
-    _load_engine(monkeypatch, node, make_model(checkpoint_path=lambda: None))
+    _load_engine(monkeypatch, {"LLM": node}, make_model(checkpoint_path=lambda: None))
     assert node.declared_handles == {"kv": "LLM"}
+
+
+def test_nodes_in_one_process_share_their_handles(monkeypatch):
+    nodes = {name: _EngineNode() for name in ("LLM_cfg_text", "LLM_cfg_img")}
+    _load_engine(monkeypatch, nodes, make_model(checkpoint_path=lambda: None),
+                 handles=lambda model, name, resources, **kwargs: {"kv": object()})
+    text, image = (node.declared_handles for node in nodes.values())
+    assert text["kv"] is image["kv"], (
+        "BAGEL's LLM nodes share one language model, so a handle per node would leave the shared layers on the handle "
+        "of the node bound last, which the other node's steps never open"
+    )
 
 
 def test_the_engine_binds_nothing_when_it_loads_no_model(monkeypatch):
     node = _EngineNode()
-    _load_engine(monkeypatch, node, model=None)
+    _load_engine(monkeypatch, {"LLM": node}, model=None)
     assert node.declared_handles is None
 
 
