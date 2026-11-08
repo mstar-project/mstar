@@ -168,17 +168,25 @@ def test_extra_body_non_standard_knobs_pass_through(tmp_path):
 @pytest.mark.parametrize("adapter", [adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter], ids=lambda a: a.__name__)
 @pytest.mark.parametrize(("fields", "want"), [
     ({"chat_template_kwargs": {"enable_thinking": False}}, {"enable_thinking": False}),
-    # bool(), as the Rust frontend reads it (Qwen3.5's template thinks only on a real true)
-    ({"chat_template_kwargs": {"enable_thinking": 1}}, {"enable_thinking": True}),
     # every key, as Muse Glimmer reads reasoning_strength and current_date; a flat key wins
     ({"chat_template_kwargs": {"reasoning_strength": "low", "current_date": "2026-11-08"},
       "reasoning_strength": "high"},
      {"reasoning_strength": "high", "current_date": "2026-11-08"}),
-], ids=["false", "truthy", "every-key"])
+], ids=["false", "every-key"])
 def test_a_thinking_chat_reads_the_template_kwargs_flat(adapter, fields, want, tmp_path):
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
     mk = adapter().chat_to_request(req, tmp_path).model_kwargs
     assert mk == want
+
+
+@pytest.mark.parametrize("adapter", [adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter], ids=lambda a: a.__name__)
+@pytest.mark.parametrize("thinking", ["false", 0, None])
+def test_a_thinking_chat_refuses_an_enable_thinking_that_is_not_a_boolean(adapter, thinking, tmp_path):
+    """Qwen3.5 thought on "false", which is truthy."""
+    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}],
+                                chat_template_kwargs={"enable_thinking": thinking})
+    with pytest.raises(ValueError, match="enable_thinking must be true or false"):
+        adapter().chat_to_request(req, tmp_path)
 
 
 def test_text_chat_maps_text_and_sampling(tmp_path):

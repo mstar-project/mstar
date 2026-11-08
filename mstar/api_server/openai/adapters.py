@@ -232,9 +232,10 @@ def _flatten_template_kwargs(mk: dict) -> None:
     template_kwargs = mk.pop("chat_template_kwargs", None) or {}
     if not isinstance(template_kwargs, dict):
         raise ValueError("chat_template_kwargs must be an object")
+    if not isinstance(template_kwargs.get("enable_thinking", False), bool):  # "false" is truthy
+        raise ValueError("chat_template_kwargs enable_thinking must be true or false")
     for key, value in template_kwargs.items():
-        # bool(), as Cosmos3's reasoner and the Rust frontend read it: Qwen3.5's template thinks only on a true
-        mk.setdefault(key, bool(value) if key == "enable_thinking" else value)
+        mk.setdefault(key, value)
 
 
 def _apply_sampling(
