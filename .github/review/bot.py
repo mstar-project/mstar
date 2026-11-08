@@ -108,9 +108,11 @@ IMPROVE_SCHEMA = {
 
 def run(argv, input=None, check=True, timeout=None):
     """Run `argv` (no shell). A failure raises with the end of what it printed, never its argv, which
-    can hold a token. Bytes that aren't UTF-8 pass through unchanged (surrogateescape)."""
-    r = subprocess.run(argv, input=input, capture_output=True, encoding="utf-8", errors="surrogateescape",
-                       timeout=timeout, check=False)
+    can hold a token. What it prints is exactly its bytes: those that aren't UTF-8 pass through
+    (surrogateescape), and with no newline translation a bare \\r inside a source line stays inside it."""
+    r = subprocess.run(argv, input=input if input is None else input.encode("utf-8", "surrogateescape"),
+                       capture_output=True, timeout=timeout, check=False)
+    r.stdout, r.stderr = r.stdout.decode("utf-8", "surrogateescape"), r.stderr.decode("utf-8", "surrogateescape")
     if check and r.returncode:
         raise RuntimeError(f"{os.path.basename(argv[0])} {argv[1] if len(argv) > 1 else ''} failed: "
                            f"{(r.stderr or r.stdout).strip()[-500:]}")
@@ -393,7 +395,11 @@ def resolve(out, repo, pr, mode, runner_temp, non_write=""):
     # Someone with write access: a timeout that only stops a runaway, like the turn cap.
     out["timeout"] = 25 if non_write else 300
     if mode == "":
-        restore(out, repo, pr, pull["head"]["sha"], runner_temp, non_write)
+        try:
+            restore(out, repo, pr, pull["head"]["sha"], runner_temp, non_write)
+        except Exception:  # a refusal too, so it can't overwrite the stopped review's comment
+            out.update(why="the saved handoff couldn't be read; try `/review continue` again", refused="true")
+            raise
     else:
         out["mode"] = mode if mode in ("nogpu", "full") else "light"  # sets the prompt's reporting bar
 
@@ -498,11 +504,13 @@ def stacked_above(repo, pull, head_sha):
 def file_patches(diff):
     """{"diff --git" line: the file's lines} of a unified diff. Lines end only at \\n: a form feed or
     U+2028 inside a source line (str.splitlines breaks on those) could fake a header and hide the code
-    around it."""
+    around it. A header that repeats adds to its file, never replaces it: git prints one twice for a
+    type change (the file deleted, then created)."""
     files, current = {}, None
     for line in re.findall(r".*\n|.+", diff):
         if line.startswith("diff --git "):
-            current = files[line] = [line]
+            current = files.setdefault(line, [])
+            current.append(line)
         elif current is not None:
             current.append(line)
     return files
@@ -510,8 +518,9 @@ def file_patches(diff):
 
 def patch_key(lines):
     """A file's patch as a rebase leaves it: no `@@` line numbers (the function name after them stays, so a
-    change moved to another function counts), and from the `index` line only the new blob when the file
-    has no hunks (binary, a pure rename), and nothing when it has: a rebase moves those blobs."""
+    change moved to another function counts), no `similarity index` or `dissimilarity index` line, and
+    from the `index` line only the new blob when the file has no hunks (binary, a pure rename), and nothing
+    when it has: a rebase moves those blobs, and what a rename is similar to."""
     hunks = any(line.startswith("@@") for line in lines)
     key = []
     for line in lines:
@@ -520,12 +529,14 @@ def patch_key(lines):
         elif line.startswith("index "):
             if not hunks:
                 key.append(line.split("..")[-1])
+        elif line.startswith(("similarity index ", "dissimilarity index ")):
+            continue
         else:
             key.append(line)
     return key
 
 
-DROPPED = "=== dropped since the last review: these were in the PR then, and aren't now ===\n"
+DROPPED = "=== dropped since the last review: these files as they were at the last review ===\n"
 
 
 def interdiff(old, new):

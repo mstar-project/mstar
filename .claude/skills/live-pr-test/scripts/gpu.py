@@ -347,6 +347,22 @@ class Provider:
     def run_dir(self, name: str, args) -> str | None:  # the directory a --run job keeps its files in, if any
         return None
 
+    def offers(self, gpus, min_vram, all_regions, allow_arm=False) -> list[dict]:
+        """The GPUs this provider offers now."""
+        raise NotImplementedError
+
+    def hf_home(self) -> str:
+        """Where the box keeps the Hugging Face cache."""
+        raise NotImplementedError
+
+    def status(self, e: dict) -> tuple[str, str | None, int]:
+        """(the instance's status, its ssh host if it has one yet, its ssh port)."""
+        raise NotImplementedError
+
+    def release(self, iid: str, e: dict) -> None:
+        """Release the instance."""
+        raise NotImplementedError
+
     @classmethod
     def pool(cls, cfg: dict, offer_id: str) -> list[dict]:
         """The offers a saved offer id is looked up among."""
@@ -619,7 +635,7 @@ class Eras(Provider):
         return st, ssh and ssh.get("host"), int((ssh or {}).get("port") or 22)
 
     def named(self, name):
-        return [i["id"] for i in eras_instances()
+        return [i["id"] for i in eras_items("/instances", 200)
                 if i.get("name") == name and i.get("status") not in ("ended", "releasing")]
 
     def release(self, iid, e):
@@ -627,7 +643,7 @@ class Eras(Provider):
 
     def running(self):
         prefix = self.job_prefix()
-        return [f"eras:{i['id']}  {i.get('name')}  {i.get('status')}" for i in eras_instances()
+        return [f"eras:{i['id']}  {i.get('name')}  {i.get('status')}" for i in eras_items("/instances", 200)
                 if str(i.get("name")).startswith(prefix) and i.get("status") not in ("ended", "releasing")]
 
 
@@ -971,7 +987,7 @@ def eras_ssh_key_id(pubkey: str, name: str) -> str:
     import hashlib
     blob = base64.b64decode(pubkey.split()[1])
     fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
-    for k in eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []:
+    for k in eras_items("/ssh-keys", 100):
         if k.get("fingerprint") == fingerprint:
             return k["id"]
     return eras("POST", "/ssh-keys", {"name": name, "public_key": pubkey})["id"]
@@ -1164,11 +1180,11 @@ def terminate(key: str, e: dict) -> None:
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
 
 
-def eras_instances() -> list[dict]:
-    """Every instance in the organization, across all pages."""
+def eras_items(path: str, page_size: int) -> list[dict]:
+    """Every item of an Eras list, across all pages."""
     items, token = [], None
     while True:
-        page = eras("GET", "/instances", params={"page_size": 200, **({"page_token": token} if token else {})})
+        page = eras("GET", path, params={"page_size": page_size, **({"page_token": token} if token else {})})
         items += page.get("items") or []
         if not (token := page.get("next_page_token")):
             return items
