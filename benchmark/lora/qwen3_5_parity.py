@@ -35,8 +35,9 @@ be rerun on its own:
     reference is reported, not judged.
 ``tp``
     Needs ``--tp 2`` or more GPUs and the captured single-GPU ``serve`` output. For each
-    ``MSTAR_TP_ASYNC_SCHED`` in ``--async-sched`` (default both 0 and 1): the same
-    server with the LLM node tensor-parallel, the ``serve`` requests checked against
+    ``MSTAR_TP_ASYNC_SCHED`` in ``--async-sched`` (default 0; 1, the async scheduler, is
+    refused with LoRA until #1082): the same server with the LLM node tensor-parallel,
+    the ``serve`` requests checked against
     the single-GPU run by the ``graphs`` rule, then an eviction-churn load on the same
     server (every adapter and the base model round-robin, more adapters than slots,
     concurrency 64) that must finish with no failed request and must have evicted.

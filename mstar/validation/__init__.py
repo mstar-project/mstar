@@ -69,7 +69,8 @@ def _lora_tp_problems(config: Mapping[str, Any], lora: list) -> list[str]:
     env = os.environ.get("MSTAR_TP_ASYNC_SCHED")
     on, only = _tp_async_sched_setting(env, config.get("tp_async_sched"))
     # the env var overrides the config, so it is the one to change when set
-    switch = (f"unset MSTAR_TP_ASYNC_SCHED (={env}) or set it to 0" if env
+    switch = (f"set MSTAR_TP_ASYNC_SCHED (now {env!r}, which overrides the config's tp_async_sched) "
+              "to 0 or to a node list without these nodes" if env
               else "set `tp_async_sched: false` (or leave these nodes out of its list)")
     lora_nodes = set().union(*(spec.nodes for spec in lora))
     problems = []
