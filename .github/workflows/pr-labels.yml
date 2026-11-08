@@ -21,12 +21,46 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: pr-labels-${{ github.event.pull_request.number || 'all' }}
-  cancel-in-progress: true
-
 jobs:
+  # A job of its own, outside the label job's cancel group, so a later event
+  # (an edit right after a push, say) can't cancel it, and a labelling failure
+  # can't skip it.
+  dismiss:
+    if: github.event.action == 'synchronize' || (github.event.action == 'edited' && github.event.changes.base)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - name: Mint the review app's token
+        if: vars.REVIEW_APP_CLIENT_ID != ''
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.REVIEW_APP_CLIENT_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+      - name: Dismiss the review bot's approval
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          python3 .github/review/gpu_review.py dismiss --pr "$PR" \
+            --message "New commits or a new base since the review bot approved; comment /review gpu for a new review."
+
   label:
+    concurrency:
+      group: pr-labels-${{ github.event.pull_request.number || 'all' }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -62,12 +96,3 @@ jobs:
           else
             python3 .github/labels/label_prs.py --repo "$GITHUB_REPOSITORY" --all
           fi
-      - name: Dismiss the review bot's approval
-        if: github.event.action == 'synchronize' || (github.event.action == 'edited' && github.event.changes.base)
-        env:
-          GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          python3 .github/review/gpu_review.py dismiss --pr "$PR" \
-            --message "New commits or a new base since the review bot approved; comment /review gpu for a new review."
