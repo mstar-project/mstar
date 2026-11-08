@@ -4,11 +4,11 @@ e4m3 with one fp32 scale per 128 x 128 block: a decode step reads half the bytes
 Decode batches meet the weights as bf16 (w8a16): a few tokens as fp32 FMAs on weights converted
 in registers (fused_moe.decode's per-pair GEMV), more as a bf16 ``tl.dot`` per scale block
 (e4m3 to bf16 is exact). The last program of an output tile sums its split-K partials in split
-order, so the result does not depend on scheduling. Larger batches quantize x to e4m3 per 128
-columns (W8A8): flashinfer's SM90 block-scale GEMM, then cuBLAS's. Where DeepGEMM is installed (an optional
-import), its SM90 block-scaled GEMM is a fourth W8A8 candidate: the kernel vLLM runs from 32 tokens.
+order, so the result does not depend on scheduling. The same kernel with an e4m3 dot (triton8) quantizes x
+per 128 columns in its loop (W8A8). Larger batches quantize x first: flashinfer's SM90 block-scale GEMM, then
+cuBLAS's; where DeepGEMM is installed (an optional import), its SM90 GEMM, the one vLLM runs from 32 tokens.
 
-Which of the three runs is the kernel registry's ``fp8_linear`` op: a GPU's table row for the
+Which of these runs is the kernel registry's ``fp8_linear`` op: a GPU's table row for the
 shape and token count where it has one (``mstar/kernels/tables/fp8_linear/``) and the GPU can run
 it, else the built-in rule in ``_builtin``.
 
@@ -359,6 +359,30 @@ def _probe_fi(device: torch.device) -> bool:
         return False
 
 
+@triton.jit
+def _swiglu_kernel(h, out, I: tl.constexpr, BLOCK: tl.constexpr):
+    """``out[t, c] = silu(h[t, c]) * h[t, I + c]`` over one token's BLOCK columns: act_and_mul_triton's math."""
+    t = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    live = c < I
+    gate = tl.load(h + t * (2 * I) + c, mask=live, other=0.0)
+    up = tl.load(h + t * (2 * I) + I + c, mask=live, other=0.0)
+    g32 = gate.to(tl.float32)
+    act = (g32 * tl.sigmoid(g32)).to(h.dtype.element_ty)
+    tl.store(out + t * I + c, (act * up).to(out.dtype.element_ty), mask=live)
+
+
+def _swiglu(h):
+    """SwiGLU of a ``[gate | up]`` GEMM output ``(M, 2 I)``. act_and_mul_triton gives each token one program,
+    which at a decode batch's few tokens walks 17408 columns on a few SMs (~12 us at M=1 for Qwen3.5-27B's
+    MLP); here each program takes BLOCK columns of one token."""
+    M, two_i = h.shape
+    out = torch.empty(M, two_i // 2, dtype=h.dtype, device=h.device)
+    block = 1024
+    _swiglu_kernel[(M, triton.cdiv(two_i // 2, block))](h, out, I=two_i // 2, BLOCK=block, num_warps=4)
+    return out
+
+
 def _probe_dg(device: torch.device) -> bool:
     """DeepGEMM is installed and its SM90 GEMM runs here (compiled and loaded before any capture)."""
     global _DG
@@ -413,16 +437,12 @@ def _quant_mn_major(x, group):
 def _dg(x, w, s, glu):
     """DeepGEMM's SM90 GEMM, ``fp8_gemm_nt``: x quantized per 128 columns, the weight's 128 x 128 scales as
     they are (its 1D2D kernel); SwiGLU after it with glu, as on flashinfer's path."""
-    from mstar.utils.fused_moe.kernels import act_and_mul_triton
-
     q, a_scale = _quant_mn_major(x, 128)
     h = torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
     _DG.fp8_gemm_nt((q, a_scale), (w.view(FP8_DTYPE), s), h)
     if not glu:
         return h
-    out = torch.empty(h.shape[0], h.shape[1] // 2, dtype=x.dtype, device=x.device)
-    act_and_mul_triton(h, out, activation="silu")
-    return out
+    return _swiglu(h)
 
 
 def _counters(device: torch.device) -> torch.Tensor:
@@ -548,7 +568,6 @@ def _w8a8(x, w, s, block_size, glu):
     (fused_moe.prefill's kernel), the weight's 128 x 128 scales as they are. cuBLAS wants the
     activation scales token-major with the token count a multiple of 4 (x is zero-padded) and
     the weight's K blocks padded to a multiple of 4."""
-    from mstar.utils.fused_moe.kernels import act_and_mul_triton
     from mstar.utils.fused_moe.prefill import _group_quant
 
     M, K = x.shape
@@ -561,23 +580,17 @@ def _w8a8(x, w, s, block_size, glu):
                     output_dtype=x.dtype)[:M]
     if not glu:
         return h
-    out = torch.empty(M, h.shape[1] // 2, dtype=x.dtype, device=x.device)
-    act_and_mul_triton(h, out, activation="silu")
-    return out
+    return _swiglu(h)
 
 
 def _fi(x, w, s, glu):
     """flashinfer's SM90 block-scale GEMM; it group-quantizes x per 128 columns itself."""
     from flashinfer.gemm import fp8_blockscale_gemm_sm90
 
-    from mstar.utils.fused_moe.kernels import act_and_mul_triton
-
     h = fp8_blockscale_gemm_sm90(x, w.view(FP8_DTYPE), None, s)
     if not glu:
         return h
-    out = torch.empty(h.shape[0], h.shape[1] // 2, dtype=x.dtype, device=x.device)
-    act_and_mul_triton(h, out, activation="silu")
-    return out
+    return _swiglu(h)
 
 
 @triton.jit
@@ -609,11 +622,7 @@ def _dequant_linear(x, w, s, block_size, glu):
     h = F.linear(x, dequantize(w, s, block_size, x.dtype))
     if not glu:
         return h
-    from mstar.utils.fused_moe.kernels import act_and_mul_triton
-
-    out = torch.empty(x.shape[0], h.shape[1] // 2, dtype=x.dtype, device=x.device)
-    act_and_mul_triton(h, out, activation="silu")
-    return out
+    return _swiglu(h)
 
 
 def _table_rows(device: torch.device, n: int, k: int, glu: bool):
