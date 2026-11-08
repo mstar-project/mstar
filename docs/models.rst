@@ -759,8 +759,9 @@ Qwen3-Omni notes
   At 1-2 tokens per-pair decode was 5-11% slower than grouped on one H200 box
   (torch 2.10, Triton 3.6) and 4-6% faster on another (torch 2.12.1, Triton
   3.7.1); at 4 tokens grouped beat the built-in 7 on both. A crossover keyed
-  by GPU name can't suit both boxes, so it takes grouped: at most about 6%
-  behind per-pair, where per-pair would be up to about 11% behind grouped.
+  by GPU name can't suit both boxes, so it takes grouped, which trails
+  per-pair by at most about 6% at 1-2 tokens, whereas per-pair would trail
+  grouped by up to about 11%.
   The Thinker at TP2 (expert width 384) has no H200 entry yet, so it keeps 7
   there, unmeasured.
 - ``configs/qwen3omni_pd_2gpu.yaml`` runs ``qwen3omni_pd_disaggregated.yaml``'s
