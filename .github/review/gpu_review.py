@@ -679,31 +679,36 @@ def published_media(results):
     return files
 
 
-def render_comment(pr, sha, lt, site=None, media_url=""):
-    """lt/comment.md for the PR and lt/verdict, and with `site`, that directory with the media and an
-    index.html of players."""
+def write_gallery(pr, sha, results, site):
+    """`site`: the published media of `results`, and an index.html of players. Nothing when there are none."""
+    files = published_media(results)
+    if not files:
+        return
+    rows = []
+    for p in files:
+        rel = p.relative_to(results).as_posix()
+        (site / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(p, site / rel)
+        kind = MEDIA[p.suffix.lower()]
+        tag = (f'<img src="{html.escape(rel)}" loading="lazy">' if kind == "img"
+               else f'<{kind} controls preload="none" src="{html.escape(rel)}"></{kind}>')
+        rows.append(f"<section><h3>{html.escape(rel)}</h3>{tag}</section>")
+    (site / "index.html").write_text(
+        "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+        f"<title>PR #{pr} live test media</title>"
+        "<style>body{font:14px system-ui;max-width:960px;margin:2em auto;padding:0 16px}"
+        "img,video{max-width:100%}audio{width:100%}</style>"
+        f"<h1>PR #{pr}, live test of {sha[:7]}</h1>" + "".join(rows))
+
+
+def render_comment(sha, lt, media_url=""):
+    """lt/comment.md for the PR and lt/verdict, links to the gallery's copies once `media_url` says it is
+    published; its verdict."""
     results = lt / "results"
     report = (results / "report.md").read_text() if (results / "report.md").exists() else ""
     result = json.loads((results / "result.json").read_text()) if (results / "result.json").exists() else {}
     files = published_media(results)
     rels = {p.relative_to(results).as_posix() for p in files}
-    if files and site:
-        site = Path(site)
-        rows = []
-        for p in files:
-            rel = p.relative_to(results).as_posix()
-            (site / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(p, site / rel)
-            kind = MEDIA[p.suffix.lower()]
-            tag = (f'<img src="{html.escape(rel)}" loading="lazy">' if kind == "img"
-                   else f'<{kind} controls preload="none" src="{html.escape(rel)}"></{kind}>')
-            rows.append(f"<section><h3>{html.escape(rel)}</h3>{tag}</section>")
-        (site / "index.html").write_text(
-            "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-            f"<title>PR #{pr} live test media</title>"
-            "<style>body{font:14px system-ui;max-width:960px;margin:2em auto;padding:0 16px}"
-            "img,video{max-width:100%}audio{width:100%}</style>"
-            f"<h1>PR #{pr}, live test of {sha[:7]}</h1>" + "".join(rows))
 
     def link(m):  # links to the gallery's media point at its copy; images show inline
         bang, text, rel = m[1], m[2], m[3]
@@ -734,7 +739,9 @@ def render_comment(pr, sha, lt, site=None, media_url=""):
 
 def comment(out, pr, head_sha, runner_temp):
     """Render the live test's comment and its media gallery ($RUNNER_TEMP/site) from the redacted report."""
-    out["verdict"] = render_comment(pr, head_sha, Path(runner_temp, "lt"), site=Path(runner_temp, "site"))
+    lt, site = Path(runner_temp, "lt"), Path(runner_temp, "site")
+    write_gallery(pr, head_sha, lt / "results", site)
+    out["verdict"] = render_comment(head_sha, lt)
     if Path(runner_temp, "site/index.html").exists():
         out["media"] = "true"
 
@@ -763,7 +770,7 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner)
     bot.run([*git, "-c", "user.name=mstar-review", "-c", "user.email=mstar-review@users.noreply.github.com", "commit",
              "-qm", "Live-test media, the newest runs"])
     bot.run([*git, "push", "-q", f"--force-with-lease={branch}:{old}", "origin", f"HEAD:{branch}"])
-    render_comment(pr, head_sha, Path(runner_temp, "lt"),
+    render_comment(head_sha, Path(runner_temp, "lt"),
                    media_url=f"https://{owner.lower()}.github.io/{media_repo}/pr-{pr}/{tag}")
 
 

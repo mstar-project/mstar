@@ -347,7 +347,8 @@ class TestComment(unittest.TestCase):
         for name, size in files:
             (out / "results/media" / name).write_bytes(b"0" * size)
         with contextlib.redirect_stdout(io.StringIO()):
-            gpu_review.render_comment(7, "0123456789", out, site=out / "site", media_url=media_url)
+            gpu_review.write_gallery(7, "0123456789", out / "results", out / "site")
+            gpu_review.render_comment("0123456789", out, media_url=media_url)
         return out, (out / "comment.md").read_text()
 
     def test_the_report_cant_forge_the_verdict_marker(self):
