@@ -118,10 +118,10 @@ SCHEMA = {
                 "why": {"type": "string", "description": "one line"},
             }, "required": ["what", "why"]}},
             # What the live test can't exercise in this PR; it stops the bot's approval, not the GPU run.
-            "untestable": {"type": "string", "description": "what in this PR the live test can't exercise: hardware "
-                                                            "the bot's GPUs aren't, more GPUs or nodes than a run "
-                                                            "gets, weights or services it can't get, anything else. "
-                                                            "Short; empty when there is nothing"},
+            "untestable": {"type": "string", "description": "what in this PR the live test cannot exercise: hardware "
+                                                            "other than the GPUs the bot runs on, more GPUs or nodes "
+                                                            "than a run gets, weights or services it cannot get, "
+                                                            "anything else. Short; empty when there is nothing"},
         }, "required": ["run", "reason", "checks", "gpus", "focus", "untestable"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
