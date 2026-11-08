@@ -8,9 +8,10 @@
 #   $WORKDIR/results/{media,bench,logs}   everything the run produces; copied back at the end
 #   $WORKDIR/env.sh   source this in every shell before using an arm
 #
-# --untrusted: the PR needed the trust question (SKILL.md step 1). Its code runs with the
-# compile caches, so save_caches refuses: a tarball it wrote would load its code into every
-# later run, main arms included.
+# --untrusted: the PR needed the trust question (SKILL.md step 1). Its compile caches hold code
+# that later runs load (Inductor's FX cache runs Python, Triton and FlashInfer load .so files),
+# so they go in $WORKDIR/compile rather than the HOME cache other runs share, and save_caches
+# refuses to put them in the shared tarball.
 #
 # Each arm gets its own venv because the editable install maps `mstar` to one checkout's
 # path, and a PR that touches rust/ needs its own mstar_rust: one shared venv would make
@@ -62,6 +63,10 @@ esac
 SM=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d .) || true
 [[ $SM =~ ^[0-9]+$ ]] || SM=unknown  # a failed nvidia-smi prints its error on stdout
 CACHE_TAR=$(dirname "$HF")/live-pr-compile-cache/sm$SM.tar
+COMPILE=$HOME/.cache/compile
+[ "$UNTRUSTED" = 0 ] || COMPILE=$WORKDIR/compile
+mkdir -p "$COMPILE"
+[ "$UNTRUSTED" = 0 ] || touch "$COMPILE/UNTRUSTED"  # in the cache itself, so no later env.sh can clear it
 cat > "$WORKDIR/env.sh" <<EOF
 export HF_PERSIST=$HF HF_HOME=$HF_SERVE
 export UV_CACHE_DIR=\$HOME/.cache/uv PIP_CACHE_DIR=\$HOME/.cache/pip
@@ -70,10 +75,11 @@ export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH
 export MSTAR_SHM_ARENA=1
 # Inductor/Triton autotune results and FlashInfer JIT builds, restored from and saved to
 # CACHE_TAR so a new box doesn't recompile every kernel. Keyed by compute capability.
-export TORCHINDUCTOR_CACHE_DIR=\$HOME/.cache/compile/inductor TRITON_CACHE_DIR=\$HOME/.cache/compile/triton
-export FLASHINFER_WORKSPACE_BASE=\$HOME/.cache/compile
+export COMPILE_CACHE=$COMPILE
+export TORCHINDUCTOR_CACHE_DIR=$COMPILE/inductor TRITON_CACHE_DIR=$COMPILE/triton
+export FLASHINFER_WORKSPACE_BASE=$COMPILE
 export CACHE_TAR="$CACHE_TAR"
-export LIVE_PR=$PR LIVE_WORKDIR=$WORKDIR LIVE_RESULTS=$WORKDIR/results LIVE_UNTRUSTED=$UNTRUSTED
+export LIVE_PR=$PR LIVE_WORKDIR=$WORKDIR LIVE_RESULTS=$WORKDIR/results
 # arm <pr|main>: activate that arm's venv and cd into its checkout
 arm() { deactivate 2>/dev/null || true; cd "$WORKDIR/\$1" && source .venv/bin/activate; }
 # stage_model <repo>: put a model in the local HF cache servers read. The Hub is the fast
@@ -89,17 +95,17 @@ stage_model() {
 }
 # save_caches: write the compile caches back to persistent storage (before terminating)
 save_caches() {
-  [ "\$LIVE_UNTRUSTED" = 0 ] || { echo "save_caches: not for a PR that needed the trust check (--untrusted)" >&2; return 1; }
-  mkdir -p "\$(dirname "\$CACHE_TAR")" && tar -C "\$HOME/.cache" -cf "\$HOME/compile-cache.tar" compile \
+  [ ! -e "\$COMPILE_CACHE/UNTRUSTED" ] || { echo "save_caches: these caches ran a PR that needed the trust check (--untrusted)" >&2; return 1; }
+  mkdir -p "\$(dirname "\$CACHE_TAR")" && tar -C "\$(dirname "\$COMPILE_CACHE")" -cf "\$HOME/compile-cache.tar" compile \
     && cp "\$HOME/compile-cache.tar" "\$CACHE_TAR.tmp" && mv "\$CACHE_TAR.tmp" "\$CACHE_TAR" && ls -lh "\$CACHE_TAR"
 }
 EOF
 # shellcheck disable=SC1091
 source "$WORKDIR/env.sh"
-mkdir -p "$HF" "$HF_HOME" "$HOME/.cache/compile"
+mkdir -p "$HF" "$HF_HOME"
 if [ -f "$CACHE_TAR" ]; then
-  cp "$CACHE_TAR" "$HOME/compile-cache.tar" && tar -C "$HOME/.cache" -xf "$HOME/compile-cache.tar" \
-    && echo "compile caches restored from $CACHE_TAR ($(du -sh "$HOME/.cache/compile" | cut -f1))"
+  cp "$CACHE_TAR" "$HOME/compile-cache.tar" && tar -C "$(dirname "$COMPILE")" -xf "$HOME/compile-cache.tar" \
+    && echo "compile caches restored from $CACHE_TAR ($(du -sh "$COMPILE" | cut -f1))"
 fi
 
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
