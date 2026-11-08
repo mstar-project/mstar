@@ -64,10 +64,10 @@ def _lora_tp_problems(config: Mapping[str, Any], lora: list) -> list[str]:
     The serial TP protocol admits every step before any teardown, so it is allowed."""
     import os
 
-    from mstar.worker.worker import _tp_async_sched_setting
+    from mstar.worker.lockstep import tp_async_sched_setting
 
     env = os.environ.get("MSTAR_TP_ASYNC_SCHED")
-    on, only = _tp_async_sched_setting(env, config.get("tp_async_sched"))
+    on, only = tp_async_sched_setting(env, config.get("tp_async_sched"))
     # the env var overrides the config, so it is the one to change when set
     switch = (f"set MSTAR_TP_ASYNC_SCHED (now {env!r}, which overrides the config's tp_async_sched) "
               "to 0 or to a node list without these nodes" if env
