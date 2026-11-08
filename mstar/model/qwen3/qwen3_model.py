@@ -1,5 +1,10 @@
 """Dense Qwen3 (Qwen3-8B and its siblings): text in, text out on one ``LLM``
 node, a packed prefill then a decode loop, on the shared Qwen3 decoder.
+
+``model_kwargs.draft`` turns on speculative decoding with a DSpark drafter
+(`mstar.model.components.dspark`): the drafter's layers join the target's KV
+pool, and every decode step drafts and verifies ``num_draft_tokens`` tokens.
+Without the block the model is plain Qwen3.
 """
 from __future__ import annotations
 
@@ -13,6 +18,8 @@ from jinja2 import TemplateError
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardConductorMetadata
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+from mstar.engine.resources.draft.config import DraftConfig
+from mstar.engine.resources.draft.drafter import ModelGeometry, VerifyNode, drafter_resources
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
@@ -38,6 +45,7 @@ from mstar.model.qwen3.config import (
     PREFILL_WALK,
     ROPE,
     SAMPLER,
+    checkpoint_dtype,
     qwen3_lm_config,
 )
 from mstar.model.submodule_base import NodeSubmodule
@@ -56,10 +64,10 @@ _REQUEST_KNOBS = tuple(f.name for f in dataclasses.fields(SamplingReqConfig) if 
 class Qwen3Model(Model):
     """``max_seq_len`` bounds prompt plus reply per request (default: the
     checkpoint's context); ``prefill_token_buckets`` replaces the captured
-    prefill ladder.
+    prefill ladder; ``draft`` is the speculative-decoding block.
     ``serve_min_tokens`` lets a request set ``min_tokens``: off by default,
     since barring the stop ids takes every sample step off FlashInfer's fused
-    sampler."""
+    sampler; never with ``draft``, where verify refuses ``min_tokens``."""
 
     def __init__(
         self,
@@ -68,6 +76,7 @@ class Qwen3Model(Model):
         max_seq_len: int | None = None,
         accelerator_graph: bool = True,
         prefill_token_buckets: list[int] | None = None,
+        draft: dict | None = None,
         serve_min_tokens: bool = False,
         **kwargs,
     ):
@@ -86,10 +95,37 @@ class Qwen3Model(Model):
         self.prefill_token_buckets = prefill_token_buckets
         generation = self.local_dir / "generation_config.json"
         self.generation = json.loads(generation.read_text()) if generation.is_file() else {}
+        self.draft = DraftConfig.from_model_kwargs({"draft": draft})
+        self.drafter_decl = None if self.draft is None else self._drafter(self.draft)
         self.serve_min_tokens = bool(serve_min_tokens)
+        if self.serve_min_tokens and self.draft is not None:
+            raise ValueError("serve_min_tokens: a verifying node refuses min_tokens; drop one of the two")
         self._tokenizer = None
         self._stop_token_ids: frozenset[int] | None = None
         self._submodule: NodeSubmodule | None = None
+
+    def _drafter(self, draft: DraftConfig):
+        """The drafter's declaration, from its checkpoint's config alone."""
+        from mstar.model.components.dspark import DSpark, DSparkConfig
+
+        if draft.method != "dspark":
+            raise ValueError(f"Qwen3 drafts with method dspark, not {draft.method!r}: its checkpoints ship no MTP")
+        directory = self._drafter_dir = resolve_snapshot_dir(
+            draft.model, cache_dir=self.cache_dir, allow_patterns=["*.json"],
+        )
+        dspark = DSparkConfig.from_hf(json.loads((directory / "config.json").read_text()))
+        if max(dspark.taps) >= self.config.num_hidden_layers:
+            # its checkpoint names the last layer's output, HF's hidden_states[L], which is after
+            # the final norm; the tap hook hands over the stream before it
+            raise ValueError(
+                f"the DSpark drafter reads target layer {max(dspark.taps) - 1}'s output, the last layer's, "
+                "which it was trained on after the final norm; the target's taps read the stream before it"
+            )
+        # its query heads and RoPE base are checked at startup (`geometry_problems`)
+        return DSpark(
+            dspark, draft.num_draft_tokens, kv_key=KV_CACHE, pos_key=ROPE, checkpoint=draft.model,
+            cache_dir=self.cache_dir,
+        )
 
     # ── tokenizer ──
 
@@ -121,16 +157,22 @@ class Qwen3Model(Model):
 
     # ── resources ──
 
+    def _kv_slack(self) -> int:
+        return 0 if self.draft is None else self.draft.kv_slack
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         config, nodes = self.config, {LLM_NODE}
+        slack = self._kv_slack()
         specs = [
             KVSpec(
-                resource_key=KV_CACHE, nodes=nodes,
+                resource_key=KV_CACHE, nodes=nodes, draft_slack=slack,
                 config=PagedKVConfig(
+                    # a drafter's layers join after the target's (`drafter_resources`)
                     num_layers=config.num_hidden_layers,
                     num_kv_heads=config.num_key_value_heads, num_qo_heads=config.num_attention_heads,
                     head_dim=config.head_dim,
-                    max_seq_len=self.max_seq_len,
+                    # two committed verify steps' worth past the serving limit
+                    max_seq_len=self.max_seq_len + slack,
                 ),
             ),
             AttentionSpec(resource_key=ATTN, nodes=nodes, config=AttentionConfig(kv_cache=KV_CACHE)),
@@ -139,14 +181,44 @@ class Qwen3Model(Model):
             ),
             SamplerSpec(
                 resource_key=SAMPLER, nodes=nodes, vocab_size=config.vocab_size,
+                # a verify step can't penalize per draft position
+                enable_repetion_penalty=self.draft is None, verifies=self.draft is not None,
                 # opt-in: without stop ids a min_tokens request is a 400
                 min_tokens_stop_ids=tuple(sorted(self.stop_token_ids)) if self.serve_min_tokens else (),
             ),
         ]
+        if self.drafter_decl is not None:
+            specs = drafter_resources(specs, self.drafter_decl, nodes)
         return specs
 
+    def verify_nodes(self) -> list[VerifyNode]:
+        if self.draft is None:
+            return []
+        if self.generation.get("repetition_penalty", 1) not in (None, 1, 1.0):
+            # it would be every request's default, which verifying refuses
+            raise ValueError(
+                f"the checkpoint defaults repetition_penalty to {self.generation['repetition_penalty']}, "
+                "which speculative decoding can't apply"
+            )
+        from mstar.model.qwen3.submodules import DEVICE_LOOPBACK, token_stop
+
+        config = self.config
+        return [VerifyNode(
+            LLM_NODE, DECODE_WALK, self.draft, self.drafter_decl.needs,
+            token_stop=token_stop(self.stop_token_ids), device_loopback=DEVICE_LOOPBACK,
+            input_kinds=frozenset({TEXT}),
+            target=ModelGeometry(
+                num_layers=config.num_hidden_layers, num_kv_heads=config.num_key_value_heads,
+                head_dim=config.head_dim, hidden_size=config.hidden_size, vocab_size=config.vocab_size,
+                dtype=checkpoint_dtype(self.hf_config),
+            ),
+            checkpoint=str(self._drafter_dir),
+            prefill_steps=self.drafter_decl.prefill_steps(), verify_steps=self.drafter_decl.verify_steps(),
+        )]
+
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        # the reply's ids extend the keys (an agent's next turn resends them)
+        # the reply's ids extend the keys (an agent's next turn resends them); the engine
+        # drops them on a walk that verifies, whose commits count rejected drafts
         return {KV_CACHE: {"main": KVLabel(
             growth=((DECODE_WALK, DECODE_LOOP),),
             keys=PrefixKeys("text_inputs", (PREFILL_WALK,), growth=True),
@@ -249,6 +321,8 @@ class Qwen3Model(Model):
             raise ValueError("prompt token ids must be within the vocabulary")
         layout = LabelLayout(
             spans=(Span("ids", PREFILL_WALK, n, n, "text_inputs"),), growth=((DECODE_LOOP, 1),),
+            # a verify step's reserved length runs past the kept tokens
+            scratch=self._kv_slack(),
         )
         return ProcessPromptOutput({"text_inputs": [ids]}, {"kv_layout": {KV_CACHE: {"main": layout}}})
 
@@ -307,21 +381,25 @@ class Qwen3Model(Model):
             if key.startswith(("model.", "lm_head."))
         )
         lm.requires_grad_(False).eval()
-        return self.make_submodule(lm)
+        return self.make_submodule(lm, device, tp_group, dtype or torch.bfloat16)
 
     def build_lm(self, device, tp_group=None, dtype: torch.dtype = torch.bfloat16):
-        """The decoder on ``device``, weights unset."""
+        """The target's module on ``device``, weights unset."""
         from mstar.model.components.qwen3_lm import Qwen3DenseLM
 
         with torch.device("meta"):
             lm = Qwen3DenseLM(self.config, attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=tp_group)
         return lm.to(dtype).to_empty(device=device)
 
-    def make_submodule(self, lm) -> NodeSubmodule:
-        """The node around a loaded decoder."""
+    def make_submodule(self, lm, device, tp_group=None, dtype: torch.dtype = torch.bfloat16) -> NodeSubmodule:
+        """The node around a loaded target, with the drafter the deployment names."""
         from mstar.model.qwen3.submodules import Qwen3LMSubmodule
 
+        drafter = None
+        if self.drafter_decl is not None:
+            drafter = self.drafter_decl.build(device=device, comm_group=tp_group, dtype=dtype, target=lm)
         return Qwen3LMSubmodule(
             lm, self.stop_token_ids, accelerator_graph=self.accelerator_graph,
-            prefill_token_buckets=self.prefill_token_buckets,
+            prefill_token_buckets=self.prefill_token_buckets, drafter=drafter,
+            drafter_decl=self.drafter_decl,
         )

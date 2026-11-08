@@ -90,9 +90,13 @@ class Qwen3DenseLM(nn.Module):
         kv_key: str,
         pos_key: str,
         comm_group: CommGroup | None = None,
+        kv_layer_offset: int = 0,
     ):
+        """``kv_layer_offset``: the KV pool layer of layer 0, for a stack whose
+        layers follow another's in one pool (a drafter's after its target's)."""
         super().__init__()
         self.config = config
+        self.kv_layer_offset = int(kv_layer_offset)
         comm_group = comm_group or CommGroup.trivial()
         self.embed_tokens = VocabParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -159,15 +163,29 @@ class Qwen3DenseLM(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor, *, label: str, taps=None) -> torch.Tensor:
         """``(tokens, hidden)`` -> ``(tokens, hidden)`` after the final norm.
 
         The label and layer index are cursors on the shared resources: bind
         the label once, advance the index per layer. Passing them as
         arguments instead would make inductor specialize on the int.
+        ``taps``: a drafter's `TapResource`, which ``run_layers`` hands the
+        residual stream entering its layers.
         """
         self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+        cursor = self._offset_cursor if self.kv_layer_offset else None
+        return run_layers(self.layers, input_embeds, self.norm, set_cursor=cursor, taps=taps)
+
+    @property
+    def kv_layers_unbound(self) -> bool:
+        """A drafter's stack before the engine binds its layers to the pool's layer set."""
+        from mstar.engine.resources.draft.drafter import UNBOUND_KV_LAYER
+
+        return self.kv_layer_offset == UNBOUND_KV_LAYER
+
+    @torch.compiler.disable
+    def _offset_cursor(self, i: int, attn: nn.Module) -> None:
+        attn.attend.set_layer_idx(self.kv_layer_offset + i)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
