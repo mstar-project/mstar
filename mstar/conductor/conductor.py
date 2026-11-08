@@ -2094,7 +2094,8 @@ class Conductor:
         it ends), and the partition is done past the last step. In a partition
         whose walk the stream moves (`Connection.consumer_walk`), the report
         names the step that ran; the conductor enters the next step only to
-        send it something, and otherwise leaves it to the stream.
+        send it something, and otherwise leaves it to the stream. A report of
+        a walk the plan doesn't run is a model bug, and fails the request.
         """
         pstate = request_data.partition_states[partition_name]
         plan, k, walk = pstate.plan, pstate.cursor, pstate.graph_walk
@@ -2105,7 +2106,10 @@ class Conductor:
             k = next((j for j in range(k, len(plan)) if plan[j].walk == walk), None)
             if k is None:
                 if all(step.walk != walk for step in plan[:pstate.cursor]):
-                    raise RuntimeError(f"partition {partition_name!r} ran walk {walk!r}, which its plan doesn't run")
+                    raise RuntimeError(
+                        f"{type(self.model).__name__}'s partition {partition_name!r} ran walk {walk!r}, "
+                        "which its plan doesn't run"
+                    )
                 # a walk the plan is past: only a lagging TP rank's report can name one, and with
                 # no pass number on the wire it can't be told apart, so it moves nothing
                 logger.debug("partition %s reported walk %s, which its plan is past", partition_name, walk)

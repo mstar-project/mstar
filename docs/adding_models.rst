@@ -180,8 +180,10 @@ You must implement these abstract methods:
    In a partition a stream moves (``Connection.consumer_walk``), the stream decides how
    many passes each step runs, but the conductor moves past a step on its first report
    when it is the last step (the partition ends) or the next step takes inputs it sends,
-   so such a step must run once (a ``Loop``, say). Qwen3.5 (through
-   ``MultimodalDecoderModel``), Z-Image, Orpheus and Chatterbox are references.
+   so such a step must run once (a ``Loop``, say). Its plan must list every walk the stream
+   can move it to: a report of a walk the plan doesn't run fails the request.
+   Qwen3.5 (through ``MultimodalDecoderModel``), Z-Image, Orpheus and Chatterbox are
+   references.
 
 ``get_submodule(self, node_name, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None, moe_parallel=None, cfg_group=None) -> NodeSubmodule | None``
    Build and return the ``NodeSubmodule`` for ``node_name``, and cache the result. Load

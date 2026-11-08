@@ -580,7 +580,7 @@ def test_a_stream_moved_report_of_a_walk_its_plan_is_past_moves_nothing():
     can't be told apart, so it neither fails the request nor moves the plan. A walk the plan
     never ran is a bug, and fails it."""
     c = Conductor.__new__(Conductor)
-    c.producer_triggered_partitions = {"B"}
+    c.model, c.producer_triggered_partitions = SimpleNamespace(), {"B"}
     c._walk_inputs, c._repeating_walks = {"x": (), "y": (("t", "n"),)}, frozenset()
     # the plan is at its last step; the report names its first
     pstate = PartitionState("B", plan=[WalkStep("x"), WalkStep("y"), WalkStep("z")], cursor=2)
