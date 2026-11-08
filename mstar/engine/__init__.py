@@ -73,7 +73,10 @@ def with_recompile_limit(fn, limit: int | None):
         config = torch._dynamo.config
         if limit <= config.recompile_limit:
             return fn(*args, **kwargs)
-        with config.patch(recompile_limit=limit):
+        # and dynamo's cap on a code object's entries in all, which past 256 would hold the
+        # captures over it uncompiled just the same
+        with config.patch(recompile_limit=limit,
+                          accumulated_recompile_limit=max(limit, config.accumulated_recompile_limit)):
             return fn(*args, **kwargs)
 
     return forward

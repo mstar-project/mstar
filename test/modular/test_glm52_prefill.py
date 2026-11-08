@@ -329,6 +329,7 @@ def test_the_runner_sizes_the_recompile_limit_for_a_config_s_ladder():
         )
 
     assert runner({}).recompile_limit is None  # the default buckets fit the engine's limit
-    buckets = list(range(64, 2049, 64))
+    # past dynamo's default 256 entries per code object, which the wrapper raises too
+    buckets = list(range(64, 4097, 32))
     shapes = len(buckets) + 7  # + the decode batch sizes
-    assert runner({"prefill": buckets}).recompile_limit >= 3 * shapes > recompile_limit()
+    assert runner({"prefill": buckets}).recompile_limit >= 3 * shapes > 256

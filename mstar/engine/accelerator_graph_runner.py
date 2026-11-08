@@ -801,19 +801,13 @@ class AcceleratorGraphRunner:
         engine's holds: an entry per compiled capture's token count
         (``compiled_entries_per_shape`` of them), and some for the engine's compiled forward,
         which shares the code objects. A capture past the limit would run uncompiled inside
-        its graph. Dynamo's cap of 256 entries per code object in all bounds it."""
+        its graph."""
         shapes = {
             (idx, n) for idx, config in enumerate(self._capture_configs) if config.compile
             for bs in self._batch_sizes(config) for n in config.get_total_tokens(bs)
         }
         need = self._submodule.compiled_entries_per_shape * len(shapes) + 16
-        if need > 256:
-            logger.warning(
-                "AcceleratorGraphRunner[%s]: %d captured token counts need a recompile limit of "
-                "%d, past dynamo's 256; the captures compiled last run uncompiled",
-                self._submodule_name, len(shapes), need,
-            )
-        return min(need, 256) if need > recompile_limit() else None
+        return need if need > recompile_limit() else None
 
     def max_capture_bs(self, walks: Collection[str]) -> int:
         """The widest capture of any of ``walks``, 0 when none of them has one."""

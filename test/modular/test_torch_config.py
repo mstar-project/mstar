@@ -39,11 +39,13 @@ def test_a_raised_recompile_limit_holds_inside_its_calls_only():
 
     config = torch._dynamo.config
     seen = []
-    before = config.recompile_limit
-    wrapped = with_recompile_limit(lambda: seen.append(config.recompile_limit), 200)
+    before = (config.recompile_limit, config.accumulated_recompile_limit)
+    wrapped = with_recompile_limit(
+        lambda: seen.append((config.recompile_limit, config.accumulated_recompile_limit)), 500)
     wrapped()
-    assert seen == [200]
-    assert config.recompile_limit == before
+    # past dynamo's per-code-object total too, or the entries over it would run uncompiled
+    assert seen == [(500, 500)]
+    assert (config.recompile_limit, config.accumulated_recompile_limit) == before
 
     def plain():
         return None
