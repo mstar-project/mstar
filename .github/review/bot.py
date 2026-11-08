@@ -21,6 +21,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 import render_summary
@@ -74,9 +75,10 @@ MONITOR_DAYS = 60
 ISSUE_COMMENTS = 2_000  # a bot issue past this rolls over to a new one; GitHub stops an issue at 2,500
 # How a PR's body says it fixes or reverts another, and the subjects `szz` treats as fixes.
 FIXES = re.compile(r"\b(?:fix(?:e[sd])?|revert(?:s|ed)?)\s+#(\d+)\b", re.IGNORECASE)
-# A fix-word that isn't straight away about a typo, a comment, docs or lint.
-FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd])?|bug(?:fix)?|revert(?:s|ed)?)\b"
-                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?|comments?|docs?|lint|format\w*)\b)", re.IGNORECASE)
+# A fix-word, unless all it fixes is a typo, a comment, docs or lint: such a word ending the subject.
+FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s|ed|ing)?)\b"
+                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?|comments?|docs?|lint|format\w*)\s*(?:\(#\d+\)\s*)?$)",
+                         re.IGNORECASE)
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
 # The weekly improvement run: how much a reader needs (PRs read, and comments kept per PR; characters of a
@@ -220,8 +222,9 @@ def comment_on_issue(repo, number, body):
 
 
 def ledger(repo, since):
-    """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments, each run once
-    (re-running its spend job records the same costs again), from every ledger issue. A failed read raises."""
+    """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments from every ledger
+    issue, once per run and attempt of what they cost. Re-running only a run's spend job records the same costs
+    again, with the attempt its usage came from; re-running all its jobs spends again. A failed read raises."""
     records, seen = [], set()
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
@@ -232,8 +235,9 @@ def ledger(repo, since):
                 record = json.loads(base64.b64decode(m[1]))
             except ValueError:
                 continue
-            if record.get("run") not in seen:
-                seen.add(record.get("run"))
+            key = record.get("run"), (record.get("usage") or {}).get("run_attempt") or record.get("attempt")
+            if key not in seen:
+                seen.add(key)
                 records.append((c["created_at"], record))
     return records
 
@@ -492,9 +496,11 @@ def stacked_above(repo, pull, head_sha):
 
 
 def diff_files(diff):
-    """{"diff --git" line: [its header lines, [its hunks, each a list of lines]]} of a unified diff."""
+    """{"diff --git" line: [its header lines, [its hunks, each a list of lines]]} of a unified diff. Lines
+    end only at \\n: a form feed or U+2028 inside a source line (str.splitlines breaks on those) could
+    fake a header and hide the code around it."""
     files, current = {}, None
-    for line in diff.splitlines(keepends=True):
+    for line in re.findall(r".*\n|.+", diff):
         if line.startswith("diff --git "):
             current = files[line] = [[line], []]
         elif current is None:
@@ -510,18 +516,23 @@ def diff_files(diff):
 
 def changes(hunk):
     """What a hunk changes: its runs of added and removed lines, each with the function on its `@@` line
-    and the context line on either side, so a change moved elsewhere in a file counts. The line numbers
-    stay out: a rebase shifts them."""
-    section, runs, run, above = hunk[0].split("@@", 2)[-1], [], [], ""
+    and the nearest non-blank context line on either side within the hunk, so a change moved elsewhere
+    in a file counts. The line numbers stay out: a rebase shifts them."""
+    section, runs, run, above, open_runs = hunk[0].split("@@", 2)[-1], [], [], "", []
     for line in hunk[1:]:
         if line.startswith(("+", "-", "\\")):
             run.append(line)
-        else:
-            if run:
-                runs.append((section, above, tuple(run), line))
-                run = []
+            continue
+        if run:
+            open_runs.append((section, above, tuple(run)))
+            run = []
+        if line.strip():
+            runs += [(*r, line) for r in open_runs]
+            open_runs = []
             above = line
-    return runs + [(section, above, tuple(run), "")] if run else runs
+    if run:
+        open_runs.append((section, above, tuple(run)))
+    return runs + [(*r, "") for r in open_runs]
 
 
 def header_change(head, hunks):
@@ -545,7 +556,8 @@ def not_in(files, others):
                 kept.append(h)
             else:
                 made -= runs
-        if kept or header_change(head, hunks) != header_change(other_head, other_hunks):
+        mine = header_change(head, hunks)
+        if kept or mine and mine != header_change(other_head, other_hunks):
             parts += head + [line for h in kept for line in h]
     return parts
 
@@ -978,8 +990,10 @@ def referenced(timeline, number, repo):
 
 
 def safe(text):
-    """Untrusted text for the status issue: redacted, on one line, unable to ping anyone or open a comment."""
-    return redact(" ".join(str(text or "").split())).replace("@", "@\u200b").replace("<!--", "&lt;!--")
+    """Untrusted text for the status issue: redacted, on one line, unable to ping anyone, open a comment or
+    mark another issue's timeline."""
+    return (redact(" ".join(str(text or "").split())).replace("@", "@\u200b").replace("<!--", "&lt;!--")
+            .replace("#", "#\u200b"))
 
 
 def szz(commits, shas, number, files, bug_prs=(), since=""):
@@ -993,7 +1007,7 @@ def szz(commits, shas, number, files, bug_prs=(), since=""):
         if fix_pr == number or not (FIX_SUBJECT.search(c["subject"]) or fix_pr in bug_prs):
             continue
         path = None
-        for line in run(["git", "show", "--format=", "-U0", c["sha"]], check=False).stdout.splitlines():
+        for line in run(["git", "show", "--format=", "-U0", c["sha"]], check=False).stdout.split("\n"):
             if line.startswith("--- "):
                 path = line[6:] if line.startswith("--- a/") else None
             hunk = re.match(r"@@ -(\d+)(?:,(\d+))? \+", line) if path in files else None
@@ -1001,7 +1015,7 @@ def szz(commits, shas, number, files, bug_prs=(), since=""):
                 continue
             blame = run(["git", "blame", "-l", "-s", *([f"--since={since}"] if since else []), "-L",
                          f"{hunk[1]},+{hunk[2] or 1}", f"{c['sha']}^", "--", path], check=False).stdout
-            for offset, row in enumerate(blame.splitlines()):
+            for offset, row in enumerate(blame.split("\n")):
                 if row.lstrip("^").split(" ")[0] in shas:
                     name = f"`#{fix_pr}`" if fix_pr else f"`{c['sha'][:10]}`"
                     at = int(hunk[1]) + offset
@@ -1070,7 +1084,7 @@ def monitor(out, repo, approvals=""):
     bug_prs = {i["number"] for i in api_list(f"repos/{repo}/issues?state=closed&labels=type%2Fbug&since={window}"
                                              "&per_page=100")
                if (i.get("pull_request") or {}).get("merged_at")}
-    rows, signals, linked = [], [], set()
+    rows, signals, linked, unread = [], [], set(), set()
     for pr in approved:
         try:
             pull = api(f"repos/{repo}/pulls/{pr}")
@@ -1082,6 +1096,7 @@ def monitor(out, repo, approvals=""):
             found, mentions = pr_signals(repo, {**pull, "number": pr}, commits, bug_prs, window)
         except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
             rows.append(f"| `#{pr}` | ? | couldn't read: {safe(e).replace('|', '/')} |")
+            unread.add(str(pr))
             continue
         signals += found
         linked |= {s["key"].split(":")[-1] for s in found if ":ref:" in s["key"]} | {m.lstrip("#") for m in mentions}
@@ -1106,7 +1121,8 @@ def monitor(out, repo, approvals=""):
     tail = ["", f"New PRs since the last report: {len(new_prs)}.",
             "#### New bug reports not linked to an approved PR"]
     tail += [f"- `#{i['number']}` {safe(i.get('title'))}" for i in bugs] or ["None."]
-    saved = {"last": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "signals": sorted(current)}
+    kept = {k for k in reported if k.split(":")[0] in unread}  # a failed read isn't a signal gone
+    saved = {"last": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "signals": sorted(set(current) | kept)}
     tail.append(f"\n<!-- review-monitor-state {base64.b64encode(json.dumps(saved).encode()).decode()} -->")
     while len("\n".join(head + rows + tail)) > 60_000 and rows:
         rows.pop()  # the oldest PRs go first: `approved` is newest first
@@ -1120,10 +1136,11 @@ def monitor(out, repo, approvals=""):
 # ---------------------------------------------------------------- improve (a weekly job)
 
 def scrub(text):
-    """Comment or model text for the weekly improvement run: `safe`, clipped, and without names, links or
-    #references, so it can't name anyone, load an image or mark a PR's timeline."""
-    text = re.sub(r"https?://\S+", "[link]", re.sub(r"@[\w-]+", "@someone", str(text or "")))
-    return safe(text).replace("#", "#\u200b")[:IMPROVE_TEXT]
+    """Comment or model text for the weekly improvement run: `safe`, clipped, and without names, links,
+    markup or references, so it can't name anyone, load an image or mark a PR's timeline."""
+    text = re.sub(r"(?i)(?:[a-z][a-z0-9+.-]*:)?//\S+|\bwww\.\S+", "[link]",
+                  re.sub(r"@[\w-]+", "@someone", str(text or "")))
+    return safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "&lt;")[:IMPROVE_TEXT]
 
 
 def monday(now):
@@ -1178,7 +1195,7 @@ def improve_inputs(out, repo, key_set):
     if key_set != "true":
         print("::warning::ANTHROPIC_API_KEY is not set; skipping the improvement run.")
         return
-    stop = over_cap(repo)
+    stop = over_cap(repo)  # its alert is best effort: this job's token can only read issues
     if stop:
         print(f"::notice::{stop}")
         return
@@ -1214,9 +1231,9 @@ def improve_inputs(out, repo, key_set):
 
 def improve_post(out, repo, github_run_id, github_run_attempt, output="", usage=""):
     """Record what the improvement run cost, first, so a failed post can't lose it; then open the week's issue
-    from its structured output, redacted, on stdin. Evidence links stay inside this repository and go through
-    redirect.github.com, which keeps them off the PRs' timelines. An empty list opens nothing; a run that
-    returned no list fails. Never touches code, PRs or the bot."""
+    from its structured output, redacted, on stdin. Evidence links stay inside this repository (no `..`, which
+    would climb out of it) and go through redirect.github.com, which keeps them off the PRs' timelines. An empty
+    list opens nothing; a run that returned no list fails. Never touches code, PRs or the bot."""
     record(out, repo, "", github_run_id, github_run_attempt, usage=usage)
     try:
         items = json.loads(output)["improvements"]
@@ -1228,7 +1245,8 @@ def improve_post(out, repo, github_run_id, github_run_attempt, output="", usage=
     link = re.compile(rf"https://github\.com/({re.escape(repo)}/[\w./?=#&%-]+)")
     parts = ["What the review bot could improve about itself, most useful first. It changes nothing on its own."]
     for n, item in enumerate(items, 1):
-        links = [f"- https://redirect.github.com/{m[1]}" for m in map(link.fullmatch, item["evidence"]) if m]
+        links = [f"- https://redirect.github.com/{m[1]}" for m in map(link.fullmatch, item["evidence"])
+                 if m and ".." not in urllib.parse.unquote(m[1])]
         parts.append("\n".join([f"### {n}. {scrub(item['title'])}", "", f"**Change:** {scrub(item['change'])}", "",
                                 f"**Where:** {scrub(item['where'])}", "", "**Evidence:**", *links]))
     body = json.dumps({"title": f"Review bot: what to improve, week of {monday(utcnow())}",

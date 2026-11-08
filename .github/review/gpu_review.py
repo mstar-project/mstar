@@ -39,10 +39,10 @@ NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/ci/")
 NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py", "Cargo.toml", "rust-toolchain.toml",
                "requirements*.txt")
 # Approved only as a comment that doesn't count toward required reviews.
-MAX_BOX_USD = 500  # what a box's own claude.json can claim for one run; a box controls that file
 NO_COUNT_AREAS = {"area/engine", "area/resources"}
 # No runtime code: a review's `none` alone approves a change only to these.
 NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
+MAX_BOX_USD = 500  # what a box's own claude.json can claim for one run; a box controls that file
 ERAS_OUT = "/workspace/live-pr/out"
 # The kinds of check the review can ask for (the schema's `checks`), as the brief names them.
 CHECKS = {"correctness": "correctness (served output, parity, regressions)",
@@ -400,7 +400,7 @@ def run_cost(lt, now):
         gpu_usd = max(0.0, e["usd_per_hour"] * (min(now, e["deadline"]) - e["launched_at"]) / 3600)
     try:
         box_usd = float(json.loads((lt / "results/claude.json").read_text()).get("total_cost_usd") or 0)
-    except (OSError, ValueError, AttributeError, TypeError, OverflowError):
+    except (OSError, ValueError, AttributeError, TypeError, OverflowError, RecursionError):
         box_usd = 0.0
     if not 0 <= box_usd <= MAX_BOX_USD:  # NaN fails this too
         box_usd = 0.0
@@ -482,7 +482,7 @@ def reasons_not_to_approve(pr, sha, verdict, since, review):
         why.append("the PR has new commits since the reviewed one")
     perm = bot.permission(REPO, pull["user"]["login"])
     if perm not in WRITE:
-        why.append(f"the author has {perm} access, not write")
+        why.append(f"the author's access is {perm}, not write")
     # `skipped`: the review chose `none` and the workflow let it stand (the last live test passed on an
     # ancestor, or there is none and the review didn't build on an earlier one or the PR changes no
     # runtime code). On runtime code it counts only after that passing live test (below).
@@ -578,8 +578,14 @@ def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
                                        f"P0–P2 finding, and {tested}. A push dismisses it.")
     # A push between the check and the approval would leave it on a commit nobody tested.
     if bot.api(f"repos/{REPO}/pulls/{pr}")["head"]["sha"] != head_sha:
-        decision.write_text(f"**Not approved:** new commits arrived while approving `{head_sha[:7]}`.\n")
-        dismiss_approvals(pr, "new commits arrived while approving")
+        said = f"**Not approved:** new commits arrived while approving `{head_sha[:7]}`.\n"
+        try:
+            dismiss_approvals(pr, "new commits arrived while approving")
+        except (SystemExit, RuntimeError, ValueError, KeyError, TypeError):
+            decision.write_text(said + f"The approval on `{head_sha[:7]}` couldn't be withdrawn: a maintainer needs "
+                                "to dismiss it.\n")
+            raise
+        decision.write_text(said)
         return
     out["approval"] = "approve"
     decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")
