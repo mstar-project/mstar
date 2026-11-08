@@ -232,8 +232,6 @@ def _flatten_template_kwargs(mk: dict) -> None:
     template_kwargs = mk.pop("chat_template_kwargs", None) or {}
     if not isinstance(template_kwargs, dict):
         raise ValueError("chat_template_kwargs must be an object")
-    if not isinstance(template_kwargs.get("enable_thinking", False), bool):  # "false" is truthy
-        raise ValueError("chat_template_kwargs enable_thinking must be true or false")
     for key, value in template_kwargs.items():
         mk.setdefault(key, value)
 

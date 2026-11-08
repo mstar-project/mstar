@@ -697,17 +697,12 @@ fn text_chat(
 }
 
 /// `chat_template_kwargs` read as `_flatten_template_kwargs` does: a falsy
-/// value is no kwargs, anything else but an object is refused, and so is an
-/// `enable_thinking` that is not a bool (`"false"` is truthy).
+/// value is no kwargs, and anything else but an object is refused.
 fn template_kwargs(kwargs: Option<&Value>) -> Result<Map<String, Value>, String> {
-    let m = match kwargs {
-        Some(Value::Object(m)) => m.clone(),
-        Some(v) if truthy(v) => return Err("chat_template_kwargs must be an object".to_string()),
-        _ => Map::new(),
-    };
-    match m.get("enable_thinking") {
-        Some(v) if !v.is_boolean() => Err("chat_template_kwargs enable_thinking must be true or false".to_string()),
-        _ => Ok(m),
+    match kwargs {
+        Some(Value::Object(m)) => Ok(m.clone()),
+        Some(v) if truthy(v) => Err("chat_template_kwargs must be an object".to_string()),
+        _ => Ok(Map::new()),
     }
 }
 
@@ -1017,17 +1012,6 @@ mod tests {
             r#""chat_template_kwargs":1.5"#,
         ] {
             assert_eq!(chat(fields).unwrap_err(), "chat_template_kwargs must be an object", "{fields}");
-        }
-        for fields in [
-            r#""chat_template_kwargs":{"enable_thinking":"false"}"#,
-            r#""chat_template_kwargs":{"enable_thinking":0}"#,
-            r#""chat_template_kwargs":{"enable_thinking":null}"#,
-        ] {
-            assert_eq!(
-                chat(fields).unwrap_err(),
-                "chat_template_kwargs enable_thinking must be true or false",
-                "{fields}"
-            );
         }
         let mk = chat(
             r#""chat_template_kwargs":{"reasoning_strength":"low","current_date":"2026-11-08","enable_thinking":false},
