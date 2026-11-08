@@ -512,7 +512,8 @@ class Resource(ResidentHooks, ABC):
         return
 
     def land_rebuild(self, rid: str) -> None:
-        """The dropped request's rebuild has run its last chunk."""
+        """The dropped request's rebuild has run its last chunk, and that chunk's commit has run, so the resource
+        holds everything the rebuild wrote."""
         return
 
     def reload(self, rid: str) -> bool:
