@@ -123,6 +123,8 @@ class RankRebuilds(Protocol):
 
     def rebuilding(self, rid: int, node: str) -> bool: ...
 
+    def forget(self, rid: int, node: str) -> None: ...
+
 
 @contextmanager
 def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None]:
@@ -3260,6 +3262,11 @@ class Engine:
         if node_name in self._tp_leader_nodes:
             self._journal(MoveKind.LAND, request_id, node=node_name)
 
+    def keeps_no_ids(self, node_name: str, request_id: int) -> None:
+        """Rank 0 journals that the request keeps no ids on the node, so each follower gives back the ones it kept."""
+        if node_name in self._tp_leader_nodes:
+            self._journal(MoveKind.FORGET, request_id, node=node_name)
+
     def _land_rebuild(self, node_name: str, request_id: int) -> None:
         for resource in self._submodules[node_name].resources.values():
             resource.land_rebuild(request_id)
@@ -3437,6 +3444,8 @@ class Engine:
                     )
                 self._land_rebuild(node_name, rid)
                 logger.debug("Replayed rank 0's LAND of request %s on %s", wire_rid, node_name)
+            elif kind == MoveKind.FORGET:
+                rebuilds.forget(rid, node_name)
             elif kind == MoveKind.OFFLOAD:
                 hosted = any(kv.cache.moves_to_host(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes)
                 if self.residency(node_name, rid) is Residency.ON_HOST:

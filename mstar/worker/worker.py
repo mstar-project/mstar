@@ -2352,7 +2352,8 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        self._rebuilds.keep_prompts(batch_N.node_batch)
+        for rid in self._rebuilds.keep_prompts(batch_N.node_batch, spill=self.lockstep.follows(batch_N.node_name)):
+            engine.keeps_no_ids(batch_N.node_name, rid)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(

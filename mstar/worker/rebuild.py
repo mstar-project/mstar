@@ -180,26 +180,34 @@ class Rebuilds:
                     self._droppable[node].add(rid)
         return rebuildable
 
-    def keep_prompts(self, node_batch: ExecutingBatch) -> None:
-        """Copy a row's prompt to the host once the step that read the prompt completes, when the row is in the
-        policy's walk, a drop here can free its request's pages, and the request keeps no ids yet. A row the pool can't
-        hold keeps none."""
+    def keep_prompts(self, node_batch: ExecutingBatch, spill: bool = False) -> list[int]:
+        """Copy a row's prompt to the host once the first step that read the prompt completes, when the row is in the
+        policy's walk and a drop here can free its request's pages. Returns the rows the pool can't hold, which keep
+        no ids.
+
+        ``spill`` copies them outside the pool instead, for a TP follower. Each rank gives a slice back at its own
+        teardown, so a follower's pool can be fuller than rank 0's when rank 0 keeps a request's ids. The follower
+        gives back the ids of a request rank 0 kept none for at `forget`."""
         policy = self._policies.get(node_batch.node_name)
         if self._pool is None or policy is None:
-            return
+            return []
         walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
         if walk != policy.walk and policy.walk not in walks.values():
-            return
+            return []
         kept, droppable = self._kept[node_batch.node_name], self._droppable[node_batch.node_name]
+        unkept = []
         for rid, row in node_batch.per_request_input_tensors.items():
             # a TP follower's unread row has no inputs, and the step fails it
             if not row or rid in kept or rid not in droppable or walks.get(rid, walk) != policy.walk:
                 continue
             prompt = row[policy.ids_input][0]
-            copy = self._pool.copy_out(prompt, node_batch.completion_event)
+            copy = self._pool.copy_out(prompt, node_batch.completion_event, spill)
             if copy is not None:
                 kept[rid] = KeptIds(copy, array("i"))
-            elif node_batch.node_name not in self._logged_full:
+                continue
+            droppable.discard(rid)
+            unkept.append(rid)
+            if node_batch.node_name not in self._logged_full:
                 self._logged_full.add(node_batch.node_name)
                 logger.warning(
                     "%s: the rebuild host pool has no room for a %d-byte prompt, with %d of %d bytes in use, so its "
@@ -207,6 +215,7 @@ class Rebuilds:
                     "serving config's rebuild_host_mb sizes the pool.",
                     node_batch.node_name, prompt.nbytes, self._pool.nbytes_used(), self._pool.nbytes,
                 )
+        return unkept
 
     def keep_samples(
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
@@ -330,12 +339,16 @@ class Rebuilds:
             return None
         return self._cursors.pop((node, rid))
 
+    def forget(self, rid: int, node: str) -> None:
+        """Give back the ids ``rid`` keeps on ``node``, and keep none from here on."""
+        self._droppable[node].discard(rid)
+        ids = self._kept[node].pop(rid, None)
+        if ids is not None and ids.prompt.slice is not None:
+            self._pool.give(ids.prompt.slice)
+
     def remove_request(self, rid: int) -> None:
-        for node, kept in self._kept.items():
-            self._droppable[node].discard(rid)
-            ids = kept.pop(rid, None)
-            if ids is not None:
-                self._pool.give(ids.prompt.slice)
+        for node in self._kept:
+            self.forget(rid, node)
             self._cursors.pop((node, rid), None)
 
 

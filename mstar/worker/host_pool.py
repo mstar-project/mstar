@@ -19,9 +19,9 @@ class HostSlice(NamedTuple):
 
 
 class HostCopy(NamedTuple):
-    """A device tensor copied into the pool: its slice, a view of the slice, and the event that records the
-    copy, None when it copied in place."""
-    slice: HostSlice
+    """A device tensor copied into the pool: its slice, None for a copy outside the pool, a view of the copy, and
+    the event that records the copy, None when it copied in place."""
+    slice: HostSlice | None
     view: torch.Tensor
     landed: torch.Event | None
 
@@ -68,13 +68,18 @@ class HostPool:
             start = self._free.pop(i).offset
         self._free.insert(i, HostSlice(start, end - start))
 
-    def copy_out(self, src: torch.Tensor, after: torch.Event | None) -> HostCopy | None:
+    def copy_out(self, src: torch.Tensor, after: torch.Event | None, spill: bool = False) -> HostCopy | None:
         """Copy ``src`` as it is into a slice once ``after`` (the step that wrote it) completes, running nothing on
-        the device but the copy. None when no free slice holds it."""
+        the device but the copy. None when no free slice holds it, unless ``spill``, which copies it outside the pool
+        then."""
         piece = self.take(src.nbytes)
-        if piece is None:
+        if piece is not None:
+            memory = self._memory[piece.offset:piece.offset + src.nbytes]
+        elif spill:
+            memory = torch.empty(src.nbytes, dtype=torch.uint8, pin_memory=DeviceCapability.of(self.device).pin_memory)
+        else:
             return None
-        view = self._memory[piece.offset:piece.offset + src.nbytes].view(src.dtype).view(src.shape)
+        view = memory.view(src.dtype).view(src.shape)
         if after is None:
             view.copy_(src)
             return HostCopy(piece, view, None)
