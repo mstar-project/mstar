@@ -31,7 +31,7 @@ from mstar.utils.fp8_block import FP8_DTYPE
 
 DEFAULT_BUCKETS = (1, 2, 4, 8, 16, 24, 32, 48, 64, 128, 256, 512, 1024, 2048)
 W8A16_SWEEP_MAX = 64
-TRITON8_SWEEP_MAX = 128
+TRITON8_SWEEP_MAX = 64
 MAX_REL_L2 = 0.06
 # enough weight copies that a rotation outgrows any GPU's L2
 ROTATION_BYTES = 256 << 20
@@ -51,8 +51,8 @@ def w8a16_candidates(m: int, k: int, quick: bool = False) -> Iterator[dict]:
 
 def triton8_candidates(k: int, quick: bool = False) -> Iterator[dict]:
     """triton8 tiles worth timing: output columns, K split, pipeline depth, warps (the token tile follows M)."""
-    grid = itertools.product((64, 128) if quick else (32, 64, 128), (1, 2, 4, 8), (3, 4) if quick else (3, 4, 5),
-                             (4,) if quick else (4, 8))
+    grid = itertools.product((64, 128) if quick else (32, 64, 128), (2, 4, 8) if quick else (1, 2, 4, 8),
+                             (3, 4) if quick else (3, 4, 5), (4,) if quick else (4, 8))
     for bn, split, stages, warps in grid:
         if k % (split * 128) == 0:
             yield dict(BN=bn, SPLIT=split, STAGES=stages, num_warps=warps)
