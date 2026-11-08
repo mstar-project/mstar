@@ -30,8 +30,9 @@ def fake_slurm(replies, calls=None):
     return slurm_run
 
 
-def thread(comment_id, body, outdated=False):
-    return {"isOutdated": outdated}, {"databaseId": comment_id, "author": {"login": "mstar-review"}, "body": body}
+def thread(comment_id, body, outdated=False, resolved=False):
+    first = {"databaseId": comment_id, "author": {"login": "mstar-review"}, "body": body}
+    return {"isOutdated": outdated, "isResolved": resolved, "comments": {"nodes": [first]}}
 
 
 def review(prior=(), outside=()):
@@ -41,7 +42,7 @@ def review(prior=(), outside=()):
 class TestApproval(unittest.TestCase):
     def test_open_findings_block_however_their_threads_were_closed(self):
         threads = [
-            thread(1, "**[P1]** resolved by the author, never fixed"),
+            thread(1, "**[P1]** resolved by the author, never fixed", resolved=True),
             thread(2, "**[P1]** judged fixed by the re-review"),
             thread(3, "**[P2]** its lines changed", outdated=True),
             thread(4, "**[P3]** a nit"),
@@ -50,7 +51,8 @@ class TestApproval(unittest.TestCase):
         prior = [{"ref": "2", "priority": "P1", "status": "fixed", "why": "guard added"},
                  {"ref": "3", "priority": "P2", "status": "open", "why": "moved, not fixed"}]
         outside = [{"priority": "P2", "location": "mstar/engine/engine.py:10", "claim": "c", "detail": "d"}]
-        found = blocking(review(prior, outside), threads)
+        found = blocking(review(prior, outside), [{"data": {"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": threads}}}}}])
         self.assertEqual(len(found), 4, found)
         for expected in ("inline 1", "inline 5", "engine.py:10", "earlier 3"):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")

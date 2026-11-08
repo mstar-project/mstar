@@ -7,7 +7,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUMMARY = runpy.run_path(str(REPO_ROOT / ".github/review/render_summary.py"))
-render, open_priorities, read_state = SUMMARY["render"], SUMMARY["open_priorities"], SUMMARY["read_state"]
+render, open_findings, read_state = SUMMARY["render"], SUMMARY["open_findings"], SUMMARY["read_state"]
 
 
 def review(skipped=(), prior=()):
@@ -28,25 +28,28 @@ def thread(priority, resolved=False, outdated=False, login="mstar-review", comme
 
 class TestReviewSummary(unittest.TestCase):
     def test_an_open_p1_makes_the_status_red(self):
-        inline = open_priorities(threads(thread("P1"), thread("P2")))
-        text = render(review(), inline, "0123456789", "light")
+        text = render(review(), threads(thread("P1"), thread("P2")), "0123456789", "light")
         self.assertIn("\n🔴 **1 P1, 1 P2** on `0123456`, light review", text)
 
     def test_threads_from_before_the_review_app_still_count(self):
-        inline = open_priorities(threads(thread("P1", login="github-actions"), thread("P2", login="Gaurav-Shah05")))
-        self.assertEqual(inline, [("7", "P1")], "a finding posted as github-actions would drop out of the count")
+        found = open_findings(review(), threads(thread("P1", login="github-actions"),
+                                                thread("P2", login="Gaurav-Shah05")))
+        self.assertEqual(found, [("inline 7", "P1")], "a finding posted as github-actions would drop out of the count")
 
-    def test_resolved_and_outdated_threads_are_not_counted(self):
-        inline = open_priorities(threads(thread("P1", resolved=True), thread("P1", outdated=True)))
-        self.assertEqual(inline, [], "a fixed or dismissed finding would keep the status red")
+    def test_a_resolved_thread_counts_until_a_re_review_clears_it(self):
+        pages = threads(thread("P1", resolved=True, comment_id=7), thread("P1", outdated=True, comment_id=8))
+        self.assertEqual(open_findings(review(), pages), [("inline 7", "P1")],
+                         "resolving a thread would clear a finding nobody fixed")
+        fixed = [{"ref": "7", "priority": "P1", "status": "fixed", "why": "guard added"}]
+        self.assertEqual(open_findings(review(prior=fixed), pages), [], "a fixed finding would keep the status red")
 
     def test_an_earlier_finding_judged_open_counts_once_whatever_its_thread(self):
         # The author resolved thread 8 without fixing it; thread 7 is still open and also judged open.
         prior = [{"ref": "8", "priority": "P1", "status": "open", "why": "unchanged"},
                  {"ref": "7", "priority": "P2", "status": "open", "why": "unchanged"},
                  {"ref": "9", "priority": "P1", "status": "fixed", "why": "guard added"}]
-        inline = open_priorities(threads(thread("P2", comment_id=7), thread("P1", resolved=True, comment_id=8)))
-        text = render(review(prior=prior), inline, "0123456789", "light")
+        pages = threads(thread("P2", comment_id=7), thread("P1", resolved=True, comment_id=8))
+        text = render(review(prior=prior), pages, "0123456789", "light")
         self.assertIn("🔴 **1 P1, 1 P2**", text, "resolving a thread would clear a finding the re-review found open")
 
     def test_state_survives_model_text_that_closes_a_comment(self):

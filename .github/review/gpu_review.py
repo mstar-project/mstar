@@ -29,6 +29,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 GPU = ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"
+SUMMARY = runpy.run_path(str(Path(__file__).with_name("render_summary.py")))
 BOX = Path(__file__).with_name("gpu_review_box.sh")
 REPO = os.environ.get("REPO", "mstar-project/mstar")
 BOT_LOGINS = ("mstar-review", "mstar-review[bot]", "github-actions", "github-actions[bot]")
@@ -207,42 +208,19 @@ def cmd_cleanup(a):
 
 # ---------------------------------------------------------------- approval
 
-def bot_threads(pr):
+def review_threads(pr):
     q = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
       repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
         reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor }
           nodes { isOutdated comments(first: 1) { nodes { databaseId author { login } body } } } } } } }"""
     owner, name = REPO.split("/")
-    raw = gh("api", "graphql", "--paginate", "--slurp", "-F", f"owner={owner}", "-F", f"name={name}",
-             "-F", f"pr={pr}", "-f", f"query={q}").stdout
-    for page in json.loads(raw):
-        for t in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
-            first = t["comments"]["nodes"][0]
-            if first["author"] and first["author"]["login"] in BOT_LOGINS:
-                yield t, first
+    return json.loads(gh("api", "graphql", "--paginate", "--slurp", "-F", f"owner={owner}", "-F", f"name={name}",
+                         "-F", f"pr={pr}", "-f", f"query={q}").stdout)
 
 
-def blocking(review, threads):
-    """The open P0–P2 findings. A thread the author resolved still counts: only a re-review that
-    judged it fixed or moot, or a commit that made it outdated, clears it. An untagged bot thread
-    counts too, since its priority is unknown."""
-    prior = review.get("prior_findings", [])
-    cleared = {f["ref"] for f in prior if f["status"] in ("fixed", "moot")}
-    found, counted = [], set()
-    for t, first in threads:
-        ref = str(first["databaseId"])
-        if t["isOutdated"] or ref in cleared:
-            continue
-        m = TAG.match(first["body"])
-        if not m or m[1] != "P3":
-            found.append(f"inline {ref} ({m[1] if m else 'untagged'})")
-            counted.add(ref)
-    found += [f"outside the diff, {f['location']} ({f['priority']})"
-              for f in review["outside_diff"] if f["priority"] != "P3"]
-    # Judged still open, though its thread went outdated or it was outside the diff.
-    found += [f"earlier {f['ref']} ({f['priority']})" for f in prior
-              if f["status"] == "open" and f["priority"] != "P3" and f["ref"] not in counted]
-    return found
+def blocking(review, pages):
+    """The open P0–P2 findings, by the summary's own rule (render_summary.open_findings)."""
+    return [f"{where} ({p})" for where, p in SUMMARY["open_findings"](review, pages) if p != "P3"]
 
 
 def risky_files(files, repo_root):
@@ -282,7 +260,7 @@ def reasons_not_to_approve(a, review):
         why.append(f"{len(review['questions'])} open question(s)")
     if review.get("skipped"):
         why.append("the review skipped files")
-    open_ = blocking(review, bot_threads(a.pr))
+    open_ = blocking(review, review_threads(a.pr))
     if open_:
         why.append("open P0–P2 findings: " + ", ".join(open_))
     cmp = gh_json(f"repos/{REPO}/compare/{pr['base']['sha']}...{a.sha}")

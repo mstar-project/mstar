@@ -74,7 +74,7 @@ Keep the body to one short paragraph that names the triggering inputs or state; 
 
 **Summary.** After all inline comments are posted, return the summary as fields of your structured output. The workflow renders them into a comment that opens with a status line (the open findings by priority, the head commit and the mode), posts it below the earlier summaries and hides those as outdated. You have no shell and can't post it yourself. Write each item as one plain sentence. Don't restate what the PR does: the description says that, and the reader has it open.
 
-- `outside_diff`: the findings whose cause is outside the diff, as above. The workflow counts your inline findings, and earlier ones whose threads are still open, from the PR itself.
+- `outside_diff`: the findings whose cause is outside the diff, as above. The workflow counts your inline findings, and earlier ones until you judge them `fixed` or `moot` in `prior_findings` or a commit outdates their thread, from the PR itself.
 - `prior_findings`: on a re-review, every earlier finding (step 1 above): `ref` (the inline comment's id, or the `outside_diff` item's location), `priority`, `status` and one sentence of why. Empty on a first review.
 - `since_last`: on a re-review, one sentence on what changed since your previous summary in `pr-conversation.json`: findings fixed, still open or new. Empty on a first review.
 - `description_problems`: inaccuracies first, including anything the code does that the description doesn't say, then what's missing.

@@ -3,10 +3,10 @@
 
 The review returns the fields in SCHEMA rather than Markdown, so every summary
 has the same shape: a status line, then only the sections that have something
-in them. The status line counts the bot's inline findings from the PR's review
-threads, so a finding from an earlier run counts until its thread is resolved or
-a commit changes its lines. Run by claude-review.yml with the default branch
-checked out:
+in them. The status line counts the open findings (`open_findings`, which the
+approval rule in gpu_review.py uses too), so a finding from an earlier run counts
+until a re-review judges it fixed or moot or a commit changes its lines. Run by
+claude-review.yml with the default branch checked out:
 
     python3 .github/review/render_summary.py --schema     # for --json-schema
     python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json < output.json
@@ -77,31 +77,33 @@ SCHEMA = {
 FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.</sub>"
 
 
-def open_priorities(pages):
-    """(comment id, priority) of each of the bot's inline findings whose thread is neither resolved nor outdated."""
-    found = []
+def open_findings(review, pages):
+    """(where, priority) of every open finding: the bot's inline threads, this run's findings outside
+    the diff, and the earlier findings a re-review judged still open. A thread someone resolved stays
+    open: only a re-review that judged it fixed or moot, or a commit that outdated it, clears it. An
+    untagged bot thread counts as "untagged", since its priority is unknown. `pages` are the PR's
+    review threads, from `gh api graphql --paginate --slurp`."""
+    prior = review.get("prior_findings", [])
+    cleared = {f["ref"] for f in prior if f["status"] in ("fixed", "moot")}
+    found, counted = [], set()
     for page in pages:
         for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
-            if thread["isResolved"] or thread["isOutdated"]:
-                continue
             first = thread["comments"]["nodes"][0]
+            ref = str(first.get("databaseId", ""))
+            if thread["isOutdated"] or ref in cleared or not (first["author"] and first["author"]["login"] in BOTS):
+                continue
             match = TAG.match(first["body"])
-            if match and first["author"] and first["author"]["login"] in BOTS:
-                found.append((str(first.get("databaseId", "")), match[1]))
+            found.append((f"inline {ref}", match[1] if match else "untagged"))
+            counted.add(ref)
+    found += [(f"outside the diff, {f['location']}", f["priority"]) for f in review["outside_diff"]]
+    # Judged still open, though its thread went outdated or it was outside the diff.
+    found += [(f"earlier {f['ref']}", f["priority"]) for f in prior
+              if f["status"] == "open" and f["ref"] not in counted]
     return found
 
 
-def open_findings(review, inline):
-    """Every open finding's priority: open inline threads, this run's findings outside the diff, and the
-    earlier findings a re-review judged still open (whatever their thread's state)."""
-    counted = {ref for ref, _ in inline}
-    return ([p for _, p in inline] + [f["priority"] for f in review["outside_diff"]]
-            + [f["priority"] for f in review.get("prior_findings", [])
-               if f["status"] == "open" and f["ref"] not in counted])
-
-
-def status(review, inline, head, mode):
-    found = open_findings(review, inline)
+def status(review, pages, head, mode):
+    found = [p for _, p in open_findings(review, pages)]
     counts = {p: found.count(p) for p in PRIORITIES}
     if counts["P0"] or counts["P1"]:
         icon = "🔴"
@@ -116,9 +118,8 @@ def status(review, inline, head, mode):
     return line
 
 
-def render(review, inline, head, mode):
-    """``inline`` is the priority of each open inline finding, from `open_priorities`."""
-    parts = [f"{MARKER}\n### Automated review", status(review, inline, head, mode)]
+def render(review, pages, head, mode):
+    parts = [f"{MARKER}\n### Automated review", status(review, pages, head, mode)]
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
@@ -173,8 +174,8 @@ def main():
         print(json.dumps(state) if state else "")
     else:
         with open(a.threads) as f:
-            inline = open_priorities(json.load(f))
-        sys.stdout.write(render(json.load(sys.stdin), inline, a.head, a.mode))
+            pages = json.load(f)
+        sys.stdout.write(render(json.load(sys.stdin), pages, a.head, a.mode))
 
 
 if __name__ == "__main__":
