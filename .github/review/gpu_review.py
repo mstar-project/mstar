@@ -334,12 +334,14 @@ def cmd_comment(a):
         image = bang or MEDIA.get(Path(rel).suffix.lower()) == "img"
         return f"![{text}]({url})" if image else f"[{text}]({url})"
 
-    report = re.sub(r"(!?)\[([^\]]*)\]\(([^)\s]+)\)", link, report)
+    # The box's text can't open an HTML comment, so it can't forge the verdict marker the workflow reads.
+    report = re.sub(r"(!?)\[([^\]]*)\]\(([^)\s]+)\)", link, report).replace("<!--", "&lt;!--")
     head = ("> 🤖 **Automated live test, AI-generated** (Claude Code). Not checked line by line by a human. "
             "Numbers come from one allocation, so treat small deltas as provisional.")
     verdict = result.get("verdict") if result.get("verdict") in ("pass", "partial", "fail", "unavailable") else "none"
     lines = [f"<!-- claude-live-test sha={a.sha} verdict={verdict} -->", head, "",
-             f"**Live test of `{a.sha[:7]}`: {verdict}.** {result.get('summary', '')}".rstrip()]
+             f"**Live test of `{a.sha[:7]}`: {verdict}.** "
+             f"{str(result.get('summary', '')).replace('<!--', '&lt;!--')}".rstrip()]
     if files and a.media_url:
         lines.append(f"Media: [gallery]({a.media_url.rstrip('/')}/index.html) ({len(files)} files).")
     body = "\n".join(lines) + "\n\n" + report

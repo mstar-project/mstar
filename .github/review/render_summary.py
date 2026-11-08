@@ -119,7 +119,7 @@ def status(review, pages, head, mode):
 
 
 def render(review, pages, head, mode):
-    parts = [f"{MARKER}\n### Automated review", status(review, pages, head, mode)]
+    parts = ["### Automated review", status(review, pages, head, mode)]
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
@@ -149,14 +149,20 @@ def render(review, pages, head, mode):
     parts.append(FOOTER)
     state = {"head": head, "mode": mode, "outside_diff": review["outside_diff"], "risk": review.get("risk"),
              "live_test": live}
-    parts.append(f"<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->")
-    return "\n\n".join(parts) + "\n"
+    # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
+    text = "\n\n".join(parts).replace("<!--", "&lt;!--")
+    return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
 
 
 def read_state(body):
-    """The state a summary comment carries, or None."""
-    match = STATE.search(body)
-    return json.loads(base64.b64decode(match[1])) if match else None
+    """The state a summary comment carries (its last), or None, also when it doesn't decode: then the
+    next run reviews the whole PR."""
+    found = STATE.findall(body)
+    try:
+        state = json.loads(base64.b64decode(found[-1])) if found else None
+    except ValueError:
+        return None
+    return state if isinstance(state, dict) else None
 
 
 def main():
