@@ -26,9 +26,9 @@ from mstar.conductor.workers import deployment_workers  # noqa: E402
 from mstar.engine.engine import ExecutingBatch  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.platforms import CpuPlatform, CudaPlatform, RocmPlatform, interface  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils import cpus, threads  # noqa: E402
 from mstar.utils.cpus import CpuPlan, CpuPlanError, StepCpus, deployment_plan, parse_cpu_list  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 NODES = [parse_cpu_list(f"{32 * n}-{32 * n + 31},{128 + 32 * n}-{128 + 32 * n + 31}") for n in range(4)]
@@ -1259,9 +1259,7 @@ def test_the_api_server_takes_the_next_free_set_and_its_workers_follow(core_serv
 # ── worker ──────────────────────────────────────────────────────────────────
 
 def _bare_worker(worker_id="worker_1", device="cuda:1"):
-    w = Worker.__new__(Worker)
-    w.worker_id = worker_id
-    w.device = torch.device(device)
+    w = make_worker(worker_id=worker_id, device=torch.device(device))
     return w
 
 
@@ -1278,6 +1276,9 @@ def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(worker_mod.cpus, "device_addresses", lambda devices: [addresses.get(d) for d in devices])
     monkeypatch.setattr(worker_mod.cpus, "deployment_plan", plan)
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "always")
+    # deployment_cpu_plan leaves this set, so an earlier test in the process
+    # picks the slot this one reads; see #1223
+    monkeypatch.delenv(cpus.CORE_SET_ENV, raising=False)
     w = _bare_worker()
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
         w._plan_step_cpus(["worker_0", "worker_1", "worker_2"], ["cuda:0", "cuda:1", "cuda:2"])
@@ -1577,7 +1578,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
                                      graph_walk=batch.graph_walk, slot=0, capture=False),
         )
 
-    def next_batch(request_state, exclude_target=None):
+    def next_batch(exclude_target=None):
         mask("main")
         if not schedule:
             raise _StopLoopError
@@ -1616,33 +1617,25 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     def stub(*a, **k):
         return None
 
-    w = Worker.__new__(Worker)
-    w.worker_id = "worker_0"
-    w.device = torch.device("cpu")
-    w.enable_nvtx = False
-    w._phase_period, w._phase_buf = 0, {}
-    w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
-    w.tp_async_sched, w.is_tp_follower = False, False
-    w._in_flight_rids = set()
-    w._metrics = None
-    w._step_cpus = StepCpus(step, "test")
-    w._process_cpus = allowed
-    w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
-    w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: None)
-    w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
-    w.wakeup_event = SimpleNamespace(register_future=stub)
-    w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
-    w.scheduler = SimpleNamespace(
-        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
+    w = make_worker(
+        worker_id="worker_0",
+        device=torch.device("cpu"),
+        _step_cpus=StepCpus(step, "test"),
+        _process_cpus=allowed,
+        parallel_groups=SimpleNamespace(barrier_all=stub, restore_default_timeout=stub),
+        engine_manager=SimpleNamespace(warmup_all=stub, get_engine=lambda node: None),
+        communicator=SimpleNamespace(send=stub, wait_for_work=stub),
+        wakeup_event=SimpleNamespace(register_future=stub),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
+        scheduler=SimpleNamespace(next_batch=next_batch, note_ran=stub),
     )
-    for name in ("_verify_tp_async_sched_agrees", "_await_admit_settled",
-                 "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
-                 "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
-                 "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
+    for name in ("_await_admit_settled", "_teardown", "_report_failures", "_fail_requests",
+                 "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_settle_speculation", "_drop_rows_whose_loop_stopped", "_handle_admit_failure",
                  "_thread_outputs_to_speculative", "_postprocess_batch"):
         setattr(w, name, stub)
-    w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
+    for name in ("process_messages", "check_ready_tensors", "poll_stream_buffers"):
+        setattr(w.ingest, name, stub)
     w._build_executing_batch = executing
     w._build_speculation = build_speculation
     w._plans_ahead = lambda spec: True

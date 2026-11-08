@@ -56,6 +56,22 @@ def _build_decoder_layer(
     )
 
 
+def higgs_llm_remap(name: str) -> str | None:
+    """The full checkpoint's names as this LLM's: generation-only components (audio
+    codec embeddings, audio head) and the encoder / projector dropped, the text head at
+    ``audio_decoder_proj.text_lm_head`` as ``lm_head``."""
+    if name.startswith((
+        "audio_tower.", "audio_encoder_proj.",
+        "audio_codebook_embeddings.",
+    )):
+        return None
+    if name == "audio_decoder_proj.text_lm_head.weight":
+        return "lm_head.weight"
+    if name.startswith("audio_decoder_proj."):
+        return None
+    return name
+
+
 class HiggsAudioLLM(nn.Module):
     """Qwen3 causal LM; parameter paths mirror the (flat) HF checkpoint."""
 
@@ -81,6 +97,12 @@ class HiggsAudioLLM(nn.Module):
             bias=False,
             gather_output=True,
         )
+
+    def checkpoint_rules(self):
+        """How the checkpoint lands here (and where LoRA adapters land)."""
+        from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
+
+        return CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=higgs_llm_remap)
 
     def forward(
         self,

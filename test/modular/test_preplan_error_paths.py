@@ -8,7 +8,6 @@ so the runner's foreign-step guard stays the backstop it is meant to be.
 from __future__ import annotations
 
 import sys
-from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures.thread import BrokenThreadPool
 from types import SimpleNamespace
@@ -19,6 +18,7 @@ import pytest
 import torch
 
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.worker import make_worker
 from mstar.worker import worker as worker_mod
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -26,13 +26,7 @@ from mstar.worker.worker import Worker
 
 
 def _fake_worker() -> Worker:
-    w = Worker.__new__(Worker)
-    w.worker_id = 0
-    w.enable_nvtx = False
-    w._phase_period = 0
-    w._phase_buf = defaultdict(list)
-    w.device = torch.device("cpu")
-    w._in_flight_rids = set()
+    w = make_worker(worker_id=0, device=torch.device("cpu"))
     w.failed = []
     w.resets = []
     w.pushed_back = []
@@ -40,10 +34,6 @@ def _fake_worker() -> Worker:
     w._reset_skip_plan_flags = w.resets.append
     w._rid_str = str
     w.despeculated = []
-    w._pending_removes = {}
-    w._pending_drains = set()
-    w._draining_rids = set()
-    w.scheduler = SimpleNamespace(failed_rids=set())
     w.settled = []
     w._graph_runtime = SimpleNamespace(
         push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),

@@ -33,6 +33,7 @@ from test_kv_prefix_lease import (
     _StubTransfer,
 )
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources import StepRunner
 from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
@@ -474,7 +475,8 @@ def _cfg_parallel_pool(node: str, world_size: int = 1, rank: int = 0, shared_pre
     )
     if shared_prefix:
         spec.config.prefix_cache = spec.config.prefix_cache_tp = True
-    group = None if world_size == 1 else SimpleNamespace(rank=rank, world_size=world_size)
+    tp = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world_size)))
+    group = None if world_size == 1 else JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp)
     return KVManager.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), kv_dtype=torch.float32,
         nodes=frozenset(spec.nodes if shared_prefix else {node}), joint_comm_group=group,

@@ -1,4 +1,5 @@
-"""A streaming response that cleans up after a body Starlette never started."""
+"""Streaming-response helpers: a response that cleans up after a body
+Starlette never started, and a body that reports a mid-stream error in band."""
 
 import asyncio
 import contextlib
@@ -6,9 +7,26 @@ import inspect
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
+from mstar.api_server.request_types import ResultChunk
+
 logger = logging.getLogger(__name__)
+
+
+async def errors_in_band(request_id: str, chunks):
+    """``chunks``, with an ``HTTPException`` raised mid-stream (``--timeout``)
+    ending it as the error chunk an engine error ends it with: the 200 is
+    already sent, so raising would only cut the body off."""
+    try:
+        async for chunk in chunks:
+            yield chunk
+    except HTTPException as exc:
+        yield ResultChunk(
+            request_id=request_id, modality="error",
+            data=str(exc.detail).encode("utf-8"), metadata={"status": exc.status_code},
+        )
 
 
 class ReleasingStreamingResponse(StreamingResponse):

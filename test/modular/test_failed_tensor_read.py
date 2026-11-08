@@ -18,7 +18,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_request_failure_propagation import _preprocess_thread, _worker
+from test_request_failure_propagation import _preprocess_thread
 
 from mstar.api_server.request_types import ResultChunk
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
@@ -36,6 +36,7 @@ from mstar.communication.tensors import (
     create_tensor_communication_manager,
 )
 from mstar.graph.base import GraphEdge, TensorPointerInfo
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import ConductorMessageType, WorkerMessageType
 
 
@@ -212,23 +213,31 @@ def test_a_future_with_only_done_and_result_is_polled_like_any_other(tmp_path):
 
 
 def test_the_worker_fails_a_request_once_when_its_input_read_fails(tmp_path):
-    w = _worker()
-    w.enable_nvtx = False
-    w.wakeup_event = SimpleNamespace(drain=lambda: None)
-    w.tensor_manager, _ = _shm_manager(tmp_path)
-    w.tensor_manager.pending = [_read("r1", _edge(11), _failed_future())]
+    mgr, _ = _shm_manager(tmp_path)
+    mgr.pending = [_read("r1", _edge(11), _failed_future())]
+    sent = []
+    w = make_worker(
+        communicator=SimpleNamespace(send=lambda entity_id, msg: sent.append((entity_id, msg))),
+        request_state=SimpleNamespace(per_request_info={"r1": object()}),
+        tensor_manager=mgr,
+        wakeup_event=SimpleNamespace(drain=lambda: None),
+        scheduler=SimpleNamespace(drop_backlogged=lambda rids: None),
+    )
+    w.lifecycle.add("r1", "r1")
 
-    w._check_ready_tensors()
-    w._check_ready_tensors()
+    w.ingest.check_ready_tensors()
+    w._report_failures()
+    w.ingest.check_ready_tensors()
+    w._report_failures()
 
-    (sent,) = w.sent
+    (sent,) = sent
     assert sent[1].message_type == ConductorMessageType.FAIL_REQUESTS
     assert list(sent[1].body.errors) == ["r1"]
     assert re.fullmatch(
         r"internal error \(error id [0-9a-f]{12}\)",
         sent[1].body.errors["r1"].message,
     )
-    assert w.scheduler.failed_rids == {"r1"}
+    assert w.lifecycle.failed_rids == {"r1"}
 
 
 def test_the_data_worker_answers_a_failed_output_read_in_its_slot(tmp_path, caplog):

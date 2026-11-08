@@ -16,6 +16,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnSpec,
     LinearAttnVariant,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
@@ -93,8 +94,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
         # the vision tower, whose output fills images' and videos' pads in
-        # prompt order
-        pad = self._pad_ids()
+        # prompt order. A text-only checkpoint's tokenizer still has the pad
+        # tokens, so the tower decides whether the model takes media.
+        pad = self._pad_ids() if self.vision_config is not None else {}
         tower = vision_encoder(tuple(pad.values())) if pad else None
         self.media = tuple(
             MediaIntake(m, tower, p, self._image_intake) if m == "image"
@@ -178,6 +180,12 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             *self._vision_resources(),
         ]
 
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """The LLM's, then the vision encoder's when the checkpoint has a vision tower."""
+        from mstar.model.qwen3_5.lora import qwen3_5_lora_specs
+
+        return qwen3_5_lora_specs(self.config, self.vision_config)
+
     def _vision_resources(self) -> list[NodeResourceSpec]:
         """The ViT tower's attention, its only resource; none when text-only."""
         if self.vision_config is None:
@@ -201,8 +209,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                     max_segments_per_step=(
                         VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
                     ),
-                    # the tower's compiled block loop keeps attention in its graph
-                    compile_op=True,
                 ),
             ),
         ]
@@ -393,6 +399,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         out = self.image_processor(
             images=[as_uint8_chw(image, truncate=True).permute(1, 2, 0).numpy()], return_tensors="pt",
             do_rescale=False, do_normalize=False,
+            # inferred, a 1, 3 or 4 px tall image would be read as channels first
+            input_data_format="channels_last",
         )
         grid = out["image_grid_thw"][0]
         return PreparedMedia({"pixel_values": out["pixel_values"]}, [int(grid.prod()) // merge ** 2], [grid])
@@ -409,9 +417,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        merge = self.vision_config.spatial_merge_size
         advance = length + sum(
-            vision_position_advance(torch.tensor(grid), merge) - tokens
+            vision_position_advance(torch.tensor(grid), self._merge()) - tokens
             for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
         )
         return super().kv_layout(layout, length, advance)

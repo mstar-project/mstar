@@ -689,6 +689,7 @@ class VJepa2Model(Model):
         """
         out: NameToTensorList = {}
         rollout = self._initial_walk(kwargs) in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING)
+        num_tokens = None  # the encoder's output tokens, which the predictor masks index
 
         if tensors and "video_inputs" in tensors and len(tensors["video_inputs"]) > 0:
             meta = ((kwargs.get("input_metadata") or {}).get("video_inputs") or [{}])[0]
@@ -720,6 +721,8 @@ class VJepa2Model(Model):
                 tensors["video_inputs"][0], [sampled[i] for i in keep], transform=self._preprocess_frames,
             )
             out["video_frames"] = [processed]
+            tubelet = self.config.tubelet_size
+            num_tokens = max(len(keep), tubelet) // tubelet * self.config.grid_size ** 2
             # the encoder reads ``video_frames``; don't ship the raw input
             out["video_inputs"] = []
 
@@ -802,13 +805,24 @@ class VJepa2Model(Model):
                         tuple(out["goal_hidden"][0].shape),
                     )
 
-        # Optional user-supplied masks (masked predictor only). the submodule
-        # builds full-coverage defaults if notpreent.
+        # Optional user-supplied masks (masked predictor only), both or neither:
+        # without them the submodule builds full-coverage defaults.
         if self.config.predictor_kind != "ac":
-            for mask_name in ("context_mask", "target_mask"):
-                m = kwargs.get(mask_name)
-                if m is not None:
-                    out[mask_name] = [torch.as_tensor(m, dtype=torch.long)]
+            given = [name for name in ("context_mask", "target_mask") if kwargs.get(name) is not None]
+            if len(given) == 1:
+                raise ValueError(f"V-JEPA 2 takes context_mask and target_mask together; got only {given[0]}")
+            for mask_name in given:
+                try:
+                    m = torch.as_tensor(kwargs[mask_name])
+                except (TypeError, ValueError, RuntimeError):
+                    m = torch.empty(0)  # refused below with the rest
+                if m.dtype.is_floating_point or m.dtype.is_complex or m.dtype == torch.bool or m.numel() == 0 \
+                        or m.ndim > 2 or m.ndim == 2 and m.shape[0] != 1 or m.min() < 0 \
+                        or num_tokens is not None and m.max() >= num_tokens:
+                    raise ValueError(
+                        f"V-JEPA 2 {mask_name} must be one row of token indices in [0, {num_tokens}), the clip's tokens"
+                    )
+                out[mask_name] = [m.long()]
 
         kv_layout = {}
         if self.config.predictor_kind == "ac":

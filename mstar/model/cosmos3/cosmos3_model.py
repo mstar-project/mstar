@@ -1434,8 +1434,14 @@ class Cosmos3Model(Model):
                 1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
             ),
         }
-        if params["width"] <= 0 or params["height"] <= 0 or num_frames <= 0:
-            raise ValueError("Cosmos3 width, height and num_frames must be positive")
+        latent_px = self.config.vae.scale_factor_spatial
+        if params["width"] < latent_px or params["height"] < latent_px:
+            raise ValueError(
+                f"Cosmos3 width and height must be at least {latent_px} px (one latent pixel), "
+                f"got {params['width']}x{params['height']}."
+            )
+        if num_frames <= 0:
+            raise ValueError("Cosmos3 num_frames must be positive")
         if not math.isfinite(params["fps"]) or params["fps"] <= 0:
             raise ValueError("Cosmos3 fps must be finite and positive")
         frames_per_latent = self.config.vae.scale_factor_temporal

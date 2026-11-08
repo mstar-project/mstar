@@ -8,12 +8,11 @@ import pytest
 import torch
 
 from mstar.engine import _default_compile_caches, recompile_limit
-from mstar.worker.worker import Worker
+from mstar.testing_utils.worker import make_worker
 
 
 def test_executor_thread_gets_torch_config():
-    worker = Worker.__new__(Worker)  # skips __init__, which opens sockets
-    worker.device = torch.device("cpu")
+    worker = make_worker(device=torch.device("cpu"))
     with ThreadPoolExecutor(1, initializer=worker._init_engine_thread) as ex:
         limit, unspec = ex.submit(lambda: (
             torch._dynamo.config.recompile_limit,
@@ -24,14 +23,15 @@ def test_executor_thread_gets_torch_config():
 
 def test_the_engine_threads_start_before_a_compiled_call_can_raise_the_limit():
     """Before torch 2.12 dynamo's config is process-wide: a thread whose initializer ran only at
-    its first job would set the engine's limit inside another thread's ``with_recompile_limit``."""
-    worker = Worker.__new__(Worker)
-    worker.device, worker.worker_id = torch.device("cpu"), "worker_0"
+    its first job would read and write the limit beside another thread's ``with_recompile_limit``,
+    so the pool's thread runs its initializer when the pool is built."""
+    worker = make_worker(device=torch.device("cpu"))
+    started = []
+    init = worker._init_engine_thread
+    worker._init_engine_thread = lambda: (started.append(1), init())
     pool = worker._engine_thread_pool("mstar-plan")
     try:
-        with torch._dynamo.config.patch(recompile_limit=500):
-            pool.submit(int).result()  # the first step's pre-plan
-            assert torch._dynamo.config.recompile_limit == 500
+        assert started == [1], "the engine thread's initializer waited for its first job"
     finally:
         pool.shutdown()
 

@@ -32,7 +32,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-from mstar.api_server import media_io
+from mstar.api_server import media_io, ws_frames
 from mstar.api_server.auth import (
     API_KEY_ENV,
     APIKeyGuard,
@@ -41,7 +41,7 @@ from mstar.api_server.auth import (
     resolve_api_key,
     warn_if_no_api_key,
 )
-from mstar.api_server.body_limit import BodyLimitMiddleware
+from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
@@ -51,7 +51,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.api_server.served_models import ServedModels
-from mstar.api_server.streaming_response import ReleasingStreamingResponse, read_stream_head
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band, read_stream_head
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
@@ -80,6 +80,7 @@ from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
+from mstar.validation import positive_int
 
 logger = logging.getLogger(__name__)
 
@@ -566,8 +567,9 @@ class APIServer:
         # _process_messages).
         self.conductor_proc: mp.Process | None = None
         # Non-None once the deployment is going down because the conductor
-        # died. It is the error every pending (and later) request gets, and the
-        # reason main() exits non-zero. on_fatal stops the HTTP server.
+        # died or the message loop ended. It is the error every pending (and
+        # later) request gets, and the reason main() exits non-zero. on_fatal
+        # stops the HTTP server.
         self.fatal_error: str | None = None
         self.on_fatal: Callable[[], None] | None = None
         self._liveness_interval_s = 0.5
@@ -645,14 +647,15 @@ class APIServer:
             return None
         return describe_exitcode(proc.exitcode)
 
-    def _fail_pending_for_dead_conductor(self, exited: str) -> None:
-        """The conductor is gone (it exits when a worker dies, or it crashed).
+    def _fail_pending_and_stop(self, cause: str) -> None:
+        """The server can't deliver results any more: the conductor is gone (it
+        exits when a worker dies, or it crashed), or the message loop ended.
         Release every waiting client with a 503 now rather than at the request
         timeout, refuse new requests, and stop the HTTP server so the process
         exits non-zero instead of serving a deployment that can't run anything.
         """
-        message = f"conductor process exited with {exited}, so the server is shutting down"
-        logger.error("Conductor process exited with %s, shutting the server down", exited)
+        message = f"{cause}, so the server is shutting down"
+        logger.error("%s, shutting the server down", cause)
         with self.request_lock:
             self.fatal_error = message
             for req in self.pending_requests.values():
@@ -1076,9 +1079,24 @@ class APIServer:
         return None if oldest is None else oldest + self._recently_completed_ttl
 
     def _process_messages(self) -> None:
+        """Run ``_message_loop``. When it ends while the server runs (the
+        conductor exited, or its wait raised: a closed wakeup fd, the one error
+        the transport raises there, never recovers), every pending request
+        fails with a 503 and the HTTP server stops."""
+        try:
+            cause = self._message_loop()
+        except Exception as e:
+            if not self.running:
+                return
+            logger.exception("Message processing loop failed")
+            cause = f"the API server's message loop failed ({type(e).__name__}: {e})"
+        if cause is not None:
+            self._fail_pending_and_stop(cause)
+
+    def _message_loop(self) -> str | None:
         """Drain the ZMQ pull socket and route results to pending requests.
-        Also watches the conductor process. Once it exits, every pending
-        request is failed and the HTTP server is told to stop."""
+        Also watches the conductor process: returns why the server must go
+        down once it exits, None once the server stops."""
         self.pin_result_thread()
         next_liveness_check = 0.0
         self.communicator.register_event_for_poll(self.preprocess_worker.results_wakeup)
@@ -1089,8 +1107,7 @@ class APIServer:
                 next_liveness_check = now + self._liveness_interval_s
                 exited = self._conductor_exited()
                 if exited is not None:
-                    self._fail_pending_for_dead_conductor(exited)
-                    return
+                    return f"conductor process exited with {exited}"
             next_expiry = None
             try:
                 for message in self.communicator.get_all_new_messages():
@@ -1319,30 +1336,29 @@ class APIServer:
                 with self.request_lock:
                     if self.recently_completed:
                         next_expiry = self._prune_recently_completed()
-                # Everything else that changes what a pass reads signals the poll:
-                # a message, the data worker's flush (``ResultQueue``) and a
-                # request handler (``_wake_message_loop``). Only the liveness
-                # check and the delivery TTL are on a timer. Inside the try: a
-                # transport error from the wait is a failed pass, not the end of
-                # the thread that delivers every request's results.
-                wait_s = next_liveness_check - time.monotonic()
-                if next_expiry is not None:
-                    wait_s = min(wait_s, next_expiry - time.time())
-                self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
                 if failed_passes:
                     logger.warning("Message processing loop recovered after %d failed passes", failed_passes)
                     failed_passes = 0
             except Exception:
-                # the next pass goes after the back-off, without a wait: the
-                # prune may not have run. A transport that stays broken logs
-                # its traceback once, then a count, backing off to 1 s a pass.
+                # one pass's error (a message it can't route) is logged and the
+                # loop goes on; a prune it skipped runs by the next liveness check.
+                # Passes that keep failing log one traceback, then a count.
                 if self.running:
                     failed_passes += 1
                     if failed_passes == 1:
                         logger.exception("Error in message processing loop")
                     elif failed_passes % 100 == 0:
                         logger.error("Message processing loop: %d failed passes in a row", failed_passes)
-                    time.sleep(min(0.01 * 2 ** min(failed_passes - 1, 7), 1.0))
+            # Everything else that changes what a pass reads signals the poll:
+            # a message, the data worker's flush (``ResultQueue``) and a
+            # request handler (``_wake_message_loop``). Only the liveness
+            # check and the delivery TTL are on a timer. Outside the try: an
+            # error here ends the loop (see ``_process_messages``).
+            wait_s = next_liveness_check - time.monotonic()
+            if next_expiry is not None:
+                wait_s = min(wait_s, next_expiry - time.time())
+            self.communicator.poll_for_messages(timeout_ms=max(0, math.ceil(wait_s * 1000)))
+        return None
 
     def _wake_message_loop(self) -> None:
         """End the message thread's wait: a request handler changed what its
@@ -1569,7 +1585,9 @@ class APIServer:
         ``chunks`` is the request's ``ResultChunk`` iterator when the caller has
         already read from it (``open_result_stream``); None opens a fresh one.
         """
-        chunks = chunks if chunks is not None else self.iter_result_chunks(request_id)
+        chunks = errors_in_band(
+            request_id, chunks if chunks is not None else self.iter_result_chunks(request_id),
+        )
         if binary:
             return self._stream_binary(chunks)
         return self._stream_ndjson(chunks)
@@ -1861,12 +1879,6 @@ class WarmupMedia:
         return cls(path=path, modality=modality)
 
 
-def _positive_int(name: str, value: Any) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-    return value
-
-
 @dataclass
 class WarmupRequest:
     """One entry of the deployment's ``warmup_requests``: a ``/generate``
@@ -1889,7 +1901,7 @@ class WarmupRequest:
         text = spec.get("text")
         if text is not None and not isinstance(text, str):
             raise ValueError("text must be a string")
-        repeat = _positive_int("repeat", spec.get("repeat", 1))
+        repeat = positive_int("repeat", spec.get("repeat", 1))
         if repeat > 1 and not text:
             raise ValueError("repeat needs text")
         out_mods = spec.get("output_modalities") or ["text"]
@@ -2094,10 +2106,11 @@ def _decode_ws_files(
     files: list | None, upload_dir: Path,
 ) -> tuple[dict[str, list[str]], list[PromptPart]]:
     """Persist a websocket message's media (``{"name", "data"}`` entries;
-    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame) under
-    the upload dir, grouped by the modality of each file name, the way the
-    multipart ``/generate`` route does. A message rejected halfway leaves no
-    files behind."""
+    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame, or a
+    ``SavedUpload`` a large frame's parse already saved) under the upload dir,
+    grouped by the modality of each file name, the way the multipart
+    ``/generate`` route does. A message rejected halfway leaves no files
+    behind."""
     if files is not None and not isinstance(files, list):
         raise ValueError("files must be a list of {name, data} objects")
     file_paths: dict[str, list[str]] = {}
@@ -2112,19 +2125,20 @@ def _decode_ws_files(
             if modality == "unknown":
                 raise ValueError(f"Cannot determine modality for file: {name}")
             data = entry.get("data")
-            if isinstance(data, str):
-                # the decoder the data-URL paths use: unpadded or wrapped
-                # base64 is fine, a bad alphabet is the client's error
-                data = media_io._decode_base64_payload(data)
-            if not isinstance(data, (bytes, bytearray)):
-                raise ValueError(f"file {name!r} carries no data")
-            save_path = media_io.save_upload(data, name, upload_dir)
+            save_path = (
+                data.claim() if isinstance(data, ws_frames.SavedUpload)
+                else ws_frames.save_entry(name, data, upload_dir)
+            )
             saved.append(save_path)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
             paths.append(str(save_path))
     except Exception:
-        media_io.remove_uploads({"upload": saved}, upload_dir)
+        leftover = [
+            entry["data"].claim() for entry in files or []
+            if isinstance(entry, dict) and isinstance(entry.get("data"), ws_frames.SavedUpload)
+        ]
+        media_io.remove_uploads({"upload": [*saved, *leftover]}, upload_dir)
         raise
     return file_paths, parts
 
@@ -2521,17 +2535,22 @@ async def generate_ws(websocket: WebSocket):
     previous_turn: asyncio.Future | None = None
     try:
         while True:
+            # not kept while the socket idles: a refused message's saved files go with it
+            frame = message = None
             frame = await websocket.receive()
             if frame.get("type") == "websocket.disconnect":
                 break
             binary = frame.get("bytes") is not None
             try:
-                if binary:
-                    message = msgpack.unpackb(frame["bytes"], raw=False)
-                else:
-                    message = json.loads(frame.get("text") or "")
+                message = await ws_frames.parse_frame(
+                    frame["bytes"] if binary else frame.get("text") or "", api_server.upload_dir,
+                )
+            except OSError as exc:  # the server's side of a large frame, not the frame
+                text, _ = client_error_text(exc, "generate/ws frame hand-off failed", log=logger, type_name=False)
+                reply({"request_id": None, "error": text, "status": 500}, binary)
+                continue
             except Exception as exc:  # noqa: BLE001 — a bad frame is reported, not fatal
-                reply({"request_id": None, "error": f"undecodable frame: {exc}"}, binary)
+                reply({"request_id": None, "error": f"undecodable frame: {scrub_paths(str(exc))}"}, binary)
                 continue
             if not isinstance(message, dict):
                 reply({"request_id": None, "error": "message must be an object"}, binary)
@@ -2630,6 +2649,17 @@ async def generate(
         check_request_id(request_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
+
+    # Every field is a form field: any other body (JSON, say) parses as an
+    # empty form, and would be submitted as an empty request.
+    content_type = request.headers.get("content-type", "")
+    if content_type and content_type.split(";", 1)[0].strip().lower() not in (
+        "multipart/form-data", "application/x-www-form-urlencoded",
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"/generate takes multipart/form-data or urlencoded fields, not {content_type}",
+        )
 
     # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
     # HTML checkbox) instead of its declared default, for Optional[bool] too.
@@ -2856,9 +2886,12 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
 
 def _ws_max_size(config: dict) -> int:
     """The config's ``ws_max_message_mb``, in bytes: the largest WebSocket
-    message the server reads (16 MiB, uvicorn's own, by default). A larger one
-    closes its socket with 1009."""
-    mb = config.get("ws_max_message_mb", 16)
+    message the server reads (by default what an HTTP body may be, since one
+    /generate/ws message carries what a body would). A larger one closes its
+    socket with 1009."""
+    mb = config.get("ws_max_message_mb")
+    if mb is None:
+        return max_body_bytes()
     if isinstance(mb, bool) or not isinstance(mb, (int, float)) or not 0 < mb < math.inf:
         raise ValueError(f"ws_max_message_mb must be a positive number of MiB, not {mb!r}")
     return int(mb * (1 << 20))
@@ -3131,6 +3164,7 @@ def main(argv: list[str] | None = None):
                 server.should_exit = True
 
             api_server.set_on_fatal(_stop_server)
+            ws_frames.start()
             server.run()
             if not server.started:
                 exit_code = 3  # uvicorn.run()'s own code for a server that never came up
@@ -3147,6 +3181,7 @@ def main(argv: list[str] | None = None):
             shutil.rmtree(bridge_dir, ignore_errors=True)
         if api_server is not None:
             api_server.cleanup()
+        ws_frames.stop()
         _shutdown_conductor_process(conductor_proc)
     # A worker or conductor death is a failed run. A SIGINT stop still exits 0.
     if api_server.fatal_error is not None:

@@ -67,6 +67,14 @@ class Qwen3_5VisionModel(nn.Module):
         hidden, cos, sin = self.embed(pixel_values, indices, weights, position_ids)
         return self.merger(self.encode(hidden, cos, sin))
 
+    def checkpoint_rules(self):
+        """How the checkpoint's ``model.visual.*`` lands here, for its weight loader and
+        for LoRA adapters."""
+        from mstar.model.loader import CheckpointRules
+        from mstar.model.qwen3_5.weight_loader import qwen3_5_vision_name_remapper
+
+        return CheckpointRules(remap=qwen3_5_vision_name_remapper)
+
     def embed(
         self,
         pixel_values: torch.Tensor,

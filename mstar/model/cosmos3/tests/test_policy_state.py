@@ -102,17 +102,6 @@ def test_robot_state_must_be_finite_numbers(bad) -> None:
         _submit(_model(), {**POLICY, "robot_state": "0.1, 0.2"})
 
 
-def test_inverse_dynamics_needs_a_clip_as_long_as_num_frames() -> None:
-    """The encoder truncates a long clip to num_frames but a short one encoded fewer latent frames than the
-    request's latent shape."""
-    model = _model()
-    model.tokenizer = object()  # refused before the prompt is tokenized
-    mk = {"action_mode": "inverse_dynamics", "domain_id": 1, "raw_action_dim": 8, "num_frames": 17}
-    with pytest.raises(ValueError, match="num_frames=17"):
-        model.process_prompt("", ["video", "text"], ["action"], tensors={"video_inputs": [torch.rand(9, 3, 8, 8)]},
-                             **mk)
-
-
 def test_domain_id_must_name_a_trained_domain() -> None:
     """The domain id indexes the action embedding table on the GPU; past its 32 rows it device-asserted
     the worker for every later request."""
@@ -129,6 +118,17 @@ def test_forward_dynamics_needs_an_action_row_per_step_as_wide_as_the_robot(acti
     sent = {key: value for key, value in mk.items() if key not in Cosmos3Model.INTERNAL_KWARGS}
     with pytest.raises(ValueError, match="action"):
         _model()._resolve_gen_params(sent, ["image", "text"], ["video"])
+
+
+def test_inverse_dynamics_needs_a_clip_as_long_as_num_frames() -> None:
+    """The encoder truncates a long clip to num_frames but a short one encoded fewer latent frames than the
+    request's latent shape."""
+    model = _model()
+    model.tokenizer = object()  # refused before the prompt is tokenized
+    mk = {"action_mode": "inverse_dynamics", "domain_id": 1, "raw_action_dim": 8, "num_frames": 17}
+    with pytest.raises(ValueError, match="num_frames=17"):
+        model.process_prompt("", ["video", "text"], ["action"], tensors={"video_inputs": [torch.rand(9, 3, 8, 8)]},
+                             **mk)
 
 
 def _policy_checkpoint(root, policy):

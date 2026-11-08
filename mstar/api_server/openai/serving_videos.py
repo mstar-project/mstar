@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, rid
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
 
 logger = logging.getLogger(__name__)
 
 
 async def create_videos(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
     """The response dict, or for ``stream_video`` the NDJSON response itself."""
-    args = adapter.video_to_request(req, api.upload_dir)
+    # off the loop: a conditioning image or video may be decoded, written or fetched
+    args = await asyncio.to_thread(adapter.video_to_request, req, api.upload_dir)
     request_id = rid("vid")
 
     stream = bool(args.model_kwargs.get("stream_video"))
@@ -34,7 +36,7 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
         if stream:
             chunks = await api.open_result_stream(request_id, raw_request)
             return ReleasingStreamingResponse(
-                _ndjson_lines(chunks),
+                _ndjson_lines(errors_in_band(request_id, chunks)),
                 release=lambda: api.release_request(request_id),
                 media_type="application/x-ndjson", headers={"Cache-Control": "no-cache"},
             )

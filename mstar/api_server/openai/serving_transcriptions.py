@@ -51,6 +51,7 @@ Response formats
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import threading
@@ -66,6 +67,8 @@ from mstar.api_server.openai._util import SSE_DONE, error_type, rid, sse
 from mstar.api_server.openai.adapters import Transcript
 from mstar.api_server.streaming_response import ReleasingStreamingResponse, read_stream_head
 from mstar.utils.utf8_stream import Utf8Stream
+
+logger = logging.getLogger(__name__)
 
 _TIMED_FORMATS = ("verbose_json", "srt", "vtt")
 RESPONSE_FORMATS = ("json", "text", *_TIMED_FORMATS)
@@ -750,6 +753,16 @@ def _error_event(message: str, status: int | None) -> str:
     })
 
 
+def _stream_http_error(exc: Exception) -> HTTPException:
+    """Why a streamed transcription failed: the request's reason (an
+    HTTPException: a bad upload, a timeout), or a server error (no FFmpeg, no
+    memory, a bug), which is logged."""
+    if isinstance(exc, HTTPException):
+        return exc
+    logger.exception("Streamed transcription failed")
+    return HTTPException(status_code=500, detail=f"transcription failed ({type(exc).__name__})")
+
+
 async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_request=None):
     """Deltas as they come for one window or parallel windows (in window
     order); sequential long form emits each window's text once the window
@@ -763,19 +776,9 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
             raise HTTPException(status_code=status or 500, detail=message)
         return _error_event(message, status)
 
-    def cutting_error(exc):
-        if isinstance(exc, HTTPException):
-            return error(str(exc.detail), exc.status_code)
-        return error(f"the server could not decode the upload ({type(exc).__name__})", 500)
-
     try:
         if mode == "parallel" or planner.single:
-            try:
-                windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
-            except (HTTPException, ImportError, MemoryError) as exc:
-                yield cutting_error(exc)
-                yield SSE_DONE
-                return
+            windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
             # The stream carries text only, and a window decoded with timestamps
             # can stop early and leave its tail to the next one (see _tail).
             window_req = req if planner.single else req.model_copy(
@@ -828,22 +831,17 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
                 spoken = spoken or bool(emitted.strip())
                 await asyncio.sleep(0)
         else:
-            try:
-                spoken = False
-                async for window in _sequential(api, adapter, req, planner, inflight, raw_request):
-                    windows.append(window)
-                    if window.transcript.text:
-                        if spoken:
-                            started = True
-                            yield sse({"type": "transcript.text.delta", "delta": " "})
+            spoken = False
+            async for window in _sequential(api, adapter, req, planner, inflight, raw_request):
+                windows.append(window)
+                if window.transcript.text:
+                    if spoken:
                         started = True
-                        yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
-                        spoken = True
-                    await asyncio.sleep(0)
-            except (HTTPException, ImportError, MemoryError) as exc:
-                yield cutting_error(exc)
-                yield SSE_DONE
-                return
+                        yield sse({"type": "transcript.text.delta", "delta": " "})
+                    started = True
+                    yield sse({"type": "transcript.text.delta", "delta": window.transcript.text})
+                    spoken = True
+                await asyncio.sleep(0)
         transcript = merge_windows(windows, adapter, req)
         started = True
         yield sse({
@@ -851,6 +849,12 @@ async def _stream(api, adapter, req, planner: WindowPlanner, mode: str, raw_requ
             "text": transcript.text,
             "usage": _usage(planner.duration),
         })
+        yield SSE_DONE
+    except Exception as exc:
+        failure = _stream_http_error(exc)
+        if not started:  # no 200 yet: the client gets the real status
+            raise failure from None
+        yield _error_event(str(failure.detail), failure.status_code)
         yield SSE_DONE
     finally:
         _release(api, inflight)
