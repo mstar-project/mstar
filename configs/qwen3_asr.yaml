@@ -1,9 +1,10 @@
 model: "qwen3_asr"
 max_seq_len: 65536
-# Sized for an 80 GB H100: 3500 pages of about 14 MiB each, peaking near 74300 MiB
-# in all under load. A 20 min file holds about 122 pages of 128 tokens for its
-# prompt and up to 32 for its transcript, so the two pools hold about 32 of them
-# at full size.
+# Sized for an 80 GB H100: 3500 pages of about 14 MiB each. Under 16 and 32 whole
+# 20 min files at once, GPU memory peaked at 74,285 and 78,651 MiB in two sessions
+# on an H200 (an H100 has 81,559 MiB; not run on one). A 20 min file holds about
+# 122 pages of 128 tokens for its prompt and up to 32 for its transcript, so the
+# two pools hold about 32 of them at full size.
 # More long files than that at once can stall (see docs/asr.rst).
 max_concurrent_requests: 64
 resources:

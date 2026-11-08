@@ -89,7 +89,7 @@ language as an ISO code and the text alone.
 A request hears up to 20 minutes, but the route cuts an upload into 30 s windows
 and submits them at once, which is several times faster and holds far fewer KV
 pages. ``window_seconds=1200`` in ``extra_body`` asks for the whole file as one
-request (1.52 % WER against 1.61 % on the windows, at concurrency 16). The ``context`` (the OpenAI ``prompt``) is the system-turn hint
+request (on 10 minute English files, about 1.07 % WER against 1.2 % on the windows one request at a time; at concurrency 16 the difference is within batching noise). The ``context`` (the OpenAI ``prompt``) is the system-turn hint
 the reference SDK also takes; ``language`` forces the language;
 ``assistant_prefix`` prefills the assistant turn, which is what streaming
 builds on.
@@ -132,17 +132,20 @@ them, at least one window each; their other windows wait in the API server.
 A lone upload keeps up to 32 windows on the engine. Qwen3-ASR's requests vary far more in size: a 20 minute
 file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
 its transcript, while a 30 s window holds about 4. ``qwen3_asr.yaml`` sizes
-its pools for an 80 GB H100 (``kv_cache.max_num_pages: 3500``, peaking near
-74300 MiB in all under load, and ``cpu_offload_pages: 1536``) and caps Qwen3-ASR at 64
+its pools for an 80 GB H100 (``kv_cache.max_num_pages: 3500`` and
+``cpu_offload_pages: 1536``) and caps Qwen3-ASR at 64
 concurrent requests, which any mix of windows fits and which is what the
-default long-form throughput needs.
+default long-form throughput needs. Under 16 and 32 concurrent whole 20 minute
+files, GPU memory peaked at 74,285 and 78,651 MiB in two sessions on an H200, against
+an H100's 81,559 MiB. It hasn't been run on an H100; the H200's larger memory may
+let the allocator cache more, so an H100 may peak lower.
 
 The cap does not bound long whole files. Admission reserves only a request's
 prompt, so more concurrent 20 minute files than the pools hold offload to the
 host pool and, once that is full too, wait on each other until they time out.
 Only requests that ask for whole files with ``window_seconds`` can do this; one
 that takes bursts of them should lower the cap or raise the pools with it.
-``qwen3_asr_split.yaml`` keeps its cap of 12.
+``qwen3_asr_split.yaml`` keeps its cap of 12 and 2048 pages, which hold any mix of files up to 20 minutes; it hasn't been measured at a higher cap.
 
 Both decode loops stream their transcript token by token. A decode step
 keeps its rows' tokens on the device for the next step (the sampler's device

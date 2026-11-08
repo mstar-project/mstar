@@ -10,10 +10,15 @@ Long uploads
     A model that hears a bounded clip (``adapter.max_audio_seconds``, 30 s
     for Whisper) gets the upload served as consecutive windows of at most
     that length, each its own engine request; the windows' texts are joined
-    and their timestamps offset by the window start. Models without a bound
-    (Qwen3-ASR hears 20 minutes) see the whole file.
+    and their timestamps offset by the window start. An adapter's
+    ``window_seconds`` cuts shorter windows than its bound: Qwen3-ASR hears
+    20 minutes but cuts 30 s windows, and a request's ``window_seconds`` can
+    ask for the whole file.
 
-    ``sequential`` (the default) is openai-whisper's ``transcribe`` loop.
+    The adapter's ``long_form`` picks the mode, and a request can override it;
+    Whisper and Qwen3-ASR default to ``parallel``.
+
+    ``sequential`` is openai-whisper's ``transcribe`` loop.
     Windows run in order, each conditioned on the transcript so far
     (``initial_prompt``) and on the language the first window settled. When
     the adapter ``seeks_by_timestamps`` every window is decoded with
