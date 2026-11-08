@@ -45,6 +45,7 @@ from mstar.model.submodule_base import (  # noqa: E402
     ModelInputsFromEngine,
     NodeInputs,
 )
+from mstar.worker.rebuild import Rebuilds  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -500,7 +501,7 @@ def test_llm_check_stop_batched_agrees_with_per_request():
 def test_engine_stop_check_takes_the_batched_path():
     """The engine's stop check reaches the batched path rather than falling
     back to one ``check_stop`` per row."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     sub = _llm_submodule(_tiny_config())
 
@@ -521,10 +522,9 @@ def test_engine_stop_check_takes_the_batched_path():
         node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
     )
-    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=sub)})
+    engine = make_engine(_submodules={"llm": make_mgmt(submodule=sub)})
     tokens = torch.tensor([[IM_END], [1234]])
-    stops = Engine.check_stop_for_batch(
-        engine, batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
+    stops = engine.check_stop_for_batch(batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
     )
     assert stops == {"end": {"decode_loop"}} and not failures
 
@@ -538,6 +538,8 @@ def test_graph_resources_and_walk_plan():
     model = _make_model()
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {PREFILL_WALK, DECODE_WALK} and model.nodes == [LLM_NODE, ENCODER_NODE]
+    # no text walk to rebuild a dropped request on, so the worker starts with no rebuild policy
+    Rebuilds(model.rebuild_policies(), walks)
     specs = model.get_node_resources()
     ragged = next(s for s in specs if isinstance(s, RaggedAttentionSpec))
     assert ragged.nodes == {ENCODER_NODE} and ragged.config.num_qo_heads == 4 and ragged.config.head_dim == 16

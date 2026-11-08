@@ -45,7 +45,7 @@ from mstar.engine.resources import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
-from mstar.model.components.diffusion.image_io import encode_mp4
+from mstar.model.components.video_encode import encode_mp4
 from mstar.model.ltx2_5.config import (
     AUDIO_DECODER_NODE,
     DENOISE_LOOP,
@@ -434,8 +434,12 @@ class LTX25Model(Model):
         if modality != "video":
             raise ValueError(f"unsupported output modality for LTX-2.5: {modality!r}")
         fps = self.resolve_request(request_kwargs or {})["fps"]
-        # the decoder emits [F, H, W, 3] already, the layout the encoder takes
-        return encode_mp4(output[0] if output.ndim == 5 else output, fps)
+        # the decoder emits [F, H, W, 3] already, the layout PyAV encodes from
+        frames = (output[0] if output.ndim == 5 else output).cpu().numpy()
+        # As Cosmos3 encodes: CRF 18 is less lossy than libx264's default 23, and the
+        # multithreaded ultrafast preset is several times faster than the default (121 frames
+        # at 544x960 in 0.23 s), all of it on the request's critical path.
+        return encode_mp4(frames, fps, options={"crf": "18", "preset": "ultrafast", "threads": "0"})
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.geometry.output_sample_rate

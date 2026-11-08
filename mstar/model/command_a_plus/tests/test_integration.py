@@ -319,6 +319,8 @@ class ModelIntegrationTests(unittest.TestCase):
         layout = metadata[MEDIA_LAYOUT]
         self.assertEqual((layout["offset"], layout["tokens"]), ([2, 7, 15], [4, 4, 4]))
         node = toy_node(self.model)
+        # the media prompt reads where its stream's positions start
+        node.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
         ids, rows = result["text_inputs"][0], torch.randn(12, self.model.config.vocab_size)
         engine = ModelInputsFromEngine(["a"], {}, {
             LOCAL_ATTN: SimpleNamespace(select_last_hidden=lambda x: x),

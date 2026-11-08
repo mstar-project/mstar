@@ -16,8 +16,6 @@ pytest.importorskip("diffusers")
 
 from diffusers import UniPCMultistepScheduler  # noqa: E402
 
-from mstar.engine.chunking import ChunkingManagement  # noqa: E402
-from mstar.engine.engine import Engine  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
@@ -25,6 +23,7 @@ from mstar.model.cosmos3.submodules import (  # noqa: E402
     VIDEO_GEN_AR_WALK,
     Cosmos3DiTSubmodule,
 )
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
 # nvidia/Cosmos3-Edge scheduler/scheduler_config.json (the fields UniPC reads)
 EDGE_SCHEDULER = {
@@ -131,11 +130,7 @@ def test_finished_request_re_queued_fails_alone():
     batch.drop_rids = lambda rids: setattr(
         batch, "request_ids", [r for r in batch.request_ids if r not in rids])
     batch.register_failure = lambda rid, err, walk=None: batch.failed_requests.__setitem__(rid, str(err))
-    eng = Engine.__new__(Engine)
-    eng._submodules = {"dit": SimpleNamespace(submodule=dit, resources={})}
-    eng._enable_nvtx = False
-    eng._loopback_steps = {}
-    eng._chunking = ChunkingManagement(eng._submodules)
+    eng = make_engine(_submodules={"dit": make_mgmt(dit)})
 
     eng.prepare_inputs(batch)
 

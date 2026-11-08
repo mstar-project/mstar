@@ -36,17 +36,17 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwargs
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.testing_utils.model import StubModel
 from mstar.utils.containers import ParallelList
 from mstar.validation import validate_deployment
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-class _ToyModel(Model):
+class _ToyModel(StubModel):
     def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=(), sp_enabled_nodes=()):
         self._walks = walks
         self._partitions = partitions
@@ -66,21 +66,6 @@ class _ToyModel(Model):
     def get_default_sharding_config(self):
         return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={},
                               sp_enabled_nodes=self._sp_enabled_nodes)
-
-    def get_node_resources(self):
-        return []
-
-    def walk_plan(self, *a, **k):
-        raise NotImplementedError
-
-    def process_prompt(self, *a, **k):
-        return {}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
 
 
 def _config(tmp_path, node_groups) -> str:

@@ -36,6 +36,7 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
     ConductorMessageType,
@@ -45,7 +46,6 @@ from mstar.utils.ipc_format import (
     WorkerMessageType,
 )
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 PRODUCER = "worker_0"
 CONSUMER = "worker_1"
@@ -184,10 +184,7 @@ def _conduct(c, wgds) -> InputSignals:
 
 def _consumer(policy):
     """A consumer worker holding one StreamBuffer; reads land at once."""
-    w = Worker.__new__(Worker)
-    w._reads_done_sent = set()  # takes every input (`_takes_input`)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
+    w = make_worker()
     buf = StreamBuffer(1, EDGE, "LLM", policy)
     w.worker_id = CONSUMER
     w._reads_done_sent = set()

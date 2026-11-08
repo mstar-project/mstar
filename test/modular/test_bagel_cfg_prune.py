@@ -292,7 +292,7 @@ def _pointer(uuid):
 def _image_request_intake(kwargs, cfg_parallel=True):
     """A text-to-image request through BAGEL's intake: the model, the request's
     `CFGWindow`, the kwargs process_prompt hands on, and its walk plan."""
-    from mstar.model.bagel.bagel_model import CFG_WINDOW, BagelModel
+    from mstar.model.bagel.bagel_model import CFG_WINDOW, ROLE_TURNS, BagelModel
 
     model = BagelModel.__new__(BagelModel)
     model.config = CONFIG
@@ -301,7 +301,7 @@ def _image_request_intake(kwargs, cfg_parallel=True):
     model._image_gen_remote_handoff = False
     params = model._request_params(["text"], ["image"], kwargs)
     window = cfg_window(N, SHIFT, tuple(params["cfg_interval"]), params["cfg_text_scale"], params["cfg_img_scale"])
-    model_kwargs = {**kwargs, CFG_WINDOW: tuple(window)}
+    model_kwargs = {**kwargs, CFG_WINDOW: tuple(window), ROLE_TURNS: False}
     plan = model.walk_plan(DEFAULT_PARTITION, ["text"], ["image"], {"text_inputs.0": [_pointer(0)]}, model_kwargs)
     return model, window, model_kwargs, plan
 

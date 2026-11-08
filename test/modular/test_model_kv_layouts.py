@@ -11,7 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ForwardPassInfoWrapper
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.manager import SpanCursor
-from mstar.model.base import LabelLayout
+from mstar.model.base import LabelLayout, Span
 from mstar.model.submodule_base import InputMetadata
 
 NOT_EOS = 42
@@ -463,6 +463,36 @@ def test_higgs_lays_out_its_prompt_as_one_audio_row(thinking):
     # every prompt carries the clip: no text walk, mixed step or prefix keys
     assert "prefill_text" not in model.get_graph_walk_graphs() and model.get_combined_graph_walks() == {}
     assert model.kv_labels()[KV_CACHE]["main"].keys is None
+
+
+def _text_only_qwen3_5(tmp_path, monkeypatch):
+    """A checkpoint with no ``vision_config``, whose tokenizer still has the pad tokens."""
+    from mstar.model.qwen3_5 import qwen3_5_model
+
+    (tmp_path / "config.json").write_text("{}")
+    pads = {"<|image_pad|>": 5, "<|video_pad|>": 6}
+    tokenizer = SimpleNamespace(eos_token_id=None, unk_token_id=0, convert_tokens_to_ids=lambda t: pads.get(t, 0))
+    monkeypatch.setattr(qwen3_5_model.AutoTokenizer, "from_pretrained", lambda *a, **k: tokenizer)
+    monkeypatch.setattr(qwen3_5_model.Qwen3_5Config, "from_hf", lambda _: SimpleNamespace(max_position_embeddings=64))
+    return qwen3_5_model.Qwen3_5DenseModel(str(tmp_path))
+
+
+def test_a_text_only_qwen3_5_takes_no_media(tmp_path, monkeypatch):
+    model = _text_only_qwen3_5(tmp_path, monkeypatch)
+
+    assert not model.media and not model.encoders, "a media walk needs a vision_encoder node, which startup refuses"
+
+
+def test_a_text_only_qwen3_5_lays_out_a_text_prompt(tmp_path, monkeypatch):
+    from mstar.model.keys import KV_CACHE
+
+    model = _text_only_qwen3_5(tmp_path, monkeypatch)
+
+    layout = model.kv_layout({"offset": [], "tokens": [], "output": [], "grid": []}, 7)
+
+    assert layout[KV_CACHE]["main"] == LabelLayout(
+        spans=(Span("ids", "prefill_text", 7, 7, "text_inputs"),), growth=(("decode_loop", 1),),
+    ), "a text-only checkpoint lays out a text prompt as a vision checkpoint does"
 
 
 def _omni_submodule():

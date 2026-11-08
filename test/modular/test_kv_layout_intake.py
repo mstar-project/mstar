@@ -14,28 +14,31 @@ import torch
 import yaml
 from test_kv_prefix_request_keys import _StubTensorManager
 
+import mstar.communication.wire_types  # noqa: F401  (registers the wire tags)
 import mstar.conductor.conductor as conductor_mod
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication import wire
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import WalkStep
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, StreamLayout
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig, PrefixSpan, SpanKind, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
 
 PS = 16
 PROMPT = 100
 LAYOUT = {"kv": {
     "main": LabelLayout(
-        spans=(Span("ids", "prefill", PROMPT, PROMPT, "text_inputs"),), growth=(("decode_loop", 1),),
+        spans=(Span(SpanKind.IDS, "prefill", PROMPT, PROMPT, "text_inputs"),), growth=(("decode_loop", 1),),
     ),
     "uncond": LabelLayout(
-        spans=(Span("rows", "prefill", 10, 10, "cond"),), growth=(("talk_loop", 2),), scratch=7,
+        spans=(Span(SpanKind.ROWS, "prefill", 10, 10, "cond"),), growth=(("talk_loop", 2),), scratch=7,
     ),
 }}
 
@@ -47,7 +50,8 @@ class _Comm:
         self.batches = deque()
 
     def send(self, entity_id, msg):
-        self.sent.append(msg)
+        # through the wire codec, as the data worker's and the conductor's messages travel
+        self.sent.append(wire.decode(wire.encode(msg)))
 
     def get_all_new_messages(self):
         return self.batches.popleft() if self.batches else []
@@ -60,8 +64,7 @@ class _ScriptDoneError(Exception):
     pass
 
 
-class _Model(Model):
-
+class _Model(StubModel):
     def __init__(self, layout=LAYOUT, max_seq_len=4096):
         self._layout, self._max_seq_len = layout, max_seq_len
 
@@ -105,18 +108,9 @@ class _Model(Model):
         # no worker reports in these tests, so the request never leaves prefill
         return [WalkStep("prefill"), WalkStep("decode", bind={"text_inputs": "new_token"})]
 
-    def max_input_files(self):
-        return {}
-
     def process_prompt(self, *args, **kwargs):
         tensors = {"text_inputs": [torch.arange(PROMPT)]}
         return tensors if self._layout is None else ProcessPromptOutput(tensors, {"kv_layout": self._layout})
-
-    def postprocess(self, *args, **kwargs):
-        return b""
-
-    def get_submodule(self, *args, **kwargs):
-        return None
 
 
 def _preprocess(model: _Model, model_kwargs: dict, **config) -> dict:

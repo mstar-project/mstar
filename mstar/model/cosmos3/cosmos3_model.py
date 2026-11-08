@@ -87,9 +87,9 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
-from mstar.model.components.diffusion.image_io import encode_mp4
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.components.mrope import layout_extent
+from mstar.model.components.video_encode import encode_mp4
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -1217,7 +1217,11 @@ class Cosmos3Model(Model):
                         "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
-                data = encode_mp4(frames.permute(0, 2, 3, 1), fps=fps, preset=preset)
+                # the default rate_denominator (1001) writes NTSC rates exactly
+                data = encode_mp4(
+                    frames.permute(0, 2, 3, 1).numpy(), fps,
+                    options={"crf": "18", "preset": preset, "threads": "0"}, pad_even=True,
+                )
             return data
         if modality == "action":
             # The predicted action latents [1, chunk, action_dim] -> [chunk,
@@ -1374,6 +1378,12 @@ class Cosmos3Model(Model):
                 1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
             ),
         }
+        frames_per_latent = self.config.vae.scale_factor_temporal
+        if params["has_image_condition"] and action_mode is None and num_frames <= frames_per_latent:
+            # the image pins the first latent frame, so one latent frame leaves nothing to denoise
+            raise ValueError(
+                f"Cosmos3 image conditioning requires a video request (num_frames > {frames_per_latent})."
+            )
         # Video-to-video: a non-action video input pins clean conditioning
         # latent frames taken from the request video (reference recipe defaults:
         # indexes (0, 1), keep "first", flow_shift 10.0). Validated here so a

@@ -742,3 +742,19 @@ def test_ramp_boundaries_are_no_worse_than_25_frame_chunks(long_reach_code2wav):
     assert statistics.median(steady) >= statistics.median(base_steady) - 1
     assert min(steady) >= min(base_steady) - 2
     assert len(ramp) == 8 and min(ramp) > 80
+
+
+def test_a_full_scale_bf16_sample_stays_at_the_top_of_int16():
+    """The vocoder runs in bf16, where 32767 rounds up to 32768; converted
+    there, a clipped sample wraps to -32768, a click."""
+
+    class _FullScale(torch.nn.Module):
+        def forward(self, codes, position_ids):
+            return torch.tensor([[[1.0, -1.0]]], dtype=torch.bfloat16).expand(codes.shape[0], 1, 2)
+
+    submodule = Code2WavSubmodule(_FullScale(), Qwen3OmniModelConfig())
+    outputs = submodule.forward_batched(
+        "code2wav_chunk", SimpleNamespace(request_ids=["r"]),
+        codec_tokens=_codes(1).t()[None], position_ids=torch.arange(1)[None],
+    )
+    assert outputs["r"]["audio_chunk"][0].tolist() == [32767, -32767]

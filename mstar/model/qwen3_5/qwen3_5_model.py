@@ -93,8 +93,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
         # the vision tower, whose output fills images' and videos' pads in
-        # prompt order
-        pad = self._pad_ids()
+        # prompt order. A text-only checkpoint's tokenizer still has the pad
+        # tokens, so the tower decides whether the model takes media.
+        pad = self._pad_ids() if self.vision_config is not None else {}
         tower = vision_encoder(tuple(pad.values())) if pad else None
         self.media = tuple(
             MediaIntake(m, tower, p, self._image_intake) if m == "image"
@@ -405,16 +406,16 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        return super().kv_layout(layout, length, layout_extent(layout, self.vision_config.spatial_merge_size, length))
+        if not layout.get("grid"):  # a text prompt, the only kind a text-only checkpoint takes
+            return super().kv_layout(layout, length)
+        return super().kv_layout(layout, length, layout_extent(layout, self._merge(), length))
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
     # ------------------------------------------------------------------
 
     def _create_submodule(
-        self, node_name: str, device: str,
-        autocast_dtype: torch.dtype | None = None,
-        tp_group=None,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
         from mstar.model.qwen3_5.submodules import (
             LLMSubmodule,
@@ -424,7 +425,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         if node_name not in ("LLM", "vision_encoder"):
             return None
 
-        dtype = autocast_dtype or torch.bfloat16
         weights_dir = self._resolve_weights()
 
         if node_name == "vision_encoder":
@@ -456,9 +456,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         )
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
-        if tp_group is not None and tp_group.world_size > 1:
-            # collective over the TP group; every rank builds the LLM here
-            tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
         return LLMSubmodule(
             model, self.config, self.vision_config, self.encoders,

@@ -1,5 +1,4 @@
-"""Pixel <-> latent-token layout helpers and PNG encoding shared by the image DiTs,
-and the H.264 mp4 encoder the video models share.
+"""Pixel <-> latent-token layout helpers and PNG encoding shared by the image DiTs.
 
 The conventions are the FLUX family's: a VAE latent ``[B, C, H, W]`` is
 patchified 2x2 into ``[B, 4C, H/2, W/2]`` and packed to tokens ``[B, (H/2)(W/2),
@@ -10,8 +9,8 @@ from __future__ import annotations
 
 import io
 import struct
+import threading
 import zlib
-from fractions import Fraction
 
 import numpy as np
 import torch
@@ -123,33 +122,56 @@ def uint8_to_png(
     return b"".join((
         b"\x89PNG\r\n\x1a\n",
         _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),  # 8-bit RGB
-        _png_chunk(b"IDAT", _zlib_parallel(raw.tobytes(), compress_level, workers or cpus.plan().png_threads)),
+        _png_chunk(b"IDAT", _zlib_parallel(
+            memoryview(raw).cast("B"), compress_level, workers or cpus.plan().png_threads,
+        )),
         _png_chunk(b"IEND", b""),
     ))
 
 
-def _zlib_parallel(data: bytes, level: int, workers: int, min_block: int = 1 << 18) -> bytes:
-    """One valid zlib stream from ``workers`` independently deflated blocks.
+def _zlib_parallel(data, level: int, workers: int, min_block: int = 1 << 18) -> bytes:
+    """One valid zlib stream from ``workers`` independently deflated blocks of the
+    bytes-like ``data``.
 
     Raw deflate blocks ended with ``Z_SYNC_FLUSH`` finish on a byte boundary, so their
     concatenation is one deflate stream once the last block carries the final bit; zlib
-    releases the GIL, so the blocks compress in parallel. Small inputs take the plain path.
+    releases the GIL, so the blocks compress in parallel, on the process's deflate pool
+    (:func:`_deflate_pool`). Small inputs take the plain path.
     """
     blocks = max(1, min(workers, len(data) // min_block))
     if blocks == 1:
         return zlib.compress(data, level)
     size = -(-len(data) // blocks)
-    parts = [data[i * size:(i + 1) * size] for i in range(blocks)]
+    view = memoryview(data)
 
-    def deflate(index: int, part: bytes) -> bytes:
+    def deflate(index: int) -> bytes:
         compressor = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)
-        out = compressor.compress(part)
+        out = compressor.compress(view[index * size:(index + 1) * size])
         return out + compressor.flush(zlib.Z_FINISH if index == blocks - 1 else zlib.Z_SYNC_FLUSH)
 
-    with ThreadPool(max_workers=blocks) as pool:
-        deflated = list(pool.map(deflate, range(blocks), parts))
+    futures = [_deflate_pool().submit(deflate, index) for index in range(blocks)]
+    adler = zlib.adler32(view) & 0xFFFFFFFF
     # zlib header: deflate, 32K window, no preset dictionary, "fastest" level hint (FCHECK ok)
-    return b"\x78\x01" + b"".join(deflated) + struct.pack(">I", zlib.adler32(data) & 0xFFFFFFFF)
+    return b"\x78\x01" + b"".join(future.result() for future in futures) + struct.pack(">I", adler)
+
+
+_deflate_threads: ThreadPool | None = None
+_deflate_lock = threading.Lock()
+
+
+def _deflate_pool() -> ThreadPool:
+    """The threads every PNG of this process deflates its blocks on, the CPU plan's
+    ``deflate_threads``. Images encoded at once queue their blocks here instead of
+    each starting threads of its own, and the images the data worker encodes at
+    once still deflate all their blocks together."""
+    global _deflate_threads
+    if _deflate_threads is None:
+        with _deflate_lock:
+            if _deflate_threads is None:
+                _deflate_threads = ThreadPool(
+                    max_workers=cpus.plan().deflate_threads, thread_name_prefix="mstar-deflate",
+                )
+    return _deflate_threads
 
 
 OUTPUT_FORMATS = ("png", "jpeg", "webp")
@@ -216,31 +238,3 @@ def normalize_pixels(image: torch.Tensor) -> torch.Tensor:
     if image.dtype == torch.uint8:
         image = image.to(torch.float32) / 255.0
     return image.to(torch.float32) * 2.0 - 1.0
-
-
-def encode_mp4(frames: torch.Tensor, fps: float, crf: int = 18, preset: str = "ultrafast") -> bytes:
-    """H.264 mp4 bytes from uint8 frames ``[T, H, W, 3]`` through PyAV, whose
-    wheel bundles FFmpeg with libx264. CRF 18 is near-visually-lossless where
-    libx264's default 23 is visibly lossier at the same preset, and the
-    ultrafast preset encodes several times faster than its default ``medium``,
-    all of it on the request's critical path (121 frames at 544x960 in 0.23 s).
-    Odd frame sizes are edge-padded to even ones for yuv420p."""
-    import av
-
-    arr = frames.cpu().numpy()
-    _, h, w, _ = arr.shape
-    if (w % 2) or (h % 2):
-        arr = np.pad(arr, ((0, 0), (0, h % 2), (0, w % 2), (0, 0)), mode="edge")
-    buf = io.BytesIO()
-    with av.open(buf, mode="w", format="mp4") as container:
-        # PyAV wants a rational rate: 24 -> 24, 23.976 -> 2997/125
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
-        stream.width, stream.height = arr.shape[2], arr.shape[1]
-        stream.pix_fmt = "yuv420p"
-        stream.options = {"crf": str(crf), "preset": preset, "threads": "0"}
-        for frame in arr:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
-    return buf.getvalue()

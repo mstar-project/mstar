@@ -140,7 +140,7 @@ class LLMSubmodule(SampledTokenDecoder):
     # ------------------------------------------------------------------
 
     def prompt_positions(
-        self, fwd_info: CurrentForwardPassInfo, layout: dict, num_tokens: int,
+        self, start: int, layout: dict, num_tokens: int,
     ) -> tuple[torch.Tensor, int]:
         """A media prompt's ``[3, tokens]`` MRoPE ids, from the intake's
         layout (no read of the ids).
@@ -150,7 +150,6 @@ class LLMSubmodule(SampledTokenDecoder):
         ``t * h' * w'`` tokens, so the cursor advances by the real amount and
         the position resource is handed the total.
         """
-        start = self.node_resources[ROPE].position(rid=fwd_info.request_id, label="main")
         # built on the host, copied once
         pos_ids, advance = layout_position_ids(layout, self._merge_size, num_tokens, start)
         return to_device_nonblocking(pos_ids, self.get_device()), advance

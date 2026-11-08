@@ -522,13 +522,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         contradicts. ``Engine.exec`` checks the two against each other.
 
         The guidance interval is the fact this deliberately does not consult:
-        a captured step always runs both branches, so an out-of-interval step
-        gets the guidance combine where the eager path would run the
-        conditional branch alone (``postprocess`` combines unconditionally).
-        That predates the v1 migration and matches the fused reference
-        pipeline, which applies guidance on every step; honoring the interval
-        here instead would make the key step-dependent, which is exactly what
-        the pre-plan path cannot support.
+        a captured step always runs both branches, and ``postprocess`` keeps
+        the conditional one outside the interval, as the eager path does.
+        Honoring the interval here instead would make the key step-dependent,
+        which is exactly what the pre-plan path cannot support.
         """
         del per_request_input_metadata, kwargs
         rids = list(per_request_info)
@@ -1546,7 +1543,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if captured:
             # The captured denoise graph has a fixed shape and always runs both
             # guidance branches — including outside a request's guidance
-            # interval, which the eager path below honors. See `cg_key_info`.
+            # interval, where postprocess keeps the conditional one. See `cg_key_info`.
             return self._gen_step(
                 request_ids, spans, (COND_LABEL, UNCOND_LABEL),
                 combined=True, attn_key=attn_key, cg_key_info=capture_key,
@@ -1555,7 +1552,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if len(infos) > 1:
             # Cross-request batch: one combined plan over every request's
             # guidance branches (a single branch when guidance is off). The
-            # image and sound batched forwards apply guidance whenever the
+            # image and sound batched forwards run both branches whenever the
             # branch exists. The action one runs the conditional branch alone
             # when no row is inside its guidance interval, as a single request
             # does (rows outside it in a guided batch drop the other branch).
@@ -1765,11 +1762,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ``_forward_action_gen`` call this for the same step, so the declared
         attention (batched vs cond-only) matches the forward that runs.
 
-        The captured path does not consult it at all: its graph is fixed at
-        both branches and ``postprocess`` combines unconditionally, so an
-        out-of-interval step that lands on a capture slot gets guidance where
-        the eager one would not. See ``cg_key_info`` for why the interval
-        cannot be folded into the capture key."""
+        The captured path and the cross-request batch always run both
+        branches; ``postprocess`` and ``forward_batched`` call this to keep
+        the conditional one outside the interval. See ``cg_key_info`` for why
+        the interval is not folded into the capture key."""
         if st["uncond"] is None:
             return False
         gi = st.get("guidance_interval")
@@ -2117,7 +2113,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, k, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
-            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
+            if self._cfg_active(st, local):
+                velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
+            else:  # outside the guidance_interval, as in _forward_image_gen
+                velocity = cond_v.to(lat.dtype)
             solver = {name: kwargs[name][rid] for name in self._solver_state}
             new_latents, solver = self._scheduler_step(st, velocity, lat, local, solver)
             if st.get("vmask") is not None:
@@ -2170,8 +2169,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, snd, k), ((cond_v, s_c), (uncond_v, s_u)) in zip(meta, results, strict=True):
-            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
-            sound_v = _guided(s_c, s_u, st["gs"], snd.dtype)
+            if self._cfg_active(st, k):
+                velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
+                sound_v = _guided(s_c, s_u, st["gs"], snd.dtype)
+            else:  # outside the guidance_interval, as in _forward_image_gen
+                velocity, sound_v = cond_v.to(lat.dtype), s_c.to(snd.dtype)
             solver = {name: solvers[name][rid] for name in self._solver_state}
             new_latents, new_sound, solver = self._sound_scheduler_step(st, lat, snd, velocity, sound_v, k, solver)
             if st.get("vmask") is not None:
@@ -2518,9 +2520,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return
         st = self.request_states[request_id]
         latents = inputs.tensor_inputs["latents"]
-        velocity = _guided(outputs["cond_v"][0], outputs["uncond_v"][0], st["gs"], latents.dtype)
-        solver = {name: inputs.tensor_inputs[name] for name in self._solver_state}
-        outputs.clear()
         # in range: the request's step count is the loop's cap (Cosmos3Model._denoise_cap)
         step_index = _loop_step(request_info, request_info.graph_walk)
         windowed = "ar_schedule" in st
@@ -2530,6 +2529,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # counter is global, the schedule index is the within-window step.
             window_index, local, _ = self._window_step(st, step_index)
             step_index = local
+        # the graph runs both branches; a step outside the guidance_interval keeps the conditional one
+        if self._cfg_active(st, step_index):
+            velocity = _guided(outputs["cond_v"][0], outputs["uncond_v"][0], st["gs"], latents.dtype)
+        else:
+            velocity = outputs["cond_v"][0].to(latents.dtype)
+        solver = {name: inputs.tensor_inputs[name] for name in self._solver_state}
+        outputs.clear()
         # The graph predicts every frame; clean frames (i2v anchor, chained
         # overlap) get the zero velocity the eager unpatchify gives them.
         velocity = velocity * self._noisy_masks(st, velocity.device)[1].to(velocity.dtype)
@@ -3201,8 +3207,7 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     def layer_steps(self) -> dict[str, ResourceStep]:
         return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
 
-    def prompt_positions(self, fwd_info, layout: dict, num_tokens: int) -> tuple[torch.Tensor, int]:
-        start = self.node_resources[ROPE].position(rid=fwd_info.request_id, label=REASONER_LABEL)
+    def prompt_positions(self, start: int, layout: dict, num_tokens: int) -> tuple[torch.Tensor, int]:
         return layout_position_ids(
             layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start, self.get_device(),
         )

@@ -6,13 +6,13 @@ single ``GraphNode`` matched, but a decode ``Loop`` whose inner node consumes
 the streamed edge did not. Its chunks were then routed to ``next_node=""`` and
 its ``StreamBuffer`` was never created (``KeyError`` when routing the edge).
 """
-from types import SimpleNamespace
 
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, StreamingGraphEdge
+from mstar.testing_utils.model import make_model
 from mstar.worker.stream_buffers import consumer_nodes
 from mstar.worker.worker import Worker
 
@@ -45,7 +45,7 @@ def _model():
         PartitionDefinition(name="B", graph_walks={"consume"}),
         PartitionDefinition(name="C", graph_walks={"decode_audio"}),
     ]
-    return SimpleNamespace(
+    return make_model(
         get_graph_walk_graphs=lambda: walks,
         get_partitions=lambda: partitions,
     )

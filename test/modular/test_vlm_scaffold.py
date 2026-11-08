@@ -205,12 +205,16 @@ def test_a_padded_media_step_moves_no_position_for_its_padding_rows():
 def test_a_media_row_with_the_wrong_row_count_fails_its_request():
     """Checked on host values: the media tensor's shape against the layout."""
     llm = _qwen_llm((AUDIO,))
-    llm.prompt_positions = lambda fwd_info, layout, n: (None, None)
+    starts = []
+    llm.prompt_positions = lambda start, layout, n: starts.append(start) or (None, None)
+    # the stream's counter is keyed by the worker's handle, not the wire id
+    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {(7, "main"): 5}[rid, label])}
     ids = torch.tensor([1, AUDIO_PAD, AUDIO_PAD])
     layout = {"offset": [1], "tokens": [2], "output": ["audio_embeds"], "grid": [[]]}
-    fwd_info = SimpleNamespace(request_id="r", step_metadata={MEDIA_LAYOUT: layout})
+    fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata={MEDIA_LAYOUT: layout})
     row = llm.prepare_inputs("prefill_audio", fwd_info, {"text_inputs": [ids], "audio_embeds": [torch.zeros(2, 8)]})
     assert row.input_ids is ids and row.tensor_inputs["audio_embeds"].shape == (2, 8)
+    assert starts == [5]
     with pytest.raises(ValueError, match="1 rows for the prompt's 2 pads"):
         llm.prepare_inputs("prefill_audio", fwd_info, {"text_inputs": [ids], "audio_embeds": [torch.zeros(1, 8)]})
     # no output at all: a replay would splice in the previous step's rows
@@ -358,3 +362,51 @@ def test_qwen3_5_floors_a_float_images_levels():
     model._image_processor = processor
     model._image_intake(half, {})
     assert int(seen[0].max()) == 127
+
+
+def _glimmer_encoder(max_segments: int):
+    from mstar.model.keys import VISION_ATTN
+    from mstar.model.muse.submodules import VisionEncoderSubmodule
+
+    encoder = object.__new__(VisionEncoderSubmodule)
+    encoder.config = SimpleNamespace(hidden_size=8, head_dim=4)
+    encoder.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=max_segments)}
+    return encoder
+
+
+def test_glimmer_leases_and_replays_both_layouts():
+    """A replay's plan holds the resource's ceiling under each label, frames
+    as well as windows, and plans both; the frames pick the bucket."""
+    from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
+    from mstar.model.muse.config import VISION_FULL, VISION_WINDOW
+    from mstar.model.submodule_base import NodeInputs
+
+    encoder = _glimmer_encoder(max_segments=4)
+    region = encoder.get_piecewise_accelerator_graph_configs(
+        torch.device("cpu"), torch.bfloat16,
+    )[VISION_BLOCK_LOOP]
+
+    def row(windows: int, frames: int) -> NodeInputs:
+        return NodeInputs(
+            input_seq_len=windows,
+            resource_step_info={VISION_WINDOW: (1,) * windows, VISION_FULL: (1,) * frames},
+        )
+
+    assert region.can_lease([row(4, 4)])
+    assert not region.can_lease([row(1, 5)])
+    assert not region.can_lease([row(5, 1)])
+
+    ran = {}
+    runner = SimpleNamespace(
+        run=lambda **kwargs: ran.update(kwargs) or SimpleNamespace(get_view=lambda name: "replayed"),
+    )
+    hidden = torch.zeros(8, 8)
+    engine_inputs = SimpleNamespace(
+        piecewise_runners={VISION_BLOCK_LOOP: runner}, piecewise_leases={VISION_BLOCK_LOOP: object()},
+        request_ids=["r"],
+    )
+    lengths = {VISION_WINDOW: (4, 4), VISION_FULL: (8,)}
+    replayed = encoder._replay_block_loop(engine_inputs, hidden, hidden, hidden, lengths)
+    assert replayed.get_view("hidden") == "replayed"
+    assert ran["seq_lens"] == [8]
+    assert ran["label_seq_lens"] == {VISION_WINDOW: [4, 4], VISION_FULL: [8]}

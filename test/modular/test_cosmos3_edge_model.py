@@ -312,6 +312,7 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
     sub.get_device = lambda: torch.device("cpu")
     sub.node_resources = {ROPE: RopeManager(PositionConfig(kv_cache=KV_CACHE), torch.device("cpu"))}
+    sub.node_resources[ROPE].ingest_request("r")
 
     ids = torch.tensor([5, 6, 7] + [r.image_token_id] * 8 + [8, 9])
     layout = vision_layout(ids, r, [MediaGrid(1, 4, 8)], [], "vision_embeds")

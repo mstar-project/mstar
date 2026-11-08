@@ -50,6 +50,7 @@ from mstar.model.multimodal import (
     parts_from_modalities,
     text_combined_walks,
 )
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import TextOutput, load_generation_defaults
 
@@ -191,6 +192,15 @@ class MultimodalDecoderModel(Model):
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # a safety bound on decode, not the per-request budget
         return media_walks(self.config.max_position_embeddings, self.encoders, text=self.TEXT_PROMPTS)
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # A dropped text request reprefills its ids on the text walk. A media prompt prefills on
+        # its media walk, which keeps no ids, so the KV cache never drops it; nor anything of a
+        # model with no text walk (TEXT_PROMPTS False).
+        if not self.TEXT_PROMPTS:
+            return {}
+        return {"LLM": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
+                                     loop="decode_loop")}
 
     # -----------------------------------------------------------------------
     # KV layout
@@ -416,16 +426,22 @@ class MultimodalDecoderModel(Model):
         autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule | None:
         if node_name not in self._submodule_cache:
+            # the weights' dtype, and the fused kernel's: they must agree
+            dtype = autocast_dtype or torch.bfloat16
             self._submodule_cache[node_name] = self._create_submodule(
-                node_name, device, autocast_dtype, tp_group,
+                node_name, device, dtype, tp_group,
             )
+            if tp_group is not None and tp_group.world_size > 1:
+                # the LLM's norms reduce its row-parallel partial sums in one
+                # fused kernel; collective, and every rank builds the node here
+                tp_group.init_allreduce_fusion(self.config.hidden_size, dtype)
         return self._submodule_cache[node_name]
 
     def _create_submodule(
-        self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
-        """The node's submodule with its weights loaded, or None for a node
-        this model does not run."""
+        """The node's submodule with its weights loaded in ``dtype``, or None
+        for a node this model does not run."""
         raise NotImplementedError
 
     @staticmethod

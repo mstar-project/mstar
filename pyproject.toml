@@ -82,6 +82,7 @@ command_a_plus = [
 dev = [
     "ruff<=0.16",
     "pytest>=9.0.3",
+    "pytest-timeout",  # a per-test limit, so a stuck test is named rather than holding the suite
     "pydub",  # the OmniVoice silence trim's test oracle
     "audioop-lts; python_version >= '3.13'",  # pydub imports audioop, gone in 3.13
 ]
@@ -168,9 +169,9 @@ bagel_xpu = [
 ]
 
 cosmos3 = [
-    # PyAV writes the video container when torchcodec has no VideoEncoder
-    # (< 0.9) or cannot load FFmpeg.
-    "av",
+    # PyAV encodes the mp4 when torchcodec can't load (video_encode.encode_mp4,
+    # whose frame conversion threads need 19).
+    "av>=19",
     # The Cosmos3 reference pipeline (used by the parity tests) landed in
     # diffusers 0.39; serving itself uses AutoencoderKLWan and the scheduler.
     "diffusers>=0.39",
@@ -329,8 +330,9 @@ wan22 = [
     "huggingface-hub",
     "transformers",
     # mp4 encode for the video output. PyAV bundles its own FFmpeg libs;
-    # torchcodec is unusable here without a system FFmpeg install.
-    "av",
+    # torchcodec is unusable here without a system FFmpeg install. 19 for the
+    # frame conversion threads in video_encode.encode_mp4.
+    "av>=19",
     # The DiT's default self-attention runs on the engine's FlashInfer ragged resource.
     "flashinfer-python==0.7.2",
 ]
@@ -425,7 +427,7 @@ all = [
     "soundfile",
     "silero-vad>=5.1",
     "onnxruntime>=1.17",
-    "av",
+    "av>=19",
     "diffusers>=0.39",
     "fa3-fwd",
     "einops",

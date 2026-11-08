@@ -228,7 +228,7 @@ class SNACDecoderSubmodule(NodeSubmodule):
 
     def _decode(self, codes_0, codes_1, codes_2) -> torch.Tensor:
         audio = self.snac_model.decode([codes_0, codes_1, codes_2])
-        return (audio.clamp(-1, 1) * 32767).to(torch.int16).squeeze(1)
+        return (audio.float().clamp(-1, 1) * 32767).to(torch.int16).squeeze(1)
 
     def _decode_rows(self, codes_0, codes_1, codes_2, widths) -> torch.Tensor:
         """``[B, widest * hop]`` int16 audio, each row decoded at its own width."""

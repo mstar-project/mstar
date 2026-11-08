@@ -289,25 +289,24 @@ class Qwen3ASRModel(MultimodalDecoderModel):
     # -------------------------------------------------------------------
 
     def _create_submodule(
-        self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
         if node_name == ENCODER_NODE:
-            submodule = self._create_encoder_submodule(device, autocast_dtype)
+            submodule = self._create_encoder_submodule(device, dtype)
         elif node_name == LLM_NODE:
-            submodule = self._create_llm_submodule(device, tp_group, autocast_dtype)
+            submodule = self._create_llm_submodule(device, tp_group, dtype)
         else:
             return None
         logger.info("Successfully loaded Qwen3-ASR submodule for %s", node_name)
         return submodule
 
-    def _create_encoder_submodule(self, device: str, autocast_dtype: torch.dtype | None) -> NodeSubmodule:
+    def _create_encoder_submodule(self, device: str, dtype: torch.dtype) -> NodeSubmodule:
         from mstar.model.components.aut_encoder import AuTEncoder
         from mstar.model.loader.iterators import iter_safetensors_shards
 
         with torch.device("meta"):
             encoder = AuTEncoder(self.config.audio, attn_key=AUT_ATTN)
-        if autocast_dtype is not None:
-            encoder = encoder.to(autocast_dtype)
+        encoder = encoder.to(dtype)
         encoder.to_empty(device=device)
         prefix = "thinker.audio_tower."
         weights = iter_safetensors_shards(self._resolve_weights(), device=device, prefix=prefix)
@@ -326,7 +325,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         return None
 
     def _create_llm_submodule(
-        self, device: str, tp_group, autocast_dtype: torch.dtype | None,
+        self, device: str, tp_group, dtype: torch.dtype,
     ) -> NodeSubmodule:
         from mstar.model.components.qwen3_lm import Qwen3DenseLM
         from mstar.model.loader.iterators import iter_safetensors_shards
@@ -335,8 +334,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
             llm = Qwen3DenseLM(
                 self.config.text, attn_key=ATTN, kv_key=KV_CACHE, pos_key=ROPE, comm_group=tp_group,
             )
-        if autocast_dtype is not None:
-            llm = llm.to(autocast_dtype)
+        llm = llm.to(dtype)
         llm.to_empty(device=device)
         weights = iter_safetensors_shards(self._resolve_weights(), device=device, prefix="thinker.")
         llm.load_weights(

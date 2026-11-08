@@ -29,7 +29,7 @@ from mstar.engine.resources.kv.transfer import (
     make_deployment_kv_shm_dir,
 )
 from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.model.bagel.bagel_model import CFG_WINDOW, BagelModel
+from mstar.model.bagel.bagel_model import CFG_WINDOW, ROLE_TURNS, BagelModel
 from mstar.model.bagel.components.modeling_utils import TimestepEmbedder
 from mstar.model.bagel.submodules import SAMPLER, CombineCFGSubmodule, LLMSubmodule, cfg_window
 from mstar.model.submodule_base import END_PARTITION
@@ -175,7 +175,8 @@ def test_a_stop_token_sampled_at_the_last_prefill_ends_a_text_reply(inputs, targ
     model._has_cfg_parallel = False
     signals = {name: [SimpleNamespace(dims=[3, 8, 8])]
                for name in ("text_inputs.0", "text_inputs.1", *(("image_inputs.0",) if "image" in inputs else ()))}
-    kwargs = {"think_mode": think}
+    # a text reply's prompt is written as role turns (bagel_model.uses_role_turns)
+    kwargs = {"think_mode": think, ROLE_TURNS: target == "text"}
     if target == "image":
         kwargs = _image_kwargs(model, kwargs)
     plan = model.walk_plan("default", inputs, [target], signals, kwargs)

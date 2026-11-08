@@ -25,9 +25,10 @@ from mstar.conductor.request_info import PartitionDefinition, WalkStep
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.runtime.base import RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import Model, WorkerGraph
+from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology
+from mstar.testing_utils.model import StubModel
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import NewRequestConductor
 
@@ -108,7 +109,7 @@ def test_split_inputs_keeps_persist_order_across_walks():
     assert [x.uuid for x in got.tensor_info] == [1, 2, 3]
 
 
-class _TwoStreamModel(Model):
+class _TwoStreamModel(StubModel):
     def get_graph_walk_graphs(self):
         return {"p": GraphNode(name="p", input_names=["x"], outputs=[]),
                 "c": GraphNode(name="c", input_names=["y"], outputs=[])}
@@ -125,18 +126,6 @@ class _TwoStreamModel(Model):
     def walk_plan(self, partition_name, *a, **k):
         # P ends after its one pass; C waits on its streams
         return [WalkStep("p" if partition_name == "P" else "c")]
-
-    def get_node_resources(self):
-        return []
-
-    def process_prompt(self, *a, **k):
-        return {}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
 
 
 class _ColonNamesModel(_TwoStreamModel):

@@ -44,7 +44,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
-from mstar.model.components.diffusion.image_io import encode_mp4
+from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
@@ -479,8 +479,7 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        # CRF 23 and medium, libx264's defaults, which Wan2.2 served at on PyAV >= 14.2
-        return encode_mp4(output, fps, crf=23, preset="medium")
+        return encode_mp4(output.cpu().numpy(), fps)
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration

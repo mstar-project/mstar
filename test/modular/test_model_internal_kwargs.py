@@ -19,7 +19,7 @@ from mstar.api_server.request_types import PreprocessInput
 from mstar.model.base import ProcessPromptOutput
 from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig, Qwen3TTSTalkerConfig
 from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
-from mstar.streaming.topology import PartitionTopology
+from mstar.testing_utils.model import StubModel
 
 ASSISTANT_PREFIX = [151644, 77091, 198]
 ASSISTANT_SUFFIX = [151645, 198, 151644, 77091, 198]
@@ -83,13 +83,10 @@ class _StubTensorManager:
         pass
 
 
-class _Internal:
+class _Internal(StubModel):
     """Reports a key of its own to the conductor, and only on some prompts."""
 
     INTERNAL_KWARGS = ("prompt_layout",)
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
     def process_prompt(self, *args, **kwargs):
         self.handed = kwargs

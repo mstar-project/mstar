@@ -95,7 +95,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        ``configs/pi05.yaml``). Cameras it leaves out are masked, as openpi does, and more
        images than that are a 400.
        ``configs/pi05_droid.yaml`` serves the DROID fine-tune (``lerobot/pi05_droid``) with
-       openpi's DROID normalization: raw joint state in, joint velocities out.
+       openpi's DROID normalization: raw joint state in, joint velocities out. It also
+       serves openpi's policy WebSocket, so openpi's DROID client connects unchanged
+       (see :doc:`clients`).
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -1100,7 +1102,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   8, which keep up; from 24 calls up the server fell behind real time, so lag
   grew over the call. Capturing the encoder's live step (below) took its host
   time at 32 calls from 23.6 to 8.4 ms and cut live lag 2-6x at 16-32 calls
-  (paced runs interleaved against the uncaptured encoder, ``MSTAR_SHM_ARENA=1``);
+  (paced runs interleaved against the uncaptured encoder, on the SHM arena);
   32 calls staggered over 2 s all finish, heard latency p50 2.1-2.3 s (from the
   user stopping to agent audio playable without gaps). With the codec in the
   talker's step, on one H200: 16 live calls keep real time whether they start
@@ -1366,7 +1368,7 @@ Cosmos3 environment requirements
   requests at preprocessing (other modes are unaffected).
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
   when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
-  ``image_io.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
+  ``video_encode.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
   covers a torchcodec that cannot load FFmpeg.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
@@ -1392,7 +1394,10 @@ size with its aspect ratio kept, center-cropped and rounded to 8 bits, as in
 NVIDIA's cosmos-framework and diffusers 0.40 and later. Setting
 ``conditioning_resize: stretch`` under the config YAML's ``model_kwargs``
 resizes it to the output size instead (antialiased bilinear, aspect ratio not
-kept), as diffusers 0.39 did. Action requests ignore the setting.
+kept), as diffusers 0.39 did. Action requests ignore the setting. The image
+pins the first latent frame, so the request must ask for a video of more than
+one latent frame (``num_frames`` above 4); an image output, or a shorter video,
+is refused with a 400.
 
 Cosmos3-Edge reasoner and action loop
 -------------------------------------

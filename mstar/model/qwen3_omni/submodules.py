@@ -1966,7 +1966,8 @@ class Code2WavSubmodule(NodeSubmodule):
         results: dict[str, NameToTensorList] = {}
         for i, rid in enumerate(request_ids):
             wav = wavs[i]
-            audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16).squeeze()
+            # in fp32: bf16 rounds a full-scale 32767 up to 32768, which wraps to -32768
+            audio_int16 = (wav.float().clamp(-1, 1) * 32767).to(torch.int16).squeeze()
             results[rid] = {"audio_chunk": [audio_int16]}
         return results
 
@@ -1988,7 +1989,7 @@ class Code2WavSubmodule(NodeSubmodule):
             return {}
 
         wav = self.code2wav(codec_tokens, position_ids)
-        audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16)
+        audio_int16 = (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
         return {"audio_chunk": [audio_int16]}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:

@@ -97,7 +97,7 @@ def test_no_token_row_means_per_request_path():
 def test_engine_falls_back_and_attributes_failures():
     """A batched check that raises (here: a request with no info) is redone
     per request, where the failure lands on that request alone."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     failures = {}
     infos = {"a": _info()}  # "x" missing
@@ -113,11 +113,10 @@ def test_engine_falls_back_and_attributes_failures():
         check_stop_batched=lambda *a: LLMSubmodule.check_stop_batched(_sub(), *a),
         check_stop=lambda rid, info, out: LLMSubmodule.check_stop(_sub(), rid, info, out),
     )
-    engine = SimpleNamespace(_submodules={"LLM": SimpleNamespace(submodule=sub)})
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule=sub)})
     tokens = torch.tensor([EOS, 3])
     outputs = {"a": {"new_token": [tokens[0:1]]}, "x": {"new_token": [tokens[1:2]]}}
-    stops = Engine.check_stop_for_batch(
-        engine, batch, outputs, host_rows=HostRows(("a", "x"), {"new_token": tokens}),
+    stops = engine.check_stop_for_batch(batch, outputs, host_rows=HostRows(("a", "x"), {"new_token": tokens}),
     )
     assert stops == {"a": {"decode_loop"}}
     assert list(failures) == ["x"]

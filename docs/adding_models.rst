@@ -243,10 +243,18 @@ The following methods have defaults and are optional to override:
 ``text_output``, ``postprocess`` and ``postprocess_inline`` (described next),
 ``get_request_resource_configs`` (described below), ``get_sampling_config``,
 ``get_max_output_tokens``, ``get_autocast_dtype``, ``load_image``, ``load_audio``,
-``load_video``, and the partition methods described at the end of this page. The default
-``load_audio`` decodes an upload to mono at the class attribute ``AUDIO_INPUT_RATE``
-(16 kHz) and refuses one longer than ``MAX_AUDIO_SECONDS`` (30 minutes); set those rather
-than overriding it.
+``load_video``, ``load_decoded_image``, and the partition methods described at the end
+of this page. The default ``load_audio`` decodes an upload to mono at the class attribute
+``AUDIO_INPUT_RATE`` (16 kHz) and refuses one longer than ``MAX_AUDIO_SECONDS`` (30
+minutes); set those rather than overriding it. ``load_decoded_image`` takes an image the
+API server already holds decoded (RGB uint8 ``[3, H, W]``, from the openpi WebSocket) and
+must return what ``load_image`` returns for the same pixels in a file. The default refuses,
+so a model takes images only as files until it overrides this. pi0.5's ``load_image`` calls
+it, so the two paths cannot drift apart. A robot policy also overrides ``robot_io``,
+returning a ``RobotIO``: the ``model_kwargs`` key its robot state goes under, and the
+``[action_horizon, action_dim]`` shape of the float32 actions its ``postprocess`` returns.
+The openpi WebSocket serves a model by these two hooks alone, so a new policy needs no
+change to the API server.
 
 ``text_output(self) -> TextOutput | None``
    Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
@@ -2585,11 +2593,15 @@ A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145
 video decoder should therefore emit its clip in the layout the encoder takes, transposed
 on the GPU inside its forward, so ``postprocess`` hands the tensor it reads straight to the
 encoder: ``[T, C, H, W]`` for torchcodec's ``VideoEncoder`` (Cosmos3) and ``[T, H, W, 3]``
-rgb24 frames for PyAV's ``image_io.encode_mp4`` (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
+rgb24 frames for PyAV (Wan2.2, LTX-2.5) or a raw ``video_frame`` stream (LingBot-World).
 A permute in ``postprocess`` costs a host copy of the whole clip, or a slower copy of each
-frame inside PyAV. The arena's CPU read of an output (``MSTAR_SHM_ARENA``) slices a large
-copy over threads of its own (``mstar.utils.host_copy.HostCopier``), one encode's share of
-the CPUs.
+frame inside PyAV. A PyAV mp4 should be written with
+``mstar.model.components.video_encode.encode_mp4``, which takes the model's x264 options,
+rate and padding, and converts the frames to the encoder's pixel format on a thread a few
+frames ahead of the encoder, so x264 gets the frames the plain ``stream.encode`` loop
+would hand it without waiting on the conversion between them. The SHM arena's CPU read of an
+output slices a large copy over threads of its own
+(``mstar.utils.host_copy.HostCopier``), one encode's share of the CPUs.
 
 .. _tensor-parallelism:
 
@@ -2652,6 +2664,16 @@ Two separate mechanisms split work across the TP group. Keep them distinct:
 If a node group has ``tp_size > 1`` and names a node that is not in ``tp_enabled_nodes``,
 loading fails. See ``configs/qwen3omni_thinker_tp2.yaml`` for an example with several node
 types.
+
+A row-parallel projection followed by an RMSNorm can leave its all-reduce to the norm, which
+runs both in one fused kernel. Set the projection's ``reduce_results = False``, so it returns
+its partial sum, and hand the norm the comm group: ``RMSNorm.forward_residual(x, residual,
+comm_group)`` reduces, adds and norms, and ``RMSNorm.forward(x, comm_group)`` reduces and
+norms (a post-norm before the residual add). The two go together, since a norm called
+without the group norms an unreduced partial sum, which is wrong only under TP. Keep both in
+the module whose ``forward`` calls the norms, as ``Qwen3_5LanguageModel`` and
+``MuseGlimmerTextModel`` do. ``MultimodalDecoderModel`` builds the kernel's workspace for its
+TP node.
 
 .. _Expert parallelism (MoE):
 
@@ -3144,7 +3166,11 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
 ``_prompt_ids`` and ``_create_submodule``, which hands the LLM node
-``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). ``media`` holds a
+``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). The scaffold's
+``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
+``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
+or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through
+its sliding-window pool. ``media`` holds a
 ``MediaIntake`` per attachment modality: its ``MediaEncoder`` (modalities may share one),
 its placeholder ``pad`` id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (``runs``, one by default; a Qwen3.5 video fills one per
@@ -3190,7 +3216,7 @@ writes:
             return {KV_CACHE: KVStep(), ATTN_FULL: AttentionStep(causal=True)}
 
         # optional, for positions the resource cannot place (MRoPE):
-        def prompt_positions(self, fwd_info, layout, num_tokens): ...  # -> (custom_pos_ids, advance)
+        def prompt_positions(self, start, layout, num_tokens): ...  # -> (custom_pos_ids, advance)
         def decoder_kwargs(self, graph_walk, engine_inputs, num_tokens, **tensors): ...
 
 Its decoder module provides ``embed(ids)``, ``forward(input_embeds, *, label, **kw)``
@@ -3216,10 +3242,14 @@ region per patch bucket (``BLOCK_LOOP_PATCH_BUCKETS``), the step as one row. Its
 tower's tensors in ``tensor_inputs`` and, in ``resource_step_info``, each of
 ``SEGMENT_LABELS``' attending spans (frames, windows) over the same patches. The tower
 provides ``embed(**tensors) -> (hidden, cos, sin)``, ``encode(hidden, cos, sin)`` and
-``project(encoded, **tensors)``. A step whose spans under some label exceed the
-ragged resource's ``max_segments_per_step`` takes no lease and runs eagerly.
-Qwen3-Omni's ViT node is one too, off the scaffold: its region also returns the
-deepstack taps (its ``_capture_block_loop``), which its own ``forward_batched`` reads
+``project(encoded, **tensors)``. The replay's input buffers are in the node's autocast
+dtype unless ``BLOCK_LOOP_DTYPE`` names what ``embed`` returns (Muse Glimmer's ends on a
+LayerNorm, which autocast returns in fp32). The runner refuses an ``embed`` output its
+buffers may round, and widens a narrower one, so a declaration wider than ``embed``'s
+output replays the loop in more precision than the eager loop runs. A step whose spans
+under some label exceed the ragged resource's ``max_segments_per_step`` takes no lease and
+runs eagerly. Qwen3-Omni's ViT node is one too, off the scaffold: its region also returns
+the deepstack taps (its ``_capture_block_loop``), which its own ``forward_batched`` reads
 off the replay.
 A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
 ``bilinear_table_taps`` (the learned position table resampled onto a patch grid),

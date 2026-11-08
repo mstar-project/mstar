@@ -27,10 +27,11 @@ from mstar.conductor.request_info import (  # noqa: E402
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig  # noqa: E402
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION  # noqa: E402
-from mstar.model.base import KVLabel, LabelLayout, Model, Span  # noqa: E402
+from mstar.model.base import KVLabel, LabelLayout, Span  # noqa: E402
 from mstar.model.submodule_base import ChunkingPolicy, chunk_tick_name  # noqa: E402
 from mstar.streaming.chunk_policy import FixedChunkPolicy  # noqa: E402
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -61,7 +62,7 @@ class _ScriptDoneError(Exception):
     pass
 
 
-class _ToyModel(Model):
+class _ToyModel(StubModel):
     """Walks, partitions (``{name: walks}``, one default partition when
     omitted), streams and each partition's plan come from the test."""
 
@@ -102,15 +103,6 @@ class _ToyModel(Model):
         if isinstance(plan, Exception):
             raise plan
         return list(plan)
-
-    def process_prompt(self, *a, **k):
-        return {}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
 
 
 def _conductor(model, node_groups, tmp_path, monkeypatch) -> Conductor:

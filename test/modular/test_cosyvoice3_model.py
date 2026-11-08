@@ -73,6 +73,7 @@ from mstar.model.cosyvoice3.submodules import (
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.testing_utils.model import make_model
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "cosyvoice3.yaml"
 SR = 24_000
@@ -673,7 +674,7 @@ def test_an_upload_write_failure_is_a_500_with_no_path(tmp_path, monkeypatch):
 
     api = SimpleNamespace(
         model_name="cosyvoice3",
-        model=SimpleNamespace(get_output_sample_rate=lambda modality="audio": 24000),
+        model=make_model(get_output_sample_rate=lambda modality="audio": 24000),
         upload_dir=tmp_path,
         submit_request=lambda **kw: pytest.fail("nothing is submitted"),
     )

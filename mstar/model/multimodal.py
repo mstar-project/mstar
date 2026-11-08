@@ -150,7 +150,7 @@ def prefill_plan(
     Adjacent text collapses into one segment: the rendered prompt puts it in
     one contiguous run. A trailing segment always exists — the template's turn
     close — even with no user text there. ``leading_text`` says whether the
-    template opens with one too; BAGEL's generation prompt does not.
+    template opens with one too; BAGEL's generation and bare prompts do not.
 
     Text segments are numbered in order, so ``index`` addresses the model's own
     list of spans, and each carries its text (``None`` when only the template

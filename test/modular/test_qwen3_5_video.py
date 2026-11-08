@@ -420,8 +420,10 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     ])
     (encoder,) = model.encoders
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
-    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
-    fwd_info = SimpleNamespace(request_id="r", step_metadata=step.step_metadata)
+    # the stream's counter is keyed by the worker's handle, not the wire id (AGENTS.md invariant 14)
+    start = 5
+    llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {7: start}.get(rid, 0))}
+    fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.step_metadata)
     row = llm._media_inputs(fwd_info, {"text_inputs": [prompt], "vision_embeds": [marks]})
 
     expected_row = ref["input_ids"][0].float()
@@ -434,7 +436,7 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
         ref["input_ids"], ref["mm_token_type_ids"],
         image_grid_thw=ref.get("image_grid_thw"), video_grid_thw=ref["video_grid_thw"],
     )
-    assert torch.equal(row.custom_pos_ids.long(), positions[:, 0])
+    assert torch.equal(row.custom_pos_ids.long(), positions[:, 0] + start)
     # decode resumes where transformers' rope delta puts it
     assert row.resource_step_info == int(positions.max()) + 1
     spans = out.metadata["kv_layout"][KV_CACHE]["main"].spans
@@ -636,7 +638,7 @@ def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
     segment ceiling is a group of its own, so a long video's embeddings are
     not held back for its batch's others. The engine splits a node whose only
     capture is a piecewise region."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     encoder = _encoder(max_segments=4)
 
@@ -649,10 +651,9 @@ def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
     assert encoder.cg_key_info("prefill_vision", {2: video}) == (2,)
     assert encoder.cg_key_info("prefill_vision", {3: frames}) == (3,)
 
-    engine = Engine.__new__(Engine)
-    engine._submodules = {"vision_encoder": SimpleNamespace(
-        submodule=encoder, accelerator_graph_runner=None, piecewise_runners={"vision_block_loop": object()},
-    )}
+    engine = make_engine(
+        _submodules={"vision_encoder": make_mgmt(encoder, piecewise_runners={"vision_block_loop": object()})},
+    )
     assert engine.splits_by_capture_key("vision_encoder", "prefill_vision")
     assert engine.capture_group("vision_encoder", "prefill_vision", 2, video) == (2,)
     assert engine.capture_group("vision_encoder", "prefill_vision", 1, image) is None

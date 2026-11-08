@@ -11,8 +11,8 @@ sliding layers' K/V; they attend it through a windowed attention resource, the
 full ones through an unwindowed one.
 
 TP shards by head, as Qwen3.5 does. The post-norms sit between each
-row-parallel projection and its residual add, so those projections reduce
-their own outputs rather than deferring the all-reduce into a fused add+norm.
+row-parallel projection and its residual add, so each reduces its
+projection's partial sums in one fused all-reduce + norm kernel.
 """
 from __future__ import annotations
 
@@ -153,6 +153,11 @@ class MuseGlimmerTextModel(nn.Module):
         self.layers = nn.ModuleList(
             MuseGlimmerDecoderLayer(config, s, comm_group) for s in sliding
         )
+        # `forward` reduces both row-parallel projections in their post-norms,
+        # one fused all-reduce + norm kernel each, so they return partial sums
+        for layer in self.layers:
+            layer.self_attn.o_proj.reduce_results = False
+            layer.mlp.down_proj.reduce_results = False
         # plain `w`, unlike the layers' norms
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # a layer of each kind, to bind the step's label on both attention resources
@@ -165,6 +170,7 @@ class MuseGlimmerTextModel(nn.Module):
     def forward(self, hidden: torch.Tensor, *, label: str) -> torch.Tensor:
         for idx in self._bind_through:
             self.layers[idx].self_attn.attend.bind_step(label)
+        cg = self.comm_group
         residual = hidden
         h = self.layers[0].input_layernorm(hidden)
         out = None
@@ -173,9 +179,9 @@ class MuseGlimmerTextModel(nn.Module):
                 h, residual = layer.input_layernorm.forward_residual(out, residual)
             # every layer is a layer of the one cache, so its stack index
             layer.self_attn.attend.set_layer_idx(i)
-            a = layer.post_attention_layernorm(layer.self_attn(h))
+            a = layer.post_attention_layernorm(layer.self_attn(h), cg)
             h, residual = layer.pre_feedforward_layernorm.forward_residual(a, residual)
-            out = layer.post_feedforward_layernorm(layer.mlp(h))
+            out = layer.post_feedforward_layernorm(layer.mlp(h), cg)
         normed, _ = self.norm.forward_residual(out, residual)
         return normed
 

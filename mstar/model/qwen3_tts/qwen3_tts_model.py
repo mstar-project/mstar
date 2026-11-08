@@ -837,6 +837,9 @@ class Qwen3TTSModel(Model):
         ``stream_lead_items`` reports the reference frames that lead the codec
         stream: the first chunk's context, never audio of their own.
         """
+        # a leading newline would merge with the template's "assistant\n" into one token,
+        # changing the ChatML prefix the text span is sized from; it carries no speech
+        prompt = (prompt or "").lstrip()
         if not prompt:
             raise ValueError("Qwen3-TTS requires a non-empty text prompt")
         if "audio" in input_modalities and not self.config.supports_reference_audio:

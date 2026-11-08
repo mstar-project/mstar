@@ -391,6 +391,13 @@ class RecurrentStatePool(Resource):
             self._forget_prefix_admit(lambda key: key[0] == rid)
             self._version += 1
 
+    supports_drop = True
+
+    def drop(self, rid: str, tokens: int) -> int:
+        # zeroed in place, so recomputing the state never waits for a free slot
+        self.reset_request(rid)
+        return 0
+
     def reset_request(self, rid: str, free: bool = False):
         """Drop a request's slots. ``free`` hands them back to the pool.
 

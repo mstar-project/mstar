@@ -41,6 +41,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
@@ -138,19 +139,14 @@ def test_a_step_that_runs_a_collective_per_row_stays_in_step(tmp_path, monkeypat
 def test_a_step_whose_every_row_failed_runs_empty_on_every_rank(tmp_path, monkeypatch):
     """Rank 0 sends a step of rows the follower could read none of: both ranks
     run it empty, both requests fail and drain, and nothing is routed."""
-    clean = acc._run(tmp_path / "clean", acc.Scenario(kind="text", fail=False))
-    assert not clean.crashed and not clean.hung, clean.summary()
     monkeypatch.setattr(acc, "_rank_main", _rank_main_every_row_fails)
-    run = acc._run(tmp_path / "failed", acc.Scenario(kind="text"))
+    run = acc._run(tmp_path, acc.Scenario(kind="text"))
     assert not run.crashed, run.summary() + "\n" + "\n".join(map(str, run.crashed.values()))
     assert not run.hung, run.summary()
     assert set(run.failed) == {"r0", "r1"}, run.summary()
     assert run.torn_down("r0") and run.torn_down("r1"), run.summary()
     assert run.routed == {0: {}, 1: {}}, run.summary()
-    # No rank sat in a collective the other never joined, which costs a
-    # COLLECTIVE_S wait. Measured against the run with no failure, not as a
-    # fixed bound: starting the two ranks alone takes seconds on a slow host.
-    assert run.elapsed < clean.elapsed + acc.COLLECTIVE_S, (run.summary(), clean.summary())
+    assert not run.collective_failures, run.summary()   # no rank sat in one the other never joined
 
 
 # ── the check itself at TP4 and TP2 x SP2 (four gloo ranks) ───────────────
@@ -189,13 +185,12 @@ def _check_rank(rank, layout, failed_here, store, out):
             timeout=datetime.timedelta(seconds=acc.RENDEZVOUS_S),
         )
         tp, sp = _groups(rank, layout)
-        w = Worker.__new__(Worker)
-        w._walk_drivers = {}
-        w._walk_driven_edges = {}
-        w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
-        w.scheduler = SimpleNamespace(read_failed_rids=set(failed_here))
-        w.parallel_groups = SimpleNamespace(
+        w = make_worker(
+            streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
+            scheduler=SimpleNamespace(read_failed_rids=set(failed_here)),
+            parallel_groups=SimpleNamespace(
             get_joint_group_for_node=lambda node: JointGroups(tp_group=tp, sp_group=sp),
+        ),
         )
         # a follower that could not read a row left it out; the others hold it
         rows = [r for r in ROWS if r not in failed_here]
@@ -336,13 +331,13 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     sched, manager = _follower_scheduler(ready=["r0"])
     sched.fail_rids({"r1"})
     tm, _ = _shm_manager(tmp_path)
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), tm, [])  # no streams
-    w.scheduler, w.request_state, w.tensor_manager = sched, manager, tm
-    w.wakeup_event = SimpleNamespace(drain=lambda: None)
-    w.enable_nvtx = False
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
+        scheduler=sched,
+        request_state=manager,
+        tensor_manager=tm,
+        wakeup_event=SimpleNamespace(drain=lambda: None),
+    )
     reported = []
     w._fail_requests = reported.append
     tm.pending.append(_read("r1", _input(17, "text_inputs"), _failed_future()))
@@ -374,11 +369,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
     sched, manager = _follower_scheduler(
         ready=[r for r in fresh if r not in read_failed], read_failed=read_failed,
     )
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.scheduler, w.request_state, w.enable_nvtx = sched, manager, False
-    w._in_flight_rids = set()
+    w = make_worker(scheduler=sched, request_state=manager)
     w.preps, w.assembled = [], []
 
     def prep(prep_input):
@@ -524,14 +515,11 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
     an edge carries from ``source`` to ``dest``."""
     consumed = consumed or {}
     tm, _ = _shm_manager(tmp_path)
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), tm, [])  # no streams
-    w.worker_id = "w0"
-    w.parallel_nodes, w.parallel_leader_nodes = set(nodes), set(nodes)
-    w.is_tp_follower, w.enable_nvtx = False, False
-    w._tp_broadcast_seq = 0
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
+        parallel_nodes=set(nodes),
+        parallel_leader_nodes=set(nodes),
+    )
     w.sent = []
     w.communicator = SimpleNamespace(
         send=lambda dest, msg=None: w.sent.append((dest, decode(encode(msg)))),

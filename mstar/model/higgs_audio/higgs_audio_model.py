@@ -214,12 +214,12 @@ class HiggsAudioModel(MultimodalDecoderModel):
     # -------------------------------------------------------------------
 
     def _create_submodule(
-        self, node_name: str, device: str, autocast_dtype: torch.dtype | None, tp_group,
+        self, node_name: str, device: str, dtype: torch.dtype, tp_group,
     ) -> NodeSubmodule | None:
         if node_name == "audio_encoder":
             submodule = self._create_encoder_submodule(device)
         elif node_name == "LLM":
-            submodule = self._create_llm_submodule(device, tp_group, autocast_dtype)
+            submodule = self._create_llm_submodule(device, tp_group, dtype)
         else:
             return None
         logger.info("Loaded Higgs-Audio %s onto %s", node_name, device)
@@ -267,7 +267,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
         return name
 
     def _create_llm_submodule(
-        self, device: str, tp_group, autocast_dtype: torch.dtype | None,
+        self, device: str, tp_group, dtype: torch.dtype,
     ) -> NodeSubmodule:
         from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig
         from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
@@ -282,8 +282,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
             )
         # Cast on meta (no allocation) so to_empty allocates directly in the
         # target dtype instead of fp32-then-downcast.
-        if autocast_dtype is not None:
-            llm = llm.to(autocast_dtype)
+        llm = llm.to(dtype)
         llm.to_empty(device=device)
         weights = iter_safetensors_shards(self._resolve_weights(), device=device)
         llm.load_weights(
