@@ -373,6 +373,12 @@ class WaypointModel(Model):
                 f"got {output_modalities!r}. Raw RGB frames are served only by "
                 "the native streaming endpoint, not as encoded video."
             )
+        if "num_steps" in kwargs:
+            # gone with the actions stream; refused so an old client learns why its count is ignored
+            raise ValueError(
+                "Waypoint no longer takes num_steps: it generates one frame per action, "
+                "so the frame count is len(actions)"
+            )
         actions = kwargs.get("actions")
         if not isinstance(actions, list) or not 1 <= len(actions) <= self.config.max_frames:
             actual = len(actions) if isinstance(actions, list) else 0

@@ -1404,6 +1404,16 @@ def test_process_prompt_takes_one_to_max_frames_actions(model, config, count):
         )
 
 
+def test_process_prompt_refuses_the_old_num_steps(model):
+    """num_steps went with the actions stream; a client still sending it is told
+    the frame count is len(actions), not left with its count ignored."""
+    seed = torch.zeros((720, 1280, 3), dtype=torch.uint8)
+    with pytest.raises(ValueError, match="no longer takes num_steps"):
+        model.process_prompt(
+            None, ["image"], ["video_frame"], tensors={"image_inputs": [seed]}, actions=[{}], num_steps=1,
+        )
+
+
 def test_a_live_append_carries_its_actions_in_model_kwargs(model, config):
     def chunk(**fields):
         return ClientChunk(**{
