@@ -18,6 +18,7 @@ import torch
 pytest.importorskip("safetensors")
 from safetensors.torch import save_file  # noqa: E402
 
+from mstar.distributed.base import PARALLEL_AXES  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, Residency, Resource  # noqa: E402
 from mstar.engine.resources.lora import LoraModuleRef, LoraReqConfig, LoraSpec, LoraStep, LoraTarget  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool  # noqa: E402
@@ -492,7 +493,7 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
     assert asked and "No eviction candidate" in caplog.text
 
 
-@pytest.mark.parametrize("axis", ["sp", "cfg"])
+@pytest.mark.parametrize("axis", [axis for axis in PARALLEL_AXES if axis != "tp"])
 def test_a_node_running_sequence_or_cfg_parallelism_refuses_lora(adapters, axis):
     """LoRA rows are per request over the whole batch, not per SP shard or CFG branch: the
     build refuses either axis above 1 at startup, and takes TP with both at 1."""
