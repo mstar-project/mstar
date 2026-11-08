@@ -2,7 +2,14 @@
   "mode": "cloud",
   "results_dir": "~/live-pr-results",
   "ssh_public_key": "~/.ssh/id_ed25519.pub",
-  "budget": {"max_usd_per_hour": 20, "max_hours": 6, "max_concurrent_instances": 1, "max_total_usd": 150},
+  "identity_file": "",
+  "budget": {
+    "max_usd_per_hour": 20,
+    "max_hours": 6,
+    "max_concurrent_instances": 1,
+    "max_total_usd": 150,
+    "max_running": null
+  },
   "runpod": {
     "image": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
     "disk_gb": 300,
@@ -18,5 +25,28 @@
     "workdir": "~/live-pr",
     "hf_home": "~/.cache/huggingface",
     "results_dir": "~/live-pr-results"
+  },
+  "slurm": {
+    "host": "",
+    "port": 22,
+    "host_key": "",
+    "identity_file": "~/.ssh/id_ed25519",
+    "partition": "main",
+    "nice": 100,
+    "max_gpus": 4,
+    "cpus_per_gpu": 24,
+    "mem_gb_per_gpu": 180,
+    "job_prefix": "<you>-live-pr",
+    "workdir": "/workspace/<you>/live-pr",
+    "gpu": "H200",
+    "vram_gb": 141,
+    "hf_home": "/workspace/shared/hf"
+  },
+  "eras": {
+    "hf_home": "/workspace/hf",
+    "template_id": "ed6d2a30-36aa-5d50-b911-1f6b551f2081",
+    "shm": "64Gi",
+    "run_secret_id": "",
+    "cache_volume_ids": []
   }
 }

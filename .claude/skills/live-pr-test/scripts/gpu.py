@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Provision Hopper-or-newer GPU boxes on RunPod and Lambda for live PR tests.
+"""Provision Hopper-or-newer GPUs for live PR tests: a Slurm node, Eras Cloud, RunPod or Lambda.
 
 usage:
   gpu.py check                                   keys, persistent storage, budget
   gpu.py offers --gpus N [--min-vram GB] [--all-regions] [--allow-arm] [--json]
-  gpu.py launch <offer-id> --pr N [--hours H] [--allow-over-budget] [--dry-run]
+  gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]]
+               [--cache ro|none | --cache-write ID] [--allow-over-budget] [--dry-run]
   gpu.py wait <instance>                         until ssh answers; prints how to reach it
   gpu.py ssh <instance> [command ...]            run a command (or a shell) on it
   gpu.py push <instance> <local> <remote>        scp -r to the box
   gpu.py pull <instance> <remote> <local>        scp -r from the box
-  gpu.py list [--all]                            instances launched by this tool (--all: whole accounts)
+  gpu.py list [--all]                            instances launched here (--all: by any session; all RunPod, Lambda)
   gpu.py extend <instance> --hours H             move the watchdog deadline to now + H
   gpu.py terminate <instance>
 
@@ -18,20 +19,39 @@ mounts anywhere; a RunPod network volume or a Lambda filesystem pins one region)
 HF cache lives there; --all-regions lists the rest for
 a "no availability" report. Prices are USD/hr for the whole box.
 
+A Slurm node (`slurm` in the config) is offered first when it has the GPUs free now: an
+"instance" there is a batch job that holds them, every command runs inside it with
+`srun --overlap`, and Slurm's `--time` ends it at the deadline. Serve there with `mserve`,
+the node's own wrapper that runs `mstar serve --gpus $CUDA_VISIBLE_DEVICES` inside a Slurm
+job, never with `--gpus`. An Eras instance runs sshd as root in a Pod that Kubernetes stops
+at the deadline (`activeDeadlineSeconds`, `restartPolicy: Never`); a run that ends releases it.
+
+`launch --run SCRIPT` makes the script the work itself rather than holding the GPUs for ssh.
+The Slurm job runs Slurm's copy of it, in the job's own directory under slurm.workdir, which
+holds the --input files; terminate (and so the watchdog) deletes that directory, so pull what
+you need first. On Eras it is the Pod's command, with the inputs in /run/live-pr and sshd up
+beside it for copying results back; the instance is released 15 minutes after it exits.
+Either way the GPUs go when the script ends, whether or not whoever launched it is still there.
+
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
 its deadline (budget.max_hours by default), even if the session that launched it is gone.
 
-Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY; settings from config.local.json next to
-the skill (see config.example.json). Stdlib only, so it runs from any python3.
+`launch` exits 4 when budget.max_running refuses it, 1 on any other error.
+
+Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY; the Slurm node is reached by
+ssh. Settings from config.local.json next to the skill (see config.example.json). Stdlib
+only, so it runs from any python3.
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
 import fcntl
+import functools
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -46,13 +66,14 @@ LEDGER = STATE / "instances.json"
 RUNPOD = "https://api.runpod.io/v2"
 RUNPOD_GRAPHQL = "https://api.runpod.io/graphql"
 LAMBDA = "https://cloud.lambda.ai/api/v1"
+ERAS = "https://api.erascloud.ai"
 # Hopper or newer. \b keeps out the H20 (Hopper silicon, a fraction of the compute).
 HOPPER_PLUS = re.compile(r"\b(H100|H200|GH200|B200|B300)\b", re.I)
 
 
-def die(msg: str) -> None:
+def die(msg: str, code: int = 1) -> None:
     print(f"gpu.py: {msg}", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(code)
 
 
 def load_config() -> dict:
@@ -69,11 +90,14 @@ class ApiError(Exception):
         self.status, self.body = status, body
         super().__init__(f"HTTP {status}: {body}")
 
-    def code(self) -> str:  # Lambda's machine-readable error code, if any
-        return self.body.get("error", {}).get("code", "") if isinstance(self.body, dict) else ""
+    def code(self) -> str:  # the machine-readable error code, if any: Lambda's under "error", Eras's at the top
+        if not isinstance(self.body, dict):
+            return ""
+        return self.body.get("code") or (self.body.get("error") or {}).get("code", "")
 
 
-def http(method: str, url: str, key_env: str, body: dict | None = None, params: dict | None = None):
+def http(method: str, url: str, key_env: str, body: dict | None = None, params: dict | None = None,
+         key_header: str = "Authorization", key_prefix: str = "Bearer "):
     key = os.environ.get(key_env)
     if not key:
         raise ApiError(0, f"{key_env} is not set")
@@ -82,7 +106,7 @@ def http(method: str, url: str, key_env: str, body: dict | None = None, params: 
     data = json.dumps(body).encode() if body is not None else None
     for attempt in range(6):
         req = urllib.request.Request(url, data=data, method=method, headers={
-            "Authorization": f"Bearer {key}",
+            key_header: f"{key_prefix}{key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": "mstar-live-pr-test/1",  # Cloudflare in front of Lambda rejects urllib's default
@@ -125,6 +149,50 @@ def runpod_list(path: str, field: str, params: dict | None = None) -> list:
 
 def lambda_(method, path, body=None):
     return http(method, LAMBDA + path, "LAMBDA_API_KEY", body).get("data")
+
+
+_eras_org: str | None = None
+
+
+def eras(method, path, body=None, params=None):
+    """Eras Cloud, under the key's default organization."""
+    global _eras_org
+    def call(m, url, b=None, q=None):
+        return http(m, ERAS + url, "ERAS_API_KEY", b, q, "x-api-key", "")
+    _eras_org = _eras_org or call("GET", "/v1/me")["default_organization"]["id"]
+    return call(method, f"/v1/org/{_eras_org}{path}", body, params)
+
+
+def slurm_run(cfg: dict, command: str, check: bool = True) -> str:
+    """One shell command on the Slurm login host; stdout."""
+    r = subprocess.run(slurm_ssh(cfg) + [command], capture_output=True, text=True, check=False, timeout=120)
+    if check and r.returncode != 0:
+        raise ApiError(r.returncode, f"slurm: {command.split(maxsplit=1)[0]}: {(r.stderr or r.stdout).strip()[-400:]}")
+    return r.stdout
+
+
+def slurm_cancel(cfg: dict, job: str, jobdir: str | None) -> None:
+    """Cancel a job (scancel's arguments) and, once it has gone, remove its directory: on a shared
+    node nothing of a run stays but what was copied back (weights live in slurm.hf_home)."""
+    rm = f"sleep 60; rm -rf {shlex.quote(jobdir)}" if jobdir else ":"
+    slurm_run(cfg, f"scancel {job}; (nohup sh -c {shlex.quote(rm)} > /dev/null 2>&1 < /dev/null &)")
+
+
+def slurm_ssh(cfg: dict, scp: bool = False) -> list[str]:
+    sl = cfg["slurm"]
+    known = STATE / f"slurm_{re.sub(r'[^A-Za-z0-9.]', '_', sl['host'])}.known_hosts"
+    STATE.mkdir(parents=True, exist_ok=True)
+    if sl.get("host_key"):  # pinned: the node's ngrok port is reused across machines
+        host = sl["host"].split("@")[-1]
+        hostport = host if sl.get("port", 22) == 22 else f"[{host}]:{sl['port']}"
+        known.write_text(f"{hostport} {sl['host_key']}\n")
+    cmd = ["scp" if scp else "ssh", "-P" if scp else "-p", str(sl.get("port", 22)),
+           "-o", f"StrictHostKeyChecking={'yes' if sl.get('host_key') else 'accept-new'}",
+           "-o", f"UserKnownHostsFile={known}",
+           "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=20", "-o", "BatchMode=yes"]
+    if sl.get("identity_file"):
+        cmd += ["-i", str(Path(sl["identity_file"]).expanduser())]
+    return cmd if scp else cmd + [sl["host"]]
 
 
 # ---------------------------------------------------------------- storage
@@ -240,38 +308,99 @@ def lambda_offers(cfg, gpus, min_vram, all_regions, allow_arm=False) -> list[dic
     return offers
 
 
+GIB = re.compile(r"(\d+(?:\.\d+)?)\s*([GT])i?", re.I)
+
+
+def eras_offers(cfg, gpus, min_vram, all_regions) -> list[dict]:
+    # Hopper+ is checked here rather than in the filter: Eras names models "H200", "B300", ...
+    flt = json.dumps({"field": "hardware.gpu.count", "op": ">=", "value": gpus})
+    page, offers = eras("GET", "/compute-listings", params={"page_size": 100, "filter": flt}), []
+    for x in page.get("items") or []:
+        g = (x.get("hardware") or {}).get("gpu") or {}
+        m = GIB.match(str(g.get("memory_per_device") or ""))
+        vram = int(float(m.group(1)) * (1024 if m.group(2).upper() == "T" else 1)) if m else None
+        if not HOPPER_PLUS.search(str(g.get("model") or "")) or (vram is not None and vram < min_vram):
+            continue
+        if x.get("hourly_price") is None:
+            continue
+        now = (x.get("access_method") or {}).get("is_available") and (x.get("launches_available") or 0) > 0
+        if now or all_regions:
+            # Local NVMe only: stage_model pulls weights from the Hub (the default hf_home is on it).
+            offers.append({
+                "id": f"eras:{x['id']}", "provider": "eras", "gpu": g["model"], "count": g["count"],
+                "vram_gb": vram or "?", "region": x.get("name", "eras"), "usd_per_hour": round(x["hourly_price"], 2),
+                "availability": "now" if now else "none", "storage": True,
+            })
+    return offers
+
+
+def gres_gpus(gres: str) -> int:
+    """The GPU count in "gpu:8(S:0-1)" or "gpu:(null):5(IDX:0-3,6)": drop the parentheses, then it is last."""
+    m = re.search(r"gpu:(?:[^:,]*:)?(\d+)", re.sub(r"\([^)]*\)", "", gres))
+    return int(m[1]) if m else 0
+
+
+def slurm_offers(cfg, gpus, min_vram, all_regions) -> list[dict]:
+    """A node with `gpus` free now. Never more than slurm.max_gpus: the node is shared."""
+    sl = cfg["slurm"]
+    if gpus > sl.get("max_gpus", 4):
+        return []
+    offers = []
+    partition = shlex.quote(sl.get("partition", "main"))
+    out = slurm_run(cfg, f"sinfo -h -N -p {partition} -O 'NodeHost:40,Gres:40,GresUsed:60,StateLong:20'")
+    for line in out.splitlines():
+        host, gres, used, state = (line.split() + ["", "", "", ""])[:4]
+        total, busy = gres_gpus(gres), gres_gpus(used)
+        free = 0 if any(s in state for s in ("drain", "down", "fail")) else total - busy
+        if free >= gpus or (all_regions and total >= gpus):
+            offers.append({
+                "id": f"slurm:{host}:{gpus}", "provider": "slurm", "gpu": sl.get("gpu", "?"), "count": gpus,
+                "vram_gb": sl.get("vram_gb", "?"), "region": host, "usd_per_hour": 0.0,
+                "availability": f"{free} free" if free >= gpus else f"busy ({free} free)", "storage": True,
+            })
+    return offers
+
+
+PROVIDERS = {"slurm": slurm_offers, "eras": eras_offers, "runpod": runpod_offers, "lambda": lambda_offers}
+
+
 def enabled(cfg, provider) -> bool:
-    key = {"runpod": "RUNPOD_API_KEY", "lambda": "LAMBDA_API_KEY"}[provider]
+    if provider == "slurm":
+        return bool(cfg.get("slurm", {}).get("host")) and cfg["slurm"].get("enabled", True)
+    key = {"runpod": "RUNPOD_API_KEY", "lambda": "LAMBDA_API_KEY", "eras": "ERAS_API_KEY"}[provider]
     return cfg.get(provider, {}).get("enabled", True) and bool(os.environ.get(key))
 
 
 def cmd_offers(args, cfg):
     offers, errors = [], []
-    for provider, fn in (("runpod", runpod_offers), ("lambda", lambda_offers)):
+    for provider, fn in PROVIDERS.items():
         if not enabled(cfg, provider):
-            errors.append(f"{provider}: skipped (disabled or no API key)")
+            errors.append(f"{provider}: skipped (disabled, or no API key or host)")
             continue
         try:
             offers += fn(cfg, args.gpus, args.min_vram, args.all_regions,
                          **({"allow_arm": args.allow_arm} if provider == "lambda" else {}))
-        except ApiError as e:
+        except (ApiError, subprocess.TimeoutExpired) as e:
             errors.append(f"{provider}: {e}")
-    offers.sort(key=lambda o: (o["usd_per_hour"], o["count"]))
+    # What can start now first, then the cheapest (a Slurm node costs nothing extra).
+    offers.sort(key=lambda o: (o["availability"] in ("none",) or o["availability"].startswith("busy"),
+                               o["usd_per_hour"], o["count"]))
     cap = cfg["budget"]["max_usd_per_hour"]
     if args.json:
         print(json.dumps({"offers": offers, "errors": errors, "max_usd_per_hour": cap}, indent=1))
         return
     for e in errors:
         print("#", e)
-    if not offers:
+    if not any(o["availability"] not in ("none",) and not o["availability"].startswith("busy") for o in offers):
         print(f"no availability: no Hopper+ box with >= {args.gpus} GPUs"
               + ("" if args.all_regions else " in a region with team storage (try --all-regions)"))
-        return
+        if not offers:
+            return
     print(f"{'offer':58} {'$/hr':>7}  {'gpus':>4}  {'vram':>5}  avail   storage")
     for o in offers:
         flag = "" if o["usd_per_hour"] <= cap else f"  over ${cap}/hr cap"
         print(f"{o['id']:58} {o['usd_per_hour']:7.2f}  {o['count']:4}  {o['vram_gb']:4}G  "
-              f"{o['availability']:7} {'yes' if o['storage'] else 'no '}{flag}")
+              f"{str(o['availability']):7} {'yes' if o['storage'] else 'no '}{flag}")
 
 
 # ---------------------------------------------------------------- ledger
@@ -321,6 +450,10 @@ def find_offer(cfg, offer_id: str) -> dict:
         pool = runpod_offers(cfg, int(count), 0, True)
     elif provider == "lambda":
         pool = lambda_offers(cfg, 1, 0, True, allow_arm=True)
+    elif provider == "slurm":
+        pool = slurm_offers(cfg, int(offer_id.rsplit(":", 1)[1]), 0, False)
+    elif provider == "eras":
+        pool = eras_offers(cfg, 1, 0, False)
     else:
         die(f"bad offer id {offer_id!r}")
     for o in pool:
@@ -339,48 +472,93 @@ def cmd_launch(args, cfg):
     if hours > cfg["budget"]["max_hours"] and not args.allow_over_budget:
         die(f"{hours} h is over the {cfg['budget']['max_hours']} h cap; ask before passing --allow-over-budget")
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
-    name = f"live-pr-{args.pr}-{time.strftime('%m%d-%H%M')}"
+    name = job_name(cfg, o["provider"], args.pr, args.tag or time.strftime('%m%d-%H%M'))
     max_instances = cfg["budget"].get("max_concurrent_instances", 1)
     max_total = cfg["budget"].get("max_total_usd")
+    max_running = cfg["budget"].get("max_running")
 
-    if o["provider"] == "runpod":
-        rp = cfg["runpod"]
-        vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
-        kind = "global" if vol["kind"] == "global" else "network"
-        body = {
-            "name": name, "cloud": "SECURE",
-            "gpu": {"id": o["gpu"], "count": o["count"], "minCudaVersion": rp.get("min_cuda", "12.8")},
-            "image": rp["image"], "disk": rp.get("disk_gb", 200),
-            # Both names: the API spec and the SSH docs disagree on which one the image reads.
-            "env": {"PUBLIC_KEY": pubkey, "SSH_PUBLIC_KEY": pubkey, "HF_HOME": rp["hf_home"]},
-            "ports": ["22/tcp"], "startSsh": True,
-            "mounts": {kind: [{"volumeId": vol["id"], "path": "/workspace"}]},
-            "dataCenterIds": [o["region"]],
-        }
-    else:
-        lm = cfg["lambda"]
-        fs = lambda_filesystems(cfg)[o["region"]]
-        body = {
-            "name": name, "region_name": o["region"], "instance_type_name": o["id"].split(":")[1],
-            "ssh_key_names": [lm["ssh_key_name"]], "file_system_names": [fs["name"]],
-            "image": {"family": lm.get("image_family", "lambda-stack-24-04")},
-        }
-    if args.dry_run:
-        print(json.dumps(body, indent=1).replace(pubkey, "<public key>"))
-        return
-
-    # The caps are checked and the launch recorded under one lock, so parallel
-    # sessions can't each pass the check and launch together.
-    with ledger_txn() as d:
-        if len(d) >= max_instances and not args.allow_over_budget:
-            die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
-                f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
-        committed = sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours
-        if max_total is not None and committed > max_total and not args.allow_over_budget:
-            die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
-                f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
+    # The caps are checked and the launch recorded under one lock, so parallel sessions can't each
+    # pass the check and launch together; and the body is built after the caps, since building an
+    # Eras one registers an ssh key. A dry run checks nothing and records nothing.
+    with contextlib.nullcontext({}) if args.dry_run else ledger_txn() as d:
+        if not args.dry_run:
+            if len(d) >= max_instances and not args.allow_over_budget:
+                die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
+                    f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
+            if max_running is not None and not args.allow_over_budget:
+                up, errors = running(cfg)
+                if o["provider"] in errors:
+                    die(f"can't count this tool's {o['provider']} jobs for budget.max_running: {errors[o['provider']]}")
+                if len(up) >= max_running:
+                    die(f"{len(up)} of this tool's jobs are up, from every session; budget.max_running is "
+                        f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget", code=4)
+            committed = sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours
+            if max_total is not None and committed > max_total and not args.allow_over_budget:
+                die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
+                    f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
+        if o["provider"] == "slurm":
+            sl, n = cfg["slurm"], o["count"]
+            jobdir = job_dir(cfg, name)
+            body = " ".join(["sbatch", "--parsable", "-p", shlex.quote(sl.get("partition", "main")),
+                             f"--gres=gpu:{n}", f"-c {sl.get('cpus_per_gpu', 24) * n}",
+                             f"--mem={sl.get('mem_gb_per_gpu', 180) * n}G", f"--time={max(1, int(hours * 60))}",
+                             f"--nice={sl.get('nice', 100)}", "--no-requeue", f"-J {shlex.quote(name)}",
+                             shlex.quote(f"--export=ALL,HF_HOME={hf_home(cfg, 'slurm', None)}"),
+                             *([f"--chdir={shlex.quote(jobdir)}", f"-o {shlex.quote(jobdir)}/job.log",
+                                shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
+                               else ["-o /dev/null", "--wrap 'sleep infinity'"])])
+        elif o["provider"] == "eras":  # tried in turn: each free cache volume, then none (cold); a refresh only its own
+            free = eras_cache_volumes(cfg, args.cache, args.cache_write)
+            candidates = free if args.cache_write else [*free, None]
+            eras_body = functools.partial(eras_launch_body, cfg, o, name, pubkey, hours, args.run, args.input,
+                                          rw=bool(args.cache_write))
+            body = eras_body(candidates[0])
+        elif o["provider"] == "runpod":
+            rp = cfg["runpod"]
+            vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
+            kind = "global" if vol["kind"] == "global" else "network"
+            body = {
+                "name": name, "cloud": "SECURE",
+                "gpu": {"id": o["gpu"], "count": o["count"], "minCudaVersion": rp.get("min_cuda", "12.8")},
+                "image": rp["image"], "disk": rp.get("disk_gb", 200),
+                # Both names: the API spec and the SSH docs disagree on which one the image reads.
+                "env": {"PUBLIC_KEY": pubkey, "SSH_PUBLIC_KEY": pubkey, "HF_HOME": rp["hf_home"]},
+                "ports": ["22/tcp"], "startSsh": True,
+                "mounts": {kind: [{"volumeId": vol["id"], "path": "/workspace"}]},
+                "dataCenterIds": [o["region"]],
+            }
+        else:
+            lm = cfg["lambda"]
+            fs = lambda_filesystems(cfg)[o["region"]]
+            body = {
+                "name": name, "region_name": o["region"], "instance_type_name": o["id"].split(":")[1],
+                "ssh_key_names": [lm["ssh_key_name"]], "file_system_names": [fs["name"]],
+                "image": {"family": lm.get("image_family", "lambda-stack-24-04")},
+            }
+        if args.dry_run:
+            print(body if isinstance(body, str) else json.dumps(body, indent=1).replace(pubkey, "<public key>"))
+            return
         try:
-            if o["provider"] == "runpod":
+            if o["provider"] == "slurm":
+                if args.run:  # the job's directory, script and inputs exist before it can start
+                    slurm_run(cfg, f"umask 077 && mkdir -p {shlex.quote(jobdir)}")
+                    for f in [args.run, *args.input]:  # scp keeps the mode, so a 0600 key file stays 0600
+                        subprocess.run(slurm_ssh(cfg, scp=True) + ["-p", f, f"{sl['host']}:{jobdir}/"], check=True,
+                                       capture_output=True, timeout=300)
+                iid = slurm_run(cfg, body).strip().split(";")[0]
+            elif o["provider"] == "eras":
+                for i, vid in enumerate(candidates):
+                    try:
+                        iid = eras_create(eras_body(vid) if i else body, pubkey)
+                        break
+                    except ApiError as err:  # another box took the cache volume since: the next free one, then cold
+                        if not volume_refused(err) or vid is None:
+                            raise
+                        if args.cache_write:  # a refresh without its volume would write nothing that lasts
+                            die(f"cache volume {vid} is held or being deleted: {err}")
+                        print(f"gpu.py: cache volume {vid} is held or being deleted ({str(err)[:200]}); "
+                              "trying the next free one, else cold", file=sys.stderr)
+            elif o["provider"] == "runpod":
                 iid = runpod("POST", "/pods", body)["id"]
             else:
                 iid = lambda_("POST", "/instance-operations/launch", body)["instance_ids"][0]
@@ -391,9 +569,10 @@ def cmd_launch(args, cfg):
         key = f"{o['provider']}:{iid}"
         now = time.time()
         d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
+              "run": bool(args.run), "dir": jobdir if o["provider"] == "slurm" and args.run else None,
               "usd_per_hour": o["usd_per_hour"], "gpu": o["gpu"], "count": o["count"], "region": o["region"],
               "launched_at": now, "deadline": now + hours * 3600,
-              "user": "root" if o["provider"] == "runpod" else "ubuntu",
+              "user": "ubuntu" if o["provider"] == "lambda" else "root",
               "hf_home": hf_home(cfg, o["provider"], o["region"])}
     log = STATE / f"{key.replace(':', '_')}.watchdog.log"
     with open(log, "a") as fh:
@@ -404,7 +583,153 @@ def cmd_launch(args, cfg):
     print(key)
 
 
+def job_prefix(cfg: dict, provider: str) -> str:
+    """What the names of this tool's jobs and instances start with: slurm.job_prefix on a shared node."""
+    return (cfg.get("slurm", {}).get("job_prefix", "live-pr") if provider == "slurm" else "live-pr") + "-"
+
+
+def job_name(cfg: dict, provider: str, pr: int, tag: str) -> str:
+    return f"{job_prefix(cfg, provider)}{pr}-{tag}"
+
+
+def job_dir(cfg: dict, name: str) -> str:
+    """A Slurm job's directory: its working directory, holding a --run script and its inputs."""
+    return f"{cfg['slurm'].get('workdir', '/workspace/live-pr')}/{name}"
+
+
+ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Notebook (NVIDIA GPU): sshd as root
+
+
+def eras_ssh_key_id(pubkey: str, name: str) -> str:
+    """The organization's id for this public key. A key it doesn't know yet is registered under the
+    instance's name, which makes it that launch's to delete (eras_delete_key)."""
+    import base64
+    import hashlib
+    blob = base64.b64decode(pubkey.split()[1])
+    fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+    for k in eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []:
+        if k.get("fingerprint") == fingerprint:
+            return k["id"]
+    return eras("POST", "/ssh-keys", {"name": name, "public_key": pubkey})["id"]
+
+
+def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float, run: str | None = None,
+                     inputs: list[str] = (), volume: str | None = None, rw: bool = False) -> dict:
+    """The GPU notebook template's container and image, with sshd as root, every GPU of the
+    listing and a big /dev/shm. Kubernetes stops the Pod at the deadline and never restarts
+    it, and a run that ends releases the instance, so the box goes even if nothing that
+    launched it is left to. With `run`, the script is the Pod's work and its inputs are a
+    ConfigMap at /run/live-pr; the instance stays 15 minutes after it exits, for copying back.
+    A cache volume (weights, compile caches; see eras_cache_volumes) mounts at /cache, read-only
+    unless `rw`."""
+    er = cfg.get("eras", {})
+    tpl = eras("GET", f"/templates/{er.get('template_id', ERAS_GPU_NOTEBOOK)}")
+    pod = tpl["pod"]
+    box = next(c for c in pod["containers"] if (c.get("resources") or {}).get("limits", {}).get("nvidia.com/gpu"))
+    box["resources"]["limits"]["nvidia.com/gpu"] = str(o["count"])
+    box.pop("readinessProbe", None)  # it probes Jupyter, which this Pod doesn't run
+    box["ports"] = [p for p in box.get("ports") or [] if p.get("name") == "ssh"]
+    box["env"] = [v for v in box.get("env") or [] if not v["name"].startswith("ERAS_JUPYTER")]
+    sshd = "/usr/sbin/sshd -D -e -o StrictModes=no -o 'AuthorizedKeysFile /etc/ssh/keys/authorized_keys'"
+    box["args"] = ["set -e\ninstall -d -m 0700 /root/.ssh /run/sshd\n"
+                   + (f"{sshd} &\nexec bash /run/live-pr/{Path(run).name}\n" if run else f"exec {sshd}\n")]
+    pod["restartPolicy"] = "Never"
+    pod["activeDeadlineSeconds"] = int(hours * 3600)
+    for v in pod.get("volumes") or []:
+        if v["name"] == "shm":
+            v["emptyDir"]["sizeLimit"] = er.get("shm", "64Gi")  # the most Eras allows
+    config_maps = None
+    if run:
+        pod["volumes"].append({"name": "live-pr", "configMap": {"name": "live-pr"}})
+        box["volumeMounts"].append({"mountPath": "/run/live-pr", "name": "live-pr", "readOnly": True})
+        config_maps = {"live-pr": {"data": {Path(f).name: Path(f).read_text() for f in [run, *inputs]}}}
+        if er.get("run_secret_id"):  # a saved Eras secret (an API key, say), at /run/live-pr-key/value
+            pod["volumes"].append({"name": "live-pr-key", "secret": {"secretName": "live-pr-key",
+                                                                      "items": [{"key": "value", "path": "value"}]}})
+            box["volumeMounts"].append({"mountPath": "/run/live-pr-key", "name": "live-pr-key", "readOnly": True})
+    claims = {}
+    if volume:
+        claims["cache"] = {"volume_id": volume}
+        pod["volumes"].append({"name": "cache", "persistentVolumeClaim": {"claimName": "cache"}})
+        box["volumeMounts"].append({"mountPath": "/cache", "name": "cache", "readOnly": not rw})
+    keep = 900 if run else 0
+    return {
+        "listing_id": o["id"].split(":", 1)[1], "name": name,
+        "run": {"pod": pod, "endpoints": {"ssh": tpl["endpoints"]["ssh"]}, "config_maps": config_maps,
+                "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [eras_ssh_key_id(pubkey, name)]},
+                                         **({"live-pr-key": {"secret_id": er["run_secret_id"]}}
+                                            if run and er.get("run_secret_id") else {})},
+                             "volumes": {"workspace": "emptyDir", **claims}},
+                "release_when": {"after_success_seconds": keep, "after_failure_seconds": keep}},
+    }
+
+
+def eras_cache_volumes(cfg: dict, cache: str, write: str | None) -> list[str]:
+    """The cache volumes a launch tries to bind, in order. An instance binds one volume, so
+    eras.cache_volume_ids are replicas, one per box: "ro" tries those no box holds, then none (the
+    box starts cold). `write` (a cache refresh) takes only that volume, and dies if a box holds it."""
+    ids = [write] if write else [] if cache == "none" else cfg.get("eras", {}).get("cache_volume_ids") or []
+    free = []
+    for vid in ids:
+        att = eras("GET", f"/volumes/{vid}").get("attachment") or {}
+        if not att.get("instance_id") or att.get("detached_at"):
+            free.append(vid)
+        elif write:
+            die(f"cache volume {vid} is held by instance {att['instance_id']}; wait for it to end")
+    if ids and not free:
+        print("gpu.py: every cache volume is held by another box; launching cold", file=sys.stderr)
+    return free
+
+
+# The error codes of a launch refused over a volume another instance holds, or one being deleted.
+VOLUME_HELD = ("volume_bound", "volume_deleting", "volume_binding_conflict", "volume_binding_deleting",
+               "resource_in_use")
+
+
+def volume_refused(err: ApiError) -> bool:
+    """Whether Eras refused a launch over a volume binding, by its error code, never by its wording."""
+    return err.code() in VOLUME_HELD
+
+
+def eras_create(body: dict, pubkey: str) -> str:
+    """Preview, accept the quoted prices, create; the instance id. Eras refuses an idempotency key
+    reused with another request, so each attempt (listing, cache volume, ssh key) has its own, and
+    the same attempt sent again after a timeout keeps it. The ssh key the body binds may be one an
+    earlier launch registered, which that launch's terminate can delete before the create: then the
+    key is registered again, under this launch's name, once."""
+    import hashlib
+    preview = eras("POST", "/instances/preview", body)
+    problems = (preview.get("run") or {}).get("problems") or []
+    if problems:
+        raise ApiError(409, {"code": problems[0].get("code"), "problems": problems})
+    if not preview.get("is_available"):
+        reason, detail = preview.get("unavailable_reason"), preview.get("unavailable_detail")
+        if reason in VOLUME_HELD:  # another box binds the cache volume, or it is being deleted
+            raise ApiError(409, {"code": reason, "message": detail})
+        raise ApiError(409, f"capacity: {detail or reason}")
+    for w in (preview.get("run") or {}).get("warnings") or []:
+        print(f"gpu.py: eras preview: {w.get('message')}", file=sys.stderr)
+    body = dict(body, accepted_prices={i["usage_type"]: i["unit_price"] for i in preview["quote"]["line_items"]},
+                accepted_available_until=preview.get("available_until"))
+    binds = body["run"]["bindings"]
+    keys = binds["secrets"]["authorized-keys"]["ssh_key_ids"]
+    for again in (False, True):
+        attempt = json.dumps([body["listing_id"], (binds["volumes"].get("cache") or {}).get("volume_id"), keys])
+        body["idempotency_key"] = f"{body['name']}-{hashlib.sha256(attempt.encode()).hexdigest()[:8]}"
+        try:
+            return eras("POST", "/instances", body)["id"]
+        except ApiError as err:  # a key gone since the lookup: not found or not valid, by the spec's codes
+            if again or err.status not in (404, 422) or (key := eras_ssh_key_id(pubkey, body["name"])) in keys:
+                raise
+            print(f"gpu.py: ssh key {keys[0]} was deleted mid-launch; now bound as {key}", file=sys.stderr)
+            keys[:] = [key]
+
+
 def hf_home(cfg, provider, region) -> str:
+    if provider == "slurm":
+        return cfg["slurm"].get("hf_home", "/workspace/shared/hf")
+    if provider == "eras":
+        return cfg.get("eras", {}).get("hf_home", "/workspace/hf")
     if provider == "runpod":
         return cfg["runpod"]["hf_home"]
     fs = lambda_filesystems(cfg)[region]
@@ -413,8 +738,23 @@ def hf_home(cfg, provider, region) -> str:
 
 # ---------------------------------------------------------------- status / ssh
 
-def status(e: dict) -> tuple[str, str | None, int]:
+def status(e: dict, cfg: dict | None = None) -> tuple[str, str | None, int]:
     """(status, host, ssh port)."""
+    if e["provider"] == "slurm":
+        try:  # "ended" only on squeue's word: a failed ssh says nothing about the job
+            st = slurm_run(cfg or load_config(), f"squeue -h -j {e['instance_id']} -o %T").strip()
+        except ApiError as err:
+            if "Invalid job id" not in str(err):
+                raise
+            st = ""
+        return (st or "ended").lower(), ("slurm" if st == "RUNNING" or (st == "" and e.get("run")) else None), 0
+    if e["provider"] == "eras":
+        i = eras("GET", f"/instances/{e['instance_id']}")
+        ssh = next((p for p in (i.get("standalone") or {}).get("endpoints") or []
+                    if p.get("name") == "ssh" and p.get("ready")), None)
+        run = ((i.get("standalone") or {}).get("current_run") or {}).get("status")
+        st = f"run {run}" if e.get("run") and run in ("succeeded", "failed", "stopped") else i.get("status", "?")
+        return st, ssh and ssh.get("host"), int((ssh or {}).get("port") or 22)
     if e["provider"] == "runpod":
         p = runpod("GET", f"/pods/{e['instance_id']}")
         direct = (p.get("ssh") or {}).get("direct") or {}
@@ -423,30 +763,44 @@ def status(e: dict) -> tuple[str, str | None, int]:
     return i.get("status", "?"), i.get("ip"), 22
 
 
-def ssh_base(e: dict, scp: bool = False) -> list[str]:
+def ssh_base(e: dict, cfg: dict, scp: bool = False) -> list[str]:
     known = STATE / f"{e['provider']}_{e['instance_id']}.known_hosts"
     return ["scp" if scp else "ssh", "-P" if scp else "-p", str(e["port"]),
             "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={known}",
-            "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=15"]
+            "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=15",
+            # the private half of ssh_public_key, when ssh wouldn't try it by default
+            *(["-i", str(Path(cfg["identity_file"]).expanduser())] if cfg.get("identity_file") else [])]
+
+
+def remote(e: dict, cfg: dict, command: list[str] | str, tty: bool = False) -> list[str]:
+    """The ssh command line that runs `command` on the box (inside the job, on Slurm)."""
+    cmd = command if isinstance(command, str) else " ".join(command)
+    if e["provider"] == "slurm":
+        shell = f"bash -lc {shlex.quote(cmd)}" if cmd else "--pty bash -l"
+        inner = f"srun --jobid={e['instance_id']} --overlap {shell}"
+        return slurm_ssh(cfg)[:1] + (["-t"] if tty or not cmd else []) + slurm_ssh(cfg)[1:] + [inner]
+    return ssh_base(e, cfg) + [f"{e['user']}@{e['host']}"] + ([cmd] if cmd else [])
 
 
 def cmd_wait(args, cfg):
     e = entry(args.instance)
     t0 = time.time()
     while True:
-        st, host, port = status(e)
-        if st.lower() in ("exited", "error", "terminated", "terminating", "unhealthy", "preempted"):
+        st, host, port = status(e, cfg)
+        if st.lower() in ("exited", "error", "terminated", "terminating", "unhealthy", "preempted",
+                          "ended", "releasing", "cancelled", "failed", "timeout", "completed"):
             die(f"{args.instance} is {st}")
         if host:
             e["host"], e["port"] = host, port
-            probe = ssh_base(e) + ["-o", "BatchMode=yes", f"{e['user']}@{host}", "nvidia-smi -L"]
+            probe = remote(e, cfg, "nvidia-smi -L")
+            probe[1:1] = ["-o", "BatchMode=yes"]
             r = subprocess.run(probe, capture_output=True, text=True, check=False)
             if r.returncode == 0:
                 with ledger_txn() as d:
                     if args.instance in d:
                         d[args.instance].update(host=host, port=port)
                 print(r.stdout.strip())
-                print(f"ready after {int(time.time() - t0)}s: {' '.join(ssh_base(e))} {e['user']}@{host}")
+                print(f"ready after {int(time.time() - t0)}s: {' '.join(remote(e, cfg, ''))}")
                 print(f"hf_home: {e['hf_home']}")
                 return
         if time.time() - t0 > args.timeout:
@@ -456,28 +810,36 @@ def cmd_wait(args, cfg):
 
 def reachable(key: str) -> dict:
     e = entry(key)
-    if not e.get("host"):
+    if not e.get("host") and e["provider"] != "slurm":  # a Slurm job is reached through the login host
         die(f"run `gpu.py wait {key}` first")
     return e
 
 
 def cmd_ssh(args, cfg):
     e = reachable(args.instance)
-    os.execvp("ssh", ssh_base(e) + [f"{e['user']}@{e['host']}"] + args.command)
+    os.execvp("ssh", remote(e, cfg, args.command))
 
 
 def cmd_copy(args, cfg):
     e = reachable(args.instance)
-    target = f"{e['user']}@{e['host']}:{args.remote}"
+    if e["provider"] == "slurm":  # the job's files are the login host's files; relative to its directory
+        rel = args.remote if args.remote.startswith(("/", "~")) or not e.get("dir") else f"{e['dir']}/{args.remote}"
+        target, scp = f"{cfg['slurm']['host']}:{rel}", slurm_ssh(cfg, scp=True)
+    else:
+        target, scp = f"{e['user']}@{e['host']}:{args.remote}", ssh_base(e, cfg, scp=True)
     src, dst = (args.local, target) if args.cmd == "push" else (target, args.local)
-    sys.exit(subprocess.run(ssh_base(e, scp=True) + ["-r", src, dst], check=False).returncode)
+    sys.exit(subprocess.run(scp + ["-r", src, dst], check=False).returncode)
 
 
 # ---------------------------------------------------------------- list / extend / terminate
 
 def terminate(key: str, e: dict) -> None:
     try:
-        if e["provider"] == "runpod":
+        if e["provider"] == "slurm":
+            slurm_cancel(load_config(), e["instance_id"], e.get("dir"))
+        elif e["provider"] == "eras":
+            eras("POST", f"/instances/{e['instance_id']}/release", {})
+        elif e["provider"] == "runpod":
             runpod("DELETE", f"/pods/{e['instance_id']}")
         else:
             lambda_("POST", "/instance-operations/terminate", {"instance_ids": [e["instance_id"]]})
@@ -486,8 +848,33 @@ def terminate(key: str, e: dict) -> None:
             raise
     with ledger_txn() as d:
         d.pop(key, None)
+    if e["provider"] == "eras":
+        eras_delete_key(e["name"])
     hours = (time.time() - e["launched_at"]) / 3600
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
+
+
+def eras_delete_key(name: str) -> None:
+    """Best effort: delete the ssh key the launch `name` registered (named after it), now that its
+    instances are released, unless an instance not releasing binds it in a run not finished: a deleted
+    key leaves the authorized_keys of every box that binds it. A key the launch reused stays."""
+    try:
+        keys = eras("GET", "/ssh-keys", params={"filter": json.dumps({"field": "name", "op": "=", "value": name})})
+        bound, token = set(), None
+        while True:  # every page: a binding missed would cut a live box off
+            page = eras("GET", "/instances", params={"page_size": 200, **({"page_token": token} if token else {})})
+            for i in page.get("items") or []:
+                run = (i.get("standalone") or {}).get("current_run") or {}
+                secrets = (run.get("bindings") or {}).get("secrets") or {}
+                if i.get("status") != "releasing" and run.get("status") not in ("succeeded", "failed", "stopped"):
+                    bound.update(k for b in secrets.values() for k in b.get("ssh_key_ids") or [])
+            if not (token := page.get("next_page_token")):
+                break
+        for k in keys.get("items") or []:
+            if k["id"] not in bound:
+                eras("DELETE", f"/ssh-keys/{k['id']}")
+    except ApiError as err:
+        print(f"gpu.py: ssh key {name} not deleted: {err}", file=sys.stderr)
 
 
 def cmd_terminate(args, cfg):
@@ -502,13 +889,34 @@ def cmd_extend(args, cfg):
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
 
+def running(cfg: dict) -> tuple[list[str], dict[str, str]]:
+    """This tool's jobs and instances up now on the Slurm node and Eras, from every session and
+    machine (the ledger has only this machine's), one line each; and why a provider couldn't be listed."""
+    up, errors = [], {}
+    if enabled(cfg, "slurm"):
+        try:
+            out = slurm_run(cfg, "squeue -h -o '%j %i %T %M/%l'")
+            up += [f"slurm: {ln}" for ln in out.splitlines() if ln.startswith(job_prefix(cfg, "slurm"))]
+        except (ApiError, subprocess.TimeoutExpired) as err:
+            errors["slurm"] = str(err)
+    if enabled(cfg, "eras"):
+        try:
+            items = eras("GET", "/instances", params={"page_size": 100}).get("items") or []
+        except (ApiError, subprocess.TimeoutExpired) as err:
+            errors["eras"], items = str(err), []
+        for i in items:
+            if str(i.get("name")).startswith(job_prefix(cfg, "eras")) and i.get("status") not in ("ended", "releasing"):
+                up.append(f"eras:{i['id']}  {i.get('name')}  {i.get('status')}")
+    return up, errors
+
+
 def cmd_list(args, cfg):
     d = ledger()
     if not d:
         print("no instances launched by this tool are up")
     for key, e in d.items():
         try:
-            st = status(e)[0]
+            st = status(e, cfg)[0]
         except ApiError as err:
             st = f"? ({err.status})"
         hrs = (time.time() - e["launched_at"]) / 3600
@@ -516,10 +924,13 @@ def cmd_list(args, cfg):
         print(f"{key}  pr {e['pr']}  {e['count']}x {e['gpu']} {e['region']}  {st}  "
               f"{hrs:.2f} h, ~${hrs * e['usd_per_hour']:.2f}  deadline in {left:.0f} min")
     if args.all:
-        print("--- every instance on the accounts ---")
+        print("--- this tool's on Slurm and Eras, from every session; all of RunPod and Lambda ---")
         if enabled(cfg, "runpod"):
             for p in runpod_list("/pods", "pods"):
                 print(f"runpod:{p['id']}  {p.get('name')}  {p.get('status')}  ${p.get('cost', '?')}/hr")
+        up, errors = running(cfg)
+        for line in up + [f"{p}: {err}" for p, err in errors.items()]:
+            print(line)
         if enabled(cfg, "lambda"):
             for i in lambda_("GET", "/instances") or []:
                 print(f"lambda:{i['id']}  {i.get('name')}  {i.get('status')}  {i['instance_type']['name']}")
@@ -589,6 +1000,15 @@ def main():
     p.add_argument("offer")
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--hours", type=float)
+    p.add_argument("--tag", help="names the instance <prefix>-<pr>-<tag> (and makes an Eras launch idempotent)")
+    p.add_argument("--run", help="a script that is the work itself; the GPUs go when it ends")
+    p.add_argument("--input", action="append", default=[],
+                   help="a file for the --run script: in its working directory on Slurm, in /run/live-pr on Eras")
+    cache = p.add_mutually_exclusive_group()
+    cache.add_argument("--cache", choices=("ro", "none"), default="ro",
+                       help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
+    cache.add_argument("--cache-write", metavar="ID",
+                       help="Eras: mount this cache volume read-write at /cache instead, to fill it; dies if held")
     p.add_argument("--allow-over-budget", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("wait")
