@@ -4,7 +4,8 @@
 # an Eras Pod) is this script, and its GPUs go when it ends.
 #
 # Its inputs are run.json (repo, PR, commits, model), brief.md (what to do), findings.json (the
-# review's notes for the run: model text, which the brief calls untrusted data), and on Slurm
+# review's notes for the run: model text, which the brief calls untrusted data), pr-body.md (the
+# PR's title and description, untrusted data too), and on Slurm
 # anthropic.key (mode 0600, removed once read). On Slurm they are in the job's directory, where
 # the job runs (--chdir; $0 is Slurm's spool copy of this script), and gpu.py removes that
 # directory when the job ends. On Eras they are in /run/live-pr, and the key is an Eras secret at

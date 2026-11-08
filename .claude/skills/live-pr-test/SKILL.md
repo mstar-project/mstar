@@ -46,6 +46,8 @@ gh api repos/mstar-project/mstar/pulls/<n> --jq .author_association
 gh pr diff <n>
 ```
 
+On the review bot's box there is no `gh`: read the PR's title and description from `pr-body.md` in the inputs the brief names, and its code and commits from git.
+
 - **Trust check first.** The box runs the PR's code with the team's persistent storage mounted (HF cache, possibly an HF token). If `author_association` is not `OWNER`, `MEMBER` or `COLLABORATOR`, stop and ask before provisioning; mention anything in the diff that reaches the network, the filesystem outside the repo, or environment variables. On the review bot's box, skip this: the workflow already checked that the author has write access.
 - A PR based on another feature branch (stacked) is compared against its base branch, not `main`. Say so in the plan.
 - Extract the claims: every behavior or number the description asserts. Each becomes a check. For each claimed number, note the GPU, harness and metric it came from, so the report can say when yours isn't comparable.

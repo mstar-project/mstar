@@ -194,9 +194,10 @@ class TestStart(unittest.TestCase):
             return argparse.Namespace(returncode=0, stdout=json.dumps(listing), stderr="")
 
         globs = GPU_REVIEW["cmd_start"].__globals__
-        saved = {k: globs[k] for k in ("gpu", "gpu_py")}
+        saved = {k: globs[k] for k in ("gpu", "gpu_py", "gh_json")}
         self.addCleanup(globs.update, saved)
-        globs.update(gpu=gpu, gpu_py=lambda: {"load_config": lambda: cfg})
+        globs.update(gpu=gpu, gpu_py=lambda: {"load_config": lambda: cfg},
+                     gh_json=lambda path: {"title": "Faster decode", "body": self.INJECTED})
         a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="main", gpus=1, hours=4.0,
                                run="full", review=str(out / "review.json"), out=str(out), tag="1-1",
                                model="m", turns=10, claude_version="stable", since=None, earlier_report=None,
@@ -220,6 +221,10 @@ class TestStart(unittest.TestCase):
         self.assertNotIn(self.INJECTED, (out / "brief.md").read_text(),
                          "model text from an untrusted PR would be instructions to a root shell")
         self.assertIn(self.INJECTED, (out / "findings.json").read_text())
+        self.assertIn("`$LIVE_PR_IN/pr-body.md`", (out / "brief.md").read_text(),
+                      "the session would look for the PR's description with gh, which the box doesn't have")
+        self.assertIn(str(out / "pr-body.md"), launched[0])
+        self.assertIn(self.INJECTED, (out / "pr-body.md").read_text())
 
     def test_a_run_past_the_bots_cap_says_so(self):
         out, launched = self.start("sk-test", {"eras": {"run_secret_id": "s"}, "budget": {"max_running": 2}},
