@@ -254,8 +254,9 @@ Judge the PR as a whole, before the line-level design passes.
   flight, and should it wait or fold into another PR? (A split request stays a note, §1.)
 - **Is the overall approach right?** Name the 2–3 system-level ways to build it, including the PR's,
   and say which you'd pick and why. Compare with how vLLM, SGLang and their -Omni variants (and
-  LMCache, Dynamo or diffusers where relevant) solve it; read their code when you can, and say so
-  when the comparison is from memory.
+  LMCache, Dynamo or diffusers where relevant) solve it. Read their code or docs (the web tools are
+  limited to code hosts, the projects' docs, Hugging Face, PyTorch and arXiv) and say what you read;
+  don't go from memory.
 - **Scope, timing and commitments:** is this the right slice to land now? What does it commit mstar
   to (public config keys, API fields, wire formats, base-class hooks or invariants that are hard to
   undo), and does it make the likely next step (TP, a new modality, disaggregation, another cache

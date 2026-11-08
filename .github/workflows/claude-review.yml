@@ -450,6 +450,10 @@ jobs:
           # set by the preflight; the action then also scrubs secrets from any
           # subprocess environment.
           allowed_non_write_users: ${{ steps.pre.outputs.non_write_user }}
+          # Reads stay inside the checkout (main at the root, the PR in pr-head/), so the model
+          # can't read the runner's files, and with --permission-mode dontAsk below any tool
+          # call this list doesn't allow is refused rather than waiting for an approval.
+          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, inputs and output format, and points
@@ -462,7 +466,9 @@ jobs:
             Turn cap: ${{ steps.pre.outputs.turns }}.
             ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
             ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json, since.diff and since-commits.txt are present. Follow the prompt''s Re-review section.' || '' }}
-          # No shell, no edits, no network. The only write tool is the inline-
+          # No shell or edits; web reads only from the sites listed here (code hosts,
+          # the vLLM and SGLang docs, Hugging Face, PyTorch, arXiv), so the review can
+          # read how other projects do it. The only write tool is the inline-
           # comment tool, which the action loads only when it is listed here and
           # which redacts secrets. The summary comes back as structured output.
           # The turn cap is the preflight's: CLAUDE_REVIEW_MAX_TURNS (40) for a
@@ -474,8 +480,9 @@ jobs:
             --model claude-opus-5-5
             --effort ${{ steps.prev.outputs.effort || steps.pr.outputs.effort }}
             --max-turns ${{ steps.pre.outputs.turns }}
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Task,Agent"
-            --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Skill
+            --permission-mode dontAsk
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Task,Agent,WebSearch,WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com),WebFetch(domain:docs.vllm.ai),WebFetch(domain:docs.sglang.ai),WebFetch(domain:huggingface.co),WebFetch(domain:pytorch.org),WebFetch(domain:arxiv.org)"
+            --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,Skill
             --json-schema '${{ steps.diff.outputs.schema }}'
 
       # The app's token lasts an hour and the review can take five: a fresh one
