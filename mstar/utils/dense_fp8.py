@@ -373,9 +373,8 @@ def _swiglu_kernel(h, out, I: tl.constexpr, BLOCK: tl.constexpr):
 
 
 def _swiglu(h):
-    """SwiGLU of a ``[gate | up]`` GEMM output ``(M, 2 I)``. act_and_mul_triton gives each token one program,
-    which at a decode batch's few tokens walks 17408 columns on a few SMs (~12 us at M=1 for Qwen3.5-27B's
-    MLP); here each program takes BLOCK columns of one token."""
+    """SwiGLU of a ``[gate | up]`` GEMM output ``(M, 2 I)``, one program per (token, BLOCK columns).
+    act_and_mul_triton's one program per token cost Qwen3.5-27B's MLP ~15 us a call at 2-64 tokens on H200."""
     M, two_i = h.shape
     out = torch.empty(M, two_i // 2, dtype=h.dtype, device=h.device)
     block = 1024
@@ -440,9 +439,7 @@ def _dg(x, w, s, glu):
     q, a_scale = _quant_mn_major(x, 128)
     h = torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
     _DG.fp8_gemm_nt((q, a_scale), (w.view(FP8_DTYPE), s), h)
-    if not glu:
-        return h
-    return _swiglu(h)
+    return _swiglu(h) if glu else h
 
 
 def _counters(device: torch.device) -> torch.Tensor:
