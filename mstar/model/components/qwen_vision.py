@@ -120,9 +120,12 @@ class ConvPatchEmbed(VisionPatchEmbed):
     """The patch embed as transformers runs it, a strided conv. ``VisionPatchEmbed``'s
     matmul is faster on long videos but rounds differently in bf16 at Qwen3-VL's width."""
 
+    lora_unservable = {"proj": "run as transformers' conv, never its own forward"}
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
-        return self.proj(x.to(self.proj.weight.dtype)).view(-1, self.embed_dim)
+        # the conv itself: ``proj``'s own forward is the shared matmul
+        return nn.Conv3d.forward(self.proj, x.to(self.proj.weight.dtype)).view(-1, self.embed_dim)
 
 
 class QwenVisionModel(nn.Module):

@@ -190,7 +190,7 @@ def _inductor_options(compile_kwargs: dict[str, Any], *, deterministic: bool) ->
     options.update(compile_kwargs.pop("options", None) or {})
     options["emulate_precision_casts"] = True
     if deterministic:
-        from mstar.engine.accelerator_graph_runner import deterministic_inductor_options
+        from mstar.platforms.compile import deterministic_inductor_options
 
         options.update(deterministic_inductor_options())
     return options

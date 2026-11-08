@@ -643,7 +643,7 @@ def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
     segment ceiling is a group of its own, so a long video's embeddings are
     not held back for its batch's others. The engine splits a node whose only
     capture is a piecewise region."""
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     encoder = _encoder(max_segments=4)
 
@@ -656,10 +656,9 @@ def test_a_vision_request_too_large_for_a_replay_gets_a_step_of_its_own():
     assert encoder.cg_key_info("prefill_vision", {2: video}) == (2,)
     assert encoder.cg_key_info("prefill_vision", {3: frames}) == (3,)
 
-    engine = Engine.__new__(Engine)
-    engine._submodules = {"vision_encoder": SimpleNamespace(
-        submodule=encoder, accelerator_graph_runner=None, piecewise_runners={"vision_block_loop": object()},
-    )}
+    engine = make_engine(
+        _submodules={"vision_encoder": make_mgmt(encoder, piecewise_runners={"vision_block_loop": object()})},
+    )
     assert engine.splits_by_capture_key("vision_encoder", "prefill_vision")
     assert engine.capture_group("vision_encoder", "prefill_vision", 2, video) == (2,)
     assert engine.capture_group("vision_encoder", "prefill_vision", 1, image) is None
@@ -777,6 +776,15 @@ def test_the_vision_node_boots_on_an_image_processor_the_video_one_disagrees_wit
         _ = model.video_processor
 
 
+@pytest.mark.parametrize("height", [1, 3, 4])
+def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, height):
+    """Handed HWC without a format, the processor guesses CHW when the first side is 1, 3 or 4."""
+    image = torch.randint(0, 256, (3, height, 64), dtype=torch.uint8)
+    out = model.process_prompt("Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [image]})
+    (_, rows, cols), = out.metadata[MEDIA_LAYOUT]["grid"]
+    assert rows < cols, "a wide image's patch grid is wide"
+
+
 def test_the_model_pickles_for_its_workers(model):
     """The server pickles the Model into every worker process it spawns."""
     import pickle
@@ -872,7 +880,9 @@ def test_patch_embed_matmul_matches_its_conv():
     )
     embed = VisionPatchEmbed(config).double()
     patches = torch.randn(10, 3 * 2 * 4 * 4, dtype=torch.float64)
-    conv = embed.proj(patches.view(-1, 3, 2, 4, 4)).view(-1, 32)
+    proj = embed.proj
+    conv = torch.nn.functional.conv3d(patches.view(-1, 3, 2, 4, 4), proj.weight, proj.bias, stride=proj.stride)
+    conv = conv.view(-1, 32)
     torch.testing.assert_close(embed(patches), conv)
 
 

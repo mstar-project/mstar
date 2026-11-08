@@ -217,27 +217,29 @@ EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
 }
 
 
-def resolve_action_domain_id(domain_id, domain_name) -> int:
+def resolve_action_domain_id(domain_id, domain_name, num_domains: int) -> int:
     """Resolve an action request's embodiment domain. A numeric ``domain_id``
     wins; otherwise ``domain_name`` looks up the published table. One of the
     two is required — the domain conditions the action pathway, and a silent
-    default would predict actions for the wrong embodiment."""
+    default would predict actions for the wrong embodiment. The id indexes the
+    model's ``num_domains``-row embedding table on the GPU, so it must be below."""
     if domain_id is not None:
         resolved = int(domain_id)
-        if resolved < 0:
-            raise ValueError(f"Cosmos3 domain_id must be non-negative, got {resolved}.")
-        return resolved
-    if domain_name is None or not str(domain_name).strip():
-        raise ValueError(
-            "Cosmos3 action requests require 'domain_id' or a non-empty 'domain_name'."
-        )
-    key = str(domain_name).strip().lower()
-    if key not in EMBODIMENT_TO_DOMAIN_ID:
-        raise ValueError(
-            f"Unknown Cosmos3 action domain_name={domain_name!r}; expected one of "
-            f"{sorted(EMBODIMENT_TO_DOMAIN_ID)} or a numeric domain_id."
-        )
-    return EMBODIMENT_TO_DOMAIN_ID[key]
+    else:
+        if domain_name is None or not str(domain_name).strip():
+            raise ValueError(
+                "Cosmos3 action requests require 'domain_id' or a non-empty 'domain_name'."
+            )
+        key = str(domain_name).strip().lower()
+        if key not in EMBODIMENT_TO_DOMAIN_ID:
+            raise ValueError(
+                f"Unknown Cosmos3 action domain_name={domain_name!r}; expected one of "
+                f"{sorted(EMBODIMENT_TO_DOMAIN_ID)} or a numeric domain_id."
+            )
+        resolved = EMBODIMENT_TO_DOMAIN_ID[key]
+    if not 0 <= resolved < num_domains:
+        raise ValueError(f"Cosmos3 domain_id must be in [0, {num_domains}), got {resolved}.")
+    return resolved
 
 
 # ---------------------------------------------------------------------------

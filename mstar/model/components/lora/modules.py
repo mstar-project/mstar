@@ -8,7 +8,7 @@ entries agree in shape at that role; any other module is a target of its own), a
 places checkpoint modules with the root's own ``CheckpointRules`` (the ones its weight
 loader uses). The model states only what its modules cannot: how a
 target's rows relate to the step's tokens (``rows``), modules it calls outside the step
-(``exclude``, ``deferred``), names kept for compatibility (``names``), the prefixes
+(``exclude``), names kept for compatibility (``names``), the prefixes
 adapters write the root under (``adapter_roots``) and adapter-only renames (``aliases``).
 A module itself names the children it runs through their weights rather than their
 forward (``lora_unservable``), which the walk refuses.
@@ -77,8 +77,8 @@ class ModuleLoraMap:
     ``aliases``) goes through the loader's ``CheckpointRules`` (prefix, remap, stacked
     rules, then any adapter-only stacked rules) to a native module, which ``bindings``
     names. Also what binding reads: ``bindings`` below ``root_path`` (the weights root's
-    path in the node submodule), the ``deferred`` ones the node adds itself, and why a
-    module the walk found is not a target (``unservable``)."""
+    path in the node submodule), and why a module the walk found is not a target
+    (``unservable``)."""
 
     def __init__(
         self,
@@ -90,12 +90,10 @@ class ModuleLoraMap:
         unservable: Mapping[str, str] | None = None,
         ignore: Sequence[str] = (),
         root_path: str = "",
-        deferred: frozenset[str] = frozenset(),
     ):
         self.bindings = dict(bindings)
         self.unservable = dict(unservable or {})
         self.root_path = root_path
-        self.deferred = frozenset(deferred)
         self.rules = rules
         self._stacked = [*rules.stacked_params, *adapter_stacked_params]
         roots = [AdapterRoot(*r) for r in adapter_roots]
@@ -223,7 +221,6 @@ def module_lora_spec(
     rows: Mapping[str, RowSpec] | None = None,
     names: Mapping[str, str] | None = None,
     exclude: Sequence[str] | Mapping[str, str] = (),
-    deferred: Sequence[str] = (),
     ignore: Sequence[str] = (),
     embeddings: bool = False,
     convert_keys: Callable | None = None,
@@ -236,7 +233,7 @@ def module_lora_spec(
     (``CheckpointRules``); by default the root's own ``checkpoint_rules()``, so placement
     cannot drift from loading. ``adapter_stacked_params`` adds rules only adapters need
     (Tinker's split projections). Module paths, ``rows`` / ``names`` keys and ``exclude``
-    / ``deferred`` patterns are relative to ``root``; a role is the path below a stack
+    patterns are relative to ``root``; a role is the path below a stack
     layer (``self_attn.qkv_proj``), or the whole path for a module outside the stacks. A
     stack whose entries differ in shape at a role gives each entry a target of its own,
     named by its path, which ``rows`` still matches by the role (``names`` cannot name it).
@@ -249,15 +246,11 @@ def module_lora_spec(
     * ``exclude``: module paths (fnmatch, children included) not served, optionally
       mapped to the reason (a module called outside the planned step); an adapter
       touching one is refused with it.
-    * ``deferred``: modules whose delta the node adds itself, where the step's rows are
-      planned (``preprocess``, the forward), because it also calls them before the step
-      (an embedding run in ``prepare_inputs``): bound as ``lora_deferred``, which the
-      module's own forward never adds.
     * ``ignore``: checkpoint module paths (fnmatch) an adapter may hold that this
       deployment never runs, neither loaded nor refused.
     * ``embeddings``: serve token-embedding targets. Off by default: a node that embeds
       in ``prepare_inputs`` calls the embedding outside its planned step; turn it on when
-      every call is in the step. An embedding listed in ``deferred`` is served either way.
+      every call is in the step.
 
     Linear-like modules that cannot take a delta (a depthwise conv, MoE experts) are
     recorded with the reason, which an adapter touching them is refused with, and so are
@@ -308,7 +301,7 @@ def module_lora_spec(
             unservable[path] = capability.reason
             continue
         target = capability.capable.lora_target(module)
-        if target.kind == "embedding" and not embeddings and _match(path, deferred) is None:
+        if target.kind == "embedding" and not embeddings:
             unservable[path] = "a token embedding, which this node does not serve LoRA on"
             continue
         found = _in_stack(path, stacks)
@@ -354,10 +347,6 @@ def module_lora_spec(
     unmatched = [p for p in rows if not any(fnmatch.fnmatchcase(r, p) for r in roles)]
     if unmatched:
         raise ValueError(f"`rows` patterns {unmatched} match no LoRA target role")
-    deferred_paths = frozenset(p for p in bindings if _match(p, deferred) is not None)
-    unmatched = [p for p in deferred if not any(_match(b, [p]) for b in bindings)]
-    if unmatched:
-        raise ValueError(f"`deferred` patterns {unmatched} match no LoRA target module")
     if unservable:
         logger.info(
             "LoRA %s: %d module(s) take no delta, e.g. %s",
@@ -367,7 +356,7 @@ def module_lora_spec(
     module_map = ModuleLoraMap(
         bindings, rules=rules, adapter_stacked_params=adapter_stacked_params,
         adapter_roots=adapter_roots, aliases=aliases, unservable=unservable, ignore=ignore,
-        root_path=root_path, deferred=deferred_paths,
+        root_path=root_path,
     )
     return LoraSpec(
         resource_key=resource_key, nodes=set(nodes), num_layers=num_layers, targets=targets,
@@ -478,7 +467,7 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> tupl
             if ref.target not in spec.targets:
                 continue  # the YAML's `targets` dropped it
             module = modules[path]
-            if getattr(module, "lora_delta", None) is not None or getattr(module, "lora_deferred", None) is not None:
+            if getattr(module, "lora_delta", None) is not None:
                 raise ValueError(f"{path} already holds a LoRA delta from another resource of this node")
             original = type(module)
             module = make_lora_capable(module)
@@ -487,9 +476,5 @@ def bind_module_lora(submodule: nn.Module, resources: Mapping[str, Any]) -> tupl
             except Exception:
                 module.__class__ = original
                 raise
-            delta = pool.layer_delta(ref.target, ref.layer)
-            if path in module_map.deferred:
-                module.lora_deferred = delta
-            else:
-                module.lora_delta = delta
+            module.lora_delta = pool.layer_delta(ref.target, ref.layer)
     return tuple(key for key, _ in pools)

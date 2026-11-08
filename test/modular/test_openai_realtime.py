@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from mstar.api_server.openai import adapters, serving_realtime  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs, Transcript  # noqa: E402
+from mstar.testing_utils.model import StubModel
 
 
 class _Chunk:
@@ -42,7 +43,7 @@ class _WordTokenizer:
         return " ".join(ids)
 
 
-class _StubModel:
+class _StubModel(StubModel):
     tokenizer = _WordTokenizer()
 
 

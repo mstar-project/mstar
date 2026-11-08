@@ -14,12 +14,15 @@ Images arrive packed: ``pixel_values`` is ``[total_patches, patch_numel]`` and
 """
 from __future__ import annotations
 
+import math
 from typing import Protocol
 
 import torch
 from torch import nn
 
+from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.linear import FusedColumnLinear
+from mstar.model.components.lora.capable import LoraCapable, LoraOutputAdd
 
 
 class ViTBlockConfig(Protocol):
@@ -222,9 +225,27 @@ class VisionRotaryEmbedding(nn.Module):
         return torch.cat([freq_hw, freq_hw], dim=-1)
 
 
-class VisionPatchEmbed(nn.Module):
-    lora_unservable = {"proj": "run as a matmul over its weight, never its own forward"}
+class PatchProjection(LoraCapable, nn.Conv3d):
+    """The patch embedding's conv, whose kernel is its stride, run as the one GEMM
+    it is over patches cut beforehand (``[N, C * T * P * P]``): on Qwen3.5's tower
+    cuDNN ran the conv as a legacy implicit-GEMM kernel at ~17 ms for a 60 s
+    video's patches, ~1 ms as a matmul. Its parameters are the conv's, so the
+    checkpoint loads as is, and a bound LoRA delta adds to its rows as a linear's
+    does (PEFT's conv LoRA is the linear over the flattened patch)."""
 
+    lora_twin = LoraOutputAdd
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.linear(x, self.weight.view(self.out_channels, -1), self.bias)
+
+    def lora_target(self) -> LoraTarget:
+        return LoraTarget(
+            in_features=self.in_channels * math.prod(self.kernel_size),
+            out_slices=(self.out_channels,), parallel="none",
+        )
+
+
+class VisionPatchEmbed(nn.Module):
     def __init__(self, config: ViTConfig):
         super().__init__()
         self.in_channels = config.in_channels
@@ -232,18 +253,14 @@ class VisionPatchEmbed(nn.Module):
         self.patch_size = config.patch_size
         self.embed_dim = config.hidden_size
         kernel = (config.temporal_patch_size, config.patch_size, config.patch_size)
-        self.proj = nn.Conv3d(
+        self.proj = PatchProjection(
             config.in_channels, config.hidden_size,
             kernel_size=kernel, stride=kernel, bias=True,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # The conv's stride is its kernel, so it is one GEMM over flattened
-        # patches. On Qwen3.5's tower, cuDNN ran it as a legacy implicit-GEMM
-        # kernel at ~17 ms for a 60 s video's patches, ~1 ms as a matmul.
         weight = self.proj.weight
-        x = x.reshape(-1, weight[0].numel()).to(weight.dtype)
-        return nn.functional.linear(x, weight.view(self.embed_dim, -1), self.proj.bias)
+        return self.proj(x.reshape(-1, weight[0].numel()).to(weight.dtype))
 
 
 class VisionMLP(nn.Module):
