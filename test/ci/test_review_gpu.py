@@ -117,6 +117,10 @@ class TestStart(unittest.TestCase):
                          "model text from an untrusted PR would be instructions to a root shell")
         self.assertIn(self.INJECTED, (out / "findings.json").read_text())
 
+    def test_a_stacked_pr_is_tested_against_its_base_branch(self):
+        a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="joe/cp-stack-1", run="full")
+        self.assertIn("--base joe/cp-stack-1", GPU_REVIEW["brief"](a), "the PR's arm would be compared with main")
+
     def test_no_launch_past_the_bots_cap_across_prs(self):
         g = {"enabled": lambda cfg, p: True,
              "slurm_run": fake_slurm({"squeue": "review-bot-3-9-1\njoe-live-pr-5-x\n"}),

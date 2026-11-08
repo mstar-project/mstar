@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a risk rating. One session runs every pass itself — an mstar-way derivation written before the diff is read, behaviour lenses, hard rules, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (defects only, P0–P2), thorough (all passes, P0–P3 and design questions) and gpu (thorough plus a live GPU test through live-pr-test). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
+description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a risk rating. One session runs every pass itself (a big PR's slices go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, hard rules, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (defects only, P0–P2), thorough (all passes, P0–P3 and design questions) and gpu (thorough plus a live GPU test through live-pr-test). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
 ---
 
 # Reviewing an M* pull request
@@ -26,12 +26,13 @@ GitHub token or cloud key.
 
 | Mode | Reports | Passes | Tools |
 | --- | --- | --- | --- |
-| `light` | P0–P2, description problems, questions that could become P0 or P1 | those marked **light** | read only, no shell; about 40 turns |
+| `light` | P0–P2, description problems, questions that could become P0 or P1 | those marked **light** | read only, no shell; 40 turns on a contributor's own PR, else a cap that only stops a loop |
 | `thorough` | everything, P0–P3, and design questions | all | read only, no shell |
 | `gpu` | as thorough, then a live test (§7) | all; §7 runs in a separate session on the GPU box | review: read only, no shell; live test: a shell on the GPU box only |
 
-Each pass in §3–§4 names its modes. One session does all of it: no orchestrator, subagents,
-parallel finders or cross-check round trips.
+Each pass in §3–§4 names its modes. One session runs the review and owns every finding: no
+orchestrator, parallel finders or cross-check round trips. The one exception is a big PR, whose
+slices go to subagents as "Working economically" says; the session verifies what they return.
 
 ## Working economically
 

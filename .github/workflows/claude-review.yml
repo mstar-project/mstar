@@ -814,12 +814,13 @@ jobs:
           printf '%s' "$RESULT" > review.json
           # The live test runs the PR's code: only for an author with write access, checked
           # against their permission (author_association can't tell write from read).
-          author=$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)
+          gh api "repos/$REPO/pulls/$PR" > pr.json
+          author=$(jq -r .user.login pr.json)
           perm=$(gh api "repos/$REPO/collaborators/$author/permission" --jq .permission 2> /dev/null || echo none)
           case "$perm" in admin|maintain|write) echo "trusted=true" >> "$GITHUB_OUTPUT" ;; esac
           gpus=$(jq -r --argjson cap "$MAX_GPUS" '[.live_test.gpus // 1, $cap] | min' review.json)
           run=$(jq -r '.live_test.run // "full"' review.json)
-          { echo "gpus=$gpus"; echo "run=$run"; echo "hours=$HOURS"; } >> "$GITHUB_OUTPUT"
+          { echo "gpus=$gpus"; echo "run=$run"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
       # `none` and `targeted` build on the last live test: only when it passed, on a commit
       # that is an ancestor of this head. Otherwise the live test runs in full. A `none` that
@@ -857,9 +858,11 @@ jobs:
         env:
           # The box's own key, never the review's: the box runs PR code with a shell.
           LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
+          BASE: ${{ steps.cfg.outputs.base }}
         run: |
           set +e
           python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
+            --base "$BASE" \
             --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
             --run "${{ steps.carry.outputs.run || steps.cfg.outputs.run }}" \
             --max-runs "${{ vars.REVIEW_GPU_MAX_RUNS || '2' }}" \
