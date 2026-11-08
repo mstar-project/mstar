@@ -408,7 +408,7 @@ class TestApprove(unittest.TestCase):
         list unless `head_after` (the head on the read after the POST) asks for the fake and its calls."""
         pr = {"head": {"sha": head}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}, "title": "T"}
         heads = iter(() if head_after is None else (pr,))
-        after = head_after if isinstance(head_after, Fail) else {**pr, "head": {"sha": head_after}}
+        after = head_after if isinstance(head_after, (Fail, dict)) else {**pr, "head": {"sha": head_after}}
         routes = {f"GET repos/{R}/pulls/7": (lambda a, i: next(heads, after))
                   if head_after else pr,
                   f"GET repos/{R}/collaborators/an-author/permission": {"permission": perm},
@@ -483,14 +483,16 @@ class TestApprove(unittest.TestCase):
         self.assertIn("couldn't be withdrawn", text, "the comment would say not approved with the approval standing")
 
     def test_a_failed_read_of_the_head_after_the_approval_withdraws_it_like_a_push(self):
-        text, out, fake = self.approve({"value": "on"}, head_after=Fail("HTTP 502"), extra={
-            f"GET repos/{R}/pulls/7/reviews?per_page=100": [
-                {"id": 3, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
-            f"PUT repos/{R}/pulls/7/reviews/3/dismissals": {}})
-        self.assertIn(f"PUT repos/{R}/pulls/7/reviews/3/dismissals", [key for key, _ in fake.writes()],
-                      "the approval would stand on a commit it can't be sure of")
-        self.assertNotIn("approval", out, "the ledger would record an approval that was withdrawn")
-        self.assertIn("Not approved", text)
+        for name, after in (("a failed read", Fail("HTTP 502")), ("a malformed reply", {"head": None})):
+            with self.subTest(name):
+                text, out, fake = self.approve({"value": "on"}, head_after=after, extra={
+                    f"GET repos/{R}/pulls/7/reviews?per_page=100": [
+                        {"id": 3, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
+                    f"PUT repos/{R}/pulls/7/reviews/3/dismissals": {}})
+                self.assertIn(f"PUT repos/{R}/pulls/7/reviews/3/dismissals", [key for key, _ in fake.writes()],
+                              "the approval would stand on a commit it can't be sure of")
+                self.assertNotIn("approval", out, "the ledger would record an approval that was withdrawn")
+                self.assertIn("Not approved", text)
 
     def test_a_finding_counts_as_fixed_above_only_while_that_pr_still_holds_the_fix(self):
         finding = {"priority": "P1", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}

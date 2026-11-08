@@ -661,10 +661,10 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
         return
     review_pr(pr, head_sha, "APPROVE", f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open "
                                        f"P0–P2 finding, and {tested}. It covers this commit only.")
-    # A push between the check and the approval would leave it on a commit nobody tested; a failed read can't
-    # rule one out.
+    # A push between the check and the approval would leave it on a commit nobody tested; a failed read or a
+    # malformed reply can't rule one out.
     pull = bot.read(bot.api, f"repos/{REPO}/pulls/{pr}")
-    if pull is None or pull["head"]["sha"] != head_sha:
+    if ((pull or {}).get("head") or {}).get("sha") != head_sha:
         said = f"**Not approved:** new commits arrived while approving `{head_sha[:7]}`.\n"
         try:
             dismiss_approvals(pr, "new commits arrived while approving")
