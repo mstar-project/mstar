@@ -18,6 +18,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosyvoice3": ("mstar.model.cosyvoice3.cosyvoice3_model", "CosyVoice3Model"),
+    "deepseek_ocr": ("mstar.model.deepseek_ocr.deepseek_ocr_model", "DeepseekOCRModel"),
     "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
@@ -101,6 +102,9 @@ HF_MODELS: dict[str, dict] = {
     # causal HiFT, zero-shot voice cloning; the speech tokenizer and speaker
     # encoder are Chatterbox's, loaded from the checkpoint's ONNX files.
     "cosyvoice3": {"model_path_hf": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"},
+    # DeepSeek-OCR: DeepEncoder (SAM-B + CLIP-L) over a padded global view and
+    # 640 px tiles, into a 3B DeepSeek-V2 MoE decoder (570M active, plain MHA).
+    "deepseek_ocr": {"model_path_hf": "deepseek-ai/DeepSeek-OCR"},
     # FLUX.2 [klein]: step-distilled rectified-flow text-to-image + multi-reference
     # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
     # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.

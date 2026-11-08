@@ -660,6 +660,13 @@ def _command_a_plus(name, model_kwargs, tmp_path, monkeypatch):
     return _constructed(name, model_kwargs, checkpoint_dir=str(tmp_path), max_seq_len=64)
 
 
+def _deepseek_ocr(name, model_kwargs, tmp_path, monkeypatch):
+    # the checkpoint's config.json as the package's tests ship it; nothing is downloaded
+    fixture = ROOT / "mstar/model/deepseek_ocr/tests/fixtures/config.json"
+    (tmp_path / "config.json").write_text(fixture.read_text())
+    return _constructed(name, model_kwargs, model_path_hf=str(tmp_path))
+
+
 def _cosyvoice3(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.cosyvoice3.config import CosyVoice3Config
     from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model
@@ -874,6 +881,7 @@ _FACTORIES = {
     "Cosmos3Model": _cosmos3,
     "FishS2ProModel": _fish_s2_pro,
     "CosyVoice3Model": _cosyvoice3,
+    "DeepseekOCRModel": _deepseek_ocr,
     "Flux2KleinModel": _flux2,
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,

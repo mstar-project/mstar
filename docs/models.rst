@@ -26,6 +26,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``CohereLabs/command-a-plus-05-2026-bf16``
      - Command A+ text and image chat: a 218B-parameter MoE (25B active) with
        sliding-window attention. Tested on 4x GB200 at TP4; see the notes below.
+   * - ``deepseek_ocr`` *(Experimental)*
+     - ``deepseek-ai/DeepSeek-OCR``
+     - Document OCR from page images (text out): DeepEncoder (SAM-B + CLIP-L) over
+       the model card's "gundam" views, a 3B MoE decoder. Greedy by default.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -611,6 +615,37 @@ On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
 kept only their window); ``validate_checkpoint.py``
 there checks parity against Hugging Face, with ``--images`` for image prompts.
 Not supported yet: FP8 weights and prefill CUDA graphs.
+
+DeepSeek-OCR (``deepseek_ocr``)
+-------------------------------
+
+Document OCR on ``deepseek-ai/DeepSeek-OCR``: page images in, text out. The
+``vision_encoder`` node runs DeepEncoder (SAM-B into CLIP-L, then a linear
+projector) and the ``LLM`` node a 3B DeepSeek-V2 MoE decoder (64 experts, top-6,
+570M active) with plain multi-head attention::
+
+    mstar serve deepseek_ocr --gpus 0
+    curl -s http://localhost:8000/generate -F 'text=Free OCR.' -F 'files=@page.png'
+
+``/v1/chat/completions`` takes ``image_url`` and text parts. An image goes before
+the text that follows it as ``<image>\n``, which gives the model card's prompts
+(``Free OCR.``, ``<|grounding|>Convert the document to markdown.``); text that
+already holds ``<image>`` is used as written. Decoding is greedy unless the request
+sets a temperature, and there is no n-gram repetition ban yet (the model card's
+``no_repeat_ngram_size``, vLLM's ``NGramPerReqLogitsProcessor``).
+
+Views are cut on the API server with PIL, as the model card's ``infer`` cuts them:
+``model_kwargs.image_mode`` is one of the card's modes (``tiny``, ``small``,
+``base``, ``large``, or ``gundam``, the default: a 1024 px padded global view plus
+640 px tiles), and ``max_crops`` caps the tiles (9, as ``infer``; vLLM caps at 6,
+which gives the same 2x3 grid on A4 and Letter pages). Decode, packed image
+prefills up to 5120 tokens and the encoder replay CUDA graphs (the encoder per view
+size and count, up to 8 views a call); decode loops its token back on the device.
+
+``baidu/Unlimited-OCR`` shares the architecture and weights layout but attends with
+R-SWA: generated tokens see the whole prompt plus the last 128 generated tokens.
+No attention resource expresses a per-request prompt sink beside a window yet, so
+its checkpoint is refused rather than served with full attention.
 
 Kokoro notes
 ------------

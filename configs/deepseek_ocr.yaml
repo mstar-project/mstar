@@ -1,0 +1,13 @@
+model: deepseek_ocr
+max_seq_len: 8192
+model_kwargs:
+  # The model card's modes: tiny, small, base, large (one view) or gundam
+  # (a 1024 px global view plus 640 px tiles, the default).
+  image_mode: gundam
+  # Tiles per image in gundam mode. The model card's infer allows 9; vLLM and
+  # DeepSeek's own vLLM script allow 6. Pages of A4/Letter shape get 6 either way.
+  max_crops: 9
+node_groups:
+  # Colocated: the encoder runs once per page, then idles.
+  - node_names: [LLM, vision_encoder]
+    ranks: [0]

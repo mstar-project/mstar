@@ -39,6 +39,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "chatterbox_multilingual": "chatterbox_multilingual.yaml",
     "chatterbox_turbo": "chatterbox_turbo.yaml",
     "cosyvoice3": "cosyvoice3.yaml",
+    "deepseek_ocr": "deepseek_ocr.yaml",
     "voxcpm2": "voxcpm2.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
@@ -151,6 +152,8 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     ]
     if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "muse_glimmer"):
         lines.append("    print(client.chat(\"Hello!\").text)")
+    if model == "deepseek_ocr":
+        lines.append("    print(client.chat(\"Free OCR.\", images=[\"page.png\"]).text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
     if model in ("cosmos3", "cosmos3_super"):
