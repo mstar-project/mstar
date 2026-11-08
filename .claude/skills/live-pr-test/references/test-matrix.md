@@ -36,7 +36,7 @@ Probes that found bugs our earlier runs missed, from human reviews of the same P
 | `mstar/distributed/`, `mstar/model/components/distributed/`, anything TP/SP | the TP rows of the worker A/B set |
 | `mstar/communication/`, `rust/`, `mstar/graph/` runtime | worker A/B set. Every functional and risk check runs on both the Rust and the Python runtime (`MSTAR_RUST_ZMQ=0 MSTAR_RUST_GRAPH=0`), plus a functional smoke over `--tensor-comm-protocol TCP` (untimed) (AGENTS.md invariant 5) |
 | `mstar/api_server/` | functional suite for each modality family it routes (text, image, speech, video), including streaming and the OpenAI routes the change touches, on both the Python and the Rust frontend (`--rust-frontend`); the CPU-overhead row if it sits on the request path |
-| `docs/`, `test/` or comments only | no served run unless the PR claims a number; run the changed tests on the arms they target, then say so and stop |
+| `docs/`, `test/` or comments only | no served run unless the PR claims a number; read CPU test results from CI, run changed tests only if they need a GPU or weights, then say so and stop |
 | `benchmark/` | run the changed script end to end, with a real checkpoint, on the hardware it's meant for |
 
 ## Worker A/B set
@@ -48,10 +48,10 @@ PR vs `main`, back to back per model, three server restarts per arm by default, 
 | BAGEL CFG parallel | `mstar serve bagel_cfg_parallel` (`configs/bagel_cfg_parallel.yaml`) | `--model bagel --request-type text_to_image` | 1, 4 | 3 |
 | Cosmos3 TP/SP | `mstar serve cosmos3 --config configs/cosmos3_nano_tp2_sp2.yaml` (also `_tp2` / `_sp2` when 4 GPUs are not needed elsewhere) | `benchmark/cosmos3/` scripts | 1 | 4 |
 | Qwen3-Omni a2s + t2s, thinker TP | `mstar serve qwen3_omni --config configs/qwen3omni_thinker_tp2.yaml` | `--model qwen3omni --request-type audio_to_speech`, then `text_to_speech` | 1, 8, 32 | 3 |
-| Qwen3.5 0.8B CPU overhead | `mstar serve qwen3_5_0.8b` | `--model qwen3.5 --model-id Qwen/Qwen3.5-0.8B --request-type text_to_text --ignore-eos --output-len-min/max` | 8, 32, **128** | 1 |
+| Qwen3.5 0.8B CPU overhead | `mstar serve qwen3_5_0.8b --rust-frontend` | `--model qwen3.5 --model-id Qwen/Qwen3.5-0.8B --request-type text_to_text --ignore-eos --output-len-min/max` | 8, 32, **128** | 1 |
 | Orpheus TP | `mstar serve orpheus --config configs/orpheus_tp2.yaml` | `--model orpheus --request-type text_to_speech` | 1, 8, 32 | 2 |
 
-Use the Qwen3.5 0.8B row for anything that could add host work on the critical path (per-step Python, extra syncs, serialization, scheduler bookkeeping). It is the most host-bound model in the repo, so it shows CPU overhead first. Run `benchmark.worker_phases` on both arms when it moves, to say whether the change is in `event_sync` (GPU) or host phases.
+Use the Qwen3.5 0.8B row for anything that could add host work on the critical path (per-step Python, extra syncs, serialization, scheduler bookkeeping). It is the most host-bound model in the repo, so it shows CPU overhead first. Run `benchmark.worker_phases` on both arms when it moves, to say whether the change is in `event_sync` (GPU) or host phases. Always serve this row with `--rust-frontend`: the default frontend is uvicorn, which can become the limit at high concurrency and hide the worker overhead the row is there to catch. Check that the server log has no `Uvicorn running` line before trusting the numbers.
 
 - **Run it for every PR that touches the worker, engine, resources or graph runtime, correctness fixes included.** A fix that adds bookkeeping to admit, plan, commit or the scheduling pass can cost host time that no functional check shows. Run it at c=8/32/128 by default (add 1 or 64 if a number there is in question); c=32 and c=128 are where host overhead appears, so they are never dropped.
 - **Skip it only for a change that is compute-neutral on the per-step path**: per-request bookkeeping in the API server or data worker (a counter per request, a queue drained once per submit), startup-only code, or error paths a normal request never reaches. Read the diff to decide, and say in one clause of the report why the row was skipped.

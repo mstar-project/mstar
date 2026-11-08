@@ -106,6 +106,8 @@ build_arm() {  # build_arm <dir>
     source .venv/bin/activate
     uv pip install -q --torch-backend=auto -e ".[all]" maturin
     maturin develop -q --release -m rust/Cargo.toml
+    # mstar-server, for rows served with --rust-frontend
+    [ ! -d rust/server ] || (cd rust/server && cargo build --release -q)
     find mstar -name __pycache__ -type d -prune -exec rm -rf {} +
     python -c "import mstar, mstar_rust, mstar.conductor.conductor, mstar.worker.worker; print('import ok:', mstar.__file__)"
   )
