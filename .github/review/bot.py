@@ -520,19 +520,21 @@ def patch_key(lines):
     """A file's patch as a rebase leaves it: no `@@` line numbers (the function name after them stays, so a
     change moved to another function counts), no `similarity index` or `dissimilarity index` line, and
     from the `index` line only the new blob when the file has no hunks (binary, a pure rename), and nothing
-    when it has: a rebase moves those blobs, and what a rename is similar to."""
-    hunks = any(line.startswith("@@") for line in lines)
+    when it has: a rebase moves those blobs, and what a rename is similar to. Each `diff --git` section is
+    judged alone, since a type change has two."""
+    starts = [i for i, line in enumerate(lines) if line.startswith("diff --git ")] + [len(lines)]
     key = []
-    for line in lines:
-        if line.startswith("@@"):
-            key.append(re.sub(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", "@@", line))
-        elif line.startswith("index "):
-            if not hunks:
-                key.append(line.split("..")[-1])
-        elif line.startswith(("similarity index ", "dissimilarity index ")):
-            continue
-        else:
-            key.append(line)
+    for start, end in zip(starts, starts[1:]):
+        section = lines[start:end]
+        hunks = any(line.startswith("@@") for line in section)
+        for line in section:
+            if line.startswith("@@"):
+                key.append(re.sub(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", "@@", line))
+            elif line.startswith("index "):
+                if not hunks:
+                    key.append(line.split("..")[-1])
+            elif not line.startswith(("similarity index ", "dissimilarity index ")):
+                key.append(line)
     return key
 
 
