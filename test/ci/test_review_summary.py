@@ -104,10 +104,11 @@ class TestReviewSummary(unittest.TestCase):
         kept = {"live_test": {"run": "full", "untestable": "AMD kernels"}}
         left_out = carried(review(), kept, True)
         self.assertEqual(left_out["live_test"], {"untestable": "AMD kernels"},
-                         "a re-review or a person's answer would lift it, and the bot approve what no GPU of its ran")
+                         "a re-review or a person's answer would lift it, and the bot approve what its GPUs can't run")
         for mode in ("light", "full"):
             self.assertEqual(read_state(render(left_out, [], "0123456789", mode, []))["live_test"],
-                             left_out["live_test"], "a light re-review, or a full one that gave no live_test, would lose it for the next")
+                             left_out["live_test"],
+                             "a light re-review, or a full one that gave no live_test, would lose it for the next")
         ran = {"live_test": {"run": "targeted", "reason": "r", "untestable": ""}}
         self.assertEqual(carried({**review(), **ran}, kept, False)["live_test"]["run"], "targeted")
         for older in ({}, {"live_test": None}, {"live_test": {"run": "full", "reason": "r"}}):
