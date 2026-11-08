@@ -2,7 +2,7 @@
 import json
 import logging
 import re
-from collections.abc import Container
+from collections.abc import Container, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -640,14 +640,19 @@ def kv_pages(tokens: int, page_size: int, requests: int) -> int:
     return 1 + requests * -(-tokens // page_size)
 
 
-def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logger) -> None:
+def check_kv_pools_fit(
+    model, config: dict, config_path: str, log: logging.Logger,
+    request_tokens: Mapping[str, Sequence[int]] | None = None,
+) -> None:
     """Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.
 
     A request keeps its pages from prefill to its last token. Past a pool, a
     prefill batch is refused and the worker offloads decoding requests to
     admit it, which costs far more than queueing would. So the cap's requests
     at full length must fit each cache next to its sink page; the conductor
-    queues the rest. Warnings go to the model's ``log``.
+    queues the rest. Warnings go to the model's ``log``. ``request_tokens``
+    gives a pool the tokens each of a request's streams holds at full length,
+    by default one stream of the pool's ``max_seq_len``.
     """
     from mstar.engine.resources import KVSpec, PagedKVConfig
     from mstar.model.base import serving_resources
@@ -674,7 +679,10 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
         kv = spec.config
         # in arena pages: a request at full length holds every token of every group, a window's
         # too, since a one-step prefill keeps its whole prompt until it commits
-        per_request = sum(-(-kv.max_seq_len // group.page_size) for group in kv.groups)
+        per_request = sum(
+            -(-tokens // group.page_size)
+            for tokens in (request_tokens or {}).get(spec.resource_key, (kv.max_seq_len,)) for group in kv.groups
+        )
         need = 1 + cap * per_request
         if need > kv.num_units:
             raise ValueError(
