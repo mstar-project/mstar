@@ -793,28 +793,33 @@ def _stream_unit_runtime(*, install_consumer=True, consumer_worker=WORKER, drive
     return runtime, rid
 
 
-def test_real_talker_loop_and_plain_codec_derive_one_stream_unit():
+@pytest.mark.parametrize("omni", [False, True])
+def test_real_talker_loop_and_plain_codec_derive_one_stream_unit(omni):
     from pathlib import Path
 
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
     from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
 
-    model = object.__new__(Qwen3TTSModel)
-    model.config = Qwen3TTSModelConfig()
-    graphs = model.get_worker_graphs(str(Path(__file__).resolve().parents[2] / "configs/qwen3tts.yaml"))
+    model = object.__new__(Qwen3OmniModel if omni else Qwen3TTSModel)
+    model.config = Qwen3OmniModelConfig() if omni else Qwen3TTSModelConfig()
+    config = "qwen3omni_colocated.yaml" if omni else "qwen3tts.yaml"
+    graphs = model.get_worker_graphs(str(Path(__file__).resolve().parents[2] / "configs" / config))
+    codec, walk = ("Code2Wav", "code2wav_chunk") if omni else ("Codec", "codec_chunk")
     runtime = rust_runtime.RustGraphRuntime(
         my_worker_id=WORKER, my_worker_graphs=graphs,
         all_wg_ids_to_graph_walks={g.worker_graph_id: g.graph_walks for g in graphs},
         all_wg_ids_to_dyn_loops={g.worker_graph_id: set(g.section.get_loops()) for g in graphs},
         all_wg_ids_to_nodes={g.worker_graph_id: set(g.section.get_nodes()) for g in graphs},
-        node_to_partition={"Talker": "Talker", "Codec": "Codec"},
+        node_to_partition={node: node for g in graphs for node in g.section.get_nodes()},
         sharding_config=ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={}),
         bookkeeping=RustTensorBookkeeping(), connections=tuple(model.get_partition_topology().connections),
     )
     unit, = runtime.execution_units("talker_decode")
-    assert unit.nodes == ("Talker", "Codec")
-    assert unit.graph_walks == ("talker_decode", "codec_chunk")
-    assert unit.streaming_edges == (("Talker", "Codec", "codec_tokens"),)
+    assert unit.nodes == ("Talker", codec)
+    assert unit.graph_walks == ("talker_decode", walk)
+    assert unit.streaming_edges == (("Talker", codec, "codec_tokens"),)
     assert unit.loop_name is None
     assert runtime.execution_units("talker_prefill") == ()
 

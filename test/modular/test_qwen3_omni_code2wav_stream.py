@@ -23,6 +23,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.engine.engine import Engine
+from mstar.engine.resources.resident import step_refusal
 from mstar.model.qwen3_omni.components import code2wav as code2wav_module
 from mstar.model.qwen3_omni.components.code2wav import Qwen3OmniMoeCode2Wav
 from mstar.model.qwen3_omni.config import Code2WavConfig, Qwen3OmniModelConfig
@@ -61,7 +63,12 @@ def _talker_streamed(config: Qwen3OmniModelConfig, frames: torch.Tensor) -> tupl
     )
     kept, results = [], []
     for frame in frames:
-        results.append(talker.check_stop("r", info, {"layer0_codes": [frame[:1]], "codec_tokens": [frame]}))
+        outputs = {"new_token": [frame[:1]], "codec_tokens": [frame]}
+        direct = {name: outputs[name][0].clone() for name in talker.DIRECT_OUTPUTS[info.graph_walk]}
+        talker.postprocess("r", info, outputs)
+        for name, before in direct.items():
+            assert torch.equal(outputs[name][0], before)
+        results.append(talker.check_stop("r", info, outputs))
         if not ("codec_tokens" in policy.withhold and frame[0].item() in policy.eos_tokens):
             kept.append(frame)
     return (torch.stack(kept) if kept else frames[:0]), results
@@ -121,11 +128,16 @@ def _stream_batched(
             )
             for rid in rids
         ]
+        declaration = submodule.declare_step("code2wav_chunk", rids, items)
+        assert declaration.cg_key_info == key
+        assert step_refusal((), declaration) is None
         assert submodule.can_batch(None, items)
         packed = submodule.preprocess("code2wav_chunk", engine_inputs, items)
         decoded = packed["codec_tokens"].shape[-1] > 0
         with torch.no_grad():
-            outputs = submodule.forward_batched("code2wav_chunk", engine_inputs, **packed)
+            raw = submodule.forward_batched("code2wav_chunk", engine_inputs, **packed)
+        outputs = {}
+        Engine._merge_per_rid(Engine.__new__(Engine), outputs, raw, rids, rids, submodule, fwd_infos)
         for rid, item in zip(rids, items, strict=True):
             submodule.postprocess(rid, fwd_infos[rid], outputs[rid], inputs=item)
             steps[rid].append((chunks[rid].info, outputs[rid]["audio_chunk"][0], decoded))
@@ -184,6 +196,83 @@ class _LookaheadDecoder(torch.nn.Module):
 
 def _codes(num_frames: int) -> torch.Tensor:
     return (torch.arange(num_frames) + 1)[:, None].expand(num_frames, 16).contiguous()
+
+
+@pytest.mark.parametrize("window", ["first", "steady", "short", "context_only", "changing", "sliced"])
+def test_connected_code2wav_certifies_the_actual_scheduled_window(window):
+    from mstar.engine.chunking import ChunkingManagement
+    from mstar.engine.connected_inputs import ConnectedInputs
+    from mstar.engine.engine import ExecutingBatch, SubmoduleManagement
+    from mstar.engine.resources.step import StepContext
+    from mstar.streaming.stream_buffer import StreamingEdge
+
+    config = Qwen3OmniModelConfig()
+    if window == "sliced":
+        config.code2wav.num_quantizers = 8
+    submodule = Code2WavSubmodule(_LookaheadDecoder(), config)
+    source = StreamBuffer(1, "codec_tokens", "Talker", _scheduled_policy(config.code2wav))
+    count = {"first": 12, "steady": 50, "short": 27, "context_only": 25, "changing": 0, "sliced": 12}[window]
+    source.put_positions(range(count))
+    if window in ("short", "context_only"):
+        source.signal_done(count)
+    if window in ("steady", "short", "context_only"):
+        source.pop_chunk()  # the ordinary 12- and 13-frame ramp already ran
+        source.pop_chunk()
+    adopted = source.reserve_window(1) if window != "changing" else None
+    future = () if source.producer_done else range(count, count + 4)
+    snapshot = source.reserve_future_window(future, 1, adopt=adopted.reservation if adopted else None)
+    assert snapshot is not None
+    batch = ExecutingBatch(
+        "Code2Wav", {1: SimpleNamespace(request_id=1)}, StepContext((1,), "code2wav_chunk", 0, False),
+        stream_windows={1: [StreamingEdge("codec_tokens", "Code2Wav", [], snapshot.info)]},
+    )
+    engine = Engine.__new__(Engine)
+    engine._enable_nvtx = False
+    engine._loopback_steps = engine._keyed_walks = {}
+    engine._submodules = {"Code2Wav": SubmoduleManagement(submodule, None, None, None, {})}
+    engine._chunking = ChunkingManagement(engine._submodules)
+    guard = ConnectedInputs({})
+    prototype = _codes(submodule.full_seqlen)
+    with guard.preparing():
+        if window in ("changing", "sliced"):
+            reason = "prepared host inputs" if window == "changing" else "slices a future row"
+            with pytest.raises(ValueError, match=reason):
+                engine._prepare_stream_choices(batch, "Talker", "codec_tokens", prototype, guard, 1)
+            return
+        choices = engine._prepare_stream_choices(batch, "Talker", "codec_tokens", prototype, guard, 1)
+    assert choices and all(choice.inputs for choice in choices)
+    candidate = choices[0]
+    declared = submodule.declare_step("code2wav_chunk", [1], candidate.inputs)
+    assert step_refusal((), declared) is None
+    info = ModelInputsFromEngine(
+        request_ids=[1], per_request_info={}, per_request_input_metadata=candidate.per_request_input_metadata,
+        captured=window != "context_only",
+    )
+    inputs = (ConnectedInputs.materialize(candidate.inputs, guard.bindings)
+              if window == "context_only" else candidate.inputs)
+    packed = submodule.preprocess("code2wav_chunk", info, inputs)
+    if window == "context_only":
+        assert declared.cg_key_info == submodule._CONTEXT_ONLY_KEY
+        assert packed["codec_tokens"].shape[-1] == 0
+        assert submodule.forward_batched("code2wav_chunk", info, **packed).row_outputs["audio_chunk"].numel() == 0
+        assert submodule.code2wav.calls == 0
+    else:
+        assert declared.cg_key_info is None
+        captured, = submodule.get_accelerator_graph_configs("cpu")
+        template = submodule.preprocess("code2wav_chunk", info, [captured.single_request_inputs])
+        key = ("Talker", "Code2Wav", "codec_tokens", 1)
+        for src, dst in guard.copies(packed["codec_tokens"], template["codec_tokens"], (key,)):
+            dst.copy_(src)
+        chunk = candidate.per_request_input_metadata[1].stream_chunks["codec_tokens"]
+        expected = submodule.prepare_inputs(
+            "code2wav_chunk", None, {"codec_tokens": [prototype[:chunk.num_items]]},
+            input_metadata=candidate.per_request_input_metadata[1],
+        )
+        ordinary = submodule.preprocess("code2wav_chunk", info, [expected])
+        assert torch.equal(template["codec_tokens"], ordinary["codec_tokens"])
+        assert candidate.inputs[0].kwargs == expected.kwargs
+    assert source.owns_window(snapshot.reservation)
+    assert batch.inputs is None and not batch.failed_requests
 
 
 @pytest.mark.parametrize("num_frames", [1, 24, 25, 26, 49, 50, 51, 75, 76, 120, 125])

@@ -1372,6 +1372,8 @@ def talker_token_stop(config: Qwen3OmniModelConfig) -> TokenStop | None:
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
 
+    DIRECT_OUTPUTS = MappingProxyType({"talker_decode": frozenset({"codec_tokens"})})
+
     # the forward reads the codec embedding sum as ``input_embeds``
     REPEAT_CARRIES = MappingProxyType({"talker_input_embeds": CarryPair("talker_input_embeds", "input_embeds")})
 
@@ -1966,9 +1968,11 @@ class Code2WavSubmodule(NodeSubmodule):
                         ), dtype=torch.long, device=device),
                         "position_ids": torch.arange(self.full_seqlen, device=device)
                     },
+                    kwargs={"frames": self.full_seqlen, "context": 0},
                 ),
                 capture_batch_sizes=[1, 2, 4, 8, 16, 32],
-                compile=False
+                input_seq_dims={"codec_tokens": 0, "position_ids": 0},
+                compile=False,
             ),
         ]
 
@@ -2032,6 +2036,24 @@ class Code2WavSubmodule(NodeSubmodule):
             kwargs={"frames": orig_seq_len, "context": context},
         )
 
+    def declare_step(
+        self,
+        graph_walk: str,
+        request_ids: list[str],
+        inputs: list[NodeInputs],
+        slot_lease: SlotLease | None = None,
+        piecewise_leases: Mapping[str, SlotLease] | None = None,
+        **kwargs,
+    ) -> SubmoduleStep:
+        """A stateless vocoder row; terminal context-only windows stay eager."""
+        return SubmoduleStep(
+            segments=[Segment(rid, "main", 1) for rid in request_ids],
+            steps={},
+            cg_key_info=self._CONTEXT_ONLY_KEY if inputs and all(
+                item.kwargs["frames"] <= item.kwargs["context"] for item in inputs
+            ) else None,
+        )
+
     def preprocess(
         self,
         graph_walk: str,
@@ -2063,7 +2085,7 @@ class Code2WavSubmodule(NodeSubmodule):
         codec_tokens: torch.Tensor,
         position_ids: torch.Tensor,
         **kwargs
-    ) -> dict[str, NameToTensorList]:
+    ) -> BatchedModelOutput:
         """Decode a batch of padded windows to untrimmed int16 PCM.
 
         The Talker→Code2Wav StreamBuffer uses ``ScheduledLeftContextChunkPolicy``:
@@ -2079,23 +2101,19 @@ class Code2WavSubmodule(NodeSubmodule):
         """
         request_ids = engine_inputs.request_ids
         if codec_tokens is None:
-            return {rid: {} for rid in request_ids}
+            return BatchedModelOutput()
         if codec_tokens.numel() == 0:
-            return {
-                rid: {"audio_chunk": [torch.empty(0, dtype=torch.int16, device=codec_tokens.device)]}
-                for rid in request_ids
-            }
+            return BatchedModelOutput(row_outputs={
+                "audio_chunk": torch.empty((len(request_ids), 0), dtype=torch.int16, device=codec_tokens.device),
+            })
 
         wavs = self.code2wav(
             codec_tokens, position_ids
         )
 
-        results: dict[str, NameToTensorList] = {}
-        for i, rid in enumerate(request_ids):
-            wav = wavs[i]
-            audio_int16 = (wav.clamp(-1, 1) * 32767).to(torch.int16).squeeze()
-            results[rid] = {"audio_chunk": [audio_int16]}
-        return results
+        return BatchedModelOutput(row_outputs={
+            "audio_chunk": (wavs.clamp(-1, 1) * 32767).to(torch.int16).flatten(1),
+        })
 
     def forward(
         self,
