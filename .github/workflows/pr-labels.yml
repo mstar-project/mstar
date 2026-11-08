@@ -21,6 +21,10 @@ on:
 
 permissions: {}
 
+env:
+  # When set, only the app's login counts as the bot (render_summary.BOTS).
+  REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
+
 jobs:
   # A job of its own, outside the label job's cancel group, so a later event
   # (an edit right after a push, say) can't cancel it, and a labelling failure

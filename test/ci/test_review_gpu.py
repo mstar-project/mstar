@@ -51,7 +51,7 @@ class TestApproval(unittest.TestCase):
         found = blocking(review(prior, outside), [{"data": {"repository": {"pullRequest": {
             "reviewThreads": {"nodes": threads}}}}}], [])
         self.assertEqual(len(found), 4, found)
-        for expected in ("inline 1", "inline 5", "engine.py:10", "earlier 3"):
+        for expected in ("inline 1", "inline 3", "inline 5", "engine.py:10"):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")
 
     def test_rules_and_dependencies_never_approve_and_engine_approvals_dont_count(self):

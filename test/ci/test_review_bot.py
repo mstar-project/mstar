@@ -193,6 +193,10 @@ class TestSpend(unittest.TestCase):
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
                          "anyone could add a record to a public issue and reach the cap")
 
+    def test_the_caps_read_the_job_tokens_ledger_with_the_app_configured(self):
+        configure_review_app(self)
+        self.assertEqual(self.spend([spent(1)])["day"], 1, "the spend caps would read nothing and never trip")
+
     def test_spend_reads_every_ledger_issue_and_starts_at_the_lowest_for_writes(self):
         self.assertEqual(self.spend([spent(1)], issues=(LEDGER, {**STATUS, "body": LEDGER["body"]}))["day"], 1,
                          "the same run recorded in two issues would double")
@@ -503,6 +507,15 @@ def pr_diff(context, added, index="1111111..2222222"):
             f"@@ -40,2 +40,3 @@ def g():\n     return 1\n+    {added}\n")
 
 
+def configure_review_app(test):
+    """Reimport the bot as it runs with the review app configured, restoring it after `test`."""
+    test.addCleanup(importlib.reload, bot)
+    test.addCleanup(importlib.reload, render_summary)
+    with mock.patch.dict(os.environ, {"REVIEW_APP_CLIENT_ID": "app-id"}):
+        importlib.reload(render_summary)
+        importlib.reload(bot)
+
+
 class TestCollect(unittest.TestCase):
     CONVERSATION = {"GET repos/o/r/issues/7/comments": [summary(LAST)]}
 
@@ -516,11 +529,7 @@ class TestCollect(unittest.TestCase):
         routes = {"GET repos/o/r/issues/7/comments": [forged],
                   f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead")}
         self.assertEqual(collect(**routes)[0].get("rereview"), "true", "a fork, with no app, would lose re-reviews")
-        self.addCleanup(importlib.reload, bot)
-        self.addCleanup(importlib.reload, render_summary)
-        with mock.patch.dict(os.environ, {"REVIEW_APP_CLIENT_ID": "app-id"}):
-            importlib.reload(render_summary)
-            importlib.reload(bot)
+        configure_review_app(self)
         self.assertIsNone(collect(**routes)[0].get("rereview"),
                           "any workflow on a branch could post the state a re-review starts from")
         team_run = {"isResolved": False, "isOutdated": False, "comments": {"nodes": [

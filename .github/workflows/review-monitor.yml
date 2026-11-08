@@ -17,6 +17,8 @@ concurrency: review-monitor
 
 env:
   PYTHONDONTWRITEBYTECODE: 1
+  # When set, only the app's login counts as the bot (render_summary.BOTS).
+  REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
 
 jobs:
   monitor:

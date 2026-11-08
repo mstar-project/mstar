@@ -207,10 +207,10 @@ def issues(repo, kind):
     with the kind's marker. Created in a race, or rolled over when one is full, several can exist; readers
     take them all, writers the lowest with room (`issue`)."""
     found = {}
-    for login in BOT_USERS:
+    for login in POSTING_BOT_USERS:  # the spend ledger and status issue are written with the job's own token
         creator = login.replace("[", "%5B").replace("]", "%5D")
         for i in api_list(f"repos/{repo}/issues?state=all&creator={creator}&per_page=100"):
-            if (i.get("user") or {}).get("login") in BOT_USERS \
+            if (i.get("user") or {}).get("login") in POSTING_BOT_USERS \
                     and (i.get("body") or "").startswith(issue_marker(kind)):
                 found[i["number"]] = i
     return [found[n] for n in sorted(found)]
@@ -242,7 +242,7 @@ def ledger(repo, since):
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
             m = SPEND.search(c.get("body") or "")
-            if not m or (c.get("user") or {}).get("login") not in BOT_USERS:
+            if not m or (c.get("user") or {}).get("login") not in POSTING_BOT_USERS:
                 continue
             try:
                 record = json.loads(base64.b64decode(m[1]))
@@ -1001,7 +1001,7 @@ def referenced(timeline, number, repo):
         if event.get("event") != "cross-referenced":
             continue
         source = (event.get("source") or {}).get("issue") or {}
-        if (source.get("user") or {}).get("login") in BOT_USERS:
+        if (source.get("user") or {}).get("login") in POSTING_BOT_USERS:
             continue
         ref, labels = source.get("number"), {x.get("name") for x in source.get("labels") or []}
         is_pr = "pull_request" in source
@@ -1196,7 +1196,7 @@ def pr_evidence(repo, pr, since, records):
     def kept(comments):
         rows = []
         for c in comments:
-            mine = c["user"] in BOT_USERS
+            mine = c["user"] in POSTING_BOT_USERS
             if not c.get("body") or (c.get("user_type") == "Bot" and not mine):
                 continue
             if (c.get("created_at") or "") >= since or (mine and c.get("resolved")):
@@ -1250,7 +1250,7 @@ def improve_inputs(out, repo, key_set):
     status = [{"url": c.get("html_url"), "text": scrub(line)}
               for i in issues(repo, "status")
               for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100")
-              if (c.get("user") or {}).get("login") in BOT_USERS
+              if (c.get("user") or {}).get("login") in POSTING_BOT_USERS
               for line in (c.get("body") or "").splitlines() if line.strip()]
     if status:
         files["status.json"] = status[-IMPROVE_ITEMS:]
