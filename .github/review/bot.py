@@ -198,14 +198,9 @@ def resolve(out, repo, pr, mode, comment_id, non_write=""):
     out["continue"] = "true" if mode == "" else "false"
     out.update(head_sha=pull["head"]["sha"], head_repo=head_repo)
     # Mode sets the prompt's reporting bar.
-    if mode == "nogpu":
-        out["mode"] = "nogpu"
-        timeout = 45
-    else:
-        out["mode"] = "light"
-        timeout = 25
+    out["mode"] = "nogpu" if mode == "nogpu" else "light"
     # Someone with write access: a timeout that only stops a runaway, like the turn cap.
-    out["timeout"] = 300 if not non_write else timeout
+    out["timeout"] = 25 if non_write else 300
     out["title"] = pull["title"]
 
 
@@ -266,15 +261,11 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
     if jq_text(meta.get("head_sha")) != head_sha:
         fail("the PR has new commits since that review stopped; ask for a new review of the current head with "
              "`/review light` or `/review`")
-    if mode == "light":
-        timeout = 25
-    elif mode == "nogpu":
-        if non_write:
-            fail("continuing a nogpu review takes write access, like `/review nogpu`")
-        timeout = 45
-    else:
+    if mode not in ("light", "nogpu"):
         fail("the saved handoff is malformed")
-    out.update(dir=str(saved), mode=mode, timeout=300 if not non_write else timeout)
+    if mode == "nogpu" and non_write:
+        fail("continuing a nogpu review takes write access, like `/review nogpu`")
+    out.update(dir=str(saved), mode=mode, timeout=25 if non_write else 300)
 
 
 def jq_text(value):
