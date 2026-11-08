@@ -776,9 +776,9 @@ def test_the_vision_node_boots_on_an_image_processor_the_video_one_disagrees_wit
         _ = model.video_processor
 
 
-@pytest.mark.parametrize("height", [1, 3])
-def test_an_image_one_or_three_pixels_tall_is_read_as_height_width_channels(model, height):
-    """Handed HWC without a format, the processor guesses CHW when the first side is 1 or 3."""
+@pytest.mark.parametrize("height", [1, 3, 4])
+def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, height):
+    """Handed HWC without a format, the processor guesses CHW when the first side is 1, 3 or 4."""
     image = torch.randint(0, 256, (3, height, 64), dtype=torch.uint8)
     out = model.process_prompt("Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [image]})
     (_, rows, cols), = out.metadata[MEDIA_LAYOUT]["grid"]

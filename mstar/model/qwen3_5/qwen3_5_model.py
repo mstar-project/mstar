@@ -390,7 +390,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         out = self.image_processor(
             images=[as_uint8_chw(image, truncate=True).permute(1, 2, 0).numpy()], return_tensors="pt",
             do_rescale=False, do_normalize=False,
-            # inferred, a 1 or 3 px tall image would be read as channels first
+            # inferred, a 1, 3 or 4 px tall image would be read as channels first
             input_data_format="channels_last",
         )
         grid = out["image_grid_thw"][0]

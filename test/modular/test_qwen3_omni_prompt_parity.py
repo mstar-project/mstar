@@ -406,9 +406,9 @@ def test_stub_matches_released_checkpoint(messages):
     ) == _StubProcessor().apply_chat_template(messages)
 
 
-@pytest.mark.parametrize("height", [1, 3])
-def test_an_image_one_or_three_pixels_tall_is_read_as_height_width_channels(model, height):
-    """Handed HWC without a format, the processor guesses CHW when the first side is 1 or 3."""
+@pytest.mark.parametrize("height", [1, 3, 4])
+def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, height):
+    """Handed HWC without a format, the processor guesses CHW when the first side is 1, 3 or 4."""
     from transformers import Qwen2VLImageProcessor
 
     model._processor.image_processor = Qwen2VLImageProcessor()
