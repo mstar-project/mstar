@@ -5,10 +5,10 @@
     {
       "dtype": "bfloat16",
       "shape": {"E": 128, "K": 2048, "N": 1536, "top_k": 8},
-      "provenance": {"device": "AMD Instinct MI325X", "date": "2026-10-20", "harness": "mstar/utils/fused_moe/tune.py on the AMD line (E=128,N=1536,K=2048,device_name=AMD_Instinct_MI325X.json, nearest token count)", "mstar": "4b54fb41f", "note": "Qwen3-Omni-30B-A3B thinker and talker experts, TP1, bf16; the sweep included waves_per_eu, matrix_instr_nonkdim and kpack"},
+      "provenance": {"device": "AMD Instinct MI325X", "date": "2026-11-03", "harness": "mstar/utils/fused_moe/tune.py on the AMD line (E=128,N=1536,K=2048,device_name=AMD_Instinct_MI325X.json, nearest token count)", "mstar": "bf6fb3702", "note": "Qwen3-Omni-30B-A3B thinker and talker experts, TP1, bf16; the sweep included waves_per_eu, matrix_instr_nonkdim and kpack; one- and two-token entries retuned; the Thinker's 512-token entry back on the default tile"},
       "rows": {
-        "1": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 2, "waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}},
-        "3": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 1, "num_stages": 2, "waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 2}},
+        "1": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2, "waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 2, "down": {"BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "num_warps": 2, "waves_per_eu": 4}}},
+        "3": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 2, "down": {"waves_per_eu": 4}}},
         "6": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 2, "waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 2}},
         "12": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1}},
         "24": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 4, "num_warps": 4, "num_stages": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 2}},
@@ -16,7 +16,7 @@
         "96": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 4, "num_warps": 4, "num_stages": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 2}},
         "192": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 256, "GROUP_SIZE_M": 8, "num_warps": 2, "num_stages": 2, "waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 1}},
         "384": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1}},
-        "768": {"impl": "triton", "config": {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 2, "waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}},
+        "768": {"impl": "triton", "config": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "GROUP_SIZE_M": 8, "num_warps": 4, "num_stages": 2}},
         "1536": {"impl": "triton", "config": {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 8, "num_stages": 2, "waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}},
         "3072": {"impl": "triton", "config": {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "num_warps": 8, "num_stages": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 1}},
         "*": {"impl": "triton", "config": {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "num_warps": 8, "num_stages": 2, "waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 1}}
@@ -25,10 +25,10 @@
     {
       "dtype": "bfloat16",
       "shape": {"E": 128, "K": 1024, "N": 768, "top_k": 6},
-      "provenance": {"device": "AMD Instinct MI325X", "date": "2026-10-20", "harness": "mstar/utils/fused_moe/tune.py on the AMD line (E=128,N=768,K=1024,device_name=AMD_Instinct_MI325X.json, nearest token count)", "mstar": "4b54fb41f", "note": "Qwen3-Omni-30B-A3B thinker and talker experts, TP1, bf16; the sweep included waves_per_eu, matrix_instr_nonkdim and kpack"},
+      "provenance": {"device": "AMD Instinct MI325X", "date": "2026-11-03", "harness": "mstar/utils/fused_moe/tune.py on the AMD line (E=128,N=768,K=1024,device_name=AMD_Instinct_MI325X.json, nearest token count)", "mstar": "bf6fb3702", "note": "Qwen3-Omni-30B-A3B thinker and talker experts, TP1, bf16; the sweep included waves_per_eu, matrix_instr_nonkdim and kpack; one- and two-token entries retuned; the Thinker's 512-token entry back on the default tile"},
       "rows": {
         "1": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1}},
-        "3": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2, "waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 2}},
+        "3": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 2, "waves_per_eu": 0, "matrix_instr_nonkdim": 16, "kpack": 2}},
         "6": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 2}},
         "12": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 2, "waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 1}},
         "24": {"impl": "triton", "config": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 2, "num_stages": 2, "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1}},
