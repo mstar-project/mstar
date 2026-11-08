@@ -1,7 +1,7 @@
 name: Review bot cache
 
-# Fills the review bot's Eras cache volumes (ERAS_CACHE_VOLUMES) with model weights and compile
-# caches from main, so a `/review gpu` live test on Eras starts warm. An Eras box binds one volume,
+# Fills the review bot's Eras cache volumes (ERAS_CACHE_VOLUMES) with compile caches (and, with
+# `weights`, model weights) from main, so a `/review gpu` live test on Eras starts warm. An Eras box binds one volume,
 # so the volumes are replicas, one per box: each gets a box of its own, two at a time. Run by hand
 # (it takes write access to dispatch) after models are added or main's kernels change. It runs only
 # main's code, with the volume read-write; live tests mount one read-only. See .github/review/README.md.
@@ -18,6 +18,10 @@ on:
       skip:
         description: Names to leave out (checkpoints too big for the volumes)
         default: glm52 glm5_next
+      weights:
+        description: Keep the weights on the volumes too, not only the compile caches (whether that makes a live test faster is not yet measured)
+        type: boolean
+        default: false
       gpus:
         description: GPUs for the box (the largest default config needs 8)
         default: "8"
@@ -71,6 +75,7 @@ jobs:
         env:
           MODELS: ${{ inputs.models }}
           SKIP: ${{ inputs.skip }}
+          WEIGHTS: ${{ inputs.weights }}
           GPUS: ${{ inputs.gpus }}
           HOURS: ${{ inputs.hours }}
         run: |
@@ -81,7 +86,7 @@ jobs:
           python3 .github/review/gpu_review.py configure
           out="$RUNNER_TEMP/cache" && mkdir -p "$out"
           jq -n --arg r "$GITHUB_REPOSITORY" --arg s "$(git rev-parse HEAD)" --arg m "$MODELS" --arg k "$SKIP" \
-            '{repo: $r, main_sha: $s, models: $m, skip: $k}' > "$out/run.json"
+            --arg w "$WEIGHTS" '{repo: $r, main_sha: $s, models: $m, skip: $k, weights: $w}' > "$out/run.json"
           S=.claude/skills/live-pr-test/scripts/gpu.py
           offer=$(python3 "$S" offers --gpus "$GPUS" --json | jq -r --argjson cap "$MAX_USD" \
             '[.offers[] | select(.provider == "eras" and .availability == "now" and .usd_per_hour <= ($cap * 2))][0].id // empty')
