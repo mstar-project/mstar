@@ -160,6 +160,57 @@ def test_removing_a_request_gives_its_slice_back():
     assert A in rebuilds._kept[NODE], "the pool would fill with removed requests' ids and keep no more"
 
 
+def _prompts() -> tuple[SimpleNamespace, SimpleNamespace]:
+    """Steps that read the prompts of r and a, each of which fills a 32-byte pool."""
+    return tuple(_ran(PREFILL, {rid: {"text_inputs": [torch.arange(4)]}}) for rid in (R, A))
+
+
+def test_a_follower_keeps_the_ids_of_a_request_rank_0_keeps_when_its_own_pool_is_full():
+    """Each rank gives a slice back at its own teardown. Rank 0 tears r down before it keeps a's prompt and the
+    follower after, so only rank 0's pool has room for a's prompt. Rank 0 can then drop a, and a follower that kept
+    no ids for a stopped. The follower keeps a's prompt outside its pool."""
+    (leader, follower), (r, a) = (_rebuilds(32), _rebuilds(32)), _prompts()
+    leader.keep_prompts(r)
+    follower.keep_prompts(r, spill=True)
+    leader.remove_request(R)
+
+    assert leader.keep_prompts(a) == [] and follower.keep_prompts(a, spill=True) == []
+    follower.remove_request(R)
+
+    kept = follower.kept(A, NODE)
+    assert leader.kept(A, NODE) is not None
+    assert kept is not None, "rank 0 can drop a request the follower keeps no ids for"
+    assert kept.prompt.view.tolist() == [0, 1, 2, 3] and follower.pool.nbytes_used() == 0, (
+        "the follower kept other ids, or a's copy takes room in its pool"
+    )
+
+
+def test_a_follower_gives_back_the_ids_of_a_request_rank_0_kept_none_for():
+    """Rank 0's pool has no room for a's prompt, so a keeps no ids and rank 0 never drops it. The follower kept a's
+    prompt outside its pool until rank 0's journal said so, and kept it again from a later step."""
+    (leader, follower), (r, a) = (_rebuilds(32), _rebuilds(32)), _prompts()
+    leader.keep_prompts(r)
+    follower.keep_prompts(r, spill=True)
+    assert leader.keep_prompts(a) == [A]
+    follower.keep_prompts(a, spill=True)
+
+    follower.forget(A, NODE)
+    follower.keep_prompts(a, spill=True)
+
+    assert follower.kept(A, NODE) is None, "the follower holds ids outside its pool that rank 0 never drops with"
+
+
+def test_a_request_whose_prompt_the_pool_couldnt_hold_keeps_no_ids_from_a_later_step():
+    """Rank 0 decides once whether a request keeps ids, at the first step that reads its prompt. A later chunk that
+    found room kept a's ids on rank 0 after rank 0 had journaled that a keeps none, which the follower had replayed."""
+    rebuilds, (r, a) = _rebuilds(32), _prompts()
+    rebuilds.keep_prompts(r)
+    assert rebuilds.keep_prompts(a) == [A]
+    rebuilds.remove_request(R)
+
+    assert rebuilds.keep_prompts(a) == [] and rebuilds.kept(A, NODE) is None
+
+
 @pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])
 def test_a_request_no_drop_can_free_keeps_no_ids(why):
     """A guaranteed request kept a host copy of its prompt and appended every sample, each step, though no drop
