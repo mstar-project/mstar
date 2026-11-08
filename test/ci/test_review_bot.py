@@ -171,10 +171,21 @@ class TestSpend(unittest.TestCase):
                          "re-running only a run's spend job would count its costs twice")
         self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "2"})])["day"], 2,
                          "re-running all a run's jobs spends again, and that would go uncounted")
-        live = {"usage": {"run_attempt": "1"}, "gpu_usd": 2, "box_usd": 1}
-        self.assertEqual(self.spend([spent(13, **live), spent(16, attempt="2", **{**live, "gpu_usd": 5}),
-                                     spent(16, attempt="3", **{**live, "gpu_usd": 5})])["day"], 19,
-                         "re-running only the live test spends GPUs again, and its review tokens are already counted")
+        live = {"usage": {"run_attempt": "1"}, "gpu_usd": 2, "box_usd": 1, "live_attempt": "1"}
+        rerun = {**live, "gpu_usd": 5, "live_attempt": "2"}
+        self.assertEqual(self.spend([spent(13, **live), spent(16, attempt="2", **rerun),
+                                     spent(16, attempt="3", **rerun)])["day"], 19,
+                         "re-running only the live test spends GPUs again, its review tokens are already counted, "
+                         "and re-running only the spend job after that adds nothing")
+        free = {"usage": {"run_attempt": "1"}, "gpu_usd": 0.0, "box_usd": 0.0}
+        comments = [spent(1, **free, live_attempt="1", approval="approve"),
+                    spent(1, attempt="2", **free, live_attempt="2", approval="approve"),
+                    spent(1, attempt="3", **free, live_attempt="2", approval="approve")]
+        self.assertEqual(self.spend(comments)["day"], 1, "a free live test re-run would count its review tokens again")
+        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [LEDGER],
+                                                   "GET repos/o/r/issues/1/comments*": comments})):
+            kept = [r["approval"] for _, r in bot.ledger("o/r", "2026-11-01T00:00:00Z")]
+        self.assertEqual(kept, ["approve", "approve"], "a live test re-run costing the same as the first would be lost")
         self.assertEqual(self.spend([spent(1, attempt="1"), spent(1, attempt="2")])["day"], 2,
                          "a record with no usage counts by its own attempt")
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,

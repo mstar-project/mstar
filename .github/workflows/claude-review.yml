@@ -507,6 +507,8 @@ jobs:
       gpu_usd: ${{ steps.release.outputs.gpu_usd }}
       box_usd: ${{ steps.release.outputs.box_usd }}
       approval: ${{ steps.approve.outputs.approval }}
+      # A re-run of only the spend job keeps this; a re-run of the live test changes it. The ledger's key.
+      live_attempt: ${{ github.run_attempt }}
     permissions:
       contents: read
       pull-requests: write
@@ -743,4 +745,5 @@ jobs:
           GPU_USD: ${{ needs.live-test.outputs.gpu_usd }}
           BOX_USD: ${{ needs.live-test.outputs.box_usd }}
           APPROVAL: ${{ needs.live-test.outputs.approval }}
+          LIVE_ATTEMPT: ${{ needs.live-test.outputs.live_attempt }}
         run: python3 .github/review/bot.py record

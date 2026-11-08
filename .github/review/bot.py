@@ -226,10 +226,10 @@ def comment_on_issue(repo, number, body):
 
 def ledger(repo, since):
     """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments from every ledger
-    issue, once per run and attempt of what they cost. Re-running only a run's spend job records the same costs
-    again, with the attempt its usage came from; re-running all its jobs spends again, and re-running only its
-    live test spends GPUs and the box again, which counts on top of the review already counted. A failed read
-    raises."""
+    issue, once per run, attempt of its review and attempt of its live test. Re-running only a run's spend job
+    keeps the attempts its usage and live test came from, so it adds nothing; re-running all its jobs spends again,
+    and re-running only its live test counts its GPUs and box on top of the review already counted, even at the
+    same or no cost, and keeps its approval. A failed read raises."""
     records, seen = [], set()
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
@@ -241,7 +241,7 @@ def ledger(repo, since):
             except ValueError:
                 continue
             run_key = record.get("run"), (record.get("usage") or {}).get("run_attempt") or record.get("attempt")
-            live_key = (*run_key, record.get("gpu_usd"), record.get("box_usd"))
+            live_key = (*run_key, record.get("live_attempt"))
             if live_key in seen:
                 continue
             if run_key in seen:  # the live test ran again: new GPU and box cost, the review's tokens already counted
@@ -919,7 +919,8 @@ def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_conti
 
 # ---------------------------------------------------------------- spend job
 
-def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="", box_usd="", approval=""):
+def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="", box_usd="", approval="",
+           live_attempt=""):
     """Append one record for this run to the ledger issue (`spend` job, after the review and the live test),
     so the caps and the monitor read what each run cost: the review's tokens and the live test's GPUs and
     box session. Nothing spent, nothing written."""
@@ -934,7 +935,7 @@ def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="
     usd = round((cost if isinstance(cost, (int, float)) else 0) + gpu + box, 4)
     entry = {"pr": pr, "head": review.get("head_sha"), "mode": review.get("mode"), "run": github_run_id,
              "attempt": github_run_attempt, "usage": review, "gpu_usd": gpu, "box_usd": box, "approval": approval,
-             "usd": usd}
+             "live_attempt": live_attempt, "usd": usd}
     b64 = base64.b64encode(json.dumps(entry).encode()).decode()
     what = f"PR `#{pr}`" if pr else "Weekly improvement run"
     try:
