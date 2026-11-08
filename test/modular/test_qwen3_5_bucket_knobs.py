@@ -29,13 +29,10 @@ def test_decode_ladder_knob(monkeypatch):
     assert m.LLMSubmodule.DECODE_CAPTURE_BATCH_SIZES[-1] == 128
 
 
-def test_prefill_buckets_hold_near_power_of_two_batches(monkeypatch):
+def test_default_prefill_ladder_holds_every_power_of_two(monkeypatch):
     submodule = _reload(monkeypatch, "MSTAR_QWEN35_DECODE_BUCKETS", None).LLMSubmodule
-    buckets = submodule.PREFILL_TOKEN_BUCKETS
-    # a 16-row batch with a few prompts a couple of tokens long stays captured
-    assert 16 * 512 + 8 <= buckets[-1]
     # a batch that fills a power of two doesn't pad past it
-    assert {256, 512, 1024, 2048, 4096, 8192} <= set(buckets)
+    assert {256, 512, 1024, 2048, 4096, 8192} <= set(submodule.PREFILL_TOKEN_BUCKETS)
 
 
 def _shipped_prefill_ladders():

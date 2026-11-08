@@ -51,6 +51,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
+from torch.fx.experimental import _config as fx_config
 
 from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
@@ -473,8 +474,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             static["rotary"],
         )
         t0 = time.perf_counter()
-        # as `forward_batched` runs it: native dtype, no autocast
-        with torch.autocast(device_type=device.type, enabled=False):
+        # as `forward_batched` runs it: native dtype, no autocast. Without duck sizing, which would
+        # tie a pack as long as the hidden size (Nano's default, 4096) to that static size and
+        # compile again at the first other length.
+        with torch.autocast(device_type=device.type, enabled=False), fx_config.patch(use_duck_shape=False):
             self.transformer.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
         logger.info(
             "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two requests)",
@@ -2090,8 +2093,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         output comes at the end of its loop."""
         return StepOrder.TURNS if graph_walk == VIDEO_GEN_AR_WALK else StepOrder.ARRIVAL
 
-    # Native bf16, not the engine autocast — see the note on forward(). The
-    # cross-request batched denoise must match the per-request path exactly.
+    # Native bf16, not the engine autocast, as forward() runs: the same dtypes as
+    # the per-request path, so batching (and the compiled layer stack) changes
+    # only kernel-level rounding.
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,

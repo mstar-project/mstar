@@ -25,7 +25,6 @@ from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection
 from mstar.worker.spec_rows import DeferredRowInputs
-from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import PendingBatch
 
 CODES, CTX = "codes", "ctx"
@@ -64,7 +63,7 @@ def _loop(extra_input: str, streaming: bool) -> Loop:
     return Loop(name=T.LOOP, section=node, max_iters=1 << 20, outputs=[])
 
 
-def _worker(section: Loop):
+def _worker(section: Loop, connections=()):
     def runtime(*_a, **_k):
         from mstar.communication.tensor_store import RustTensorBookkeeping
         from mstar.graph.runtime import rust as rust_runtime
@@ -83,13 +82,9 @@ def _worker(section: Loop):
 
     shared, T._runtime = T._runtime, runtime
     try:
-        w = T._worker()
+        w = T._worker(connections=connections, walks={T.WALK: section} if connections else None)
     finally:
         T._runtime = shared
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        release_cached_prefix=lambda batch: None,
-        order_split_rows=lambda node, walk, rids, walks: rids,
-    ))
     return w
 
 
@@ -105,15 +100,10 @@ def _run_stream(seed: int, n_rids=3, n_items=9, chunk=2):
     its buffer, and how often a step reported its stream final."""
     rng = random.Random(seed)
     section = _loop(CODES, streaming=True)
-    w = _worker(section)
-    w.streams = StreamBufferManager(
-        w.request_state, w.tensor_manager,
-        [Connection(
-            from_partition="LLM", to_partition=T.PART, edge_name=CODES,
-            chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=chunk),
-        )],
-        {T.WALK: section},
-    )
+    w = _worker(section, [Connection(
+        from_partition="LLM", to_partition=T.PART, edge_name=CODES,
+        chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=chunk),
+    )])
     rids = T._admit(w, n_rids)
     for r in rids:
         w.streams.add_request(r, SimpleNamespace(partition_name=T.PART, stream_lead_items={}))
@@ -172,7 +162,7 @@ def _run_stream(seed: int, n_rids=3, n_items=9, chunk=2):
 
     def plain_step():
         """Poll every buffer, then run whichever rows are ready."""
-        w._poll_stream_buffers()
+        w.ingest.poll_stream_buffers()
         popped = w._graph_runtime.pop_rids(T.NODE, T.WALK, sorted(alive))
         if not len(popped.wg_ids.keys):
             return None
