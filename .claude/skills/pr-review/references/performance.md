@@ -1,8 +1,8 @@
 # Performance checklist
 
 What the performance pass (SKILL.md §4.3) looks for. Leads, not rules: AGENTS.md's "Performance
-ideas from past work" and patterns C4 and C15 are further leads, and AGENTS.md invariants 6, 7 and
-10 are the citable rules.
+ideas from past work" and patterns C4, C6 and C15 are further leads, and AGENTS.md invariants 6, 7
+and 10 are the citable rules.
 
 ## Where time goes
 

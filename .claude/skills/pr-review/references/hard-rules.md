@@ -39,15 +39,17 @@ Usually P2; P1 when the description claims the opposite.
   error text, output format.
 - **R9. Handle-keyed state is purged on every release path** and listed in
   `mstar/worker/rid_table.py` (invariant 14).
-- **R10. One concern per PR.** Separable changes bundled into core files could be split. This is a
-  note, never above P3 and never blocking (AGENTS.md "Splitting work across PRs"); raise it only
-  when the split changes what lands.
 - **R11. The description matches the code**, including comments and docstrings that state a premise
   ("no step of this shape can be served"). Every sentence the author wrote is a claim: description,
   commit messages, comments, "N tests fail on main" counts.
 - **R12. Nothing beyond what is needed.** Every added line changes behaviour or explains a hazard,
   and the change deletes what it replaces. No guard for a case no caller reaches, no new env var
   where the code around uses config or CLI, comments at the file's density.
+
+## A note, never blocking
+
+- **R10. One concern per PR**: a note, at most P3 and never blocking, raised only when the split
+  changes what lands (AGENTS.md "Splitting work across PRs").
 
 ## Premise checks
 
@@ -59,8 +61,8 @@ Usually P2; P1 when the description claims the opposite.
   rebase is a post-rebase ask, not a design flaw (#471).
 - **Pre-existing or made reachable.** A gap is pre-existing only if `main` reaches it today. If
   `main` fails earlier and the PR removes that failure, the gap is the PR's (#729).
-- **The decision history.** Read the linked issues, the other reviewers' asks and the author's
-  replies before writing anything.
+- **The decision history.** Read the linked issues and their closed predecessors, the other
+  reviewers' asks and the author's replies before writing anything.
 - **One mechanism across PRs.** Two open PRs that count the same thing become one count, folded by
   whichever lands second (#459 and #551).
 - **The structural direction.** A finding that asks for a change names the smallest structural fix,

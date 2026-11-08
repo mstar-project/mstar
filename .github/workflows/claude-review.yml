@@ -419,8 +419,8 @@ jobs:
           allowed_non_write_users: ${{ steps.pre.outputs.non_write_user }}
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
-            exactly. It defines your trust boundary, your method, your reporting bar and
-            your output format.
+            exactly. It defines your trust boundary, inputs and output format, and points
+            you to the method and its bar.
 
             Mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
             PR #${{ env.PR }}: ${{ steps.pr.outputs.title }}
