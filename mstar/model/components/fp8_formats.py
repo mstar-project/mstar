@@ -4,8 +4,10 @@ Each keeps the weight as e4m3 in a uint8 container and its fp32 scales in an int
 loaded node's floating tensors to its dtype), under the checkpoint's own names, so a pre-quantized checkpoint
 loads straight into them and a bf16 one is quantized at load into the same layout:
 
-- ``fp8_tensor``: ``weight_scale [1]``, the activation scaled per tensor each call (compressed-tensors /
-  modelopt FP8); ``torch._scaled_mm`` TensorWise.
+- ``fp8_tensor``: ``weight_scale [1]`` (compressed-tensors / modelopt FP8), the activation scaled per token each
+  call; ``torch._scaled_mm`` RowWise, as one op (``mstar::fp8_tensor_linear``). Per token, not per tensor: a
+  captured bucket's padding rows hold whatever the buffer last held, and a shared amax let them set every live
+  row's scale (B300, GLM-5.3-NVFP4's dense FFN: NaN logits at batch > 1).
 - ``fp8_channel``: ``weight_scale [N, 1]``, the activation per token (compressed-tensors channel/token);
   ``torch._scaled_mm`` RowWise.
 - ``fp8_block``: ``weight_scale_inv [N/128, K/128]`` (DeepSeek, Qwen, GLM, MiniMax FP8); the ``fp8_linear``
@@ -95,12 +97,7 @@ class Fp8TensorFormat(_Fp8Format):
         return _e4m3(buffers["weight"]).float() * _f32(buffers["weight_scale"]).reshape(())
 
     def linear(self, x, weight, weight_scale):
-        scale_b = weight_scale.view(_F32)
-        scale_a = (x.float().abs().amax() / _FP8_MAX).clamp_min(_TINY).reshape(1)
-        xq = _to_e4m3(x, scale_a)
-        if not x.is_cuda:
-            return ((xq.float() * scale_a) @ (_e4m3(weight).float() * scale_b).t()).to(x.dtype)
-        return torch._scaled_mm(xq, _e4m3(weight).t(), scale_a=scale_a, scale_b=scale_b, out_dtype=x.dtype)
+        return torch.ops.mstar.fp8_tensor_linear(x, weight, weight_scale)
 
 
 class Fp8ChannelFormat(_Fp8Format):
@@ -207,3 +204,30 @@ class Fp8BlockFormat(_Fp8Format):
 FP8_TENSOR = register_format(Fp8TensorFormat())
 FP8_CHANNEL = register_format(Fp8ChannelFormat())
 FP8_BLOCK = register_format(Fp8BlockFormat())
+
+
+def _token_scales(x: torch.Tensor) -> torch.Tensor:
+    return (x.float().abs().amax(dim=1, keepdim=True) / _FP8_MAX).clamp_min(_TINY)
+
+
+@torch.library.custom_op("mstar::fp8_tensor_linear", mutates_args=())
+def fp8_tensor_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
+    """``x [M, K]`` (bf16) times an e4m3 weight ``[N, K]`` with one fp32 scale (int32 container), the activation
+    quantized per token: what the operands stand for, in fp32 (the reference; CUDA runs the kernel)."""
+    scale_a = _token_scales(x)
+    xq = _to_e4m3(x, scale_a)
+    return ((xq.float() * scale_a) @ (_e4m3(weight).float() * _f32(weight_scale)).t()).to(x.dtype)
+
+
+@fp8_tensor_linear.register_fake
+def _(x, weight, weight_scale):
+    return x.new_empty((x.shape[0], weight.shape[0]))
+
+
+@fp8_tensor_linear.register_kernel("cuda")
+def _(x, weight, weight_scale):
+    scale_a = _token_scales(x)
+    # RowWise wants an fp32 [1, N] for the weight; the one tensor scale, repeated
+    scale_b = weight_scale.view(_F32).reshape(1, 1).expand(1, weight.shape[0]).contiguous()
+    return torch._scaled_mm(_to_e4m3(x, scale_a), _e4m3(weight).t(), scale_a=scale_a, scale_b=scale_b,
+                            out_dtype=x.dtype)
