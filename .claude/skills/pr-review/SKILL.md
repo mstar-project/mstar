@@ -560,7 +560,8 @@ The live test is a second session that runs after the review, on the GPU box, wi
 nothing else: no GitHub token and no cloud keys. It follows `.claude/skills/live-pr-test/SKILL.md`
 (cluster mode: the box is already provisioned) end to end: its plan, risk map, reach before results,
 reference parity, both frontends where they apply. It gets the PR, the head commit to test, the
-review's reason for its call and the "how to confirm" lines of open P0–P2 findings.
+review's reason for its call, the "how to confirm" lines of open P0–P2 findings and the review's
+focus.
 
 **The review decides whether and what the live test runs**, on every review and re-review, from
 what the change can affect, and says why. "The change" is what changed since the PR's last passing
@@ -579,6 +580,10 @@ the last review.
   `performance` (throughput and latency A/Bs). Leave `performance` out when the change can't
   plausibly move speed; leave `correctness` out only for a pure performance change whose outputs you
   proved unchanged by reading the code. Give it with `none` too; it is ignored there.
+- `focus`: up to eight things the live test should try that the diff alone wouldn't show it, each
+  `what` (an input, a claim to measure, or a config or path the change only shows on) and `why`
+  (one line): the input your trace found, the config that takes the changed branch. Short strings,
+  no commands. Empty when you have none. The live test folds them into its risk map.
 
 The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
 counts them), no open question and no skipped file. Otherwise no box starts, and the comment lists
@@ -651,8 +656,8 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
   its cap.
 - **Latent bugs on main** (§2), each with its open issue or a suggested title.
 - **Risk:** the design-risk rating, its sentence and, above low, the decisions (§6).
-- **Live test** (full mode): `full`, `targeted` or `none`, the kinds of check, the reason, and the fewest
-  GPUs the largest config it needs runs on (§7).
+- **Live test** (full mode): `full`, `targeted` or `none`, the kinds of check, the reason, the fewest
+  GPUs the largest config it needs runs on, and the focus (§7).
 
 **Before reporting, check:** every cited `path:line` says what the finding claims at the head; every
 gap in the design verdict is a finding or a question; the eight coverage lines are

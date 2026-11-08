@@ -102,7 +102,13 @@ SCHEMA = {
             "checks": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": True,
                        "items": {"type": "string", "enum": ["correctness", "performance"]}},
             "gpus": {"type": "integer", "minimum": 1, "maximum": 8},
-        }, "required": ["run", "reason", "confirm", "checks", "gpus"]},
+            # What the review would have the live test try: suggestions for its plan, read as data.
+            "focus": {"type": "array", "maxItems": 8, "items": {"type": "object", "properties": {
+                "what": {"type": "string", "description": "an input, a claim to measure, or a config or path "
+                                                          "the change only shows on"},
+                "why": {"type": "string", "description": "one line"},
+            }, "required": ["what", "why"]}},
+        }, "required": ["run", "reason", "confirm", "checks", "gpus", "focus"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "latent", "risk"],
