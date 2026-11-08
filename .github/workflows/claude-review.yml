@@ -820,6 +820,7 @@ jobs:
           case "$perm" in admin|maintain|write) echo "trusted=true" >> "$GITHUB_OUTPUT" ;; esac
           gpus=$(jq -r --argjson cap "$MAX_GPUS" '[.live_test.gpus // 1, $cap] | min' review.json)
           run=$(jq -r '.live_test.run // "full"' review.json)
+          case "$run" in none|targeted|full) ;; *) run=full ;; esac   # model output: only the enum reaches a shell
           { echo "gpus=$gpus"; echo "run=$run"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
       # `none` and `targeted` build on the last live test: only when it passed, on a commit
@@ -859,12 +860,13 @@ jobs:
           # The box's own key, never the review's: the box runs PR code with a shell.
           LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
+          RUN: ${{ steps.carry.outputs.run || steps.cfg.outputs.run }}
         run: |
           set +e
           python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
             --base "$BASE" \
             --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
-            --run "${{ steps.carry.outputs.run || steps.cfg.outputs.run }}" \
+            --run "$RUN" \
             --max-runs "${{ vars.REVIEW_GPU_MAX_RUNS || '2' }}" \
             --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
           code=$?
