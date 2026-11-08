@@ -650,8 +650,9 @@ def _builtin(device: torch.device, n: int, k: int, glu: bool, m: int) -> str:
 def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=(128, 128)):
     """``(implementation, config)`` for ``m`` tokens: the table's row where it names one that runs
     on ``device`` (a w8a16 row without a config takes the built-in tile), else the built-in rule.
-    DeepGEMM is optional, so a deepgemm row takes flashinfer's GEMM (the same activation quantize) where
-    DeepGEMM doesn't run. The table is keyed by 128 x 128 scale blocks; any other block runs w8a16."""
+    DeepGEMM is optional, so where it doesn't run a deepgemm row takes the built-in rule's W8A8 GEMM for the
+    count (flashinfer's up to _FI_MAX_TOKENS, cuBLAS's above). The table is keyed by 128 x 128 scale blocks;
+    any other block runs w8a16."""
     if tuple(block_size) != (128, 128):
         return ("dequant" if _BLACKWELL.get(device) and m > _DEQUANT_MIN_TOKENS else "w8a16"), None
     rows = _table_rows(device, n, k, glu) if device.type == "cuda" else None
@@ -659,7 +660,7 @@ def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=
         bounds, choices = rows
         choice = choices[bisect.bisect_left(bounds, m)]
         if choice.impl == "deepgemm" and not _DG_OK.get(device):
-            choice = Choice("flashinfer")
+            choice = Choice("flashinfer" if m <= _FI_MAX_TOKENS else "cublas")
         if (choice.impl in ("w8a16", "dequant", "triton8") or (choice.impl == "flashinfer" and _FI_OK.get(device))
                 or (choice.impl == "cublas" and _W8A8_OK.get(device))
                 or (choice.impl == "deepgemm" and _DG_OK.get(device))):

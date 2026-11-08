@@ -1,6 +1,6 @@
 """The fp8_linear table: bench_linears turns per-kernel timings into per-token-count rows; the H200 table has swept
-rows for every Qwen3.5 FP8 checkpoint linear; a row naming DeepGEMM (an optional import) runs flashinfer's GEMM
-where DeepGEMM doesn't."""
+rows for every Qwen3.5 FP8 checkpoint linear; a row naming DeepGEMM (an optional import) runs the built-in rule's
+W8A8 GEMM where DeepGEMM doesn't."""
 
 from pathlib import Path
 
@@ -66,8 +66,9 @@ def test_a_deepgemm_row_runs_flashinfer_where_deepgemm_does_not(monkeypatch):
     dev = torch.device("cuda", 0)
     monkeypatch.setattr(dense_fp8, "_table_rows", lambda *a: ((16,), (Choice("triton8"), Choice("deepgemm"))))
     monkeypatch.setitem(dense_fp8._FI_OK, dev, True)
+    monkeypatch.setitem(dense_fp8._W8A8_OK, dev, True)
     monkeypatch.setitem(dense_fp8._DG_OK, dev, False)
-    assert [dense_fp8._choose(dev, 5120, 17408, False, m) for m in (8, 32)] == [("triton8", None),
-                                                                              ("flashinfer", None)]
+    assert [dense_fp8._choose(dev, 5120, 17408, False, m)[0] for m in (8, 32, 4096)] == ["triton8", "flashinfer",
+                                                                                       "cublas"]
     monkeypatch.setitem(dense_fp8._DG_OK, dev, True)
     assert dense_fp8._choose(dev, 5120, 17408, False, 32) == ("deepgemm", None)
