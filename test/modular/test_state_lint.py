@@ -24,7 +24,7 @@ PORTED = (
     "mstar/model/qwen3_tts",
 )
 FORBIDDEN_ATTRIBUTES = {
-    "node_resources", "resources", "request_state", "per_request_states",
+    "node_resources", "resources", "request_state", "request_states", "per_request_states",
     # what a handle holds
     "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_linear", "_views", "_blocks",
 }
@@ -41,6 +41,8 @@ ALLOWED = {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
 }
+# Exceptions for one file, by file, module and name, which a later port of the same kind mustn't inherit.
+ALLOWED_IN: dict[tuple[str, str, str], str] = {}
 # Graph breaks a ported package keeps, by file and function, since no state call sits behind them.
 ALLOWED_BREAKS = {
     ("mstar/model/qwen3_omni/components/code2wav.py", "forward"): "the vocoder's transformer, which keeps no state",
@@ -64,8 +66,8 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
                 continue
             for alias in node.names:
                 key = (node.module, alias.name)
-                if key in ALLOWED:
-                    used.add(key)
+                if key in ALLOWED or (path, *key) in ALLOWED_IN:
+                    used.add(key if key in ALLOWED else (path, *key))
                 else:
                     found.append(f"from {node.module} import {alias.name}")
         elif isinstance(node, ast.Import):
@@ -104,8 +106,16 @@ def test_every_exception_is_still_used():
     used = set()
     for path in _sources():
         used |= _violations(path.read_text(), str(path))[1]
-    excepted = ALLOWED.keys() | ALLOWED_BREAKS.keys()
+    excepted = ALLOWED.keys() | ALLOWED_IN.keys() | ALLOWED_BREAKS.keys()
     assert excepted <= used, f"delete these exceptions: {sorted(excepted - used)}"
+
+
+def test_an_exception_for_one_file_refuses_the_import_in_another(monkeypatch):
+    source = "from mstar.engine.resources import KVReqConfig"
+    entry = ("mstar/model/a/a.py", "mstar.engine.resources", "KVReqConfig")
+    monkeypatch.setitem(ALLOWED_IN, entry, "a's own")
+    assert _violations(source, "mstar/model/a/a.py") == ([], {entry})
+    assert _violations(source, "mstar/model/b/b.py")[0] == [source], "the exception would reach every ported package"
 
 
 @pytest.mark.parametrize("source, expected", [
