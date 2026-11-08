@@ -4,7 +4,8 @@ Same names and signatures as ``flashinfer.gdn_prefill.chunk_gated_delta_rule``,
 ``flashinfer.gdn_decode.gated_delta_rule_decode_pretranspose`` and
 ``mstar.utils.causal_conv1d``; each returns its outputs' shapes and is charged
 the work the real fused kernel does, with the geometry the measured tables
-need.
+need. And :data:`KEPT_WRITES`, the Triton kernels whose integer bookkeeping the
+emulator has to keep.
 """
 
 from __future__ import annotations
@@ -117,3 +118,32 @@ def causal_conv1d_update(
 ):
     """Decode conv over ``x`` ``[batch, dim(, seqlen)]``, into ``out`` (default ``x``)."""
     return out if out is not None else x
+
+
+def _scatter_cells(cells, values, store, **_):
+    store.index_copy_(0, cells, values)
+
+
+def _gather_column(slots, store, out, plus, STRIDE, COL, PLUS, **_):
+    value = store.index_select(0, slots * STRIDE + COL)
+    out[:slots.numel()].copy_(value + plus if PLUS else value)
+
+
+def _advance_column(slots, store, STRIDE, COL, TRASH, **_):
+    cells = slots * STRIDE + COL
+    store.index_copy_(0, cells, store.index_select(0, cells) + (slots != TRASH))
+
+
+def _gather_block_rows(slots, kv_len, store, table, lens, **_):
+    lens.copy_(kv_len + 1)  # the kernel's own count, with this step's token: what attention is priced by
+
+
+# Triton kernels by name, for what they write on values the emulator keeps (a launch computes
+# nothing else: :mod:`mstar_sim.triton_launch`). Resident planning's integer bookkeeping, as
+# ``mstar.engine.resources.resident`` does it off a GPU: the lengths a step's attention is priced by.
+KEPT_WRITES = {
+    "_scatter_cells_kernel": _scatter_cells,
+    "_gather_column_kernel": _gather_column,
+    "_advance_column_kernel": _advance_column,
+    "_gather_block_rows_kernel": _gather_block_rows,
+}

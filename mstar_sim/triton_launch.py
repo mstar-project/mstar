@@ -1,7 +1,8 @@
 """Triton kernels on the emulated GPU.
 
 ``TRITON_INTERPRET=1`` makes every ``@triton.jit`` function an interpreted one,
-whose launch this replaces: nothing runs, and the launch is one kernel of the
+whose launch this replaces: nothing runs but its writes in
+:data:`mstar_sim.kernels.KEPT_WRITES`, and the launch is one kernel of the
 simulated device, charged by its memory traffic (the tensor arguments it
 touches, an upper bound).
 """
@@ -10,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from mstar_sim import clock
+from mstar_sim import clock, kernels
 
 
 def traffic(*args, **kwargs) -> tuple[float, float]:
@@ -31,11 +32,14 @@ def install() -> None:
         return
 
     def launch(self, *args, grid, warmup, **kwargs):
-        name = f"triton.{getattr(self.fn, '__name__', 'kernel')}"
+        name = getattr(self.fn, "__name__", "kernel")
+        kept = kernels.KEPT_WRITES.get(name)
 
-        @clock.kernel_fn(name, cost=traffic, writes_args=True)
+        @clock.kernel_fn(f"triton.{name}", cost=traffic, writes_args=kept is None)
         def body(*a, **k):
-            return None  # its outputs are value-less: nothing to run
+            # its outputs are value-less: nothing else to run
+            if kept is not None:
+                kept(*a, **k)  # (a graph re-runs it, as any op on kept values)
 
         return body(*args, **kwargs)
 
