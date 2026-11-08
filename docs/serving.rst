@@ -350,7 +350,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        the steps its capture replays (``max_batch_tokens``; a walk inside a
        combined walk runs under the combined walk's), and the rungs past it, which
        no step would reach, are dropped and logged; a region takes its ladder
-       whole, and its node packs a step up to the ladder's top. A tower's
+       whole. A vision tower's ``vision_block_loop`` and an AuT encoder's
+       ``aut_encode`` (Qwen3-Omni, Qwen3-ASR) pack a step up to their ladder's
+       top; BAGEL's and OmniVoice's regions keep their own batch caps. A tower's
        attention resource is sized from the model's own top rung, and a step
        with more attention segments than it holds runs eagerly, so a ladder
        past that rung replays its longer steps only with the resource raised

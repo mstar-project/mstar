@@ -559,7 +559,12 @@ class PiecewisePackedConfig(PiecewiseAcceleratorGraphConfig):
     requests for the capture-time plan; real per-request lengths arrive at
     replay.
     """
-    total_tokens: list[int]  # token-count buckets to capture
+    # The token-count buckets to capture. Before capture the engine replaces
+    # it, on this same config object, with the serving config's
+    # ``prefill_token_buckets`` for the region's label where one is named
+    # (`apply_region_ladders`), so a submodule that keeps the config it
+    # returned may read back the ladder its region was captured on.
+    total_tokens: list[int]
     # The attention resource of a region whose rows each attend within
     # themselves. Set with `declare_step` left None, the region declares one
     # non-causal "main" segment per row on it; a `one_row_per_step` region's
