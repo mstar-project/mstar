@@ -373,7 +373,7 @@ class TestMonitor(unittest.TestCase):
         return calls["body"], fake
 
     def test_new_signals_reach_subscribers_once_and_the_body_is_safe(self):
-        body, fake = self.run_monitor(STATUS["body"], bug_title="crash @someone <!-- x")
+        body, fake = self.run_monitor(STATUS["body"], bug_title="crash @someone <!-- x in #99")
         self.assertTrue(body.startswith(bot.issue_marker("status")), "the next run couldn't find the status issue")
         self.assertIn("$3 of $10,000", body)
         self.assertIn("Approvals: **on**", body)
@@ -389,6 +389,7 @@ class TestMonitor(unittest.TestCase):
     def test_a_failed_post_leaves_the_state_unwritten_so_the_signal_goes_out_tomorrow(self):
         patched = []
         with self.assertRaises(RuntimeError):
+        self.assertNotIn("#99", body, "a title could mark another issue's timeline")
             self.run_monitor(STATUS["body"], **{"issue comment": Fail("HTTP 502"),
                                                 "PATCH repos/o/r/issues/2": lambda a, i: patched.append(i) or {}})
         self.assertEqual(patched, [], "the day's signals would count as reported though the post failed")
@@ -767,8 +768,11 @@ class TestImprove(unittest.TestCase):
 
     def test_a_post_is_redacted_on_stdin_with_links_kept_in_the_repository(self):
         secret = "sk-ant-" + "a1b2c3d4" * 3
-        item = {"title": f"leak {secret}", "change": "ask @a-person about #7, see https://evil.example/x.png",
-                "where": "bot.py", "evidence": ["https://github.com/o/r/pull/5#discussion_r1", "https://evil.example/y"]}
+        change = ("ask @a-person about #7, see https://evil.example/x.png HTTPS://evil.example/x www.evil.example/a "
+                  '![x](HTTP://evil.example/x.png) <img src="//evil.example/x.png"> [y](//evil.example) GH-123')
+        item = {"title": f"leak {secret}", "change": change, "where": "bot.py",
+                "evidence": ["https://github.com/o/r/pull/5#discussion_r1", "https://evil.example/y",
+                             "https://github.com/o/r/../../evil/phish", "https://github.com/o/r/%2e%2e/%2e%2e/evil/phish"]}
         out, fake = self.post(json.dumps({"improvements": [item]}))
         self.assertNotIn("exit", out)
         [(key, stdin)] = fake.writes()
@@ -779,8 +783,8 @@ class TestImprove(unittest.TestCase):
         self.assertIn("[REDACTED]", issue["body"])
         self.assertFalse(any(secret in " ".join(argv) for argv, _ in fake.calls), "text reached the command line")
         self.assertIn("https://redirect.github.com/o/r/pull/5#discussion_r1", issue["body"])
-        self.assertNotIn("evil.example", issue["body"])
-        self.assertNotIn("a-person", issue["body"])
+        for text in ("evil.example", "a-person", "<img", "GH-123", "phish"):
+            self.assertNotIn(text, issue["body"])
 
 
 if __name__ == "__main__":

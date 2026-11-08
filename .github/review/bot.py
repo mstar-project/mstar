@@ -21,6 +21,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 import render_summary
@@ -986,8 +987,10 @@ def referenced(timeline, number, repo):
 
 
 def safe(text):
-    """Untrusted text for the status issue: redacted, on one line, unable to ping anyone or open a comment."""
-    return redact(" ".join(str(text or "").split())).replace("@", "@\u200b").replace("<!--", "&lt;!--")
+    """Untrusted text for the status issue: redacted, on one line, unable to ping anyone, open a comment or
+    mark another issue's timeline."""
+    return (redact(" ".join(str(text or "").split())).replace("@", "@\u200b").replace("<!--", "&lt;!--")
+            .replace("#", "#\u200b"))
 
 
 def szz(commits, shas, number, files, bug_prs=(), since=""):
@@ -1128,10 +1131,11 @@ def monitor(out, repo, approvals=""):
 # ---------------------------------------------------------------- improve (a weekly job)
 
 def scrub(text):
-    """Comment or model text for the weekly improvement run: `safe`, clipped, and without names, links or
-    #references, so it can't name anyone, load an image or mark a PR's timeline."""
-    text = re.sub(r"https?://\S+", "[link]", re.sub(r"@[\w-]+", "@someone", str(text or "")))
-    return safe(text).replace("#", "#\u200b")[:IMPROVE_TEXT]
+    """Comment or model text for the weekly improvement run: `safe`, clipped, and without names, links,
+    markup or references, so it can't name anyone, load an image or mark a PR's timeline."""
+    text = re.sub(r"(?i)(?:[a-z][a-z0-9+.-]*:)?//\S+|\bwww\.\S+", "[link]",
+                  re.sub(r"@[\w-]+", "@someone", str(text or "")))
+    return safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "&lt;")[:IMPROVE_TEXT]
 
 
 def monday(now):
@@ -1222,9 +1226,9 @@ def improve_inputs(out, repo, key_set):
 
 def improve_post(out, repo, github_run_id, github_run_attempt, output="", usage=""):
     """Record what the improvement run cost, first, so a failed post can't lose it; then open the week's issue
-    from its structured output, redacted, on stdin. Evidence links stay inside this repository and go through
-    redirect.github.com, which keeps them off the PRs' timelines. An empty list opens nothing; a run that
-    returned no list fails. Never touches code, PRs or the bot."""
+    from its structured output, redacted, on stdin. Evidence links stay inside this repository (no `..`, which
+    would climb out of it) and go through redirect.github.com, which keeps them off the PRs' timelines. An empty
+    list opens nothing; a run that returned no list fails. Never touches code, PRs or the bot."""
     record(out, repo, "", github_run_id, github_run_attempt, usage=usage)
     try:
         items = json.loads(output)["improvements"]
@@ -1236,7 +1240,8 @@ def improve_post(out, repo, github_run_id, github_run_attempt, output="", usage=
     link = re.compile(rf"https://github\.com/({re.escape(repo)}/[\w./?=#&%-]+)")
     parts = ["What the review bot could improve about itself, most useful first. It changes nothing on its own."]
     for n, item in enumerate(items, 1):
-        links = [f"- https://redirect.github.com/{m[1]}" for m in map(link.fullmatch, item["evidence"]) if m]
+        links = [f"- https://redirect.github.com/{m[1]}" for m in map(link.fullmatch, item["evidence"])
+                 if m and ".." not in urllib.parse.unquote(m[1])]
         parts.append("\n".join([f"### {n}. {scrub(item['title'])}", "", f"**Change:** {scrub(item['change'])}", "",
                                 f"**Where:** {scrub(item['where'])}", "", "**Evidence:**", *links]))
     body = json.dumps({"title": f"Review bot: what to improve, week of {monday(utcnow())}",
