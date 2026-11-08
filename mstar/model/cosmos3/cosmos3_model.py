@@ -1196,7 +1196,7 @@ class Cosmos3Model(Model):
             # preset and multithreading (threads=0) target the same CRF/quality
             # but encode several times faster than libx264's default "medium"
             # preset, which otherwise dominates the serving latency for a
-            # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
+            # many-frame clip. The preset is overridable via COSMOS3_X264_PRESET.
             frames = output.cpu()
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")

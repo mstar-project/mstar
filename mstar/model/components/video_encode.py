@@ -44,7 +44,7 @@ def encode_mp4(
 
     The container's rate is ``fps`` as the nearest fraction with a denominator up
     to 1001, so NTSC rates are exact (PyAV takes no float rate: 24 -> 24,
-    23.976 -> 24000/1001). ``options`` are the stream's codec options (None: libx264's
+    30000/1001 -> 30000/1001). ``options`` are the stream's codec options (None: libx264's
     defaults). yuv420p needs even sides; ``pad_even`` repeats the last row or
     column of an odd-sized clip, else such a clip fails to encode.
     """
