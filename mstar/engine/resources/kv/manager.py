@@ -4420,8 +4420,8 @@ class KVManager(AttentionResource):
     def make_room(self, mark: RoomMark, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
         """Choose requests from ``newer`` that wait holding pages, newest first, to move off the device for
         ``mark.rid``, a waiting request the room doesn't fit, and earmark what they free for it. It takes that room
-        as their moves land, once the room covers all it asks for. None when the pool doesn't decide, ``mark.rid``
-        fits, or no such moves cover it."""
+        as their moves land, once the room covers all it asks for. No victims once the room fits ``mark.rid``, and
+        None when the pool doesn't decide, ``mark.rid`` no longer asks, or no such moves cover it."""
         if not self._decides:
             return None
         with self._lock:
@@ -4429,7 +4429,9 @@ class KVManager(AttentionResource):
             if not parked or mark.rid not in self._asks:
                 return None
             pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
-            victims = self._choose(pages - self._room(), parked, droppable) if pages > self._room() else None
+            if pages <= self._room():
+                return Victims([], [], [])
+            victims = self._choose(pages - self._room(), parked, droppable)
             return None if victims is None else self._earmark(Earmark(mark.rid, pages, set()), victims)
 
     def _choose(self, pages_short: int, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:

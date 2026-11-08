@@ -86,7 +86,8 @@ class Preemption:
         """Move the newer requests that wait holding pages for the oldest waiting request a paged KV pool refused
         that such moves can let in, as `KVManager.make_room` chooses them. No step of theirs runs short to move
         them, since none of them runs. An older request stuck on something no move frees, another resource or a
-        pool that doesn't move, holds up no younger one."""
+        pool that doesn't move, holds up no younger one, and one the room now fits moves nothing, so no younger one
+        takes that room."""
         if not any(kv.cache.any_parked() for kv in self._caches.values()):
             return
         engine = self._engine_manager.engine
