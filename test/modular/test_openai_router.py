@@ -157,10 +157,9 @@ def test_chat_extra_numeric_knob_is_coerced(client_and_stub, top_k):
     assert got == 5 and type(got) is int
 
 
-def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub, caplog):
+def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
-    caplog.set_level(logging.INFO, logger="mstar.api_server.openai.router")
     r = client.post(
         "/v1/chat/completions",
         json={
@@ -174,9 +173,28 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub, caplog)
     assert r.status_code == 400
     # a refused input is the client's error, on every route
     assert r.json()["error"]["type"] == "invalid_request_error"
-    # and logs one INFO line: a client that sends a refused field on every call logged a traceback each
+
+
+@pytest.mark.parametrize("exc,level", [
+    # a refusal is one INFO line: a client that sent stop on every call logged a traceback each
+    (ValueError("stop sequences are not supported"), logging.INFO),
+    # still a 400, but maybe a bug in the route, so it keeps its stack
+    (TypeError("'NoneType' object is not subscriptable"), logging.ERROR),
+], ids=["refusal", "type-error"])
+def test_a_chat_s_400_logs_a_traceback_only_for_a_type_error(client_and_stub, monkeypatch, caplog, exc, level):
+    from mstar.api_server.openai import adapters
+
+    def raising(self, req, upload_dir):
+        raise exc
+
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    monkeypatch.setattr(adapters.BagelAdapter, "chat_to_request", raising)
+    caplog.set_level(logging.INFO, logger="mstar.api_server.openai.router")
+    r = client.post("/v1/chat/completions", json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
     [record] = [rec for rec in caplog.records if rec.name == "mstar.api_server.openai.router"]
-    assert (record.levelno, record.exc_info) == (logging.INFO, None)
+    assert (record.levelno, record.exc_info is not None) == (level, level == logging.ERROR)
 
 
 def test_chat_refuses_server_paths_uniformly(client_and_stub, tmp_path):

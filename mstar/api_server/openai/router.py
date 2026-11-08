@@ -72,22 +72,25 @@ def _exception_error(e: Exception, route: str) -> JSONResponse:
     """The error envelope for an exception a route's handler raised.
 
     An ``HTTPException`` was raised on purpose and keeps its status and
-    detail. A ``ValueError`` or ``TypeError`` is the request's fault: a 400
-    with server paths cut to base names, logged as one INFO line, since the
-    client reads why (a client that sends ``stop`` on every call would
-    otherwise log a traceback per request). Any other error goes through
-    :func:`client_error_text`, a 500 that shows the client only an error id,
-    with the full error logged under it. An exception class that names its
-    own ``status_code`` (``AudioTooLongError`` is a 413) keeps that status.
+    detail. A ``ValueError`` is a refusal: a 400 with server paths cut to
+    base names, logged as one INFO line, since the client reads why (a
+    client that sends ``stop`` on every call would otherwise log a traceback
+    per request). Anything else goes through :func:`client_error_text`: a
+    ``TypeError`` is a 400 too, but may be a bug in the route, so it keeps its
+    traceback; any other error is a 500 that shows the client only an error
+    id, with the full error logged under it. An exception class that names
+    its own ``status_code`` (``AudioTooLongError`` is a 413) keeps that status.
     """
     status, detail = getattr(e, "status_code", None), getattr(e, "detail", None)
     if isinstance(status, int) and detail is not None:
         return _error(status, str(detail))
-    if isinstance(e, (ValueError, TypeError)):
-        logger.info("%s request refused: %s: %s", route, type(e).__name__, e)
+    if isinstance(e, ValueError):
+        logger.info("%s request refused: %s", route, e)
         return _error(status if isinstance(status, int) else 400, scrub_paths(str(e)))
     text, _ = client_error_text(e, f"{route} request failed", log=logger, type_name=False)
-    return _error(status if isinstance(status, int) else 500, text)
+    if not isinstance(status, int):
+        status = 400 if isinstance(e, TypeError) else 500
+    return _error(status, text)
 
 
 def _resolve(require: str):
