@@ -161,7 +161,7 @@ class TestSpend(unittest.TestCase):
         with mock.patch.object(bot, "run", FakeGh(routes)):
             return bot.spend("o/r", NOW)
 
-    def test_spend_sums_this_day_and_month_once_per_run_from_the_bots_comments_alone(self):
+    def test_spend_sums_this_day_and_month_once_per_run_and_attempt_from_the_bots_comments_alone(self):
         self.assertEqual(self.spend([spent(1.5), spent(2, "2026-11-01T23:59:59Z", run="2"),
                                      spent(99, "2026-10-31T23:59:59Z", run="3")]), {"day": 1.5, "month": 3.5})
         self.assertEqual(self.spend([spent(1), spent(1)]), {"day": 1, "month": 1},
@@ -171,6 +171,10 @@ class TestSpend(unittest.TestCase):
                          "re-running only a run's spend job would count its costs twice")
         self.assertEqual(self.spend([first, spent(1, attempt="2", usage={"run_attempt": "2"})])["day"], 2,
                          "re-running all a run's jobs spends again, and that would go uncounted")
+        live = {"usage": {"run_attempt": "1"}, "gpu_usd": 2, "box_usd": 1}
+        self.assertEqual(self.spend([spent(13, **live), spent(16, attempt="2", **{**live, "gpu_usd": 5}),
+                                     spent(16, attempt="3", **{**live, "gpu_usd": 5})])["day"], 19,
+                         "re-running only the live test spends GPUs again, and its review tokens are already counted")
         self.assertEqual(self.spend([spent(1, attempt="1"), spent(1, attempt="2")])["day"], 2,
                          "a record with no usage counts by its own attempt")
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
@@ -302,9 +306,10 @@ class TestMonitor(unittest.TestCase):
     def test_only_a_bug_fix_subject_counts_as_a_fix(self):
         for subject in ("Fix a crash (#9)", "[Worker][Critical fix] Drop late messages", "Revert \"x\"", "bugfix: y",
                         "Fixing a race", "Bugs in decode", "Bugfixes for x", "Reverting x", "Fix format string crash",
-                        "fix docs build", "fix typo in README"):
+                        "fix docs build", "Fix typography crash"):
             self.assertTrue(bot.FIX_SUBJECT.search(subject), subject)
-        for subject in ("Fix a typo", "fix: docs", "fix lint (#12)", "fix the comments", "prefix cache"):
+        for subject in ("Fix a typo", "fix typo in README", "fix: docs", "fix lint (#12)", "fix docs.",
+                        "fix lint. (#12)", "fix the comments", "prefix cache"):
             self.assertFalse(bot.FIX_SUBJECT.search(subject), subject)
 
     def test_a_fix_that_changes_a_prs_lines_is_blamed_on_it(self):
@@ -795,6 +800,20 @@ class TestImprove(unittest.TestCase):
         self.assertIn("https://redirect.github.com/o/r/pull/5#discussion_r1", issue["body"])
         for text in ("evil.example", "a-person", "<img", "GH-123", "phish"):
             self.assertNotIn(text, issue["body"])
+
+    def test_scrub_leaves_no_link_image_mention_or_reference_in_any_spelling(self):
+        for text in ("![x](https&colon;&sol;&sol;evil.example/x.png)", "![w](https:\\/\\/evil.example/x.png)",
+                     "[w](/\\/evil.example)", "[z](http:evil.example/x)", "&commat;someone", "&num;99"):
+            with self.subTest(text):
+                scrubbed = bot.scrub(text)
+                self.assertNotIn("](", scrubbed, "it would render as a link or load an image")
+                self.assertNotRegex(scrubbed, r"&(?!amp;)", "an entity would render as the character it spells")
+                self.assertNotRegex(scrubbed, r"(?<!\\)\\(?!\\)", "a backslash would hide a link from the pattern")
+
+    def test_scrub_keeps_ordinary_text_readable(self):
+        for text in ("a//b", "use n//2 here", "path/to//file.py", "`a//b`", "`List<int>`"):
+            with self.subTest(text):
+                self.assertEqual(bot.scrub(text).replace("\u200b", ""), text, "ordinary text would read as a link")
 
 
 if __name__ == "__main__":

@@ -56,12 +56,13 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
       pageInfo { hasNextPage endCursor }
       nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
     } } } }"""
-# A run's record, base64 JSON, in a ledger comment: one comment per run, so concurrent runs can't lose updates.
+# A run's record, base64 JSON, in a ledger comment: one comment per attempt of a run, so concurrent runs can't lose
+# updates.
 SPEND = re.compile(r"<!-- review-spend ([A-Za-z0-9+/=]+) -->")
 # USD the bot may spend per UTC day and month on review tokens and Eras GPU time, a change to main like the
 # approval rule. Slurm GPUs are free.
 CAPS = {"day": 10_000, "month": 50_000}
-ISSUES = {"ledger": ("Review bot spend ledger", "The review bot's spend, one comment per run. Read by code."),
+ISSUES = {"ledger": ("Review bot spend ledger", "The review bot's spend, one comment per run attempt. Read by code."),
           "status": ("Review bot status", "The review bot's status: a daily report in this body, alerts as comments.")}
 EJECTIONS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
@@ -75,9 +76,11 @@ MONITOR_DAYS = 60
 ISSUE_COMMENTS = 2_000  # a bot issue past this rolls over to a new one; GitHub stops an issue at 2,500
 # How a PR's body says it fixes or reverts another, and the subjects `szz` treats as fixes.
 FIXES = re.compile(r"\b(?:fix(?:e[sd])?|revert(?:s|ed)?)\s+#(\d+)\b", re.IGNORECASE)
-# A fix-word, unless all it fixes is a typo, a comment, docs or lint: such a word ending the subject.
+# A fix-word, unless what follows is a typo, or all it fixes is a comment, docs or lint: such a word ending the
+# subject, before a `.` or a PR number.
 FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s|ed|ing)?)\b"
-                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?|comments?|docs?|lint|format\w*)\s*(?:\(#\d+\)\s*)?$)",
+                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?\b|(?:comments?|docs?|lint|format\w*)\s*\.?\s*"
+                         r"(?:\(#\d+\)\s*)?$))",
                          re.IGNORECASE)
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
@@ -224,7 +227,9 @@ def comment_on_issue(repo, number, body):
 def ledger(repo, since):
     """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments from every ledger
     issue, once per run and attempt of what they cost. Re-running only a run's spend job records the same costs
-    again, with the attempt its usage came from; re-running all its jobs spends again. A failed read raises."""
+    again, with the attempt its usage came from; re-running all its jobs spends again, and re-running only its
+    live test spends GPUs and the box again, which counts on top of the review already counted. A failed read
+    raises."""
     records, seen = [], set()
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
@@ -235,10 +240,14 @@ def ledger(repo, since):
                 record = json.loads(base64.b64decode(m[1]))
             except ValueError:
                 continue
-            key = record.get("run"), (record.get("usage") or {}).get("run_attempt") or record.get("attempt")
-            if key not in seen:
-                seen.add(key)
-                records.append((c["created_at"], record))
+            run_key = record.get("run"), (record.get("usage") or {}).get("run_attempt") or record.get("attempt")
+            live_key = (*run_key, record.get("gpu_usd"), record.get("box_usd"))
+            if live_key in seen:
+                continue
+            if run_key in seen:  # the live test ran again: new GPU and box cost, the review's tokens already counted
+                record = {**record, "usd": round(finite_usd(record, "gpu_usd") + finite_usd(record, "box_usd"), 4)}
+            seen |= {run_key, live_key}
+            records.append((c["created_at"], record))
     return records
 
 
@@ -253,9 +262,9 @@ def spend(repo, now):
     return used
 
 
-def finite_usd(record):
-    """A record's USD, or 0 when it isn't a finite, non-negative number."""
-    usd = record.get("usd")
+def finite_usd(record, key="usd"):
+    """A record's USD under `key`, or 0 when it isn't a finite, non-negative number."""
+    usd = record.get(key)
     return usd if isinstance(usd, (int, float)) and not isinstance(usd, bool) and 0 <= usd < float("inf") else 0
 
 
@@ -991,9 +1000,9 @@ def referenced(timeline, number, repo):
 
 def safe(text):
     """Untrusted text for the status issue: redacted, on one line, unable to ping anyone, open a comment or
-    mark another issue's timeline."""
-    return (redact(" ".join(str(text or "").split())).replace("@", "@\u200b").replace("<!--", "&lt;!--")
-            .replace("#", "#\u200b"))
+    mark another issue's timeline, in plain characters or in entity or backslash spellings of them."""
+    return (redact(" ".join(str(text or "").split())).replace("\\", "\\\\").replace("&", "&amp;")
+            .replace("@", "@\u200b").replace("<!--", "&lt;!--").replace("#", "#\u200b"))
 
 
 def szz(commits, shas, number, files, bug_prs=(), since=""):
@@ -1138,9 +1147,10 @@ def monitor(out, repo, approvals=""):
 def scrub(text):
     """Comment or model text for the weekly improvement run: `safe`, clipped, and without names, links,
     markup or references, so it can't name anyone, load an image or mark a PR's timeline."""
-    text = re.sub(r"(?i)(?:[a-z][a-z0-9+.-]*:)?//\S+|\bwww\.\S+", "[link]",
+    text = re.sub(r"(?i)[a-z][a-z0-9+.-]*://[^\s`]+|(?<![\w./-])//[^\s`]+|\bwww\.[^\s`]+", "[link]",
                   re.sub(r"@[\w-]+", "@someone", str(text or "")))
-    return safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "&lt;")[:IMPROVE_TEXT]
+    return (safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "<\u200b")
+            .replace("](", "]\u200b("))[:IMPROVE_TEXT]
 
 
 def monday(now):
