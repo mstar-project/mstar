@@ -368,16 +368,19 @@ def test_openai_adapter(tmp_path):
 
 def test_a_refused_keyframe_leaves_no_upload(tmp_path, monkeypatch):
     """A request refused at its last keyframe removes the first one's saved upload: it is
-    never submitted, so no deferred cleanup would. A non-string reference is a 400."""
+    never submitted, so no deferred cleanup would. A non-string or empty reference is a
+    400, not a text-only request."""
     from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
     from mstar.api_server.openai.protocol import VideoGenerationRequest
 
     monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
     adapter = ADAPTER_REGISTRY["minimax_h3"]
-    for last in ("/etc/hostname", "file:///etc/hostname", "https://example.com/a.png", 123, ["x"]):
+    for last in ("/etc/hostname", "file:///etc/hostname", "https://example.com/a.png", 123, ["x"], "", 0, []):
         with pytest.raises(ValueError):
             adapter.video_to_request(VideoGenerationRequest(prompt="a dog", image=PNG_URL, last_image=last), tmp_path)
         assert list(tmp_path.iterdir()) == [], last
+    with pytest.raises(ValueError):
+        adapter.video_to_request(VideoGenerationRequest(prompt="a dog", image=""), tmp_path)
 
 
 def test_a_keyframe_is_never_scaled_far_past_the_canvas(monkeypatch):

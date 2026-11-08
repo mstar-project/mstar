@@ -1199,7 +1199,8 @@ class MiniMaxH3Adapter(OpenAIAdapter):
         for name in ("seed", "num_frames"):
             if getattr(req, name, None) is not None:
                 mk.setdefault(name, getattr(req, name))
-        refs = [(anchor, ref) for anchor, ref in (("first", getattr(req, "image", None)), ("last", last_image)) if ref]
+        refs = [(anchor, ref) for anchor, ref in (("first", getattr(req, "image", None)), ("last", last_image))
+                if ref is not None]
         for anchor, ref in refs:
             if not isinstance(ref, str):
                 name = "image" if anchor == "first" else "extra_body 'last_image'"
