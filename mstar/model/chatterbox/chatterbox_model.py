@@ -188,6 +188,16 @@ class ChatterboxModel(Model):
             self.config.stream_chunk_growth = float(stream_chunk_growth)
         if stream_max_chunk_tokens is not None:
             self.config.stream_max_chunk_tokens = int(stream_max_chunk_tokens)
+        # the first streamed chunk vocodes its tokens past the look-ahead, and the next one
+        # crossfades the vocoder cache's worth of its tail
+        s3 = self.config.s3gen
+        first_frames = (self.config.stream_first_chunk_tokens - s3.encoder.pre_lookahead_len) * s3.token_mel_ratio
+        if self.config.stream_chunk_tokens > 0 and first_frames < self.config.stream_mel_cache_frames:
+            fewest = s3.encoder.pre_lookahead_len + -(-self.config.stream_mel_cache_frames // s3.token_mel_ratio)
+            raise ValueError(
+                f"stream_first_chunk_tokens={self.config.stream_first_chunk_tokens} is under the {fewest} tokens "
+                "the first streamed chunk needs to fill the vocoder cache"
+            )
         if s3gen_compile is not None:
             self.config.s3gen_compile = bool(s3gen_compile)
         if s3gen_compile_mode is not None:

@@ -984,8 +984,14 @@ def test_wan22_config_echo_normalizes_bogus_decode_override(monkeypatch, caplog)
 
 
 # ----------------------------------------------------------------------
-# dit attention layout
+# dit attention layout and guidance-branch split
 # ----------------------------------------------------------------------
+
+
+class _FakeCfgGroup:
+    def __init__(self, world_size: int, rank: int = 0):
+        self.world_size = world_size
+        self.rank = rank
 
 
 def _dit_info(guidance: float) -> CurrentForwardPassInfo:
@@ -994,14 +1000,78 @@ def _dit_info(guidance: float) -> CurrentForwardPassInfo:
     return info
 
 
-@pytest.mark.parametrize("guidance,branches", [
-    (5.0, 2),  # both guidance branches in one forward
-    (1.0, 1),  # guidance off: the conditional branch alone
+@pytest.mark.parametrize("world_size,guidance,branches", [
+    (None, 5.0, 2),  # one GPU: both guidance branches in one forward
+    (None, 1.0, 1),  # guidance off: the conditional branch alone
+    (2, 5.0, 1),     # two ranks split the branches
+    (2, 1.0, 1),     # nothing to split: both ranks run the one branch
+    (3, 5.0, None),  # two branches do not split over three ranks: refused
 ])
-def test_wan22_dit_attends_one_segment_per_branch(guidance, branches):
-    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config())
+def test_wan22_dit_attends_one_segment_per_branch_on_its_rank(world_size, guidance, branches):
+    group = _FakeCfgGroup(world_size) if world_size else None
+    submodule = Wan22DitSubmodule(transformer=None, config=Wan22Config(), cfg_group=group)
     key = submodule.bucket_key_for(_dit_info(guidance))
+    if branches is None:
+        with pytest.raises(ValueError, match="evenly"):
+            submodule.attention_segments(key)
+        return
     assert submodule.attention_segments(key) == ((submodule.MAIN_SPAN, submodule.num_tokens(key)),) * branches
+
+
+class _BranchEcho(torch.nn.Module):
+    """A dit stand-in whose prediction is each row's text embedding, broadcast."""
+    dtype = torch.float32
+
+    def forward(self, hidden_states, timestep, encoder_hidden_states, self_attn_fn):
+        return encoder_hidden_states[:, :1, :1, None, None].expand_as(hidden_states).clone()
+
+
+class _TwoRankGroup(_FakeCfgGroup):
+    """One rank of a two-rank instance. The all-gather checks this rank's rows
+    and returns both ranks' rows, as each rank's forward computes them."""
+    def __init__(self, rank: int, full: torch.Tensor, rows: int):
+        super().__init__(world_size=2, rank=rank)
+        self.full, self.rows, self.gathers = full, rows, 0
+
+    def all_gather(self, x, dim):
+        assert dim == 0 and torch.equal(x, self.full[self.rank * self.rows:(self.rank + 1) * self.rows])
+        self.gathers += 1
+        return self.full
+
+
+@pytest.mark.parametrize("rows", [1, 2])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("guidance", [5.0, 1.0])
+def test_wan22_cfg_parallel_rank_runs_its_branch_and_matches_one_gpu(rows, rank, guidance):
+    """Each rank of the CFG-parallel pair forwards its own branch of every row,
+    gathers once and only when guided, and the combine matches the one-GPU forward."""
+    latents, ts = torch.zeros(rows, 4, 2, 2, 2), torch.zeros(rows, 2)
+    pos = torch.arange(3.0, 3.0 + rows)[:, None, None].expand(rows, 8, 16)
+    neg = -torch.arange(1.0, 1.0 + rows)[:, None, None].expand(rows, 8, 16)
+    one_gpu = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False))
+    expected = one_gpu._noise_prediction(latents, ts, pos, neg, guidance)
+    full = _BranchEcho()(latents.repeat(2, 1, 1, 1, 1), None, torch.cat([pos, neg]), None)
+    group = _TwoRankGroup(rank, full, rows)
+    pair = Wan22DitSubmodule(transformer=_BranchEcho(), config=Wan22Config(compile_dit=False), cfg_group=group)
+    assert torch.equal(pair._noise_prediction(latents, ts, pos, neg, guidance), expected)
+    assert group.gathers == (1 if guidance > 1.0 else 0)
+
+
+@pytest.mark.parametrize("cfg_size,ok", [(None, True), (1, True), (2, True), (3, False), (4, False)])
+def test_wan22_refuses_a_dit_instance_it_cannot_split_cfg_over(cfg_size, ok):
+    """CFG parallelism splits two branches; a larger dit instance would serve,
+    every rank recomputing the whole step, unless refused at startup."""
+    from mstar.validation.placement import check_placement
+
+    group = {"node_names": ["dit"], "ranks": list(range(cfg_size or 1))}
+    if cfg_size is not None:
+        group["cfg_size"] = cfg_size
+    config = {"node_groups": [{"node_names": ["text_encoder", "vae_encoder", "vae_decoder"], "ranks": [0]}, group]}
+    problems = check_placement(Wan22Model(model_path_hf="test/wan22"), config)
+    if ok:
+        assert problems == []
+    else:
+        assert len(problems) == 1 and "does not divide the 2 guidance branches" in problems[0], problems
 
 
 def test_wan22_dit_declares_its_attention_on_the_ragged_resource():
