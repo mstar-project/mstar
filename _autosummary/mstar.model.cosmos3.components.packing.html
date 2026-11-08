@@ -784,7 +784,7 @@ diffusers pipeline’s packed t2i inputs byte-for-byte.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.normalize_condition_frame_indexes" title="mstar.model.cosmos3.components.packing.normalize_condition_frame_indexes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">normalize_condition_frame_indexes</span></code></a>(value, default)</p></td>
 <td><p>Normalize a request's video-conditioning latent-frame indexes.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.resolve_action_domain_id" title="mstar.model.cosmos3.components.packing.resolve_action_domain_id"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_action_domain_id</span></code></a>(domain_id, domain_name)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.resolve_action_domain_id" title="mstar.model.cosmos3.components.packing.resolve_action_domain_id"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_action_domain_id</span></code></a>(domain_id, ...)</p></td>
 <td><p>Resolve an action request's embodiment domain.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.cosmos3.components.packing.tokenize_prompt" title="mstar.model.cosmos3.components.packing.tokenize_prompt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tokenize_prompt</span></code></a>(tokenizer, prompt, ...[, ...])</p></td>
@@ -1068,14 +1068,18 @@ sorted, de-duplicated tuple. <code class="docutils literal notranslate"><span cl
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.cosmos3.components.packing.resolve_action_domain_id">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.packing.</span></span><span class="sig-name descname"><span class="pre">resolve_action_domain_id</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">domain_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">domain_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/packing.html#resolve_action_domain_id"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.packing.resolve_action_domain_id" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.cosmos3.components.packing.</span></span><span class="sig-name descname"><span class="pre">resolve_action_domain_id</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">domain_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">domain_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">num_domains</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/cosmos3/components/packing.html#resolve_action_domain_id"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.cosmos3.components.packing.resolve_action_domain_id" title="Link to this definition">#</a></dt>
 <dd><p>Resolve an action request’s embodiment domain. A numeric <code class="docutils literal notranslate"><span class="pre">domain_id</span></code>
 wins; otherwise <code class="docutils literal notranslate"><span class="pre">domain_name</span></code> looks up the published table. One of the
 two is required — the domain conditions the action pathway, and a silent
-default would predict actions for the wrong embodiment.</p>
+default would predict actions for the wrong embodiment. The id indexes the
+model’s <code class="docutils literal notranslate"><span class="pre">num_domains</span></code>-row embedding table on the GPU, so it must be below.</p>
 <dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>num_domains</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>

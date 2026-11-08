@@ -1284,7 +1284,8 @@ so attaching more files does not multiply them.</p>
 header before decoding; over it, the request gets a 400. PNG, JPEG,
 WebP and GIF are read (FLUX.2 klein, which decodes with Pillow, also
 reads BMP and TIFF); other formats get a 400. A GIF or an animated
-WebP is read as its first frame.</p></td>
+WebP is read as its first frame. Images are turned upright by their
+EXIF orientation; a malformed EXIF block leaves one as stored.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_VIDEO_PIXELS</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1073741824</span></code></p></td>

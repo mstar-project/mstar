@@ -1059,8 +1059,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="apply_dynamo_config">
 <a class="viewcode-back" href="../../_autosummary/mstar.engine.html#mstar.engine.apply_dynamo_config">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">apply_dynamo_config</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-    <span class="c1"># dynamo config is per-thread since torch 2.12, so every compiling thread calls this</span>
-    <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">recompile_limit</span> <span class="o">=</span> <span class="n">recompile_limit</span><span class="p">()</span>
+    <span class="c1"># dynamo config is per-thread since torch 2.12, so every compiling thread calls this. Before 2.12 it is</span>
+    <span class="c1"># process-wide, and a compiled DiT may have raised the limit for its own forward</span>
+    <span class="c1"># (compile_transformer_forward), so a thread starting later never lowers it.</span>
+    <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">recompile_limit</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">recompile_limit</span><span class="p">,</span> <span class="n">recompile_limit</span><span class="p">())</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">allow_unspec_int_on_nn_module</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">_dynamo</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">specialize_int</span> <span class="o">=</span> <span class="kc">False</span></div>
 

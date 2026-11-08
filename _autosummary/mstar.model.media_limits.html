@@ -731,6 +731,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_image_pixels"><code class="docutils literal notranslate"><span class="pre">max_image_pixels()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_media_files"><code class="docutils literal notranslate"><span class="pre">max_media_files()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_video_pixels"><code class="docutils literal notranslate"><span class="pre">max_video_pixels()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.open_upright_image"><code class="docutils literal notranslate"><span class="pre">open_upright_image()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.probe_audio_seconds"><code class="docutils literal notranslate"><span class="pre">probe_audio_seconds()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.probe_video"><code class="docutils literal notranslate"><span class="pre">probe_video()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.read_image"><code class="docutils literal notranslate"><span class="pre">read_image()</span></code></a></li>
@@ -803,22 +804,25 @@ against what the request’s earlier files used.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.max_video_pixels" title="mstar.model.media_limits.max_video_pixels"><code class="xref py py-obj docutils literal notranslate"><span class="pre">max_video_pixels</span></code></a>()</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_VIDEO_PIXELS</span></code>: pixels a request's videos may decode to, summed over the frames the loader decodes from each.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.probe_audio_seconds" title="mstar.model.media_limits.probe_audio_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">probe_audio_seconds</span></code></a>(filepath)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.open_upright_image" title="mstar.model.media_limits.open_upright_image"><code class="xref py py-obj docutils literal notranslate"><span class="pre">open_upright_image</span></code></a>(filepath[, formats])</p></td>
+<td><p>The image opened with Pillow and turned upright by its EXIF orientation, as transformers' and diffusers' <code class="docutils literal notranslate"><span class="pre">load_image</span></code> do.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.probe_audio_seconds" title="mstar.model.media_limits.probe_audio_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">probe_audio_seconds</span></code></a>(filepath)</p></td>
 <td><p>The duration an audio file's header declares, or None when it declares none (a sample count of 0 or libsndfile's &quot;unknown&quot; value) or neither soundfile nor torchcodec can read it.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.probe_video" title="mstar.model.media_limits.probe_video"><code class="xref py py-obj docutils literal notranslate"><span class="pre">probe_video</span></code></a>(filepath)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.probe_video" title="mstar.model.media_limits.probe_video"><code class="xref py py-obj docutils literal notranslate"><span class="pre">probe_video</span></code></a>(filepath)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(num_frames,</span> <span class="pre">fps,</span> <span class="pre">height,</span> <span class="pre">width)</span></code> from the container header, or None when neither torchcodec nor PyAV can read it.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_image" title="mstar.model.media_limits.read_image"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_image</span></code></a>(filepath, *[, rgb])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_image" title="mstar.model.media_limits.read_image"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_image</span></code></a>(filepath, *[, rgb])</p></td>
 <td><p>A request image as uint8 <code class="docutils literal notranslate"><span class="pre">[C,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, refused first if it is too large (a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code>, as is a file that does not decode).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_sound_file" title="mstar.model.media_limits.read_sound_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_sound_file</span></code></a>(filepath, max_seconds)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.read_sound_file" title="mstar.model.media_limits.read_sound_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_sound_file</span></code></a>(filepath, max_seconds)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">soundfile.read(filepath,</span> <span class="pre">dtype=&quot;float32&quot;,</span> <span class="pre">always_2d=True)</span></code> for a header that gives no sample count, where <code class="docutils literal notranslate"><span class="pre">soundfile.read</span></code> would size its buffer from the header (libsndfile's 2**63 - 1 frames) and fail; decodes block by block and stops just past <code class="docutils literal notranslate"><span class="pre">max_seconds</span></code>, so the caller's length check refuses a longer clip.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.sound_file_seconds" title="mstar.model.media_limits.sound_file_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sound_file_seconds</span></code></a>(frames, rate)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.sound_file_seconds" title="mstar.model.media_limits.sound_file_seconds"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sound_file_seconds</span></code></a>(frames, rate)</p></td>
 <td><p>The length a libsndfile header declares, or None when it declares none (a sample count of 0 or libsndfile's &quot;unknown&quot; value).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.media_limits.video_decode_threads" title="mstar.model.media_limits.video_decode_threads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">video_decode_threads</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.media_limits.video_decode_threads" title="mstar.model.media_limits.video_decode_threads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">video_decode_threads</span></code></a>()</p></td>
 <td><p>FFmpeg threads for one video decode.</p></td>
 </tr>
 </tbody>
@@ -1086,6 +1090,22 @@ summed over the frames the loader decodes from each.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.media_limits.open_upright_image">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">open_upright_image</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">filepath</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">formats</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#open_upright_image"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.open_upright_image" title="Link to this definition">#</a></dt>
+<dd><p>The image opened with Pillow and turned upright by its EXIF orientation,
+as transformers’ and diffusers’ <code class="docutils literal notranslate"><span class="pre">load_image</span></code> do. A malformed EXIF block
+leaves it as stored.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>filepath</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>formats</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><em>tuple</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>...</em><em>] </em><em>| </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.media_limits.probe_audio_seconds">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.media_limits.</span></span><span class="sig-name descname"><span class="pre">probe_audio_seconds</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">filepath</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/media_limits.html#probe_audio_seconds"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.media_limits.probe_audio_seconds" title="Link to this definition">#</a></dt>
 <dd><p>The duration an audio file’s header declares, or None when it declares
@@ -1127,7 +1147,9 @@ would turn a transparent background black); otherwise the file’s own
 channels are kept, as <code class="docutils literal notranslate"><span class="pre">torchvision.io.decode_image</span></code> does. A GIF or an
 animated WebP is read with Pillow, as its first frame in RGB: torchvision’s
 GIF decoder is not safe on untrusted files before torchvision 0.28, and its
-WebP decoder refuses animation.</p>
+WebP decoder refuses animation and ignores EXIF, so a WebP stored rotated
+is read with Pillow too. The image is turned upright by its EXIF
+orientation (see <a class="reference internal" href="#mstar.model.media_limits.open_upright_image" title="mstar.model.media_limits.open_upright_image"><code class="xref py py-func docutils literal notranslate"><span class="pre">open_upright_image()</span></code></a>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1264,6 +1286,7 @@ for fork-join ops a decode doesn’t run.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_image_pixels"><code class="docutils literal notranslate"><span class="pre">max_image_pixels()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_media_files"><code class="docutils literal notranslate"><span class="pre">max_media_files()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.max_video_pixels"><code class="docutils literal notranslate"><span class="pre">max_video_pixels()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.open_upright_image"><code class="docutils literal notranslate"><span class="pre">open_upright_image()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.probe_audio_seconds"><code class="docutils literal notranslate"><span class="pre">probe_audio_seconds()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.probe_video"><code class="docutils literal notranslate"><span class="pre">probe_video()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.media_limits.read_image"><code class="docutils literal notranslate"><span class="pre">read_image()</span></code></a></li>

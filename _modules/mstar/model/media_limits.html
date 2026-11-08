@@ -1013,6 +1013,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">against what the request's earlier files used.</span>
 <span class="sd">"""</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">contextlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">contextmanager</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">contextvars</span><span class="w"> </span><span class="kn">import</span> <span class="n">ContextVar</span>
 
@@ -1050,6 +1051,8 @@ window.runMermaid = runMermaid;</script>
 <span class="n">IMAGE_FORMATS</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"PNG"</span><span class="p">,</span> <span class="s2">"JPEG"</span><span class="p">,</span> <span class="s2">"WEBP"</span><span class="p">,</span> <span class="s2">"GIF"</span><span class="p">)</span>
 <span class="c1"># a loader that decodes with Pillow also reads the other image types the API accepts</span>
 <span class="n">PILLOW_IMAGE_FORMATS</span> <span class="o">=</span> <span class="n">IMAGE_FORMATS</span> <span class="o">+</span> <span class="p">(</span><span class="s2">"BMP"</span><span class="p">,</span> <span class="s2">"TIFF"</span><span class="p">)</span>
+<span class="c1"># what Pillow's lazy EXIF parse raises on a malformed block; the image is then read as stored</span>
+<span class="n">_MALFORMED_EXIF</span> <span class="o">=</span> <span class="p">(</span><span class="ne">SyntaxError</span><span class="p">,</span> <span class="n">struct</span><span class="o">.</span><span class="n">error</span><span class="p">,</span> <span class="ne">ValueError</span><span class="p">,</span> <span class="ne">TypeError</span><span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_positive_int_env</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">default</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -1408,17 +1411,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    Reads the header only. The decoders allocate what the header declares, so</span>
 <span class="sd">    it cannot understate the decode.</span>
 <span class="sd">    """</span>
-    <span class="n">fmt</span><span class="p">,</span> <span class="n">animated</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">_check_image_header</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">formats</span><span class="p">)</span>
+    <span class="n">fmt</span><span class="p">,</span> <span class="n">animated</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">_check_image_header</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">formats</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">fmt</span><span class="p">,</span> <span class="n">animated</span></div>
 
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_check_image_header</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">formats</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">""":func:`check_image_size`, plus Pillow's mode and whether the file</span>
-<span class="sd">    carries transparency (an alpha channel or a tRNS or GIF transparent color)."""</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_check_image_header</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">formats</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">""":func:`check_image_size`, plus Pillow's mode, whether the file</span>
+<span class="sd">    carries transparency (an alpha channel or a tRNS or GIF transparent color)</span>
+<span class="sd">    and a static WebP's EXIF orientation (1, upright, for any other file)."""</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">warnings</span>
 
-    <span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span><span class="p">,</span> <span class="n">UnidentifiedImageError</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">ExifTags</span><span class="p">,</span> <span class="n">Image</span><span class="p">,</span> <span class="n">UnidentifiedImageError</span>
 
     <span class="n">limit</span> <span class="o">=</span> <span class="n">max_image_pixels</span><span class="p">()</span>
     <span class="k">try</span><span class="p">:</span>
@@ -1430,6 +1434,12 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">animated</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">image</span><span class="p">,</span> <span class="s2">"is_animated"</span><span class="p">,</span> <span class="kc">False</span><span class="p">))</span>
                 <span class="n">mode</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">mode</span>
                 <span class="n">transparent</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">image</span><span class="o">.</span><span class="n">has_transparency_data</span><span class="p">)</span>
+                <span class="n">orientation</span> <span class="o">=</span> <span class="mi">1</span>
+                <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"WEBP"</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">animated</span><span class="p">:</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="n">orientation</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">getexif</span><span class="p">()</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">ExifTags</span><span class="o">.</span><span class="n">Base</span><span class="o">.</span><span class="n">Orientation</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+                    <span class="k">except</span> <span class="n">_MALFORMED_EXIF</span><span class="p">:</span>
+                        <span class="k">pass</span>
     <span class="k">except</span> <span class="n">Image</span><span class="o">.</span><span class="n">DecompressionBombError</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"image is too large to decode; the limit is </span><span class="si">{</span><span class="n">limit</span><span class="si">}</span><span class="s2"> pixels"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
     <span class="k">except</span> <span class="p">(</span><span class="n">UnidentifiedImageError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">,</span> <span class="ne">SyntaxError</span><span class="p">):</span>
@@ -1438,7 +1448,25 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="n">width</span> <span class="o">*</span> <span class="n">height</span> <span class="o">&gt;</span> <span class="n">limit</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"image is </span><span class="si">{</span><span class="n">width</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="n">height</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">width</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">height</span><span class="si">}</span><span class="s2"> pixels); the limit is </span><span class="si">{</span><span class="n">limit</span><span class="si">}</span><span class="s2"> pixels"</span><span class="p">)</span>
     <span class="n">_charge_request</span><span class="p">(</span><span class="s2">"image"</span><span class="p">,</span> <span class="n">width</span> <span class="o">*</span> <span class="n">height</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">fmt</span><span class="p">,</span> <span class="n">animated</span><span class="p">,</span> <span class="n">mode</span><span class="p">,</span> <span class="n">transparent</span>
+    <span class="k">return</span> <span class="n">fmt</span><span class="p">,</span> <span class="n">animated</span><span class="p">,</span> <span class="n">mode</span><span class="p">,</span> <span class="n">transparent</span><span class="p">,</span> <span class="n">orientation</span>
+
+
+<div class="viewcode-block" id="open_upright_image">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.media_limits.html#mstar.model.media_limits.open_upright_image">[docs]</a>
+<span class="nd">@contextmanager</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">open_upright_image</span><span class="p">(</span><span class="n">filepath</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">formats</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""The image opened with Pillow and turned upright by its EXIF orientation,</span>
+<span class="sd">    as transformers' and diffusers' ``load_image`` do. A malformed EXIF block</span>
+<span class="sd">    leaves it as stored."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span><span class="p">,</span> <span class="n">ImageOps</span>
+
+    <span class="k">with</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">formats</span><span class="o">=</span><span class="n">formats</span><span class="p">)</span> <span class="k">as</span> <span class="n">image</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">upright</span> <span class="o">=</span> <span class="n">ImageOps</span><span class="o">.</span><span class="n">exif_transpose</span><span class="p">(</span><span class="n">image</span><span class="p">)</span>
+        <span class="k">except</span> <span class="n">_MALFORMED_EXIF</span><span class="p">:</span>
+            <span class="n">upright</span> <span class="o">=</span> <span class="n">image</span>
+        <span class="k">yield</span> <span class="n">upright</span></div>
+
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_on_white</span><span class="p">(</span><span class="n">image</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
@@ -1459,19 +1487,20 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    channels are kept, as ``torchvision.io.decode_image`` does. A GIF or an</span>
 <span class="sd">    animated WebP is read with Pillow, as its first frame in RGB: torchvision's</span>
 <span class="sd">    GIF decoder is not safe on untrusted files before torchvision 0.28, and its</span>
-<span class="sd">    WebP decoder refuses animation.</span>
+<span class="sd">    WebP decoder refuses animation and ignores EXIF, so a WebP stored rotated</span>
+<span class="sd">    is read with Pillow too. The image is turned upright by its EXIF</span>
+<span class="sd">    orientation (see :func:`open_upright_image`).</span>
 <span class="sd">    """</span>
     <span class="kn">import</span><span class="w"> </span><span class="nn">torchvision</span>
 
-    <span class="n">fmt</span><span class="p">,</span> <span class="n">animated</span><span class="p">,</span> <span class="n">pil_mode</span><span class="p">,</span> <span class="n">transparent</span> <span class="o">=</span> <span class="n">_check_image_header</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">IMAGE_FORMATS</span><span class="p">)</span>
+    <span class="n">fmt</span><span class="p">,</span> <span class="n">animated</span><span class="p">,</span> <span class="n">pil_mode</span><span class="p">,</span> <span class="n">transparent</span><span class="p">,</span> <span class="n">orientation</span> <span class="o">=</span> <span class="n">_check_image_header</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">IMAGE_FORMATS</span><span class="p">)</span>
     <span class="k">try</span><span class="p">:</span>
         <span class="c1"># torchvision ignores a tRNS color on a gray or RGB PNG; Pillow applies it</span>
         <span class="n">trns_color</span> <span class="o">=</span> <span class="n">rgb</span> <span class="ow">and</span> <span class="n">transparent</span> <span class="ow">and</span> <span class="n">pil_mode</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"L"</span><span class="p">,</span> <span class="s2">"RGB"</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"GIF"</span> <span class="ow">or</span> <span class="p">(</span><span class="n">fmt</span> <span class="o">==</span> <span class="s2">"WEBP"</span> <span class="ow">and</span> <span class="n">animated</span><span class="p">)</span> <span class="ow">or</span> <span class="n">trns_color</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"GIF"</span> <span class="ow">or</span> <span class="p">(</span><span class="n">fmt</span> <span class="o">==</span> <span class="s2">"WEBP"</span> <span class="ow">and</span> <span class="p">(</span><span class="n">animated</span> <span class="ow">or</span> <span class="n">orientation</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">))</span> <span class="ow">or</span> <span class="n">trns_color</span><span class="p">:</span>
             <span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
-            <span class="kn">from</span><span class="w"> </span><span class="nn">PIL</span><span class="w"> </span><span class="kn">import</span> <span class="n">Image</span>
 
-            <span class="k">with</span> <span class="n">Image</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="k">as</span> <span class="n">image</span><span class="p">:</span>
+            <span class="k">with</span> <span class="n">open_upright_image</span><span class="p">(</span><span class="n">filepath</span><span class="p">)</span> <span class="k">as</span> <span class="n">image</span><span class="p">:</span>
                 <span class="n">array</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">image</span><span class="o">.</span><span class="n">convert</span><span class="p">(</span><span class="s2">"RGBA"</span><span class="p">))</span>
             <span class="k">return</span> <span class="n">_on_white</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">from_numpy</span><span class="p">(</span><span class="n">array</span><span class="p">)</span><span class="o">.</span><span class="n">permute</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">rgb</span><span class="p">:</span>
@@ -1480,7 +1509,7 @@ window.runMermaid = runMermaid;</script>
             <span class="c1"># only a file with transparency is read with alpha: a CMYK JPEG's</span>
             <span class="c1"># four channels are not RGBA</span>
             <span class="n">mode</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">ImageReadMode</span><span class="o">.</span><span class="n">RGB_ALPHA</span> <span class="k">if</span> <span class="n">transparent</span> <span class="k">else</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">ImageReadMode</span><span class="o">.</span><span class="n">RGB</span>
-        <span class="n">image</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">decode_image</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="n">mode</span><span class="p">)</span>
+        <span class="n">image</span> <span class="o">=</span> <span class="n">torchvision</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">decode_image</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="n">mode</span><span class="p">,</span> <span class="n">apply_exif_orientation</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
     <span class="k">except</span> <span class="p">(</span><span class="ne">RuntimeError</span><span class="p">,</span> <span class="ne">OSError</span><span class="p">)</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>  <span class="c1"># torchvision's decoders raise RuntimeError, Pillow's OSError</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"could not decode image: the file is corrupt or truncated"</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
     <span class="k">if</span> <span class="n">image</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="n">torch</span><span class="o">.</span><span class="n">uint16</span><span class="p">:</span>

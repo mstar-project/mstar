@@ -30,6 +30,7 @@ mstar.model.media\_limits
       max_image_pixels
       max_media_files
       max_video_pixels
+      open_upright_image
       probe_audio_seconds
       probe_video
       read_image
