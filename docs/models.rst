@@ -60,7 +60,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
        LM, text in / text out, fp8 checkpoint, TP8. ``configs/glm5_next_tp8_mtp.yaml``
-       drafts with MTP k=3 (greedy only).
+       drafts with MTP k=3 (greedy only); ``configs/glm53_flash_tp2_b300.yaml`` serves it on
+       2x B300.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
@@ -85,8 +86,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - GLM-5.2 (753B/40B): MLA + DSA MoE causal LM, fp8 block-scale weights, TP8.
        ``model_kwargs.kernels`` is ``auto`` (the tuned kernels) or ``reference``, the numerics
        anchor, served eager. ``configs/glm52_tp8_mtp.yaml`` drafts with MTP k=3 (greedy only).
-       On sm_100 / sm_103, ``auto`` runs the routed experts on FlashInfer's trtllm-gen fp8 MoE where
-       a load-time probe against the Triton kernels passes, else on the Triton kernels.
+       On B300: ``configs/glm52_tp8_b300.yaml``, and GLM-5.3 (``zai-org/GLM-5.3``, the same
+       geometry) at TP4 in ``configs/glm53_tp4_b300.yaml``. There
+       ``model_kwargs.dense_bf16_min_tokens`` gives the fp8 dense linears a bf16 copy that runs
+       from that many tokens up, where Blackwell's block-fp8 GEMMs lose to bf16 cuBLAS.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.

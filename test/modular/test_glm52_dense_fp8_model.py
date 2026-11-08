@@ -308,3 +308,29 @@ def test_dense_bf16_min_tokens_is_a_token_count():
     for bad in (0, True, "3", 2.5):
         with pytest.raises(ValueError, match="dense_bf16_min_tokens"):
             Glm52Model(model_path_hf=None, config_variant="reduced_fp8", dense_bf16_min_tokens=bad)
+
+
+@pytest.mark.parametrize("name", ["glm52_tp8_b300.yaml", "glm53_tp4_b300.yaml"])
+def test_b300_configs_build_and_hold_a_window_per_request(name):
+    """The B300 configs' model_kwargs construct the model (no checkpoint read), their KV
+    overrides apply, and every request slot can hold a full window beside the sink page."""
+    import yaml
+
+    from mstar.engine.resources import AttentionSpec, KVSpec
+    from mstar.model.glm52.glm52_model import Glm52Model
+    from mstar.model.registry import model_init_kwargs
+
+    serve = yaml.safe_load((Path(__file__).parents[2] / "configs" / name).read_text())
+    model = Glm52Model(**{**model_init_kwargs("glm52"), **serve["model_kwargs"]})
+    assert model.config.dense_bf16_min_tokens == 1 and model.config.routed_experts_routing == "kernel"
+    specs = model.get_node_resources()
+    (kv,) = [s for s in specs if isinstance(s, KVSpec)]
+    kv.config.apply_yaml_overrides(**serve["resources"]["kv"])
+    (attn,) = [s for s in specs if isinstance(s, AttentionSpec)]
+    attn.apply_yaml_overrides(**serve["resources"]["attn"])
+    assert attn.config.decode_fmha
+    pages = serve["resources"]["kv"]
+    assert (pages["max_num_pages"] - 1) * pages["page_size"] >= (
+        serve["max_concurrent_requests"] * model.context_limit())
+    (group,) = serve["node_groups"]
+    assert len(group["ranks"]) == group["tp_size"] and model.config.num_attention_heads % group["tp_size"] == 0
