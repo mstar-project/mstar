@@ -33,6 +33,8 @@
     "partition": "main",
     "nice": 100,
     "max_gpus": 4,
+    "cpus_per_gpu": 24,
+    "mem_gb_per_gpu": 180,
     "job_prefix": "<you>-live-pr",
     "workdir": "/workspace/<you>/live-pr",
     "gpu": "H200",
@@ -40,6 +42,9 @@
     "hf_home": "/workspace/shared/hf"
   },
   "eras": {
-    "hf_home": "/workspace/hf"
+    "hf_home": "/workspace/hf",
+    "template_id": "ed6d2a30-36aa-5d50-b911-1f6b551f2081",
+    "shm": "64Gi",
+    "run_secret_id": ""
   }
 }
