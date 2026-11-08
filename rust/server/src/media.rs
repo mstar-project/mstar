@@ -84,14 +84,26 @@ pub fn modality_from_mime(mime: &str) -> &'static str {
 // Inbound: persist request media into upload_dir, return (modality, path)
 // ---------------------------------------------------------------------------
 
-/// Decode base64 the way Python's `base64.b64decode(..., validate=False)` does:
-/// non-alphabet bytes are discarded rather than erroring. In practice the only
-/// such bytes are the interior newlines of line-wrapped payloads (what the
-/// `base64` CLI and `base64.encodebytes` emit by default), so stripping ASCII
-/// whitespace before a strict decode matches Python without accepting garbage.
+/// Client base64 decoded as the Python frontend's `_decode_base64_payload`
+/// does: whitespace anywhere is dropped (line-wrapped payloads), missing `=`
+/// padding is restored (some OpenAI clients strip it), and anything else
+/// outside the standard alphabet is refused.
 fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD.decode(compact.as_bytes())
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+    use base64::engine::DecodePaddingMode;
+    // Python ignores the unused low bits of the last symbol too
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    // Python's `str.split()` whitespace: Unicode's plus the C0 separators
+    let compact: String = payload
+        .chars()
+        .filter(|c| !c.is_whitespace() && !('\u{1c}'..='\u{1f}').contains(c))
+        .collect();
+    LENIENT.decode(compact.as_bytes())
 }
 
 fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
@@ -359,6 +371,31 @@ mod tests {
             "response_format 'mp3' cannot be streamed by this server; use one of: wav, pcm"
         );
         assert!(check_audio_format("mp3", false).unwrap_err().contains("not supported by the Rust frontend"));
+    }
+
+    #[test]
+    fn base64_decodes_what_the_python_frontend_decodes() {
+        // each payload's outcome in `media_io._decode_base64_payload` on CPython 3.12
+        let a: Option<&[u8]> = Some(b"a");
+        for (payload, want) in [
+            ("YQ==", a),
+            ("YQ", a), // the client stripped the padding
+            ("YQ=", a),
+            ("YR==", a), // unused low bits set
+            ("YQ\r\n==\n", a),
+            ("Y Q\u{a0}\u{b}\u{1c}\u{85}\u{3000}", a),
+            ("YWJjZA", Some(&b"abcd"[..])),
+            ("", Some(&b""[..])),
+            ("Y", None),
+            ("Y==", None),
+            ("YQ===", None),
+            ("YQ==YQ==", None),
+            ("====", None),
+            ("-_", None),
+            ("YQ\u{200b}", None),
+        ] {
+            assert_eq!(decode_b64_lenient(payload).ok().as_deref(), want, "{payload:?}");
+        }
     }
 
     #[test]

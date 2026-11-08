@@ -243,6 +243,52 @@ def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields,
     assert rust_files == _files(want.file_paths) == {"image": [base64.b64decode(PNG)]}
 
 
+def _wrapped(text: str, width: int, sep: str) -> str:
+    return sep.join(text[i:i + width] for i in range(0, len(text), width))
+
+
+# PNG as clients send it, by whether the Python adapter takes it. Its base64 is
+# padded and holds "+" and "/".
+IMAGE_URLS = {
+    "padded": (f"data:image/png;base64,{PNG}", True),
+    "unpadded": (f"data:image/png;base64,{PNG.rstrip('=')}", True),
+    "wrapped": ("data:image/png;base64," + _wrapped(PNG, 76, "\n") + "\n", True),
+    "wrapped-unpadded": ("data:image/png;base64," + _wrapped(PNG.rstrip("="), 64, "\r\n"), True),
+    "unicode-spaces": (f"data:image/png;base64,{PNG[:8]}\u00a0{PNG[8:]}\u3000", True),
+    "unused-bits-set": (f"data:image/png;base64,{PNG[:-2]}J=", True),
+    "excess-padding": (f"data:image/png;base64,{PNG}==", False),
+    "url-safe": ("data:image/png;base64," + PNG.replace("+", "-").replace("/", "_"), False),
+    "cut-mid-quad": (f"data:image/png;base64,{PNG[:-3]}", False),
+}
+
+
+@pytest.mark.parametrize("cls", CHAT_CLASSES)
+def test_an_image_chat_takes_the_data_urls_the_python_adapter_takes(cls, tmp_path):
+    model = _model_of(cls)
+    stub = _StubAPIServer()
+    with _model_stack(model, stub) as (port, _upload):
+        for name, (url, taken) in IMAGE_URLS.items():
+            body = {"messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": url}},
+                {"type": "text", "text": "Read the page."},
+            ]}]}
+            try:
+                want = ADAPTER_REGISTRY[model].chat_to_request(_python_request(body), tmp_path)
+            except ValueError:
+                want = None
+            assert (want is not None) == taken, name
+            before = len(stub.submitted)
+            status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+            if want is None:
+                assert status == 400 and len(stub.submitted) == before, (name, status, data)
+                continue
+            assert status == 200, (name, data)
+            sub = stub.submitted[-1]
+            assert (sub["text"], sub["in"], sub["mk"]) == (want.text, want.input_modalities, want.model_kwargs), name
+            assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts], name
+            assert _files(sub["files"]) == _files(want.file_paths) == {"image": [base64.b64decode(PNG)]}, name
+
+
 # ── both frontends answer a chat the same way ────────────────────────────────
 
 class _PythonServer:
@@ -282,11 +328,18 @@ def _normalized(status, data: bytes, stream: bool):
     return status, [e if e == "[DONE]" else blank(json.loads(e)) for e in events]
 
 
+def _image_chat(url: str) -> dict:
+    return {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}]}
+
+
 PARITY_CASES = {
     "chat": ({"messages": [{"role": "user", "content": "Привет, 世界"}], "max_tokens": 8}, False),
     "chat-stream": ({"messages": [{"role": "user", "content": "안녕"}], "stream": True}, True),
     "tool-call": ({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "required"}, False),
     "bad-role": ({"messages": [{"role": "tool", "content": "42"}]}, False),
+    # remote fetch is off unless MSTAR_ALLOW_REMOTE=1, and a server path never reads
+    "remote-image": (_image_chat("https://example.com/page.png"), False),
+    "server-path-image": (_image_chat("/etc/hosts"), False),
 }
 
 
@@ -298,6 +351,7 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
 
     from mstar.api_server import entrypoint
 
+    monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
     body, stream = PARITY_CASES[case]
     monkeypatch.setattr(entrypoint, "api_server", _PythonServer(model, tmp_path))
     py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
