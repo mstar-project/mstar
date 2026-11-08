@@ -96,7 +96,7 @@ class TestApproval(unittest.TestCase):
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "checks": ["correctness"], "gpus": 1}}
             with workspace(), unittest.mock.patch.object(bot, "run", fake):
-                return gpu_review.reasons_not_to_approve(7, "0123456789", verdict, since, r)[0]
+                return gpu_review.decide(gpu_review.approval_facts(7, "0123456789", verdict, since, r)).why
 
         self.assertEqual(why("pass", "full"), [])
         self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), ["the review skipped files"],

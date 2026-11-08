@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import bot
@@ -506,44 +507,94 @@ def untestable(pull, changes, review):
             *([f"couldn't read the diff of `{unread[0]}` to check what the live test can't cover"] if unread else [])]
 
 
-def reasons_not_to_approve(pr, sha, verdict, since, review):
-    """(why not, engine files, the conditions only this rule knows): the rule's failed conditions, the files
-    that make an approval one that doesn't count, and what the checklist has no field for, its `extra`."""
+@dataclass(frozen=True)
+class ApprovalFacts:
+    """Everything the approval rule (decide) looks at, gathered first so the rule reads as plain conditions."""
+    head_moved: bool
+    author_access: str
+    verdict: str
+    # The review chose `none` and the workflow let it stand (the last live test passed on an ancestor, or
+    # there is none and the review didn't build on an earlier one or the PR changes no runtime code).
+    review_chose_none: bool
+    since: str  # the last passing live test this run built on, or ""
+    untestable: tuple  # what the live test can't cover here (untestable)
+    too_many_files: bool  # the changed-file list is over GitHub's limit, so it couldn't be checked
+    blocked: tuple  # files that rule out any approval (the bot's rules, CI, dependencies, toolchains)
+    engine: tuple  # area/engine or area/resources files, which make an approval a comment instead
+    runtime: bool  # the PR touches runtime code
+    risk_level: str
+    questions: int
+    to_fix_first: tuple  # what the review left open (to_fix_first)
+
+
+def approval_facts(pr, sha, verdict, since, review):
+    """The facts of this PR at `sha`, from GitHub and the review; the network reads the rule needs."""
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
-    why, engine = [], []
-    if pull["head"]["sha"] != sha:
-        why.append("the PR has new commits since the reviewed one")
-    perm = bot.permission(REPO, pull["user"]["login"])
-    if perm not in WRITE:
-        why.append(f"the author's access is {perm}, not write")
-    # `skipped`: the review chose `none` and the workflow let it stand (the last live test passed on an
-    # ancestor, or there is none and the review didn't build on an earlier one or the PR changes no
-    # runtime code). On runtime code it counts only after that passing live test (below).
-    if not (verdict == "pass" or (verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none")):
-        why.append(f"the live test's verdict is {verdict}" + ("; judge its 👂 rows" if verdict == "partial" else ""))
     changes = changed_files(pull["base"]["sha"], sha)
-    why += untestable(pull, changes or [], review)
-    if changes is None:
-        why.append("the file list is too long to check")
-    else:
-        blocked, engine, runtime = file_gate(file_names(changes), ROOT)
-        if blocked:
-            why.append("touches the review's rules or dependencies: " + ", ".join(blocked[:8])
-                       + (" and more" if len(blocked) > 8 else ""))
-        if verdict == "skipped" and not since and runtime:
-            why.append("no GPU run on runtime code")
-    extra = list(why)
-    if engine:
-        extra.append("touches area/engine or area/resources, so the bot's approval wouldn't count: "
-                     + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else ""))
-    if (review.get("risk") or {}).get("level") != "low":
-        level = (review.get("risk") or {}).get("level", "unrated")
-        why.append(f"the review rated the design risk {level}: a maintainer owns the decisions its summary's "
-                   "\"What's left for you\" lists")
-    if review.get("questions"):
-        why.append(f"{len(review['questions'])} open question(s)")
-    why += to_fix_first(review, pr, "stacked-above.json")
-    return why, engine, extra
+    blocked, engine, runtime = file_gate(file_names(changes), ROOT) if changes is not None else ((), (), False)
+    return ApprovalFacts(
+        head_moved=pull["head"]["sha"] != sha,
+        author_access=bot.permission(REPO, pull["user"]["login"]),
+        verdict=verdict,
+        review_chose_none=verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none",
+        since=since,
+        untestable=tuple(untestable(pull, changes or [], review)),
+        too_many_files=changes is None,
+        blocked=tuple(blocked),
+        engine=tuple(engine),
+        runtime=bool(runtime),
+        risk_level=(review.get("risk") or {}).get("level", "unrated"),
+        questions=len(review.get("questions") or ()),
+        to_fix_first=tuple(to_fix_first(review, pr, "stacked-above.json")),
+    )
+
+
+@dataclass(frozen=True)
+class Decision:
+    """What decide concludes. `why` is every reason not to approve: `rule`, the conditions only this rule
+    knows, then `review`, what the review itself left open, which the checklist already lists.
+    `engine` turns an approval into a comment that doesn't count."""
+    rule: tuple
+    engine: tuple
+    review: tuple
+
+    @property
+    def why(self):
+        return [*self.rule, *self.review]
+
+    def extra(self):
+        """What the checklist has no field for."""
+        engine = ("touches area/engine or area/resources, so the bot's approval wouldn't count: "
+                  + ", ".join(f"`{f}`" for f in self.engine[:8]) + (" and more" if len(self.engine) > 8 else ""))
+        return [*self.rule, engine] if self.engine else list(self.rule)
+
+
+def decide(f):
+    """The approval rule: pure, from ApprovalFacts."""
+    rule = []
+    if f.head_moved:
+        rule.append("the PR has new commits since the reviewed one")
+    if f.author_access not in WRITE:
+        rule.append(f"the author's access is {f.author_access}, not write")
+    if not (f.verdict == "pass" or f.review_chose_none):
+        note = "; judge its 👂 rows" if f.verdict == "partial" else ""
+        rule.append(f"the live test's verdict is {f.verdict}{note}")
+    rule += f.untestable
+    if f.too_many_files:
+        rule.append("the file list is too long to check")
+    if f.blocked:
+        rule.append("touches the review's rules or dependencies: " + ", ".join(f.blocked[:8])
+                    + (" and more" if len(f.blocked) > 8 else ""))
+    # A review's `none` counts on runtime code only after a passing live test.
+    if f.verdict == "skipped" and not f.since and f.runtime:
+        rule.append("no GPU run on runtime code")
+    review = []
+    if f.risk_level != "low":
+        review.append(f"the review rated the design risk {f.risk_level}: a maintainer owns the decisions its "
+                      "summary's \"What's left for you\" lists")
+    if f.questions:
+        review.append(f"{f.questions} open question(s)")
+    return Decision(rule=tuple(rule), engine=f.engine, review=(*review, *f.to_fix_first))
 
 
 def refresh_above():
@@ -568,13 +619,13 @@ def approvals_on():
     return (bot.read(bot.api, f"repos/{REPO}/actions/variables/REVIEW_APPROVALS") or {}).get("value") == "on"
 
 
-def left_for_you(pr, review, extra):
+def left_for_you(pr, review, decision):
     stacked = render_summary.stacked_above("stacked-above.json")
-    return render_summary.checklist(review, review_threads(pr), stacked, extra)
+    return render_summary.checklist(review, review_threads(pr), stacked, decision.extra())
 
 
 def approve(out, pr, head_sha, runner_temp, verdict, since=""):
-    """Approve the PR when the rule holds (reasons_not_to_approve) and REVIEW_APPROVALS is on, as a comment
+    """Approve the PR when the rule holds (decide) and REVIEW_APPROVALS is on, as a comment
     that doesn't count toward required reviews when it touches area/engine or area/resources. What the
     live-test comment says of it goes in $RUNNER_TEMP/decision.md: the approval line, or the checklist of
     what's left, which with approvals off also says what the rule would have done; then no GitHub review
@@ -582,16 +633,17 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
     pr, since = int(pr), commit(since) if since else ""
     review = json.loads(Path("review.json").read_text())
     refresh_above()
-    why, engine, extra = reasons_not_to_approve(pr, head_sha, verdict, since, review)
+    outcome = decide(approval_facts(pr, head_sha, verdict, since, review))
     decision = Path(runner_temp, "decision.md")
     if not approvals_on():
-        decision.write_text(f"Approvals are off (`REVIEW_APPROVALS`). By the rule this would {'not ' if why else ''}be "
-                            f"approved.\n\n{left_for_you(pr, review, extra)}\n")
+        decision.write_text(f"Approvals are off (`REVIEW_APPROVALS`). By the rule this would "
+                            f"{'not ' if outcome.why else ''}be approved.\n\n{left_for_you(pr, review, outcome)}\n")
         return
-    if why:
-        print("not approved: " + "; ".join(why))
-        decision.write_text(left_for_you(pr, review, extra) + "\n")
+    if outcome.why:
+        print("not approved: " + "; ".join(outcome.why))
+        decision.write_text(left_for_you(pr, review, outcome) + "\n")
         return
+    engine = outcome.engine
     tested = "the live test passed on it" if verdict == "pass" else "the review found nothing that needs a GPU run"
     if engine:  # a comment, not an approval, so it can't count toward required reviews
         body = (f"The review bot would approve `{head_sha[:7]}`: low design risk, no open P0–P2 finding, and "
