@@ -1,6 +1,6 @@
-"""The worker's half of preemption: the moves a paged KV pool chooses when a request runs short or its oldest waiting
-request doesn't fit, made through the engine, and the counts the metrics read. The pool keeps every victim, so nothing
-here outlives a call."""
+"""The worker's half of preemption: the moves a paged KV pool chooses when a request runs short or a waiting request
+doesn't fit, made through the engine, and the counts the metrics read. The pool keeps every victim, so nothing here
+outlives a call."""
 
 from __future__ import annotations
 
@@ -94,11 +94,11 @@ class Preemption:
         A walk that moved nothing runs again only once the refusals or what the pools can move have changed. A
         refusal's mark changes once its room grows, but a request becomes droppable when its ids land, which grows
         nothing."""
-        if not any(kv.cache.any_parked() for kv in self._caches.values()):
+        if not any(kv.cache.any_stalled() for kv in self._caches.values()):
             return
         engine = self._engine_manager.engine
         refusals = engine.refusals()
-        walked = (refusals, [kv.cache.parked_moves(self._droppable(kv, engine)) for kv in self._caches.values()])
+        walked = (refusals, [kv.cache.stalled_moves(self._droppable(kv, engine)) for kv in self._caches.values()])
         if walked == self._walked:
             return
         self._walked = None

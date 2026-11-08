@@ -494,7 +494,7 @@ def test_a_waiting_request_the_runner_admits_before_its_victims_land_takes_no_mo
     assert kv._allotments["w0"].pages == pages, "the victims' moves grew the allotment of a request already admitted"
 
 
-def test_a_request_no_move_covers_waits_in_the_queue_until_its_whole_shortage_fits():
+def test_a_request_no_move_covers_waits_until_its_whole_shortage_fits():
     kv = _pool()
     _running(kv, "a", 1, arrival=0)
     _running(kv, "b", 4, arrival=1)
@@ -665,7 +665,7 @@ def test_the_page_check_catches_a_host_page_counted_as_room_that_eviction_cant_f
 
 
 def test_the_page_check_catches_a_request_on_the_host_that_kept_a_device_page():
-    """A request waiting in the queue on the host holds no page on the device. A move that copied only some of its
+    """A request waiting on the host holds no page on the device. A move that copied only some of its
     pages would leave the request holding a device page, which the debug page check raises on."""
     kv = _pool()
     kv._cpu_pool = host._HostPool(64)
