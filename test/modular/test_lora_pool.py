@@ -492,18 +492,20 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
     assert asked and "No eviction candidate" in caplog.text
 
 
-def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
-    """LoRA rows are per request, not per SP shard: the build refuses SP > 1 at startup,
-    and takes TP with SP 1."""
+@pytest.mark.parametrize("axis", ["sp", "cfg"])
+def test_a_node_running_sequence_or_cfg_parallelism_refuses_lora(adapters, axis):
+    """LoRA rows are per request over the whole batch, not per SP shard or CFG branch: the
+    build refuses either axis above 1 at startup, and takes TP with both at 1."""
     from mstar.distributed.communication import CommGroup, JointGroups
 
     _, paths = adapters
 
-    def build(sp_group):
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=sp_group, instance=sp_group)
+    def build(group):
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=group)
+        setattr(groups, f"{axis}_group", group)
         return LoraAdapterPool.build(make_spec(paths), EngineResourceInfo(device=CPU, joint_comm_group=groups))
 
-    with pytest.raises(ValueError, match=r"sequence parallelism \(SP=2\)"):
+    with pytest.raises(ValueError, match=rf"at {axis}_size 2, which LoRA does not support"):
         build(CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]))
     assert build(CommGroup.trivial()).targets
 

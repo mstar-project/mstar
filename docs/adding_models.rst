@@ -1355,9 +1355,10 @@ ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
 agreement holds the pool's lock, so the main thread's ingests and removes go on
 meanwhile.
 
-A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
-out per request, while each SP rank holds a shard of the tokens, so building the pool
-refuses the deployment.
+A node that runs sequence parallelism (SP > 1) or CFG parallelism (cfg_size > 1) cannot
+serve LoRA yet: the pool lays rows out per request over the whole batch, while each SP rank
+holds a shard of the tokens and each CFG rank one guidance branch's rows, so building the
+pool refuses the deployment.
 
 Step 3 — Declare the computation graph
 --------------------------------------

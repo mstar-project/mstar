@@ -286,14 +286,16 @@ class LoraAdapterPool(Resource):
         rank, world_size, agree, decides = 0, 1, None, True
         joint = info.joint_comm_group
         if joint is not None:
-            if joint.sp_group.world_size > 1:
-                raise ValueError(
-                    f"LoRA resource {spec.resource_key!r} serves a node that runs sequence "
-                    f"parallelism (SP={joint.sp_group.world_size}), which LoRA does not "
-                    "support: its rows are laid out per request, while each SP rank holds "
-                    "a shard of the tokens. Serve this node without SP, or drop the "
-                    "'lora:' block"
-                )
+            # its rows are laid out per request over the whole batch, and these axes hand
+            # each rank only part of it
+            for axis, part in (("sp", "a shard of the tokens"), ("cfg", "one guidance branch's rows")):
+                if (size := getattr(joint, f"{axis}_group").world_size) > 1:
+                    raise ValueError(
+                        f"LoRA resource {spec.resource_key!r} serves a node at {axis}_size {size}, "
+                        "which LoRA does not support: its rows are laid out per request, while "
+                        f"each {axis.upper()} rank holds {part}. Serve this node at {axis}_size 1, "
+                        "or drop the 'lora:' block"
+                    )
             # the base linears split over the TP group
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size
             if joint.world_size > 1:
