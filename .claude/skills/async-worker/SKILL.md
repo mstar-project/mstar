@@ -27,7 +27,7 @@ The others: `MSTAR_PRE_PLAN_SPEC`, `MSTAR_MAX_CONSECUTIVE_SPEC_STEPS`, `MSTAR_SP
 
 The loop is circular, so this starts at an arbitrary point: **batch N is running on the GPU and postprocess for N-1 has just finished.** The code carries its own stage comments 1-3; the substages below are what they expand to.
 
-**0. Deferred teardown.** `StepPipeline._deferred_teardown`: the removes `RequestLifecycle.removes_ready` says are ready, then `_fail_requests` on `admission.take_admit_errors()`, then the drains. The admit-error step is where a terminal refusal fails: requests a resource refused for good since last pass, in a readiness scan or in a step's admit (`Admission.requeue`), fail here, one pass after the refusal.
+**0. Deferred teardown.** `StepPipeline._deferred_teardown`: the removes `RequestLifecycle.removes_ready` says are ready, then `_report_failures`, then the drains. A terminal refusal, in a readiness scan or in a step's admit (`Admission.requeue`), fails its request at once (`RequestLifecycle.fail`), so no later scan takes it; this is where the conductor hears of the refusals since last pass.
 
 **1. CPU preamble — overlaps GPU(N).** `InputIngest`: `process_messages` (ZMQ), `check_ready_tensors` (read tensors in from other ranks), `poll_stream_buffers`. Removes and drains are only recorded there; the pipeline runs the ready ones at the end of the preamble. Every NVTX range here uses `synchronize=False`, because a `torch.cuda.synchronize()` would drain the in-flight GPU work and destroy the overlap.
 

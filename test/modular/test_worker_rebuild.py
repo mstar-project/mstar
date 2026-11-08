@@ -265,7 +265,7 @@ def test_a_terminal_refusal_of_a_rebuild_row_fails_only_its_request():
         admit_error=SimpleNamespace(terminal=True, request_ids=(R,), message="too long"),
     ))
 
-    assert w.admission.take_admit_errors().keys() == {R} and w.seen == [A], (
+    assert w.failed.keys() == {R} and w.seen == [A], (
         "the other row would fail, or go back as a row it never was"
     )
 

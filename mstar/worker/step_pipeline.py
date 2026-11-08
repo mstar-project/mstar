@@ -220,9 +220,9 @@ class StepPipeline:
         self._count_turn(self.pending)
         laps.skip()
         self._apply_removes(self.in_flight_rids)
-        # Requests a resource declared unservable during last pass's readiness
-        # scans. They are in no batch, so nothing else would ever fail them.
-        self._fail_requests(self.admission.take_admit_errors())
+        # Requests a resource refused for good since last pass, in a readiness
+        # scan or a step's admit (``Admission``), which failed them then.
+        self._report_failures()
         self._apply_drains(self.in_flight_rids)
         laps.lap("teardown")
 

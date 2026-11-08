@@ -332,7 +332,7 @@ class Worker:
             streams=self.streams,
         )
         self.lifecycle = RequestLifecycle(layout=layout, graph_runtime=services.graph_runtime)
-        self.admission = Admission(services=services, layout=layout)
+        self.admission = Admission(services=services, layout=layout, lifecycle=self.lifecycle)
         # TP async scheduling: the leader speculates N+1 during forward N and
         # broadcasts it at once; followers rebuild it during their own N.
         self.lockstep = Lockstep(

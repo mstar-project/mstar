@@ -72,9 +72,9 @@ def make_scheduler(
         combined_walk_of=combined_walk_of or {}, chunk_loops=chunk_loops or ChunkLoops(),
         side_keys=frozenset(side_keys),
     )
-    admission = Admission(services=services, layout=layout)
-    lockstep = Lockstep(services=services, layout=layout, admission=admission, async_sched=async_sched)
     lifecycle = RequestLifecycle(layout=layout, graph_runtime=graph_runtime)
+    admission = Admission(services=services, layout=layout, lifecycle=lifecycle)
+    lockstep = Lockstep(services=services, layout=layout, admission=admission, async_sched=async_sched)
     return MicroScheduler(
         services=services, layout=layout, lifecycle=lifecycle, lockstep=lockstep,
         admission=admission, model_config=model_config, **scheduler_kwargs,
@@ -86,6 +86,7 @@ def bound(scheduler: MicroScheduler, request_state=None, *, runtime=None) -> Mic
     a test that builds a fresh fake per call."""
     if runtime is not None:
         scheduler.runtime = runtime
+        scheduler.lifecycle._runtime = runtime
         scheduler.lockstep._runtime = runtime
         scheduler.admission._runtime = runtime
     if request_state is not None:
@@ -154,7 +155,7 @@ def make_worker(
         setattr(worker, name, given if given is not None else build())
 
     component("lifecycle", lambda: RequestLifecycle(layout=layout, graph_runtime=services.graph_runtime))
-    component("admission", lambda: Admission(services=services, layout=layout))
+    component("admission", lambda: Admission(services=services, layout=layout, lifecycle=worker.lifecycle))
     component("lockstep", lambda: Lockstep(
         services=services, layout=layout, admission=worker.admission, async_sched=async_sched,
     ))
