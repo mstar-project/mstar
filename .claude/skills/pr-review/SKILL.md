@@ -77,9 +77,9 @@ is its turns times its context: every turn re-reads everything read so far.
   the finding asks, and a move, rename or deleted file isn't a fix (#392, above #387, deleted
   `dsa.py` but still planned DSA in `preprocess`). A partial fix is a plain open finding. Before
   folding a finding into another, check its callers at every stacked head. When you can't read the
-  PR above (no shell, as in the bot), a finding said to be fixed there stays a plain open finding
-  that adds "said to be fixed in #N, not checked". If the PR carries another PR's commit, say
-  whether it is byte-identical.
+  PR above (the bot reads only the diffs its workflow fetched), a finding said to be fixed there
+  stays a plain open finding that adds "said to be fixed in #N, not checked". If the PR carries
+  another PR's commit, say whether it is byte-identical.
 - **Rules.** `AGENTS.md` every review; then the skills it points to for the layers the PR touches:
   `async-worker` before judging any worker-loop change, `engine-resources` for resources,
   `prefix-caching` for KV, `benchmarking` for performance claims, `writing-prs` for the description,

@@ -8,7 +8,8 @@ from an earlier run counts until a later review judges it fixed, fixed above or 
 changes its lines. Run by claude-review.yml with the default branch checked out:
 
     python3 .github/review/render_summary.py --schema     # for --json-schema
-    python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json < output.json
+    python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json \
+        --above stacked-above.json < output.json
     python3 .github/review/render_summary.py --state --mode thorough < summary-comment-body   # what a re-review reads
 """
 import argparse
@@ -16,6 +17,7 @@ import base64
 import json
 import re
 import sys
+from pathlib import Path
 
 # Lets the workflow find earlier summaries to hide as outdated.
 MARKER = "<!-- claude-review-summary -->"
@@ -26,7 +28,8 @@ STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
 BOTS = ("mstar-review", "github-actions")
 TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
-# fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open.
+# fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
+# PR is one the review was given the diff of (stacked-above.json).
 STATUSES = ("fixed", "fixed_above", "open", "moot")
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
@@ -41,7 +44,7 @@ SCHEMA = {
                 "location": {"type": "string", "description": "path:line"},
                 "detail": {"type": "string"},
                 # Set only when a PR stacked above, whose code the review read, fixes it for real.
-                "fixed_in": {"type": "integer", "description": "that PR number"},
+                "fixed_in": {"type": "integer", "minimum": 1, "description": "that PR number"},
             },
             "required": ["priority", "claim", "location", "detail"],
         }},
@@ -58,7 +61,8 @@ SCHEMA = {
                 "ref": {"type": "string", "description": "inline comment id, or the outside_diff location"},
                 "priority": {"type": "string", "enum": list(PRIORITIES)},
                 "status": {"type": "string", "enum": list(STATUSES)},
-                "fixed_in": {"type": "integer", "description": "with fixed_above: the PR stacked above that fixes it"},
+                "fixed_in": {"type": "integer", "minimum": 1,
+                             "description": "with fixed_above: the PR stacked above that fixes it"},
                 "why": {"type": "string"},
             },
             "required": ["ref", "priority", "status", "why"],
@@ -80,14 +84,36 @@ SCHEMA = {
 FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.</sub>"
 
 
-def open_findings(review, pages):
+def stacked_above(path):
+    """The numbers of the PRs stacked above whose diffs the review was given: stacked-above.json, which
+    the workflow leaves out when a fetch failed. None without it."""
+    return [int(pr["number"]) for pr in json.loads(Path(path).read_text())] if Path(path).exists() else []
+
+
+def judged(review, stacked):
+    """The review's findings as they count. One said to be fixed in a PR stacked above is fixed there only
+    when that PR is one of `stacked` (stacked_above); otherwise the claim wasn't checked, and the finding
+    is open and says so."""
+    def unchecked(f):
+        return f"Said to be fixed in #{f.get('fixed_in', '?')}, not checked."
+    return {**review,
+            "outside_diff": [f if not f.get("fixed_in") or f["fixed_in"] in stacked else
+                             {**{k: v for k, v in f.items() if k != "fixed_in"},
+                              "detail": f"{f['detail']} {unchecked(f)}"} for f in review["outside_diff"]],
+            "prior_findings": [f if f["status"] != "fixed_above" or f.get("fixed_in") in stacked else
+                               {**f, "status": "open", "why": f"{f['why']} {unchecked(f)}"}
+                               for f in review.get("prior_findings", [])]}
+
+
+def open_findings(review, pages, stacked):
     """(where, priority) of every open finding: the bot's inline threads, this run's findings outside
     the diff, and the earlier findings a later review judged still open. A thread someone resolved stays
-    open: only a later review that judged it fixed or moot, or a commit that outdated it, clears it. An
-    untagged bot thread counts as a P2, since its priority is unknown. A finding a PR stacked above
-    fixes isn't open: it lands with that PR. `pages` are the PR's review threads, from
-    `gh api graphql --paginate --slurp`."""
-    prior = review.get("prior_findings", [])
+    open: only a later review that judged it fixed, fixed above or moot, or a commit that outdated it,
+    clears it. An untagged bot thread counts as a P2, since its priority is unknown. A finding a PR
+    stacked above fixes isn't open: it lands with that PR, when that PR is one of `stacked` (judged).
+    `pages` are the PR's review threads, from `gh api graphql --paginate --slurp`."""
+    review = judged(review, stacked)
+    prior = review["prior_findings"]
     cleared = {f["ref"] for f in prior if f["status"] != "open"}
     found, counted = [], set()
     for page in pages:
@@ -107,8 +133,9 @@ def open_findings(review, pages):
     return found
 
 
-def status(review, pages, head, mode):
-    found = [p for _, p in open_findings(review, pages)]
+def status(review, pages, head, mode, stacked):
+    found = [p for _, p in open_findings(review, pages, stacked)]
+    review = judged(review, stacked)
     counts = {p: found.count(p) for p in PRIORITIES}
     if counts["P0"] or counts["P1"]:
         icon = "🔴"
@@ -116,7 +143,10 @@ def status(review, pages, head, mode):
         icon = "🟡"
     else:
         icon = "🟢"
-    text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No findings"
+    fixed_above = sum(f["status"] == "fixed_above" for f in review["prior_findings"]) \
+        + sum(bool(f.get("fixed_in")) for f in review["outside_diff"])
+    text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No open findings" + (
+        f"; {fixed_above} fixed above" if fixed_above else "")
     line = f"{icon} **{text}** on `{head[:7]}`, {mode} review"
     if review.get("risk"):
         line += f" · design risk **{review['risk']['level']}**: {review['risk']['reason']}"
@@ -127,8 +157,10 @@ def above(finding):
     return f"Fixed in #{finding.get('fixed_in', '?')} above; merge together with it."
 
 
-def render(review, pages, head, mode):
-    parts = ["### Automated review", status(review, pages, head, mode)]
+def render(review, pages, head, mode, stacked):
+    """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above)."""
+    parts = ["### Automated review", status(review, pages, head, mode, stacked)]
+    review = judged(review, stacked)
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
@@ -189,6 +221,8 @@ def main():
     ap.add_argument("--head")
     ap.add_argument("--mode")
     ap.add_argument("--threads", help="the PR's review threads, from `gh api graphql --paginate --slurp`")
+    ap.add_argument("--above", help="stacked-above.json: the PRs stacked above whose diffs the review was given; "
+                                    "none when the file is missing")
     ap.add_argument("--state", action="store_true",
                     help="print the state a summary comment (stdin) carries, for a re-review in --mode")
     a = ap.parse_args()
@@ -200,7 +234,7 @@ def main():
     else:
         with open(a.threads) as f:
             pages = json.load(f)
-        sys.stdout.write(render(json.load(sys.stdin), pages, a.head, a.mode))
+        sys.stdout.write(render(json.load(sys.stdin), pages, a.head, a.mode, stacked_above(a.above)))
 
 
 if __name__ == "__main__":
