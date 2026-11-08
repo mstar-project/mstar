@@ -168,6 +168,23 @@ class TestSlurm(unittest.TestCase):
         self.globals["eras"] = eras_down
         self.assertEqual(len(launch(2)), 2, "an Eras outage would stop launches on the Slurm node too")
 
+    def test_an_eras_ssh_key_on_a_later_page_is_reused(self):
+        key = base64.b64encode(b"key").decode()
+        fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(b"key").digest()).decode().rstrip("=")
+        posts = []
+
+        def eras(method, path, body=None, params=None):
+            if method == "POST":
+                posts.append(path)
+                return {"id": "new"}
+            return {"items": [{"id": "k2", "fingerprint": fingerprint}]} if params.get("page_token") \
+                else {"items": [{"id": "k1", "fingerprint": "other"}], "next_page_token": "p2"}
+        self.addCleanup(self.globals.update, {"eras": self.globals["eras"]})
+        self.globals["eras"] = eras
+        self.assertEqual(GPU["eras_ssh_key_id"](f"ssh-ed25519 {key} me", "live-pr-1"), "k2",
+                         "a key on a later page would be registered again on every launch")
+        self.assertEqual(posts, [])
+
     def test_the_job_uses_the_shared_hf_cache(self):
         key = Path(tempfile.mkdtemp()) / "key.pub"
         key.write_text("ssh-ed25519 AAAA test")
