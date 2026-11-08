@@ -188,9 +188,9 @@ def _kernels(p: Problem) -> dict[str, Callable[[], Callable[[], torch.Tensor]]]:
         return make
 
     def torch_flash():
+        cu = p.cu.to(p.q.device)
         return lambda: torch.ops.aten._flash_attention_forward(
-            p.q, p.k, p.v, p.cu.to(p.q.device), p.cu.to(p.q.device), p.seq, p.seq, 0.0, False, False,
-            scale=p.head_dim ** -0.5)[0]
+            p.q, p.k, p.v, cu, cu, p.seq, p.seq, 0.0, False, False, scale=p.head_dim ** -0.5)[0]
 
     return {
         "flashinfer fa2 (graph wrapper)": via(Choice("flashinfer", {"backend": "fa2"})),
