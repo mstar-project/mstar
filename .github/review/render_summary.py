@@ -63,7 +63,7 @@ SCHEMA = {
         "risk": {"type": "object", "properties": {
             "level": {"type": "string", "enum": ["low", "medium", "high"]},
             "reason": {"type": "string"},
-            # Where a human reviewer should look, when the risk isn't low: each place and why.
+            # The design or direction decisions left to a human, when the risk isn't low: where each lives and why.
             "look_at": {"type": "array", "items": {"type": "object", "properties": {
                 "location": {"type": "string", "description": "path:line, or a function or class"},
                 "why": {"type": "string"},
@@ -119,7 +119,7 @@ def status(review, pages, head, mode):
     text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No findings"
     line = f"{icon} **{text}** on `{head[:7]}`, {mode} review"
     if review.get("risk"):
-        line += f" · risk **{review['risk']['level']}**: {review['risk']['reason']}"
+        line += f" · design risk **{review['risk']['level']}**: {review['risk']['reason']}"
     return line
 
 

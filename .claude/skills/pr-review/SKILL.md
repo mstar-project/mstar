@@ -1,15 +1,16 @@
 ---
 name: pr-review
-description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a risk rating. One session runs every pass itself (a big PR's slices go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, hard rules, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (defects only, P0–P2), thorough (all passes, P0–P3 and design questions) and gpu (thorough plus a live GPU test through live-pr-test). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
+description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a design-risk rating (whether a human must make a design or direction call). One session runs every pass itself (a big PR's slices go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, hard rules, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (defects only, P0–P2), thorough (all passes, P0–P3 and design questions) and gpu (thorough plus a live GPU test through live-pr-test). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
 ---
 
 # Reviewing an M* pull request
 
 Tell the author and the maintainers what they would want to know before merging: defects first,
-then problems with the description, then the questions worth asking, and how risky the change is.
+then problems with the description, then the questions worth asking, and which design or direction
+decisions the change leaves to a human.
 The review is advisory; a maintainer decides.
 
-This skill holds the method, the priority bar, what a finding must contain and the risk rating.
+This skill holds the method, the priority bar, what a finding must contain and the design-risk rating.
 `AGENTS.md` and the skills it links say what is true about the codebase, and win over general
 instinct. The review bot's prompt (`.github/review/review-prompt.md`) owns the input files,
 re-review rules, and how and where findings are posted; an agent outside the bot returns the same
@@ -442,30 +443,27 @@ does; read it.
   implementation, with a same-code control and the reference's own spread? Say what is missing; the
   check that would settle it goes in "how to confirm".
 
-## 6. Risk (all modes)
+## 6. Design risk (all modes)
 
-Rate the PR `low`, `medium` or `high`, with one sentence of reason. The rating describes the change,
-not the review's confidence. A part of the diff the review did not read or skipped makes it at least
-`medium`.
+The rating says whether a human must make a design or direction decision before this merges. It is
+not about correctness: findings and, in gpu mode, the live test own that. Rate the PR `low`,
+`medium` or `high`, with one sentence of reason. Touching a shared layer is not by itself `medium`
+or `high`; what counts is whether the PR decides something the team hasn't.
 
-- **`low`:** behaviour changes only inside one model, a benchmark, docs, tests or tooling; or shared
-  code changes with no behaviour change on any default path; and no new public API, config key, CLI
-  flag, env var or wire format; no change to dependencies, lockstep/TP decisions, kernels shared by
-  several models, or the trust boundary; and nothing the review left open at P0–P2.
-- **`high`:** changes default-path behaviour of a shared layer (worker loop, scheduler, conductor,
-  engine, resources/KV, graph runtime, transport, API server), lockstep or rank decisions, a
-  dependency pin or a kernel many models use, or security-relevant code; or is large enough that the
-  review could not read all of it.
-- **`medium`:** everything else.
+- **`low`:** follows the existing design and patterns: no new abstraction and no change to how a
+  shared layer is structured; no new public API, config key, CLI flag, env var or wire format; no
+  direction or trade-off the team hasn't already decided.
+- **`medium`:** a smaller design call a maintainer should still own: a model-local abstraction
+  other models will copy, say, or a debatable trade-off.
+- **`high`:** a new abstraction or an architecture change in a shared layer (worker, scheduler,
+  conductor, engine, resources, graph runtime, transport, API server), new public surface, a
+  commitment to a direction that is hard to undo, or a "do we want this at all" question.
 
-**When the risk isn't low, say where to look.** A human now has to approve it, so list every place
-they should read before merging: `path:line` (or the function or class) and, in a sentence, what
-could go wrong there and on which path. Name the risk, not the diff: "this early return skips the
-rank-0 broadcast on the failure path" rather than "changes the scheduler". For a risk in the
-abstractions or the architecture, spell the design out: the choice the PR made, the alternatives
+**When the risk isn't low, list the decisions.** For each: the choice the PR made, the alternatives
 (including the one Phase A derived), what the PR's choice does well, what would be better and what
-it would cost to change. Each of these is also a finding or a question if it is a defect or
-undecided; `look_at` is the reading list, not a second home for findings.
+changing it would cost, with the `path:line` (or the function or class) where the choice lives. A
+decision that is a defect is also a finding, and one the PR leaves open is also a question;
+`look_at` is the human's decision list, not a second home for findings.
 
 ## 7. Live test (gpu mode)
 
@@ -533,6 +531,6 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
   differs and which side is better, the north star and the PR's distance from it. Every gap named
   here is also a finding or a question.
 - **Skipped:** files not reviewed, on a diff too large to cover.
-- **Risk:** the rating and its sentence (§6).
+- **Risk:** the design-risk rating, its sentence and, above low, the decisions (§6).
 - **Live test** (gpu): `full`, `targeted` or `none`, with the reason, and the fewest GPUs the largest
   config it needs runs on (§7).

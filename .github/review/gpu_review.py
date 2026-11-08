@@ -314,7 +314,8 @@ def reasons_not_to_approve(a, review):
         why.append(f"the live test's verdict is {a.verdict}")
     if (review.get("risk") or {}).get("level") != "low":
         level = (review.get("risk") or {}).get("level", "unrated")
-        why.append(f"the review rated the risk {level} (its summary's \"Where to look\" lists what to read)")
+        why.append(f"the review rated the design risk {level}: a maintainer owns the decisions its summary's "
+                   "\"Where to look\" lists")
     if review.get("questions"):
         why.append(f"{len(review['questions'])} open question(s)")
     if review.get("skipped"):
@@ -342,15 +343,15 @@ def cmd_approve(a):
             Path(a.why).write_text("; ".join(why))
         return
     if engine:  # a comment, not an approval, so it can't count toward required reviews
-        body = (f"The review bot would approve `{a.sha[:7]}`: low risk, no open P0–P2 finding, and the live test "
-                "passed on it. This doesn't count toward required reviews, because the change touches "
+        body = (f"The review bot would approve `{a.sha[:7]}`: low design risk, no open P0–P2 finding, and the live "
+                "test passed on it. This doesn't count toward required reviews, because the change touches "
                 "area/engine or area/resources ("
                 + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else "") + ").")
         gh("api", "-X", "POST", f"repos/{REPO}/pulls/{a.pr}/reviews", "-f", f"commit_id={a.sha}",
            "-f", "event=COMMENT", "-f", f"body={body}")
         print("approval=comment")
         return
-    body = (f"Approved by the review bot on `{a.sha[:7]}`: low risk, no open P0–P2 finding, and the live test "
+    body = (f"Approved by the review bot on `{a.sha[:7]}`: low design risk, no open P0–P2 finding, and the live test "
             "passed. A push dismisses it.")
     gh("api", "-X", "POST", f"repos/{REPO}/pulls/{a.pr}/reviews", "-f", f"commit_id={a.sha}",
        "-f", "event=APPROVE", "-f", f"body={body}")
