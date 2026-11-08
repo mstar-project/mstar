@@ -7,10 +7,8 @@ forwards each teardown stamped with the last step it has broadcast. A follower h
 until it has popped that step, and reads no message between popping a step and the admit
 fence at the top of the next pass, so it lands after that admit. Rank 0 lands it there too.
 When the follower drops a step it popped, it tears the held ones down before it takes the
-next. A removal deferred behind step N is retried once N is post-processed, when N+1 is
-speculated, broadcast and maybe not yet admitted; but the teardown defers it again
-while N is still the step in flight, and the next pass tears it down behind N+1's admit
-fence. A removal that reaches rank 0 once N is done, with nothing in flight, lands before
+next. A removal deferred behind step N is torn down at the next pass's teardown point, behind
+N+1's admit fence. A removal that reaches rank 0 once N is done, with nothing in flight, lands before
 N+1 is sent; a follower still running N defers it, and tears it down once N is done, before
 it takes N+1. The order matters as well: the free list hands pages back out in the order
 they were freed, so another order gives a follower other page ids than rank 0's.
