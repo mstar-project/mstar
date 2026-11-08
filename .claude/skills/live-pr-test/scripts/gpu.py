@@ -103,7 +103,10 @@ def http(method: str, url: str, key_env: str, body: dict | None = None, params: 
             except ValueError:  # a proxy's error page: the request may still have been acted on
                 raise ApiError(-1, f"{method} {url}: a reply that is not JSON: {raw[:200]!r}") from None
         except urllib.error.HTTPError as e:
-            raw = e.read().decode(errors="replace")
+            try:
+                raw = e.read().decode(errors="replace")
+            except (OSError, HTTPException):  # the error body itself was cut off
+                raw = ""
             try:
                 parsed = json.loads(raw)
             except ValueError:
@@ -421,14 +424,16 @@ def cmd_launch(args, cfg):
                 iid = runpod("POST", "/pods", body, retry=False)["id"]
             else:
                 iid = lambda_("POST", "/instance-operations/launch", body, retry=False)["instance_ids"][0]
-        except ApiError as e:
-            if e.status == 409 or re.search(r"capacity|no longer any instances|not available",
-                                            f"{e.code()} {e.body}", re.I):
-                die(f"no availability: {o['id']} was taken before launch ({e}); rerun offers")
-            if e.status not in (-1, 429) and e.status < 500:
-                raise  # refused (a bad config, a bad image): nothing was created
-            # The provider may have made it before the answer was lost. Until it is found, the
-            # ledger holds its cost under its name, outside this lock.
+        except Exception as e:  # noqa: BLE001 - anything after the send may have made the instance
+            if isinstance(e, ApiError) and e.status == 429:
+                die(f"rate-limited on create ({e}); nothing was made, try again in a minute")
+            if isinstance(e, ApiError) and 0 < e.status < 500:  # refused: nothing was made
+                if e.status == 409 or re.search(r"capacity|no longer any instances|not available",
+                                                f"{e.code()} {e.body}", re.I):
+                    die(f"no availability: {o['id']} was taken before launch ({e}); rerun offers")
+                raise  # a bad config, a bad image
+            # A 5xx, a lost connection, a reply without an id: the provider may have made it. Until
+            # it is found by name, the ledger holds its cost, and a watchdog its deadline.
             lost, iid = e, None
         key = pending if lost else f"{o['provider']}:{iid}"
         now = time.time()
@@ -437,37 +442,47 @@ def cmd_launch(args, cfg):
               "launched_at": now, "deadline": now + hours * 3600,
               "user": "root" if o["provider"] == "runpod" else "ubuntu",
               "hf_home": hf_home(cfg, o["provider"], o["region"])}
+    arm_watchdog(key)  # a pending entry's watchdog terminates by name at the deadline
     if lost:
-        iid = adopt(o["provider"], name, lost, pending)
+        try:
+            iid = adopt(o["provider"], name, lost)
+        except ApiError as err:
+            die(f"the create's answer was lost ({lost}), and looking for {name} failed ({err}): "
+                f"`gpu.py terminate {pending}` terminates it by name once the API answers")
+        if iid is None:
+            die(f"the create failed ({lost}), and no instance named {name} showed up in 2 min. Its watchdog "
+                f"still terminates one by name at the deadline; `gpu.py terminate {pending}` does it now")
         with ledger_txn() as d:
             key = f"{o['provider']}:{iid}"
-            d[key] = {**d.pop(pending), "instance_id": iid}
-    log = STATE / f"{key.replace(':', '_')}.watchdog.log"
-    with open(log, "a") as fh:
-        subprocess.Popen([sys.executable, __file__, "watchdog", key], stdout=fh, stderr=fh,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+            d[key] = {**d.pop(pending), "instance_id": iid}  # pending's watchdog sees it gone and exits
+        arm_watchdog(key)
     print(f"launched {key} ({o['count']}x {o['gpu']}, {o['region']}, ${o['usd_per_hour']}/hr); "
           f"watchdog terminates it at {time.strftime('%H:%M', time.localtime(now + hours * 3600))} ({hours} h)")
     print(key)
 
 
-def adopt(provider: str, name: str, err: ApiError, pending: str) -> str:
-    """The instance a create whose answer was lost made, found by its name, or exit saying none was
-    (its ``pending`` ledger entry stays, so its cost still counts until it is terminated)."""
+def arm_watchdog(key: str) -> None:
+    log = STATE / f"{key.replace(':', '_')}.watchdog.log"
+    with open(log, "a") as fh:
+        subprocess.Popen([sys.executable, __file__, "watchdog", key], stdout=fh, stderr=fh,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+
+
+def named(provider: str, name: str) -> list[str]:
+    """The ids of the account's instances with this name (one create makes one, the name is unique)."""
+    if provider == "runpod":
+        return [p["id"] for p in runpod_list("/pods", "pods") if p.get("name") == name]
+    return [i["id"] for i in lambda_("GET", "/instances") or [] if i.get("name") == name]
+
+
+def adopt(provider: str, name: str, err: Exception) -> str | None:
+    """The instance a create whose answer was lost made, found by its name, or None after 2 min."""
     for _ in range(12):  # a new instance can take a while to show in the listing
-        if provider == "runpod":
-            ids = [p["id"] for p in runpod_list("/pods", "pods") if p.get("name") == name]
-        else:
-            ids = [i["id"] for i in lambda_("GET", "/instances") or [] if i.get("name") == name]
-        if ids:
-            if len(ids) > 1:
-                die(f"the create failed ({err}) and left {len(ids)} instances named {name} ({', '.join(ids)}); "
-                    f"terminate them from `gpu.py list --all`, then `gpu.py terminate {pending}`")
+        if ids := named(provider, name):
             print(f"the create's answer was lost ({err}); adopting {provider}:{ids[0]}, named {name}", file=sys.stderr)
             return ids[0]
         time.sleep(10)
-    die(f"the create failed ({err}), and no instance named {name} showed up in 2 min. Check `gpu.py list --all` "
-        f"and terminate it there if it appears, then `gpu.py terminate {pending}`, before launching again")
+    return None
 
 
 def hf_home(cfg, provider, region) -> str:
@@ -498,6 +513,8 @@ def ssh_base(e: dict, scp: bool = False) -> list[str]:
 
 def cmd_wait(args, cfg):
     e = entry(args.instance)
+    if not e["instance_id"]:
+        die(f"{args.instance} is a create whose answer was lost; `gpu.py terminate {args.instance}` and launch again")
     t0 = time.time()
     while True:
         st, host, port = status(e)
@@ -542,16 +559,16 @@ def cmd_copy(args, cfg):
 # ---------------------------------------------------------------- list / extend / terminate
 
 def terminate(key: str, e: dict) -> None:
-    try:
-        if e["instance_id"] is None:  # a lost create's entry: its instance, if any, is terminated from list --all
-            pass
-        elif e["provider"] == "runpod":
-            runpod("DELETE", f"/pods/{e['instance_id']}")
-        else:
-            lambda_("POST", "/instance-operations/terminate", {"instance_ids": [e["instance_id"]]})
-    except ApiError as err:
-        if err.status != 404 and "does-not-exist" not in err.code():
-            raise
+    # a lost create's entry (instance_id None) terminates whatever has its name, if anything does
+    for iid in [e["instance_id"]] if e["instance_id"] else named(e["provider"], e["name"]):
+        try:
+            if e["provider"] == "runpod":
+                runpod("DELETE", f"/pods/{iid}")
+            else:
+                lambda_("POST", "/instance-operations/terminate", {"instance_ids": [iid]})
+        except ApiError as err:
+            if err.status != 404 and "does-not-exist" not in err.code():
+                raise
     with ledger_txn() as d:
         d.pop(key, None)
     hours = (time.time() - e["launched_at"]) / 3600
@@ -568,7 +585,7 @@ def cmd_extend(args, cfg):
     with ledger_txn() as d:
         e = d[args.instance]
         deadline = time.time() + args.hours * 3600
-        if deadline > e["deadline"]:  # an earlier deadline only saves money, whatever was approved
+        if deadline > max(e["deadline"], time.time()):  # an earlier deadline only saves money, whatever was approved
             check_hours(cfg, (deadline - e["launched_at"]) / 3600, args.allow_over_budget)
             check_total(cfg, sum(committed_usd(x) for k, x in d.items() if k != args.instance)
                         + committed_usd({**e, "deadline": deadline}), args.allow_over_budget)
@@ -582,7 +599,7 @@ def cmd_list(args, cfg):
         print("no instances launched by this tool are up")
     for key, e in d.items():
         try:
-            st = status(e)[0] if e["instance_id"] else f"create's answer lost; find {e['name']} in --all"
+            st = status(e)[0] if e["instance_id"] else f"create's answer lost; terminate it to end {e['name']}"
         except ApiError as err:
             st = f"? ({err.status})"
         hrs = (time.time() - e["launched_at"]) / 3600

@@ -25,14 +25,29 @@ OFFER = {"id": "runpod:H100:US-1:1", "provider": "runpod", "gpu": "H100", "count
          "region": "US-1", "usd_per_hour": 3.0, "availability": "High", "storage": True}
 
 
-def http_error(code):
-    return urllib.error.HTTPError("https://x", code, "err", {}, io.BytesIO(b"{}"))
+def http_error(code, body=b"{}"):
+    return urllib.error.HTTPError("https://x", code, "err", {}, io.BytesIO(body))
+
+
+class Reply:
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self.raw
 
 
 class TestGpu(unittest.TestCase):
     def setUp(self):
         self.g = GPU["http"].__globals__
-        saved = {k: self.g[k] for k in ("STATE", "LEDGER", "runpod", "runpod_list", "runpod_volumes", "find_offer")}
+        saved = {k: self.g[k] for k in ("STATE", "LEDGER", "runpod", "runpod_list", "runpod_volumes", "find_offer",
+                                        "runpod_offers", "lambda_offers")}
         self.addCleanup(self.g.update, saved)
         state = Path(tempfile.mkdtemp())
         self.g.update(STATE=state, LEDGER=state / "instances.json")
@@ -45,53 +60,88 @@ class TestGpu(unittest.TestCase):
 
     def test_a_create_is_not_sent_again_after_a_5xx_or_a_timeout(self):
         for failure in (http_error(502), TimeoutError("timed out"), urllib.error.URLError("refused"),
-                        ConnectionResetError("reset"), http.client.RemoteDisconnected("closed")):
+                        ConnectionResetError("reset"), http.client.RemoteDisconnected("closed"),
+                        Reply(b"<html>proxy error</html>")):
             calls = []
 
             def urlopen(req, timeout, failure=failure, calls=calls):
                 calls.append(req)
+                if isinstance(failure, Reply):
+                    return failure
                 raise failure
             with unittest.mock.patch("urllib.request.urlopen", urlopen):
                 with self.assertRaises(GPU["ApiError"]):
                     GPU["http"]("POST", "https://x/pods", "RUNPOD_API_KEY", {}, retry=False)
             self.assertEqual(len(calls), 1, f"a create that may have succeeded was sent again after {failure!r}")
-        # a 429 was refused before anything was made, so it is retried
-        replies = iter([http_error(429), None])
+        # a 429 was refused before anything was made, so it is retried, and raised as a 429 in the end
+        for replies, want in (([http_error(429), Reply(b'{"id": "p1"}')], {"id": "p1"}), ([http_error(429)] * 6, 429)):
+            replies = iter(replies)
 
-        class Ok:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def read(self):
-                return b'{"id": "p1"}'
-
-        def urlopen(req, timeout):
-            reply = next(replies)
-            if reply is not None:
+            def urlopen(req, timeout, replies=replies):
+                reply = next(replies)
+                if isinstance(reply, Reply):
+                    return reply
                 raise reply
-            return Ok()
-        with unittest.mock.patch("urllib.request.urlopen", urlopen):
-            self.assertEqual(GPU["http"]("POST", "https://x/pods", "RUNPOD_API_KEY", {}, retry=False), {"id": "p1"})
+            with unittest.mock.patch("urllib.request.urlopen", urlopen):
+                if want == 429:
+                    with self.assertRaises(GPU["ApiError"]) as refused:
+                        GPU["http"]("POST", "https://x/pods", "RUNPOD_API_KEY", {}, retry=False)
+                    self.assertEqual(refused.exception.status, 429)
+                else:
+                    self.assertEqual(GPU["http"]("POST", "https://x/pods", "RUNPOD_API_KEY", {}, retry=False), want)
 
-    def test_a_launch_whose_answer_was_lost_adopts_the_pod_it_made(self):
-        made = []
+    def launch(self, answer, shows_up=True):
+        """cmd_launch against a RunPod that makes the pod and then answers the create with ``answer``;
+        the pod shows in its listing at once, or (``shows_up`` False) only after the launch gave up.
+        Returns the pods, the ledger and whether the launch exited."""
+        made, listed, deleted = [], [], []
 
         def runpod(method, path, body=None, params=None, retry=True):
             if method == "POST":
-                made.append({"id": "p1", "name": body["name"]})  # RunPod made it, then the answer was lost
-                raise GPU["ApiError"](502, "bad gateway")
+                made.append({"id": "p1", "name": body["name"]})
+                (listed if shows_up else []).extend(made)
+                raise answer
+            if method == "DELETE":
+                deleted.append(path)
             return {}
-        self.g.update(runpod=runpod, runpod_list=lambda path, field, params=None: made,
+        self.g.update(runpod=runpod, runpod_list=lambda path, field, params=None: listed,
                       find_offer=lambda cfg, oid: OFFER,
                       runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
         args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, allow_over_budget=False, dry_run=False)
+        exited = False
         with unittest.mock.patch("subprocess.Popen"), contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            GPU["cmd_launch"](args, CFG)
-        self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"], "the pod the lost create made never reached the ledger")
+            try:
+                GPU["cmd_launch"](args, CFG)
+            except SystemExit:
+                exited = True
+        return made, listed, deleted, exited
+
+    def test_a_launch_whose_answer_was_lost_adopts_the_pod_it_made(self):
+        # a 502, and a 503 whose page says "not available" (a proxy's, not RunPod's capacity answer)
+        for answer in (GPU["ApiError"](502, "bad gateway"), GPU["ApiError"](503, "Service not available")):
+            GPU["save_ledger"]({})
+            self.launch(answer)
+            self.assertEqual(list(GPU["ledger"]()), ["runpod:p1"],
+                             f"the pod the lost create made never reached the ledger ({answer})")
+
+    def test_a_lost_create_whose_pod_shows_up_late_is_still_ended_by_name(self):
+        made, _, _, exited = self.launch(GPU["ApiError"](502, "bad gateway"), shows_up=False)
+        (key,) = GPU["ledger"]()
+        self.assertTrue(exited and key.startswith("pending:"), "the lost create's cost stopped counting")
+        self.assertTrue(self.launch(GPU["ApiError"](502, "bad gateway"))[3], "a second launch got past the cap")
+        deleted = []  # the first pod appears after its launch gave up
+        self.g.update(runpod_list=lambda path, field, params=None: made,
+                      runpod=lambda method, path, *a, **k: deleted.append((method, path)) or {})
+        with contextlib.redirect_stdout(io.StringIO()):
+            GPU["cmd_terminate"](argparse.Namespace(instance=key), CFG)
+        self.assertEqual(deleted, [("DELETE", "/pods/p1")], "terminating the pending entry left its pod running")
+        self.assertEqual(GPU["ledger"](), {})
+
+    def test_a_create_refused_with_a_429_makes_nothing_to_look_for(self):
+        made, listed, deleted, exited = self.launch(GPU["ApiError"](429, "slow down"))
+        self.assertTrue(exited)
+        self.assertEqual(GPU["ledger"](), {}, "a rate-limited create left a pending entry blocking the next launch")
 
     def test_extend_keeps_to_the_launch_caps(self):
         now = time.time()
@@ -113,9 +163,10 @@ class TestGpu(unittest.TestCase):
         def erroring(*a, **k):
             raise GPU["ApiError"](503, "unavailable")
         args = argparse.Namespace(gpus=1, min_vram=80, all_regions=False, allow_arm=False, json=False)
-        self.g["runpod_offers"], saved = erroring, self.g["runpod_offers"]
-        self.addCleanup(self.g.__setitem__, "runpod_offers", saved)
-        for env in ({}, {"RUNPOD_API_KEY": "k"}):  # no key anywhere; RunPod erroring
+        self.g["runpod_offers"] = erroring
+        self.g["lambda_offers"] = lambda *a, **k: []
+        # no key anywhere; RunPod erroring with no Lambda key; RunPod erroring and Lambda answering with nothing
+        for env in ({}, {"RUNPOD_API_KEY": "k"}, {"RUNPOD_API_KEY": "k", "LAMBDA_API_KEY": "k"}):
             out = io.StringIO()
             with unittest.mock.patch.dict(os.environ, env, clear=True), self.assertRaises(SystemExit) as exited, \
                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
@@ -132,7 +183,6 @@ class TestBootstrap(unittest.TestCase):
                                env={"PATH": "/usr/bin:/bin", "HOME": home, "HF_HOME": f"{home}/hf"}, check=False)
             self.assertEqual(r.returncode, code, r.stderr)
             self.assertEqual(os.listdir(home), [], f"bootstrap.sh {argv} wrote to HOME")
-
 
     def test_untrusted_caches_stay_in_the_work_directory_and_are_never_saved(self):
         home = Path(tempfile.mkdtemp())
@@ -151,9 +201,22 @@ class TestBootstrap(unittest.TestCase):
 
 
 class TestHealth(unittest.TestCase):
+    SMI = "GPU-aaaa, 35, 345, 0x0\nGPU-bbbb, 60, 1980, 0x0\nGPU-cccc, 61, 1975, 0x0\nGPU-dddd, 34, 345, 0x0\n"
+
     def test_only_the_visible_gpus_are_judged_by_torch_index(self):
-        smi = ("GPU-aaaa, 35, 345, 0x0\nGPU-bbbb, 60, 1980, 0x0\nGPU-cccc, 61, 1975, 0x0\nGPU-dddd, 34, 345, 0x0\n")
-        self.assertEqual(HEALTH["by_torch_index"](smi, ["cccc", "bbbb"]), [(0, 61, 1975, 0), (1, 60, 1980, 0)])
+        self.assertEqual(HEALTH["by_torch_index"](self.SMI, ["cccc", "bbbb"]), [(0, 61, 1975, 0), (1, 60, 1980, 0)])
+
+    def test_a_gpu_it_cannot_match_exits_before_anything_is_loaded(self):
+        g, burned = HEALTH["main"].__globals__, []
+        saved = {k: g[k] for k in ("visible_uuids", "burn")}
+        self.addCleanup(g.update, saved)
+        g.update(visible_uuids=lambda: ["mig-1234"], burn=lambda i, stop: burned.append(i))
+        smi = subprocess.CompletedProcess([], 0, stdout=self.SMI)
+        with unittest.mock.patch("subprocess.run", return_value=smi), \
+                unittest.mock.patch("sys.argv", ["gpu_health.py"]):
+            with self.assertRaises(SystemExit):
+                HEALTH["main"]()
+        self.assertEqual(burned, [], "the burn started before the GPU mapping was checked, so a mismatch hangs")
 
 
 if __name__ == "__main__":

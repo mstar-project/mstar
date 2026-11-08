@@ -63,6 +63,7 @@ esac
 SM=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d .) || true
 [[ $SM =~ ^[0-9]+$ ]] || SM=unknown  # a failed nvidia-smi prints its error on stdout
 CACHE_TAR=$(dirname "$HF")/live-pr-compile-cache/sm$SM.tar
+[ ! -e "$WORKDIR/compile/UNTRUSTED" ] || UNTRUSTED=1  # a rerun of an untrusted work directory stays untrusted
 COMPILE=$HOME/.cache/compile
 [ "$UNTRUSTED" = 0 ] || COMPILE=$WORKDIR/compile
 mkdir -p "$COMPILE"
