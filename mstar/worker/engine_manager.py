@@ -18,6 +18,7 @@ from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dt
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
+from mstar.validation.draft import async_scheduling_of
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            async_scheduling=async_scheduling_of(model, model_config),
         )
         budgets = model_config.get("max_batch_tokens") or {}
         override_mixed = model_config.get("can_override_mixed_max_tokens") or {}

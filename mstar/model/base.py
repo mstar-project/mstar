@@ -139,6 +139,7 @@ def _applying_chunking(build):
     return get_graph_walk_graphs
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.draft.drafter import VerifyNode
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
@@ -951,6 +952,13 @@ class Model(ABC):
     @abstractmethod
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         pass
+
+    def verify_nodes(self) -> "list[VerifyNode]":
+        """The nodes that draft and verify tokens (speculative decoding), from
+        the deployment's ``model_kwargs.draft`` (`DraftConfig.from_model_kwargs`).
+        Empty, the default, leaves speculative decoding off. Raises
+        ``ValueError`` on a block the model can't serve."""
+        return []
 
     @abstractmethod
     def get_initial_forward_pass_args(

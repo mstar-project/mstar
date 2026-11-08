@@ -66,10 +66,11 @@ def _init_worker(monkeypatch, runtime: RustGraphRuntime, parallel: set[str]) -> 
     monkeypatch.setattr(worker_mod, "create_tensor_communication_manager", lambda **kw: SimpleNamespace(
         transfer_engine=None, my_session_id="s", get_tensor=None))
     monkeypatch.setattr(worker_mod, "_make_graph_runtime", lambda **kw: runtime)
-    # an engine per node that declares no stop policies
-    engine = SimpleNamespace(get_stop_policies=lambda node, walk: None)
+    # an engine per node that declares no stop policies, and no node that verifies drafts
+    engine = SimpleNamespace(get_stop_policies=lambda node, walk: None, verifying_nodes=frozenset,
+                             synchronous_verify_nodes=frozenset)
     monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
-        build=lambda *a, **kw: SimpleNamespace(get_engine=lambda node: engine, side_keys=())))
+        build=lambda *a, **kw: SimpleNamespace(get_engine=lambda node: engine, side_keys=(), engine=engine)))
     groups = SimpleNamespace(
         init_dist=lambda **kw: None,
         get_instance_rank_for_node=lambda node: 0,

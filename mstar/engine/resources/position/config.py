@@ -69,6 +69,15 @@ class PositionConfig:
 class PositionSpec(NodeResourceSpec):
     config: PositionConfig
 
+    def verify_refusal(self, draft) -> str | None:
+        if self.config.scheme != PosScheme.SEQUENTIAL:
+            return f"position scheme {self.config.scheme} doesn't follow the KV length"
+        return None
+
+    def async_verify_refusal(self, draft) -> str | None:
+        # a resident row's position is its device KV length plus a fixed offset
+        return None
+
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
 

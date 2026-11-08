@@ -298,6 +298,21 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    cache's tokens before the recurrent pool cuts the hit to a snapshot, so a hit the pool
    cuts to 0 still counts.
 
+``mstar_spec_draft_tokens_total{model_name, component}``
+   Counter, on a node that drafts and verifies tokens (speculative decoding): drafts
+   proposed.
+
+``mstar_spec_accepted_tokens_total{model_name, component}``
+   Counter. Drafts the target accepted, before a stop or the budget cuts the run.
+
+``mstar_spec_verify_rows_total{model_name, component}``
+   Counter. Verify rows, one per request per step. The acceptance length τ is
+   ``(accepted + rows) / rows``; near-zero acceptance with correct output means a
+   mismatched drafter.
+
+``mstar_spec_accepted_per_row{model_name, component}``
+   Histogram. Drafts one verify row accepted, 0 to ``num_draft_tokens``.
+
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
    running: waiting for room in a step, or for the worker to pick the node.

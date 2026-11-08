@@ -20,6 +20,21 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class VerifyBackend(Enum):
+    """The kernel a verify step (``AttentionStep.verify``) runs on (`AttentionConfig.verify_backend`)."""
+    # FA3 where it runs, else FlashInfer
+    AUTO = "auto"
+    FA3 = "fa3"
+    FLASHINFER = "flashinfer"
+
+    @classmethod
+    def parse(cls, value: "str | VerifyBackend") -> "VerifyBackend":
+        try:
+            return cls(value)
+        except ValueError:
+            raise ValueError(f"verify_backend must be auto, fa3 or flashinfer, not {value!r}") from None
+
+
 class AttnBackend(Enum):
     # the platform's default, decided when the resource is built
     AUTO = "auto"
@@ -63,8 +78,14 @@ class AttentionConfig:
     # The KV layers a ``sliding_window`` attention runs, which a window shorter than the pool's
     # ``max_seq_len`` needs; the pool's other layers keep every token.
     layers: tuple[int, ...] | None = None
+    # Which kernel a verify step (``AttentionStep.verify``) runs on: FlashAttention-3's paged
+    # kernel, which reads KV lengths on the device and so serves asynchronous verify steps
+    # (Hopper only), or FlashInfer's, planned on the host (synchronous mode). "auto" takes
+    # FA3 where it runs.
+    verify_backend: VerifyBackend = VerifyBackend.AUTO
 
     def __post_init__(self) -> None:
+        self.verify_backend = VerifyBackend.parse(self.verify_backend)
         if self.sliding_window is not None and (
             type(self.sliding_window) is not int or self.sliding_window <= 0
         ):
@@ -89,6 +110,24 @@ class AttentionSpec(NodeResourceSpec):
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits
 
+    def verify_refusal(self, draft) -> str | None:
+        cfg = self.config
+        if cfg.backend not in (AttnBackend.AUTO, AttnBackend.FLASHINFER):
+            return f"the {cfg.backend.value} backend has no verify kernel"
+        if cfg.sliding_window is not None:
+            return "a sliding window is not supported with speculative decoding"
+        if cfg.splits:
+            return "mixed prompt-plus-verify steps are not supported yet: declare no splits on a verifying node"
+        return None
+
+    def async_verify_refusal(self, draft) -> str | None:
+        """Asynchronous verify steps need lengths read on the device: FA3's paged
+        kernel. A config fact only; whether FA3 runs on the workers' GPUs is
+        theirs to say at load (`FlashInferManager.bind_verify`)."""
+        if self.config.verify_backend is VerifyBackend.FLASHINFER:
+            return "verify_backend flashinfer plans lengths on the host"
+        return None
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.attn.base import AttentionManager
@@ -101,6 +140,7 @@ class AttentionSpec(NodeResourceSpec):
         flashinfer_backend: str | None = None,
         decode_tensor_cores: bool | None = None,
         decode_fmha: bool | None = None,
+        verify_backend: str | VerifyBackend | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the
         model's — an image that cannot build FA3 pins FA2 here.
@@ -116,6 +156,8 @@ class AttentionSpec(NodeResourceSpec):
             self.config.decode_tensor_cores = _yaml_bool("decode_tensor_cores", decode_tensor_cores)
         if decode_fmha is not None:
             self.config.decode_fmha = _yaml_bool("decode_fmha", decode_fmha)
+        if verify_backend is not None:
+            self.config.verify_backend = VerifyBackend.parse(verify_backend)
 
 
 def derive_kv_groups(name: str, cfg: KVConfig, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
@@ -255,6 +297,19 @@ class AttentionStep(ResourceStep):
     # `segments` then carry the query counts, the cache's segments the appended counts.
     # Only the MLA backend reads it; the others refuse it (`refuse_context_only`).
     context_only: bool = False
+    # A verify step of speculative decoding: every row runs one block of
+    # ``k + 1`` queries, on the verify kernel (`AttentionConfig.verify_backend`).
+    verify: bool = False
+    # Rows at the end of each row's block that no query attends to, the block
+    # otherwise seen whole (non-causal): DSpark's drafter over a verify block.
+    hide_last: int = 0
+
+    def __post_init__(self):
+        if self.hide_last and self.causal:
+            raise ValueError("hide_last attends to the rest of the block whole: declare causal=False")
+        if self.hide_last and not self.verify:
+            # elsewhere it would plan from the host's lengths, the reserved ones in asynchronous mode
+            raise ValueError("hide_last is a verify step's mask: declare verify=True")
 
 
 def refuse_context_only(step: AttentionStep, manager: str) -> None:

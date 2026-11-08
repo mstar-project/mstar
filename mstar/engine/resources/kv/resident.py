@@ -19,12 +19,13 @@ from mstar.engine.resources.resident import (
 @triton.jit
 def _gather_write_slots_kernel(
     slots_ptr, kv_len_ptr, store_ptr, page_ptr, offset_ptr,
-    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr,
+    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, SPAN: tl.constexpr,
 ):
-    i = tl.program_id(0)
-    n = tl.load(kv_len_ptr + i)
-    tl.store(page_ptr + i, tl.load(store_ptr + tl.load(slots_ptr + i) * STRIDE + BLOCK + n // PAGE))
-    tl.store(offset_ptr + i, n % PAGE)
+    t = tl.program_id(0)
+    i = t // SPAN
+    n = tl.load(kv_len_ptr + i) + t % SPAN
+    tl.store(page_ptr + t, tl.load(store_ptr + tl.load(slots_ptr + i) * STRIDE + BLOCK + n // PAGE))
+    tl.store(offset_ptr + t, n % PAGE)
 
 
 class KVResidentTables:
@@ -39,6 +40,12 @@ class KVResidentTables:
     The stream stays the truth. ``host_len`` advances by the rule the graph
     does, so nothing comes back from the device, and ``host_cols`` counts the
     columns a row holds, which is how the host sees a crossing.
+
+    A verify step appends ``k + 1`` tokens a row and the graph keeps
+    ``accepted + 1``, so ``host_len`` advances by the span, as the stream's
+    reserved length does, and a take-back lowers both. A row with unapplied
+    results (`ResidentPlanner.pending`) keeps the device's length cell
+    through a rewrite: only the device knows it.
     """
 
     def __init__(self, planner: ResidentPlanner, key: str, page_size: int, max_pages: int):
@@ -46,20 +53,30 @@ class KVResidentTables:
         self.key = key
         self.page_size = page_size
         self.block_table = planner.table(max_pages)
-        self.kv_len = planner.length_table(key)
+        # a row's tokens of one step reach at most this many columns past its last
+        self.new_cols = (planner.max_span + page_size - 2) // page_size + 1
+        self.kv_len = planner.length_table(key, self.new_cols)
         self.host_len = np.zeros(planner.max_slots, dtype=np.int64)
         self.host_cols = np.zeros(planner.max_slots, dtype=np.int64)
 
-    def row(self, stored_len: int, pages: list[int], slot: int, row: list[int], writes: ResidentWrites) -> None:
-        """The cells of a stream about to append one token, or to be read. Its
-        host mirrors move here, not at the flush: a plan that never runs leaves
-        the row stale."""
+    def row(
+        self, stored_len: int, pages: list[int], slot: int, row: list[int], writes: ResidentWrites,
+        keep_len: bool = False,
+    ) -> None:
+        """The cells of a stream about to append its step's span, or to be read.
+        Its host mirrors move here, not at the flush: a plan that never runs
+        leaves the row stale. With ``keep_len`` the device's length cell stays
+        as it is (a row whose verify results are unapplied)."""
         if len(pages) > self.block_table.width:
             raise ValueError(f"{len(pages)} pages of a stream don't fit a block table row of {self.block_table.width}")
         page = self.page_size
-        # a stream that appends holds the page its next token goes to, too
-        cols = -(-stored_len // page) if writes.streams[self.key].reads else stored_len // page + 1
-        row[self.kv_len.col] = stored_len
+        stream = writes.streams[self.key]
+        # a stream that appends holds the pages its step's tokens go to, too
+        cols = -(-stored_len // page) if stream.reads else (stored_len + stream.span - 1) // page + 1
+        if keep_len:
+            writes.kept.append(self.kv_len.col)
+        else:
+            row[self.kv_len.col] = stored_len
         writes.kv_len[self.key] = stored_len
         if cols:
             writes.run(slot, self.block_table.col, pages[:cols])
@@ -70,6 +87,12 @@ class KVResidentTables:
         """A row a host-planned step advanced; its columns stay until `stage_step`."""
         writes.put(self.kv_len.cell(slot), stored_len)
         self.host_len[slot] = stored_len
+
+    def take_back(self, slot: int, n: int) -> None:
+        """A verify result applied: the row's host length drops to the stream's.
+        The device's length cell already holds it, and the columns stay, since
+        the stream keeps its pages."""
+        self.host_len[slot] -= n
 
     def stage_step(self, plan: ResidentPlan, stream_len, stream_pages, rewrite) -> None:
         """Bring each row's columns up to this step. The usual case, one new
@@ -91,25 +114,29 @@ class KVResidentTables:
             return
         slots = plan.slots
         cols = self.host_cols[slots]
-        need = self.host_len[slots] // self.page_size + 1
+        # host_len is at least the device's length, so these columns cover every token the step writes
+        need = (self.host_len[slots] + plan.writes.streams[self.key].span - 1) // self.page_size + 1
         rows = np.flatnonzero(need > cols)
         if not rows.size:
             return
         for i in rows.tolist():
-            rid, slot, last = plan.rids[i], int(slots[i]), int(need[i]) - 1
+            rid, slot, first, last = plan.rids[i], int(slots[i]), int(cols[i]), int(need[i]) - 1
             if last >= self.block_table.width:
                 raise ValueError(f"page {last} of a stream doesn't fit a block table row of {self.block_table.width}")
-            if last > cols[i]:
+            if last - first >= self.new_cols:
                 plan.taken.add(rid)
                 rewrite(rid, slot, plan.writes)
             else:
-                plan.writes.put(self.block_table.cell(slot, last), stream_pages(rid)[last])
+                pages = stream_pages(rid)
+                for col in range(first, last + 1):
+                    plan.writes.put(self.block_table.cell(slot, col), pages[col])
         plan.crossed[self.key] = (rows, need[rows])
 
     def advance(self, plan: ResidentPlan) -> None:
-        if plan.writes.streams[self.key].reads:
+        stream = plan.writes.streams[self.key]
+        if stream.reads:
             return
-        self.host_len[plan.slots] += 1
+        self.host_len[plan.slots] += stream.span
         crossed = plan.crossed.get(self.key)
         if crossed is not None:
             rows, need = crossed
@@ -127,17 +154,26 @@ class KVResidentTables:
         gather_column(store, step.slots, stride, self.kv_len.col, kv_len)
         if step.streams[self.key].reads:
             return
+        span, bs = step.streams[self.key].span, step.bucket.bs
         if store.is_cuda:
-            _gather_write_slots_kernel[(step.bucket.bs,)](
+            _gather_write_slots_kernel[(bs * span,)](
                 step.slots, kv_len, store, token_to_page, token_to_cache,
-                STRIDE=stride, BLOCK=table.col, PAGE=page_size, num_warps=1,
+                STRIDE=stride, BLOCK=table.col, PAGE=page_size, SPAN=span, num_warps=1,
             )
             return
-        col = torch.div(kv_len, page_size, rounding_mode="floor")
-        bs = step.bucket.bs
-        torch.index_select(store, 0, step.slots * stride + col + table.col, out=token_to_page[:bs])
-        token_to_cache[:bs].copy_(kv_len - col * page_size)
+        # token j of row i writes at the row's length + j
+        at = (kv_len[:, None] + torch.arange(span, device=kv_len.device)).reshape(-1)
+        col = torch.div(at, page_size, rounding_mode="floor")
+        slots = step.slots.repeat_interleave(span) if span > 1 else step.slots
+        torch.index_select(store, 0, slots * stride + col + table.col, out=token_to_page[: bs * span])
+        token_to_cache[: bs * span].copy_(at - col * page_size)
 
     def commit(self, step: CapturedResidentStep) -> None:
-        if not step.streams[self.key].reads:
+        stream = step.streams[self.key]
+        if stream.reads:
+            return
+        if stream.span > 1:
+            # a verify step keeps accepted + 1 of its span, which the verify wrote in the graph
+            advance_column(self.planner.store, step.slots, self.kv_len.stride, self.kv_len.col, step.buffers.advance)
+        else:
             advance_column(self.planner.store, step.slots, self.kv_len.stride, self.kv_len.col)

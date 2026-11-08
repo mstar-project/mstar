@@ -393,6 +393,11 @@ class Worker:
     computation via engines.
     """
 
+    # nodes that verify drafts (speculative decoding), and those of them in
+    # synchronous mode, which are never speculated; empty on a worker without any
+    _verifying_nodes: frozenset[str] = frozenset()
+    _synchronous_verify_nodes: frozenset[str] = frozenset()
+
     # This worker's chunk Loops, set at load. Empty here so a worker built
     # without one -- any test fake -- chunks nowhere rather than raising from
     # postprocess.
@@ -568,6 +573,8 @@ class Worker:
             enable_prof=self.enable_prof,
             device_capability=self.device_capability,
         )
+        self._verifying_nodes = self.engine_manager.engine.verifying_nodes()
+        self._synchronous_verify_nodes = self.engine_manager.engine.synchronous_verify_nodes()
         self._never_publish_unshared(all_worker_graph_ids_to_instances)
         self._declare_stop_policies(my_walks)
 
@@ -597,7 +604,7 @@ class Worker:
             streams=self.streams,
         )
         self.lifecycle = RequestLifecycle(layout=layout)
-        self.admission = Admission(services=services, layout=layout)
+        self.admission = Admission(services=services, layout=layout, verifying_nodes=self._verifying_nodes)
         # TP async scheduling: the leader speculates N+1 during forward N and
         # broadcasts it at once; followers rebuild it during their own N.
         self.lockstep = Lockstep(
@@ -605,6 +612,7 @@ class Worker:
             async_sched=tp_async_sched_setting(
                 os.environ.get("MSTAR_TP_ASYNC_SCHED"), model_config.get("tp_async_sched"),
             ),
+            synchronous_verify_nodes=self._synchronous_verify_nodes,
         )
         # without these the runtime sees no parallel node, and its speculation
         # filter never holds one to the leader
@@ -1493,6 +1501,9 @@ class Worker:
     def _can_speculate(self, batch: ScheduledBatch) -> bool:
         if not self._async_schedulable(batch):
             return False
+        if batch.node_name in self._synchronous_verify_nodes:
+            # synchronous speculative decoding: a verify step is planned after the last one's postprocess
+            return False
         if batch.node_name in self.parallel_nodes:
             # Only the leader initiates, only under TP async scheduling.
             return (
@@ -1819,6 +1830,12 @@ class Worker:
         ran = frozenset(outputs_N.row_request_ids or ()) if rows_only else None
         # a mixed N's rows that looped back on the device arrive empty too
         loopback = getattr(outputs_N, "loopback_rids", frozenset())
+        if getattr(outputs_N, "verify_step", False):
+            # a verify step's outputs are uncut until its postprocess; its next
+            # step reads each row's token off the loop-back slot instead. Only a
+            # row N ran wrote one: a row N skipped is dropped, as below.
+            ran_N = set(outputs_N.row_request_ids or ()) | set(outputs_N.per_rid_outputs)
+            loopback = frozenset(rid for rid in speculation.continuing_rids if rid in ran_N)
         chunked = speculation.scheduled_batch.chunk_ranges
         for rid in list(speculation.node_batch.request_ids):
             if rid not in speculation.continuing_rids:
@@ -2171,6 +2188,12 @@ class Worker:
         self._set_in_flight_flag(batch, False)
 
 
+    def _record_verify(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
+        """A verify step that leaves postprocess early still hands its result
+        to the take-back."""
+        if self._verifying_nodes and batch_N.node_name in self._verifying_nodes:
+            self.engine_manager.get_engine(batch_N.node_name).record_verify(batch_N.node_batch, outputs)
+
     def _wait_for_step(self, batch_N: PendingBatch) -> None:
         """Wait for batch N's GPU work: its completion event, or the whole
         device when it has none."""
@@ -2246,6 +2269,7 @@ class Worker:
             # no outputs leave, but the step's kernels may still be running
             # in the slot a later step reuses
             self._wait_for_step(batch_N)
+            self._record_verify(batch_N, outputs)
             if self.enable_nvtx:
                 range_pop(synchronize=False)
             return
@@ -2273,6 +2297,7 @@ class Worker:
                     # no outputs leave, but the step's kernels may still be
                     # running in the capture slot a later step reuses
                     self._wait_for_step(batch_N)
+                    self._record_verify(batch_N, outputs)
                     if self.enable_nvtx:
                         range_pop(synchronize=False)
                     return
@@ -2320,6 +2345,10 @@ class Worker:
             request_ids=batch_N.node_batch.request_ids,
         )
         self._rebuilds.keep_prompts(batch_N.node_batch)
+        if self._verifying_nodes and batch_N.node_name in self._verifying_nodes:
+            # a verify step's runs, cut at stops and the budget before the
+            # prefix chains, the stop check or the store read them
+            engine.cut_verify_step(batch_N.node_batch, outputs, host_rows)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
@@ -3310,6 +3339,12 @@ class Worker:
                     "Worker %s discarding failed batch for node %s",
                     self.worker_id, stale.node_name,
                 )
+        if self._verifying_nodes:
+            for stale in in_flight:
+                if stale is not None and stale.node_name in self._verifying_nodes:
+                    # drained above: a verify step it committed and never recorded is
+                    # voided, so no later admit waits on its result
+                    self.engine_manager.get_engine(stale.node_name).void_verify(stale.node_batch)
         if batch is not None:
             failed_rids.update(batch.request_to_worker_graph)
             self._clear_in_flight_flag(batch)

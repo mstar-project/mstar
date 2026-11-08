@@ -115,3 +115,56 @@ def test_a_capture_input_row_desyncs_the_step_when_prepare_runs_a_collective():
     part's vocab-parallel embedding) has no partner on the follower."""
     assert explore_read_check("CAPTURE", "shape").ok
     assert any(v == "lockstep" for v, _ in explore_read_check("CAPTURE", "prepare").violations)
+
+
+def test_verify_results_apply_alike_on_every_rank():
+    """Speculative decoding's take-back: each rank's own interleaving of commit,
+    postprocess and admit, and every rank applies the same results at every
+    admit, with every due result recorded, in both modes."""
+    from tp_async_sim import explore_verify
+
+    for synchronous in (False, True):
+        for nranks in (2, 3):
+            res = explore_verify("ledger", synchronous, nranks, steps=4)
+            assert res.ok, (synchronous, nranks, res.violations[:2])
+
+
+def test_applying_whatever_arrived_is_refuted():
+    """Negative control: applying every recorded result lets ranks admit from different lengths."""
+    from tp_async_sim import explore_verify
+
+    res = explore_verify("arrived", synchronous=False, nranks=2, steps=4)
+    assert any(kind == "diverged" for kind, *_ in res.violations)
+
+
+def test_the_ledger_rests_on_postprocess_preceding_the_admit_two_steps_on():
+    """Without that stage-order guarantee a due result can be unrecorded at its admit,
+    which the ledger raises on rather than letting ranks diverge."""
+    from tp_async_sim import explore_verify
+
+    res = explore_verify("ledger", synchronous=False, nranks=2, steps=4, stage_order=False)
+    assert any(kind == "unrecorded-due" for kind, *_ in res.violations)
+
+
+def test_a_follower_never_replays_an_offload_of_a_row_it_hasnt_recorded():
+    """Rank 0 offloads a verifying row it has fully recorded and
+    ships the move with its next step; a follower settles the row when it replays
+    that move, which raises on an unrecorded result. Over every interleaving the
+    follower has recorded every step of the row by then, in both modes."""
+    from tp_async_sim import explore_offload
+
+    for synchronous in (False, True):
+        for nranks in (2, 3):
+            res = explore_offload(synchronous, nranks, steps=5)
+            assert res.ok and res.states > 100, (synchronous, nranks, res.violations[:2])
+            # the case at issue is reached: an offload riding a speculative head (V skipped the step in flight)
+            assert synchronous or res.speculative_offloads > 0
+
+
+def test_the_offload_replay_rests_on_the_serial_path_draining_its_steps():
+    """Negative control: a follower taking a serial head as early as a speculative
+    one can replay the offload of a row from the step it hasn't post-processed."""
+    from tp_async_sim import explore_offload
+
+    res = explore_offload(False, 2, steps=5, serial_gate=False)
+    assert any(kind == "unrecorded-at-replay" for kind, *_ in res.violations)

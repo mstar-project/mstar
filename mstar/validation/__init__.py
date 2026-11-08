@@ -16,6 +16,7 @@ from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY, lora_enabled
 from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
 from mstar.model.base import Model, WorkerGraph, built_resources, parse_autocast_dtype
 from mstar.validation.client_streams import check_client_streams
+from mstar.validation.draft import check_draft
 from mstar.validation.knobs import check_knobs
 from mstar.validation.placement import check_worker_graphs, node_groups_problems, routing_weights_problems
 from mstar.validation.resources import check_resources, resources_shape_problem
@@ -151,6 +152,7 @@ def validate_deployment(
         except (ValueError, OSError) as e:
             problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
             specs = None
+    problems += _checked("checking speculative decoding", check_draft, model, config, specs)
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked(
         "checking the client streams", check_client_streams,

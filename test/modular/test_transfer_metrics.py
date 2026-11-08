@@ -320,7 +320,7 @@ def _bare_worker(tmp_path, scheduler):
     switches on with ENABLE_METRICS."""
     fields = dict(
         worker_id="worker_1",
-        engine_manager=SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list)),
+        engine_manager=SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list, node_drafts=dict)),
         communicator=_Sink(),
         tensor_manager=_shm("worker_1", tmp_path),
         scheduler=scheduler,
