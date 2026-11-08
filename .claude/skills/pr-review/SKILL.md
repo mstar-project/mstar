@@ -123,6 +123,8 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   shipped YAML sets it. Never fold a defect into a minimality or cleanup finding.
 - **Any path to a lockstep hang or rank divergence is at least P1** (invariant 11), however rare
   the timing.
+- **A request field or input file that can crash or wedge a worker is P0**, however unlikely the
+  input: one client takes the deployment down for everyone (mstar philosophy §12).
 - **A test that can fail under CI load, xdist or another order is at least P2** (behaviour lens 7).
 - **A shared-layer mechanism built beside an existing mstar primitive is P0** (a disguise-check hit,
   §4.5), even though it may break nothing on `main` yet. It is the foundation later PRs build on, so
@@ -137,7 +139,9 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   mesh blocks at the high-water mark and never raises for a dead peer, #465). A gap is pre-existing
   only if `main` reaches it today: when `main` fails earlier and the PR removes that failure, the
   gap is the PR's (#729). (On #365 one unchecked premise made an unreachable crash P1
-  and a reachable recompute regression P3.)
+  and a reachable recompute regression P3.) A pre-existing bug is the PR's to fix when the PR's own
+  result depends on it, or when it hid the bug the PR fixes (#800's parity held only on an older
+  transformers, and a silent broadcast had hidden the one-camera bug it fixed).
 - **Evidence and scope are one finding.** Missing per-mechanism measurement, undisclosed shared-layer
   changes and untested models become one "evidence and scope" finding: P1 only when the description
   makes a claim the code or evidence contradicts, otherwise P2. A behaviour change that alters the
@@ -150,7 +154,9 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   exception: a fix already written in a PR stacked above, read and checked, makes the finding fixed
   above, which is reported but doesn't block (§1).
 - **Duplicates of open PRs** (shell only): for each bug-fix hunk in shared code, search open PRs
-  touching the same lines. A fix another open PR also makes is a note naming that PR.
+  touching the same lines. A fix another open PR also makes is a note naming that PR. Two open PRs
+  that each count the same thing (a counter, a metric, a tracked set) end with one count: the one
+  that lands second folds into the first.
 - **The author's stated reason.** For every finding, P0–P3, read the description, replies, commit
   messages and code comments for a reason the author gave for that code. When there is one, the
   finding states it in one clause and then says why it doesn't hold or why the finding stands
@@ -198,7 +204,7 @@ its pin, including what `main` changed under the PR; (4) shared mutable state ac
 streams, async steps, ranks and deployments, then failure and retry; (5) every silent fallback;
 (6) new ops on compiled or captured paths; (7) what can make each added or changed test fail under CI
 and not alone; (8) each claimed benefit traced through the code that decides it. Write each lens's
-coverage line. This pass finds most of the defects the design passes miss. Three checks go with
+coverage line. This pass finds most of the defects the design passes miss. Five checks go with
 the lenses:
 
 - **Structural, not tuned.** Correctness, liveness and scheduling never rest on a wall-clock window,
@@ -208,8 +214,24 @@ the lenses:
 - **Fix the cause.** No stopgap and nothing that hides a failure: a broad `except` over half-updated
   state, a leak bounded by a budget, a retry for a failure the system never produces, a WARNING
   where `main` logged an ERROR, an exemption from a check.
+- **Bug fixes.** Trace the bug on `main` with the PR's repro as the input, then on the head. Check
+  the inverse failure: a fix that keeps something alive, retries or relaxes a check can now keep
+  alive what should end (#288 kept a busy request alive, and also one its TTL should have cleaned
+  up). Search the base tree for the same pattern: a sibling site with the same bug that the PR
+  leaves is a finding (#275 returned 400 on a `ValueError` on one route, not on the speech or image
+  routes). When the fix costs speed or memory, say whether a narrower change removes the cause
+  without that cost.
 - **Handle-keyed state is purged on every release path** and listed in `mstar/worker/rid_table.py`
   (invariant 14).
+- **Lockstep, concretely** (invariant 11). A row leaves a lockstep step on every rank, decided
+  before `prepare_inputs`, since `prepare_inputs` can run collectives. A per-rank fact (a data
+  pointer's alignment, measured free memory, a local timer) never picks a collective's kernel, a
+  capture or the capture order: what to capture is planned from config before any capture, the same
+  on every boot and every rank. A check that can fail on one rank fails before the collective its
+  peers enter, not inside it. A rank that can't follow rank 0 exits (`SystemExit`) rather than
+  failing requests or asserting alone. The leader is instance rank 0 (`get_instance_rank_for_node`),
+  not TP rank 0, which under SP elects one leader per TP row. Process groups are created at startup
+  in one order on every rank, never lazily on a path only some ranks reach.
 
 ### 4.2 Performance (all modes)
 
@@ -238,8 +260,12 @@ reservations, scaling).
   given capture buckets and caps such as `graph_max_latent_area`; compiled or not; which kernel or
   exchange). A speedup credited to a mechanism the row doesn't reach on either arm is a finding, P1
   when the description makes the claim (#897 credited a 1280×720 gain to dropping a captured
-  all-gather, but that size ran eager on both builds). A missing piece joins the evidence and scope
-  finding.
+  all-gather, but that size ran eager on both builds). Derive what the mechanism should save from
+  the work and bytes it removes, and set that beside the measured number: a gain far above the
+  derivation is measuring something else, and one far below says the mechanism misses the hot path.
+  A number from an earlier head, a recompile, a cold cache or a single pass settles nothing about
+  this head, and a stress config no deployment runs (a 48-page KV pool) is evidence neither for nor
+  against the PR. A missing piece joins the evidence and scope finding.
 - **An alternative you suggest under capture, compile or a collective is a hypothesis** that needs a
   served-output check, not a free speedup (#897's suggested alternatives broke images or capture).
 

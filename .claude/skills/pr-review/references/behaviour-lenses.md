@@ -26,7 +26,9 @@ every one through the new code:
 - **Modes:** every TP degree and bs=1 (raw pointers reach kernels there that a `.contiguous()` copy
   hides at bs>1); eager, capture, replay and padding rows; CPU and GPU; colocated, data-parallel
   and disaggregated; async speculation on and off; TP async scheduling on and off; prefix cache on
-  and off; preemption and rebuild.
+  and off; preemption and rebuild; CPU offload; streaming; and the feature's own off or null config,
+  which must leave `main`'s path and cost unchanged (#365's null config still measured every row and
+  barred speculation).
 - **Every path that builds or changes a checked object.** For each check, validation or invariant
   the PR adds or touches, list every path that builds or changes the object (constructor,
   YAML/config override, `build`, setters) and every mode the check runs in, and confirm each one
@@ -63,6 +65,11 @@ examples, configs, tests (including GPU-gated ones that skip on CPU), docs. A re
 sends a value the PR now refuses, or a harness that sends a key the PR now ignores, is a finding.
 So is a default that moved without a line in the description.
 
+A new message type is a change for every receiver: `Worker._process_message_list` drops an unknown
+type silently, where the conductor raises. A per-request message can reach a worker before its
+NEW_REQUEST or after its REMOVE: it joins `msg_types_needing_active_request` so it is parked or
+dropped, and a dropped one that carries tensors is acked so its producer frees them.
+
 Coverage line: `behaviour changes → consumers checked: <change> → <files>; …`
 
 ## 3. Follow each new assumption back to whatever guarantees it
@@ -97,6 +104,13 @@ For every new reliance on something outside the diff, find where it is pinned an
   both; #948 called `get_sp_config_for_node` after `main` removed it, and a test stub hid that;
   #870, #871 and #873 measured before #938 and #1075 flipped defaults they depend on.)
 
+  Check too that every base-class hook the PR overrides, and every registry it adds to, still
+  exists under that name: an override of a hook `main` renamed is never called, and nothing errors
+  (#379 implemented `get_cuda_graph_configs` after `main` renamed the hook, so decode would have run
+  eager). A finding that only `main`'s later commits cause is a post-rebase ask: report it at its
+  priority and say the PR needs it once rebased. Don't report what the merge itself shows: a
+  conflict, an import error, a failing CI job.
+
 Coverage line: `assumptions → where pinned: <assumption> → <pin, holds | doesn't>; …; merge target: <removed symbols, flipped defaults, new callers, rules: none | list>`
 
 ## 4. For each piece of shared mutable state, list every writer and reader in every concurrency domain
@@ -109,7 +123,14 @@ touches, list who writes and who reads it, across:
 - CUDA streams: the plan stream's copies against default-stream kernels;
 - steps under async scheduling: step N+1's plan or H2D overwriting what step N still reads
   (AGENTS.md invariant 7, `force_double_buffer`);
-- processes and TP ranks: invariant 11, *when* as well as whether;
+- processes: the API server (where `load_*`, `process_prompt` and output `postprocess` run on its own
+  `Model` instance), the conductor and each worker. State set up in one (a config refreshed when
+  submodules are built, a cache, a registration) doesn't exist in the others (#249: the checkpoint
+  config was refreshed only where submodules are built, so preprocessing never saw it);
+- TP ranks: invariant 11, *when* as well as whether. A per-rank report the conductor aggregates
+  reads replicated values (new-token counts) from rank 0's report only (`is_first_tp_rank`) and sums
+  sharded ones over ranks. A new `WorkerGraphsDone` field or worker metric read the other way double
+  counts or drops data;
 - separate deployments on one host: file names, socket paths, SHM prefixes.
 
 Then say what orders them. Two or more threads on a handle that isn't thread-safe by contract
@@ -159,6 +180,11 @@ whose only tests run eager. The check that settles it is a compiled-vs-eager par
 on CUDA at a few shapes. (#946: `apply_experts_` was traced while its dense siblings are custom
 ops; Inductor mis-lowered its sliced expand and Qwen3-Omni crashed at startup under compile. Only
 the GPU test found it.)
+
+On a captured path, also check: a Python value read inside the captured callable is frozen at
+capture; a static input reassigned instead of written in place (`copy_`) detaches from the address
+the graph holds; and a `cg_key_info()` that disagrees with the step's declaration misses the capture
+and runs eager with no error.
 
 Coverage line: `compiled path: <op> → <opaque like siblings? | traced> → <compiled test? y/n>; …`
 

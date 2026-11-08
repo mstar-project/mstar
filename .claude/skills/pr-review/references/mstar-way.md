@@ -117,6 +117,9 @@ For every mechanism a design or PR puts in the worker, engine, scheduler, conduc
 | Engine, worker, runner or scheduler code naming one resource kind or computation (`isinstance(KVManager)`, a KV-specific branch in a generic path) | a generic hook or declaration on the base class, with that resource as one implementation |
 | A lifecycle, class or decision every resource with per-request state would need (admission class, residency, preemption, replication across ranks), built inside one resource | a contract on the base class or a fact on the request, with that resource as the first implementation |
 | One strategy built as "the feature", or a second near-identical feature under another name | a family (§1b): shared axes, a per-resource declaration, this strategy as one cell |
+| Followers reporting a per-rank fact to rank 0, and rank 0 waiting for the reports before it schedules | rank 0 deciding and sending the decision as a typed field on the step's `ScheduleTPNode`, as `prefix_hits` and `page_trails` go |
+| A hand-kept list or count per node or model (the inputs that set a shape, the sampling keys, a page count) that a new model can get wrong | a value derived from the declarations, the checkpoint config, engine state or what rank 0 already decides |
+| A gate every request waits on to cover a failure that almost never happens | handling on the failure path, paid only by the request that fails |
 
 **Altitude check.** For each new concept (a state, class or flag, lifecycle phase, decision and who
 makes it, journal or message), ask whether it is a fact about the request, the node or the
