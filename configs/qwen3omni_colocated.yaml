@@ -3,8 +3,9 @@ max_seq_len: 32768
 # The KV pools default to 2,048 pages. The Thinker's is 24 GiB at 12 MiB a page,
 # and every node's weights on one 80 GB GPU leave about 12 GiB. At 256 Thinker
 # pages the encoder and Thinker graphs no longer fit beside them; 176 leaves
-# room for the Talker's and a few of the Thinker's (15 of 74 at 80 GB). It also
-# caps one request at about 22K tokens: a longer prompt gets a 400.
+# room for the Talker's and some of the encoders' and the Thinker's (15 of 74 at
+# 80 GB). It holds about 22K tokens of prompt and output per request: a request
+# that can't fit gets a 400, and one with no output limit is cut to fit.
 resources:
   thinker_kv:
     max_num_pages: 176
