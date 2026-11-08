@@ -4311,7 +4311,8 @@ class KVManager(AttentionResource):
     def _admit(self, rid: str, pages: int) -> bool:
         """Allot ``rid`` the ``pages`` it asks for, which the room covers, so the moves still to land for an earmark
         ``rid`` holds add nothing, or return False when ``rid`` turns guaranteed here and the room doesn't cover its
-        footprint. Caller holds the lock."""
+        footprint, which that earmark then waits for. Caller holds the lock."""
+        earmark = self._earmarks.get(rid)
         if rid in self._allotments:
             self._stalled.discard(rid)
             allotment = self._allotments[rid]
@@ -4326,12 +4327,13 @@ class KVManager(AttentionResource):
             ):
                 self._guarantee(rid)
                 pages = self._asks[rid] = self._footprint(rid)
+                if earmark is not None:
+                    earmark.pages = pages
                 if pages > self._room():
                     return False
             returning = self._return_pages(rid) if self._on_host(rid) else None
             self._allotments[rid] = Allotment(pages=pages, asks_again=self._asks.pop(rid), returning=returning)
             self._recount(rid)
-        earmark = self._earmarks.get(rid)
         if earmark is not None:
             earmark.granted = earmark.pages
         return True
@@ -4647,9 +4649,8 @@ class KVManager(AttentionResource):
         if not earmark.victims:
             del self._earmarks[earmark.rid]
         if earmark.rid in self._asks:
-            if earmark.pages <= self._room() and not self._admit(earmark.rid, earmark.pages):
-                # turned guaranteed, so the later moves count toward its footprint
-                earmark.pages = self._asks[earmark.rid]
+            if earmark.pages <= self._room():
+                self._admit(earmark.rid, earmark.pages)
             return
         granted = min(earmark.pages - earmark.granted, freed)
         if granted:
