@@ -71,6 +71,7 @@ def test_downcast_during_capture_names_the_node(monkeypatch, caplog, static_outp
     """A capture runs under the node's scope too, so a downcast it records
     names the node rather than ``<unknown>``."""
     from mstar.engine import accelerator_graph_runner, node_dtype
+    from mstar.engine.accelerator_graph_backend import AcceleratorGraphBackend
     from mstar.utils.device import DeviceCapability
 
     backend = types.SimpleNamespace(
@@ -78,6 +79,7 @@ def test_downcast_during_capture_names_the_node(monkeypatch, caplog, static_outp
         capture=lambda graph, pool, stream=None: nullcontext(), synchronize=lambda: None,
         recover_failed_capture=lambda pool, stream: None,
     )
+    backend.capture_call = AcceleratorGraphBackend.capture_call.__get__(backend)
     monkeypatch.setattr(DeviceCapability, "of", lambda device: types.SimpleNamespace(graph_backend=backend))
     monkeypatch.setattr(
         torch.ops.mstar, "rope_apply_qk_inplace", lambda q, k, *args, **kwargs: None,
