@@ -783,13 +783,14 @@ serving layer lifts into <code class="docutils literal notranslate"><span class=
 <code class="docutils literal notranslate"><span class="pre">initial_prompt</span></code> (the OpenAI <code class="docutils literal notranslate"><span class="pre">prompt</span></code>: prior text carried over as
 <code class="docutils literal notranslate"><span class="pre">&lt;|startofprev|&gt;</span></code> context), <code class="docutils literal notranslate"><span class="pre">timestamps</span></code> (<code class="docutils literal notranslate"><span class="pre">segment</span></code> or <code class="docutils literal notranslate"><span class="pre">word</span></code>, set
 from <code class="docutils literal notranslate"><span class="pre">response_format</span></code> / <code class="docutils literal notranslate"><span class="pre">timestamp_granularities</span></code>), <code class="docutils literal notranslate"><span class="pre">temperature</span></code>.</p>
-<p><strong>Long-form audio.</strong> Whisper hears 30 s; the transcription route serves a
-longer upload as consecutive windows (openai-whisper’s loop): each window is
-conditioned on the transcript so far, decoded with timestamps so the next
-window starts where the last closed segment ended, and re-decoded (first
-without the prompt, then at rising temperatures) when its text is a
-repetition loop. <code class="docutils literal notranslate"><span class="pre">long_form=&quot;parallel&quot;</span></code> submits fixed windows at once,
-cut at the quietest point before each boundary. See <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>.</p>
+<p><strong>Long-form audio.</strong> Whisper hears 30 s; the transcription route cuts a longer
+upload into fixed windows, each at the quietest point before its boundary, and
+submits them at once. <code class="docutils literal notranslate"><span class="pre">long_form=&quot;sequential&quot;</span></code> asks for openai-whisper’s loop
+instead: each window is conditioned on the transcript so far, decoded with
+timestamps so the next window starts where the last closed segment ended, and
+re-decoded (first without the prompt, then at rising temperatures) when its text
+is a repetition loop. It is several times slower, and only it has that
+repetition guard. See <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>.</p>
 </section>
 <section id="qwen3-asr">
 <h2>Qwen3-ASR<a class="headerlink" href="#qwen3-asr" title="Link to this heading">#</a></h2>
@@ -804,8 +805,10 @@ scattered over the placeholders, and prefill (captured on packed token
 buckets) and decode (captured per batch size) run on paged KV. The model
 writes <code class="docutils literal notranslate"><span class="pre">language</span> <span class="pre">{Name}&lt;asr_text&gt;{text}</span></code>; the adapter reports the
 language as an ISO code and the text alone.</p>
-<p>A request hears up to 20 minutes; longer uploads are cut into 20 minute
-windows. The <code class="docutils literal notranslate"><span class="pre">context</span></code> (the OpenAI <code class="docutils literal notranslate"><span class="pre">prompt</span></code>) is the system-turn hint
+<p>A request hears up to 20 minutes, but the route cuts an upload into 30 s windows
+and submits them at once, which is several times faster and holds far fewer KV
+pages. <code class="docutils literal notranslate"><span class="pre">window_seconds=1200</span></code> in <code class="docutils literal notranslate"><span class="pre">extra_body</span></code> asks for the whole file as one
+request (on 10 minute English files, about 1.07 % WER against 1.2 % on the windows one request at a time; at concurrency 16 the difference is within batching noise). The <code class="docutils literal notranslate"><span class="pre">context</span></code> (the OpenAI <code class="docutils literal notranslate"><span class="pre">prompt</span></code>) is the system-turn hint
 the reference SDK also takes; <code class="docutils literal notranslate"><span class="pre">language</span></code> forces the language;
 <code class="docutils literal notranslate"><span class="pre">assistant_prefix</span></code> prefills the assistant turn, which is what streaming
 builds on.</p>
@@ -838,21 +841,25 @@ and 64 with a file per tensor, 87, 252, 494 and 558 on the arena, with the same
 <p>Every ASR config sets <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code>. Whisper’s decoder caches
 hold 64 requests (12 cross-attention pages and 4 self-attention pages each),
 and the model refuses at startup a cap they cannot hold. Requests past the cap
-wait in the conductor. Qwen3-ASR’s requests vary far more in size: a 20 minute
+wait in the conductor, with their audio already staged in shared memory, so
+the uploads the transcription route is cutting at once split the cap between
+them, at least one window each; their other windows wait in the API server.
+A lone upload keeps up to 32 windows on the engine. Qwen3-ASR’s requests vary far more in size: a 20 minute
 file holds about 122 pages of 128 tokens for its prompt and up to 32 more for
-its transcript, so the shipped config’s 2048 pages (<code class="docutils literal notranslate"><span class="pre">kv_cache.max_num_pages</span></code>)
-hold about 13 of them at full size at once. More concurrent long files than
-the pool holds offload to the host pool and, once that is full too, wait on
-each other until they time out: 16 concurrent single-window 20 minute files
-stalled on 2048 pages, and peaked at 2352 pages with 4096 in the pool.</p>
-<p><code class="docutils literal notranslate"><span class="pre">qwen3_asr.yaml</span></code> and <code class="docutils literal notranslate"><span class="pre">qwen3_asr_split.yaml</span></code> therefore cap Qwen3-ASR at 12
-concurrent requests, which any mix of files up to 20 minutes fits. The cap costs short-utterance
-throughput: on LibriSpeech test-clean (one H200, Qwen3-ASR 1.7B) RTFx was
-about 420 at 8 concurrent requests, 900 at 32 and 1280 at 64. A deployment
-that only serves short audio can raise <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> (64 fits
-the default pool); one that serves many long files at once can raise
-<code class="docutils literal notranslate"><span class="pre">kv_cache.max_num_pages</span></code> with the cap. Admission that sizes the cap by each
-request’s pages instead is planned.</p>
+its transcript, while a 30 s window holds about 4. <code class="docutils literal notranslate"><span class="pre">qwen3_asr.yaml</span></code> sizes
+its pools for an 80 GB H100 (<code class="docutils literal notranslate"><span class="pre">kv_cache.max_num_pages:</span> <span class="pre">3500</span></code> and
+<code class="docutils literal notranslate"><span class="pre">cpu_offload_pages:</span> <span class="pre">1536</span></code>) and caps Qwen3-ASR at 64
+concurrent requests, which any mix of windows fits and which is what the
+default long-form throughput needs. Under 16 and 32 concurrent whole 20 minute
+files, GPU memory peaked at 74,285 and 78,651 MiB in two sessions on an H200, against
+an H100’s 81,559 MiB. It hasn’t been run on an H100; the H200’s larger memory may
+let the allocator cache more, so an H100 may peak lower.</p>
+<p>The cap does not bound long whole files. Admission reserves only a request’s
+prompt, so more concurrent 20 minute files than the pools hold offload to the
+host pool and, once that is full too, wait on each other until they time out.
+Only requests that ask for whole files with <code class="docutils literal notranslate"><span class="pre">window_seconds</span></code> can do this; one
+that takes bursts of them should lower the cap or raise the pools with it.
+<code class="docutils literal notranslate"><span class="pre">qwen3_asr_split.yaml</span></code> keeps its cap of 12 and 2048 pages, which hold any mix of files up to 20 minutes; it hasn’t been measured at a higher cap.</p>
 <p>Both decode loops stream their transcript token by token. A decode step
 keeps its rows’ tokens on the device for the next step (the sampler’s device
 loop-back, <code class="docutils literal notranslate"><span class="pre">device_loopback_signals</span></code>), and the worker sends the batch’s
