@@ -829,6 +829,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
@@ -1078,7 +1079,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    From torch 2.12 dynamo's config is per thread. Before it the patch is process-wide while</span>
 <span class="sd">    the call runs, so other nodes keep the engine's limit only because a worker runs one</span>
 <span class="sd">    compiled call at a time (capture before its loop, then its one GPU thread), and its GPU and</span>
-<span class="sd">    plan threads set the engine's config before the loop (``Worker._engine_thread_pool``)."""</span>
+<span class="sd">    plan threads set the engine's config before the loop (``StepExecutor._engine_thread_pool``)."""</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeSubmodule</span>
 
     <span class="n">hook</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="nb">type</span><span class="p">(</span><span class="n">submodule</span><span class="p">),</span> <span class="s2">"dynamo_recompile_limit"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>

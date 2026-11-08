@@ -472,6 +472,7 @@
 <li class="toctree-l2 current active has-children"><a class="current reference internal" href="#">mstar.worker</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
@@ -719,31 +720,34 @@
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.chunk_loops.html#module-mstar.worker.chunk_loops" title="mstar.worker.chunk_loops"><code class="xref py py-obj docutils literal notranslate"><span class="pre">chunk_loops</span></code></a></p></td>
 <td><p>The worker's side of chunked prefill: which (node, walk) pairs run as a chunk Loop, and how far each step moves them.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.host_pool.html#module-mstar.worker.host_pool" title="mstar.worker.host_pool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">host_pool</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.host_copies.html#module-mstar.worker.host_copies" title="mstar.worker.host_copies"><code class="xref py py-obj docutils literal notranslate"><span class="pre">host_copies</span></code></a></p></td>
+<td><p>Host copies of a step's outputs: the pinned staging buffers they go through and the side stream that copies them without waiting on the next step.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.host_pool.html#module-mstar.worker.host_pool" title="mstar.worker.host_pool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">host_pool</span></code></a></p></td>
 <td><p>Host memory a worker copies request state into, so a request can leave the device and come back.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils" title="mstar.worker.node_manager_utils"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_manager_utils</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils" title="mstar.worker.node_manager_utils"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_manager_utils</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.phase_timer.html#module-mstar.worker.phase_timer" title="mstar.worker.phase_timer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">phase_timer</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.phase_timer.html#module-mstar.worker.phase_timer" title="mstar.worker.phase_timer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">phase_timer</span></code></a></p></td>
 <td><p>Per-phase timing of the worker's threads, and the NVTX range that goes with each phase.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.rebuild.html#module-mstar.worker.rebuild" title="mstar.worker.rebuild"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rebuild</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.rebuild.html#module-mstar.worker.rebuild" title="mstar.worker.rebuild"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rebuild</span></code></a></p></td>
 <td><p>What a worker keeps so a request dropped from a node's KV can be rebuilt there, as the node's <cite>RebuildPolicy</cite> declares, and how far each rebuild has run.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.rid_table.html#module-mstar.worker.rid_table" title="mstar.worker.rid_table"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rid_table</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.rid_table.html#module-mstar.worker.rid_table" title="mstar.worker.rid_table"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rid_table</span></code></a></p></td>
 <td><p>Worker-local integer handles for request ids.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.scheduled_batch.html#module-mstar.worker.scheduled_batch" title="mstar.worker.scheduled_batch"><code class="xref py py-obj docutils literal notranslate"><span class="pre">scheduled_batch</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.scheduled_batch.html#module-mstar.worker.scheduled_batch" title="mstar.worker.scheduled_batch"><code class="xref py py-obj docutils literal notranslate"><span class="pre">scheduled_batch</span></code></a></p></td>
 <td><p>A step's rows as the scheduler hands them on, and the chunk arithmetic that goes with them.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.spec_rows.html#module-mstar.worker.spec_rows" title="mstar.worker.spec_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_rows</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.spec_rows.html#module-mstar.worker.spec_rows" title="mstar.worker.spec_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_rows</span></code></a></p></td>
 <td><p>A speculative step's per-row objects, built as columns.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.stream_buffers.html#module-mstar.worker.stream_buffers" title="mstar.worker.stream_buffers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">stream_buffers</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.stream_buffers.html#module-mstar.worker.stream_buffers" title="mstar.worker.stream_buffers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">stream_buffers</span></code></a></p></td>
 <td><p>Streaming edges on one worker, both sides.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.worker_metrics.html#module-mstar.worker.worker_metrics" title="mstar.worker.worker_metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">worker_metrics</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.worker_metrics.html#module-mstar.worker.worker_metrics" title="mstar.worker.worker_metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">worker_metrics</span></code></a></p></td>
 <td><p>The engine worker's metrics, built only while metrics are on.</p></td>
 </tr>
 </tbody>

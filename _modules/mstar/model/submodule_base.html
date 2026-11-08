@@ -829,6 +829,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
@@ -1960,7 +1961,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># autocast, and explicitly disables any ambient one.</span>
     <span class="n">disable_autocast</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Walks whose steps may run beside the worker's main chain, on a second</span>
-    <span class="c1"># stream (``mstar.worker.side_steps``); they do where the node's group in</span>
+    <span class="c1"># stream (``StepPipeline._launch_side``); they do where the node's group in</span>
     <span class="c1"># the serving config sets ``side_stream: true``. For a stream-fed walk that</span>
     <span class="c1"># no chain step waits on. Where the config asks, ``EngineManager.build``</span>
     <span class="c1"># (``_side_lane_keys``) refuses a TP, SP or CFG node, a node alone on its</span>

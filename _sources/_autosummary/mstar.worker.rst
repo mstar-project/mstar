@@ -32,6 +32,7 @@
    chunk_loops
    engine_manager
    executing_batch
+   host_copies
    host_pool
    input_ingest
    lockstep
@@ -43,9 +44,10 @@
    rid_table
    scheduled_batch
    services
-   side_steps
    spec_rows
    speculation
+   step_executor
+   step_pipeline
    stream_buffers
    worker
    worker_metrics

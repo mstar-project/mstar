@@ -475,6 +475,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
@@ -2695,7 +2696,7 @@ worker with a heavier one can set <code class="docutils literal notranslate"><sp
 may run beside the chain instead, and a deployment turns that on with <code class="docutils literal notranslate"><span class="pre">side_stream:</span> <span class="pre">true</span></code>
 on the node’s group (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). Such a step neither takes a turn on the chain nor
 makes it yield, runs on a second stream, and the windows that come ready while it runs
-batch into the next one (see <code class="docutils literal notranslate"><span class="pre">mstar/worker/side_steps.py</span></code>). Its graphs capture on a stream
+batch into the next one (see <code class="docutils literal notranslate"><span class="pre">StepPipeline._launch_side</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/worker/step_pipeline.py</span></code>). Its graphs capture on a stream
 of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
 walk that nothing on the chain reads, such as a codec. Where the config asks,
 <code class="docutils literal notranslate"><span class="pre">EngineManager.build</span></code> refuses what the lane can’t serve, since a side step is neither

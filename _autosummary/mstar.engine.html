@@ -476,6 +476,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
@@ -784,7 +785,7 @@ the call’s duration. A submodule that doesn’t override the hook gets <code c
 <p>From torch 2.12 dynamo’s config is per thread. Before it the patch is process-wide while
 the call runs, so other nodes keep the engine’s limit only because a worker runs one
 compiled call at a time (capture before its loop, then its one GPU thread), and its GPU and
-plan threads set the engine’s config before the loop (<code class="docutils literal notranslate"><span class="pre">Worker._engine_thread_pool</span></code>).</p>
+plan threads set the engine’s config before the loop (<code class="docutils literal notranslate"><span class="pre">StepExecutor._engine_thread_pool</span></code>).</p>
 </dd></dl>
 
 <p class="rubric">Modules</p>

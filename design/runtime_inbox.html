@@ -476,6 +476,7 @@
 <li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
@@ -731,7 +732,7 @@
 <p>Status: proposed, parked. Nothing measured today is limited by it; this note records the design and the numbers behind it so the work can start from here when a workload is.</p>
 <section id="the-input-path-today">
 <h2>The input path today<a class="headerlink" href="#the-input-path-today" title="Link to this heading">#</a></h2>
-<p>A worker’s main thread drains its control socket and handles each message in Python (<code class="docutils literal notranslate"><span class="pre">Worker._process_message_list</span></code>):</p>
+<p>A worker’s main thread drains its control socket and handles each message in Python (<code class="docutils literal notranslate"><span class="pre">InputIngest.process_messages</span></code>):</p>
 <ol class="arabic simple">
 <li><p><strong>Decode</strong> the message (<code class="docutils literal notranslate"><span class="pre">wire.decode</span></code>).</p></li>
 <li><p><strong>Dispatch</strong> on its type: <code class="docutils literal notranslate"><span class="pre">NEW_REQUEST</span></code>, <code class="docutils literal notranslate"><span class="pre">INPUT_SIGNALS</span></code>, <code class="docutils literal notranslate"><span class="pre">EDGE_ITEMS</span></code>, <code class="docutils literal notranslate"><span class="pre">TENSOR_RECEIVED</span></code>, <code class="docutils literal notranslate"><span class="pre">REMOVE_REQUEST</span></code>, <code class="docutils literal notranslate"><span class="pre">STOP_LOOPS</span></code> and the TP control messages.</p></li>

@@ -4,19 +4,20 @@ when admit refuses one.
 Doesn't import the scheduler. A refused step's caller passes in what only it
 knows: the requests in arrival order, who is last in line, and whether other
 rows could refill the step (the last two as callables into the scheduler).
-Reads the request bookkeeping only to unpark rows, and starts the rebuild of a
-row its engine dropped (``Rebuilds.start``).
+Reads the request bookkeeping only to unpark rows, starts the rebuild of a row
+its engine dropped (``Rebuilds.start``), and fails a request a resource refused
+for good (``RequestLifecycle.fail``).
 """
 from __future__ import annotations
 
 import logging
-import math
 import time
 from collections.abc import Callable, Collection, Iterable
 from enum import Enum
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AllocationFailed, Residency
+from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.scheduled_batch import ScheduledBatch
 from mstar.worker.services import WorkerLayout, WorkerServices
 
@@ -35,25 +36,20 @@ class EvictionPolicy(Enum):
 
 
 class Admission:
-    """Parked rows, holds, batch limits and admit errors.
-
-    A rid with an admit error is held until the error is taken, so a scan or a
-    backlog skips it wherever it skips a held row.
-    """
+    """Parked rows, holds and batch limits. A terminal refusal fails its
+    request at once, which every scan then leaves out."""
 
     # Seconds to wait before retrying a held request after OOM
     HOLD_BACKOFF_SECONDS = 0.05
 
-    def __init__(self, services: WorkerServices, layout: WorkerLayout):
+    def __init__(self, services: WorkerServices, layout: WorkerLayout, lifecycle: RequestLifecycle):
+        self._lifecycle = lifecycle
         self._engine_manager = services.engine_manager
         self._request_state = services.request_state
         self._runtime = services.graph_runtime
         self._rebuilds = services.rebuilds
         self._combined_walk_of = layout.combined_walk_of
         self._follows = layout.followed_nodes
-        # rid -> message, for requests a resource declared unservable, or that a
-        # raising scheduling pass left in no step
-        self.admit_errors: dict[int, str] = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
         # node -> rids waiting for capacity there, which readiness answers
@@ -81,7 +77,7 @@ class Admission:
     ) -> bool:
         """Engine-level readiness. Retryable not-ready (an in-flight KV read, a
         reload that doesn't fit) just comes back False; a ``terminal`` reason
-        never will, so it becomes an admit error instead of being rescanned
+        never will, so it fails the request instead of being rescanned
         forever. A rid waiting for capacity is parked on its node until
         `let_rows_back` finds it admitted, and a dropped rid waits until its
         rebuild lands."""
@@ -100,22 +96,11 @@ class Admission:
                 "Request %s cannot be served on node %s by resource %s: %s",
                 rid, node_name, outcome.failed_resource, outcome.reason.message,
             )
-            self._record_admit_error(
-                rid, f"resource {outcome.failed_resource} rejected the request: {outcome.reason.message}",
-            )
+            self._lifecycle.fail({
+                rid: f"resource {outcome.failed_resource} rejected the request: {outcome.reason.message}",
+            })
             return False
         return outcome.ok and outcome.ready
-
-    def _record_admit_error(self, rid: int, message: str) -> None:
-        self.admit_errors[rid] = message
-        self.held_until[rid] = math.inf
-
-    def take_admit_errors(self) -> dict[int, str]:
-        """Hand the accumulated terminal failures to the caller, once."""
-        errors, self.admit_errors = self.admit_errors, {}
-        for rid in errors:
-            self.held_until.pop(rid, None)
-        return errors
 
     def let_rows_back(self) -> None:
         """Before a scan: drop the holds that have run out, and unpark the
@@ -140,7 +125,6 @@ class Admission:
 
     def clear(self, rid: int) -> None:
         """Forget ``rid``; called from its teardown."""
-        self.admit_errors.pop(rid, None)
         self.held_until.pop(rid, None)
         for rids in self.parked.values():
             rids.discard(rid)
@@ -257,7 +241,7 @@ class Admission:
         walk completes only on a step that runs.
 
         A ``terminal`` reason would refuse the same step again on every pass,
-        so the requests it names become admit errors and the rest are re-queued;
+        so the requests it names fail and the rest are re-queued;
         the whole batch when it names no row of it. A TP follower only re-queues:
         rank 0 refused the same step, fails the same requests, and their
         teardown reaches this rank as a REMOVE.
@@ -285,8 +269,7 @@ class Admission:
                 "%d requests", batch.node_name, batch.graph_walk,
                 reason.message, len(doomed), len(rids),
             )
-            for rid in doomed:
-                self._record_admit_error(rid, f"Error in worker: {reason.message}")
+            self._lifecycle.fail(dict.fromkeys(doomed, f"Error in worker: {reason.message}"))
         elif not reason.terminal and not isinstance(reason, AllocationFailed):
             logger.info(
                 "Admit refused node=%s walk=%s (%s): re-queued %d requests",

@@ -476,6 +476,7 @@
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.worker.html">mstar.worker</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
@@ -740,12 +741,11 @@ be purged on the same REMOVE_REQUEST that releases it. A leaked string key was
 harmless – the string never recurred – but a leaked handle silently attaches
 to whichever request gets that handle next. Known handle-keyed state:
 RequestLifecycle.{failed_rids, arrivals, pending_removes, _removes_awaiting_step,
-_wires, _unreported}
-(purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
-cached_prefix} (purged by clear_rid), Admission.{admit_errors, held_until,
-parked} (purged by clear), Lockstep.read_failed_rids (purged by clear),
-Worker._pending_loop_stops, Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info,
-_fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the engine’s and
+_unreported} (purged by removed), MicroScheduler.{backlog, last_ran, chunk_started,
+cached_prefix} (purged by clear_rid), Admission.{held_until, parked}
+(purged by clear), Lockstep.read_failed_rids (purged by clear),
+Rebuilds.{_kept, _cursors}, RequestStateManager.{per_request_info, _fwd_by_partition}
+and StreamBufferManager._rids (purged by remove_request), the engine’s and
 tensor manager’s per-request state (including ChunkingManagement.prepared,
 Glm52LLMSubmodule’s MTP maps, cleared by its cleanup_request, and
 the tensor store’s rid -&gt; uuids ownership, held in the Rust bookkeeper under

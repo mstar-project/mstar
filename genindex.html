@@ -829,6 +829,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
@@ -2972,6 +2973,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.created">created (mstar.api_server.openai.protocol.ModelCard attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.crop_size">crop_size (mstar.model.vjepa2.config.VJepa2Config attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.host_copies.html#mstar.worker.host_copies.crop_to_spans">crop_to_spans() (in module mstar.worker.host_copies)</a>
 </li>
       <li><a href="_autosummary/mstar.model.wan22.config.html#mstar.model.wan22.config.Wan22Config.cross_attn_norm">cross_attn_norm (mstar.model.wan22.config.Wan22Config attribute)</a>
 </li>
@@ -5225,10 +5228,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.vjepa2.config.html#mstar.model.vjepa2.config.VJepa2Config.hidden_act">(mstar.model.vjepa2.config.VJepa2Config attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroModelConfig.hidden_dim">hidden_dim (mstar.model.kokoro.config.KokoroModelConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.T3BackboneConfig.hidden_size">hidden_size (mstar.model.chatterbox.config.T3BackboneConfig attribute)</a>
 
       <ul>
@@ -5332,6 +5335,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.host_spans">host_spans (mstar.model.submodule_base.BatchedModelOutput attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.host_copy.html#mstar.utils.host_copy.HostCopier">HostCopier (class in mstar.utils.host_copy)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.host_copies.html#mstar.worker.host_copies.HostCopies">HostCopies (class in mstar.worker.host_copies)</a>
 </li>
       <li><a href="_autosummary/mstar.worker.host_pool.html#mstar.worker.host_pool.HostCopy">HostCopy (class in mstar.worker.host_pool)</a>
 </li>
@@ -7905,6 +7910,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.worker.chunk_loops.html#module-mstar.worker.chunk_loops">mstar.worker.chunk_loops</a>
 </li>
+        <li><a href="_autosummary/mstar.worker.host_copies.html#module-mstar.worker.host_copies">mstar.worker.host_copies</a>
+</li>
         <li><a href="_autosummary/mstar.worker.host_pool.html#module-mstar.worker.host_pool">mstar.worker.host_pool</a>
 </li>
         <li><a href="_autosummary/mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils">mstar.worker.node_manager_utils</a>
@@ -7962,10 +7969,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.glm5_next.config.html#mstar.model.glm5_next.config.Glm5NextModelConfig.moe_router_dtype">(mstar.model.glm5_next.config.Glm5NextModelConfig attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MOONCAKE_PATCHED_VERSION">MOONCAKE_PATCHED_VERSION (in module mstar.communication.tensors)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MooncakeCommunicationManager">MooncakeCommunicationManager (class in mstar.communication.tensors)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.MooncakeTransferEngine">MooncakeTransferEngine (class in mstar.communication.tensors)</a>
@@ -9823,6 +9830,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    mstar.worker.host_copies
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.host_copies.html#module-mstar.worker.host_copies">module</a>
+</li>
+      </ul></li>
+      <li>
     mstar.worker.host_pool
 
       <ul>
@@ -11355,10 +11369,10 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.pool">pool (mstar.worker.rebuild.Rebuilds property)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CapturedGraph.pool">pool() (mstar.engine.accelerator_graph_backend.CapturedGraph method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.pop">pop() (mstar.model.submodule_base.BatchedModelOutput method)</a>
 </li>
       <li><a href="_autosummary/mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamBuffer.pop_chunk">pop_chunk() (mstar.streaming.stream_buffer.StreamBuffer method)</a>
@@ -11636,6 +11650,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex">PrefixIndex (class in mstar.engine.resources.kv.prefix_index)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PrefixSpan">PrefixSpan (class in mstar.engine.resources.kv.config)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.host_copies.html#mstar.worker.host_copies.HostCopies.prematerialize_for_check_stop">prematerialize_for_check_stop() (mstar.worker.host_copies.HostCopies method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.conditioning.html#mstar.model.cosmos3.components.conditioning.prepare_conditioning_frames">prepare_conditioning_frames() (in module mstar.model.cosmos3.components.conditioning)</a>
 </li>
@@ -13351,6 +13367,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.AllocationFailed.rows_sized">(mstar.engine.resources.step.AllocationFailed attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.worker.host_copies.html#mstar.worker.host_copies.rows_to_per_rid">rows_to_per_rid() (in module mstar.worker.host_copies)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.SidecarScaling.rslora">rslora (mstar.engine.resources.lora.checkpoint.SidecarScaling attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.whisper.components.timestamps.html#mstar.model.whisper.components.timestamps.rule_state">rule_state() (in module mstar.model.whisper.components.timestamps)</a>
@@ -14438,6 +14456,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.StackingMethod.STACK">STACK (mstar.model.submodule_base.StackingMethod attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.StackingMethod">StackingMethod (class in mstar.model.submodule_base)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.host_copies.html#mstar.worker.host_copies.HostCopies.stage_host_rows">stage_host_rows() (mstar.worker.host_copies.HostCopies method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.runner.html#mstar.engine.resources.runner.StepRunner.staged">staged (mstar.engine.resources.runner.StepRunner property)</a>
 
@@ -16050,6 +16070,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.graph.loop_indices.html#mstar.graph.loop_indices.NestedLoopIndices.wg_fwd_pass_idx">wg_fwd_pass_idx (mstar.graph.loop_indices.NestedLoopIndices attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.PopReadyResult.wg_ids">wg_ids (mstar.worker.scheduled_batch.PopReadyResult attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.ScheduledBatch.wg_ids">wg_ids() (mstar.worker.scheduled_batch.ScheduledBatch method)</a>
 </li>
       <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.PartitionState.wg_rank_completions">wg_rank_completions (mstar.conductor.request_info.PartitionState attribute)</a>
 </li>
