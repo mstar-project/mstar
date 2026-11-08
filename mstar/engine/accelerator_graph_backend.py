@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import ctypes
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from types import ModuleType
 from typing import Any, Literal, NamedTuple, Protocol, Sequence
 
@@ -96,16 +97,17 @@ class _Memcpy3D(ctypes.Structure):
 class _CUDAComposedGraph:
     """One native graph over existing captures and copies; owns every binding."""
 
-    def __init__(self, backend, ops):
+    def __init__(self, backend, ops, *, keep_graph=False, retained=(), owned=()):
         self._backend, self._cuda = backend, backend.while_runtime()
         self._graph, self._exec = ctypes.c_void_p(), ctypes.c_void_p()
         self._ops = ()
+        self._retained, self._owned = list(retained), list(owned)
         try:
             self._ops = self._snapshot(ops)
             self._cuda._call("cudaGraphCreate", ctypes.byref(self._graph), ctypes.c_uint(0))
             self._append(self._graph.value, self._ops)
-            self._cuda._call("cudaGraphInstantiateWithFlags", ctypes.byref(self._exec), self._graph,
-                             ctypes.c_ulonglong(0))
+            if not keep_graph:
+                self.raw_cuda_graph_exec()
         except BaseException:
             self.reset()
             raise
@@ -122,6 +124,8 @@ class _CUDAComposedGraph:
             if isinstance(op, _CUDAComposedGraph):
                 if not op._graph.value or op._backend.device != self._backend.device:
                     raise ValueError("a composed member must be live and on the same device")
+                self._retained.extend(op._retained)
+                self._owned.extend(op._owned)
                 result.extend(self._snapshot(op._ops))
             elif isinstance(op, GraphConditional):
                 result.append(GraphConditional(op.kind, op.predicate, self._snapshot(op.body)))
@@ -174,8 +178,57 @@ class _CUDAComposedGraph:
         device = self._backend.device
         return tensor.device.type == device.type and (device.index is None or tensor.device.index == device.index)
 
+    def raw_cuda_graph(self) -> int:
+        return self._graph.value
+
+    def raw_cuda_graph_exec(self) -> int:
+        if not self._graph.value:
+            raise ValueError("a reset composed graph cannot launch")
+        if not self._exec.value:
+            self._cuda._call("cudaGraphInstantiateWithFlags", ctypes.byref(self._exec), self._graph,
+                             ctypes.c_ulonglong(0))
+        return self._exec.value
+
+    def measurement_copy(self):
+        """Fresh conditional handles; never replay after releasing the source."""
+        copy = _CUDAComposedGraph(self._backend, self._ops)
+        copy._ops = ()
+        copy._retained.clear()
+        copy._owned.clear()
+        return copy.reset
+
+    def retained_bytes(self, pool, outputs) -> tuple[int, int]:
+        """Internal kept bytes, and newly owned bytes outside the capture pool."""
+        values, final = [outputs], set()
+        while values:
+            value = values.pop()
+            if isinstance(value, torch.Tensor):
+                final.add(value.untyped_storage().data_ptr())
+            elif isinstance(value, Mapping):
+                values.extend(value.values())
+            elif isinstance(value, (tuple, list)):
+                values.extend(value)
+            elif is_dataclass(value):
+                values.extend(vars(value).values())
+        retained = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+                    for t in (*self._retained, *self._owned)
+                    if t.untyped_storage().data_ptr() not in final}
+        owned = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in self._owned}
+        internal = set()
+        for segment in torch.cuda.memory_snapshot():
+            if tuple(segment.get("segment_pool_id", ())) != tuple(pool):
+                continue
+            address = segment["address"]
+            for block in segment["blocks"]:
+                end = address + block["size"]
+                if any(address <= pointer < end for pointer in retained):
+                    internal.add((address, block["size"]))
+                address = end
+        outside = sum(owned.values())
+        return sum(size for _, size in internal) + sum(size for ptr, size in owned.items() if ptr not in final), outside
+
     def replay(self) -> None:
-        self._cuda.launch(self._exec.value, self._backend.raw_stream())
+        self._cuda.launch(self.raw_cuda_graph_exec(), self._backend.raw_stream())
 
     def pool(self):
         return None  # child captures own their allocation pools
@@ -188,6 +241,8 @@ class _CUDAComposedGraph:
             self._cuda._call("cudaGraphDestroy", self._graph)
             self._graph = ctypes.c_void_p()
         self._ops = ()
+        self._retained.clear()
+        self._owned.clear()
 
     def __del__(self):
         try:
@@ -233,6 +288,13 @@ class AcceleratorGraphBackend(ABC):
         pool: AcceleratorGraphPool | None = None,
         stream: Any = None,
     ) -> AbstractContextManager: ...
+
+    def capture_call(self, graph, run, *, pool, stream=None, conditionals=False, keep_graph=False):
+        if conditionals:
+            raise ValueError(f"{type(self).__name__} cannot capture tensor conditionals")
+        with self.capture(graph, pool=pool, stream=stream):
+            output = run()
+        return graph, output
 
     @abstractmethod
     def new_stream(self) -> Any: ...
@@ -374,8 +436,18 @@ class CUDAGraphBackend(_TorchGraphBackend):
 
     def compose(
         self, ops: Sequence[CapturedGraph | tuple[torch.Tensor, torch.Tensor] | GraphConditional],
+        *, keep_graph=False, retained=(), owned=(),
     ) -> CapturedGraph:
-        return _CUDAComposedGraph(self, ops)
+        return _CUDAComposedGraph(self, ops, keep_graph=keep_graph, retained=retained, owned=owned)
+
+    def capture_call(self, graph, run, *, pool, stream=None, conditionals=False, keep_graph=False):
+        if not conditionals:
+            return super().capture_call(graph, run, pool=pool, stream=stream)
+        from mstar.engine.conditional_capture import ConditionalCapture
+
+        if reason := self.while_refusal():
+            raise ValueError(reason)
+        return ConditionalCapture(self, pool, stream).capture(run, keep_graph=keep_graph)
 
     def _runtime_entry(self, name: str) -> int:
         """A libcudart entry point's address, by the soname of torch's CUDA

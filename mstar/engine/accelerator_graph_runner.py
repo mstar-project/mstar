@@ -17,6 +17,7 @@ from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
     GraphConditional,
+    _CUDAComposedGraph,
     copy_words,
 )
 from mstar.engine.accelerator_graph_config import (
@@ -28,6 +29,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
     PiecewiseConfigType,
 )
+from mstar.engine.conditional_capture import ConditionalWarmup
 from mstar.engine.device_run import DeviceRun, RunAsk, RunState, TokenStream, column_in
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
@@ -192,6 +194,7 @@ def capture_into_graph(
     run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
     node_name: str | None = None,
     stream: Any = None,
+    conditionals: bool = False,
 ):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
@@ -222,8 +225,9 @@ def capture_into_graph(
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype, backend.device_type, node_name):
-            with backend.capture(graph, pool=pool, stream=stream):
-                output = run()
+            graph, output = backend.capture_call(
+                graph, run, pool=pool, stream=stream, conditionals=conditionals, keep_graph=keep_graph,
+            )
     except BaseException:
         pool.on_failure(graph)
         backend.recover_failed_capture(pool, prev_stream)
@@ -237,7 +241,7 @@ def capture_into_graph(
 
 def capture_with_static_outputs(
     run, warm_outputs, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
-    node_name: str | None = None, stream: Any = None,
+    node_name: str | None = None, stream: Any = None, conditionals: bool = False,
 ):
     """Capture ``run`` so its outputs land in buffers allocated OUTSIDE ``pool``.
 
@@ -268,6 +272,7 @@ def capture_with_static_outputs(
 
     graph, _ = capture_into_graph(
         captured, pool, device, autocast_dtype, keep_graph, node_name=node_name, stream=stream,
+        conditionals=conditionals,
     )
     return graph, static_outputs
 
@@ -309,6 +314,7 @@ class GraphMemory(NamedTuple):
     """What a captured graph holds: in its pool, and outside the allocator."""
     pool: int
     outside: int
+    kept: int = 0
 
 
 class ExecutableMemory:
@@ -328,7 +334,7 @@ class ExecutableMemory:
         self.per_node: float | None = None
         # a lower bound on the bytes the copies hold
         self.held = 0
-        self._copies: list[ctypes.c_void_p] = []
+        self._copies: list[Callable[[], None]] = []
 
     def measure(self, graph, nodes: int) -> None:
         """Set ``per_node`` and ``held`` from copies of ``graph``, held until `release`.
@@ -349,14 +355,18 @@ class ExecutableMemory:
         tries = 0
         first = len(self._copies)
         while tries < _MEASURE_TRIES and len(self._copies) < _MEASURE_COPIES:
-            copy = ctypes.c_void_p()
-            status = cuda.cuGraphInstantiateWithFlags(
-                ctypes.byref(copy), ctypes.c_void_p(graph.raw_cuda_graph()), ctypes.c_ulonglong(0),
-            )
-            if status != 0:
-                logger.warning("Stopped measuring graph executable memory: CUresult %d", status)
-                break
-            self._copies.append(copy)
+            if isinstance(graph, _CUDAComposedGraph):
+                release = graph.measurement_copy()
+            else:
+                copy = ctypes.c_void_p()
+                status = cuda.cuGraphInstantiateWithFlags(
+                    ctypes.byref(copy), ctypes.c_void_p(graph.raw_cuda_graph()), ctypes.c_ulonglong(0),
+                )
+                if status != 0:
+                    logger.warning("Stopped measuring graph executable memory: CUresult %d", status)
+                    break
+                release = partial(cuda.cuGraphExecDestroy, copy)
+            self._copies.append(release)
             drop = free - torch.cuda.mem_get_info()[0]
             free -= drop
             if drop < 0:
@@ -387,12 +397,9 @@ class ExecutableMemory:
         self.per_node = largest
 
     def release(self) -> None:
-        # copies are made only on NVIDIA GPUs, since others may have no libcuda
-        if self._copies:
-            cuda = ctypes.CDLL("libcuda.so.1")
-            for copy in self._copies:
-                cuda.cuGraphExecDestroy(copy)
-            self._copies.clear()
+        for release in self._copies:
+            release()
+        self._copies.clear()
 
 
 #: the driver maps executable memory in pieces of 2 MiB
@@ -456,12 +463,16 @@ def _capture_thrown_away(
         logger.warning("Could not capture %s to size it", what, exc_info=True)
         graph = outputs = None
     taken = None if graph is None else _pool_bytes(pool.handle)
+    kept = 0
+    if isinstance(graph, _CUDAComposedGraph):
+        kept, outside_pool = graph.retained_bytes(pool.handle, outputs)
+        taken += outside_pool
     del graph, outputs
     # A capture that never ended, or any capture before torch 2.12, keeps its stream's cuBLAS
     # workspace in the pool. No real graph uses it yet.
     torch._C._cuda_clearCublasWorkspaces()
     torch.cuda.empty_cache()
-    return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)))
+    return None if taken is None else GraphMemory(taken, round(nodes * (executable.per_node or 0)), kept)
 
 
 def _pool_bytes(pool_id) -> int:
@@ -489,6 +500,7 @@ def _graph_nodes(graph) -> int:
 def _size_in_walk(
     captured: list[CaptureCost], cost: CaptureCost, kept_in_pool: bool,
     capture: Callable[..., tuple[Any, Any]], what: str, executable: ExecutableMemory,
+    *, structured: bool = False,
 ) -> tuple[CaptureCost, bool]:
     """Return ``cost`` with its graph's size, and whether that size came from
     another bucket's capture: the bucket is captured, thrown away, unless two
@@ -512,7 +524,7 @@ def _size_in_walk(
     cost = cost._replace(executable=executable)
     lender = max(captured, key=lambda bucket: bucket.peak, default=None)
     if (
-        len(captured) > 1 and cost.peak <= lender.peak
+        not structured and len(captured) > 1 and cost.peak <= lender.peak
         and all(scratch(bucket) <= scratch(lender) for bucket in captured)
     ):
         return cost._replace(graph=lender.graph - lender.kept + cost.kept, outside=lender.outside), True
@@ -520,8 +532,10 @@ def _size_in_walk(
     if memory is not None:
         cost = cost._replace(
             graph=memory.pool if kept_in_pool else memory.pool + cost.kept, outside=memory.outside,
+            kept=cost.kept + memory.kept,
         )
-        captured.append(cost)
+        if not structured:
+            captured.append(cost)
     return cost, False
 
 
@@ -783,9 +797,11 @@ class WarmedSpec(NamedTuple):
     # device: it sizes the run's columns before the capture
     output: Any = None
     resident: CapturedResidentStep | None = None
+    conditionals: bool = False
 
 
 class AcceleratorGraphRunner:
+    _conditional_buckets: frozenset[BucketKey] = frozenset()
     _connected_walks: frozenset[str] = frozenset()
     _member: str = ""
     CAPTURE_BATCH_SIZES = DEFAULT_CAPTURE_BATCH_SIZES
@@ -1119,15 +1135,18 @@ class AcceleratorGraphRunner:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
                     if spec.slot == 0:
                         walk = (spec.bucket.graph_walk, spec.bucket.cg_key_info)
+                        executable_key = (*walk, spec.bucket) if warmed.conditionals else walk
                         self._capture_costs[spec.bucket], lent = _size_in_walk(
                             captured.setdefault(walk, []),
                             CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
                             partial(
                                 capture_into_graph, warmed.run, device=self._device,
                                 autocast_dtype=self._autocast_dtype, node_name=self._submodule_name,
-                                stream=self._capture_stream,
+                                stream=self._capture_stream, conditionals=warmed.conditionals,
                             ),
-                            f"{self._submodule_name} {spec}", self._executables.setdefault(walk, ExecutableMemory()),
+                            f"{self._submodule_name} {spec}",
+                            self._executables.setdefault(executable_key, ExecutableMemory()),
+                            structured=warmed.conditionals,
                         )
                         extra = self._input_bank_bytes(spec, warmed)
                         cost = self._capture_costs[spec.bucket]
@@ -1354,6 +1373,7 @@ class AcceleratorGraphRunner:
                 graph, output = capture_into_graph(
                     warmed.run, self._memory_pool, self._device, self._autocast_dtype,
                     node_name=self._submodule_name, stream=self._capture_stream,
+                    conditionals=warmed.conditionals,
                     keep_graph=self._device.type == "cuda" and not self._connected_walks.isdisjoint(
                         spec.config.replay_graph_walks,
                     ),
@@ -1575,13 +1595,8 @@ class AcceleratorGraphRunner:
             graph, output = capture_into_graph(
                 body, self._memory_pool, self._device, self._autocast_dtype, keep_graph=True,
                 node_name=self._submodule_name, stream=self._capture_stream,
+                conditionals=warmed.conditionals,
             )
-            raw_graph = int(graph.raw_cuda_graph())
-            if (refusal := cuda.node_refusal(raw_graph)) is not None:
-                self._run_failures[walk] = f"runner: {refusal}"
-                if window is not None or run.prepared is not None:
-                    owner.discard_window(SlotLease(spec.slot, spec.bucket, self._member))
-                return None, None, None
             entry, _ = capture_into_graph(
                 lambda: cuda.start(state, backend.raw_stream()), self._memory_pool, self._device, None,
                 keep_graph=True, node_name=self._submodule_name, stream=self._capture_stream,
@@ -1686,12 +1701,15 @@ class AcceleratorGraphRunner:
                 torch.accelerator.reset_peak_memory_stats(self._device)
                 offset = self._graph_backend.generator_offset()
                 output = None
-                with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name):
+                warm = ConditionalWarmup(self._graph_backend, world_size=self._comm_group.world_size)
+                with autocast_scope(self._autocast_dtype, self._device.type, self._submodule_name), warm:
                     out = run_forward()
                     returned = _tensor_bytes(out)
                     if walk in self._run_asks:
                         output = out
                     del out
+                if warm.found:
+                    self._conditional_buckets = self._conditional_buckets | {spec.bucket}
                 if self._graph_backend.generator_offset() != offset:
                     self._generator_walks.add(walk)
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
@@ -1718,7 +1736,7 @@ class AcceleratorGraphRunner:
                 returned=returned,
                 row_heads=row_heads,
                 output=output,
-                resident=resident,
+                resident=resident, conditionals=spec.bucket in self._conditional_buckets,
             )
         finally:
             # Capture ran the dummy rows as real requests; free their storage
@@ -2537,6 +2555,7 @@ class WarmedRegion(NamedTuple):
     dummy_rids: list[int]
     warm_outputs: dict[str, torch.Tensor]
     peak: int
+    conditionals: bool = False
 
 
 class PiecewiseAcceleratorGraphRunner:
@@ -2603,6 +2622,7 @@ class PiecewiseAcceleratorGraphRunner:
         self._lent: set[BucketKey] = set()
         # executable memory of the region's graphs, which are all one walk
         self._executable = ExecutableMemory()
+        self._conditional_buckets: frozenset[BucketKey] = frozenset()
         # bucket -> the shape, dtype and device of each output of its warm-up
         self._output_likes: dict[BucketKey, dict[str, tuple]] = {}
         self._dummy_rows = DummyRowPool(
@@ -2726,9 +2746,11 @@ class PiecewiseAcceleratorGraphRunner:
                                 partial(
                                     capture_with_static_outputs, warmed.run, warmed.warm_outputs,
                                     device=self._device, autocast_dtype=self._autocast_dtype,
-                                    node_name=self._node_name,
+                                    node_name=self._node_name, conditionals=warmed.conditionals,
                                 ),
-                                f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}", self._executable,
+                                f"{self._label} bs={shape.bs} total_tokens={shape.total_tokens}",
+                                ExecutableMemory() if warmed.conditionals else self._executable,
+                                structured=warmed.conditionals,
                             )
                             if lent:
                                 self._lent.add(self._bucket(shape))
@@ -2786,6 +2808,9 @@ class PiecewiseAcceleratorGraphRunner:
 
     def warmup_and_capture(self, planned: Collection[BucketKey] | None) -> None:
         self._executable.release()
+        for cost in self._capture_costs.values():
+            if cost.executable is not None and cost.executable is not self._executable:
+                cost.executable.release()
         if self._graph_backend is None or not self._graph_backend.is_available():
             logger.warning(
                 "%s is not available, skipping piecewise capture for %s",
@@ -2883,7 +2908,7 @@ class PiecewiseAcceleratorGraphRunner:
             graph, static_outputs = capture_with_static_outputs(
                 warmed.run, warmed.warm_outputs if forwards else self._outputs_like(self._bucket(shape)),
                 self._memory_pool, self._device, self._autocast_dtype,
-                node_name=self._node_name, stream=self._capture_stream,
+                node_name=self._node_name, stream=self._capture_stream, conditionals=warmed.conditionals,
             )
 
         self._graphs[PiecewiseGraphKey(
@@ -2929,8 +2954,11 @@ class PiecewiseAcceleratorGraphRunner:
                 # as in `AcceleratorGraphRunner._warmed`
                 live = torch.accelerator.memory_allocated(self._device)
                 torch.accelerator.reset_peak_memory_stats(self._device)
-                with autocast_scope(self._autocast_dtype, self._device.type, self._node_name):
+                warm = ConditionalWarmup(self._graph_backend, world_size=self._comm_group.world_size)
+                with autocast_scope(self._autocast_dtype, self._device.type, self._node_name), warm:
                     warm_outputs = run_fn()
+                if warm.found:
+                    self._conditional_buckets = self._conditional_buckets | {self._bucket(shape)}
                 peak = torch.accelerator.max_memory_allocated(self._device) - live
                 # back to a clean stream state so the re-plan below (and the
                 # capture after it) sees the shapes the first plan did
@@ -2941,6 +2969,7 @@ class PiecewiseAcceleratorGraphRunner:
             yield WarmedRegion(
                 run=run_fn, static_inputs=static_inputs,
                 dummy_rids=dummy_rids, warm_outputs=warm_outputs, peak=peak,
+                conditionals=self._bucket(shape) in self._conditional_buckets,
             )
         finally:
             # pages stay with the dummy streams: replay's padding rows address

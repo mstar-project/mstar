@@ -538,3 +538,110 @@ def test_one_cuda_launch_gates_members_independently_and_drains_without_producin
         assert not output[b:].any()
     assert len(launches) == len(cases) and len(set(launches)) == 1
     graph.reset()
+
+
+def test_conditional_warmup_checks_branches_before_priming(monkeypatch):
+    from mstar.engine.conditional_capture import ConditionalWarmup
+
+    backend = CUDAGraphBackend(torch.device("cuda", 0))
+    primed = []
+    monkeypatch.setattr(ConditionalWarmup, "_prime", lambda self, *args: primed.append(args))
+    x = torch.arange(4.)
+    index = torch.tensor([99])
+    def choose(x, index, pred):
+        return torch.cond(pred, lambda x, i: x[i], lambda x, i: x[:1] + 2, (x, index))
+    mode = ConditionalWarmup(backend)
+    with mode:
+        result = choose(x, index, torch.tensor(False))
+    assert mode.found and result.tolist() == [2] and len(primed) == 1
+    with mode, torch.compiler.set_stance("fail_on_recompile"):
+        result = choose(x, torch.tensor([2]), torch.tensor(True))
+    assert result.tolist() == [2] and len(primed) == 2
+    before = len(primed)
+    with ConditionalWarmup(backend, world_size=2), pytest.raises(ValueError, match="one joint rank"):
+        choose(x, index, torch.tensor(False))
+    assert len(primed) == before
+    with ConditionalWarmup(backend), pytest.raises(ValueError, match="random"):
+        torch.cond(torch.tensor(False), torch.rand_like, lambda x: x + 1, (x,))
+    assert len(primed) == before and x.tolist() == [0, 1, 2, 3]
+    def local(value):
+        result = value.sin()
+        result.add_(1)
+        return result
+    with ConditionalWarmup(backend):
+        actual = torch.cond(torch.tensor(True), local, lambda value: value + 2, (x,))
+    torch.testing.assert_close(actual, x.sin() + 1)
+    assert x.tolist() == [0, 1, 2, 3]
+    def nested(value, outer, inner):
+        return torch.cond(outer, lambda value, inner: torch.cond(
+            inner, lambda value: value * 2, lambda value: value + 3, (value,),
+        ), lambda value, inner: value + 4, (value, inner))
+    with ConditionalWarmup(backend):
+        actual = nested(x, torch.tensor(True), torch.tensor(False))
+    torch.testing.assert_close(actual, x + 3)
+    embedding = torch.nn.Embedding(4, 3).eval().requires_grad_(False)
+    ids = torch.tensor([1, 2])
+    with ConditionalWarmup(backend):
+        actual = torch.cond(torch.tensor(True), lambda ids: embedding(ids).sin(),
+                            lambda ids: embedding(ids).cos(), (ids,))
+    torch.testing.assert_close(actual, embedding(ids).sin())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA tensor conditional capture")
+def test_tensor_conditionals_capture_safe_unselected_branches_and_shared_slots():
+    from mstar.engine.conditional_capture import ConditionalWarmup
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    backend = CUDAGraphBackend(device)
+    if reason := backend.while_refusal():
+        pytest.skip(reason)
+    x = torch.arange(4., device=device)
+    index = torch.tensor([99], device=device)
+    p = torch.tensor(False, device=device)
+    q = torch.tensor(True, device=device)
+    def run():
+        def selected(x, index, q):
+            value = x[index]
+            return torch.cond(q, lambda a: a.sin() + 1, lambda a: a.cos() + 2, (value,))
+        return torch.cond(p, selected, lambda x, index, q: x[:1] + 3, (x, index, q))
+    with ConditionalWarmup(backend) as warm:
+        expected = run()
+    backend.synchronize()  # the invalid unselected gather must not have launched
+    assert warm.found and expected.item() == 3
+    pool = backend.graph_pool_handle()
+    graphs = [capture_into_graph(run, pool, device, None, conditionals=True, keep_graph=True) for _ in range(2)]
+    from mstar.engine.accelerator_graph_runner import ExecutableMemory, _capture_thrown_away
+
+    executable = ExecutableMemory()
+    try:
+        measured = _capture_thrown_away(
+            lambda pool, keep_graph: capture_into_graph(
+                run, pool, device, None, conditionals=True, keep_graph=keep_graph,
+            ), "nested tensor conditionals", executable,
+        )
+        assert measured is not None and 0 < measured.kept <= measured.pool and measured.outside > 0
+    finally:
+        executable.release()
+    copies = [torch.empty_like(output) for _, output in graphs]
+    parents = [backend.compose((graph, (copy, output))) for (graph, output), copy in zip(graphs, copies, strict=True)]
+    for graph, _ in graphs:
+        graph.reset()  # parents must retain every internal predicate/merge/operand
+    for predicate, nested, position in [(True, False, 2), (False, True, 99), (True, True, 1)]:
+        p.fill_(predicate)
+        q.fill_(nested)
+        index.fill_(position)
+        expected = run()
+        for parent, copy in zip(reversed(parents), reversed(copies), strict=True):
+            parent.replay()
+            backend.synchronize()
+            torch.testing.assert_close(copy, expected, rtol=0, atol=0)
+
+    def interrupted():
+        run()
+        raise RuntimeError("interrupted after nested branch")
+    with pytest.raises(RuntimeError, match="interrupted after nested branch"):
+        capture_into_graph(interrupted, pool, device, None, conditionals=True)
+    healthy, output = capture_into_graph(run, pool, device, None, conditionals=True)
+    healthy.replay()
+    backend.synchronize()
+    torch.testing.assert_close(output, run(), rtol=0, atol=0)

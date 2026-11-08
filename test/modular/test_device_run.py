@@ -176,7 +176,7 @@ def _runner(
     spec = SimpleNamespace(bucket=BucketKey(WALK, bs, bs), slot=0,
                            config=config or SimpleNamespace(get_config_type=lambda: None))
     warmed = SimpleNamespace(run=forward, static_inputs=static, static_input_keys=tuple(static),
-                             row_heads={}, output=None, resident=resident)
+                             row_heads={}, output=None, resident=resident, conditionals=False)
     run, _, _ = runner._capture_run(spec, warmed)
     if run is not None:
         run.test_inputs = (runner._resources[tables_key("n")], SlotLease(0, spec.bucket), list(range(1, bs + 1)))

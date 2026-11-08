@@ -82,6 +82,7 @@ class _StubMeasuredRunner:
         self._submodule_name = "Thinker"
         self._member = ""
         self._connected_walks = frozenset()
+        self._conditional_buckets = frozenset()
         self._resident = None
         self._num_slots = 2
         self._capture_costs = {}
@@ -967,3 +968,23 @@ def test_retained_input_banks_are_budgeted_before_selecting_captures(measured):
     assert retained[bucket].graph == retained[bucket].kept > free
     assert plan_captures({"n": retained}, free=free).buckets == {"n": set()}
     assert not owner._windows  # sizing does not allocate banks for discarded captures
+
+
+def test_structured_buckets_measure_each_body_and_keep_internal_merges(monkeypatch):
+    measured = []
+    def capture(capture, what, executable):
+        measured.append(executable)
+        # Equal selected eager peaks and root sizes do not bound branch work.
+        return GraphMemory((8 + 4 * len(measured)) * _MIB, len(measured) * _MIB, 3 * _MIB)
+    monkeypatch.setattr(accelerator_graph_runner, "_capture_thrown_away", capture)
+    captured = []
+    for index in range(3):
+        executable = ExecutableMemory()
+        cost, lent = accelerator_graph_runner._size_in_walk(
+            captured, CaptureCost(_MIB, None, _MIB, 2), True, lambda: None, "conditional", executable,
+            structured=True,
+        )
+        assert not lent
+        assert cost.graph == (12 + 4 * index) * _MIB and cost.kept == 4 * _MIB
+        assert cost.outside == (index + 1) * _MIB and cost.executable is executable
+    assert len({id(item) for item in measured}) == 3

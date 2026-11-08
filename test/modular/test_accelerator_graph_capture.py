@@ -521,7 +521,7 @@ def test_a_connected_replay_alias_keeps_its_child_graph(monkeypatch):
         config=SimpleNamespace(replay_graph_walks=["alias"]),
     )
     warmed = SimpleNamespace(run=None, static_inputs={}, static_input_keys=(),
-                             dummy_rids=[], dummy_metadata={}, row_heads={})
+                             dummy_rids=[], dummy_metadata={}, row_heads={}, conditionals=False)
     runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
     runner._device = torch.device("cuda")
     runner._connected_walks = frozenset({"alias"})
