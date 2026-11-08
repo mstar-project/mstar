@@ -3,6 +3,7 @@ token suppression, applied to the logits the sampler gets; the batched stop
 check, which only a decode step's token answers; the per-request stop check,
 which copies only the token to the host; and the walk and loop names of
 Whisper's graph."""
+from collections.abc import Collection
 from types import SimpleNamespace
 
 import torch
@@ -76,17 +77,25 @@ class _StubPlan(_StubPages):
 
 
 class _StubSampler:
-    """Draws the next of ``tokens`` for each row as ``dtype``, and records the logits it was given. An eager draw
-    returns int32 tokens, and a captured one int64."""
+    """Draws the next of ``tokens`` for each row as ``dtype``, records the logits it was given, and keeps each row's
+    last draw for a loop-back row to read. An eager draw returns int32 tokens, and a captured one int64."""
+
+    has_slot_masters = True
 
     def __init__(self):
         self.tokens: list[int] = []
         self.logits: list[torch.Tensor] = []
         self.dtype = torch.int32
+        self.last: dict[int, int] = {}
 
     def sample(self, rows, logits):
         self.logits.append(logits.clone())
-        return torch.tensor([self.tokens.pop(0) for _ in rows], dtype=self.dtype)
+        drawn = torch.tensor([self.tokens.pop(0) for _ in rows], dtype=self.dtype)
+        self.last.update(zip(rows, drawn.tolist(), strict=True))
+        return drawn
+
+    def loopback_tokens(self, rows):
+        return torch.tensor([self.last[row] for row in rows])
 
 
 class _Driver:
@@ -112,10 +121,12 @@ class _Driver:
         }))
         self.ingested: set[int] = set()
 
-    def step(self, walk: str, rows: dict) -> dict:
-        """One step over ``rows``, request handle to its forward-pass info and routed inputs."""
+    def step(self, walk: str, rows: dict, looped: Collection[int] = ()) -> dict:
+        """One step over ``rows``, request handle to its forward-pass info and routed inputs. A row in ``looped`` reads
+        its token off the sampler, as one whose last step here kept it on the device."""
         rids = list(rows)
-        inputs = [self.node.prepare_inputs(walk, info, signals) for info, signals in rows.values()]
+        inputs = [self.node.prepare_inputs(walk, info, signals, has_loopback=rid in looped)
+                  for rid, (info, signals) in rows.items()]
         for rid in set(rids) - self.ingested:
             self.pool.ingest_request(rid)
             self.ingested.add(rid)
