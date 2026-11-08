@@ -259,7 +259,7 @@ def test_fused_experts_matches_naive_and_precomputed_alignment(num_tokens):
     block_m = moe_block_m(num_tokens, w1, top_k)
     alignment = MoeAlignment(*moe_align_block_size(ids.to(torch.int32), block_m, experts), block_m)
     precomputed = fused_experts(x, w1, w2, weights, ids, alignment=alignment)
-    if runs_per_pair(x, w1):
+    if runs_per_pair(x, w1, top_k):
         # Without an alignment these few tokens took the per-pair path, a different kernel.
         torch.testing.assert_close(precomputed, naive, atol=2e-2, rtol=2e-2)
     else:
