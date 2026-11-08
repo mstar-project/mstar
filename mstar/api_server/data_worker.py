@@ -50,6 +50,7 @@ from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
 from mstar.engine.resources.lora.identity import AdapterPrefixRoots
 from mstar.engine.resources.lora.serving import lora_specs
 from mstar.engine.state.adapters import kv_layouts
+from mstar.engine.state.contract import Array, Bidirectional, Block
 from mstar.model.base import (
     ClientChunk,
     Model,
@@ -943,6 +944,8 @@ class PreprocessWorkerThread:
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
             if _prefix_cache(model_kwargs):
+                if state_layout is not None:
+                    self._check_whole_steps(layouts)
                 model_kwargs.update(self._prefix_keys(
                     tensors, layouts, rows, input.file_paths, file_states,
                     adapter=model_kwargs.get(LORA_ADAPTER_KWARG),
@@ -1301,6 +1304,34 @@ class PreprocessWorkerThread:
         if root:
             kwargs["prefix_root"] = root
         return kwargs
+
+    def _check_whole_steps(self, layouts: dict) -> None:
+        """Refuse a keyed span that a prefix hit could end inside a step of: an ids span, or a digest span sharing its
+        step, on a walk that reads the array through a Block or Bidirectional read, which sees each step's adds as a
+        whole. The layout is the model's, so this raises ``RuntimeError``, which fails the request with a 500."""
+        for array, by_label in self._keyed_labels.items():
+            whole = self._whole_reads.get(array, {})
+            for label in by_label.keys() & layouts.get(array, {}).keys():
+                spans = layouts[array][label].spans
+                for i, span in enumerate(spans[:layouts[array][label].keyed_count()]):
+                    read = whole.get(span.walk, whole.get(None))
+                    shares = not span.opens_step or (i + 1 < len(spans) and not spans[i + 1].opens_step)
+                    if read is not None and (span.kind == "ids" or shares):
+                        what = "an ids span" if span.kind == "ids" else "a digest span that shares its step"
+                        raise RuntimeError(f"Array {array!r}.reads[{read!r}] reads walk {span.walk!r} as a whole, "
+                                           f"and span {i} of {label!r} is {what}, so a prefix hit could end inside the "
+                                           "step")
+
+    @cached_property
+    def _whole_reads(self) -> dict[str, dict[str | None, str]]:
+        """Each declared array's Block and Bidirectional reads, by the walks they name, or None for every walk."""
+        return {
+            array.name: {
+                walk: key for key, read in array.reads.items() if isinstance(read.mask, Block | Bidirectional)
+                for walk in read.walks or (None,)
+            }
+            for array in self._declarations if isinstance(array, Array)
+        }
 
     def _page_layout(
         self, prefix_keys: PrefixKeys, layout: tuple[Span, ...],

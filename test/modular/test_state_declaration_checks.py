@@ -69,7 +69,7 @@ class _StubModel:
 
     def get_graph_walk_graphs(self):
         return {
-            "prefill": GraphNode(name="LLM", input_names=[], outputs=[]),
+            "prefill": GraphNode(name="LLM", input_names=["text_inputs"], outputs=[]),
             "decode": GraphNode(name="LLM", input_names=[], outputs=[]),
             "encode": GraphNode(name="vision", input_names=[], outputs=[]),
         }

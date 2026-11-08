@@ -26,7 +26,8 @@ def state_declaration_problems(model: "Model") -> list[str]:
     arrays = [d for d in declarations if isinstance(d, Array)]
     samplers = [d for d in declarations if isinstance(d, Sampler)]
     problems = _name_problems(arrays, samplers)
-    walks = {walk: set(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
+    graphs = model.get_graph_walk_graphs()
+    walks = {walk: set(graph.get_nodes()) for walk, graph in graphs.items()}
     nodes = sorted(set().union(*walks.values()))
     combined_by_node = model.get_combined_graph_walks()
     combined = {walk for by_name in combined_by_node.values() for walk in by_name}
@@ -42,7 +43,7 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
-    problems += _regrouping_problems(model, arrays)
+    problems += _regrouping_problems(model, arrays, graphs)
     problems += _value_problems(arrays, model.kv_labels())
     for sampler in samplers:
         problems += _sampler_problems(sampler, nodes)
@@ -143,7 +144,9 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
     return problems
 
 
-def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
+def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mapping[str, object]) -> list[str]:
+    # A keyed walk whose node reads another tensor than the keyed one is checked per request instead, before the data
+    # worker keys its spans (`PreprocessWorkerThread._check_whole_steps`).
     regrouped = [
         *((node, walk, "a chunking policy splits across steps", "leave it out of the policy")
           for node, policies in model.get_chunking_policies().items() for policy in policies if policy.chunkable
@@ -152,19 +155,29 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
                        "step", "leave it out of the label's keys")
           for array in arrays for label, kv_label in model.kv_labels().get(array.name, {}).items()
           if kv_label.keys is not None for node in array.nodes
-          for walk in (*kv_label.keys.walks, *(grown for grown, _ in kv_label.growth if kv_label.keys.growth))),
+          for walk in (
+              *(walk for walk in kv_label.keys.walks if _reads_input(graphs, walk, node, kv_label.keys.tensor)),
+              *(grown for grown, _ in kv_label.growth if kv_label.keys.growth),
+          )),
         *((node, policy.walk, f"{node}'s rebuild policy runs again in one step with the ids sampled after it",
            "drop the rebuild policy")
           for node, policy in model.rebuild_policies().items()),
     ]
-    return [
+    # once per array, which several of its nodes may report
+    return list(dict.fromkeys(
         f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. A Block or "
         f"Bidirectional read sees each step's adds as a whole, so {fix}"
         for node, walk, cause, fix in regrouped
         for array in arrays if node in array.nodes
         for key, read in array.reads.items()
         if isinstance(read.mask, Block | Bidirectional) and (read.walks is None or walk in read.walks)
-    ]
+    ))
+
+
+def _reads_input(graphs: Mapping[str, object], walk: str, node: str, tensor: str) -> bool:
+    """Whether ``node`` takes ``tensor`` as an input on ``walk``, or ``walk`` is no walk of the model."""
+    nodes = graphs[walk].get_nodes() if walk in graphs else {}
+    return walk not in graphs or (node in nodes and tensor in nodes[node].input_names)
 
 
 def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
