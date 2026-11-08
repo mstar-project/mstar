@@ -17,7 +17,11 @@ scheduler tick, the data worker):
 - per-step work that could be done once at load or capture time;
 - launch-bound loops of tiny kernels;
 - Python on the critical path per token or step, per-request objects built every step (invariant 6);
-- memory that shrinks the KV pool or the batch size;
+- memory that shrinks the KV pool or the batch size. The PR's peak memory is measured, not
+  assumed: a peak nobody measured is a regression finding until a measurement shows none;
+- memory a step allocates that warmup and the capture plan never saw (a workspace made on first use
+  of a shape, a buffer that grows with batch size): the pools were sized without it, so serving
+  OOMs later. That is a cliff (SKILL.md §4.2).
 - missed overlap: copies and compute on one stream, the conductor waiting on the engine;
 - an algorithm that grows faster than it needs to (quadratic buffers, per-request re-planning).
 
@@ -66,5 +70,7 @@ and the difficulty higher; say so in the finding's fields and name the design yo
   matches the reference, a fused path that can't be used.
 - **Outside the GPU step:** serialization between processes, tokenization and media decode/encode on
   the critical path, Python in the conductor loop, startup (weight loading, compile and capture).
+  A change to loading, compile, capture planning or warmup is measured cold and warm against
+  `main`; a boot more than about 5% slower is a regression the PR has to justify.
 - **Will it scale:** the next likely config (TP2 → TP4, longer video, bigger batch, a second model
   reusing it). Linear, quadratic, or a cliff?

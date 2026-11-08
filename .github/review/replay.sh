@@ -14,7 +14,7 @@
 # would have posted, so you can check them (and their line anchors) by hand.
 #
 #   usage: .github/review/replay.sh <pr-number> [outfile]
-#   MODE=thorough for the on-demand mode (default: light)
+#   MODE=nogpu for the mode `/review` runs (default: light)
 #   MAX_TURNS=<n> for the turn cap (default: 40, as in the workflow)
 #   (a replay that reaches the cap prints only Claude's max-turns error, no findings; rerun it
 #   with a larger MAX_TURNS)
@@ -81,7 +81,8 @@ cp -r "$ROOT/.claude/skills" "$WORK/base/.claude/skills"
 
 cd "$WORK/base"
 # The prompt goes before the flags: --disallowedTools takes a variadic list and
-# would otherwise swallow it as one more tool name.
+# would otherwise swallow it as one more tool name. The tools are the workflow's
+# review step's, less the inline-comment tool: no shell, web reads only from its sites.
 claude -p "Read .github/review/review-prompt.md from the repository root and follow it exactly.
    It defines your trust boundary, your method, your reporting bar and your output format.
 
@@ -96,7 +97,9 @@ claude -p "Read .github/review/review-prompt.md from the repository root and fol
    fields, print them as one fenced json block instead. Print nothing else." \
   --model "$MODEL" \
   --max-turns "$MAX_TURNS" \
-  --disallowedTools Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch | tee "$OUT"
+  --permission-mode dontAsk \
+  --allowedTools "WebSearch,WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com),WebFetch(domain:docs.vllm.ai),WebFetch(domain:docs.sglang.ai),WebFetch(domain:docs.sglang.io),WebFetch(domain:huggingface.co),WebFetch(domain:pytorch.org),WebFetch(domain:docs.pytorch.org),WebFetch(domain:arxiv.org)" \
+  --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,Skill | tee "$OUT"
 
 echo >&2
 echo "saved to $OUT" >&2

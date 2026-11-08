@@ -32,6 +32,8 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
 # PR is one the review was given the diff of (stacked-above.json).
 STATUSES = ("fixed", "fixed_above", "open", "moot")
+# Summaries posted before the modes were renamed carry the old names in their state.
+RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
@@ -96,8 +98,8 @@ SCHEMA = {
 
 def stacked_above(path):
     """The numbers of the PRs stacked above whose diffs the review was given: stacked-above.json, which
-    the workflow leaves out when a fetch failed. None without it."""
-    return [int(pr["number"]) for pr in json.loads(Path(path).read_text())] if Path(path).exists() else []
+    the workflow leaves out when a fetch failed. [] without it."""
+    return [int(pr["number"]) for pr in json.loads(Path(path).read_text())] if path and Path(path).exists() else []
 
 
 def judged(review, stacked):
@@ -219,9 +221,9 @@ def render(review, pages, head, mode, stacked):
 
 def read_state(body, mode):
     """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
-    None, and that run reviews the whole PR. None too when it doesn't decode, and for a thorough or
-    gpu review unless the earlier one was thorough or gpu and skipped nothing, since a gpu review's
-    result can approve and may build on a thorough one."""
+    None, and that run reviews the whole PR. None too when it doesn't decode, and for a nogpu or
+    gpu review unless the earlier one was nogpu or gpu and skipped nothing, since a gpu review's
+    result can approve and may build on a nogpu one."""
     found = STATE.findall(body)
     try:
         state = json.loads(base64.b64decode(found[-1])) if found else None
@@ -229,8 +231,9 @@ def read_state(body, mode):
         return None
     if not isinstance(state, dict):
         return None
+    state["mode"] = RENAMED_MODES.get(state.get("mode"), state.get("mode"))
     # A state from before `skipped` was kept counts as having skipped files.
-    if mode in ("thorough", "gpu") and (state.get("mode") not in ("thorough", "gpu") or state.get("skipped", [None])):
+    if mode in ("nogpu", "gpu") and (state.get("mode") not in ("nogpu", "gpu") or state.get("skipped", [None])):
         return None
     return state
 
