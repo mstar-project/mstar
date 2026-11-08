@@ -103,12 +103,11 @@ def marked(comments, marker):
 
 
 def oneline(commits):
-    """since-commits.txt: one line per commit, merges marked."""
+    """since-commits.txt: one line per commit."""
     lines = []
     for c in commits:
-        merge = "[merge] " if len(c["parents"]) > 1 else ""
         subject = c["commit"]["message"].split("\n")[0]
-        lines.append(f"{c['sha'][:10]} {merge}{subject}\n")
+        lines.append(f"{c['sha'][:10]} {subject}\n")
     return "".join(lines)
 
 
@@ -330,27 +329,35 @@ def diff_files(diff):
 
 
 def changes(hunk):
-    """What a hunk changes: its runs of added and removed lines, without the context or the line numbers
-    around them, which a rebase shifts."""
-    runs, run = [], []
+    """What a hunk changes: its runs of added and removed lines, each with the function on its `@@` line
+    and the context line on either side, so a change moved elsewhere in a file counts. The line numbers
+    stay out: a rebase shifts them."""
+    section, runs, run, above = hunk[0].split("@@", 2)[-1], [], [], ""
     for line in hunk[1:]:
         if line.startswith(("+", "-", "\\")):
             run.append(line)
-        elif run:
-            runs.append(tuple(run))
-            run = []
-    return runs + [tuple(run)] if run else runs
+        else:
+            if run:
+                runs.append((section, above, tuple(run), line))
+                run = []
+            above = line
+    return runs + [(section, above, tuple(run), "")] if run else runs
 
 
-def interdiff(old, new):
-    """The hunks of `new`, a PR's diff, that make a change `old`, its diff at the last review, doesn't:
-    after a rebase, only the PR's own changes that differ, whatever moved around them. A file with no
-    hunks (binary, a mode change, a pure rename) counts when its header changed, its blob ids aside."""
-    before = diff_files(old)
+def header_change(head, hunks):
+    """What a file's diff header says the PR changes: its mode lines and, for a file with no hunks (binary,
+    a pure rename), its other lines and new blob. Not the old blob, which a rebase moves."""
+    if hunks:
+        return [x for x in head if x.startswith(("old mode", "new mode", "new file mode", "deleted file mode"))]
+    return [x.split("..")[-1] if x.startswith("index ") else x for x in head]
+
+
+def not_in(files, others):
+    """The lines of the files and hunks of `files` (diff_files) whose changes `others` doesn't make."""
     parts = []
-    for header, (head, hunks) in diff_files(new).items():
-        old_head, old_hunks = before.get(header, ([], []))
-        made = collections.Counter(run for h in old_hunks for run in changes(h))
+    for header, (head, hunks) in files.items():
+        other_head, other_hunks = others.get(header, ([], []))
+        made = collections.Counter(run for h in other_hunks for run in changes(h))
         kept = []
         for h in hunks:
             runs = collections.Counter(changes(h))
@@ -358,10 +365,21 @@ def interdiff(old, new):
                 kept.append(h)
             else:
                 made -= runs
-        if kept or not hunks and [x for x in head if not x.startswith("index ")] != \
-                [x for x in old_head if not x.startswith("index ")]:
+        if kept or header_change(head, hunks) != header_change(other_head, other_hunks):
             parts += head + [line for h in kept for line in h]
-    return "".join(parts)
+    return parts
+
+
+DROPPED = "=== dropped since the last review: these were in the PR then, and aren't now ===\n"
+
+
+def interdiff(old, new):
+    """What differs between `old`, a PR's diff at the last review, and `new`, its diff now: the hunks of
+    `new` that make a change `old` doesn't and, after DROPPED, the hunks and files of `old` that `new` no
+    longer has. Empty means the PR's own changes are the same, whatever a rebase moved around them."""
+    before, after = diff_files(old), diff_files(new)
+    dropped = not_in(before, after)
+    return "".join(not_in(after, before) + ([DROPPED] + dropped if dropped else []))
 
 
 def collect(out, repo, pr, head_sha, mode, prev=""):
@@ -408,8 +426,9 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
 
     # A re-review starts from this bot's last summary and reviews only what changed since
     # (review-prompt.md, "Re-review"): the commits since, when that commit is still an ancestor of the
-    # head (since.diff, since-commits.txt), and after a force-push or rebase the interdiff, the PR's own
-    # hunks whose changes differ from its diff then (interdiff.diff). read_state says when it reviews the
+    # head and none of them is a merge (since.diff, since-commits.txt), and otherwise the interdiff, the
+    # PR's own hunks whose changes differ from its diff then and what it dropped (interdiff.diff), so a
+    # merge of main or a force-push isn't read as the author's change. read_state says when it reviews the
     # whole PR again instead. The state is read only from the bot's own summaries: comments that start
     # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
     # (too large, say) means a full review, never an empty since.diff.
@@ -423,16 +442,19 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
             status = api(since)["status"] if last else ""
         except (RuntimeError, ValueError, KeyError, TypeError):
             status = ""
-        r = None
+        listing = None  # since-commits.txt, when the range can be read as the author's commits alone
         if last and (status == "ahead" or last == head_sha):
+            try:
+                commits = [c for page in api(since, "--paginate", "--slurp") for c in page["commits"]]
+                listing = None if any(len(c["parents"]) > 1 for c in commits) else oneline(commits)
+            except (RuntimeError, ValueError, KeyError, TypeError):
+                listing = None
+        r = None
+        if listing is not None:
             r = gh("api", "-H", "Accept: application/vnd.github.diff", since, check=False)
             if r.returncode == 0:
                 write("since.diff", r.stdout)
-                try:
-                    write("since-commits.txt", oneline(c for page in api(since, "--paginate", "--slurp")
-                                                       for c in page["commits"]))
-                except (RuntimeError, ValueError, KeyError):
-                    write("since-commits.txt", "")
+                write("since-commits.txt", listing)
         elif last:
             # The PR's diff at that commit: from where it forked from the base branch.
             r = gh("api", "-H", "Accept: application/vnd.github.diff",

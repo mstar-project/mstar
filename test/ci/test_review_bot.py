@@ -189,10 +189,10 @@ def collect(mode="light", diff="diff --git a/a.py b/a.py\n", **routes):
         return out, {p.name: p.read_text() for p in ws.iterdir()}
 
 
-def compare(status, diff="diff --git a/b.py b/b.py\n"):
+def compare(status, diff="diff --git a/b.py b/b.py\n", commits=()):
     """A compare of two commits, as JSON or, asked for the diff media type, as `diff`."""
     return lambda argv, stdin: diff if "Accept: application/vnd.github.diff" in argv \
-        else json.dumps([{"status": status, "commits": []}] if "--slurp" in argv else {"status": status})
+        else json.dumps([{"status": status, "commits": list(commits)}] if "--slurp" in argv else {"status": status})
 
 
 def pr_diff(context, added, index="1111111..2222222"):
@@ -213,15 +213,51 @@ class TestCollect(unittest.TestCase):
         reviewed = pr_diff("x = 1", "# unreachable")
         routes = {**self.CONVERSATION, f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("diverged"),
                   f"GET repos/o/r/compare/{BASE}...{LAST}": compare("ahead", reviewed)}
-        out, files = collect(diff=pr_diff("x = 10", "# unreachable", "3333333..4444444").replace("@@ -10,3 +10,3",
-                                                                                                 "@@ -12,3 +12,3"),
+        out, files = collect(diff=pr_diff("x = 1", "# unreachable", "3333333..4444444").replace("@@ -10,3 +10,3",
+                                                                                                "@@ -12,3 +12,3"),
                              **routes)
         self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
                          "a rebase that moved the PR's changes would read as new changes")
+        header = "diff --git a/a.py b/a.py\nindex 1111111..2222222 100644\n--- a/a.py\n+++ b/a.py\n"
+        hunk = "@@ -40,2 +40,3 @@ def g():\n     return 1\n+    # "
         out, files = collect(diff=pr_diff("x = 1", "# dead code"), **routes)
-        self.assertEqual(files["interdiff.diff"], "diff --git a/a.py b/a.py\nindex 1111111..2222222 100644\n"
-                         "--- a/a.py\n+++ b/a.py\n@@ -40,2 +40,3 @@ def g():\n     return 1\n+    # dead code\n")
+        self.assertEqual(files["interdiff.diff"],
+                         f"{header}{hunk}dead code\n{bot.DROPPED}{header}{hunk}unreachable\n")
         self.assertNotIn("since.diff", files)
+
+    def test_a_merge_in_the_range_takes_the_interdiff(self):
+        merge = {"sha": HEAD, "parents": [{"sha": LAST}, {"sha": BASE}], "commit": {"message": "Merge main"}}
+        reviewed = pr_diff("x = 1", "# unreachable")
+        out, files = collect(**self.CONVERSATION, diff=reviewed, **{
+            f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead", commits=[merge]),
+            f"GET repos/o/r/compare/{BASE}...{LAST}": compare("ahead", reviewed)})
+        self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
+                         "what the merge brought in from main would be reviewed as the author's change")
+        self.assertNotIn("since.diff", files)
+
+
+class TestInterdiff(unittest.TestCase):
+    REVIEWED = pr_diff("x = 1", "guard()")
+
+    def test_it_shows_what_moved_or_went_and_not_what_a_rebase_shifted(self):
+        moved = self.REVIEWED.replace("def g():", "def h():")
+        moved_inside = self.REVIEWED.replace("     return 1\n", "     pass\n")
+        without_hunk = self.REVIEWED[:self.REVIEWED.index("@@ -40")]
+        other = "diff --git a/b.py b/b.py\nindex 1..2 100644\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-a\n+b\n"
+        mode = self.REVIEWED.replace("index 1111111", "old mode 100644\nnew mode 100755\nindex 1111111")
+        binary = "diff --git a/w.bin b/w.bin\nindex {}\nBinary files a/w.bin and b/w.bin differ\n"
+        for name, old, new, shown in (
+                ("a guard moved to another function", self.REVIEWED, moved, "def h()"),
+                ("a guard moved inside its function", self.REVIEWED, moved_inside, "pass"),
+                ("a dropped hunk", self.REVIEWED, without_hunk, "def g()"),
+                ("a dropped file", self.REVIEWED + other, self.REVIEWED, "b.py"),
+                ("a mode change beside hunks", self.REVIEWED, mode, "new mode"),
+                ("a binary swapped", binary.format("1..2 100644"), binary.format("1..3 100644"), "1..3")):
+            with self.subTest(name):
+                self.assertIn(shown, bot.interdiff(old, new))
+        self.assertEqual(bot.interdiff(binary.format("1..2 100644"), binary.format("9..2 100644")), "",
+                         "main changing a binary's old side would read as the PR's change")
+        self.assertIn(bot.DROPPED, bot.interdiff(self.REVIEWED + other, self.REVIEWED))
 
 
 COMMENT = "mcp__github_inline_comment__create_inline_comment"
