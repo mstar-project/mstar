@@ -151,11 +151,11 @@ def test_attention_over_sharded_keys_matches_one_rank(tmp_path, world, total):
 
 
 def _compiled_packs(rank, world, dynamic, batched):
-    """The compiled stack Cosmos3's batched denoise step (length dynamic) and LTX's DiT (one
-    static graph per shape) run, over packs whose length varies: the per-rank split comes
-    from the length, so under ``dynamic`` no new length, whatever its remainder by the group
-    size, may recompile. Either way the only graph breaks are the collectives: the exchanges'
-    pack and unpack copies compile rather than run eagerly around them."""
+    """A compiled SP layer stack (the cases below say whose) over packs whose length varies:
+    the per-rank split comes from the length, so under ``dynamic`` no new length, whatever its
+    remainder by the group size, may recompile. Either way the only graph breaks are the
+    collectives: the exchanges' pack and unpack copies compile rather than run eagerly around
+    them."""
     group = _group(rank, world)
     seq_dim, head_dim = _layout(batched)
 
@@ -183,8 +183,8 @@ def _compiled_packs(rank, world, dynamic, batched):
     assert breaks and all("_all_to_all_single" in reason for reason in breaks), list(breaks)
 
 
-# Cosmos3's packed stack is [T, H, D] compiled dynamic; its single-request steps (static, [T, H, D]) and
-# LTX's and Wan's DiTs ([B, L, H, D], static) take the same static path as the static case
+# dynamic-SHD is Cosmos3's packed stack; static-BSHD is LTX's and Wan's DiTs, and stands for Cosmos3's
+# static single-request steps too, which differ from it only in the layout dynamic-SHD covers
 @pytest.mark.parametrize("dynamic,batched", [(True, False), (False, True), (True, True)],
                          ids=["dynamic-SHD", "static-BSHD", "dynamic-BSHD"])
 @pytest.mark.parametrize("world", [2, 3])
