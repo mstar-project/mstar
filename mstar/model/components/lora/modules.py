@@ -548,7 +548,8 @@ def _check(
             f"LoRA resource {key!r}: {path} holds experts {first}..{first + count - 1} of "
             f"{own.experts} on this rank (expert parallelism, `ep_config: parallel: ep`), and "
             "LoRA on experts is served under tensor parallelism only; serve this node with "
-            f"`parallel: tp`, or leave its experts targets out of `resources: {LORA_RESOURCE_KEY}: targets:`"
+            "`parallel: tp` (and `tp_async_sched: false` until the async TP scheduler is fenced), "
+            f"or leave its experts targets out of `resources: {LORA_RESOURCE_KEY}: targets:`"
         )
     plain = dataclasses.replace(declared, layers=None, node=None, per_segment=False, token_fold=1)
     if own != plain:
