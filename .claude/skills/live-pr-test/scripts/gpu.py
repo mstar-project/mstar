@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import datetime
 import fcntl
 import functools
 import json
@@ -602,7 +601,7 @@ ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Noteboo
 
 def eras_ssh_key_id(pubkey: str, name: str) -> str:
     """The organization's id for this public key. A key it doesn't know yet is registered under the
-    instance's name, and a terminate after that instance ends deletes it (eras_sweep_keys)."""
+    instance's name, which makes it that launch's to delete (eras_delete_key)."""
     import base64
     import hashlib
     blob = base64.b64decode(pubkey.split()[1])
@@ -695,7 +694,7 @@ def eras_create(body: dict, pubkey: str) -> str:
     """Preview, accept the quoted prices, create; the instance id. Eras refuses an idempotency key
     reused with another request, so each attempt (listing, cache volume, ssh key) has its own, and
     the same attempt sent again, after a timeout or by a rerun with the same --tag, keeps it. The
-    ssh key the body binds may be one an earlier launch registered, which another session's sweep
+    ssh key the body binds may be one an earlier launch registered, which that launch's terminate
     can delete before the create: then the key is registered again, under this launch's name, once."""
     import hashlib
     preview = eras("POST", "/instances/preview", body)
@@ -849,31 +848,32 @@ def terminate(key: str, e: dict) -> None:
     with ledger_txn() as d:
         d.pop(key, None)
     if e["provider"] == "eras":
-        eras_sweep_keys()
+        eras_delete_key(e["name"], {e["instance_id"]})
     hours = (time.time() - e["launched_at"]) / 3600
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
 
 
-def eras_sweep_keys() -> None:
-    """Best effort: delete the ssh keys launches registered (each named after its instance) whose
-    instance has ended or is gone. A key can't go while its instance releases, so each terminate
-    deletes those earlier ones left. One under 15 minutes old may be a launch's in progress, its
-    instance not created yet."""
+def eras_delete_key(name: str, released: set[str]) -> None:
+    """Best effort: delete the ssh key the launch `name` registered (named after it), now that its
+    instances, `released`, are released, unless another instance not ended binds it: a deleted key
+    leaves the authorized_keys of every box that binds it. A key the launch reused stays."""
     try:
-        live = {i.get("name") for i in eras("GET", "/instances", params={"page_size": 100}).get("items") or []
-                if i.get("status") != "ended"}
-        keys = eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []
-    except ApiError as err:
-        print(f"gpu.py: ssh keys not swept: {err}", file=sys.stderr)
-        return
-    recent = time.time() - 900
-    for k in keys:
-        created = datetime.datetime.fromisoformat(k["created_at"].replace("Z", "+00:00")).timestamp()
-        if str(k.get("name")).startswith(job_prefix({}, "eras")) and k["name"] not in live and created < recent:
-            try:  # one a later launch reuses (same public key) stays while that instance holds it
+        keys = eras("GET", "/ssh-keys", params={"filter": json.dumps({"field": "name", "op": "=", "value": name})})
+        bound, token = set(), None
+        while True:  # every page: a binding missed would cut a live box off
+            page = eras("GET", "/instances", params={"page_size": 200, **({"page_token": token} if token else {})})
+            for i in page.get("items") or []:
+                run = (i.get("standalone") or {}).get("current_run") or {}
+                secrets = (run.get("bindings") or {}).get("secrets") or {}
+                if i["id"] not in released:
+                    bound.update(k for b in secrets.values() for k in b.get("ssh_key_ids") or [])
+            if not (token := page.get("next_page_token")):
+                break
+        for k in keys.get("items") or []:
+            if k["id"] not in bound:
                 eras("DELETE", f"/ssh-keys/{k['id']}")
-            except ApiError as err:
-                print(f"gpu.py: ssh key {k['name']} not deleted: {err}", file=sys.stderr)
+    except ApiError as err:
+        print(f"gpu.py: ssh key {name} not deleted: {err}", file=sys.stderr)
 
 
 def cmd_terminate(args, cfg):

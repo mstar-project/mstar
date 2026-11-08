@@ -256,7 +256,8 @@ def cmd_wait(a):
 
 
 def cmd_cleanup(a):
-    """Release whatever this run launched, from the ledger and by name, for a run cancelled mid-launch."""
+    """Release whatever this run launched, and delete the ssh key it registered, from the ledger and by
+    name, for a run cancelled mid-launch."""
     print(gpu("list", check=False).stdout)
     state = gpu_py()
     for key in list(state["ledger"]()):
@@ -270,10 +271,12 @@ def cmd_cleanup(a):
             print(f"slurm: {err}")
     if state["enabled"](cfg, "eras"):
         name = state["job_name"](cfg, "eras", a.pr, a.tag)
-        for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []:
-            if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
+        mine = [i for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []
+                if i.get("name") == name]
+        for i in mine:
+            if i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
-        state["eras_sweep_keys"]()
+        state["eras_delete_key"](name, {i["id"] for i in mine})
 
 
 # ---------------------------------------------------------------- approval
