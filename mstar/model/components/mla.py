@@ -36,12 +36,14 @@ from mstar.model.components.fp8_linear import (
     COLUMN,
     ROW,
     Fp8Linear,
+    bf16_linear,
     dense_fp8_block,
     fp8_block_linear,
     fp8_reference,
 )
 from mstar.model.components.norm import RMSNorm
 from mstar.utils import mla_prep
+from mstar.utils.fp8_block import dequantize_fp8_block_weight
 from mstar.utils.mla_latent_norm import mla_latent_norm, mla_latent_norm_available
 
 
@@ -137,8 +139,11 @@ class MLAAttention(nn.Module):
             self.register_buffer("w_vc", None, persistent=False)  # (H_local, Dv,    L)
             self.register_buffer("fused_qkv_a_proj_weight", None, persistent=False)  # (q_lora+L+Drope, hidden)
             self.register_buffer("fused_qkv_a_proj_scale_inv", None, persistent=False)  # dense_fp8
+            # dense_fp8 with keep_bf16: the fused weight dequantized, run from bf16_min_tokens up
+            self.register_buffer("fused_qkv_a_proj_weight_bf16", None, persistent=False)
             self.lora_unservable = dict.fromkeys(
                 self._ABSORBED_SOURCE_PROJS, "folded into the absorbed MLA weights at load (mla_absorb)")
+        self.bf16_min_tokens = 0
         # engine-built, bound once at load (bind_resources)
         self._kv_key, self._attn_key, self._pos_key = kv_key, attn_key, pos_key
         self._kv_label, self._cache_layer = kv_label, cache_layer
@@ -255,18 +260,36 @@ class MLAAttention(nn.Module):
         num_tokens = hidden_states.shape[0]
         h = self.num_heads
 
-        if self.fp8_block is None:
-            fused = F.linear(hidden_states, self.fused_qkv_a_proj_weight)
-        else:
-            fused = fp8_block_linear(hidden_states, self.fused_qkv_a_proj_weight,
-                                     self.fused_qkv_a_proj_scale_inv, self.fp8_block,
-                                     use_reference=self.fp8_reference)
+        fused = self._qkv_a(hidden_states)
         if (self.mla_fused_prep and (self._attends_written or not self._selects(**sparse))
                 and fused.is_cuda and fused.dtype == torch.bfloat16):
             attn_latent = self._fused_prep_and_attend(fused, hidden_states, position_ids, **sparse)
         else:
             attn_latent = self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
         return self.o_proj(self._out(attn_latent))
+
+    def _qkv_a(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """The fused q_a | kv_a projection, from its bf16 copy at ``bf16_min_tokens`` tokens
+        and up when ``keep_bf16`` made one."""
+        if self.fp8_block is None:
+            return F.linear(hidden_states, self.fused_qkv_a_proj_weight)
+        if self.fused_qkv_a_proj_weight_bf16 is not None and hidden_states.shape[0] >= self.bf16_min_tokens:
+            return bf16_linear(hidden_states, self.fused_qkv_a_proj_weight_bf16)
+        return fp8_block_linear(hidden_states, self.fused_qkv_a_proj_weight,
+                                self.fused_qkv_a_proj_scale_inv, self.fp8_block,
+                                use_reference=self.fp8_reference)
+
+    def keep_bf16(self, min_tokens: int, dtype: torch.dtype = torch.bfloat16) -> None:
+        """``Fp8Linear.keep_bf16`` for the fused q_a | kv_a weight, which
+        ``process_weights_after_loading`` builds from the two sources it releases."""
+        if self.fp8_block is None or self.fp8_reference or not self.mla_absorb:
+            return
+        if self.fused_qkv_a_proj_weight is None:
+            raise RuntimeError("keep_bf16 runs after process_weights_after_loading builds the fused q_a | kv_a")
+        self.fused_qkv_a_proj_weight_bf16 = dequantize_fp8_block_weight(
+            self.fused_qkv_a_proj_weight, self.fused_qkv_a_proj_scale_inv, block_size=self.fp8_block,
+            out_dtype=dtype)
+        self.bf16_min_tokens = min_tokens
 
     def _out(self, attn_latent: torch.Tensor) -> torch.Tensor:
         """``attn_latent (T, H_local, L)`` through ``w_vc``: ``(T, H_local * Dv)``. Eager, bmm
@@ -292,12 +315,7 @@ class MLAAttention(nn.Module):
         n, h = hidden_states.shape[0], self.num_heads
         if not self.mla_absorb:
             return self._block_row_naive(hidden_states, position_ids, row, block, rows)
-        if self.fp8_block is None:
-            fused = F.linear(hidden_states, self.fused_qkv_a_proj_weight)
-        else:
-            fused = fp8_block_linear(hidden_states, self.fused_qkv_a_proj_weight,
-                                     self.fused_qkv_a_proj_scale_inv, self.fp8_block,
-                                     use_reference=self.fp8_reference)
+        fused = self._qkv_a(hidden_states)
         if self.qk_rope_head_dim == 0:
             q_c, latent = self._latent_rows(fused)
             q_nope = self.q_b_proj(q_c).view(n, h, self.qk_head_dim)

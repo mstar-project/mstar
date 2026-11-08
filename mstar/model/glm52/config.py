@@ -134,6 +134,11 @@ class Glm52ModelConfig:
     # (`weight_scale_inv`). Populated from config.json by Glm52Model. The routed experts
     # and the non-expert linears it stores in fp8 stay fp8 (``dense_fp8``).
     quantization_config: Fp8BlockQuantConfig | None = None
+    # The fp8 non-expert linears also hold their weights dequantized, which cuBLAS runs from
+    # this many tokens up (fewer stay on the fp8 kernels); None keeps them fp8 only. For GPUs
+    # whose block-fp8 GEMM loses to bf16 past a few tokens: on B300, w8a16 runs ~0.5x bf16 at
+    # 4-64 tokens and up to ~1.8x at one. Costs a bf16 copy of those weights.
+    dense_bf16_min_tokens: int | None = None
     # Keep routed experts FP8-resident (uint8 container + block scales). Disabling this
     # dequantizes them to bf16 on load — fine for reduced tests, but bf16 routed experts
     # alone outsize a device at TP8 on the real 753B checkpoint.

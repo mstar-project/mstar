@@ -228,3 +228,83 @@ def test_cpu_forward_is_bitwise_the_bf16_model(cpu_flashinfer):
         logits.append(_forward_cpu(model.eval(), cfg, ids))
     assert torch.isfinite(logits[0]).all()
     assert torch.equal(logits[0], logits[1])
+
+
+def _loaded_linear(block=(16, 16), merged=1, reference=False):
+    lin = Fp8Linear(64, 32 * merged, block, merged=merged, reference=reference)
+    for sid in range(merged):
+        w, s = _full(32, 64, block)
+        lin.weight.weight_loader(lin.weight, w, sid if merged > 1 else None)
+        lin.weight_scale_inv.weight_loader(lin.weight_scale_inv, s, sid if merged > 1 else None)
+    return lin
+
+
+@pytest.mark.parametrize("glu", [False, True])
+def test_keep_bf16_runs_the_copy_from_its_token_count(monkeypatch, glu):
+    """dense_bf16_min_tokens: the dequantized copy from min_tokens up, the fp8 kernels below."""
+    from mstar.model.components import fp8_linear
+
+    lin = _loaded_linear(merged=2 if glu else 1)
+    lin.keep_bf16(3)
+    dense = fp8_linear.dequantize_fp8_block_weight(lin.weight.data, lin.weight_scale_inv.data, (16, 16))
+    assert torch.equal(lin.weight_bf16, dense)
+    fp8_calls = []
+    real = fp8_linear.fp8_block_linear
+    monkeypatch.setattr(fp8_linear, "fp8_block_linear",
+                        lambda x, *a, **k: fp8_calls.append(x.shape[0]) or real(x, *a, **k))
+    x = torch.randn(5, 64, dtype=torch.bfloat16)
+    for m in (1, 2, 3, 5):
+        assert torch.equal(lin(x[:m], glu=glu), fp8_linear.reference(
+            x[:m], lin.weight, lin.weight_scale_inv, (16, 16), glu))
+    assert fp8_calls == [1, 2]
+
+
+def test_keep_bf16_leaves_the_reference_and_released_weights():
+    ref = _loaded_linear(reference=True)
+    ref.keep_bf16(1)
+    assert ref.weight_bf16 is None
+    lin = _loaded_linear()
+    lin.keep_bf16(1)
+    lin.release()
+    assert lin.weight_bf16 is None
+    lin.keep_bf16(1)
+    assert lin.weight_bf16 is None
+
+
+def test_keep_dense_bf16_covers_the_fused_qkv_a(monkeypatch):
+    """After process_weights_after_loading, every fp8 linear and MLA's fused q_a | kv_a hold a
+    bf16 copy (its released sources none), and the fused projection takes it from min_tokens."""
+    from test_glm52_moe import BLOCK, _fabricate_checkpoint
+
+    from mstar.model.components import mla
+    from mstar.model.glm52.glm52_model import keep_dense_bf16
+
+    torch.manual_seed(7)
+    cfg = _cfg(block=BLOCK, kernels="auto")
+    state, _ = _fabricate_checkpoint(cfg)
+    model, _ = _load(cfg, state)
+    process_weights_after_loading(model, torch.device("cpu"))
+    keep_dense_bf16(model, 4)
+    attn = model.model.layers[1].self_attn
+    assert torch.equal(attn.fused_qkv_a_proj_weight_bf16, mla.dequantize_fp8_block_weight(
+        attn.fused_qkv_a_proj_weight, attn.fused_qkv_a_proj_scale_inv, BLOCK))
+    assert attn.q_a_proj.weight_bf16 is None and attn.kv_a_proj_with_mqa.weight_bf16 is None
+    for lin in (attn.q_b_proj, attn.o_proj, model.model.layers[0].mlp.gate_up_proj):
+        assert lin.weight_bf16 is not None and lin.bf16_min_tokens == 4
+    fp8_calls = []
+    monkeypatch.setattr(mla, "fp8_block_linear", lambda x, *a, **k: fp8_calls.append(x.shape[0]))
+    x = torch.randn(4, cfg.hidden_size, dtype=attn.fused_qkv_a_proj_weight_bf16.dtype)
+    assert torch.equal(attn._qkv_a(x), torch.nn.functional.linear(x, attn.fused_qkv_a_proj_weight_bf16))
+    attn._qkv_a(x[:3])
+    assert fp8_calls == [3]
+
+
+def test_dense_bf16_min_tokens_is_a_token_count():
+    from mstar.model.glm52.glm52_model import Glm52Model
+
+    model = Glm52Model(model_path_hf=None, config_variant="reduced_fp8", dense_bf16_min_tokens=3)
+    assert model.config.dense_bf16_min_tokens == 3
+    assert Glm52Model(model_path_hf=None, config_variant="reduced_fp8").config.dense_bf16_min_tokens is None
+    for bad in (0, True, "3", 2.5):
+        with pytest.raises(ValueError, match="dense_bf16_min_tokens"):
+            Glm52Model(model_path_hf=None, config_variant="reduced_fp8", dense_bf16_min_tokens=bad)
