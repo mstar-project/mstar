@@ -404,13 +404,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             {"pixel_values": video.pixel_values}, [int(group.prod()) // merge ** 2] * t, [group] * t,
         )
 
-    def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
+    def media_advance(self, tokens: int, grid: list[int]) -> int:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        advance = length + sum(
-            vision_position_advance(torch.tensor(grid), self._merge()) - tokens
-            for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
-        )
-        return super().kv_layout(layout, length, advance)
+        return vision_position_advance(torch.tensor(grid), self._merge())
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
