@@ -10,7 +10,7 @@ usage:
   gpu.py push <instance> <local> <remote>        scp -r to the box
   gpu.py pull <instance> <remote> <local>        scp -r from the box
   gpu.py list [--all]                            instances launched by this tool (--all: whole accounts)
-  gpu.py extend <instance> --hours H             move the watchdog deadline to now + H
+  gpu.py extend <instance> --hours H [--allow-over-budget]   move the watchdog deadline to now + H
   gpu.py terminate <instance>
 
 Offers only cover regions where the team has persistent storage (a RunPod global volume
@@ -73,7 +73,12 @@ class ApiError(Exception):
         return self.body.get("error", {}).get("code", "") if isinstance(self.body, dict) else ""
 
 
-def http(method: str, url: str, key_env: str, body: dict | None = None, params: dict | None = None):
+def http(method: str, url: str, key_env: str, body: dict | None = None, params: dict | None = None,
+         retry: bool = True):
+    """``retry=False`` is for a call that must not run twice (a create): it is retried only on a
+    429, which the provider refused before acting on it. Any other failure, a 5xx, a dropped
+    connection or a timeout, may have come after the provider acted, so it raises at once with
+    ``status`` -1 or the 5xx, and the caller finds out what happened."""
     key = os.environ.get(key_env)
     if not key:
         raise ApiError(0, f"{key_env} is not set")
@@ -97,17 +102,19 @@ def http(method: str, url: str, key_env: str, body: dict | None = None, params: 
                 parsed = json.loads(raw)
             except ValueError:
                 parsed = raw[:500]
-            if e.code == 429 or e.code >= 500:
+            if e.code == 429 or (retry and e.code >= 500):
                 time.sleep(float(e.headers.get("Retry-After") or 2 ** attempt * 3))
                 continue
             raise ApiError(e.code, parsed) from None
-        except urllib.error.URLError:
+        except (urllib.error.URLError, TimeoutError) as e:  # a read timeout is not a URLError
+            if not retry:
+                raise ApiError(-1, f"{method} {url}: {e}") from None
             time.sleep(2 ** attempt * 3)
     raise ApiError(-1, f"{method} {url}: gave up after retries")
 
 
-def runpod(method, path, body=None, params=None):
-    return http(method, RUNPOD + path, "RUNPOD_API_KEY", body, params)
+def runpod(method, path, body=None, params=None, retry=True):
+    return http(method, RUNPOD + path, "RUNPOD_API_KEY", body, params, retry)
 
 
 def runpod_list(path: str, field: str, params: dict | None = None) -> list:
@@ -123,8 +130,8 @@ def runpod_list(path: str, field: str, params: dict | None = None) -> list:
         params["cursor"] = nxt
 
 
-def lambda_(method, path, body=None):
-    return http(method, LAMBDA + path, "LAMBDA_API_KEY", body).get("data")
+def lambda_(method, path, body=None, retry=True):
+    return http(method, LAMBDA + path, "LAMBDA_API_KEY", body, retry=retry).get("data")
 
 
 # ---------------------------------------------------------------- storage
@@ -246,7 +253,7 @@ def enabled(cfg, provider) -> bool:
 
 
 def cmd_offers(args, cfg):
-    offers, errors = [], []
+    offers, errors, answered = [], [], 0
     for provider, fn in (("runpod", runpod_offers), ("lambda", lambda_offers)):
         if not enabled(cfg, provider):
             errors.append(f"{provider}: skipped (disabled or no API key)")
@@ -254,15 +261,22 @@ def cmd_offers(args, cfg):
         try:
             offers += fn(cfg, args.gpus, args.min_vram, args.all_regions,
                          **({"allow_arm": args.allow_arm} if provider == "lambda" else {}))
+            answered += 1
         except ApiError as e:
             errors.append(f"{provider}: {e}")
     offers.sort(key=lambda o: (o["usd_per_hour"], o["count"]))
     cap = cfg["budget"]["max_usd_per_hour"]
+    # no provider answered (no key, an error): that says nothing about capacity
+    none_answered = not answered
     if args.json:
         print(json.dumps({"offers": offers, "errors": errors, "max_usd_per_hour": cap}, indent=1))
+        if none_answered:
+            sys.exit(1)
         return
     for e in errors:
         print("#", e)
+    if none_answered:
+        die("no provider answered, so availability is unknown; fix the keys or the errors above")
     if not offers:
         print(f"no availability: no Hopper+ box with >= {args.gpus} GPUs"
               + ("" if args.all_regions else " in a region with team storage (try --all-regions)"))
@@ -329,6 +343,19 @@ def find_offer(cfg, offer_id: str) -> dict:
     die(f"{offer_id} is no longer available; rerun offers")
 
 
+def check_hours(cfg, hours: float, allow: bool) -> None:
+    if hours > cfg["budget"]["max_hours"] and not allow:
+        die(f"{hours} h is over the {cfg['budget']['max_hours']} h cap; ask before passing --allow-over-budget")
+
+
+def check_total(cfg, committed: float, allow: bool) -> None:
+    """``committed``: what the live instances cost if they all run to their deadlines."""
+    max_total = cfg["budget"].get("max_total_usd")
+    if max_total is not None and committed > max_total and not allow:
+        die(f"running to their deadlines, the live instances would cost ~${committed:.0f}, "
+            f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
+
+
 def cmd_launch(args, cfg):
     o = find_offer(cfg, args.offer)
     if not o["storage"]:
@@ -336,12 +363,11 @@ def cmd_launch(args, cfg):
     cap, hours = cfg["budget"]["max_usd_per_hour"], args.hours or cfg["budget"]["max_hours"]
     if o["usd_per_hour"] > cap and not args.allow_over_budget:
         die(f"${o['usd_per_hour']}/hr is over the ${cap}/hr cap; ask before passing --allow-over-budget")
-    if hours > cfg["budget"]["max_hours"] and not args.allow_over_budget:
-        die(f"{hours} h is over the {cfg['budget']['max_hours']} h cap; ask before passing --allow-over-budget")
+    check_hours(cfg, hours, args.allow_over_budget)
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
-    name = f"live-pr-{args.pr}-{time.strftime('%m%d-%H%M')}"
+    # unique per launch: a create whose answer was lost is found again by this name
+    name = f"live-pr-{args.pr}-{time.strftime('%m%d-%H%M%S')}"
     max_instances = cfg["budget"].get("max_concurrent_instances", 1)
-    max_total = cfg["budget"].get("max_total_usd")
 
     if o["provider"] == "runpod":
         rp = cfg["runpod"]
@@ -375,19 +401,20 @@ def cmd_launch(args, cfg):
         if len(d) >= max_instances and not args.allow_over_budget:
             die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
                 f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
-        committed = sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours
-        if max_total is not None and committed > max_total and not args.allow_over_budget:
-            die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
-                f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
+        check_total(cfg, sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours,
+                    args.allow_over_budget)
         try:
             if o["provider"] == "runpod":
-                iid = runpod("POST", "/pods", body)["id"]
+                iid = runpod("POST", "/pods", body, retry=False)["id"]
             else:
-                iid = lambda_("POST", "/instance-operations/launch", body)["instance_ids"][0]
+                iid = lambda_("POST", "/instance-operations/launch", body, retry=False)["instance_ids"][0]
         except ApiError as e:
-            if e.status in (400, 409) or "capacity" in e.code():
+            if e.status == 409 or "capacity" in f"{e.code()} {e.body}".lower():
                 die(f"no availability: {o['id']} was taken before launch ({e}); rerun offers")
-            raise
+            if e.status != -1 and e.status < 500:
+                raise  # refused (a bad config, a bad image): nothing was created
+            # the provider may have created it before the answer was lost
+            iid = adopt(o["provider"], name, e)
         key = f"{o['provider']}:{iid}"
         now = time.time()
         d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
@@ -402,6 +429,24 @@ def cmd_launch(args, cfg):
     print(f"launched {key} ({o['count']}x {o['gpu']}, {o['region']}, ${o['usd_per_hour']}/hr); "
           f"watchdog terminates it at {time.strftime('%H:%M', time.localtime(now + hours * 3600))} ({hours} h)")
     print(key)
+
+
+def adopt(provider: str, name: str, err: ApiError) -> str:
+    """The instance a create whose answer was lost made, found by its name, or exit saying none was."""
+    for _ in range(12):  # a new instance can take a while to show in the listing
+        if provider == "runpod":
+            ids = [p["id"] for p in runpod_list("/pods", "pods") if p.get("name") == name]
+        else:
+            ids = [i["id"] for i in lambda_("GET", "/instances") or [] if i.get("name") == name]
+        if ids:
+            if len(ids) > 1:
+                die(f"the create failed ({err}) and left {len(ids)} instances named {name} ({', '.join(ids)}); "
+                    "terminate them from `gpu.py list --all`")
+            print(f"the create's answer was lost ({err}); adopting {provider}:{ids[0]}, named {name}", file=sys.stderr)
+            return ids[0]
+        time.sleep(10)
+    die(f"the create failed ({err}), and no instance named {name} showed up in 2 min; "
+        "check `gpu.py list --all` before launching again")
 
 
 def hf_home(cfg, provider, region) -> str:
@@ -496,9 +541,14 @@ def cmd_terminate(args, cfg):
 
 def cmd_extend(args, cfg):
     entry(args.instance)
+    # the caps launch applies, on the instance's whole run from launch to the new deadline
     with ledger_txn() as d:
         e = d[args.instance]
-        e["deadline"] = time.time() + args.hours * 3600
+        deadline = time.time() + args.hours * 3600
+        check_hours(cfg, (deadline - e["launched_at"]) / 3600, args.allow_over_budget)
+        check_total(cfg, sum(committed_usd(x) for k, x in d.items() if k != args.instance)
+                    + committed_usd({**e, "deadline": deadline}), args.allow_over_budget)
+        e["deadline"] = deadline
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
 
@@ -607,6 +657,7 @@ def main():
     p = sub.add_parser("extend")
     p.add_argument("instance")
     p.add_argument("--hours", type=float, required=True)
+    p.add_argument("--allow-over-budget", action="store_true")
     p = sub.add_parser("terminate")
     p.add_argument("instance")
     p = sub.add_parser("watchdog")
