@@ -768,7 +768,7 @@ class AcceleratorGraphRunner:
         self._compiled_forwards: dict[int, Any] = {}
 
         # Plan-overlap stream. Lazily created the first time pre_plan
-        # is called from Worker.plan_executor.
+        # is called from StepExecutor's plan thread.
         self._plan_stream: Any | None = None
 
         # Per-bucket template rows for declare-only calls; see

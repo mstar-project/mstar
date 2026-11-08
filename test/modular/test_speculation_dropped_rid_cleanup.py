@@ -1,4 +1,4 @@
-"""``_thread_outputs_to_speculative`` returns a dropped rid's streaming edges
+"""``Speculator.thread_outputs`` returns a dropped rid's streaming edges
 under the dropped rid.
 
 A rid is dropped from the spec batch when batch N produced no loop-back
@@ -18,8 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from mstar.engine.engine import ExecutingBatch  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.streaming.stream_buffer import StreamChunkInfo, StreamingEdge  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.worker import Speculation, Worker  # noqa: E402
+from mstar.worker.speculation import Speculation  # noqa: E402
 
 NODE = "decoder"
 
@@ -58,28 +59,23 @@ def _speculation(rids: list[str]) -> Speculation:
 def test_dropped_rid_gets_its_own_edges_back():
     returned: list[tuple[str, str]] = []
     committed: list[tuple] = []
-    worker = SimpleNamespace(
+    speculator = make_worker(
         streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.name))),
         # The staged ingests are settled per rid before the chunks go back, so
-        # the chunk leaves the node's slot first; see Worker._settle_speculation.
-        _graph_runtime=SimpleNamespace(
+        # the chunk leaves the node's slot first; see Speculator.settle.
+        graph_runtime=SimpleNamespace(
             commit_speculation=lambda sid, ok, dropped, **kw: committed.append(
                 (sid, ok, sorted(dropped), kw.get('scheduled_rids'))
             ),
         ),
-    )
-    worker._set_in_flight_flag = lambda batch, value: None
-    worker._settle_speculation = (
-        lambda spec, success, dropped_rids=frozenset():
-        Worker._settle_speculation(worker, spec, success, dropped_rids)
-    )
+    ).speculator
     # The dropped rid goes first: the threading loop leaves its variable bound
     # to the LAST rid it visited, so a cleanup that read that leftover would
     # act on ``keep`` and look correct if ``drop`` happened to come last.
     spec = _speculation(["drop", "keep"])
     outputs_N = {"keep": {"tok": ["t"]}}  # nothing came back for ``drop``
 
-    Worker._thread_outputs_to_speculative(worker, spec, outputs_N)
+    speculator.thread_outputs(spec, outputs_N)
 
     assert spec.dropped == {"drop"}
     assert spec.continuing_rids == {"keep"}
@@ -100,7 +96,7 @@ def test_dropped_rid_gets_its_own_edges_back():
 
     # What the caller then does with it: only drop's staged ingest is undone,
     # and the undo precedes the hand-back or the chunk is in two places.
-    worker._settle_speculation(spec, True, spec.dropped)
+    speculator.settle(spec, True, spec.dropped)
     # One crossing, two different rid sets: the undo targets the dropped rid,
     # the speculative-scheduled flag goes on the one that still runs.
     assert committed == [(spec.spec_id, True, ["drop"], ["keep"])]
@@ -115,17 +111,17 @@ def test_failed_settle_after_success_returns_nothing():
     stays in its slot; returning it to its buffer would track it twice.
     """
     returned: list[tuple[str, str]] = []
-    worker = SimpleNamespace(
+    speculator = make_worker(
         streams=SimpleNamespace(return_edge=lambda rid, se: returned.append((rid, se.name))),
-        _graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
+        graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
         engine_manager=SimpleNamespace(
             get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
         ),
-    )
+    ).speculator
     spec = _speculation(["keep"])
     spec.spec_id = 5
 
-    Worker._settle_speculation(worker, spec, True)
-    Worker._settle_speculation(worker, spec, False)
+    speculator.settle(spec, True)
+    speculator.settle(spec, False)
 
     assert returned == []

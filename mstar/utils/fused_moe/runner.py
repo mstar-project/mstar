@@ -58,17 +58,21 @@ def tl_compute_type(dtype: torch.dtype) -> tl.dtype:
 
 
 def runs_per_pair(
-    hidden_states: torch.Tensor, w1: torch.Tensor, activation: str = "silu", skip_invalid: bool = False,
+    hidden_states: torch.Tensor, w1: torch.Tensor, top_k: int, activation: str = "silu",
+    skip_invalid: bool = False,
 ) -> bool:
     """Whether ``fused_experts``, given no alignment and no LoRA, runs this batch as per-pair
-    GEMVs, which read none: a caller that could precompute one has no use for it then."""
+    GEMVs, which read none: a caller that could precompute one has no use for it then. Up to
+    the ``moe_decode`` entry's crossover for these experts on this GPU (``decode.routed_tuning``)."""
     if skip_invalid or activation != "silu" or not hidden_states.is_cuda or not current_platform.is_cuda():
         return False
     # imported here: it needs triton's CUDA extras, which CPU hosts may lack. Its per-pair
-    # tiles target NVIDIA GPUs (swept on an H100), so ROCm keeps the grouped path.
+    # tiles target NVIDIA GPUs, so ROCm keeps the grouped path.
     from mstar.utils.fused_moe import decode
 
-    return hidden_states.shape[0] <= decode.ROUTED_MAX_TOKENS and decode.routed_fits(w1.shape[2], w1.shape[1] // 2)
+    tuning = decode.routed_tuning(hidden_states, w1, top_k)
+    return hidden_states.shape[0] <= tuning.pair_max_tokens and decode.routed_fits(
+        w1.shape[2], w1.shape[1] // 2, tuning)
 
 
 def fused_experts(
@@ -146,7 +150,7 @@ def fused_experts(
     # moe_align_block_size expects int32; torch.topk returns int64.
     topk_ids = topk_ids.to(torch.int32).contiguous()
     topk_weights = topk_weights.contiguous()
-    if alignment is None and lora is None and runs_per_pair(hidden_states, w1, activation, skip_invalid):
+    if alignment is None and lora is None and runs_per_pair(hidden_states, w1, top_k, activation, skip_invalid):
         from mstar.utils.fused_moe import decode
 
         # At a few tokens each expert's GEMM tile is mostly padding rows: per-pair GEMVs

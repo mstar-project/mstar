@@ -529,10 +529,11 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, case):
     against each row's adapter merged into its experts in fp32: eagerly, and inside one captured
     graph replayed for other adapter mixes (``captured-compiled`` captures the Inductor-compiled
     forward, as the runner does). Base rows (and bucket padding) are bitwise the unbound layer's on
-    the grouped path. An eager step of at most ``ROUTED_MAX_TOKENS`` tokens, where an unbound layer
-    takes the per-pair GEMVs, keeps a bound one on the grouped GEMMs its deltas join."""
+    the grouped path. An eager step of at most the per-pair crossover (``routed_tuning``'s
+    ``pair_max_tokens``), where an unbound layer takes the per-pair GEMVs, keeps a bound one on the
+    grouped GEMMs its deltas join."""
     from mstar.utils.fused_moe.align import moe_align_block_size
-    from mstar.utils.fused_moe.decode import ROUTED_MAX_TOKENS
+    from mstar.utils.fused_moe.decode import routed_tuning
     from mstar.utils.fused_moe.runner import MoeAlignment, moe_block_m, runs_per_pair
 
     paths, refs = {}, {}
@@ -559,7 +560,8 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, case):
         for mix in mixes:
             step, ctx = eager_step(pool, mix)
             x, weights, ids = routed(sum(n for *_, n in mix), g)
-            assert runs_per_pair(x, plain.gate_up_proj) == (len(x) <= ROUTED_MAX_TOKENS)
+            crossover = routed_tuning(x, plain.gate_up_proj, MOE_TOP_K).pair_max_tokens
+            assert runs_per_pair(x, plain.gate_up_proj, MOE_TOP_K) == (len(x) <= crossover)
             # the unbound layer given the alignment fused_experts would make: the grouped path at
             # every size, so its rows compare bitwise
             block_m = moe_block_m(len(x), plain.gate_up_proj, MOE_TOP_K)
