@@ -34,6 +34,7 @@ mod refusals;
 mod serving;
 mod speech_chunking;
 mod tokenizer;
+mod unicode_marks;
 mod utf8;
 
 use std::collections::BTreeMap;
