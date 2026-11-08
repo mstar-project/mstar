@@ -129,12 +129,17 @@ class TestCarry(unittest.TestCase):
          {"run": "full", "checks": BOTH}),
     ]
 
-    def carry(self, rereview, run, checks, comments, status):
-        """cmd_carry's outputs and the earlier report it kept; comments None: the fetch fails."""
+    def carry(self, rereview, run, checks, comments, status, files=("mstar/worker/worker.py",)):
+        """cmd_carry's outputs and the earlier report it kept; comments None: the fetch fails. files: the
+        PR's changed files."""
         out = Path(tempfile.mkdtemp())
         (out / "review.json").write_text(json.dumps({"live_test": {"run": run, "checks": checks}}))
 
         def gh(*args, check=True):
+            if "/compare/" in args[1] and "--jq" not in args:
+                return argparse.Namespace(stdout=json.dumps({"files": [{"filename": f} for f in files]}))
+            if args[1].endswith("/pulls/7"):
+                return argparse.Namespace(stdout=json.dumps({"base": {"sha": "b" * 40}}))
             if "--paginate" not in args:
                 return argparse.Namespace(returncode=0, stdout=status + "\n", stderr="")
             if comments is None and check:
@@ -160,6 +165,9 @@ class TestCarry(unittest.TestCase):
                                  if "since" in expected and expected["run"] == "targeted" else None)
         with self.assertRaises(RuntimeError, msg="a failed fetch would read as no earlier live test"):
             self.carry(True, "none", ["correctness"], None, "")
+        self.assertEqual(self.carry(True, "none", ["correctness"], [], "", files=["docs/x.rst"])[0],
+                         {"run": "none", "checks": "correctness", "verdict": "skipped"},
+                         "a re-review of docs alone would need a GPU run, and fail approval for good without one")
 
 
 class TestStart(unittest.TestCase):

@@ -814,7 +814,8 @@ jobs:
           { echo "gpus=$gpus"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
       # The review's call stands unless the PR's last live test didn't pass on an ancestor of this
-      # head, or a re-review's `none` or `targeted` has no live test before it (gpu_review.py carry):
+      # head, or a re-review's `targeted`, or its `none` on runtime code, has no live test before it
+      # (gpu_review.py carry):
       # then the live test runs in full, every kind of check, so a failure is never hidden. After a
       # pass on an ancestor, a `targeted` run is told that commit and given that report. A `none`
       # that stands runs nothing (verdict `skipped`), and counts as a pass for approval after that

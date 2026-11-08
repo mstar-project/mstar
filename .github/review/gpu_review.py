@@ -153,13 +153,20 @@ def last_live_test(pr):
     return last
 
 
+def touches_runtime(pr, sha):
+    """Whether the PR at SHA changes runtime code, by file_gate; a file list too long to check does."""
+    base = gh_json(f"repos/{REPO}/pulls/{pr}")["base"]["sha"]
+    files = gh_json(f"repos/{REPO}/compare/{base}...{sha}").get("files")
+    return files is None or len(files) >= 300 or bool(file_gate([f["filename"] for f in files], ROOT)[2])
+
+
 def cmd_carry(a):
     """What the live test runs, printed as the step's outputs: the review's call, read as its enums only
     (model output on its way to a shell and the brief). It stands unless the PR's last live test didn't
     pass on an ancestor of the head; then the run is full, with every kind of check, whatever the review
     asked for, so a failure is never hidden behind a narrower run. A re-review with no live test before
-    it judged only the commits since the last review, which no GPU run has covered: its `none` or
-    `targeted` is full too."""
+    it judged only the commits since the last review, which no GPU run has covered: its `targeted` is
+    full too, and so is its `none` when the PR touches runtime code (file_gate)."""
     live = json.loads(Path(a.review).read_text()).get("live_test") or {}
     run = live.get("run") if live.get("run") in ("none", "targeted", "full") else "full"
     asked = live.get("checks") if isinstance(live.get("checks"), list) else []
@@ -168,7 +175,8 @@ def cmd_carry(a):
     passed = bool(last) and last["verdict"] == "pass" and gh(
         "api", f"repos/{REPO}/compare/{last['sha']}...{a.sha}", "--jq", ".status",
         check=False).stdout.strip() in ("ahead", "identical")
-    forced = "failed" if last and not passed else "untested" if not last and a.rereview and run != "full" else None
+    untested = not last and a.rereview and (run == "targeted" or run == "none" and touches_runtime(a.pr, a.sha))
+    forced = "failed" if last and not passed else "untested" if untested else None
     if forced:
         print(f"::notice::The review asked for a {run} live test, but {FORCED[forced]}; running it in full, every "
               "kind of check.")
