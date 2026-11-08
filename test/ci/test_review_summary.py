@@ -49,6 +49,17 @@ class TestReviewSummary(unittest.TestCase):
         fixed = [{"ref": "7", "priority": "P1", "status": "fixed", "why": "guard added"}]
         self.assertEqual(open_findings(review(prior=fixed), pages), [], "a fixed finding would keep the status red")
 
+    def test_a_finding_a_pr_above_fixes_is_reported_but_doesnt_block(self):
+        above = [{"ref": "7", "priority": "P1", "status": "fixed_above", "fixed_in": 12, "why": "guard added"}]
+        r = review(prior=above)
+        r["outside_diff"] = [{"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d", "fixed_in": 12}]
+        text = render(r, threads(thread("P1", comment_id=7)), "0123456789", "light")
+        self.assertIn("🟢 **No findings**", text, "a fix that lands with the PR above would block this one")
+        self.assertEqual(text.count("Fixed in #12 above"), 2, "the finding would vanish from the summary")
+        still = [{**above[0], "status": "open"}]
+        self.assertEqual(open_findings(review(prior=still), threads(thread("P1", comment_id=7))), [("inline 7", "P1")],
+                         "a finding only said to be fixed above would stop blocking")
+
     def test_an_earlier_finding_judged_open_counts_once_whatever_its_thread(self):
         # The author resolved thread 8 without fixing it; thread 7 is still open and also judged open.
         prior = [{"ref": "8", "priority": "P1", "status": "open", "why": "unchanged"},

@@ -7,7 +7,7 @@ The plan has four parts, in this order of priority. Size the hardware for the la
 3. **Correctness against the reference** for anything that changes what a model outputs (SKILL.md step 1). Media that metrics can't judge goes to a human.
 4. **Regression suites** for what the touched paths can break, from the table below.
 
-Every served check uses a real checkpoint. Where both a Python and a Rust implementation exist, the check runs on both; otherwise it runs on the default Rust runtime.
+Every served check uses a real checkpoint. Checks run on the Rust runtime, through both frontends where the API server is touched.
 
 ## Risk probes by layer
 
@@ -31,7 +31,7 @@ Probes that found bugs our earlier runs missed, from human reviews of the same P
 | --- | --- |
 | `mstar/model/<family>/` only | that family's functional suite and its perf suite at its usual concurrency, PR vs main |
 | new model (new `mstar/model/<family>/`, new `DEFAULT_CONFIGS` entry) | functional suite with media for every request type it serves; competitor benchmark per the benchmarking skill ("Profiling a gap against another engine") |
-| `mstar/worker/`, `mstar/engine/engine.py`, `mstar/engine/cuda_graph_runner.py`, `mstar/graph/`, `mstar/conductor/` | **worker A/B set** below |
+| `mstar/worker/`, `mstar/engine/engine.py`, `mstar/engine/accelerator_graph_runner.py`, `mstar/graph/`, `mstar/conductor/` | **worker A/B set** below |
 | `mstar/engine/resources/<kind>` | the worker A/B rows whose models declare that resource (grep `get_node_resources` for the class), plus the PR's own model |
 | `mstar/distributed/`, `mstar/model/components/distributed/`, anything TP/SP | the TP rows of the worker A/B set |
 | `mstar/communication/`, `rust/`, `mstar/graph/` runtime | worker A/B set, plus a functional smoke over `--tensor-comm-protocol TCP` (untimed). There is one runtime, in `rust/` (AGENTS.md invariant 5); a `rust/` change also runs `test/rust` |
