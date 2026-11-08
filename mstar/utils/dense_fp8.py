@@ -5,7 +5,8 @@ Decode batches meet the weights as bf16 (w8a16): a few tokens as fp32 FMAs on we
 in registers (fused_moe.decode's per-pair GEMV), more as a bf16 ``tl.dot`` per scale block
 (e4m3 to bf16 is exact). The last program of an output tile sums its split-K partials in split
 order, so the result does not depend on scheduling. Larger batches quantize x to e4m3 per 128
-columns (W8A8): flashinfer's SM90 block-scale GEMM, then cuBLAS's.
+columns (W8A8): flashinfer's SM90 block-scale GEMM, then cuBLAS's. Where DeepGEMM is installed (an optional
+import), its SM90 block-scaled GEMM is a fourth W8A8 candidate: the kernel vLLM runs from 32 tokens.
 
 Which of the three runs is the kernel registry's ``fp8_linear`` op: a GPU's table row for the
 shape and token count where it has one (``mstar/kernels/tables/fp8_linear/``) and the GPU can run
@@ -41,6 +42,9 @@ _FI_MAX_TOKENS = 512
 _W8A8_API = hasattr(F, "scaled_mm") and hasattr(F, "ScalingType")
 _W8A8_OK: dict[torch.device, bool] = {}
 _FI_OK: dict[torch.device, bool] = {}
+# DeepGEMM (deepseek-ai/DeepGEMM) where it imports and runs: its module, probed per device by reserve()
+_DG_OK: dict[torch.device, bool] = {}
+_DG = None
 # Blackwell (sm_100 / sm_103), set per device by reserve(): neither block-fp8 GEMM above runs there, and w8a16
 # is ~10x slower than bf16 from 512 tokens (B300: Qwen3.5-27B's 5120 x 4352 down, 187 vs 17 us). So above
 # _DEQUANT_MIN_TOKENS the weight is dequantized to bf16 per call and cuBLAS runs it: exact up to the fp8 weights,
@@ -61,6 +65,11 @@ def _fi_unavailable(target) -> str | None:
     return None if _FI_OK.get(target.device) else "flashinfer's SM90 block-scale GEMM does not run here"
 
 
+def _dg_unavailable(target) -> str | None:
+    reserve(target.device)
+    return None if _DG_OK.get(target.device) else "DeepGEMM is not installed or its SM90 GEMM does not run here"
+
+
 def _cublas_unavailable(target) -> str | None:
     reserve(target.device)
     return None if _W8A8_OK.get(target.device) else "cuBLAS's block-scaled GEMM does not run here"
@@ -74,6 +83,8 @@ FP8_LINEAR = register(KernelOp(
                  "none for the built-in tile of the token count"),
         Impl("flashinfer", _fi_unavailable, doc="flashinfer's SM90 block-scale GEMM, x quantized per 128 columns"),
         Impl("cublas", _cublas_unavailable, doc="cuBLAS's block-scaled GEMM, x quantized per 128 columns"),
+        Impl("deepgemm", _dg_unavailable,
+             doc="DeepGEMM's SM90 block-scaled GEMM (an optional import), x quantized per 128 columns"),
         Impl("dequant", _w8a16_unavailable,
              doc="the weight dequantized to bf16 per call, then cuBLAS's bf16 GEMM (exact up to the fp8 weights)"),
     ),
@@ -270,6 +281,7 @@ def reserve(device: torch.device | str) -> None:
         _COUNTERS[device] = torch.zeros(_MAX_TILES, dtype=torch.int32, device=device)
         _FI_OK[device] = _probe_fi(device)
         _W8A8_OK[device] = _probe_w8a8(device)
+        _DG_OK[device] = _probe_dg(device)
         capability = current_platform.cuda_capability(device)
         _BLACKWELL[device] = capability is not None and capability[0] == 10
 
@@ -302,6 +314,72 @@ def _probe_fi(device: torch.device) -> bool:
         return True
     except Exception:  # noqa: BLE001 — not built for this GPU / version: cuBLAS instead
         return False
+
+
+def _probe_dg(device: torch.device) -> bool:
+    """DeepGEMM is installed and its SM90 GEMM runs here (compiled and loaded before any capture)."""
+    global _DG
+    if current_platform.cuda_capability(device) != (9, 0):
+        return False
+    try:
+        import deep_gemm
+    except Exception:  # noqa: BLE001 - not installed (the usual case), or built for another torch
+        return False
+    try:
+        # programmatic dependent launch, as vLLM runs it: the GEMM's prologue overlaps the quantize's tail
+        deep_gemm.set_pdl(True)
+        _DG = deep_gemm
+        _dg(torch.zeros(4, 128, dtype=torch.bfloat16, device=device),
+            torch.zeros(128, 128, dtype=torch.uint8, device=device), torch.ones(1, 1, device=device), False)
+        return True
+    except Exception as exc:  # noqa: BLE001 - no NVCC for its JIT, or a GPU it wasn't built for
+        logger.warning("DeepGEMM is installed but its SM90 GEMM does not run (%r); fp8_linear won't use it", exc)
+        return False
+
+
+@triton.jit
+def _quant_mn_major_kernel(x, q, s, M, MP, K: tl.constexpr, G: tl.constexpr, BR: tl.constexpr,
+                           eps, fp8_min, fp8_max):
+    """BR rows of one G-column group of ``x (M, K)``: e4m3 values into ``q`` and the group's scale into
+    ``s[group * MP + row]``, the MN-major layout DeepGEMM reads without converting."""
+    r = tl.program_id(0) * BR + tl.arange(0, BR)
+    c = tl.program_id(1) * G + tl.arange(0, G)
+    live = (r < M)[:, None]
+    offs = r.to(tl.int64)[:, None] * K + c[None, :]
+    y = tl.load(x + offs, mask=live, other=0.0).to(tl.float32)
+    y_s = tl.maximum(tl.max(tl.abs(y), 1), eps) / fp8_max
+    y_q = tl.minimum(tl.maximum(y / y_s[:, None], fp8_min), fp8_max)
+    tl.store(q + offs, y_q.to(q.dtype.element_ty), mask=live)
+    tl.store(s + tl.program_id(1) * MP + r, y_s, mask=r < M)
+
+
+def _quant_mn_major(x, group):
+    """(e4m3 values, fp32 scales per ``group`` columns) of ``x (M, K)``: per_token_group_quant_fp8's math, the
+    scales ``(M, K / group)`` with their token stride 1 and group stride M rounded up to 4 (TMA's 16 bytes)."""
+    M, K = x.shape
+    mp = -(-M // 4) * 4
+    q = torch.empty(M, K, dtype=FP8_DTYPE, device=x.device)
+    s = torch.empty(K // group, mp, dtype=torch.float32, device=x.device)
+    br = 16 if M <= 256 else 32
+    fp8 = torch.finfo(FP8_DTYPE)
+    _quant_mn_major_kernel[(triton.cdiv(M, br), K // group)](
+        x, q, s, M, mp, K=K, G=group, BR=br, eps=1e-10, fp8_min=fp8.min, fp8_max=fp8.max, num_warps=4)
+    return q, s.t()[:M]
+
+
+def _dg(x, w, s, glu):
+    """DeepGEMM's SM90 GEMM, ``fp8_gemm_nt``: x quantized per 128 columns, the weight's 128 x 128 scales as
+    they are (its 1D2D kernel); SwiGLU after it with glu, as on flashinfer's path."""
+    from mstar.utils.fused_moe.kernels import act_and_mul_triton
+
+    q, a_scale = _quant_mn_major(x, 128)
+    h = torch.empty(x.shape[0], w.shape[0], dtype=x.dtype, device=x.device)
+    _DG.fp8_gemm_nt((q, a_scale), (w.view(FP8_DTYPE), s), h)
+    if not glu:
+        return h
+    out = torch.empty(h.shape[0], h.shape[1] // 2, dtype=x.dtype, device=x.device)
+    act_and_mul_triton(h, out, activation="silu")
+    return out
 
 
 def _counters(device: torch.device) -> torch.Tensor:
@@ -509,7 +587,8 @@ def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=
         bounds, choices = rows
         choice = choices[bisect.bisect_left(bounds, m)]
         if (choice.impl in ("w8a16", "dequant") or (choice.impl == "flashinfer" and _FI_OK.get(device))
-                or (choice.impl == "cublas" and _W8A8_OK.get(device))):
+                or (choice.impl == "cublas" and _W8A8_OK.get(device))
+                or (choice.impl == "deepgemm" and _DG_OK.get(device))):
             return choice.impl, choice.config
     return _builtin(device, n, k, glu, m), None
 
@@ -529,6 +608,8 @@ def _linear(x, w, s, block_size, glu):
         return _fi(x, w, s, glu)
     if impl == "cublas":
         return _w8a8(x, w, s, block_size, glu)
+    if impl == "deepgemm":
+        return _dg(x, w, s, glu)
     return _w8a16(x, w, s, block_size, glu, config)
 
 

@@ -26,6 +26,11 @@ SETS = {
     "glm53_tp8": [(2624, 6144, 0), (2048, 2048, 0), (6144, 2048, 0), (1536, 6144, 1), (6144, 1536, 0)],
     # Qwen3.5-27B at TP4: qkv, o, the MLP (fused SwiGLU), the delta net's fp8 input and output
     "qwen3_5_27b_tp4": [(3584, 5120, 0), (5120, 1536, 0), (4352, 5120, 1), (5120, 4352, 0), (4096, 5120, 0)],
+    # Qwen3.5-27B at TP1 (Qwen3.5-27B-FP8 as stored): qkv, the delta net's fp8 input, the MLP, down, o / delta-net out
+    "qwen3_5_27b_tp1": [(14336, 5120, 0), (16384, 5120, 0), (17408, 5120, 1), (5120, 17408, 0), (5120, 6144, 0)],
+    # Qwen3.5-397B-A17B at TP4: the delta net's fp8 input, qkv, o / delta-net out, the shared expert (its routed
+    # experts are fused_experts_fp8 shapes)
+    "qwen3_5_397b_a17b_tp4": [(5120, 4096, 0), (4608, 4096, 0), (4096, 2048, 0), (256, 4096, 1), (4096, 256, 0)],
     # Qwen3-Omni's Thinker attention at TP1 (its experts are moe_decode / fused_experts_fp8 shapes)
     "qwen3_omni_thinker_tp1": [(5120, 2048, 0), (2048, 4096, 0)],
 }

@@ -1,8 +1,8 @@
 """``fp8_linear``: dense_fp8's block-fp8 linear (128 x 128 weight scales), swept per token count.
 
 Each bucket times every kernel that runs on this GPU (w8a16 at its built-in tile and at candidate tiles up to
-``W8A16_SWEEP_MAX`` tokens, flashinfer's swapAB GEMM, cuBLAS's block-scaled GEMM, the weight dequantized to bf16
-for cuBLAS) inside a CUDA graph that calls
+``W8A16_SWEEP_MAX`` tokens, flashinfer's swapAB GEMM, cuBLAS's block-scaled GEMM, DeepGEMM's where it is installed,
+the weight dequantized to bf16 for cuBLAS) inside a CUDA graph that calls
 the linear once per weight copy in a rotation, so the weights come from HBM rather than L2, as in a decode step.
 A candidate competes only when its output is within ``MAX_REL_L2`` of the bf16 product of the dequantized weight
 (the kernels that quantize activations to e4m3 per 128 columns sit a few percent away; a broken tile far more).
@@ -78,7 +78,8 @@ class Fp8LinearSweep:
     def _runs(self, choice: Choice) -> bool:
         return (choice.impl in ("w8a16", "dequant")
                 or (choice.impl == "flashinfer" and dense_fp8._FI_OK.get(self.device))
-                or (choice.impl == "cublas" and dense_fp8._W8A8_OK.get(self.device)))
+                or (choice.impl == "cublas" and dense_fp8._W8A8_OK.get(self.device))
+                or (choice.impl == "deepgemm" and dense_fp8._DG_OK.get(self.device)))
 
     def run_bucket(self, m: int, current: Choice | None) -> BucketResult:
         """``current`` is the table's row for ``m``; None, the built-in dispatch."""
@@ -112,7 +113,7 @@ class Fp8LinearSweep:
 
         result = BucketResult(bucket=m, current=current, current_us=us_of(current), default_us=us_of(default),
                               best=None, best_us=float("nan"))
-        options = [Choice("w8a16"), Choice("flashinfer"), Choice("cublas"), Choice("dequant")]
+        options = [Choice("w8a16"), Choice("flashinfer"), Choice("cublas"), Choice("deepgemm"), Choice("dequant")]
         if m <= W8A16_SWEEP_MAX:
             options += [Choice("w8a16", cfg) for cfg in w8a16_candidates(m, self.k, self.quick)]
         for choice in options:
