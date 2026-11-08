@@ -51,7 +51,8 @@ class Admission:
         self._rebuilds = services.rebuilds
         self._combined_walk_of = layout.combined_walk_of
         self._follows = layout.followed_nodes
-        # rid -> message, for requests a resource declared unservable
+        # rid -> message, for requests a resource declared unservable, or that a
+        # raising scheduling pass left in no step
         self.admit_errors: dict[int, str] = {}
         # request_id -> monotonic time until which the request is held
         self.held_until: dict[int, float] = {}
