@@ -253,7 +253,8 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 - GPUs: the ones in CUDA_VISIBLE_DEVICES. On a Slurm node (SLURM_JOB_ID is set) start servers with
   `mserve`, never `--gpus`. Don't start tmux or detached processes outside this session's job.
   Another run can share the node: every server's `--port` comes from the 20 ports starting at
-  `$LIVE_PR_PORT`, and its `--socket-path-prefix` is `$LIVE_PR_SOCKET_PREFIX`. `$TMPDIR` is this run's own.
+  `$LIVE_PR_PORT`. Don't pass `--socket-path-prefix`: the default comes from the port. `$TMPDIR` is this
+  run's own.
 - You have no GitHub token and post nothing. Write everything to `$LIVE_PR_OUT`:
   `report.md` (the report reference's format, media linked relatively under `media/`),
   `media/` (the test matrix's Media rules: small files, a stereo recording for duplex), and

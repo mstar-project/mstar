@@ -37,9 +37,10 @@ if [ -n "${SLURM_JOB_ID:-}" ]; then
 fi
 
 # Two runs can share a Slurm node (no job container, network namespace or private /tmp), so each takes a
-# port block, a ZMQ socket prefix and a TMPDIR of its own, from its job id; on Eras the box is its own.
+# port block from its job id (a server's default socket prefix comes from its port), a TMPDIR of its own,
+# and its own server.sh state; on Eras the box is its own.
 export LIVE_PR_PORT=$((10000 + ${SLURM_JOB_ID:-0} % 1100 * 20))
-export LIVE_PR_SOCKET_PREFIX=/tmp/mstar_${SLURM_JOB_ID:-pod} TMPDIR=$W/tmp
+export TMPDIR=$W/tmp SERVER_STATE_DIR=$W/servers
 mkdir -p "$TMPDIR"
 
 finish() {
