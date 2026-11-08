@@ -948,8 +948,9 @@ _UNSUPPORTED_EVENTS = frozenset({
 
 @dataclass(slots=True)
 class _AgentTurn:
-    """One agent reply: the text steps from its start mark to its end mark,
-    and the audio of the same steps."""
+    """One agent reply: the text steps from its start mark to its end mark
+    (for a model with ``turn_idle_steps``, from any text outside a reply, and to
+    that much padding), and the audio of the same steps."""
     start: int                  # its first step
     end: int | None = None      # its last step, once the end mark arrived
     response_id: str = field(default_factory=lambda: f"resp_{uuid.uuid4().hex[:16]}")
@@ -1314,7 +1315,11 @@ class RealtimeConversation:
         self.text_steps = step + 1
         turn = self.turns[-1] if self.turns and self.turns[-1].end is None else None
         data = bytes(chunk.data)
-        for mark in meta.get("turn", ()):
+        marks = meta.get("turn", ())
+        if turn is None and data and self.idle_steps is not None and "start" not in marks:
+            # text after a reply ended for its padding, with no start mark: the model speaks again
+            turn = await self._start_turn(step)
+        for mark in marks:
             if mark == "start":
                 if turn is not None:   # no end mark: the open reply ends before this one
                     logger.warning("realtime reply %s got no end mark; ending it at step %d", turn.response_id,
@@ -1325,9 +1330,6 @@ class RealtimeConversation:
             elif mark == "end" and turn is not None:
                 await self._feed(turn, data, final=True)
                 data, turn.end, turn = b"", step, None
-        if turn is None and data and self.idle_steps is not None:
-            # text after a reply ended for its padding, with no start mark: the model speaks again
-            turn = await self._start_turn(step)
         if turn is not None:   # between replies the text channel is padding
             await self._feed(turn, data)
             turn.idle = 0 if data or meta.get("turn") else turn.idle + 1
