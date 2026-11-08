@@ -76,6 +76,7 @@ from mstar.model.voxcpm2.config import (
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.worker.scheduling_policy import WalkPriority
 
 STREAM_EDGE = "latent_patches"
 _CJK = re.compile(r"^[\u4e00-\u9fff]{2,}$")
@@ -296,6 +297,15 @@ class VoxCPM2Model(Model):
                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
             ),
         }
+
+    def get_walk_priorities(self) -> list[WalkPriority]:
+        # A prompt's first audio waits on its prefill, and a clone's on its reference
+        # encoding before that, while decode streams run several times faster than real
+        # time: a ready prompt takes the next step of each node on its walk.
+        return [
+            WalkPriority(walk="talker_prefill", priority=1),
+            WalkPriority(walk="talker_prefill_clone", priority=1),
+        ]
 
     def get_partitions(self) -> list[PartitionDefinition]:
         return [

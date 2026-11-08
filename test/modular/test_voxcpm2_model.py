@@ -1520,3 +1520,17 @@ def test_compile_vae_switch_reaches_the_decoder_region(model, checkpoint):
     assert VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae=False).compile_vae is False
     with pytest.raises(ValueError, match="compile_vae"):
         VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae="no")
+
+
+def test_the_talker_serves_a_ready_prompt_first(model):
+    """Each prefill walk outranks decode, a clone's reference encoding with it:
+    listing a walk covers every node on it, as the worker resolves the entries."""
+    from mstar.worker.services import walk_priorities_of
+
+    priorities = walk_priorities_of(model, model.get_graph_walk_graphs())
+    assert {pair: entry.priority for pair, entry in priorities.items()} == {
+        ("RefEncoder", "talker_prefill_clone"): 1,
+        ("Talker", "talker_prefill"): 1,
+        ("Talker", "talker_prefill_clone"): 1,
+    }
+    assert ("Talker", "talker_decode") not in priorities
