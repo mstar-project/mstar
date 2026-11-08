@@ -56,6 +56,7 @@ def _conductor(comm):
     c._drain_ttl_s = FAR_S
     c._liveness_interval_s = c._status_interval_s = FAR_S
     c._status = lambda: ConductorStatus(metrics=[])
+    c._declaration_digests = {}
     return c
 
 

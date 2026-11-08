@@ -18,6 +18,7 @@ from mstar.api_server.request_types import (
     ConductorStatus,
     RequestComplete,
     RequestFailed,
+    WorkersReady,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.conductor.mps import MpsDaemon
@@ -45,6 +46,7 @@ from mstar.engine.resources.lora.serving import lora_specs, served_lora_targets
 from mstar.engine.resources.lora.store import check_adapters
 from mstar.engine.state import SampleSettings
 from mstar.engine.state.adapters import sampling_configs
+from mstar.engine.state.analysis import declaration_digests
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import (
     ForwardPassArgs,
@@ -263,6 +265,7 @@ def _worker_process_target(
     env: dict[str, str] | None = None,
     local_worker_devices: list[str] | None = None,
     all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
+    declaration_digests: dict[str, str] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
     picklability. ``status_interval_s`` turns on the worker's metrics;
@@ -322,6 +325,7 @@ def _worker_process_target(
             tcp_transfer_device=tcp_transfer_device,
             status_interval_s=status_interval_s,
             local_worker_devices=local_worker_devices,
+            declaration_digests=declaration_digests,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
@@ -495,6 +499,8 @@ class Conductor:
         # Every check that needs only the model, this YAML and the environment,
         # before any worker exists; raises listing every problem found.
         deployment = validate_deployment(model, self.model_config, model_config_file)
+        # after the placement is read, which a declaration may follow; each worker and the API server check theirs
+        self._declaration_digests = declaration_digests(self._declarations(), model.kernel_settings())
         self.device_type = accelerator_type()
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
@@ -914,6 +920,7 @@ class Conductor:
                     "tcp_transfer_device": self.tcp_transfer_device,
                     "status_interval_s": self._status_interval_s,
                     "env": self._mps.client_env if self._mps is not None else None,
+                    "declaration_digests": self._declaration_digests,
                 },
                 daemon=False,
             )
@@ -2345,7 +2352,7 @@ class Conductor:
 
         self.communicator.send(
             "api_server",
-            APIServerMessage(message_type="setup_done")
+            APIServerMessage(message_type="setup_done", body=WorkersReady(self._declaration_digests))
         )
 
         while True:

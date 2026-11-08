@@ -300,13 +300,35 @@ def deployment_problems(
     return problems
 
 
-def declaration_digest(declarations: Sequence[Array | Sampler]) -> str:
-    """A SHA-256 that matches across processes, which Python's `hash` doesn't, since it randomizes strings per process.
+def declaration_digests(
+    declarations: Sequence[Array | Sampler], kernel_settings: Mapping[str, Mapping[str, object]] = EMPTY,
+) -> dict[str, str]:
+    """Each declaration's SHA-256, by name, and with ``kernel_settings`` that of the hook's settings, under
+    ``kernel_settings()``, since a pool size can follow the deployment too. A SHA-256 matches across processes, as
+    Python's `hash` doesn't, since it randomizes strings per process.
 
-    Every field of every declaration goes in, with keys sorted and dtypes and classes by name.
+    Every field goes in, with keys sorted and dtypes and classes by name.
     """
-    ordered = sorted(declarations, key=lambda declared: declared.name)
-    return hashlib.sha256(json.dumps(_canonical(ordered), sort_keys=True).encode()).hexdigest()
+    digests = {declared.name: _sha256(declared) for declared in declarations}
+    if kernel_settings:
+        digests["kernel_settings()"] = _sha256(kernel_settings)
+    return digests
+
+
+def _sha256(value) -> str:
+    return hashlib.sha256(json.dumps(_canonical(value), sort_keys=True).encode()).hexdigest()
+
+
+def digest_mismatch(ours: Mapping[str, str], theirs: Mapping[str, str], *, here: str, there: str) -> str | None:
+    """None when the two processes built the same declarations, or which ones differ."""
+    differ = [
+        name if name in ours and name in theirs else f"{name} (only on the {here if name in ours else there})"
+        for name in sorted(ours.keys() | theirs.keys()) if ours.get(name) != theirs.get(name)
+    ]
+    if not differ:
+        return None
+    return (f"the {here} and the {there} declare different state: {', '.join(differ)}. A declaration that follows the "
+            "deployment reads it in get_worker_graphs, which every process calls before declare_state")
 
 
 def _canonical(value):

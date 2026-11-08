@@ -18,6 +18,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
     ResultTokens,
+    WorkersReady,
 )
 from mstar.communication.wire import _set_polymorphic, register
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -94,6 +95,7 @@ _TYPES: dict[str, type] = {
     "request_complete": RequestComplete,
     "request_failed": RequestFailed,
     "conductor_status": ConductorStatus,
+    "workers_ready": WorkersReady,
     "result_chunk": ResultChunk,
     "preprocess_input": PreprocessInput,
     "data_worker_profile": DataWorkerProfile,

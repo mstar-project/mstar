@@ -103,6 +103,7 @@ def _conductor(*ticks, requests):
         poll_for_messages=lambda timeout_ms: bool(batches),
     )
     c.model = _Model()
+    c._declaration_digests = {}
     c.enable_nvtx = False
     c.enable_prof = False
     c._startup_message_backlog = []

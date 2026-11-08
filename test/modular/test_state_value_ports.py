@@ -34,7 +34,7 @@ from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state import Span
 from mstar.engine.state.adapters import kv_layouts, node_resources, sampling_configs, state_steps
-from mstar.engine.state.analysis import declaration_digest, state_declaration_problems
+from mstar.engine.state.analysis import declaration_digests, state_declaration_problems
 from mstar.model.base import LabelLayout, parse_autocast_dtype, serving_resources
 from mstar.model.canary_qwen.canary_qwen_model import CanaryQwenModel
 from mstar.model.canary_qwen.submodules import CanaryQwenLLMSubmodule
@@ -353,7 +353,7 @@ def test_declarations_have_no_problems_and_one_digest(name):
     build, _ = MODELS[name]
     model = build()
     assert state_declaration_problems(model) == []
-    assert declaration_digest(model.declare_state()) == declaration_digest(build().declare_state())
+    assert declaration_digests(model.declare_state()) == declaration_digests(build().declare_state())
 
 
 # Steps

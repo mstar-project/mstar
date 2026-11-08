@@ -33,6 +33,7 @@ from mstar.api_server.request_types import (
     RequestComplete,
     RequestFailed,
     ResultChunk,
+    WorkersReady,
 )
 from mstar.communication import wire
 from mstar.communication.event import EventWakeup
@@ -1300,6 +1301,15 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
         def __init__(self, **kwargs):
             pass
 
+        def get_worker_graphs(self, config_path):
+            pass
+
+        def declare_state(self):
+            return []
+
+        def kernel_settings(self):
+            return {}
+
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text(text)
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
@@ -1340,6 +1350,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
         def finalize_setup(self):
             events.append("setup")
+            return WorkersReady(declaration_digests={})
 
         def enable_metrics(self):
             events.append("metrics")

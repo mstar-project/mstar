@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -12,7 +12,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.state.analysis import sdpa_nodes
+from mstar.engine.state.analysis import declaration_digests, digest_mismatch, sdpa_nodes
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime
 from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
@@ -262,6 +262,7 @@ class EngineManager:
         enable_nvtx: bool = False,
         enable_prof: bool=False,
         device_capability: DeviceCapability | None = None,
+        conductor_digests: Mapping[str, str] | None = None,
     ) -> "EngineManager":
         """Build the engine and load this worker's nodes into it.
 
@@ -269,7 +270,16 @@ class EngineManager:
         resources via ``declare_state`` and ``get_node_resources``; the KV cache's
         shape rides on those, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
+        ``conductor_digests`` are the conductor's `declaration_digests`, which this
+        worker's must equal.
         """
+        if conductor_digests is not None:
+            mismatch = digest_mismatch(
+                declaration_digests(model.declare_state(), model.kernel_settings()), conductor_digests,
+                here=f"worker {transfer_engine_info.my_entity_id}", there="conductor",
+            )
+            if mismatch is not None:
+                raise RuntimeError(mismatch)
         specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling

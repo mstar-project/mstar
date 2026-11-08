@@ -531,6 +531,7 @@ class Worker:
         status_interval_s: float | None = None,
         local_worker_devices: list[str] | None = None,
         all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
+        declaration_digests: dict[str, str] | None = None,
     ):
         # before anything below builds a resource or a submodule that reads one
         knobs.configure((model_config or {}).get("knobs"))
@@ -681,6 +682,7 @@ class Worker:
             enable_nvtx=self.enable_nvtx,
             enable_prof=self.enable_prof,
             device_capability=self.device_capability,
+            conductor_digests=declaration_digests,
         )
         self._never_publish_unshared(all_worker_graph_ids_to_instances)
         self._declare_stop_policies(my_walks)

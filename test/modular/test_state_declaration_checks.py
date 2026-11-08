@@ -36,7 +36,7 @@ from mstar.engine.state import (
     Value,
     Window,
 )
-from mstar.engine.state.analysis import declaration_digest, state_declaration_problems
+from mstar.engine.state.analysis import declaration_digests, state_declaration_problems
 from mstar.engine.state.contract import Mask
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
@@ -461,22 +461,22 @@ def test_a_value_with_no_layers_has_no_problems():
 def test_the_digest_tells_a_value_with_no_layers_from_one_with_a_layer():
     empty = _empty_value()
     with_layer = Value(empty.name, nodes=empty.nodes, layers={0}, entry=empty.entry, updates=empty.updates)
-    assert declaration_digest([empty]) != declaration_digest([with_layer])
+    assert declaration_digests([empty]) != declaration_digests([with_layer])
 
 
 def test_the_digest_ignores_the_order_of_arrays_and_keys():
     a, b = _declarations()
     swapped = Array(a.name, nodes=a.nodes, layers=a.layers, entry=a.entry, max_len=a.max_len,
                     reads=dict(reversed(list(a.reads.items()))))
-    assert declaration_digest([b, swapped]) == declaration_digest([a, b])
+    assert declaration_digests([b, swapped]) == declaration_digests([a, b])
 
 
 def test_the_digest_matches_across_processes_with_different_hash_seeds():
     script = (
         "import sys; sys.path.insert(0, 'test/modular'); sys.path.insert(0, '.')\n"
         "from test_state_declaration_checks import _declarations\n"
-        "from mstar.engine.state.analysis import declaration_digest\n"
-        "print(declaration_digest(_declarations()))\n"
+        "from mstar.engine.state.analysis import declaration_digests\n"
+        "print(declaration_digests(_declarations()))\n"
     )
     digests = {
         subprocess.run(
@@ -485,7 +485,7 @@ def test_the_digest_matches_across_processes_with_different_hash_seeds():
         ).stdout.strip()
         for seed in ("0", "1", "2024")
     }
-    assert digests == {declaration_digest(_declarations())}, "the digest moved with PYTHONHASHSEED"
+    assert digests == {str(declaration_digests(_declarations()))}, "the digest moved with PYTHONHASHSEED"
 
 
 @dataclass(frozen=True)
@@ -536,8 +536,8 @@ _FIELD_CHANGES = {
 
 
 def test_every_field_change_moves_the_digest():
-    base = declaration_digest([_array(reads={"r": _READ})])
-    digests = {name: declaration_digest([array]) for name, array in _FIELD_CHANGES.items()}
+    [base] = declaration_digests([_array(reads={"r": _READ})]).values()
+    digests = {name: next(iter(declaration_digests([array]).values())) for name, array in _FIELD_CHANGES.items()}
     assert all(digest != base for digest in digests.values()), [n for n, d in digests.items() if d == base]
     assert len(set(digests.values())) == len(digests), "two changes landed on one digest"
 
@@ -548,8 +548,8 @@ def test_a_host_field_change_moves_the_digest(host):
     def value(fields):
         return Value("v", nodes={"LLM"}, layers={0}, entry=Entry({}, host=fields))
 
-    assert declaration_digest([value({})]) != declaration_digest([value(host)])
-    assert declaration_digest([value(host)]) == declaration_digest([value(dict(host))])
+    assert declaration_digests([value({})]) != declaration_digests([value(host)])
+    assert declaration_digests([value(host)]) == declaration_digests([value(dict(host))])
 
 
 def _sampler(**overrides) -> Sampler:
@@ -561,7 +561,7 @@ def _sampler(**overrides) -> Sampler:
     _sampler(eos_ids=(1,)), _sampler(draws=2),
 ])
 def test_a_sampler_field_change_moves_the_digest(changed):
-    assert declaration_digest([_sampler()]) != declaration_digest([changed])
+    assert declaration_digests([_sampler()]) != declaration_digests([changed])
 
 
 @pytest.mark.parametrize("first, second", [
@@ -577,4 +577,4 @@ def test_an_update_field_change_moves_the_digest(first, second):
 
     def value(update):
         return Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"u": update})
-    assert declaration_digest([value(first)]) != declaration_digest([value(second)])
+    assert declaration_digests([value(first)]) != declaration_digests([value(second)])

@@ -764,7 +764,11 @@ class Model(ABC):
         """By read, update or array name, what the engine doesn't pick itself yet: ``splits``, ``decode_fmha`` and
         ``decode_tensor_cores`` on a read of an array that keeps entries, ``splits`` on a GatedDeltaNet, the capture
         sizes of a ``Block`` read, and a pool's default size, ``max_num_pages`` on a paged array and ``max_slots`` on a
-        Value with tensor fields. A deployment's ``resources:`` block overrides each pool size."""
+        Value with tensor fields. A deployment's ``resources:`` block overrides each pool size.
+
+        A pure function of the model's config and the deployment's settings, as `declare_state` is, since each process
+        calls it.
+        """
         return {}
 
     def get_lora_specs(self) -> list["LoraSpec"]:
