@@ -2771,7 +2771,7 @@ defaults in its deterministic mode, which picks kernel configs by rule rather th
 them on the device, so every process compiles the same kernels (a torch without the mode
 logs a warning and compiles with the defaults). A compile outside the runner takes the same
 options from <code class="docutils literal notranslate"><span class="pre">accelerator_graph_runner.compile_kwargs(&quot;deterministic&quot;)</span></code>, or
-<code class="docutils literal notranslate"><span class="pre">deterministic_inductor_options()</span></code> where it builds its own; the Wan VAE decode, the DiT
+<code class="docutils literal notranslate"><span class="pre">mstar.platforms.compile.deterministic_inductor_options()</span></code> where it builds its own; the Wan VAE decode, the DiT
 scaffold’s <code class="docutils literal notranslate"><span class="pre">compile_blocks</span></code> and Cosmos3’s denoise step do. Building the config refuses
 an unknown mode, and one that turns on Inductor’s own CUDA graphs (<code class="docutils literal notranslate"><span class="pre">reduce-overhead</span></code>,
 <code class="docutils literal notranslate"><span class="pre">max-autotune</span></code>), which fail inside the runner’s capture.</p></li>

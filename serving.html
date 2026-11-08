@@ -1561,9 +1561,16 @@ actions in robot units, as openpi’s policy server does. <code class="docutils 
 of an openpi <code class="docutils literal notranslate"><span class="pre">norm_stats.json</span></code>. Without it, <code class="docutils literal notranslate"><span class="pre">robot_state</span></code> must already be normalized to
 [-1, 1].</p>
 <p>Per-request knobs (<code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">voice</span></code>, <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code>, …) are sent by the
-client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>. A <code class="docutils literal notranslate"><span class="pre">seed</span></code> fixes a request’s random stream whatever
-it is batched with, so requests sent with the same seed and settings sample the same
-tokens; give each request its own seed for independent samples.</p>
+client instead — see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>. Give each request its own <code class="docutils literal notranslate"><span class="pre">seed</span></code> for independent
+samples. A seed fixes a request’s tokens whatever it is batched with only where M* draws
+with one kernel that reads each row’s own seed: on CUDA, a sampler whose vocabulary is at
+most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),
+with none of <code class="docutils literal notranslate"><span class="pre">min_p</span></code>, the windowed penalty, <code class="docutils literal notranslate"><span class="pre">min_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p_first</span></code> or processed
+log-probs enabled on its node, on eager and captured steps alike. Every other sampler (every
+text LLM, and Fish S2 Pro’s 4,097-token semantic head) draws through FlashInfer, which
+reads the first row’s seed for the whole batch and folds each row’s batch position into
+its random stream, so there the same seed and settings sample the same tokens only in the
+same batch, such as a request sent alone.</p>
 </section>
 <section id="restarts-and-the-compile-cache">
 <h2>Restarts and the compile cache<a class="headerlink" href="#restarts-and-the-compile-cache" title="Link to this heading">#</a></h2>
