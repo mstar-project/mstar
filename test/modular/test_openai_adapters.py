@@ -15,7 +15,6 @@ from mstar.api_server.openai.protocol import (  # noqa: E402
     SpeechRequest,
     VideoGenerationRequest,
 )
-from mstar.utils.generation_kwargs import normalize_generation_kwargs  # noqa: E402
 
 
 def test_bagel_chat_maps_max_tokens(tmp_path):
@@ -178,18 +177,6 @@ def test_a_thinking_chat_reads_the_template_kwargs_flat(adapter, fields, want, t
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
     mk = adapter().chat_to_request(req, tmp_path).model_kwargs
     assert mk == want
-
-
-@pytest.mark.parametrize("adapter", [adapters.Qwen3_5Adapter, adapters.Cosmos3EdgeAdapter], ids=lambda a: a.__name__)
-@pytest.mark.parametrize("fields", [
-    {"chat_template_kwargs": {"enable_thinking": "false"}}, {"enable_thinking": "false"},
-], ids=["template", "flat"])
-def test_a_thinking_chat_refuses_an_enable_thinking_that_is_not_a_boolean(adapter, fields, tmp_path):
-    """Qwen3.5 thought on "false", which is truthy. Refused where every endpoint's knobs are checked."""
-    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
-    mk = adapter().chat_to_request(req, tmp_path).model_kwargs
-    with pytest.raises(ValueError, match="enable_thinking must be true or false"):
-        normalize_generation_kwargs(mk)
 
 
 def test_text_chat_maps_text_and_sampling(tmp_path):

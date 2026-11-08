@@ -56,6 +56,7 @@ def test_in_contract_values_pass(kwargs):
     ({"seed": 1e20}, "seed"),
     ({"ignore_eos": "false"}, "ignore_eos"),
     ({"return_token_ids": 1}, "return_token_ids"),
+    ({"enable_thinking": "false"}, "enable_thinking"),  # a chat template thinks on "false"
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
 ])
