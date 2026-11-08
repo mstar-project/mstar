@@ -20,9 +20,12 @@ name: Claude Review
 #   3. Rules are read from main's checkout at the root. The prompt tells the
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
-#   4. The job's token can write only to pull requests, and the review app's
-#      token (below) only to pull requests and issues of this repository, and
-#      in full mode to the media repository's contents (REVIEW_MEDIA_REPO).
+#   4. The job's token can write only to pull requests and, for the spend
+#      ledger and its alerts, to issues (preflight, live-test and spend jobs),
+#      and the review app's token (below) only to pull requests and issues of
+#      this repository, and in full mode to the media repository's contents
+#      (REVIEW_MEDIA_REPO). The review job, which runs the model, has no
+#      issues: write. The job token can't read repository variables.
 #      The model has no shell and no mutation tools: it posts inline comments
 #      through the action's tool (which redacts secrets) and returns the summary
 #      as fields, which a workflow step renders, redacts and posts. In light
