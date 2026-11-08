@@ -9,7 +9,6 @@ its interface. It records its outputs in `out`, which `main` writes to $GITHUB_O
 step fails. Every call to another program (`gh`, `git`, gpu.py, ssh-keygen) goes through `run`, the
 one place a test replaces. Text the bot posts reaches `gh` on stdin, never its command line.
 """
-import collections
 import fnmatch
 import inspect
 import json
@@ -308,83 +307,50 @@ def stacked_above(repo, pull, head_sha):
     return found
 
 
-def diff_files(diff):
-    """{"diff --git" line: [its header lines, [its hunks, each a list of lines]]} of a unified diff. Lines
-    end only at \\n: a form feed or U+2028 inside a source line (str.splitlines breaks on those) could
-    fake a header and hide the code around it."""
+def file_patches(diff):
+    """{"diff --git" line: the file's lines} of a unified diff. Lines end only at \\n: a form feed or
+    U+2028 inside a source line (str.splitlines breaks on those) could fake a header and hide the code
+    around it."""
     files, current = {}, None
     for line in re.findall(r".*\n|.+", diff):
         if line.startswith("diff --git "):
-            current = files[line] = [[line], []]
-        elif current is None:
-            continue
-        elif line.startswith("@@"):
-            current[1].append([line])
-        elif current[1]:
-            current[1][-1].append(line)
-        else:
-            current[0].append(line)
+            current = files[line] = [line]
+        elif current is not None:
+            current.append(line)
     return files
 
 
-def changes(hunk):
-    """What a hunk changes: its runs of added and removed lines, each with the function on its `@@` line
-    and the nearest non-blank context line on either side within the hunk, so a change moved elsewhere
-    in a file counts. The line numbers stay out: a rebase shifts them."""
-    section, runs, run, above, open_runs = hunk[0].split("@@", 2)[-1], [], [], "", []
-    for line in hunk[1:]:
-        if line.startswith(("+", "-", "\\")):
-            run.append(line)
-            continue
-        if run:
-            open_runs.append((section, above, tuple(run)))
-            run = []
-        if line.strip():
-            runs += [(*r, line) for r in open_runs]
-            open_runs = []
-            above = line
-    if run:
-        open_runs.append((section, above, tuple(run)))
-    return runs + [(*r, "") for r in open_runs]
-
-
-def header_change(head, hunks):
-    """What a file's diff header says the PR changes: its mode lines and, for a file with no hunks (binary,
-    a pure rename), its other lines and new blob. Not the old blob, which a rebase moves."""
-    if hunks:
-        return [x for x in head if x.startswith(("old mode", "new mode", "new file mode", "deleted file mode"))]
-    return [x.split("..")[-1] if x.startswith("index ") else x for x in head]
-
-
-def not_in(files, others):
-    """The lines of the files and hunks of `files` (diff_files) whose changes `others` doesn't make."""
-    parts = []
-    for header, (head, hunks) in files.items():
-        other_head, other_hunks = others.get(header, ([], []))
-        made = collections.Counter(run for h in other_hunks for run in changes(h))
-        kept = []
-        for h in hunks:
-            runs = collections.Counter(changes(h))
-            if runs - made:
-                kept.append(h)
-            else:
-                made -= runs
-        mine = header_change(head, hunks)
-        if kept or mine and mine != header_change(other_head, other_hunks):
-            parts += head + [line for h in kept for line in h]
-    return parts
+def patch_key(lines):
+    """A file's patch as a rebase leaves it: no `@@` line numbers (the function name after them stays, so a
+    change moved to another function counts), and from the `index` line only the new blob when the file
+    has no hunks (binary, a pure rename), and nothing when it has: a rebase moves those blobs."""
+    hunks = any(line.startswith("@@") for line in lines)
+    key = []
+    for line in lines:
+        if line.startswith("@@"):
+            key.append(re.sub(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", "@@", line))
+        elif line.startswith("index "):
+            if not hunks:
+                key.append(line.split("..")[-1])
+        else:
+            key.append(line)
+    return key
 
 
 DROPPED = "=== dropped since the last review: these were in the PR then, and aren't now ===\n"
 
 
 def interdiff(old, new):
-    """What differs between `old`, a PR's diff at the last review, and `new`, its diff now: the hunks of
-    `new` that make a change `old` doesn't and, after DROPPED, the hunks and files of `old` that `new` no
-    longer has. Empty means the PR's own changes are the same, whatever a rebase moved around them."""
-    before, after = diff_files(old), diff_files(new)
-    dropped = not_in(before, after)
-    return "".join(not_in(after, before) + ([DROPPED] + dropped if dropped else []))
+    """What differs between `old`, a PR's diff at the last review, and `new`, its diff now: each file that
+    differs, compared with line numbers stripped, as `new` has it and, after DROPPED, as `old` had it;
+    files only on one side appear on that side. Empty means the PR's own changes are the same, whatever
+    a rebase moved around them. Coarse by design: a re-review after a rebase can read a whole file's
+    patch when only part of it changed."""
+    before, after = file_patches(old), file_patches(new)
+    changed = [f for f in after if patch_key(after[f]) != patch_key(before.get(f, []))]
+    dropped = [f for f in before if patch_key(before[f]) != patch_key(after.get(f, []))]
+    text = "".join(line for f in changed for line in after[f])
+    return text + (DROPPED + "".join(line for f in dropped for line in before[f]) if dropped else "")
 
 
 def collect(out, repo, pr, head_sha, mode, prev=""):
@@ -431,8 +397,8 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
 
     # A re-review starts from this bot's last summary and reviews only what changed since
     # (review-prompt.md, "Re-review"): the commits since, when that commit is still an ancestor of the
-    # head and none of them is a merge (since.diff, since-commits.txt), and otherwise the interdiff, the
-    # PR's own hunks whose changes differ from its diff then and what it dropped (interdiff.diff), so a
+    # head and none of them is a merge (since.diff, since-commits.txt), and otherwise the interdiff, each
+    # file whose patch differs from its patch then, new and old (interdiff.diff), so a
     # merge of main or a force-push isn't read as the author's change. read_state says when it reviews the
     # whole PR again instead. The state is read only from the bot's own summaries: comments that start
     # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
