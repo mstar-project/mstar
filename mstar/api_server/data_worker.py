@@ -113,6 +113,18 @@ def pooled_output(modality: str, loop_indices: NestedLoopIndices | None) -> bool
     return modality in ARTIFACT_MODALITIES and not streamed
 
 
+def text_tokens(modality: str, tensor: torch.Tensor) -> int:
+    """The token ids an output tensor carries to the client, as ``token_ids``
+    lists them. A float text tensor (Whisper's word alignment) carries none."""
+    return tensor.numel() if modality == "text" and not tensor.is_floating_point() else 0
+
+
+def prompt_tokens(tensors: NameToTensorList) -> int:
+    """The ids in the ``text_inputs`` that ``process_prompt`` returned: the
+    prompt's tokens, but not the positions its media take."""
+    return sum(text_tokens("text", t) for t in tensors.get("text_inputs", ()) if torch.is_tensor(t))
+
+
 def _sha256(path: str) -> bytes:
     with open(path, "rb") as file:
         return hashlib.file_digest(file, "sha256").digest()
@@ -984,6 +996,7 @@ class PreprocessWorkerThread:
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
         tensors, input_metadata, model_kwargs = prepared
+        num_prompt_tokens = prompt_tokens(tensors)
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1013,6 +1026,7 @@ class PreprocessWorkerThread:
                 model_kwargs=conductor_kwargs,
                 client_request_id=input.client_request_id,
                 input_open=bool(self._client_edges - input.ends),
+                prompt_tokens=num_prompt_tokens,
             ),
         )
         self.communicator.send("conductor", msg)
@@ -1558,6 +1572,7 @@ class PreprocessWorkerThread:
             datas = None
         share = (time.perf_counter() - start) / len(rids) if start is not None and rids else 0.0
         postprocess_s = share
+        num_tokens = 1 if item.modality == "text" else 0
         states = self.request_output_state
         for i, request_id in enumerate(rids):
             state = states.get(request_id)
@@ -1583,7 +1598,7 @@ class PreprocessWorkerThread:
                     sequence,
                     ResultChunk(
                         request_id=request_id, modality=item.modality, data=data, metadata=metadata,
-                        postprocess_s=postprocess_s,
+                        postprocess_s=postprocess_s, num_tokens=num_tokens,
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1714,6 +1729,7 @@ class PreprocessWorkerThread:
                 metadata=chunk_metadata,
                 read_time=read_time,
                 postprocess_s=postprocess_s,
+                num_tokens=text_tokens(modality, tensor),
             ),
         )
         if self.enable_nvtx:

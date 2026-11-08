@@ -60,6 +60,8 @@ pub struct SubmitArgs {
     pub model_kwargs: Map<String, Value>,
     /// A chat's parts, in order; empty on every other path.
     pub parts: Vec<Part>,
+    /// End the result stream with a `usage` chunk (set by the chat handler).
+    pub report_usage: bool,
 }
 
 impl Default for SubmitArgs {
@@ -67,6 +69,7 @@ impl Default for SubmitArgs {
         Self {
             text: None,
             tokens: None,
+            report_usage: false,
             file_paths: BTreeMap::new(),
             input_modalities: Vec::new(),
             output_modalities: vec!["text".to_string()],
@@ -422,6 +425,7 @@ impl Adapter {
                 }
                 Ok(SubmitArgs {
                     tokens: None,
+                    report_usage: false,
                     text,
                     file_paths,
                     input_modalities: in_mods,
@@ -458,6 +462,7 @@ impl Adapter {
                 forward_sent_speed(&mut mk, req);
                 Ok(SubmitArgs {
                     tokens: None,
+                    report_usage: false,
                     text: Some(req.input.clone()),
                     file_paths: BTreeMap::new(),
                     input_modalities: vec!["text".to_string()],
@@ -495,6 +500,7 @@ impl Adapter {
                 }
                 Ok(SubmitArgs {
                     tokens: None,
+                    report_usage: false,
                     text: Some(req.input.clone()),
                     file_paths: BTreeMap::new(),
                     input_modalities: vec!["text".to_string()],
@@ -519,6 +525,7 @@ impl Adapter {
                 }
                 Ok(SubmitArgs {
                     tokens: None,
+                    report_usage: false,
                     text: Some(req.prompt.clone()),
                     file_paths: BTreeMap::new(),
                     input_modalities: vec!["text".to_string()],
@@ -537,6 +544,7 @@ impl Adapter {
                 }
                 Ok(SubmitArgs {
                     tokens: None,
+                    report_usage: false,
                     text: Some(req.prompt.clone()),
                     file_paths: BTreeMap::new(),
                     input_modalities: vec!["text".to_string()],
@@ -587,6 +595,7 @@ impl Adapter {
                         file_paths.insert("image".to_string(), vec![path]);
                         Ok(SubmitArgs {
                             tokens: None,
+                            report_usage: false,
                             text: Some(req.prompt.clone()),
                             file_paths,
                             input_modalities: vec!["image".to_string(), "text".to_string()],
@@ -601,6 +610,7 @@ impl Adapter {
                         file_paths.insert("video".to_string(), vec![path]);
                         Ok(SubmitArgs {
                             tokens: None,
+                            report_usage: false,
                             text: Some(req.prompt.clone()),
                             file_paths,
                             input_modalities: vec!["video".to_string(), "text".to_string()],
@@ -611,6 +621,7 @@ impl Adapter {
                     }
                     (None, None) => Ok(SubmitArgs {
                         tokens: None,
+                        report_usage: false,
                         text: Some(req.prompt.clone()),
                         file_paths: BTreeMap::new(),
                         input_modalities: vec!["text".to_string()],
@@ -642,6 +653,7 @@ impl Adapter {
                 file_paths.insert("image".to_string(), vec![image_path.to_string()]);
                 Ok(SubmitArgs {
                     tokens: None,
+                    report_usage: false,
                     text: Some(prompt.to_string()),
                     file_paths,
                     input_modalities: vec!["image".to_string(), "text".to_string()],
@@ -684,6 +696,7 @@ fn text_chat(
     );
     Ok(SubmitArgs {
         tokens: None,
+        report_usage: false,
         text,
         file_paths,
         input_modalities: in_mods,

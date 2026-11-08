@@ -9,7 +9,7 @@ protocol are untouched):
 
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
-                          prompt_parts, streaming, accepts_chunks}
+                          prompt_parts, streaming, accepts_chunks, report_usage}
                        | {t:"abort", rid, sub}
                        | {t:"ping", rid, sub}
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
@@ -33,6 +33,10 @@ rather than one per request. Only a submit that sets ``accepts_chunks`` gets
 them, so a frontend binary older than this bridge still gets ``chunk``s. A
 submission's error chunk, and anything its handler finds unrelayed at the
 end, always goes out as ``chunk``.
+
+A submit that sets ``report_usage`` (a chat) gets a last ``chunk`` of
+modality ``usage`` before ``done``: its token counts and finish reason in
+``metadata`` (``APIServer.submit_request``'s ``report_usage``).
 
 ``sub`` names one submission and is never reused. A client may resubmit its
 ``rid`` as soon as it drops a stream, and that stream's ``done`` or late
@@ -242,6 +246,7 @@ class RustFrontendBridge:
                 prompt_parts=[PromptPart(**p) for p in parts] if parts else None,
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
+                report_usage=bool(msg.get("report_usage")),
             )
         except (ValueError, TypeError) as e:
             # a refused input: an in-band error chunk carries its 400 to the client
