@@ -1,3 +1,4 @@
+import math
 import socket
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -55,6 +56,11 @@ def _all_to_all_single(
 ) -> torch.Tensor:
     dist.all_to_all_single(recv, send, recv_splits, send_splits, group=group)
     return recv
+
+
+def _with_extent(shape: Sequence[int], dim: int, n: int) -> tuple[int, ...]:
+    """``shape`` with ``dim`` at extent ``n``."""
+    return (*shape[:dim], n, *shape[dim + 1:])
 
 
 # torch 2.13 renamed the into-tensor collectives to the *_single scheme.
@@ -282,10 +288,6 @@ class CommGroup:
         dist.broadcast(tensor, self.group_members[src], self._device_pg())
         return tensor
 
-    # Eager as a whole, the boundary where the per-rank sizes become the collective's host split
-    # lists: traced, its branches on them would compile per sequence length, and a traced variant
-    # that kept them symbolic measured no faster on Cosmos3 SP.
-    @torch.compiler.disable
     def all_to_all(
         self,
         input_: torch.Tensor | Sequence[torch.Tensor],
@@ -309,77 +311,54 @@ class CommGroup:
         group size); when ``None`` the respective dimension is split evenly
         (and ``scatter_dim`` must then be divisible by ``world_size``).
 
-        ``input_`` may be several tensors that differ only in the extent of
-        ``scatter_dim``, split evenly (q, k and v with their own head counts):
-        they go in one exchange and come back as a tuple. Each exchange is one
-        ``all_to_all_single`` over a buffer packed in a single copy, which
-        replays from a CUDA graph. It runs outside torch.compile, so a compiled
-        caller breaks around this call.
+        ``input_`` may be several tensors that differ only in the extent of an
+        evenly split ``scatter_dim`` (q, k and v with their own head counts):
+        they go in one exchange and come back as a tuple.
+
+        Each exchange is one ``all_to_all_single``, which replays from a CUDA
+        graph. A tensor goes out with ``scatter_dim`` leading, so every rank's
+        piece is one run of it, and the uneven extents are the collective's
+        split sizes: nothing pads, and nothing branches on the sizes, so a
+        compiled caller keeps them symbolic, compiles once for every sequence
+        length and fuses the copies around the collective, which alone runs
+        outside the graph.
         """
         tensors = (input_,) if isinstance(input_, torch.Tensor) else tuple(input_)
         if self.world_size == 1:
             return input_ if isinstance(input_, torch.Tensor) else tensors
         world_size = self.world_size
-        # positive dims: unflatten below adds a dim, which would shift a negative one
-        scatter_dim %= tensors[0].dim()
-        gather_dim %= tensors[0].dim()
-        if scatter_sizes is not None and len(set(scatter_sizes)) > 1:
-            assert len(tensors) == 1, "all_to_all: several tensors need an even scatter"
-            out = self._all_to_all_uneven_scatter(tensors[0], scatter_dim, gather_dim, scatter_sizes, gather_sizes)
-            return out if isinstance(input_, torch.Tensor) else (out,)
-        # per tensor [.., N, ..] -> [P, .., N/P, ..]; rank r's block of the send buffer holds
-        # its piece of each tensor one after another, so each tensor unpacks contiguous
-        blocks = [x.unflatten(scatter_dim, (world_size, -1)).movedim(scatter_dim, 0) for x in tensors]
-        numels = [blk[0].numel() for blk in blocks]
-        send = blocks[0].new_empty(world_size, sum(numels))
-        for blk, piece in zip(blocks, send.split(numels, dim=1), strict=True):
-            piece.view(blk.shape).copy_(blk)
-        if gather_sizes is None or len(set(gather_sizes)) == 1:
-            # the block received from rank r has this rank's own block's layout
-            recv = _all_to_all_single(self._device_pg(), send, torch.empty_like(send))
-            outs = [
-                piece.view(blk.shape).movedim(0, gather_dim).flatten(gather_dim, gather_dim + 1)
-                for blk, piece in zip(blocks, recv.split(numels, dim=1), strict=True)
-            ]
+        dims = (scatter_dim % tensors[0].dim(), gather_dim % tensors[0].dim())
+        xs = [x.movedim(dims, (0, 1)) for x in tensors]  # [scattered, gathered, ..]
+        mine = xs[0].size(1)
+        if scatter_sizes is None:
+            # rank r's row of the send buffer holds its piece of each tensor one after another
+            pieces = [x.unflatten(0, (world_size, -1)) for x in xs]
+            numels = [piece[0].numel() for piece in pieces]
+            send = xs[0].new_empty(world_size, sum(numels))
+            for piece, row in zip(pieces, send.split(numels, dim=1), strict=True):
+                row.view(piece.shape).copy_(piece)
+            send_splits = None
+            shapes = [piece.shape[1:] for piece in pieces]
         else:
-            # rank r's block: each tensor's piece with the gathered dim at rank r's extent
-            shapes = [
-                [blk.shape[1:gather_dim + 1] + (n,) + blk.shape[gather_dim + 2:] for blk in blocks]
-                for n in gather_sizes
-            ]
-            rank_numels = [[int(torch.Size(shape).numel()) for shape in row] for row in shapes]
-            recv = _all_to_all_single(
-                self._device_pg(), send.flatten(), send.new_empty(sum(map(sum, rank_numels))),
-                [sum(row) for row in rank_numels], [sum(numels)] * world_size,
-            )
-            per_rank = [
-                [piece.view(shape) for piece, shape in zip(block.split(row), shape_row, strict=True)]
-                for block, row, shape_row in zip(recv.split([sum(row) for row in rank_numels]), rank_numels, shapes,
-                                                 strict=True)
-            ]
-            outs = [torch.cat([pieces[i] for pieces in per_rank], dim=gather_dim) for i in range(len(tensors))]
-        return outs[0] if isinstance(input_, torch.Tensor) else tuple(outs)
-
-    def _all_to_all_uneven_scatter(
-        self, input_: torch.Tensor, scatter_dim: int, gather_dim: int,
-        scatter_sizes: list[int], gather_sizes: list[int] | None,
-    ) -> torch.Tensor:
-        chunks = input_.split(scatter_sizes, dim=scatter_dim)
-        send = torch.cat([chunk.contiguous().flatten() for chunk in chunks])
-        mine = list(chunks[self.rank].shape)
-        if gather_sizes is None:
-            gather_sizes = [mine[gather_dim]] * self.world_size
-        shapes = [mine[:gather_dim] + [n] + mine[gather_dim + 1:] for n in gather_sizes]
-        numels = [int(torch.Size(shape).numel()) for shape in shapes]
+            assert len(xs) == 1, "all_to_all: several tensors need an even scatter"
+            send = xs[0]
+            send_splits = [n * send[0].numel() for n in scatter_sizes]
+            shapes = [_with_extent(send.shape, 0, scatter_sizes[self.rank])]
+        # from rank r, this rank's piece of each tensor at rank r's gathered extent
+        gathered = [mine] * world_size if gather_sizes is None else gather_sizes
+        per_row = [math.prod(_with_extent(shape, 1, 1)) for shape in shapes]
+        recv_splits = [n * sum(per_row) for n in gathered]
         recv = _all_to_all_single(
-            self._device_pg(), send, input_.new_empty(sum(numels)),
-            numels, [chunk.numel() for chunk in chunks],
+            self._device_pg(), send.reshape(-1), send.new_empty(sum(recv_splits)),
+            None if gather_sizes is None else recv_splits, send_splits,
         )
-        pieces = [
-            piece.view(shape)
-            for piece, shape in zip(recv.split(numels), shapes, strict=True)
+        blocks = [
+            [piece.view(_with_extent(shape, 1, n)).movedim((0, 1), dims)
+             for piece, shape in zip(block.split([n * k for k in per_row]), shapes, strict=True)]
+            for block, n in zip(recv.split(recv_splits), gathered, strict=True)
         ]
-        return torch.cat(pieces, dim=gather_dim)
+        outs = [torch.cat(per_rank, dim=dims[1]) for per_rank in zip(*blocks, strict=True)]
+        return outs[0] if isinstance(input_, torch.Tensor) else tuple(outs)
 
 
 @dataclass

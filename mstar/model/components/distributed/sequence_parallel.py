@@ -24,7 +24,6 @@ that split once per forward for a ``[B, L, H, D]`` DiT stream.
 """
 from __future__ import annotations
 
-import functools
 from typing import Callable, NamedTuple
 
 import torch
@@ -71,10 +70,8 @@ def gather_sequence(
     if world_size == 1:
         return x_shard
     dim %= x_shard.dim()  # positive: unflatten below adds a dim, which would shift a negative one
-    max_sz = functools.reduce(torch.sym_max, seq_sizes)
-    shape = list(x_shard.shape)
-    shape[dim] = max_sz
-    local = x_shard.new_empty(shape)
+    max_sz = max(seq_sizes)
+    local = x_shard.new_empty((*x_shard.shape[:dim], max_sz, *x_shard.shape[dim + 1:]))
     local.narrow(dim, 0, x_shard.size(dim)).copy_(x_shard)
     chunks = sp_group.all_gather(local, dim=dim).unflatten(dim, (world_size, max_sz)).unbind(dim)
     return torch.cat([chunk.narrow(dim, 0, n) for chunk, n in zip(chunks, seq_sizes, strict=True)], dim=dim)
