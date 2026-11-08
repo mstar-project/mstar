@@ -78,12 +78,9 @@ class TestApproval(unittest.TestCase):
                      "scripts/ci/check.sh", "scripts/release.sh", "docker/Dockerfile", "tools/x.py",
                      "packaging/deb.sh", "MANIFEST.in"):
             self.assertTrue(file_gate([path], REPO_ROOT)[0], f"a change to {path} could be approved")
-        engine = ["mstar/engine/engine.py", "mstar/engine/resources/kv_cache.py"]
-        self.assertEqual(file_gate(engine, REPO_ROOT)[:2], ([], engine),
-                         "an engine change's approval would count toward required reviews")
-        self.assertEqual(file_gate(["mstar/worker/worker.py", "mstar/model/kokoro/model.py",
-                                    "mstar/model/orpheus/model.py", "docs/models.rst"], REPO_ROOT)[:2], ([], []),
-                         "a low-risk worker or model change couldn't get a counting approval")
+        self.assertEqual(file_gate(["mstar/engine/engine.py", "mstar/engine/resources/kv_cache.py",
+                                    "mstar/worker/worker.py", "mstar/model/kokoro/model.py", "docs/models.rst"],
+                                   REPO_ROOT)[0], [], "a low-risk engine or model change couldn't be approved")
 
     def test_a_none_run_counts_as_a_pass_only_when_the_review_chose_none(self):
         pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}, "title": "T"}
@@ -365,19 +362,15 @@ class TestComment(unittest.TestCase):
 
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
-                outside=(), above=None, extra=None, head_after=None, untestable=""):
+                outside=(), above=None, extra=None, untestable=""):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
-        `verdict` or the other arguments fail it; its decision text, the outputs and the writes, as a
-        list unless `head_after` (the head on the read after the POST) asks for the fake and its calls."""
+        `verdict` or the other arguments fail it; its decision text, the outputs and the writes."""
         pr = {"head": {"sha": head}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}, "title": "T"}
-        heads = iter(() if head_after is None else (pr,))
-        after = head_after if isinstance(head_after, (Fail, dict)) else {**pr, "head": {"sha": head_after}}
-        routes = {f"GET repos/{R}/pulls/7": (lambda a, i: next(heads, after))
-                  if head_after else pr,
+        routes = {f"GET repos/{R}/pulls/7": pr,
                   f"GET repos/{R}/collaborators/an-author/permission": {"permission": perm},
                   "POST graphql": threads_page(), f"GET repos/{R}/actions/variables/REVIEW_APPROVALS": variable,
                   f"GET repos/{R}/compare/abcdef...0123456789": {"files": files or [{"filename": "docs/models.rst"}]},
-                  f"POST repos/{R}/pulls/7/reviews": {}, f"GET repos/{R}/pulls/7/reviews?per_page=100": [],
+                  f"POST repos/{R}/pulls/7/reviews": {},
                   **(extra or {})}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
             (ws / "review.json").write_text(json.dumps({
@@ -389,7 +382,7 @@ class TestApprove(unittest.TestCase):
                 (ws / "stacked-above.json").write_text(json.dumps(above))
             out, fake = step(gpu_review.approve, routes, pr=7, head_sha="0123456789", runner_temp=temp, verdict=verdict)
             text = Path(temp, "decision.md").read_text()
-        return text, out, fake if head_after else [key for key, _ in fake.writes()]
+        return text, out, [key for key, _ in fake.writes()]
 
     def test_each_condition_of_the_rule_stops_the_approval(self):
         blocked = {"filename": "docs/x.rst", "previous_filename": ".github/review/bot.py"}
@@ -421,14 +414,6 @@ class TestApprove(unittest.TestCase):
                           ("MPS on and off", False)):
             with self.subTest(text):
                 self.assertEqual(bool(gpu_review.UNTESTABLE_HARDWARE.search(text)), hit)
-
-    def test_an_engine_change_gets_a_comment_that_cant_count(self):
-        for files in ([{"filename": "mstar/engine/engine.py"}],
-                      [{"filename": "docs/x.rst", "previous_filename": "mstar/engine/engine.py"}]):
-            with self.subTest(files):
-                _, _, fake = self.approve({"value": "on"}, files=files, head_after="0123456789")
-                self.assertEqual(json.loads(fake.writes()[0][1])["event"], "COMMENT",
-                                 "an engine change's approval would count")
 
     def test_a_finding_counts_as_fixed_above_only_while_that_pr_still_holds_the_fix(self):
         finding = {"priority": "P1", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}

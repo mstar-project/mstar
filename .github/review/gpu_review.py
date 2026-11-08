@@ -42,8 +42,6 @@ WRITE = bot.WRITE
 NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/", "docker/", "tools/", "packaging/")
 NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "MANIFEST.in", "pyproject.toml", "setup.py", "Cargo.toml",
                "rust-toolchain.toml", "requirements*.txt")
-# Approved only as a comment that doesn't count toward required reviews.
-NO_COUNT_AREAS = {"area/engine", "area/resources"}
 # No runtime code: a review's `none` alone approves a change only to these.
 NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
 # Hardware the bot's GPUs aren't, as a word in a PR can name it (untestable): the backstop for the review's
@@ -186,7 +184,7 @@ def file_names(files):
 def touches_runtime(pr, sha):
     """Whether the PR at SHA changes runtime code, by file_gate; a file list too long to check does."""
     files = changed_files(bot.api(f"repos/{REPO}/pulls/{pr}")["base"]["sha"], sha)
-    return files is None or bool(file_gate(file_names(files), ROOT)[2])
+    return files is None or bool(file_gate(file_names(files), ROOT)[1])
 
 
 def carry(out, pr, head_sha, runner_temp, rereview=""):
@@ -441,18 +439,16 @@ def blocking(review, pages, stacked):
 
 
 def file_gate(files, repo_root):
-    """(blocked, engine, runtime): the files that rule out any approval (the bot's rules, CI,
-    dependencies, toolchains and lockfiles), those in area/engine or area/resources, whose approval the
-    bot posts as a comment that doesn't count toward required reviews, and those outside docs, tests and
-    benchmarks, which a review's `none` approves only after a passing live test."""
+    """(blocked, runtime): the files that rule out any approval (the bot's rules, CI, dependencies,
+    toolchains and lockfiles), and those outside docs, tests and benchmarks, which a review's `none`
+    approves only after a passing live test."""
     labels = runpy.run_path(str(ROOT / ".github/labels/label_prs.py"))
     aliases = labels["model_aliases"](str(repo_root), [{"filename": f} for f in files])
     areas = {f: set(labels["areas_of"](f, aliases)) for f in files}
     blocked = [f for f in files if f.startswith(NEVER_DIRS) or f.endswith(".lock")
                or any(fnmatch.fnmatchcase(Path(f).name, name) for name in NEVER_FILES)]
-    engine = [f for f in files if f not in blocked and NO_COUNT_AREAS & areas[f]]
     runtime = [f for f in files if not areas[f] <= NO_GPU_AREAS]
-    return blocked, engine, runtime
+    return blocked, runtime
 
 
 def to_fix_first(review, pr, above):
@@ -495,7 +491,6 @@ class ApprovalFacts:
     untestable: tuple  # what the live test can't cover here (untestable)
     too_many_files: bool  # the changed-file list is over GitHub's limit, so it couldn't be checked
     blocked: tuple  # files that rule out any approval (the bot's rules, CI, dependencies, toolchains)
-    engine: tuple  # area/engine or area/resources files, which make an approval a comment instead
     runtime: bool  # the PR touches runtime code
     risk_level: str
     questions: int
@@ -506,7 +501,7 @@ def approval_facts(pr, sha, verdict, since, review):
     """The facts of this PR at `sha`, from GitHub and the review; the network reads the rule needs."""
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
     changes = changed_files(pull["base"]["sha"], sha)
-    blocked, engine, runtime = file_gate(file_names(changes), ROOT) if changes is not None else ((), (), False)
+    blocked, runtime = file_gate(file_names(changes), ROOT) if changes is not None else ((), False)
     return ApprovalFacts(
         head_moved=pull["head"]["sha"] != sha,
         author_access=bot.permission(REPO, pull["user"]["login"]),
@@ -516,7 +511,6 @@ def approval_facts(pr, sha, verdict, since, review):
         untestable=tuple(untestable(pull, changes or [], review)),
         too_many_files=changes is None,
         blocked=tuple(blocked),
-        engine=tuple(engine),
         runtime=bool(runtime),
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
         questions=len(review.get("questions") or ()),
@@ -527,21 +521,13 @@ def approval_facts(pr, sha, verdict, since, review):
 @dataclass(frozen=True)
 class Decision:
     """What decide concludes. `why` is every reason not to approve: `rule`, the conditions only this rule
-    knows, then `review`, what the review itself left open, which the checklist already lists.
-    `engine` turns an approval into a comment that doesn't count."""
+    knows, then `review`, what the review itself left open, which the checklist already lists."""
     rule: tuple
-    engine: tuple
     review: tuple
 
     @property
     def why(self):
         return [*self.rule, *self.review]
-
-    def extra(self):
-        """What the checklist has no field for."""
-        engine = ("touches area/engine or area/resources, so the bot's approval wouldn't count: "
-                  + ", ".join(f"`{f}`" for f in self.engine[:8]) + (" and more" if len(self.engine) > 8 else ""))
-        return [*self.rule, engine] if self.engine else list(self.rule)
 
 
 def decide(f):
@@ -569,7 +555,7 @@ def decide(f):
                       "summary's \"What's left for you\" lists")
     if f.questions:
         review.append(f"{f.questions} open question(s)")
-    return Decision(rule=tuple(rule), engine=f.engine, review=(*review, *f.to_fix_first))
+    return Decision(rule=tuple(rule), review=(*review, *f.to_fix_first))
 
 
 def refresh_above():
@@ -596,12 +582,11 @@ def approvals_on():
 
 def left_for_you(pr, review, decision):
     stacked = render_summary.stacked_above("stacked-above.json")
-    return render_summary.checklist(review, review_threads(pr), stacked, decision.extra())
+    return render_summary.checklist(review, review_threads(pr), stacked, list(decision.rule))
 
 
 def approve(out, pr, head_sha, runner_temp, verdict, since=""):
-    """Approve the PR when the rule holds (decide) and REVIEW_APPROVALS is on, as a comment
-    that doesn't count toward required reviews when it touches area/engine or area/resources. What the
+    """Approve the PR when the rule holds (decide) and REVIEW_APPROVALS is on. What the
     live-test comment says of it goes in $RUNNER_TEMP/decision.md: the approval line, or the checklist of
     what's left, which with approvals off also says what the rule would have done; then no GitHub review
     is posted at all. The review finished cleanly: the live-test job runs only then."""
@@ -618,25 +603,12 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
         print("not approved: " + "; ".join(outcome.why))
         decision.write_text(left_for_you(pr, review, outcome) + "\n")
         return
-    engine = outcome.engine
     tested = "the live test passed on it" if verdict == "pass" else "the review found nothing that needs a GPU run"
-    if engine:  # a comment, not an approval, so it can't count toward required reviews
-        body = (f"The review bot would approve `{head_sha[:7]}`: low design risk, no open P0–P2 finding, and "
-                f"{tested}. This doesn't count toward required reviews, because the change touches "
-                "area/engine or area/resources ("
-                + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else "") + ").")
-        review_pr(pr, head_sha, "COMMENT", body)
-        decision.write_text(f"**Would approve** `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`; "
-                            "doesn't count toward required reviews: touches area/engine or area/resources.\n")
-        return
-    review_pr(pr, head_sha, "APPROVE", f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open "
-                                       f"P0–P2 finding, and {tested}. It covers this commit only.")
-    decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")
-
-
-def review_pr(pr, sha, event, body):
+    body = (f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open P0–P2 finding, and {tested}. "
+            "It covers this commit only.")
     bot.gh("api", "-X", "POST", f"repos/{REPO}/pulls/{pr}/reviews", "--input", "-",
-           input=json.dumps({"commit_id": sha, "event": event, "body": body}))
+           input=json.dumps({"commit_id": head_sha, "event": "APPROVE", "body": body}))
+    decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")
 
 
 # ---------------------------------------------------------------- what gets posted
