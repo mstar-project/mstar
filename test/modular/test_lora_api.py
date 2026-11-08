@@ -62,6 +62,7 @@ from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
 from mstar.model.base import KVLabel, PrefixKeys  # noqa: E402
 from mstar.testing_utils.model import make_model  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -72,7 +73,6 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.worker.worker import Worker  # noqa: E402
 
 BASE = "qwen3_5_0.8b"
 LORA_CONFIG = {"resources": {"lora": {"adapters": {"sql": "/a"}}}}
@@ -464,10 +464,11 @@ class _Deployment:
                 def broken(name, path):
                     raise OSError(f"{name}: cannot read /srv/secret on this rank")
                 pool.store._read = broken  # the worker's background read fails
-            w = self.workers[worker_id] = Worker.__new__(Worker)
-            w.worker_id = worker_id
-            w.engine_manager = SimpleNamespace(engine=SimpleNamespace(lora_pools=lambda p=pool: [p]))
-            w.communicator = SimpleNamespace(send=self._from_worker)
+            self.workers[worker_id] = make_worker(
+                worker_id=worker_id,
+                engine_manager=SimpleNamespace(engine=SimpleNamespace(lora_pools=lambda p=pool: [p])),
+                communicator=SimpleNamespace(send=self._from_worker),
+            )
 
     def _to_conductor(self, message: ConductorMessage):
         message = _wire(message)
