@@ -5,6 +5,7 @@ error path end to end without GPUs. Skipped unless the ``mstar_rust``
 extension is installed and the server binary is built
 (``cargo build --release`` in ``rust/server/``)."""
 import contextlib
+import dataclasses
 import json
 import socket
 import sysconfig
@@ -15,6 +16,7 @@ import types
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -230,12 +232,69 @@ def test_a_single_user_message_arrives_as_one_user_part(stack):
     ], "a one-message chat did not arrive as the one user turn it renders as"
 
 
-def test_generate_arrives_without_parts(stack):
-    """``/generate`` has no messages, so the model takes its legacy layout."""
-    port, stub, _bridge, _proc = stack
-    _generate(port, urlencoded=True)
-    (sub,) = stub.submitted
-    assert sub["parts"] is None, "a /generate submit carried chat parts"
+class _GeneratePython:
+    """What the Python ``/generate`` calls on ``APIServer``, recording the submit."""
+
+    def __init__(self, upload_dir):
+        self.upload_dir, self.submitted = Path(upload_dir), []
+
+    async def wait_for_request_id(self, request_id):
+        return None
+
+    def submit_request(self, **kwargs):
+        self.submitted.append(kwargs)
+        return kwargs["request_id"] or "rid"
+
+    async def collect_results(self, request_id, raw_request=None):
+        return [_Chunk("text", b"ok")]
+
+
+_GENERATE_FILES = [("a.png", b"\x89PNG-a"), ("b.wav", b"RIFF-b"), ("c.png", b"\x89PNG-c")]
+
+
+@pytest.mark.parametrize("fields,files", [
+    ({"text": "describe both"}, _GENERATE_FILES),
+    ({"text": "just text"}, []),
+    ({"text": "hi", "input_modalities": "image"}, _GENERATE_FILES[:1]),
+    ({"input_modalities": "text,image"}, _GENERATE_FILES[:1]),
+    ({"text": "", "input_modalities": "image,text"}, _GENERATE_FILES[:1]),
+    ({"text": "hi", "input_modalities": ""}, _GENERATE_FILES[:1]),
+], ids=["files-then-text", "text-only", "layout-without-text", "layout-text-no-text", "empty-text",
+        "empty-layout"])
+def test_generate_submits_the_layout_python_does(fields, files, tmp_path, monkeypatch):
+    """Ordered parts (each file, then the text), the modalities in that order
+    with repeats, and an explicit layout taken as given except that a text slot
+    is added for the text and dropped without it, as Python's ``/generate``."""
+    pytest.importorskip("fastapi")
+    import requests
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    form = {"output_modalities": "text", "streaming": "false", **fields}
+    uploads = [("files", (name, data)) for name, data in files]
+    python = _GeneratePython(tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", python)
+    reply = TestClient(entrypoint.app).post("/generate", data=form, files=uploads or None)
+    assert reply.status_code == 200, reply.text
+    (want,) = python.submitted
+
+    stub = _StubAPIServer()
+    with _model_stack("qwen3_omni", stub) as (port, _upload):
+        if uploads:
+            r = requests.post(f"http://127.0.0.1:{port}/generate", data=form, files=uploads, timeout=30)
+        else:
+            r = requests.post(f"http://127.0.0.1:{port}/generate", data=form, timeout=30)
+        assert r.status_code == 200, r.text
+        (sub,) = stub.submitted
+        got_files = {m: [Path(p).read_bytes() for p in ps] for m, ps in (sub["files"] or {}).items()}
+
+    want_files = {m: [Path(p).read_bytes() for p in ps] for m, ps in (want["file_paths"] or {}).items()}
+    assert sub["text"] == want["text"]
+    assert sub["in"] == want["input_modalities"]
+    parts = lambda ps: None if ps is None else [dataclasses.asdict(p) for p in ps]  # noqa: E731
+    assert parts(sub["parts"]) == parts(want["prompt_parts"])
+    assert got_files == want_files
 
 
 def _post_raw(port, path, raw_bytes, content_type="application/json", timeout=15):
@@ -1297,3 +1356,20 @@ def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkey
     monkeypatch.setattr(sysconfig, "get_path", lambda name: str(scripts))
     # Not a checkout's rust/, so the empty stand-ins are not run.
     assert find_server_binary(rust_dir=tmp_path) == str(scripts / "mstar-server")
+
+
+@pytest.mark.parametrize("ctype,body", [
+    ("application/json", b'{"text": "hi"}'),
+    ("text/plain", b"hi"),
+], ids=["json", "plain"])
+def test_generate_refuses_a_body_that_is_not_a_form_as_python_does(ctype, body, tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    monkeypatch.setattr(entrypoint, "api_server", _GeneratePython(tmp_path))
+    py = TestClient(entrypoint.app).post("/generate", content=body, headers={"Content-Type": ctype})
+    with _model_stack("qwen3_omni", _StubAPIServer()) as (port, _upload):
+        status, got = _post_raw(port, "/generate", body, content_type=ctype)
+    assert (status, got) == (py.status_code, py.json()) and status == 400

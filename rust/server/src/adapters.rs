@@ -41,7 +41,8 @@ pub struct Part {
     pub text: Option<String>,
     /// The position within its own modality's attachments.
     pub index: usize,
-    pub role: String,
+    /// The chat role of the message it came from; `None` from `/generate`.
+    pub role: Option<String>,
 }
 
 /// The arguments the bridge submits to the conductor (mirrors mstar's
@@ -174,7 +175,7 @@ fn add_file(
         modality,
         text: None,
         index: paths.len(),
-        role: "user".to_string(),
+        role: Some("user".to_string()),
     });
     paths.push(path);
 }
@@ -185,7 +186,7 @@ fn add_text(parts: &mut Vec<Part>, text: &str, role: &str) {
     // the boundary between them), so only text an attachment or a role change
     // separates gets its own part.
     if let Some(last) = parts.last_mut() {
-        if last.modality == "text" && last.role == role {
+        if last.modality == "text" && last.role.as_deref() == Some(role) {
             let merged = last.text.get_or_insert_with(String::new);
             merged.push('\n');
             merged.push_str(text);
@@ -196,7 +197,7 @@ fn add_text(parts: &mut Vec<Part>, text: &str, role: &str) {
         modality: "text".to_string(),
         text: Some(text.to_string()),
         index: 0,
-        role: role.to_string(),
+        role: Some(role.to_string()),
     });
 }
 
@@ -789,7 +790,7 @@ mod tests {
     fn described(parts: &[Part]) -> Vec<(&str, &str, Option<&str>, usize)> {
         parts
             .iter()
-            .map(|p| (p.modality.as_str(), p.role.as_str(), p.text.as_deref(), p.index))
+            .map(|p| (p.modality.as_str(), p.role.as_deref().unwrap_or(""), p.text.as_deref(), p.index))
             .collect()
     }
 

@@ -57,7 +57,7 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use adapters::{Adapter, SubmitArgs};
+use adapters::{Adapter, Part, SubmitArgs};
 use bridge::{Bridge, ResultChunk};
 use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
@@ -1171,6 +1171,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
     let mut mk_raw: Option<String> = None;
     let mut request_id: Option<String> = None;
     let mut uploads = SavedUploads::new(&st.upload_dir);
+    let mut parts: Vec<Part> = Vec::new();
 
     // The FastAPI endpoint this replaces uses `Form(...)` fields, which
     // Starlette parses from EITHER `multipart/form-data` (with file uploads)
@@ -1184,7 +1185,20 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         .unwrap_or("")
         .to_string();
 
-    if content_type.starts_with("application/x-www-form-urlencoded") {
+    // Every field is a form field, as in Python: another body (JSON, say) would
+    // parse as an empty form and be submitted as an empty request.
+    let base_type = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if !base_type.is_empty()
+        && base_type != "multipart/form-data"
+        && base_type != "application/x-www-form-urlencoded"
+    {
+        return detail_error(
+            400,
+            &format!("/generate takes multipart/form-data or urlencoded fields, not {content_type}"),
+        );
+    }
+    // Starlette reads a body with no content type as an empty form.
+    if base_type != "multipart/form-data" {
         // No file uploads on this path (files force multipart), matching how
         // these clients already behave.
         // Bounded here: `DefaultBodyLimit` binds only the extractors, and this
@@ -1214,7 +1228,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         }
         return generate_finish(
             st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
-            request_id, uploads,
+            request_id, uploads, Vec::new(),
         )
         .await;
     }
@@ -1273,11 +1287,9 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
             if let Err(e) = blocking(move || std::fs::write(&path, &bytes)).await {
                 return detail_error(500, &e.to_string());
             }
-            uploads
-                .paths
-                .entry(modality.to_string())
-                .or_default()
-                .push(save_path.to_string_lossy().into_owned());
+            let paths = uploads.paths.entry(modality.to_string()).or_default();
+            parts.push(Part { modality: modality.to_string(), text: None, index: paths.len(), role: None });
+            paths.push(save_path.to_string_lossy().into_owned());
         } else {
             // Propagate a field read failure (body-limit overrun, mid-upload
             // disconnect, non-UTF-8) as a 400 rather than silently treating it
@@ -1310,7 +1322,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
 
     generate_finish(
         st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
-        request_id, uploads,
+        request_id, uploads, parts,
     )
     .await
 }
@@ -1353,9 +1365,13 @@ async fn generate_finish(
     mk_raw: Option<String>,
     request_id: Option<String>,
     uploads: SavedUploads,
+    mut parts: Vec<Part>,
 ) -> Response {
-    // An empty id means none, as the Python /generate's form parsing reads it.
+    // An empty field means none, as the Python /generate's form parsing reads
+    // its optional fields.
     let request_id = request_id.filter(|id| !id.is_empty());
+    text = text.filter(|t| !t.is_empty());
+    let in_mods_raw = in_mods_raw.filter(|m| !m.is_empty());
     if let Err(msg) = request_id.as_deref().map_or(Ok(()), check_request_id) {
         // `uploads` drops unkept here, which deletes the saved files.
         return detail_error(400, &msg);
@@ -1366,20 +1382,34 @@ async fn generate_finish(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
+    // The prompt in request order: each file, then the text, as Python's
+    // /generate lays it out.
+    let has_text = text.is_some();
+    if has_text {
+        parts.push(Part { modality: "text".to_string(), text: text.clone(), index: 0, role: None });
+    }
     let input_modalities: Vec<String> = match in_mods_raw {
-        Some(raw) => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => {
-            let mut m: Vec<String> = uploads.paths.keys().cloned().collect();
-            if text.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
+        // An explicit list is then the layout on its own, so the derived
+        // parts go rather than disagree with it.
+        Some(raw) => {
+            parts.clear();
+            let mut m: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            // A layout without a text slot would drop the prompt, and a text
+            // slot with no text renders to nothing.
+            if has_text && !m.iter().any(|x| x == "text") {
                 m.push("text".to_string());
+            }
+            if !has_text {
+                m.retain(|x| x != "text");
             }
             m
         }
+        None => parts.iter().map(|p| p.modality.clone()).collect(),
     };
     if let Some(message) = video_frame_refusal(&input_modalities, &output_modalities, streaming) {
         return detail_error(400, message);
@@ -1387,8 +1417,10 @@ async fn generate_finish(
     let model_kwargs: Map<String, Value> = match mk_raw {
         Some(raw) if !raw.is_empty() => match serde_json::from_str::<Value>(&raw) {
             Ok(Value::Object(m)) => m,
+            // `null` is no kwargs, as `json.loads` gives None
+            Ok(Value::Null) => Map::new(),
             Ok(_) => return detail_error(400, "model_kwargs must be a JSON object"),
-            Err(e) => return detail_error(400, &format!("model_kwargs JSON: {e}")),
+            Err(_) => return detail_error(400, "model_kwargs must be valid JSON"),
         },
         _ => Map::new(),
     };
@@ -1404,6 +1436,7 @@ async fn generate_finish(
         };
         tokens = Some(tok.encode(text.as_deref().unwrap_or("")));
         text = None; // the model side must use the ids, not re-tokenize
+        parts.clear();
     }
 
     let args = SubmitArgs {
@@ -1413,7 +1446,7 @@ async fn generate_finish(
         input_modalities,
         output_modalities,
         model_kwargs,
-        parts: Vec::new(),
+        parts,
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);
@@ -1539,6 +1572,7 @@ mod tests {
             tok: None,
             bridge,
             refusals: Arc::new(refusals::Refusals::default()),
+            voices: None,
         }
     }
 
@@ -1702,7 +1736,7 @@ mod tests {
         uploads.paths = file_paths;
         let resp = generate_finish(
             st, Some("hi".into()), input.map(str::to_string), output.into(), streaming,
-            false, None, None, uploads,
+            false, None, None, uploads, Vec::new(),
         )
         .await;
         let (status, _, data) = body(resp).await;
@@ -1815,7 +1849,7 @@ mod tests {
         let long_id = "a".repeat(MAX_REQUEST_ID_LEN + 1);
         for (field, value, detail) in [
             ("model_kwargs", "[1]", "model_kwargs must be a JSON object"),
-            ("model_kwargs", "{", "model_kwargs JSON: EOF while parsing an object at line 1 column 1"),
+            ("model_kwargs", "{", "model_kwargs must be valid JSON"),
             ("tokenize", "true", "tokenize=true requires the server to be started with MSTAR_TOKENIZER"),
             ("input_modalities", "video_frame", "'video_frame' is an output-only modality"),
             ("request_id", "a/b", "request_id must be at most 128 characters from [A-Za-z0-9._:-]"),
