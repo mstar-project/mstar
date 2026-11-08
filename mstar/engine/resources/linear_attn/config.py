@@ -64,6 +64,20 @@ class LinearAttnSpec(NodeResourceSpec):
     def combined_splits(self) -> tuple[CombinedSplit, ...]:
         return self.config.splits
 
+    def verify_refusal(self, draft) -> str | None:
+        # GDN reruns a verify step's kept tokens from the slot, which the forward leaves as it was
+        # (`GDNManager.settle_verify_step`)
+        if self.config.variant is not LinearAttnVariant.GDN:
+            return f"undoing a verify step's rejected tokens is implemented for GDN, not {self.config.variant.value}"
+        if self.config.splits:
+            return "mixed prompt-plus-verify steps are not supported yet: declare no splits on a verifying node"
+        return None
+
+    def async_verify_refusal(self, draft) -> str | None:
+        # a resident verify step replays the rerun its capture recorded, from the slots the pool's
+        # tables gather
+        return None
+
     @property
     def writes_prefix_snapshots(self) -> bool:
         # only the GDN wrapper writes state checkpoints into the pool's snapshot slots

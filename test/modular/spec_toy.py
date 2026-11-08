@@ -18,6 +18,8 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.draft.config import DraftConfig
 from mstar.engine.resources.draft.drafter import (
+    DRAFT_CARRY,
+    CarrySpec,
     ChunkBoundary,
     DrafterNeeds,
     DraftInputs,
@@ -25,7 +27,7 @@ from mstar.engine.resources.draft.drafter import (
 )
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
-from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sampler.config import LoopbackState, SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.model.base import KVLabel, PrefixKeys
 from mstar.model.submodule_base import (
@@ -86,8 +88,39 @@ class _Drafter:
         return torch.stack(drafts, dim=1)
 
 
+class _CarryDrafter(_Drafter):
+    """The oracle, reading the sum of its row's KV tokens off its carry (the
+    engine's `DRAFT_CARRY`) instead of the cache: the prompt's last prefill
+    stores the prompt's sum, and each ``observe`` adds the tokens the step kept."""
+
+    def __init__(self, k: int):
+        super().__init__(k)
+        self.needs = DrafterNeeds(chunk_boundary=ChunkBoundary.NONE, carry=CarrySpec(1, torch.float32))
+        self._sums = None
+
+    def propose(self, inputs: DraftInputs) -> torch.Tensor:
+        n, k = inputs.input_ids.shape[0], self.k
+        position = inputs.resources["rope"].pos_ids("main").view(n, k + 1)[:, 0]
+        # what the KV held before the step, then the step's input token
+        self._sums = inputs.carry[:, 0].round().long()
+        kv_sum, token, drafts = self._sums + inputs.input_ids, inputs.input_ids, []
+        for j in range(k):
+            token = next_token(token, position + j, kv_sum)
+            kv_sum = kv_sum + token
+            drafts.append(token)
+        return torch.stack(drafts, dim=1)
+
+    def observe(self, block: torch.Tensor, result) -> torch.Tensor:
+        kept = torch.arange(block.shape[1])[None, :] <= result.accepted[:, None]
+        return (self._sums + (block * kept).sum(1)).float()[:, None]
+
+
 def oracle(k):
     return _Drafter(k)
+
+
+def carry_oracle(k):
+    return _CarryDrafter(k)
 
 
 def always_wrong(k):
@@ -153,6 +186,7 @@ class ToyLM(ARNodeSubmodule):
     def declare_step(self, graph_walk, request_ids, inputs, **kwargs):
         segments = tuple(Segment(rid, "main", inp.input_seq_len) for rid, inp in zip(request_ids, inputs, strict=True))
         one = tuple(Segment(rid, "main", 1) for rid in request_ids)
+        # the engine adds the drafter's carry to the sampler step (`drafter_step`)
         return SubmoduleStep(
             steps={
                 "kv": KVStep(segments=segments), "rope": PositionStep(segments=segments),
@@ -193,6 +227,11 @@ class ToyLM(ARNodeSubmodule):
             ends = torch.tensor([v.to_compute for v in _views(kv)]).cumsum(0) - 1
             # main's sampler draws on an accelerator only; the prompt step is greedy here
             tokens = logits[ends].argmax(-1)
+            if self.drafter.needs.carry is not None and not getattr(self, "skip_prefill_carry", False):
+                # each prompt's token sum, which its first verify step drafts from
+                starts = torch.cat([torch.zeros(1, dtype=torch.long), ends[:-1] + 1])
+                sums = torch.stack([ids[s: e + 1].sum() for s, e in zip(starts.tolist(), ends.tolist(), strict=True)])
+                engine_inputs.store_draft_carry(sums.float()[:, None])
             return BatchedModelOutput(
                 per_rid_outputs={rid: {"new_token": [tokens[i: i + 1]]} for i, rid in enumerate(rids)},
             )
@@ -246,14 +285,16 @@ class ToyModel:
         raise AttributeError(name)
 
 
-def specs(k: int, max_num_pages: int = 256):
+def specs(k: int, max_num_pages: int = 256, carry: CarrySpec | None = None):
+    state = {} if carry is None else {DRAFT_CARRY: LoopbackState(carry.width, carry.dtype, (0.0,) * carry.width)}
     return [
         KVSpec("kv", {NODE}, draft_slack=2 * (k + 1), config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, head_dim=HEAD_DIM, max_seq_len=256 + 2 * (k + 1),
             max_num_pages=max_num_pages, page_size=PAGE, prefix_cache_salt="toy",
         )),
         PositionSpec("rope", {NODE}, PositionConfig(kv_cache="kv")),
-        SamplerSpec("sampler", {NODE}, vocab_size=VOCAB, enable_repetion_penalty=False, verifies=True),
+        SamplerSpec("sampler", {NODE}, vocab_size=VOCAB, enable_repetion_penalty=False, verifies=True,
+                    loopback_state=state),
     ]
 
 
@@ -261,7 +302,7 @@ def engine(k: int, drafter_factory=oracle, mode: str = "synchronous") -> Engine:
     sub = ToyLM(k, drafter_factory)
     eng = Engine(graph_runtime=None)
     eng.load_model(
-        {NODE: sub}, specs(k), WorkerParallelGroups(num_workers=1, global_rank=0),
+        {NODE: sub}, specs(k, carry=sub.drafter.needs.carry), WorkerParallelGroups(num_workers=1, global_rank=0),
         torch.device("cpu"), transfer_engine_info=None, kv_cache_type=torch.float32,
         model=ToyModel(k, mode, sub.token_stop, sub.drafter.needs),
     )

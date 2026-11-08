@@ -852,6 +852,17 @@ class ModelInputsFromEngine:
             sampler, self.request_ids, input_ids, target, drafter, self.resources, self.resident,
         )
 
+    @torch.compiler.disable
+    def store_draft_carry(self, carry: torch.Tensor) -> None:
+        """A prompt step's drafter carry, ``[rows, width]``, row i request i: the
+        state the request's first verify step drafts from (a drafter that
+        declares ``DrafterNeeds.carry``). Kept for the rows the step's sampler
+        step keeps (a prompt's last prefill) when it lists `DRAFT_CARRY` in
+        its ``loopback_writes``."""
+        from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+
+        self._verifying_sampler().store_loopback_state(DRAFT_CARRY, self.request_ids, carry)
+
     @property
     @torch.compiler.disable
     def single_request_info(self):

@@ -546,6 +546,8 @@ def test_a_verify_step_whose_stream_rows_span_less_than_the_block_is_refused():
     short = [Segment(1, "main", 4), Segment(2, "main", 1)]
     with pytest.raises(RuntimeError, match="k \\+ 1 = 4"):
         draft.refuse_step(SubmoduleStep(steps={"kv": KVStep(), "rope": PositionStep()}, segments=short))
+
+
 def test_the_engine_adds_a_drafters_own_steps_to_its_prompt_and_verify_steps():
     """`drafter_step`, from `engine_step`: a drafter's resource steps (`VerifyNode.prefill_steps` / `verify_steps`)
     join the node's prompt and verify steps, fresh each step, and a target that declares one itself is refused."""
@@ -568,6 +570,124 @@ def test_the_engine_adds_a_drafters_own_steps_to_its_prompt_and_verify_steps():
     sub.declare_step = doubled
     with pytest.raises(RuntimeError, match="its drafter's steps, which the engine adds"):
         engine_step(sub, **kwargs)
+
+
+def test_a_drafter_drafts_from_its_carry_which_the_prompt_and_each_observe_store():
+    """A drafter whose state crosses steps declares a carry; the engine keeps it
+    in the sampler's loop-back rows (`DRAFT_CARRY`): the prompt's last prefill
+    stores it, each verify step reads it before ``propose`` and stores what
+    ``observe`` returns. Drafted from a correct carry, every draft is accepted."""
+    from spec_toy import carry_oracle
+
+    k = 3
+    eng = engine(k, carry_oracle)
+    out, accepted = _decode_with_accepted(eng, k)
+    for rid, prompt in PROMPTS.items():
+        assert out[rid] == reference(prompt, 24)
+    assert set(accepted) == {k}, accepted
+
+
+def test_without_the_prompts_carry_the_first_step_drafts_wrong_and_output_holds():
+    from spec_toy import carry_oracle
+
+    k = 3
+    eng = engine(k, carry_oracle)
+    eng._submodules[NODE].submodule.skip_prefill_carry = True
+    out, accepted = _decode_with_accepted(eng, k)
+    for rid, prompt in PROMPTS.items():
+        assert out[rid] == reference(prompt, 24)
+    # every step drafts from a sum short of the prompt's (a running sum carries the error): nothing is
+    # accepted, and the verify alone keeps the output exact
+    assert set(accepted) == {0}, accepted
+
+
+def test_the_engine_stores_the_carry_through_prompt_and_verify_steps_that_declare_none():
+    """The carry is the drafter's: the toy's steps list no loop-back writes, and the engine adds
+    `DRAFT_CARRY` to the sampler step of its prompt and verify steps (`drafter_step`)."""
+    from spec_toy import carry_oracle
+
+    from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+    from mstar.model.submodule_base import ARNodeInputs, engine_step
+
+    sub = engine(3, carry_oracle)._submodules[NODE].submodule
+    for walk, span in (("prefill", 2), ("decode", 4)):
+        kwargs = dict(graph_walk=walk, request_ids=[1], inputs=[ARNodeInputs(input_seq_len=span)])
+        assert sub.declare_step(**kwargs).steps["sampler"].loopback_writes == frozenset()
+        assert engine_step(sub, **kwargs).steps["sampler"].loopback_writes == {DRAFT_CARRY}
+
+
+def test_a_drafter_that_reads_the_targets_hidden_states_observes_what_the_target_returned():
+    """``DrafterNeeds.target_hidden``: a verify step's target returns ``(logits, hidden)``, and ``observe`` gets that
+    hidden."""
+    from spec_toy import _CarryDrafter
+
+    class ReadsHidden(_CarryDrafter):
+        def __init__(self, k):
+            super().__init__(k)
+            self.needs = self.needs._replace(target_hidden=True)
+            self.seen = []
+
+        def observe(self, block, result, hidden):
+            self.seen.append(hidden)
+            return super().observe(block, result)
+
+    k = 3
+    eng = engine(k, ReadsHidden)
+    sub = eng._submodules[NODE].submodule
+    target, returned = sub._target, []
+
+    def with_hidden(engine_inputs, ids):
+        logits = target(engine_inputs, ids)
+        if engine_inputs.step.ctx.graph_walk != "decode":
+            return logits
+        returned.append(logits.clone())
+        return logits, returned[-1]
+
+    sub._target = with_hidden
+    out, _ = _decode_with_accepted(eng, k)
+    for rid, prompt in PROMPTS.items():
+        assert out[rid] == reference(prompt, 24)
+    assert returned and all(a is b for a, b in zip(sub.drafter.seen, returned, strict=True))
+
+
+def _decode_with_accepted(eng, k):
+    driver = Driver(eng)
+    for rid, prompt in PROMPTS.items():
+        driver.add(rid, prompt, 24)
+    accepted = []
+    real = eng.cut_verify_step
+
+    def cut(batch, outputs, host):
+        accepted.extend(host.buffers["verify_accepted"].tolist()[: len(host.request_ids)])
+        return real(batch, outputs, host)
+
+    eng.cut_verify_step = cut
+    driver.run(list(PROMPTS))
+    return driver.out, accepted
+
+
+@pytest.mark.parametrize("ingraph", [True, False])
+def test_the_loopback_masters_a_captured_carry_reads_are_never_replaced(ingraph):
+    """With the in-graph scatter, a loop-back state's master is allocated once
+    at the in-graph rows, as offset and last_token are: registrations past the
+    capture's batch size leave the tensor a captured graph holds in place.
+    Without it the master grows (a new tensor), which is why a carrying drafter
+    is refused there."""
+    from mstar.engine.resources.sampler.config import LoopbackState
+    from mstar.engine.resources.sampler.utils import SamplerBuffers
+
+    bufs = SamplerBuffers.allocate(
+        max_batch_size=4, device=torch.device("cpu"), ingraph_scatter=ingraph, slots=64,
+        loopback_state={"draft_carry": LoopbackState(2, torch.float32, (0.0, 0.0))},
+    )
+    master = bufs.loopback["draft_carry"].master
+    for rid in range(10):
+        bufs.register_request(rid)
+    bufs.loopback_for("draft_carry", list(range(10)))
+    same = bufs.loopback["draft_carry"].master is master
+    assert same is ingraph
+    if ingraph:
+        assert master.shape[0] == 65
 
 
 def test_a_drafter_still_unbound_at_load_is_refused():
@@ -618,3 +738,101 @@ def test_a_verify_row_declaring_another_span_fails_before_admit(monkeypatch, cap
     assert batch.verify_seq is None
 
 
+def test_a_carrying_drafter_is_refused_where_the_loopback_masters_grow(monkeypatch):
+    from spec_toy import carry_oracle
+
+    monkeypatch.setenv("MSTAR_SAMPLER_INGRAPH_SCATTER", "0")
+    with pytest.raises(RuntimeError, match="loop-back rows, which grow"):
+        engine(3, carry_oracle)
+
+
+def _two_rank_node(monkeypatch, rank):
+    """The toy's node in a fake lockstep instance of two ranks, its pool with a KV head a rank; the load's one vote
+    passes through."""
+    import spec_toy
+
+    from mstar.distributed.communication import CommGroup, JointGroups, WorkerParallelGroups
+
+    real_specs = spec_toy.specs
+
+    def a_head_a_rank(*args, **kwargs):
+        kv, *rest = real_specs(*args, **kwargs)
+        return [dataclasses.replace(kv, config=dataclasses.replace(kv.config, num_kv_heads=2, num_qo_heads=2)), *rest]
+
+    monkeypatch.setattr(spec_toy, "specs", a_head_a_rank)
+    group = CommGroup(rank, rank, [0, 1])
+    joint = JointGroups(tp_group=group, sp_group=CommGroup.trivial(), instance=group)
+    monkeypatch.setattr(JointGroups, "agree", lambda self, values, op=None: values)
+    monkeypatch.setattr(WorkerParallelGroups, "get_joint_group_for_node", lambda self, node: joint)
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+def test_a_carrying_drafter_is_refused_above_one_rank(monkeypatch, rank):
+    """On every rank of the instance: above one rank the masters grow, whatever a rank's environment says."""
+    from spec_toy import carry_oracle
+
+    _two_rank_node(monkeypatch, rank)
+    with pytest.raises(RuntimeError, match="not yet under TP"):
+        engine(3, carry_oracle)
+
+
+def test_a_carry_survives_many_requests_a_recycled_handle_and_an_offload(monkeypatch):
+    """The carry oracle drafts the target's tokens only from a right carry, so
+    every draft is accepted exactly when each row's carry is its own: ten
+    requests (past the sampler buffers' eight), then the same handles again
+    for new prompts, one of them offloaded mid-decode (the KV offload stubbed:
+    its length is recorded, its pages stay)."""
+    from spec_toy import carry_oracle
+
+    snapshots: dict[int, int] = {}
+    _stub_offload(monkeypatch, snapshots)
+    k = 3
+    eng = engine(k, carry_oracle)
+    accepted: dict[int, list[int]] = {}
+    real = eng.cut_verify_step
+
+    def cut(batch, outputs, host):
+        counts = host.buffers["verify_accepted"].tolist()
+        for i, rid in enumerate(host.request_ids):
+            accepted.setdefault(rid, []).append(counts[i])
+        return real(batch, outputs, host)
+
+    eng.cut_verify_step = cut
+    first = {rid: [rid % 7 + 1, rid % 5 + 2, rid % 3 + 3] for rid in range(1, 11)}
+    driver = Driver(eng)
+    for rid, prompt in first.items():
+        driver.add(rid, prompt, 20)
+    driver.run(list(first))
+    assert all(driver.out[rid] == reference(prompt, 20) for rid, prompt in first.items())
+    # every request's verify steps but its last (cut by the budget) accept every draft
+    assert all(set(counts[:-1]) <= {k} for counts in accepted.values()), accepted
+    accepted.clear()
+    again = {rid: [rid % 4 + 9, 11, rid % 6 + 1, 2] for rid in range(1, 5)}
+    for rid, prompt in again.items():
+        driver.add(rid, prompt, 20)
+    driver.step(list(again))
+    assert eng.offload_request(NODE, 2) > 0
+    driver.run(list(again))
+    for rid, prompt in again.items():
+        assert driver.out[rid] == reference(prompt, 20)
+    # the recycled handles too, before and after the offload (its KV is stubbed: lengths, not pages)
+    assert all(set(counts[:-1]) <= {k} for counts in accepted.values()), accepted
+
+
+def test_a_prompt_step_with_no_sampler_step_to_store_the_carry_through_is_refused():
+    """The prompt step stores a request's first carry: without one, every first verify step
+    would draft from a default row."""
+    from spec_toy import carry_oracle
+
+    from mstar.model.submodule_base import ARNodeInputs, engine_step
+
+    sub = engine(3, carry_oracle)._submodules[NODE].submodule
+    real = sub.declare_step
+
+    def no_sampler(*args, **kwargs):
+        step = real(*args, **kwargs)
+        return dataclasses.replace(step, steps={k: v for k, v in step.steps.items() if k != "sampler"})
+
+    sub.declare_step = no_sampler
+    with pytest.raises(RuntimeError, match="'prefill' step declares no 'sampler' step"):
+        engine_step(sub, graph_walk="prefill", request_ids=[1], inputs=[ARNodeInputs(input_seq_len=2)])

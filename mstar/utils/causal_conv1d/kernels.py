@@ -842,6 +842,7 @@ def _causal_conv1d_update_kernel(
     HAS_NULL_BLOCK: tl.constexpr,
     BLOCK_N: tl.constexpr,
     launch_pdl: tl.constexpr,
+    UPDATE_STATE: tl.constexpr,
 ):
     if launch_pdl:
         tl.extra.cuda.gdc_wait()
@@ -942,57 +943,59 @@ def _causal_conv1d_update_kernel(
 
     # STEP 2: assume state_len > seqlen
     idx_tokens = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
-
-    # With speculative decoding, the conv_state updates works in a sliding
-    # window manner, at each forward pass, the tokens are shift by 1, so we
-    # load since idx_tokens + 1.
-    conv_state_ptrs_source = (
-        conv_state_ptr
-        + (conv_states_input_coord * stride_conv_state_seq)
-        + conv_state_token_offset * stride_conv_state_tok
-        + (idx_feats * stride_conv_state_dim)[None, :]
-        + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
-            :, None
-        ]
-    )  # [BLOCK_M, BLOCK_N]
-    mask = (
-        (conv_states_input_coord < num_cache_lines)
-        & ((idx_tokens + seqlen) < state_len)[:, None]
-        & (idx_feats < dim)[None, :]
-    )
-    conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
-
-    VAL = state_len - seqlen
     x_base = x_ptr + x_offset + (idx_feats * stride_x_dim)  # [BLOCK_N]
 
-    x_ptrs = (
-        x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
-    )  # [BLOCK_M, BLOCK_N]
+    # Off for a caller that keeps the window as it was (a verify step's forward, which settles it
+    # once the kept tokens are known); the outputs read only col0.. and x either way.
+    if UPDATE_STATE:
+        # With speculative decoding, the conv_state updates works in a sliding
+        # window manner, at each forward pass, the tokens are shift by 1, so we
+        # load since idx_tokens + 1.
+        conv_state_ptrs_source = (
+            conv_state_ptr
+            + (conv_states_input_coord * stride_conv_state_seq)
+            + conv_state_token_offset * stride_conv_state_tok
+            + (idx_feats * stride_conv_state_dim)[None, :]
+            + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
+                :, None
+            ]
+        )  # [BLOCK_M, BLOCK_N]
+        mask = (
+            (conv_states_input_coord < num_cache_lines)
+            & ((idx_tokens + seqlen) < state_len)[:, None]
+            & (idx_feats < dim)[None, :]
+        )
+        conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
 
-    mask_x = (
-        (idx_tokens - VAL >= 0)[:, None]
-        & (idx_tokens - VAL < seqlen)[:, None]
-        & (idx_feats < dim)[None, :]
-    )  # token-index  # token-index  # feature-index
-    loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-    tl.debug_barrier()
+        VAL = state_len - seqlen
+        x_ptrs = (
+            x_base[None, :] + ((idx_tokens - VAL) * stride_x_token)[:, None]
+        )  # [BLOCK_M, BLOCK_N]
 
-    new_conv_state = tl.where(mask, conv_state, loaded_x)
+        mask_x = (
+            (idx_tokens - VAL >= 0)[:, None]
+            & (idx_tokens - VAL < seqlen)[:, None]
+            & (idx_feats < dim)[None, :]
+        )  # token-index  # token-index  # feature-index
+        loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+        tl.debug_barrier()
 
-    # Get the state from the initial_state_idx
-    # cache_idx
-    conv_states_offset = tl.load(
-        conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
-    ).to(tl.int64)
-    conv_state_ptrs_target = (
-        conv_state_ptr
-        + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
-        + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [BLOCK_N,]
-        idx_tokens * stride_conv_state_tok
-    )[:, None]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+        new_conv_state = tl.where(mask, conv_state, loaded_x)
+
+        # Get the state from the initial_state_idx
+        # cache_idx
+        conv_states_offset = tl.load(
+            conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
+        ).to(tl.int64)
+        conv_state_ptrs_target = (
+            conv_state_ptr
+            + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
+            + (idx_feats * stride_conv_state_dim)
+        )[None, :] + (  # [BLOCK_N,]
+            idx_tokens * stride_conv_state_tok
+        )[:, None]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
@@ -1146,6 +1149,7 @@ def causal_conv1d_update(
     initial_state_idx: torch.Tensor | None = None,
     validate_data=False,
     out: torch.Tensor | None = None,
+    update_state: bool = True,
 ):
     """
     x: Input tensor which can take the following shapes:
@@ -1185,6 +1189,7 @@ def causal_conv1d_update(
             indices 0 and 3
     out: optional output tensor with the same shape as `x`. When omitted,
         the input is overwritten.
+    update_state: False leaves ``conv_state`` as it was (the outputs are the same).
     """
     if validate_data:
         assert null_block_id is not None
@@ -1311,6 +1316,7 @@ def causal_conv1d_update(
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=256,
         launch_pdl=_supports_pdl(),
+        UPDATE_STATE=update_state,
     )
     if unsqueeze:
         out = out.squeeze(-1)

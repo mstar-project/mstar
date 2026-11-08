@@ -3,8 +3,10 @@ makes for a verify step.
 
 A verify step runs the target over ``k + 1`` rows a request: the last emitted
 token, which has no KV yet, then ``k`` drafts. The engine fixes the order
-(`draft_verify_step`): draft, agree on rank 0's drafts, run the target, verify
-in the sampler, let a stateful drafter observe, and record what the step's
+(`draft_verify_step`): draft (from the row's carry, for a drafter that declares
+one), agree on rank 0's drafts, run the target, verify in the sampler, let each
+resource with state the block overwrote settle it (``settle_verify_step``), let a
+stateful drafter observe and keep its new carry, and record what the step's
 resources correct themselves from. A model holds the declaration, the target
 function and the drafter's weights, and no state across steps.
 """
@@ -29,6 +31,10 @@ VERIFY_TOKENS = "verify_tokens"
 VERIFY_ACCEPTED = "verify_accepted"
 # the host column the token cut adds to them: whether a row's emitted run ended the reply
 VERIFY_STOPPED = "verify_stopped"
+# The sampler loop-back state (``SamplerSpec.loopback_state``) a drafter's carry lives
+# in: a row per request, held from admission to removal, which the engine reads before
+# ``propose`` and writes from ``observe`` (and a prompt's last prefill writes first)
+DRAFT_CARRY = "draft_carry"
 # A drafter module's first KV pool layer until the engine binds it from the pool's layer set
 # (`KVManager.layer_set`): the engine refuses a verifying node whose drafter is still unbound
 # (`Drafter.kv_layers_unbound`).
@@ -41,6 +47,14 @@ class ChunkBoundary(Enum):
     UNDECLARED = "undeclared"
     # its state at row ``p`` depends only on the target at ``p`` (DSpark)
     NONE = "none"
+
+
+class CarrySpec(NamedTuple):
+    """Per-request drafter state across steps (MTP's hidden vector): the
+    node's sampler keeps it as loop-back state `DRAFT_CARRY`, by request, from
+    admission to removal."""
+    width: int
+    dtype: torch.dtype
 
 
 class ModelGeometry(NamedTuple):
@@ -79,6 +93,10 @@ class DrafterNeeds(NamedTuple):
     # the layers it adds to the target's KV pool, which share its pages and length
     # (`drafter_resources` joins them)
     kv: KVLayerSet | None = None
+    carry: CarrySpec | None = None
+    # ``observe`` reads the target's last hidden state of every block row: the
+    # target function returns ``(logits, hidden)``
+    target_hidden: bool = False
     input_kinds: frozenset[str] = frozenset({"text"})
     chunk_boundary: ChunkBoundary = ChunkBoundary.UNDECLARED
     # KV slots it writes past the verify block, which no reservation covers
@@ -104,6 +122,9 @@ class DraftInputs(NamedTuple):
     # the engine resources of the node, for taps and the drafter's own attention
     resources: dict[str, Any]
     num_draft_tokens: int
+    # ``[n, width]``: each row's carry, as the last step's ``observe`` (or its
+    # prompt's last prefill) left it; None for a drafter that declares none
+    carry: torch.Tensor | None = None
 
 
 class DrafterDecl(Protocol):
@@ -117,8 +138,10 @@ class DrafterDecl(Protocol):
 
 def drafter_resources(specs: list[NodeResourceSpec], decl: DrafterDecl, nodes: set[str]) -> list[NodeResourceSpec]:
     """The node's resource specs with its drafter's: the resources it declares,
-    its layers joined to the target's KV pool (``needs.kv``)."""
+    its layers joined to the target's KV pool (``needs.kv``), and its carry
+    kept by the node's sampler as loop-back state `DRAFT_CARRY`."""
     from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+    from mstar.engine.resources.sampler.config import LoopbackState, SamplerSpec
 
     needs = decl.needs
     out = list(specs) + list(decl.node_resources(nodes))
@@ -129,7 +152,24 @@ def drafter_resources(specs: list[NodeResourceSpec], decl: DrafterDecl, nodes: s
         if not isinstance(pools[0].config, PagedKVConfig):
             raise ValueError(f"the drafter joins KV {needs.kv.kv_cache!r}, which is not a paged pool")
         pools[0].config.join(needs.kv)
+    kept = {}
+    if needs.carry is not None:
+        width, dtype = needs.carry
+        kept[DRAFT_CARRY] = LoopbackState(width, dtype, (0.0,) * width)
+    if kept:
+        samplers = [spec for spec in out if isinstance(spec, SamplerSpec) and spec.nodes & nodes]
+        if len(samplers) != 1:
+            raise ValueError(f"the drafter's carry is kept by the node's sampler; the node declares {len(samplers)}")
+        samplers[0].loopback_state = {**samplers[0].loopback_state, **kept}
     return out
+
+
+def carry_writes(needs: DrafterNeeds | None) -> frozenset[str]:
+    """The sampler loop-back state a node's verify steps and prompt steps store
+    for its drafter, which the engine adds to their SamplerStep's
+    ``loopback_writes`` (`drafter_step`): `DRAFT_CARRY` for a drafter that
+    carries state, nothing otherwise."""
+    return frozenset({DRAFT_CARRY}) if needs is not None and needs.carry is not None else frozenset()
 
 
 @runtime_checkable
@@ -143,10 +183,22 @@ class Drafter(Protocol):
         ...
 
 
-def _observe(drafter: Drafter, block: torch.Tensor, result: VerifyResult) -> None:
+@torch.compiler.disable
+def _read_carry(sampler, request_ids: Sequence[int], n: int, name: str = DRAFT_CARRY) -> torch.Tensor:
+    # the sampler's loop-back reads stay out of the compiled forward, as `sample` does
+    return sampler.loopback_state(name, request_ids)[:n]
+
+
+def _observe(
+    drafter: Drafter, block: torch.Tensor, result: VerifyResult, hidden: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """The drafter's ``observe``, if it has one; its return is the rows' new carry."""
     observe = getattr(drafter, "observe", None)
-    if observe is not None:
-        observe(block, result)
+    if observe is None:
+        return None
+    if drafter.needs.target_hidden:
+        return observe(block, result, hidden)
+    return observe(block, result)
 
 
 def draft_verify_step(
@@ -159,20 +211,37 @@ def draft_verify_step(
     resident: CapturedResidentStep | None = None,
 ) -> VerifyResult:
     """One verify step, in the engine's order. ``target`` maps the block's ids
-    ``[n * (k + 1)]`` to logits ``[n * (k + 1), V]``; ``sampler`` is the node's
-    verifying `SamplerResource`. Capturable: nothing here reads the device on
-    the host."""
+    ``[n * (k + 1)]`` to logits ``[n * (k + 1), V]``, or with the drafter's
+    ``needs.target_hidden`` to ``(logits, hidden)``; ``sampler`` is the node's
+    verifying `SamplerResource`, which also keeps a carrying drafter's
+    `DRAFT_CARRY`. Capturable: nothing here reads the device on the host."""
     k = sampler.verify_draft_tokens
     n = input_ids.shape[0]
-    drafts = drafter.propose(DraftInputs(request_ids, input_ids, resources, k))
+    needs = drafter.needs
+    carry = _read_carry(sampler, request_ids, n) if needs.carry is not None else None
+    drafts = drafter.propose(DraftInputs(request_ids, input_ids, resources, k, carry))
     if drafts.shape != (n, k):
         raise ValueError(f"drafter proposed {tuple(drafts.shape)} drafts for {n} rows of {k}")
     # every rank writes KV for rank 0's drafts
     drafts = sampler.agree(drafts.long())
     block = torch.cat([input_ids.reshape(n, 1).long(), drafts], dim=1)
-    logits = target(block.reshape(-1))
+    hidden = None
+    if needs.target_hidden:
+        logits, hidden = target(block.reshape(-1))
+    else:
+        logits = target(block.reshape(-1))
     result = sampler.verify(request_ids, logits.view(n, k + 1, -1), drafts)
-    _observe(drafter, block, result)
+    from mstar.engine.resources.base import Resource
+
+    for resource in resources.values():
+        # a resource whose state the block wrote in place (GDN's) corrects it here, in the graph
+        if type(resource).settle_verify_step is not Resource.settle_verify_step:
+            resource.settle_verify_step(result)
+    carry = _observe(drafter, block, result, hidden)
+    if needs.carry is not None:
+        if carry is None:
+            raise RuntimeError("a drafter that declares a carry returned none from observe")
+        sampler.store_loopback_state(DRAFT_CARRY, request_ids, carry)
     if resident is not None and resident.buffers.advance is not None:
         # the KV length cell advances by what the row keeps, in the graph
         resident.buffers.advance[:n].copy_(result.accepted + 1)

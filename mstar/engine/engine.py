@@ -773,6 +773,7 @@ class Engine:
         """Check a verifying node again against what was built, pick its mode,
         and bind what its verify steps read: the sampler's ``k``, the stop's
         verify walk, the ledger. Every rank of an instance picks the same."""
+        from mstar.engine.resources.draft.drafter import carry_writes
         from mstar.engine.resources.draft.node import DrafterShare, NodeDraft
         from mstar.engine.resources.draft.startup import log_mode, node_problems
 
@@ -793,11 +794,16 @@ class Engine:
         if problems:
             raise RuntimeError("speculative decoding: " + "; ".join(problems))
         # every step the engine declares for the node, capture's and each replay's, carries its drafter's share
-        submodule.drafter_share = DrafterShare(decl.walk, stop.prefill_walks, decl.prefill_steps, decl.verify_steps)
+        submodule.drafter_share = DrafterShare(
+            decl.walk, stop.prefill_walks, stop.sampler, carry_writes(decl.needs), carry_writes(decl.needs),
+            decl.prefill_steps, decl.verify_steps,
+        )
         mode, reason = self._agreed_mode(decl, mgmt, specs_by_key, async_scheduling)
         if stop.runtime_check:
             logger.info("speculative decoding on %s: the runtime stop check is off for walk %s", decl.node, decl.walk)
         sampler = mgmt.resources[stop.sampler]
+        if decl.needs.carry is not None:
+            self._check_carry_rows(decl, sampler, mgmt)
         submodule.token_stop = dataclasses.replace(stop, verify_walks=stop.verify_walks | {decl.walk})
         sampler.bind_verify(decl.config.num_draft_tokens, stop.buffer)
         try:
@@ -805,6 +811,12 @@ class Engine:
                 resource.bind_verify_walk(decl.walk, decl.config.block, decl.config.kv_slack)
         except RuntimeError as e:
             raise RuntimeError(f"speculative decoding on {decl.node}: {e}") from e
+        # once all are bound: a pool whose state nothing settles, say, is refused
+        unsettled = [
+            problem for resource in mgmt.resources.values() if (problem := resource.verify_problem()) is not None
+        ]
+        if unsettled:
+            raise RuntimeError(f"speculative decoding on {decl.node}: " + "; ".join(unsettled))
         draft = NodeDraft(
             decl, mode, reason, stop.sampler, submodule.token_stop, self._runner.take_back_keys(mgmt.resources),
         )
@@ -837,6 +849,29 @@ class Engine:
                     f"speculative decoding on {node_name}: asynchronous mode runs every verify step on a "
                     f"resident capture of walk {draft.walk!r}, and capture left none (dropped: {dropped}); "
                     "set model_kwargs.draft.mode: synchronous, or free memory for the verify buckets"
+                )
+
+    def _check_carry_rows(self, decl: "VerifyNode", sampler, mgmt: SubmoduleManagement) -> None:
+        """A captured verify step reads the drafter's carry off the sampler's
+        loop-back masters, which must then never be replaced: refused where they
+        grow (the in-graph scatter off, as above one rank). A recurrent pool
+        holding more requests than those rows only idles its extra slots."""
+        from mstar.utils.knobs import sampler_slots
+
+        if not sampler.fixed_loopback_masters:
+            raise RuntimeError(
+                f"speculative decoding on {decl.node}: its drafter's carry is read in the captured verify step "
+                "off the sampler's loop-back rows, which grow (and move) unless the in-graph scatter keeps them "
+                "fixed: MSTAR_SAMPLER_INGRAPH_SCATTER=1, device loop-back on, and one rank (not yet under TP)"
+            )
+        rows = sampler_slots()
+        for key, resource in mgmt.resources.items():
+            usable = getattr(getattr(resource, "config", None), "usable_slots", None)
+            if isinstance(usable, int) and usable > rows:
+                logger.warning(
+                    "speculative decoding on %s: %r holds %d requests, the sampler's carry rows %d "
+                    "(MSTAR_SAMPLER_SLOTS); requests past those wait while its slots idle",
+                    decl.node, key, usable, rows,
                 )
 
     def _agreed_mode(
