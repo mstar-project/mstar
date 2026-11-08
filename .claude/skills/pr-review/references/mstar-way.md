@@ -43,8 +43,9 @@ arrives as a second mechanism beside it.
 **Who decides whether it applies.** List what must be true for a step, request or node to use the
 capability, and give each condition to the part that owns the fact (a resource for its state and
 kernels, the graph for its shape, the deployment for placement). Each owner answers for itself with
-a safe default; the engine composes the answers, never a per-model opt-in flag or a list of model or
-walk names. Facts fixed at load are resolved once at load. When the capability can't apply, one
+a safe default; the engine composes the answers, not a flag it branches on per model when it could
+work the answer out itself, and not a list of model or walk names. A helper the engine provides and a
+model opts into is fine (AGENTS.md invariant 1). Facts fixed at load are resolved once at load. When the capability can't apply, one
 startup line names the part and the reason. A fact that changes what a step means travels in the
 step's own data, not as a side field every consumer must remember to apply.
 
@@ -102,7 +103,7 @@ For every mechanism a design or PR puts in the worker, engine, scheduler, conduc
 | Looks like | Is really |
 | --- | --- |
 | A node pushed back onto the ready queue for the same request, a per-request cursor or progress counter, outputs held until a final pass | a `Loop` built outside the graph runtime |
-| Telling the graph runtime not to speculate into or look at something, or rebuilding readiness by hand | structure the runtime can't see; put it in the graph |
+| Rebuilding readiness by hand, or a check at each step to keep the graph runtime away from something | structure the runtime can't see: put it in the graph, or hand the runtime the fact once at startup (telling it not to do something is fine) |
 | Input buffered in the API server or conductor, windows cut by the server, persistent "sessions", polling for more input | a streaming edge |
 | A per-request dict, tensor or cache in model, worker or engine code | a declared resource |
 | A new lifecycle state ("waiting", "paused", "abandoned", "partial") | readiness on an edge, or the existing abort and teardown paths |
@@ -110,7 +111,7 @@ For every mechanism a design or PR puts in the worker, engine, scheduler, conduc
 | A data-dependent loop inside `forward`, with a host sync | a graph `Loop` with `check_stop` and a resource |
 | A second copy of an existing lifecycle (a second cache or manager beside a near-identical one) | one primitive generic over the variants |
 | A hook every model must implement for a cross-cutting feature | the engine deriving the answer, or a declaration |
-| A per-model or per-walk opt-in for a capability, or a central check that names resource kinds | each owning part answering for itself, composed by the engine (§1b) |
+| A flag the engine branches on per model or per walk for something it could work out itself, or a central check that names resource kinds | each owning part answering for itself, composed by the engine (§1b); a helper a model opts into is fine (AGENTS.md invariant 1) |
 | A side field on the step that each consumer must remember to apply | the step's own data carrying the change, or one shared accessor |
 | A feature that needs special cases in several layers with no graph declaration | a feature at the wrong layer |
 | New calls between scheduler, speculation, admission, lockstep and step execution, or a method on `Worker` several of them reach into | a read-only table in the worker's layout plus a field on the batch |
