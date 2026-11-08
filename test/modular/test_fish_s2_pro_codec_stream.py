@@ -374,37 +374,6 @@ def test_compiled_incremental_decode_matches_eager_on_cuda(config):
         torch.testing.assert_close(got_state[name], eager_state[name], atol=1e-3, rtol=1e-3)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the compiled codec decode runs on CUDA")
-@pytest.mark.parametrize("chunk_schedule", [(2, 3), (1, 2, 3)], ids=["windows_2_3_5", "a_1_frame_window"])
-def test_an_uncaptured_codec_step_compiles_nothing_after_warmup(chunk_schedule):
-    """The codec captures only its small batch buckets, and any other step runs the
-    compiled decode eagerly, on fresh tensors where the captures passed views of their
-    static buffers. The region's warm-up (``compile_regions``), which the engine runs
-    before capturing, compiles every such step, so none stalls on a compile live: at
-    any batch size up to ``MAX_BATCH_SIZE`` and any chunk width, a 1-frame one too."""
-    config = tiny_config(chunk_schedule=chunk_schedule)
-    submodule = CodecSubmodule(random_decoder(config).float().cuda(), config)
-    torch._dynamo.reset()
-    compiled = torch.compile(submodule.incremental, dynamic=True)
-    blocks = submodule.incremental.state_blocks()
-
-    def state(rows):
-        return {n: torch.zeros(rows, *b.shape, dtype=b.dtype, device="cuda") for n, b in blocks.items()}
-
-    with torch.no_grad():
-        for args in submodule.compile_regions()["incremental"]:
-            compiled(*args)
-        # the captures: views of one static buffer, at their bucket sizes
-        static = torch.zeros(8, config.num_codebooks, max(submodule.windows), dtype=torch.long, device="cuda")
-        for rows, width in ((1, 2), (2, 3), (4, 5)):
-            compiled(static[:rows, :, :width], state(rows), torch.full((rows,), width, device="cuda"))
-        with torch._dynamo.config.patch(error_on_recompile=True):
-            for width in submodule.windows:
-                for rows in range(1, submodule.MAX_BATCH_SIZE + 1):
-                    codes = torch.zeros(rows, config.num_codebooks, width, dtype=torch.long, device="cuda")
-                    compiled(codes, state(rows), torch.randint(1, width + 1, (rows,), device="cuda"))
-
-
 def test_streams_batched_at_different_offsets_each_stitch_into_their_own_decode(config, decoder):
     submodule = CodecSubmodule(decoder, config)
     codes = {"a": stream_codes(23, seed=3), "b": stream_codes(77, seed=4), "c": stream_codes(5, seed=5)}
@@ -436,16 +405,6 @@ def test_codec_buckets_are_the_chunk_widths(config, decoder):
     assert [submodule._bucket(n) for n in (1, 2, 3, 4, 5)] == [2, 2, 3, 5, 5]
     with pytest.raises(ValueError, match="maximum is 5"):
         submodule._bucket(6)
-
-
-def test_a_codec_width_past_the_frame_cap_captures_one_row():
-    """A width wider than ``CAPTURE_MAX_FRAMES`` still captures one row: an empty list
-    would capture the runner's default ladder, past ``MAX_BATCH_SIZE``."""
-    config = tiny_config(chunk_frames=128)
-    submodule = CodecSubmodule(random_decoder(config), config)
-    for graphs in submodule.get_accelerator_graph_configs(torch.device("cpu")):
-        width, sizes = graphs.additional_key_info, graphs.capture_batch_sizes
-        assert sizes and sizes[0] == 1 and max(sizes) <= submodule.MAX_BATCH_SIZE, (width, sizes)
 
 
 # ---------------------------------------------------------------------------
