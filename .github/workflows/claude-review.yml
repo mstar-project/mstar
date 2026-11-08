@@ -403,6 +403,7 @@ jobs:
           # a thorough or gpu review does too unless the last one was thorough or gpu and skipped nothing.
           # The state is read only from the bot's own summaries: comments that start with the
           # summary's marker, in which model text can't open an HTML comment.
+          oneline='.commits[] | "\(.sha[0:10]) \(if (.parents | length) > 1 then "[merge] " else "" end)\(.commit.message | split("\n")[0])"'
           if [ -z "$PREV" ]; then
             jq -r '[.[] | select(.user == "mstar-review[bot]" or .user == "github-actions[bot]")
                     | select(.body | startswith("<!-- claude-review-summary -->"))] | last | .body // empty' \
@@ -411,13 +412,28 @@ jobs:
             # A diff GitHub won't give (too large, say) means a full review, never an empty since.diff.
             if [ -n "$last" ] && [ "$(gh api "repos/$REPO/compare/$last...$HEAD_SHA" --jq .status 2> /dev/null)" = "ahead" -o "$last" = "$HEAD_SHA" ] &&
               gh api -H "Accept: application/vnd.github.diff" "repos/$REPO/compare/$last...$HEAD_SHA" > since.diff; then
-              gh api --paginate "repos/$REPO/compare/$last...$HEAD_SHA" --jq '.commits[] |
-                "\(.sha[0:10]) \(if (.parents | length) > 1 then "[merge] " else "" end)\(.commit.message | split("\n")[0])"' \
-                > since-commits.txt || : > since-commits.txt
+              gh api --paginate "repos/$REPO/compare/$last...$HEAD_SHA" --jq "$oneline" > since-commits.txt \
+                || : > since-commits.txt
               echo "::notice::Re-review: this PR was last reviewed at ${last:0:10}."
               echo "rereview=true" >> "$GITHUB_OUTPUT"
             else
               rm -f last-review.json since.diff
+            fi
+          fi
+
+          # gpu mode: the commits since the PR's last live test, when it passed on an ancestor of the head,
+          # for the review's live-test call (review-prompt.md, Re-review step 4). Read as gpu_review.py
+          # carry reads it: the bot's own live-test comments, by their first line, the marker, alone.
+          # Without the list the review judges the whole PR.
+          if [ "$MODE" = gpu ]; then
+            live=$(jq -r --argjson bots "$bots" '[.[] | select(.user as $u | any($bots[]; . + "[bot]" == $u))
+                | (.body // "" | split("\n")[0] // "")
+                | capture("\\A<!-- claude-live-test sha=(?<sha>[0-9a-f]{40}) verdict=(?<verdict>[a-z]+) -->\\z")]
+                | last | select(.verdict == "pass") | .sha' pr-conversation.json)
+            if [ -n "$live" ] &&
+              [[ "$(gh api "repos/$REPO/compare/$live...$HEAD_SHA" --jq .status 2> /dev/null)" =~ ^(ahead|identical)$ ]]; then
+              gh api --paginate "repos/$REPO/compare/$live...$HEAD_SHA" --jq "$oneline" > since-live-test-commits.txt \
+                || rm -f since-live-test-commits.txt
             fi
           fi
 
