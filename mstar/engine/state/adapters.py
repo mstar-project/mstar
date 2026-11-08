@@ -38,7 +38,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state.analysis import position_key
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle, step_labels
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -119,6 +119,10 @@ def _kv_specs(array: Array, by_name: Mapping[str, Array]) -> list[NodeResourceSp
         raise _no_layout(array, "seq_sharded takes max_len 0, and a paged pool plans whole segments")
     if not array.reads:
         raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
+    joined = sorted(label for label in array.labels if "+" in label)
+    if joined:
+        raise ValueError(f"Array {array.name!r}.labels: {joined} hold a '+', which joins the labels of a step over "
+                         "several labels into the name of its plan")
     for key, read in array.reads.items():
         if not isinstance(read.op, Attend):
             raise _no_layout(array, f"reads[{key!r}].op must be Attend, the only read AttentionConfig runs")
@@ -495,9 +499,13 @@ def _array_steps(handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, 
                 steps[key] = LinearAttnStep(segments=segments)
         return
     if array.max_len:
+        ordered = segments or step.segments
+        # label-major, so a step over several labels starts and ends on different ones
+        labels = step_labels(ordered) if ordered[0].label != ordered[-1].label else ()
         steps[array.name] = KVStep(
             segments=segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
             sink=declared.placeholders, eager_write=declared.eager_add,
+            combined_labels={labels: "+".join(labels)} if labels else {},
         )
     for key, causal in handle.causal_reads.items():
         steps[key] = AttentionStep(segments=segments, causal=causal)

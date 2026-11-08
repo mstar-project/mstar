@@ -579,10 +579,11 @@ def test_a_step_on_an_undeclared_label_raises():
              lambda: _begin(h, segments=[Segment(1, "cfg", TOKENS)]))
 
 
-def test_a_step_on_two_labels_of_one_array_has_no_layout_yet():
+def test_a_step_over_two_labels_that_isnt_label_major_has_no_layout_yet():
     h = _kv_handle(_array(labels={"main", "cfg"}))
-    _refused(r"Array 'kv': no layout yet: a step touches labels \['cfg', 'main'\]",
-             lambda: _begin(h, segments=[Segment(1, "main", TOKENS), Segment(1, "cfg", TOKENS)]))
+    segments = [Segment(1, "main", TOKENS), Segment(1, "cfg", TOKENS), Segment(2, "main", TOKENS)]
+    _refused(r"Array 'kv': no layout yet: segments name 'main', 'cfg', 'main'",
+             lambda: _begin(h, segments=segments, ctx=_ctx(rows=(1, 2))))
 
 
 def test_a_fork_on_an_undeclared_label_raises():

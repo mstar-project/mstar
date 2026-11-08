@@ -193,6 +193,7 @@ SNAPSHOT = {
     "at_last_token": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["x", "POSITIONAL_OR_KEYWORD", None],
+        ["label", "KEYWORD_ONLY", 'None'],
     ],
     "causal_conv": [
         ["h", "POSITIONAL_OR_KEYWORD", None],

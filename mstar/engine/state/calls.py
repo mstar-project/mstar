@@ -4,12 +4,14 @@ A call that touches state runs behind a graph break, so it is plain Python in ea
 on a replay, and its checks live in it.
 """
 
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from itertools import groupby
 from typing import Any
 
 import torch
 
-from mstar.engine.resources.step import StepHandle
+from mstar.engine.resources.step import Segment, StepHandle
 from mstar.engine.state.contract import (
     EMPTY,
     FUSED_DRAW_MAX_VOCAB,
@@ -23,6 +25,11 @@ from mstar.engine.state.contract import (
     is_value,
 )
 from mstar.engine.state.host import HostFields, is_host_value
+
+
+def step_labels(segments: Sequence[Segment]) -> tuple[str, ...]:
+    """The labels ``segments`` name, in the order they first appear."""
+    return tuple(dict.fromkeys(segment.label for segment in segments))
 
 
 class ArrayHandle(StepHandle):
@@ -80,6 +87,7 @@ class ArrayHandle(StepHandle):
         # `_updated` the update calls run, and `_written` the fields each layer's write set. `_grows` says whether
         # `check_step` needs an add, for a step that lists a row on the pages at span above 0.
         self._open = False
+        self._segments: Sequence[Segment] = ()
         self._keep = True
         self._capturing = False
         self._grows = False
@@ -117,7 +125,10 @@ class ArrayHandle(StepHandle):
         declared: ArrayStep = step.state[self.name]
         segments = declared.segments or step.segments
         if segments:
-            self.label = segments[0].label
+            # the one plan `state_steps` names for a step over several labels
+            combined = getattr(step.steps.get(self.name), "combined_labels", None)
+            self.label = next(iter(combined.values())) if combined else segments[0].label
+        self._segments = segments or ()
         # on a replay too, whose `eager_add` adds still run
         self._keep = declared.keep
         self._capturing = step.ctx.capture
@@ -139,6 +150,10 @@ class ArrayHandle(StepHandle):
         queries = step.state[self.queried.name].segments or step.segments or ()
         if queries:
             self._query_label = queries[0].label
+        labels = step_labels(queries)
+        if len(labels) > 1:
+            raise self._no_layout(f"a step over labels {sorted(labels)} on {self.queried.name!r}, whose segments lay "
+                                  "out this read's queries")
         if [s.request_id for s in queries] != [s.request_id for s in segments or ()]:
             raise self._refusal(f"its segments and those of {self.queried.name!r}, which lay out its queries, must "
                                 "name the same requests in the same order, with one segment to one")
@@ -205,7 +220,16 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"a step touches labels {sorted(labels - declared_labels)}, and the array declares "
                                 f"{sorted(declared_labels)}")
         if len(labels) > 1:
-            raise self._no_layout(f"a step touches labels {sorted(labels)}, and a plan holds one per call")
+            if is_value(self.array):
+                raise self._no_layout(f"a step over labels {sorted(labels)} on a Value")
+            runs = [label for label, _ in groupby(segment.label for segment in segments)]
+            if len(runs) > len(labels):
+                raise self._no_layout(f"segments name {', '.join(map(repr, runs))}; a combined plan packs each label's "
+                                      "rows together, in the step's order")
+            twice = [stream for stream, n in Counter((s.request_id, s.label) for s in segments).items() if n > 1]
+            if twice:
+                raise self._refusal(f"row {twice[0][0]} has two segments on label {twice[0][1]!r} in one step, and a "
+                                    "combined plan holds one segment per row and label")
         forked = {label for fork in declared.forks for label in (fork.src, fork.dst)}
         if forked - declared_labels:
             raise self._refusal(f"a fork names labels {sorted(forked - declared_labels)}, and the array declares "
@@ -549,13 +573,28 @@ def drew(s: SamplerHandle, n: int) -> None:
 
 # Eager as a whole, as `AttentionManager.select_last_hidden` explains.
 @torch.compiler.disable
-def at_last_token(h: ArrayHandle, x: torch.Tensor) -> torch.Tensor:
-    """``x`` at each row's last token in this step, in row order."""
+def at_last_token(h: ArrayHandle, x: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
+    """``x`` at the last token of each (row, label) the step touches on ``h``, in segment order; with ``label``, only
+    that label's, in row order. On a step over one label both are each row's last token, in row order."""
     h._check_open("at_last_token")
     if h.queried is not None:
         raise h._refusal(f"at_last_token lays x out by this array's segments, and its read's queries are laid out by "
                          f"{h.queried.name!r}; call it on that array")
-    return h.first_read.select_last_hidden(x, label=h.label)
+    segments = h._segments
+    first, end = 0, len(segments)
+    if label is not None:
+        at = [i for i, segment in enumerate(segments) if segment.label == label]
+        if not at:
+            raise h._refusal(f"at_last_token on label {label!r}, and the step's segments name "
+                             f"{list(step_labels(segments))}")
+        first, end = at[0], at[-1] + 1
+    # A span-0 segment adds no token to the plan, which would select the previous segment's last one.
+    empty = next((segment for segment in segments[first:end] if not segment.span), None)
+    if empty is not None:
+        raise h._refusal(f"at_last_token on row {empty.request_id}, label {empty.label!r}, whose segment has span 0 "
+                         "and so no token in this step")
+    last = h.first_read.select_last_hidden(x, label=h.label)
+    return last if label is None else last[first:end]
 
 
 def last_sampled(s: SamplerHandle) -> torch.Tensor:
