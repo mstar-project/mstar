@@ -613,6 +613,16 @@ class TestHandoff(unittest.TestCase):
         self.assertEqual(fresh["runs"], 1, "a corrupt earlier handoff would stop this one being saved")
         self.assertEqual(self.handoff(None)[0], {"exit": "No Claude Code messages to hand off."})
 
+    def test_what_a_stopped_review_posts_is_inert(self):
+        partial = self.handoff([
+            assistant(call("c1", path="a.py", line=3, body="**[P2]** @org/team ![x](https://x.example/a.png)")),
+            {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "c1",
+                                                       "content": '{"comment_id": 1}'}]}},
+        ])[3]
+        self.assertIn("`a.py:3` **[P2]**", partial)
+        for markup in ("@org", "![", "]("):
+            self.assertNotIn(markup, partial, "the model's text would ping a team or load an image from the comment")
+
 
 class TestAfterTheReview(unittest.TestCase):
     def test_a_corrupt_or_missing_execution_file_still_records_usage(self):

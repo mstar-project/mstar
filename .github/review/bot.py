@@ -829,7 +829,7 @@ def handoff(out, pr, head_sha, mode, runner_temp, home, prev=""):
     saved.mkdir(parents=True, exist_ok=True)
     (saved / "handoff.json").write_text(redact(json.dumps({"pr": pr, "head_sha": head_sha, "mode": mode, **h})))
     (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode)))
-    Path("partial.md").write_text(redact(session.partial_md(h)))
+    Path("partial.md").write_text(render_summary.inert(redact(session.partial_md(h))))
     out["dir"] = str(saved)
 
 
