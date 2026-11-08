@@ -1104,8 +1104,8 @@ class Worker:
 
     def _engine_thread_pool(self, name: str) -> ThreadPool:
         """A one-thread pool for the GPU or plan thread, started here, before the loop: before torch
-        2.12 dynamo's config is process-wide, and an initializer that ran at the first step could
-        read and write the recompile limit while the other thread's compiled call patches it
+        2.12 dynamo's config is process-wide, and a plan thread whose initializer ran at its first
+        pre-plan could read and write the recompile limit while the GPU thread's compiled call patches it
         (``with_recompile_limit``). ``apply_dynamo_config`` never lowering the limit covers a limit
         raised before the pools start (a DiT's, at compile time), not that interleaving. A failed
         initializer also stops the worker here rather than failing every step."""
