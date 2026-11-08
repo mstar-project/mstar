@@ -360,10 +360,10 @@ def interdiff(old, new):
 def collect(out, repo, pr, head_sha, mode, prev=""):
     """The review's inputs, in the workspace: pr.diff, pr-body.md, pr-comments.json (with each thread's
     resolved and outdated state, and `mine` on the bot's own), pr-conversation.json, a re-review's
-    last-review.json with since.diff and since-commits.txt or interdiff.diff, stacked-above.json and
-    above-<n>.diff, and
-    open-issues.json; and the diff's length and the summary's schema as outputs. The PR's text and
-    comments are untrusted: they only ever reach files the prompt calls untrusted."""
+    last-review.json with since.diff and since-commits.txt or interdiff.diff (rereview_inputs),
+    stacked-above.json and above-<n>.diff, and open-issues.json; and the diff's length and the summary's
+    schema as outputs. The PR's text and comments are untrusted: they only ever reach files the prompt
+    calls untrusted."""
     if prev:
         shutil.copyfile(Path(prev, "handoff.md"), "handoff.md")
     pull = api(f"repos/{repo}/pulls/{pr}")
@@ -399,44 +399,55 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
                      "body": c.get("body")} for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
     write_json("pr-conversation.json", conversation)
 
-    # A re-review starts from this bot's last summary and reviews only what changed since
-    # (review-prompt.md, "Re-review"): the commits since, when that commit is still an ancestor of the
-    # head and none of them is a merge (since.diff, since-commits.txt), and otherwise the interdiff, each
-    # file whose patch differs from its patch then, new and old (interdiff.diff), so a
-    # merge of main or a force-push isn't read as the author's change. read_state says when it reviews the
-    # whole PR again instead. The state is read only from the bot's own summaries: comments that start
-    # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
-    # (too large, say) means a full review, never an empty since.diff.
     if not prev:
-        summary = last_summary(conversation)
-        state = summary and render_summary.read_state(summary)
-        last = (state or {}).get("head")
-        since = f"repos/{repo}/compare/{last}...{head_sha}"
-        status = ((read(api, since) or {}).get("status") or "") if last else ""
-        listing = None  # since-commits.txt, when the range can be read as the author's commits alone
-        if last and (status == "ahead" or last == head_sha):
-            pages = read(api, since, "--paginate", "--slurp")
-            commits = None if pages is None else [c for page in pages for c in page["commits"]]
-            listing = None if commits is None or any(len(c["parents"]) > 1 for c in commits) else oneline(commits)
-        r = None
-        if listing is not None:
-            r = gh("api", "-H", "Accept: application/vnd.github.diff", since, check=False)
-            if r.returncode == 0:
-                write("since.diff", r.stdout)
-                write("since-commits.txt", listing)
-        elif last:
-            # The PR's diff at that commit: from where it forked from the base branch.
-            r = gh("api", "-H", "Accept: application/vnd.github.diff",
-                   f"repos/{repo}/compare/{pull['base']['sha']}...{last}", check=False)
-            if r.returncode == 0:
-                write("interdiff.diff", interdiff(r.stdout, diff))
-        if r is not None and r.returncode == 0:
-            write("last-review.json", json.dumps(state) + "\n")
-            print(f"::notice::Re-review: this PR was last reviewed at {last[:10]}.")
-            out["rereview"] = "true"
+        rereview_inputs(out, repo, pull, head_sha, diff, conversation)
+    write_stacked_above(repo, pull, head_sha)
+    write_open_issues(repo)
+    out["lines"] = diff.count("\n")
+    # The summary's fields, from main, for --json-schema.
+    out["schema"] = json.dumps(render_summary.SCHEMA, separators=(",", ":"))
 
-    # A failed fetch leaves none of these files, so a finding said to be fixed above stays open, and
-    # the review still runs.
+
+def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
+    """A re-review starts from this bot's last summary and reviews only what changed since (review-prompt.md,
+    "Re-review"): the commits since, when that commit is still an ancestor of the head and none of them is
+    a merge (since.diff, since-commits.txt), and otherwise the interdiff, each file whose patch differs from
+    its patch then, new and old (interdiff.diff), so a merge of main or a force-push isn't read as the
+    author's change. read_state says when it reviews the whole PR again instead. The state is read only
+    from the bot's own summaries: comments that start with the summary's marker, in which model text can't
+    open an HTML comment. A diff GitHub won't give (too large, say) means a full review, never an empty
+    since.diff."""
+    summary = last_summary(conversation)
+    state = summary and render_summary.read_state(summary)
+    last = (state or {}).get("head")
+    since = f"repos/{repo}/compare/{last}...{head_sha}"
+    status = ((read(api, since) or {}).get("status") or "") if last else ""
+    listing = None  # since-commits.txt, when the range can be read as the author's commits alone
+    if last and (status == "ahead" or last == head_sha):
+        pages = read(api, since, "--paginate", "--slurp")
+        commits = None if pages is None else [c for page in pages for c in page["commits"]]
+        listing = None if commits is None or any(len(c["parents"]) > 1 for c in commits) else oneline(commits)
+    r = None
+    if listing is not None:
+        r = gh("api", "-H", "Accept: application/vnd.github.diff", since, check=False)
+        if r.returncode == 0:
+            write("since.diff", r.stdout)
+            write("since-commits.txt", listing)
+    elif last:
+        # The PR's diff at that commit: from where it forked from the base branch.
+        r = gh("api", "-H", "Accept: application/vnd.github.diff",
+               f"repos/{repo}/compare/{pull['base']['sha']}...{last}", check=False)
+        if r.returncode == 0:
+            write("interdiff.diff", interdiff(r.stdout, diff))
+    if r is not None and r.returncode == 0:
+        write("last-review.json", json.dumps(state) + "\n")
+        print(f"::notice::Re-review: this PR was last reviewed at {last[:10]}.")
+        out["rereview"] = "true"
+
+
+def write_stacked_above(repo, pull, head_sha):
+    """stacked-above.json and above-<n>.diff. A failed fetch leaves none of these files, so a finding said to
+    be fixed above stays open, and the review still runs."""
     above = read(stacked_above, repo, pull, head_sha)
     if above is None:
         for f in Path(".").glob("above-*.diff"):
@@ -444,17 +455,15 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     else:
         write_json("stacked-above.json", above)
 
-    # The open issues, [{number, title}], so a latent bug on main can name the one that tracks it. Titles
-    # are user text: the model reads them as untrusted data. A failed fetch leaves no file, and the review
-    # says it couldn't check.
+
+def write_open_issues(repo):
+    """The open issues, [{number, title}], so a latent bug on main can name the one that tracks it. Titles are
+    user text: the model reads them as untrusted data. A failed fetch leaves no file, and the review says
+    it couldn't check."""
     r = gh("issue", "list", "--repo", repo, "--state", "open", "--limit", "1000", "--json", "number,title",
            check=False)
     if r.returncode == 0:
         write("open-issues.json", r.stdout)
-
-    out["lines"] = diff.count("\n")
-    # The summary's fields, from main, for --json-schema.
-    out["schema"] = json.dumps(render_summary.SCHEMA, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------- review job: after the review
