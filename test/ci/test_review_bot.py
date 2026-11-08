@@ -312,6 +312,8 @@ class TestMonitor(unittest.TestCase):
                              ("a deleted account", {"state": "APPROVED", "author": None})):
             with self.subTest(name):
                 body, fake = self.run_monitor(STATUS["body"], **{"POST graphql": self.merged_prs(review)})
+                self.assertFalse(any(a.startswith("pr=") for argv, _ in fake.calls for a in argv),
+                                 "the merged-PR query has no pr variable")
                 self.assertNotIn("Faster decode", body, f"{name}: the PR would count as bot-approved")
                 self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [])
 
@@ -611,12 +613,13 @@ class TestAfterTheReview(unittest.TestCase):
                              "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []},
                              "live_test": {"run": "full", "reason": "r", "gpus": 8, "untestable": ""}})
         with workspace():
-            out, _ = step(bot.post, {
+            out, fake = step(bot.post, {
                 "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
                 "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
                 "GET repos/o/r/issues/7/comments": [],
             }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="full", salvaged="false", max_gpus="4")
         self.assertEqual(json.loads(out["result"])["live_test"]["untestable"], "needs 8 GPUs, runs get 4")
+        self.assertTrue(any("pr=7" in argv for argv, _ in fake.calls), "the threads query needs the PR's number")
 
     def test_the_summary_is_redacted_posted_from_stdin_and_resolves_a_stopped_review(self):
         token = "sk-ant-" + "x" * 30
