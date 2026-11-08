@@ -1,4 +1,4 @@
-"""Check how .github/review/render_summary.py renders the review's summary, and which comments start a review."""
+"""Check how .github/review/render_summary.py renders the review's summary."""
 
 import json
 import os
@@ -50,15 +50,6 @@ def run_step(job, step_id, gh, **env):
         subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script(job, step_id)],
                        env=env, cwd=REPO_ROOT, check=True, capture_output=True)
         return dict(line.split("=", 1) for line in out.read_text().splitlines())
-
-
-def preflight(command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR"):
-    """The preflight job's step for `command` (the word its COMMAND env maps the comment to), with `gh`
-    answering each login's permission from `perms`. Returns its outputs."""
-    gh = "case \"$2\" in\n" + "".join(
-        f"  */collaborators/{login}/permission) echo {perm} ;;\n" for login, perm in perms.items()) + "esac\n"
-    return run_step("preflight", "pre", gh, KEY_SET="true", COMMAND=command, ACTOR=actor, AUTHOR=author,
-                    ASSOC=assoc, SKIP_LABEL="false")
 
 
 def restore(mode):
@@ -174,17 +165,7 @@ class TestReviewSummary(unittest.TestCase):
         text = render(review(skipped=["mstar/worker/worker.py"]), [], "0123456789", "light", [])
         self.assertIn("\n🟡 **No open findings**", text, "a partial review would read as a clean one")
 
-    def test_who_can_ask_for_which_review(self):
-        write, read = {"an-author": "write"}, {"an-author": "read"}
-        self.assertEqual(preflight("nogpu", write), {"run": "true", "mode": "nogpu", "turns": "2000"})
-        self.assertEqual(preflight("light", read),
-                         {"run": "true", "mode": "light", "non_write_user": "an-author", "turns": "40"})
-        refused = preflight("nogpu", read)
-        self.assertEqual(refused["run"], "false", "a contributor without write access could start a nogpu review")
-        self.assertIn("/review light", refused["refuse"], "the contributor wouldn't be told what they can run")
-        self.assertEqual(preflight("light", {"a-maintainer": "read"}, actor="a-maintainer"), {"run": "false"},
-                         "someone without write access could review another author's PR")
-        self.assertEqual(preflight("continue", read)["mode"], "", "a /review continue would not keep its own mode")
+    def test_a_review_stopped_before_the_rename_continues(self):
         self.assertEqual(restore("thorough")["mode"], "nogpu", "a review stopped before the rename couldn't continue")
 
     def test_schema_has_no_single_quote(self):

@@ -82,6 +82,8 @@ on:
 permissions: {}
 
 env:
+  # No __pycache__ in the tree the model reads.
+  PYTHONDONTWRITEBYTECODE: 1
   # Credential-shaped strings, removed (sed -E "$REDACT") from everything
   # the workflow posts or saves.
   REDACT: |
@@ -117,6 +119,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      # Main's copy of the bot's scripts.
+      contents: read
       # The one-line reply to a refused request.
       pull-requests: write
     env:
@@ -129,15 +133,21 @@ jobs:
       non_write_user: ${{ steps.pre.outputs.non_write_user }}
       turns: ${{ steps.pre.outputs.turns }}
     steps:
+      # Trusted: main's scripts, never the PR's.
+      - name: Check out main's scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/review
+          persist-credentials: false
+
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
       # be the PR's author, a contributor, on `/review light` or `/review
       # continue` (see the header). A contributor's `/review` or `/review nogpu`
-      # on their own PR gets a one-line reply (`refuse`); anyone else exits
-      # green with a notice.
-      # non_write_user is set only for that author, and only when they lack
-      # write access, so a maintainer's run is unchanged.
+      # on their own PR gets a one-line reply; anyone else exits green with a
+      # notice (bot.py, preflight).
       - name: Preflight
         id: pre
         env:
@@ -149,64 +159,12 @@ jobs:
           SKIP_LABEL: ${{ contains(github.event.issue.labels.*.name, 'skip-ai-review') }}
           TEAM_TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM }}
           SELF_TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS }}
-          # The command, as one of these fixed words; the comment's text itself never reaches the shell.
+          # The command, as one of these fixed words; the comment's text itself never reaches the script.
           COMMAND: >-
             ${{ (github.event.comment.body == '/review light' && 'light') ||
                 ((github.event.comment.body == '/review' || github.event.comment.body == '/review nogpu') && 'nogpu') ||
                 (github.event.comment.body == '/review continue' && 'continue') || '' }}
-        run: |
-          if [ "$KEY_SET" != "true" ]; then
-            echo "::warning::ANTHROPIC_API_KEY is not set; skipping the review."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          case "$COMMAND" in
-            light|nogpu) mode=$COMMAND ;;
-            continue) mode="" ;;  # the stopped review's mode, from its handoff
-            *) echo "run=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
-          esac
-          perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2> /dev/null || echo none)
-          case "$perm" in
-            admin|maintain|write)
-              {
-                echo "run=true"
-                echo "mode=$mode"
-                echo "turns=${TEAM_TURNS:-2000}"
-              } >> "$GITHUB_OUTPUT"
-              exit 0 ;;
-          esac
-          case "$ASSOC" in
-            OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR) contributor=true ;;
-            *) contributor=false ;;
-          esac
-          own=false
-          [ "$contributor" = "true" ] && [ -n "$ACTOR" ] && [ "$ACTOR" = "$AUTHOR" ] && [ "$SKIP_LABEL" != "true" ] && own=true
-          if [ "$own" = "true" ] && [ "$COMMAND" != "nogpu" ]; then
-            echo "::notice::$ACTOR has '$perm' access; reviewing their own PR as its author ($ASSOC)."
-            {
-              echo "run=true"
-              echo "mode=$mode"
-              echo "non_write_user=$ACTOR"
-              echo "turns=${SELF_TURNS:-40}"
-            } >> "$GITHUB_OUTPUT"
-          elif [ "$own" = "true" ]; then
-            echo "::notice::$ACTOR has '$perm' access, not write; this review needs write access."
-            {
-              echo "run=false"
-              echo "refuse=This review needs write access; on your own PR, comment \`/review light\`."
-            } >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::$ACTOR has '$perm' access, not write; only people with write access, or a contributor on their own PR with \`/review light\`, can request a review."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # A request the preflight turned down with a reason the commenter can act on.
-      - name: Reply to a refused request
-        if: steps.pre.outputs.refuse != ''
-        continue-on-error: true
-        env:
-          REFUSE: ${{ steps.pre.outputs.refuse }}
-        run: gh pr comment "$PR" --repo "$REPO" --body "$REFUSE" > /dev/null
+        run: python3 .github/review/bot.py preflight
 
   review:
     name: Review
