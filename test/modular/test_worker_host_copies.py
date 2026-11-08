@@ -124,7 +124,7 @@ def _step(w, value):
             output_signals=["pred"],
         ),
         node_batch=ExecutingBatch(
-            node_name=NODE, per_request_info={}, cached_rids={RID}, no_forward_rids={RID},
+            node_name=NODE, per_request_info={}, cached_rids={RID},
             step_context=StepContext(request_ids=(), graph_walk=WALK, slot=0, capture=False),
         ),
         node_name=NODE, partition="default", graph_walk=WALK, loop_name=None,
