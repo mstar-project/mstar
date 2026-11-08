@@ -69,11 +69,13 @@ class TestReviewSummary(unittest.TestCase):
         self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->", "gpu"),
                           "a malformed state would fail every later review instead of starting a full one")
 
-    def test_a_gpu_review_builds_only_on_a_thorough_review_that_covered_everything(self):
+    def test_a_thorough_or_gpu_review_builds_only_on_a_thorough_review_that_covered_everything(self):
         light = render(review(), [], "0123456789", "light")
         partial = render(review(["a.py"]), [], "0123456789", "gpu")
         self.assertIsNone(read_state(light, "gpu"), "an approval could rest on a light review")
         self.assertIsNone(read_state(partial, "gpu"), "an approval could rest on files nobody reviewed")
+        self.assertIsNone(read_state(light, "thorough"),
+                          "a thorough re-review of a light one, and a gpu review of that, could approve")
         self.assertIsNotNone(read_state(render(review(), [], "0123456789", "thorough"), "gpu"))
         self.assertIsNotNone(read_state(light, "light"))
 

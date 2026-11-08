@@ -162,8 +162,9 @@ def render(review, pages, head, mode):
 
 def read_state(body, mode):
     """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
-    None, and that run reviews the whole PR. None too when it doesn't decode, and for a gpu review
-    unless the earlier one was thorough or gpu and skipped nothing, since its result can approve."""
+    None, and that run reviews the whole PR. None too when it doesn't decode, and for a thorough or
+    gpu review unless the earlier one was thorough or gpu and skipped nothing, since a gpu review's
+    result can approve and may build on a thorough one."""
     found = STATE.findall(body)
     try:
         state = json.loads(base64.b64decode(found[-1])) if found else None
@@ -172,7 +173,7 @@ def read_state(body, mode):
     if not isinstance(state, dict):
         return None
     # A state from before `skipped` was kept counts as having skipped files.
-    if mode == "gpu" and (state.get("mode") not in ("thorough", "gpu") or state.get("skipped", [None])):
+    if mode in ("thorough", "gpu") and (state.get("mode") not in ("thorough", "gpu") or state.get("skipped", [None])):
         return None
     return state
 

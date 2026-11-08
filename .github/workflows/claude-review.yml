@@ -396,7 +396,7 @@ jobs:
           # A re-review starts from this bot's last summary, when its commit is still an ancestor
           # of the head: the review re-checks those findings and reads only what changed since
           # (review-prompt.md, "Re-review"). After a force-push it reviews the whole PR again, and
-          # a gpu review does too unless the last one was thorough or gpu and skipped nothing.
+          # a thorough or gpu review does too unless the last one was thorough or gpu and skipped nothing.
           # The state is read only from the bot's own summaries: comments that start with the
           # summary's marker, in which model text can't open an HTML comment.
           if [ -z "$PREV" ]; then
