@@ -633,7 +633,12 @@ def hf_home(cfg, provider, region) -> str:
 def status(e: dict, cfg: dict | None = None) -> tuple[str, str | None, int]:
     """(status, host, ssh port)."""
     if e["provider"] == "slurm":
-        st = slurm_run(cfg or load_config(), f"squeue -h -j {e['instance_id']} -o %T", check=False).strip()
+        try:  # "ended" only on squeue's word: a failed ssh says nothing about the job
+            st = slurm_run(cfg or load_config(), f"squeue -h -j {e['instance_id']} -o %T").strip()
+        except ApiError as err:
+            if "Invalid job id" not in str(err):
+                raise
+            st = ""
         return (st or "ended").lower(), ("slurm" if st == "RUNNING" or (st == "" and e.get("run")) else None), 0
     if e["provider"] == "eras":
         i = eras("GET", f"/instances/{e['instance_id']}")

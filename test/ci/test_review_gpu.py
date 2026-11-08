@@ -7,6 +7,23 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GPU_REVIEW = runpy.run_path(str(REPO_ROOT / ".github/review/gpu_review.py"))
 blocking, risky_files = GPU_REVIEW["blocking"], GPU_REVIEW["risky_files"]
+GPU = runpy.run_path(str(REPO_ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"))
+SLURM_CFG = {"slurm": {"host": "root@node", "job_prefix": "review-bot", "workdir": "/workspace/review-bot"}}
+
+
+def fake_slurm(replies, calls=None):
+    """Stands in for gpu.py's slurm_run: each command gets the first reply whose key it contains, and
+    an exception is a failed command (empty stdout with check=False)."""
+    def slurm_run(cfg, command, check=True):
+        if calls is not None:
+            calls.append(command)
+        reply = next(r for k, r in replies.items() if k in command)
+        if isinstance(reply, Exception):
+            if not check:
+                return ""
+            raise reply
+        return reply
+    return slurm_run
 
 
 def thread(comment_id, body, outdated=False):
@@ -42,6 +59,27 @@ class TestApproval(unittest.TestCase):
             self.assertTrue(risky_files([path], REPO_ROOT), f"{path} could be approved as low risk")
         self.assertTrue(risky_files(["mstar/model/kokoro/model.py", "mstar/model/orpheus/model.py"], REPO_ROOT),
                         "a change to two models could be approved as low risk")
+
+
+
+class TestSlurm(unittest.TestCase):
+    def setUp(self):
+        self.globals = GPU["status"].__globals__
+        self.saved = self.globals["slurm_run"]
+
+    def tearDown(self):
+        self.globals["slurm_run"] = self.saved
+
+    def test_a_failed_ssh_is_not_a_job_that_ended(self):
+        e = {"provider": "slurm", "instance_id": "42", "run": True}
+        self.globals["slurm_run"] = fake_slurm({"squeue": GPU["ApiError"](255, "ssh: connect to host node: timed out")})
+        with self.assertRaises(GPU["ApiError"], msg="a flaky ssh would end a running live test"):
+            GPU["status"](e, SLURM_CFG)
+        self.globals["slurm_run"] = fake_slurm(
+            {"squeue": GPU["ApiError"](1, "slurm: squeue: slurm_load_jobs error: Invalid job id specified")})
+        self.assertEqual(GPU["status"](e, SLURM_CFG)[0], "ended")
+        self.globals["slurm_run"] = fake_slurm({"squeue": "RUNNING\n"})
+        self.assertEqual(GPU["status"](e, SLURM_CFG)[0], "running")
 
 
 if __name__ == "__main__":
