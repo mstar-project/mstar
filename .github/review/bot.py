@@ -80,6 +80,18 @@ def api_list(path):
     return [item for page in api(path, "--paginate", "--slurp") for item in page]
 
 
+UNREADABLE = (RuntimeError, ValueError)  # gh failing, or printing what isn't JSON
+
+
+def read(fetch, *args):
+    """`fetch(*args)` (api, api_list, ...), or None when it can't be read, for a caller that has a
+    no-data path. Only UNREADABLE: anything else, a KeyError say, is a bug in how the result is used."""
+    try:
+        return fetch(*args)
+    except UNREADABLE:
+        return None
+
+
 def graphql(query, repo, pr):
     """The pages of a paginated GraphQL query on the PR."""
     owner, name = repo.split("/")
@@ -125,10 +137,7 @@ def comment(repo, pr, body):
 
 def permission(repo, login):
     """`login`'s permission on the repository, or "none" when GitHub won't say."""
-    try:
-        return api(f"repos/{repo}/collaborators/{login}/permission")["permission"]
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        return "none"
+    return (read(api, f"repos/{repo}/collaborators/{login}/permission") or {}).get("permission", "none")
 
 
 def redact(text, exact=()):
@@ -221,23 +230,18 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
         print(f"::notice::{why}")
         sys.exit(1)
 
-    try:
-        comments = api_list(f"repos/{repo}/issues/{pr}/comments")
-    except (RuntimeError, ValueError):
+    comments = read(api_list, f"repos/{repo}/issues/{pr}/comments")
+    if comments is None:
         fail("the PR's comments couldn't be read; try `/review continue` again")
     if not marked(comments, INCOMPLETE):
         fail("there is no stopped review of this PR to continue: none stopped part-way, or a later run already "
              "finished (handoffs are kept for 7 days); ask for a new review with `/review light` or `/review`")
-    try:
-        artifacts = [a for a in api(f"repos/{repo}/actions/artifacts?name={name}&per_page=30")["artifacts"]
-                     if not a["expired"]]
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        artifacts = []
+    listing = read(api, f"repos/{repo}/actions/artifacts?name={name}&per_page=30") or {}
+    artifacts = [a for a in listing.get("artifacts") or [] if not a["expired"]]
     found = None
     for a in reversed(sorted(artifacts, key=lambda a: a["created_at"])):
-        try:
-            r = api(f"repos/{repo}/actions/runs/{a['workflow_run']['id']}")
-        except (RuntimeError, ValueError):
+        r = read(api, f"repos/{repo}/actions/runs/{a['workflow_run']['id']}")
+        if r is None:
             continue
         if fnmatch.fnmatchcase(f"{r['path']}:{r['event']}", ".github/workflows/claude-review.yml*:issue_comment"):
             found = a["workflow_run"]["id"]
@@ -408,17 +412,12 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
         state = summary and render_summary.read_state(summary)
         last = (state or {}).get("head")
         since = f"repos/{repo}/compare/{last}...{head_sha}"
-        try:
-            status = api(since)["status"] if last else ""
-        except (RuntimeError, ValueError, KeyError, TypeError):
-            status = ""
+        status = ((read(api, since) or {}).get("status") or "") if last else ""
         listing = None  # since-commits.txt, when the range can be read as the author's commits alone
         if last and (status == "ahead" or last == head_sha):
-            try:
-                commits = [c for page in api(since, "--paginate", "--slurp") for c in page["commits"]]
-                listing = None if any(len(c["parents"]) > 1 for c in commits) else oneline(commits)
-            except (RuntimeError, ValueError, KeyError, TypeError):
-                listing = None
+            pages = read(api, since, "--paginate", "--slurp")
+            commits = None if pages is None else [c for page in pages for c in page["commits"]]
+            listing = None if commits is None or any(len(c["parents"]) > 1 for c in commits) else oneline(commits)
         r = None
         if listing is not None:
             r = gh("api", "-H", "Accept: application/vnd.github.diff", since, check=False)
@@ -438,11 +437,12 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
 
     # A failed fetch leaves none of these files, so a finding said to be fixed above stays open, and
     # the review still runs.
-    try:
-        write_json("stacked-above.json", stacked_above(repo, pull, head_sha))
-    except (RuntimeError, ValueError, KeyError, TypeError):
+    above = read(stacked_above, repo, pull, head_sha)
+    if above is None:
         for f in Path(".").glob("above-*.diff"):
             f.unlink()
+    else:
+        write_json("stacked-above.json", above)
 
     # The open issues, [{number, title}], so a latent bug on main can name the one that tracks it. Titles
     # are user text: the model reads them as untrusted data. A failed fetch leaves no file, and the review
@@ -549,11 +549,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
                  "reported it as failed.</sub>\n")
     url = comment(repo, pr, text)
     out["id"] = url.rsplit("-", 1)[-1]
-    try:
-        stopped = marked(api_list(f"repos/{repo}/issues/{pr}/comments"), INCOMPLETE)
-    except (RuntimeError, ValueError):
-        stopped = []
-    for cid in stopped:
+    for cid in marked(read(api_list, f"repos/{repo}/issues/{pr}/comments") or [], INCOMPLETE):
         body = f"{RESOLVED}\nAn earlier review run didn't complete; a later run finished: {url}\n"
         try:
             gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{cid}", "--input", "-",
@@ -593,11 +589,7 @@ def labels(out, repo, pr, output):
     if not wanted:
         print("::warning::The review returned no valid type; leaving the type labels alone.")
         return
-    try:
-        current = [x["name"] for x in api(f"repos/{repo}/issues/{pr}/labels")]
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        current = []
-    for old in current:
+    for old in [x["name"] for x in read(api, f"repos/{repo}/issues/{pr}/labels") or []]:
         if old.startswith("type/") and old not in wanted:
             gh("api", "-X", "DELETE", f"repos/{repo}/issues/{pr}/labels/{old.replace('/', '%2F')}")
     for label in wanted:
@@ -655,10 +647,7 @@ def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_conti
     partial = Path("partial.md")
     if partial.is_file() and partial.stat().st_size:
         text += "\nWhat it had so far:\n\n" + partial.read_text()
-    try:
-        earlier = marked(api_list(f"repos/{repo}/issues/{pr}/comments"), marker)
-    except (RuntimeError, ValueError):
-        earlier = []
+    earlier = marked(read(api_list, f"repos/{repo}/issues/{pr}/comments") or [], marker)
     if earlier:
         gh("api", "-X", "PATCH", f"repos/{repo}/issues/comments/{earlier[-1]}", "--input", "-",
            input=json.dumps({"body": text}))
