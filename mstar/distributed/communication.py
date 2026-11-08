@@ -45,8 +45,8 @@ def rendezvous_store(init_method: str, rank: int, world_size: int, timeout: time
     )
 
 
-# Kept for direct callers still on the CP branches (`to_partners`, `all_to_all_rows`); on main
-# only `CommGroup.all_to_all` calls this.
+# The collective itself stays out of torch.compile whoever calls it: traced as a functional
+# collective it gave an illegal memory access in Cosmos3's batched capture.
 @torch.compiler.disable
 def _all_to_all_single(
     group: dist.ProcessGroup, send: torch.Tensor, recv: torch.Tensor,
