@@ -27,6 +27,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.distributed.communication import CommGroup
+from mstar.model.components.distributed.linear import QKVParallelLinear
 from mstar.model.cosmos3.config import Cosmos3ReasonerConfig, Cosmos3VisionEncoderConfig
 from mstar.model.keys import VISION_ATTN
 
@@ -125,9 +127,9 @@ class Cosmos3VisionAttention(nn.Module):
         self.head_dim = dim // self.num_heads
         if self.head_dim * self.num_heads != dim:
             raise ValueError(f"hidden_size {dim} is not divisible by {self.num_heads} heads")
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
+        # one GEMM for q, k and v; the loader stacks the checkpoint's three
+        # (``cosmos3.loader.VISION_STACKED``)
+        self.qkv_proj = QKVParallelLinear(CommGroup.trivial(), dim, self.head_dim, self.num_heads, self.num_heads)
         self.out_proj = nn.Linear(dim, dim)
         self.ragged_attn = None
 
@@ -140,9 +142,7 @@ class Cosmos3VisionAttention(nn.Module):
         reference path), or, with none, the frames the step planned on the
         ragged attention resource."""
         n = x.shape[0]
-        q = self.q_proj(x).view(n, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(n, self.num_heads, self.head_dim)
-        v = self.v_proj(x).view(n, self.num_heads, self.head_dim)
+        q, k, v = (t.view(n, self.num_heads, self.head_dim) for t in self.qkv_proj(x).chunk(3, dim=-1))
         if frame_lens is not None:
             out = frame_attention(q, k, v, frame_lens)
         elif self.ragged_attn is not None:

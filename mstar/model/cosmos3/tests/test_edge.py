@@ -504,7 +504,8 @@ def test_edge_vision_encoder_key_and_shape_coverage() -> None:
     unexpected = sorted(set(ckpt) - set(model_shapes))[:5]
     assert set(model_shapes) == set(ckpt), (missing, unexpected)
     assert {k for k, s in model_shapes.items() if s != ckpt[k]} == set()
-    assert len(ckpt) == 443
+    # 443 checkpoint tensors, each layer's q / k / v weight and bias fused into one pair
+    assert len(ckpt) == 443 - 27 * 2 * 2
 
 
 @needs_edge
