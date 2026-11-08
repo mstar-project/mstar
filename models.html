@@ -2576,6 +2576,16 @@ step, correct but no faster. For throughput under concurrency,
 <code class="docutils literal notranslate"><span class="pre">configs/wan22_dp2.yaml</span></code> serves a whole replica per GPU instead: 5.2 videos/min
 at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0’s VAE
 decode; measured on that earlier version), while one request takes the 1-GPU time.</p>
+<p><strong>Four GPUs.</strong> <code class="docutils literal notranslate"><span class="pre">configs/wan22_cfg2_sp2_4gpu.yaml</span></code> also splits each branch’s
+tokens over a pair of ranks (<code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2,</span> <span class="pre">sp_size:</span> <span class="pre">2</span></code>, Ulysses on the dit’s
+self-attention) to cut one request’s latency. Split the guidance branches
+first (<code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2</span></code>), then add <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> on top: on two GPUs,
+<code class="docutils literal notranslate"><span class="pre">sp_size:</span> <span class="pre">2</span></code> alone is slower than <code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">2</span></code>.
+<code class="docutils literal notranslate"><span class="pre">sp_size</span></code> must divide the dit’s 24 attention heads. Under concurrency, data
+parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
+replicas (<code class="docutils literal notranslate"><span class="pre">wan22_dp2.yaml</span></code>’s layout over four ranks) serve 8.6 videos/min
+against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
+H100s.</p>
 </section>
 <section id="ltx-2-5-ltx2-5">
 <h2>LTX-2.5 (<code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code>)<a class="headerlink" href="#ltx-2-5-ltx2-5" title="Link to this heading">#</a></h2>
