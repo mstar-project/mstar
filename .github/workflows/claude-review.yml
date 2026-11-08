@@ -90,6 +90,16 @@ on:
 
 permissions: {}
 
+env:
+  # Credential-shaped strings, removed (sed -E "$REDACT") from everything
+  # the workflow posts or saves.
+  REDACT: |
+    s/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g
+    s/(gh[opsur]_|github_pat_)[A-Za-z0-9_]{20,}/[REDACTED]/g
+    s/hf_[A-Za-z0-9]{20,}/[REDACTED]/g
+    s/AKIA[0-9A-Z]{16}/[REDACTED]/g
+    s/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/[REDACTED]/g
+
 jobs:
   review:
     name: Review
@@ -134,13 +144,6 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
       PR: ${{ github.event.issue.number }}
-      # Credential-shaped strings, removed (sed -E "$REDACT") from everything
-      # the workflow posts or saves.
-      REDACT: |
-        s/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g
-        s/(gh[opsur]_|github_pat_)[A-Za-z0-9_]{20,}/[REDACTED]/g
-        s/AKIA[0-9A-Z]{16}/[REDACTED]/g
-        s/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/[REDACTED]/g
     steps:
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
@@ -745,12 +748,6 @@ jobs:
       HEAD_SHA: ${{ needs.review.outputs.head_sha }}
       TAG: ${{ github.run_id }}-${{ github.run_attempt }}
       ERAS_API_KEY: ${{ secrets.ERAS_API_KEY }}
-      REDACT: |
-        s/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g
-        s/(gh[opsur]_|github_pat_)[A-Za-z0-9_]{20,}/[REDACTED]/g
-        s/hf_[A-Za-z0-9]{20,}/[REDACTED]/g
-        s/AKIA[0-9A-Z]{16}/[REDACTED]/g
-        s/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+/[REDACTED]/g
     steps:
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

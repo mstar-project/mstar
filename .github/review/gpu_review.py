@@ -32,8 +32,6 @@ GPU = ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"
 SUMMARY = runpy.run_path(str(Path(__file__).with_name("render_summary.py")))
 BOX = Path(__file__).with_name("gpu_review_box.sh")
 REPO = os.environ.get("REPO", "mstar-project/mstar")
-BOT_LOGINS = ("mstar-review", "mstar-review[bot]", "github-actions", "github-actions[bot]")
-TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 WRITE = ("admin", "maintain", "write")
 # What an approvable change may touch: tests, docs, benchmarks, and one model's own code and
 # configs. Anything else (a shared layer, the review's own rules, dependencies) is not low risk.
@@ -293,7 +291,7 @@ def cmd_approve(a):
 
 def dismiss(pr, message):
     for r in gh_json(f"repos/{REPO}/pulls/{pr}/reviews?per_page=100") or []:
-        if r["state"] == "APPROVED" and r["user"]["login"] in BOT_LOGINS:
+        if r["state"] == "APPROVED" and r["user"]["login"].removesuffix("[bot]") in SUMMARY["BOTS"]:
             gh("api", "-X", "PUT", f"repos/{REPO}/pulls/{pr}/reviews/{r['id']}/dismissals",
                "-f", f"message={message}", "-f", "event=DISMISS", check=False)
 
