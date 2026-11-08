@@ -3233,10 +3233,10 @@ class Engine:
         refusal = self.drop_refusal(node_name, request_id, tokens)
         if refusal is not None:
             raise RuntimeError(refusal)
-        at = len(self._resident_delta) if node_name in self._tp_leader_nodes else None
-        freed = sum(resource.drop(request_id, tokens) for resource in self._submodules[node_name].resources.values())
+        # before the drop, so the moves the pools journal as it frees room come after it
         if node_name in self._tp_leader_nodes:
-            self._journal(MoveKind.DROP, request_id, tokens, node=node_name, at=at)
+            self._journal(MoveKind.DROP, request_id, tokens, node=node_name)
+        freed = sum(resource.drop(request_id, tokens) for resource in self._submodules[node_name].resources.values())
         self._runner.readmit(request_id, node_name, queued=True)
         return freed
 
