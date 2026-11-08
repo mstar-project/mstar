@@ -30,7 +30,9 @@ from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import ResidentPlanner
-from mstar.engine.resources.step import PIECEWISE_WALK
+from mstar.engine.resources.sampler.config import GreedySample
+from mstar.engine.resources.sampler.resource import greedy_samplers
+from mstar.engine.resources.step import PIECEWISE_WALK, has_variant
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
@@ -802,6 +804,7 @@ class AcceleratorGraphRunner:
 
     def _get_slot_specs(self) -> list[CGSlotSpec]:
         specs = []
+        greedy = bool(greedy_samplers(self._resources))
         for config_idx, config in enumerate(self._capture_configs):
             keys = [config.additional_key_info]
             if getattr(self._submodule, "lora_keys", ()):
@@ -809,6 +812,11 @@ class AcceleratorGraphRunner:
                 # adapter row, recording no LoRA kernel (see `LoraBaseOnly`); the two
                 # share the config's compiled forward, static buffers and padding rows
                 keys.append(LoraBaseOnly(config.additional_key_info))
+            if greedy and config.get_config_type() == AcceleratorGraphConfigType.BASIC_BATCHED:
+                # and for steps whose rows all sample greedily, with an argmax for
+                # the sampler (see `GreedySample`). Batched captures only: there a
+                # row is a token and the sampler a sizeable share of the step.
+                keys += [GreedySample(key) for key in keys]
             for bs in self._batch_sizes(config):
                 for num_tokens in config.get_total_tokens(bs):
                     for key in keys:
@@ -848,6 +856,9 @@ class AcceleratorGraphRunner:
             slot_specs.sort(key=lambda s: (s.bs, s.num_tokens), reverse=True)
             blocked_configs = set()
             checked_configs = set()
+            # configs whose step runs no greedy-captured sampler: no greedy capture
+            unsampled_configs = set()
+            samplers = greedy_samplers(self._resources)
             for spec in slot_specs:
                 if spec.config_idx in checked_configs:
                     continue
@@ -861,6 +872,8 @@ class AcceleratorGraphRunner:
                     slot_lease=SlotLease(slot=0, bucket=spec.bucket),
                     per_request_info=dummy_metadata(rids, spec.bucket.graph_walk),
                 )
+                if samplers and (step is None or samplers.keys().isdisjoint(step.steps)):
+                    unsampled_configs.add(spec.config_idx)
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
                     logger.error(
@@ -874,7 +887,9 @@ class AcceleratorGraphRunner:
             ))
             self.dropped_buckets = list(self._blocked_buckets)
             slot_specs = [
-                spec for spec in slot_specs if spec.config_idx not in blocked_configs
+                spec for spec in slot_specs
+                if spec.config_idx not in blocked_configs
+                and not (spec.config_idx in unsampled_configs and has_variant(spec.bucket.cg_key_info, GreedySample))
             ]
             max_seq_len = max((
                 spec.bucket.num_tokens for spec in slot_specs

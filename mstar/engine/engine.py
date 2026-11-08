@@ -48,6 +48,8 @@ from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key
 from mstar.engine.resources.resident import ResidentPlanner, build_planner
+from mstar.engine.resources.sampler.config import GreedySample
+from mstar.engine.resources.sampler.resource import greedy_samplers
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -215,6 +217,8 @@ class SubmoduleManagement:
     )
     # the LoRA pools bound to the node's modules, set at bind
     lora_pools: tuple = ()
+    # the node's samplers a greedy capture serves (`GreedySample`), set at bind
+    greedy_samplers: tuple = ()
 
     def __post_init__(self):
         # Two hazards want a second slot, both of them the host running ahead of
@@ -705,6 +709,7 @@ class Engine:
             self._submodules[node_name].lora_pools = tuple(
                 resources[key] for key in getattr(submodule, "lora_keys", ())
             )
+            self._submodules[node_name].greedy_samplers = tuple(greedy_samplers(resources).values())
             loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
             if loopback is not None:
                 # the sampler keeps its slot masters only for a node that
@@ -2932,22 +2937,28 @@ class Engine:
             None if batch.inputs is None
             else sum(inp.input_seq_len for inp in batch.inputs)
         )
-        lease = None
+        # The captures this batch may replay, the leanest first: each variant
+        # leaves out kernels its rows can't need, and each is captured beside
+        # the node's own only where it pays. Every resource checks its rows again
+        # at plan.
+        keys = [key]
         pools = submodule_mgmt.lora_pools
         if pools and not any(pool.runs_adapters(batch.request_ids) for pool in pools):
-            # no row names an adapter: the graph captured without LoRA kernels, when
-            # there is one (the pool checks the rows again at plan)
-            batch.cg_key_info = LoraBaseOnly(key)
+            # no row names an adapter: the graph captured without LoRA kernels
+            keys.insert(0, LoraBaseOnly(key))
+        samplers = submodule_mgmt.greedy_samplers
+        if samplers and all(sampler.runs_greedy(batch.request_ids) for sampler in samplers):
+            # every row samples greedily: the graph whose sampler is an argmax
+            keys[:0] = [GreedySample(k) for k in keys]
+        lease = None
+        for candidate in keys:
             lease = cg_runner.lease_slot(
                 graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
-                slot=batch.slot, num_tokens=num_tokens, cg_key_info=batch.cg_key_info,
+                slot=batch.slot, num_tokens=num_tokens, cg_key_info=candidate,
             )
-        if lease is None:
-            batch.cg_key_info = key
-            lease = cg_runner.lease_slot(
-                graph_walk=batch.step_context.graph_walk, bs=len(batch.request_ids),
-                slot=batch.slot, num_tokens=num_tokens, cg_key_info=key,
-            )
+            if lease is not None:
+                break
+        batch.cg_key_info = candidate if lease is not None else key
         planner = submodule_mgmt.resident
         ctx = batch.step_context
         ctx.resident = planner if lease is not None and planner is not None and planner.covers(lease.bucket) else None

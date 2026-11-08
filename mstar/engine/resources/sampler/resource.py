@@ -9,6 +9,7 @@ from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resour
 from mstar.engine.resources.resident import CapturedResidentStep, ResidentPlan, ResidentPlanner, ResidentWrites
 from mstar.engine.resources.sampler.config import (
     SAMPLED_LOGPROB,
+    GreedySample,
     LoopbackState,
     SamplerSpec,
     SamplerStep,
@@ -16,6 +17,7 @@ from mstar.engine.resources.sampler.config import (
 )
 from mstar.engine.resources.sampler.resident import SamplerCells
 from mstar.engine.resources.sampler.utils import (
+    FUSED_SAMPLE_MAX_VOCAB,
     AcceleratorGraphableSampler,
     FusedDrawArgs,
     GenerationHistory,
@@ -23,8 +25,9 @@ from mstar.engine.resources.sampler.utils import (
     SamplerBuffers,
     SamplingConfig,
     _rng_offset_stride,
+    samples_greedy,
 )
-from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext
+from mstar.engine.resources.step import ASKS, AdmitOutcome, SlotLease, StepContext, has_variant
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.knobs import device_loopback_enabled, sampler_ingraph_scatter
@@ -63,6 +66,9 @@ class SamplerResource(Resource):
         self._enable_logprobs = enable_logprobs
         self._enable_processed_logprobs = enable_processed_logprobs
         self._vocab_size = vocab_size if self._track_seen_tokens else None
+        # A greedy capture (`GreedySample`) only pays where the full sampler is
+        # the multi-kernel one; a narrower vocabulary draws in one kernel already.
+        self.greedy_capture = vocab_size is not None and vocab_size > FUSED_SAMPLE_MAX_VOCAB
         self._max_repetition_window = max_repetition_window
         self._enable_top_p_first = enable_top_p_first
         if max_repetition_window < 0:
@@ -112,6 +118,12 @@ class SamplerResource(Resource):
         # Resident requests that asked for log-probs: with none, no step's
         # log-prob rows are copied to the host.
         self._logprob_rids: set[str] = set()
+        # Resident requests that don't sample greedily (`samples_greedy`), so
+        # a step over the rest replays the greedy capture. Kept like the two
+        # sets above, and read per step only when it isn't empty.
+        self._sampled_rids: set[str] = set()
+        # whether the step planned last runs the greedy capture
+        self._greedy_this_step = False
         self._sampled_this_step = False
         self._device = device
         self._comm_group = comm_group
@@ -254,6 +266,11 @@ class SamplerResource(Resource):
             self._penalty_rids.add(rid)
         if resolved.return_logprobs:
             self._logprob_rids.add(rid)
+        if samples_greedy(resolved):
+            # a re-ingest replaces the request's config
+            self._sampled_rids.discard(rid)
+        else:
+            self._sampled_rids.add(rid)
         if self._history is not None:
             self._history.register(rid)
         if self._cg_buffers is not None and not self._cg_buffers.ingraph_scatter:
@@ -336,6 +353,7 @@ class SamplerResource(Resource):
         self._sampler.remove_request(rid)
         self._penalty_rids.discard(rid)
         self._logprob_rids.discard(rid)
+        self._sampled_rids.discard(rid)
         self._cached_prefix.pop(rid, None)
         if self._history is not None:
             self._history.unregister(rid)
@@ -381,6 +399,32 @@ class SamplerResource(Resource):
             if __debug__ and self._apply_penalty_this_step \
                     and not self._penalty_needed_this_step:
                 self._assert_penalty_inert(ctx)
+
+    def runs_greedy(self, rids) -> bool:
+        """Whether every one of ``rids`` samples greedily, so a step over
+        them may replay the greedy capture. From the configs set at ingest,
+        which are the same on every rank of a lockstep instance."""
+        return not self._sampled_rids or self._sampled_rids.isdisjoint(rids)
+
+    def _set_greedy_flag(self, ctx: StepContext) -> None:
+        """Whether this step runs the greedy capture: its lease's, picked by
+        the engine from `runs_greedy`. Such a step also skips the seen-token
+        traffic, as its rows' penalties are all 1.0."""
+        lease = ctx.slot_lease
+        # a sampler the capture doesn't serve (another of the node's) draws in full there too
+        self._greedy_this_step = greedy = (
+            self.greedy_capture and lease is not None and lease.bucket is not None
+            and has_variant(lease.bucket.cg_key_info, GreedySample)
+        )
+        if not greedy:
+            return
+        if not ctx.capture and not self.runs_greedy(ctx.request_ids):
+            # its sampled rows would take the argmax silently
+            raise RuntimeError(
+                f"sampler: leased greedy {lease.bucket} for a step with rows that don't sample greedily: "
+                f"{sorted(self._sampled_rids.intersection(ctx.request_ids))}"
+            )
+        self._penalty_needed_this_step = False
 
     def _assert_penalty_inert(self, ctx: StepContext) -> None:
         """Skipping the mask is sound only while every penalty in the step is 1.0.
@@ -495,6 +539,7 @@ class SamplerResource(Resource):
         laps = PhaseLaps(f"{ctx.plan_phase}.sampler.")
         self._set_penalty_flags(step, ctx)
         if not ctx.is_preplan:
+            self._set_greedy_flag(ctx)
             self._kept_rids = self._kept_rids_of(step, ctx)
             self._sampled_this_step = False
         if not ctx.is_preplan and self._penalty_live:
@@ -680,6 +725,7 @@ class SamplerResource(Resource):
                 request_ids, logits,
                 apply_penalty=self._apply_penalty_this_step,
                 apply_filters=self._apply_filters_this_step,
+                greedy=self._greedy_this_step,
             )
         bufs = self._cg_buffers
         by_slot = bufs is not None and all(bufs.has_slot(rid) for rid in request_ids)
@@ -734,9 +780,13 @@ class SamplerResource(Resource):
     def fused_draw_args(self) -> FusedDrawArgs | None:
         """This step's per-row parameters, for a kernel in the forward that draws each row's tokens as `sample` would
         on a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB``. Rows are the batch the forward runs on, as for
-        `sample`. None when `sample` would draw any other way: an eager step, the penalty, a kept last token, or a
-        filter, write or broadcast besides the draw. The kernel's caller advances the offsets with `advance_offsets`."""
-        if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token:
+        `sample`. None when `sample` would draw any other way: an eager or greedy step, the penalty, a kept last
+        token, or a filter, write or broadcast besides the draw. The kernel's caller advances the offsets with
+        `advance_offsets`."""
+        if (
+            self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token
+            or self._greedy_this_step
+        ):
             return None
         return self._cg_sampler.fused_draw_args(self._apply_filters_this_step)
 
@@ -800,3 +850,11 @@ class SamplerResource(Resource):
         self._row_stager.copy_(index, rows)
         for dst, src in updates:
             dst.index_copy_(0, index, src.to(dst.dtype))
+
+
+def greedy_samplers(resources: Mapping[str, Resource]) -> dict[str, SamplerResource]:
+    """A node's samplers that a greedy capture (`GreedySample`) serves, by resource key."""
+    return {
+        key: resource for key, resource in resources.items()
+        if isinstance(resource, SamplerResource) and resource.greedy_capture
+    }

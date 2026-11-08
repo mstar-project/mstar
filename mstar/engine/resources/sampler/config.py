@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.resources.step import CaptureVariant, ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
@@ -208,6 +208,18 @@ def derive_seed(seed: int, stream: str) -> int:
     """
     digest = hashlib.blake2b(f"{seed}:{stream}".encode(), digest_size=8).digest()
     return int.from_bytes(digest, "little") & (2**63 - 1)
+
+
+@dataclass(frozen=True)
+class GreedySample(CaptureVariant):
+    """The capture key of a step whose every row samples greedily
+    (``SamplerResource.runs_greedy``): its sampler takes each row's argmax and
+    records no softmax, filter or draw. The engine captures it beside the full
+    sampler for a node whose vocabulary is too wide for the one-kernel draw,
+    and a step with any other row replays the full one."""
+
+    def __str__(self) -> str:
+        return "greedy" if self.key is None else f"greedy:{self.key}"
 
 
 @dataclass(frozen=True)

@@ -90,6 +90,7 @@ from mstar.engine.resources.step import (
     AdmitRuntimeError,
     AllocationFailed,
     StepContext,
+    has_variant,
 )
 from mstar.utils.h2d import H2DMirror, PinnedStager
 from mstar.utils.threads import ThreadPool
@@ -976,7 +977,7 @@ class LoraAdapterPool(Resource):
         lease = ctx.slot_lease
         if lease is None or lease.bucket is None:
             return self.runs_adapters(seg.request_id for seg in segments)
-        if not isinstance(lease.bucket.cg_key_info, LoraBaseOnly):
+        if not has_variant(lease.bucket.cg_key_info, LoraBaseOnly):
             return True
         if not ctx.capture and self.runs_adapters(seg.request_id for seg in segments):
             # its rows would lose their deltas silently
