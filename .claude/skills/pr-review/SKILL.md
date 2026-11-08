@@ -120,7 +120,7 @@ description doesn't say it is deliberate.
   wrong output, data corruption, security hole, or broken CI.
 - **P1**: should be fixed before merge: a defect on a plausible path, a violation of a numbered
   `AGENTS.md` invariant (cite it), or a description claim the code doesn't support or contradicts.
-- **P2**: should be fixed but needn't block: a gap `AGENTS.md` requires to be filled (docs row, test
+- **P2**: should be fixed, and stops the bot's GPU run and approval, though a person can still approve: a gap `AGENTS.md` requires to be filled (docs row, test
   registration), an error path that leaks or misreports, a comment that says something the code
   doesn't do.
 - **P3**: an improvement a careful reviewer would suggest. `nogpu` and `full` modes only.
