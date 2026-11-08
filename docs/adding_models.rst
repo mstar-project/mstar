@@ -2098,7 +2098,7 @@ Both types share the base ``CudaGraphConfig`` fields:
   them on the device, so every process compiles the same kernels (a torch without the mode
   logs a warning and compiles with the defaults). A compile outside the runner takes the same
   options from ``accelerator_graph_runner.compile_kwargs("deterministic")``, or
-  ``deterministic_inductor_options()`` where it builds its own; the Wan VAE decode, the DiT
+  ``mstar.platforms.compile.deterministic_inductor_options()`` where it builds its own; the Wan VAE decode, the DiT
   scaffold's ``compile_blocks`` and Cosmos3's denoise step do. Building the config refuses
   an unknown mode, and one that turns on Inductor's own CUDA graphs (``reduce-overhead``,
   ``max-autotune``), which fail inside the runner's capture.

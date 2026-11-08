@@ -771,9 +771,16 @@ of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be no
 [-1, 1].
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`. A ``seed`` fixes a request's random stream whatever
-it is batched with, so requests sent with the same seed and settings sample the same
-tokens; give each request its own seed for independent samples.
+client instead — see :doc:`clients`. Give each request its own ``seed`` for independent
+samples. A seed fixes a request's tokens whatever it is batched with only where M\* draws
+with one kernel that reads each row's own seed: on CUDA, a sampler whose vocabulary is at
+most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),
+with none of ``min_p``, the windowed penalty, ``min_tokens``, ``top_p_first`` or processed
+log-probs enabled on its node, on eager and captured steps alike. Every other sampler (every
+text LLM, and Fish S2 Pro's 4,097-token semantic head) draws through FlashInfer, which
+reads the first row's seed for the whole batch and folds each row's batch position into
+its random stream, so there the same seed and settings sample the same tokens only in the
+same batch, such as a request sent alone.
 
 Restarts and the compile cache
 ------------------------------
