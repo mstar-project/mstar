@@ -386,10 +386,10 @@ class TestComment(unittest.TestCase):
         self.assertIn("## Results\n", text, "headings would break")
         self.assertIn("![a](https://o.github.io/m/pr-7/1/media/a.png)", text, "the gallery's image would stop showing")
         self.assertIn("![b](https://o.github.io/m/pr-7/1/media/a@2x.png)", text, "a file named with `@` wouldn't link")
+        self.assertIn("`List<\u200bint>`", text, "a code span should still read right")
         name = "x](http:/evil.example/y.png"
         _, text = self.comment(f"![a](media/{name})\n", [(name, 10)], media_url="https://o.github.io/m/pr-7/1")
         self.assertIn("media/x%5D%28http%3A/evil.example/y.png)", text, "a file's name would make a link to anywhere")
-        self.assertIn("`List<\u200bint>`", text, "a code span should still read right")
 
     def test_the_gallery_serves_only_media_within_the_cap_and_is_linked_once_published(self):
         cap = unittest.mock.patch.object(gpu_review, "MEDIA_CAP", 1000)
