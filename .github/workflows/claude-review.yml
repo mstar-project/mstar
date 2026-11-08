@@ -85,8 +85,8 @@ name: Claude Review
 # Failures never turn the PR's check red: every step after the preflight is
 # continue-on-error and gated on the one before it, and if the review didn't
 # complete, the last step says so in a PR comment with a link to the log. The
-# one exception is the first step, checking out main's scripts: the reporter
-# is one of those scripts, so that failure is only in the run's log.
+# one exception is a step checking out main's scripts: the reporter is one of
+# those scripts, so that failure is only in the run's log.
 #
 # Failing gracefully: a review that finished but went past --max-turns (the
 # action then reports a failure) still has its summary in the action's

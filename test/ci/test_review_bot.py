@@ -518,9 +518,18 @@ class TestInterdiff(unittest.TestCase):
         other = "diff --git a/b.py b/b.py\nindex 1..2 100644\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-a\n+b\n"
         mode = self.REVIEWED.replace("index 1111111", "old mode 100644\nnew mode 100755\nindex 1111111")
         binary = "diff --git a/w.bin b/w.bin\nindex {}\nBinary files a/w.bin and b/w.bin differ\n"
+        between_blanks = ("diff --git a/a.py b/a.py\nindex 1..2 100644\n--- a/a.py\n+++ b/a.py\n"
+                          "@@ -10,4 +10,5 @@ def f():\n     {}\n \n+    guard()\n \n     {}\n")
+        faked_header = self.REVIEWED.replace("+    guard()\n",
+                                             "+    guard()\n+    evil()\n+    s = '\fdiff --git a/a.py b/a.py\n")
+        below = self.REVIEWED.replace("     z = 4\n", "     w = 5\n")
         for name, old, new, shown in (
                 ("a guard moved to another function", self.REVIEWED, moved, "def h()"),
                 ("a guard moved inside its function", self.REVIEWED, moved_inside, "pass"),
+                ("a guard moved between blank lines in its function", between_blanks.format("a()", "b()"),
+                 between_blanks.format("c()", "d()"), "c()"),
+                ("the line below a change", self.REVIEWED, below, "w = 5"),
+                ("a form feed faking a file header", self.REVIEWED, faked_header, "evil()"),
                 ("a dropped hunk", self.REVIEWED, without_hunk, "def g()"),
                 ("a dropped file", self.REVIEWED + other, self.REVIEWED, "b.py"),
                 ("a mode change beside hunks", self.REVIEWED, mode, "new mode"),
@@ -530,6 +539,8 @@ class TestInterdiff(unittest.TestCase):
         self.assertEqual(bot.interdiff(binary.format("1..2 100644"), binary.format("9..2 100644")), "",
                          "main changing a binary's old side would read as the PR's change")
         self.assertIn(bot.DROPPED, bot.interdiff(self.REVIEWED + other, self.REVIEWED))
+        self.assertNotIn(bot.DROPPED, bot.interdiff(self.REVIEWED, mode),
+                         "a mode change beside hunks would list the file as dropped")
 
 
 class TestDispatcher(unittest.TestCase):

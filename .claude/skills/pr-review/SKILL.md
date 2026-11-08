@@ -78,8 +78,8 @@ turn re-reads everything read so far.
   review, or after a force-push, a rebase or a merge of `main` the interdiff (the PR's own hunks whose
   changes differ from its diff then, and what it dropped). Re-check every earlier finding by reading
   the lines it cites, review only the new and dropped hunks, and load nothing else: never the whole
-  PR's diff or a file no new hunk touches, and a caller only where a new hunk changes its contract, by
-  line range. Review the whole PR again only when the earlier review skipped files. With a shell, `git
+  PR's diff or a file no new or dropped hunk touches, and a caller only where a new hunk changes its
+  contract, by line range. Review the whole PR again only when the earlier review skipped files. With a shell, `git
   range-diff` gives the interdiff. The bot's prompt names its files.
 - **The stack.** For a stacked PR, diff against the base PR. With a shell, find the open PRs built
   on this one (`gh pr list --base <headRefName>`, recursively) and read their code. A finding that a
