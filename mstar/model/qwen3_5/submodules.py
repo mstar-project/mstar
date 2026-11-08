@@ -74,14 +74,14 @@ class LLMSubmodule(SampledTokenDecoder):
     # few tokens over the 2048-token step budget. 1152-1792 hold a prompt a
     # little past 1024 tokens (1024 plus its chat template) without padding it
     # to 2048. Only a text-prefill step, one with no decode rows beside it,
-    # uses them; a mixed step doesn't capture them. The ladder is sized for
-    # the default step budget, which no step past 2176 reaches. 4096 and 8192
-    # serve a deployment that raises `max_batch_tokens` or turns chunking off,
-    # where a step up to a power of two fills one; a step just past one pads to
-    # the next, and past 8192 runs eagerly. Such a deployment adds its own slack
-    # rungs with `model_kwargs.prefill_token_buckets` (static buffers are sized
-    # by the largest bucket): each bucket is one more compile against Dynamo's
-    # recompile limit, so the default doesn't carry rungs it never reaches.
+    # uses them; a mixed step doesn't capture them. Under the default step
+    # budget no step passes 2176. The default keeps 4096 and 8192, the powers
+    # of two a deployment that raises `max_batch_tokens` or turns chunking off
+    # fills exactly, and leaves it the slack rungs above them, since each
+    # bucket is one more compile against Dynamo's recompile limit: there a step
+    # just past a power of two pads to the next, and past 8192 runs eagerly,
+    # unless `model_kwargs.prefill_token_buckets` adds them (static buffers are
+    # sized by the largest bucket).
     PREFILL_TOKEN_BUCKETS = [
         32, 64, 128, 256, 512, 1024, 1152, 1280, 1536, 1792, 2048, 2176, 4096, 8192,
     ]
@@ -112,6 +112,7 @@ class LLMSubmodule(SampledTokenDecoder):
     # tokens over it (2176). Every (rows, tokens) pair here is one more recompile of the
     # forward all these captures share, and past Dynamo's limit the buckets
     # compiled last run uncompiled inside their graphs.
+    # the scaffold's mixed capture sizes: a class that sets its own sets this too
     MIXED_SLACK_TOKENS = MAX_BATCH_TOKENS + SampledTokenDecoder.MIXED_CAPTURE_BATCH_SIZES[-1]
     MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS, MIXED_SLACK_TOKENS)
 

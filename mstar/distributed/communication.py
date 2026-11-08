@@ -292,10 +292,8 @@ class CommGroup:
         ``scatter_dim``, split evenly (q, k and v with their own head counts):
         they go in one exchange and come back as a tuple. Each exchange is one
         ``all_to_all_single`` over a buffer packed in a single copy, which
-        replays from a CUDA graph. The collective is hidden from torch.compile,
-        so a compiled caller breaks around this call; tracing it as a
-        functional collective instead gave an illegal memory access in
-        Cosmos3's batched capture.
+        replays from a CUDA graph. It runs outside torch.compile, so a compiled
+        caller breaks around this call.
         """
         tensors = (input_,) if isinstance(input_, torch.Tensor) else tuple(input_)
         if self.world_size == 1:
