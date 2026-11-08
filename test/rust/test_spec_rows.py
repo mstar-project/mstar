@@ -152,7 +152,7 @@ def _worker(
     request_state = RequestStateManager(node_to_partition={NODE: PART, NODE_B: PART})
     # every row ready, and no resource splits a walk, so a mixed step keeps its rows' order
     engine = SimpleNamespace(
-        check_ready=lambda *a, **k: SimpleNamespace(queued=False, reason=None, ok=True, ready=True),
+        check_ready=lambda *a, **k: SimpleNamespace(queued=False, rebuild=False, reason=None, ok=True, ready=True),
         order_split_rows=lambda node, walk, rids, walks: rids,
         release_cached_prefix=lambda batch: None,
     )
