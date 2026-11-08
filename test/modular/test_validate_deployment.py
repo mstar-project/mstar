@@ -576,9 +576,10 @@ def test_a_lora_deployment_passes(tmp_path):
                               "has a `resources: lora:` block, but _LoraModel serves no LoRA adapters"),
     (True, None, "declaring the LoRA specs failed: ValueError: `resources: lora:` must be a mapping; got None"),
 ], ids=["bad_value", "no_lora_specs", "not_a_mapping"])
-def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, serves_lora, block, refusal):
+def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, monkeypatch, serves_lora, block, refusal):
     """The `lora:` block sizes every LoRA spec; a bad value there is one problem, and the
     other resources' checks still run."""
+    monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)  # the async scheduler on, its default
     cfg = _cfg(tmp_path, [
         {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
         {"node_names": ["b"], "ranks": [2]},
@@ -587,10 +588,33 @@ def test_a_bad_lora_value_is_reported_with_the_other_problems(tmp_path, serves_l
         [_lora_spec(nodes={"a"}), _lora_spec("lora_b", nodes={"b"})] if serves_lora else [],
         _a_then_b, specs=[_Spec("kv", {"a", "b"})], tp_enabled_nodes=["a"],
     )
+    tp = ["node_groups entry ['a'] runs LoRA node(s) ['a'] at tp_size 2 under the async TP scheduler, "
+          "which LoRA does not support yet; set `tp_async_sched: false` (or leave these nodes out of its "
+          "list), serve them at tp_size 1, or drop the 'lora:' block"]
     assert _problems(model, cfg) == [
+        *(tp if serves_lora and block is not None else []),
         refusal,
         "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas",
     ]
+
+
+@pytest.mark.parametrize("tp_async_sched, refused", [(None, True), (False, False), (["b"], False)],
+                         ids=["async_default", "serial", "async_elsewhere"])
+def test_lora_on_a_node_the_async_tp_scheduler_runs_is_refused(tmp_path, monkeypatch, tp_async_sched, refused):
+    """Each rank picks its own LoRA slots, and the async TP scheduler can tear a request
+    down on one rank between a step's broadcast and its admit; the serial protocol
+    cannot, so a TP LoRA node outside the async scheduler passes."""
+    monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)
+    extra = {} if tp_async_sched is None else {"tp_async_sched": tp_async_sched}
+    cfg = _cfg(tmp_path, [
+        {"node_names": ["a"], "ranks": [0, 1], "tp_size": 2},
+        {"node_names": ["b"], "ranks": [2]},
+    ], resources={"lora": {"max_slots": 2}}, **extra)
+    model = _LoraModel([_lora_spec(nodes={"a"})], _a_then_b, specs=[_Spec("kv", {"a"})], tp_enabled_nodes=["a"])
+    if refused:
+        _refused(model, cfg, r"LoRA node\(s\) \['a'\] at tp_size 2 under the async TP scheduler")
+    else:
+        _validate(model, cfg)
 
 
 # -- every problem at once ----------------------------------------------------

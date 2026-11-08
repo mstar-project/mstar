@@ -722,6 +722,12 @@ Under TP the LLM's targets split as its linears do (the 27B's single K/V head pe
 at TP4, and the DeltaNet ``a`` gate padded per rank, included); the vision encoder runs
 on one GPU in every shipped config.
 
+For now, though, startup refuses a LoRA node at ``tp_size`` above 1 that the async TP
+scheduler runs (its default): each rank picks its own adapter slots, and the async
+scheduler can still tear a request down on one rank between a step's broadcast and its
+admit (#1082 fences that). Under TP, serve LoRA with ``tp_async_sched: false`` (or a
+``tp_async_sched`` node list that leaves the LoRA node out) until then.
+
 LoRA needs the Python frontend (``--rust-frontend`` refuses to start with a ``lora``
 block).
 

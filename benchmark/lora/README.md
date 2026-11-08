@@ -140,8 +140,11 @@ kept 96.2/96.2/97.2% of its LoRA-off throughput at c=1/32/64 without that captur
 
 ## 4. Tensor parallelism: TP2 against one GPU, and slot churn (about 30 minutes, 2 GPUs)
 
+Until #1082 lands, startup refuses LoRA on a tensor-parallel node under the async TP
+scheduler (`docs/models.rst`), so the phase runs `MSTAR_TP_ASYNC_SCHED=0` only.
+
 Needs at least two GPUs and the `reference` and captured `serve` output of
-section 2 in the same `--out`. With `MSTAR_TP_ASYNC_SCHED=0` and `=1` in turn, the
+section 2 in the same `--out`. With `MSTAR_TP_ASYNC_SCHED=0` (the serial TP protocol), the
 same server with the LLM node at TP2 (vision encoder on rank 0):
 
 ```
@@ -149,7 +152,8 @@ python -m benchmark.lora.qwen3_5_parity --model qwen3_5_0.8b --out ~/lora_parity
 ```
 
 (`--model qwen3_5_9b` for the 9B, whose stock config is single-GPU too; `--tp 2`
-rewrites the node groups either way. `--async-sched 1` runs one setting.)
+rewrites the node groups either way. `--async-sched 0,1` adds the async scheduler once
+#1082 lands.)
 
 * Parity: every `serve` request against the single-GPU captured run, by the
   `graphs` rule (identical, or a first difference where both tokens are in the
@@ -162,10 +166,10 @@ rewrites the node groups either way. `--async-sched 1` runs one setting.)
   evictions, and the run finishes (each request times out at 300 s, so a hang
   surfaces as failures).
 
-Pass: the phase exits 0 for both settings. Results: `mstar_tp2_async{0,1}.json`,
-`tp_tp2_async{0,1}.json` and `server_tp2_async{0,1}.log`; copy them off after each
-setting. `MSTAR_TP_ASYNC_SCHED=1` is the setting that exercises the leader's
-teardowns landing behind a speculated step's admit; `=0` is today's default.
+Pass: the phase exits 0. Results: `mstar_tp2_async0.json`, `tp_tp2_async0.json` and
+`server_tp2_async0.log`; copy them off after the run. `MSTAR_TP_ASYNC_SCHED=1`, the default
+outside this harness, exercises the leader's teardowns landing behind a speculated step's
+admit, and waits on #1082.
 
 ## 5. Prefix caching keyed by adapter, on Orpheus (about 15 minutes)
 
