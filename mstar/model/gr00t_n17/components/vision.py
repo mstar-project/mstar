@@ -40,11 +40,13 @@ class ConvPatchEmbed(VisionPatchEmbed):
     """The patch embed as a ``Conv3d``, as transformers' Qwen3-VL, which GR00T runs,
     computes it. The shared one does the same sum as one matmul over flattened patches,
     which rounds differently in bf16: enough to put the vision outputs past the 1.2x
-    bar on GR00T's recorded requests. GR00T's 1,792 patches a request keep the conv cheap."""
+    bar on GR00T's recorded requests. GR00T's 1,792 patches a request keep the conv cheap.
+    ``proj``'s own forward is that matmul, so the conv runs on its weights here."""
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
-        return self.proj(x.to(self.proj.weight.dtype)).view(-1, self.embed_dim)
+        w = self.proj.weight
+        return nn.functional.conv3d(x.to(w.dtype), w, self.proj.bias, stride=self.proj.stride).view(-1, self.embed_dim)
 
 
 class Gr00tN17VisionEncoder(nn.Module):

@@ -124,7 +124,7 @@ def test_the_patch_embed_is_nvidias_conv():
         embed = ConvPatchEmbed(vision).to(torch.bfloat16)
     # a request's patches: at a few dozen rows the two sums often agree outright
     x = torch.randn(1792, 3 * 2 * 16 * 16, generator=torch.Generator().manual_seed(0)).to(torch.bfloat16)
-    conv = embed.proj(x.view(-1, 3, 2, 16, 16)).view(-1, vision.hidden_size)
+    conv = nn.Conv3d.forward(embed.proj, x.view(-1, 3, 2, 16, 16)).view(-1, vision.hidden_size)
     assert torch.equal(embed(x), conv)
     # the shared forward is a different function at this size, so the check above can fail
     assert not torch.equal(VisionPatchEmbed.forward(embed, x), conv)
