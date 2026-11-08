@@ -520,7 +520,8 @@ does; read it.
   unbounded cache on the shipped streaming path was first filed as a nit; the trace showed it grew
   every frame.)
 - **Every P0–P2 finding has a "how to confirm" line:** the request, test or GPU check that would show
-  it, and what it would show. Outside full mode it is not run.
+  it, and what it would show. The live test doesn't run it: it starts only when no P0–P2 finding is
+  open (§7).
 - **The PR's tests are evidence too.** Trace each new test against `main`'s code: count apart the
   ones that fail for the bug and the ones that fail only on a name the PR adds, say what each would
   accept that is wrong, and name the tests that model a failure the system never produces (#465:
@@ -560,8 +561,7 @@ The live test is a second session that runs after the review, on the GPU box, wi
 nothing else: no GitHub token and no cloud keys. It follows `.claude/skills/live-pr-test/SKILL.md`
 (cluster mode: the box is already provisioned) end to end: its plan, risk map, reach before results,
 reference parity, both frontends where they apply. It gets the PR, the head commit to test, the
-review's reason for its call, the "how to confirm" lines of open P0–P2 findings and the review's
-focus.
+review's reason for its call and its focus.
 
 **The review decides whether and what the live test runs**, on every review and re-review, from
 what the change can affect, and says why. "The change" is what changed since the PR's last passing
@@ -570,8 +570,7 @@ commits), else the whole PR (`pr.diff`). On a re-review that can be more than th
 the last review.
 - `run`:
   - `full`: plan the live test over the whole change;
-  - `targeted`: only the checks the change reaches, plus the "how to confirm" lines of open P0–P2
-    findings;
+  - `targeted`: only the checks the change reaches;
   - `none`: nothing in the change needs a GPU run to settle it (docs, comments, tests, benchmarks,
     or code no served request runs); never a change to what a model or the server does, however
     small. On a `none` with no passing live test before it, only docs, tests and benchmarks can be
@@ -588,8 +587,9 @@ the last review.
   no commands. Empty when you have none. The live test folds them into its risk map.
 
 The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
-counts them), no open question and no skipped file. Otherwise no box starts, and the comment lists
-what to fix first and asks for `/review` again; the design risk doesn't hold it back.
+counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first
+and asks for `/review` again; an open question and the design risk don't hold it back, though both
+still stop approval.
 
 The bot overrides the review's call in two cases: when the PR's last live test didn't pass on an
 ancestor of the head (it failed, was partial or unavailable, or ran on a commit since rebased away),
@@ -607,11 +607,7 @@ the changed code; stop as soon as the plan is done; and never rerun a passing ch
 unchanged.
 
 **On the box:**
-- **The review's findings are claims too.** Add the "how to confirm" lines of its P0–P2 findings to
-  the plan, so the run settles them.
-- **Results are evidence.** A confirmed finding becomes verified with the run as proof; a finding the
-  run contradicts is reported as contradicted, with the row; a check that didn't reach the changed
-  code proves nothing (mark it so).
+- **Results are evidence.** A check that didn't reach the changed code proves nothing (mark it so).
 - **A failed or regressed check is a finding** at the bar's priority, with the run as proof: the
   config, the input, the observed and expected outcome, and where the evidence is.
 - **Outcome**, one of:
@@ -638,7 +634,7 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
 - the rule cited, when one applies;
 - the fix: the concrete hook, helper, resource, home or deletion; a small exact replacement only
   when it is a drop-in for the anchored lines;
-- how to confirm (P0–P2), and for full mode the live-test row that settled it;
+- how to confirm (P0–P2);
 - for performance findings: est. with arithmetic, probability, expected speedup, difficulty;
 - for style findings, a leading "Nit:". Say plainly what blocks, and name the concrete home.
 

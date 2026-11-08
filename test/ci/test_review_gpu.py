@@ -63,13 +63,13 @@ class TestApproval(unittest.TestCase):
         saved = {k: globs[k] for k in ("gh", "gh_json", "review_threads")}
         self.addCleanup(globs.update, saved)
 
-        def why(verdict, run, files=("docs/models.rst",), since=None, skipped=()):
+        def why(verdict, run, files=("docs/models.rst",), since=None, skipped=(), questions=()):
             compare = {"files": [{"filename": f} for f in files]}
             globs.update(gh=lambda *a, check=True: argparse.Namespace(stdout="write\n"),
                          gh_json=lambda path: compare if "/compare/" in path else pr, review_threads=lambda pr: [])
-            r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": list(skipped),
+            r = {"outside_diff": [], "prior_findings": [], "questions": list(questions), "skipped": list(skipped),
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
-                 "live_test": {"run": run, "reason": "docs only", "confirm": [], "checks": ["correctness"], "gpus": 1}}
+                 "live_test": {"run": run, "reason": "docs only", "checks": ["correctness"], "gpus": 1}}
             a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict, since=since,
                                    above="stacked-above.json")
             return GPU_REVIEW["reasons_not_to_approve"](a, r)[0]
@@ -77,6 +77,8 @@ class TestApproval(unittest.TestCase):
         self.assertEqual(why("pass", "full"), [])
         self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), ["the review skipped files"],
                          "a review that left files unread could approve them")
+        self.assertEqual(why("pass", "full", questions=["q"]), ["1 open question(s)"],
+                         "a review that left a question open could approve")
         self.assertEqual(why("skipped", "none", ("docs/models.rst", "test/ci/test_x.py", "benchmark/run.py")), [],
                          "a change that needs no GPU run could never be approved")
         self.assertEqual(why("skipped", "targeted"), ["the live test's verdict is skipped"],
@@ -185,7 +187,6 @@ class TestCarry(unittest.TestCase):
         p1 = {"priority": "P1", "claim": "c", "location": "mstar/engine/engine.py:10", "detail": "d"}
         for review, threads, why in [({"outside_diff": [p1]}, (), "engine.py:10 (P1)"),
                                      ({}, [thread(4, "**[P2]** an inline finding")], "inline 4 (P2)"),
-                                     ({"questions": ["q"]}, (), "1 open question(s)"),
                                      ({"skipped": ["a.py"]}, (), "the review skipped files")]:
             with self.subTest(why):
                 self.assertEqual(self.carry(False, "full", ["correctness"], [], "", review=review,
@@ -193,8 +194,9 @@ class TestCarry(unittest.TestCase):
                 self.assertIn(why, self.gate)
         p3 = {**p1, "priority": "P3"}
         self.assertEqual(self.carry(False, "full", ["correctness"], [], "", review={
-            "outside_diff": [p3], "risk": {"level": "high", "reason": "r", "look_at": []}})[0],
-            {"run": "full", "checks": "correctness"}, "a P3 or the design risk would hold the live test back")
+            "outside_diff": [p3], "questions": ["q"], "risk": {"level": "high", "reason": "r", "look_at": []}})[0],
+            {"run": "full", "checks": "correctness"},
+            "a P3, an open question or the design risk would hold the live test back")
 
 
 class TestStart(unittest.TestCase):
@@ -203,7 +205,7 @@ class TestStart(unittest.TestCase):
     def start(self, env_key, cfg, launch_code=0, **args):
         out = Path(tempfile.mkdtemp())
         (out / "review.json").write_text(json.dumps({"live_test": {
-            "run": "full", "reason": self.INJECTED, "confirm": [self.INJECTED], "checks": ["correctness"],
+            "run": "full", "reason": self.INJECTED, "checks": ["correctness"],
             "gpus": 1, "focus": [{"what": self.INJECTED, "why": "the PR's own path"}]}}))
         offers = [{"id": "slurm:node1:1", "provider": "slurm", "gpu": "H200", "count": 1, "usd_per_hour": 0.0,
                    "availability": "8 free"},
