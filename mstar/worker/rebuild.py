@@ -34,11 +34,9 @@ logger = logging.getLogger(__name__)
 # The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
 # at 8 B each.
 DEFAULT_REBUILD_HOST_MB = 64
-# The serving config's ``rebuild_media_host_mb`` unless it sets one, added to the host pool only when a node copies
-# what a walk reads besides the ids and ``rebuild_host_mb`` isn't 0. A 1024-token image at hidden size 4096 is 8 MiB
-# of bf16 encoder output. With ``rebuild_host_mb``'s default that makes the pool 1 GiB, a power of two, so it isn't
-# rounded up to 2 GiB.
-DEFAULT_REBUILD_MEDIA_HOST_MB = 960
+# The same where a node copies what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of
+# bf16 encoder output.
+DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 
 @dataclass(slots=True)
@@ -245,7 +243,7 @@ class Rebuilds:
             logger.warning(
                 "%s: the rebuild host pool has no room for the %d bytes a request's ids and host copies take, with %d "
                 "of %d bytes in use, so the request can't be dropped there. Only the first on each node is logged, "
-                "and the serving config's rebuild_host_mb and rebuild_media_host_mb size the pool.",
+                "and the serving config's rebuild_host_mb sizes the pool.",
                 node, nbytes, self._pool.nbytes_used(), self._pool.nbytes,
             )
         ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)

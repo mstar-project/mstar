@@ -362,22 +362,16 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
        chunked walk. See *Chunked prefill budgets* below.
    * - ``rebuild_host_mb``
-     - *(optional, default 64)* MiB of pinned host memory a worker serving a node whose model
-       declares a rebuild policy sets aside at startup for its requests' prompt ids, which a
-       request dropped from the KV cache is rebuilt from. A request takes its room when it
-       arrives, 8 B a token (int64), and gives back what its ids don't use once its prompt is kept. One
-       the pool can't hold then is never dropped on that node, though it can still move to the
-       host with ``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it
+     - *(optional, default 64, or 1024 where a node copies media)* MiB of pinned host memory a worker serving a
+       node whose model declares a rebuild policy sets aside at startup for what its requests are rebuilt from
+       after a drop from the KV cache: their prompt ids, and, where the node's rebuild policy copies what a walk
+       reads besides the ids, those copies too, such as Qwen3.5's encoder output for a prompt with images or
+       video at one rank. A request takes its room when it arrives, 8 B a token (int64) and its copies at the
+       values per slot the policy declares in the node's dtype, and gives back what it doesn't use once its
+       prompt and copies are kept. One the pool can't hold then is never dropped on that node, though it can
+       still move to the host with ``cpu_offload_pages``. A TP, SP or CFG node never drops a request, so it
        keeps no ids and sets no memory aside. A non-negative int, and 0 sets no pool aside, so no request is
-       dropped there. The pool is this plus ``rebuild_media_host_mb`` where that applies, rounded up to a
-       power of two, as the pinned allocator would round it anyway.
-   * - ``rebuild_media_host_mb``
-     - *(optional, default 960)* MiB added to that pool on a worker where a node's rebuild policy
-       copies what a walk reads besides the ids, such as Qwen3.5's encoder output for a prompt
-       with images or video, at one rank. A request takes room for its ids and copies together,
-       at the values per slot the policy declares in the node's dtype, and gives back what its copies didn't use once
-       they are taken. A non-negative int, and with ``rebuild_host_mb: 0`` there is no pool to add to. With
-       both defaults the pool is 1 GiB.
+       dropped there. The pool is rounded up to a power of two, as the pinned allocator would round it anyway.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -1145,7 +1139,7 @@ or ``increase()``.
   request needs the room.
 - ``mstar_rebuild_host_bytes_used{model_name, component}``,
   ``mstar_rebuild_host_bytes_total{model_name, component}``: bytes of the worker's
-  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids, and the pool's size.
+  rebuild host pool (``rebuild_host_mb``) that hold kept prompt ids and host copies, and the pool's size.
   A prompt the pool has no room for keeps no ids, so its request is never dropped.
 - ``mstar_step_seconds{model_name, component, graph_walk}``: histogram over engine
   steps that ran a forward. A step counts from when the worker hands it to its GPU

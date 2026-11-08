@@ -267,8 +267,8 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    the cache frees the others when a request needs the room.
 
 ``mstar_rebuild_host_bytes_used{model_name, component}``
-   Gauge. Bytes of the worker's rebuild host pool that hold kept prompt ids, which a
-   request dropped from the KV cache is rebuilt from. A prompt the pool has no room for
+   Gauge. Bytes of the worker's rebuild host pool that hold kept prompt ids and host
+   copies, which a request dropped from the KV cache is rebuilt from. A prompt the pool has no room for
    keeps no ids, so its request is never dropped. One pool serves every node of a worker
    that declares a rebuild policy, and shows under each.
 
