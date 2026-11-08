@@ -719,7 +719,10 @@ class AcceleratorGraphRunner:
                 device, joint_comm_group.world_size
             )
         )
-        if token_ladders:
+        # a class that captures no walk has its walk ladders refused by
+        # `apply_region_ladders`, which names its regions
+        captures = type(submodule).get_accelerator_graph_configs is not NodeSubmodule.get_accelerator_graph_configs
+        if token_ladders and captures:
             apply_token_ladders(submodule_name, self._capture_configs, token_ladders, step_budget)
         self._resources = resources
         self._step_runner = step_runner

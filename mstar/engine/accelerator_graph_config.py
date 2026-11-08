@@ -347,6 +347,7 @@ def apply_token_ladders(
 def apply_region_ladders(
     node: str, configs: Mapping[str, "PiecewiseAcceleratorGraphConfig"],
     ladders: Mapping[str, list[int]], walk_ladders: Mapping[str, Any], declares_regions: bool,
+    declares_captures: bool,
 ) -> None:
     """Take a serving config's ``prefill_token_buckets`` for ``node`` that name
     no walk of it (`EngineManager` split them off) as the ``total_tokens`` of
@@ -356,8 +357,17 @@ def apply_region_ladders(
     region the config also names as a walk, or one captured by batch size
     alone. A node whose submodule ``declares_regions`` (overrides
     `NodeSubmodule.get_piecewise_accelerator_graph_configs`) but returned none
-    at this deployment logs and skips.
+    at this deployment logs and skips. The node's ``walk_ladders`` are refused
+    here, naming its regions, where its submodule never ``declares_captures``
+    (overrides `NodeSubmodule.get_accelerator_graph_configs`);
+    `apply_token_ladders` takes them otherwise.
     """
+    if walk_ladders and not declares_captures:
+        regions = f"; its piecewise regions are {sorted(configs)}" if configs else ""
+        raise ValueError(
+            f"prefill_token_buckets names walks {sorted(walk_ladders)} of {node}, which captures no "
+            f"walk{regions}"
+        )
     both = sorted(set(configs) & set(walk_ladders))
     if both:
         raise ValueError(

@@ -864,10 +864,11 @@ def test_a_name_that_is_no_walk_sets_the_piecewise_region_it_labels():
         regions({"backbone_layer": [256]})
 
 
-def _tower_with_ladder(tower: str, ladder: list[int]):
+def _tower_with_ladder(tower: str, ladder: list[int], walk: str | None = None):
     """A vision block-loop or AuT encoder node, its region captured on the serving
-    config's ``ladder`` and its attention resource sized from the class's own top
-    bucket, as the models declare it: the node and its region's runner."""
+    config's ``ladder`` (or, with ``walk``, the ladder named for that walk instead)
+    and its attention resource sized from the class's own top bucket, as the models
+    declare it: the node and its region's runner."""
     from mstar.model.components.aut_encoder import AuTEncoderConfig
     from mstar.model.components.aut_submodule import AuTEncoderSubmodule
     from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP, PackedBlockLoopEncoder
@@ -886,7 +887,8 @@ def _tower_with_ladder(tower: str, ladder: list[int]):
         node.node_resources = {"audio_attn": SimpleNamespace(
             max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(config))}
         label = "aut_encode"
-    mgmt = make_mgmt(node, joint_comm_group=SimpleNamespace(world_size=1), region_ladders={label: ladder})
+    named = {"token_ladders": {walk: ladder}} if walk else {"region_ladders": {label: ladder}}
+    mgmt = make_mgmt(node, joint_comm_group=SimpleNamespace(world_size=1), **named)
     (runner,) = make_engine(_submodules={"node": mgmt})._build_piecewise_runners("node", mgmt).values()
     return node, runner
 
@@ -910,6 +912,13 @@ def test_an_audio_clip_past_the_window_ceiling_runs_eagerly_however_long_the_lad
     assert node.can_batch(None, [SimpleNamespace(input_seq_len=3000)] * 2)
     # clips over the ceiling run one by one, not as one eager step of them all
     assert not node.can_batch(None, [SimpleNamespace(input_seq_len=5000)] * 2)
+
+
+def test_a_walk_named_on_a_node_that_captures_no_walk_is_refused_naming_its_regions():
+    """Qwen3.5's vision tower captures only its block-loop region, so a ladder named
+    for one of its walks could never apply."""
+    with pytest.raises(ValueError, match="vision_block_loop"):
+        _tower_with_ladder("vision", [256, 1024], walk="prefill_vision")
 
 
 @pytest.mark.parametrize("regions_off", [True, False])
