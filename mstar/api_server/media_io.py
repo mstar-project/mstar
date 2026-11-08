@@ -200,25 +200,32 @@ class RefAudioTooLongError(ValueError):
     """A clip that opens as audio but runs past ``MAX_REF_AUDIO_SECONDS``."""
 
 
-def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
-    """Persist bare base64 that passes :func:`check_ref_audio`; return its path,
-    or None (leaving nothing behind) when it is not base64 or not loadable audio.
+#: The refusal of a bare-base64 ``ref_audio`` that is not audio the model decodes.
+BARE_REF_AUDIO_REFUSAL = (
+    "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
+    "or base64 audio the model can decode"
+)
 
-    A path such as ``/etc/passwd`` is valid base64 too, so the alphabet cannot
-    tell them apart; the decoder can. A clip that is audio but too long raises
-    :class:`RefAudioTooLongError`.
-    """
-    try:
-        _, path = save_base64(b64, "wav", "audio", upload_dir)
-    except ValueError:
-        return None
+
+def check_saved_ref_audio(path: str, decoder: str, bare: bool) -> None:
+    """:func:`check_ref_audio` for a request's reference clip, saved at ``path``;
+    on failure the clip is deleted and ValueError says why. ``bare`` is a clip sent
+    as bare base64: a path such as ``/etc/passwd`` is valid base64 too, so the
+    alphabet cannot tell them apart and the decoder decides, and one that does not
+    open gets :data:`BARE_REF_AUDIO_REFUSAL`. A clip that opens but runs too long
+    raises :class:`RefAudioTooLongError` either way.
+
+    Both frontends call it: the Python adapters after saving the clip, and the Rust
+    frontend's bridge for a clip ``mstar-server`` saved, so the model's own loader
+    is the judge on both."""
     try:
         check_ref_audio(path, decoder)
     except RefAudioTooLongError:
         raise
     except ValueError:
-        return None
-    return path
+        if bare:
+            raise ValueError(BARE_REF_AUDIO_REFUSAL) from None
+        raise
 
 
 def check_ref_audio(path: str, decoder: str) -> None:

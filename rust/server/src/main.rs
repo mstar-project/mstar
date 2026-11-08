@@ -821,10 +821,23 @@ async fn audio_speech(
         Ok(fmt) => fmt,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    let args = match adapter.speech_to_request(&req) {
-        Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+    // Blocking: a data URL decoded, a clip saved, a remote fetch of up to 30 s.
+    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let (req, translated) = blocking(move || {
+        let speech = adapter.speech_to_request(&req, &dir, remote);
+        (req, speech)
+    })
+    .await;
+    let adapters::Speech { args, ref_audio } = match translated {
+        Ok(s) => s,
+        Err((status, e)) => return error(status, &e, error_type(status)),
     };
+    // The model's own loader judges the clip, before any piece is submitted.
+    if let (Some(check), Some(bridge)) = (&ref_audio, &st.bridge) {
+        if let Err((status, e)) = bridge.check_ref_audio(check, st.request_timeout).await {
+            return error(status, &e, error_type(status));
+        }
+    }
     let chunking = adapter.speech_chunking();
     let pieces =
         match speech_chunking::plan_chunks(req.extra.get("sentence_chunking"), &chunking, &req.input) {

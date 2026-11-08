@@ -279,10 +279,13 @@ fn forward_sent_speed(mk: &mut Map<String, Value>, req: &SpeechRequest) {
     }
 }
 
-/// Voice cloning needs the reference clip decoded and checked before submit
-/// (`_resolve_ref_audio`), and this frontend has no audio decoder.
-pub const REF_AUDIO_REFUSAL: &str =
-    "ref_audio is not supported by the Rust frontend; serve without --rust-frontend to clone a voice";
+/// A speech request's submission, and the reference clip it carries for the API
+/// server to check before anything is submitted (`_resolve_ref_audio`'s check).
+#[derive(Debug)]
+pub struct Speech {
+    pub args: SubmitArgs,
+    pub ref_audio: Option<crate::media::RefAudioCheck>,
+}
 
 /// `/v1/audio/speech` sentence chunking: the adapter's `speech_chunk_*`
 /// attributes (see `speech_chunking::plan_chunks`).
@@ -445,7 +448,37 @@ impl Adapter {
         }
     }
 
-    pub fn speech_to_request(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
+    /// The library a voice-cloning model's loader opens `ref_audio` with
+    /// (`_resolve_ref_audio`'s `decoder`); `None` for a model that takes none.
+    fn ref_audio_decoder(&self) -> Option<&'static str> {
+        match self {
+            Adapter::Qwen3TTS => Some("soundfile"),
+            _ => None,
+        }
+    }
+
+    /// `speech_to_request`, saving a `ref_audio` the model clones a voice from:
+    /// it becomes the request's audio input, as the Python adapter's does.
+    pub fn speech_to_request(
+        &self,
+        req: &SpeechRequest,
+        upload_dir: &Path,
+        allow_remote: bool,
+    ) -> Result<Speech, (u16, String)> {
+        let mut args = self.speech_args(req).map_err(|e| (400, e))?;
+        let Some(decoder) = self.ref_audio_decoder() else {
+            return Ok(Speech { args, ref_audio: None });
+        };
+        let Some(reference) = args.model_kwargs.remove("ref_audio").filter(truthy) else {
+            return Ok(Speech { args, ref_audio: None });
+        };
+        let check = crate::media::save_ref_audio(&reference, upload_dir, allow_remote, decoder)?;
+        args.file_paths.insert("audio".to_string(), vec![check.path.clone()]);
+        args.input_modalities = vec!["audio".to_string(), "text".to_string()];
+        Ok(Speech { args, ref_audio: Some(check) })
+    }
+
+    fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
         match self {
             Adapter::Qwen3Omni => {
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
@@ -499,9 +532,6 @@ impl Adapter {
                     },
                 );
                 forward_sent_speed(&mut mk, req);
-                if *self == Adapter::Qwen3TTS && mk.remove("ref_audio").is_some_and(|r| truthy(&r)) {
-                    return Err(REF_AUDIO_REFUSAL.to_string());
-                }
                 Ok(SubmitArgs {
                     tokens: None,
                     text: Some(req.input.clone()),
@@ -1015,7 +1045,7 @@ mod tests {
     #[test]
     fn a_qwen3_tts_speech_maps_instructions_sampling_and_a_sent_speed() {
         let args = Adapter::Qwen3TTS
-            .speech_to_request(&speech(
+            .speech_args(&speech(
                 r#"{"input":"Hello.","voice":"ryan","language":"English","instructions":"calm",
                     "temperature":0.7,"top_p":0.8,"seed":4,"speed":1.25,"top_k":20,"stream":true}"#,
             ))
@@ -1031,29 +1061,51 @@ mod tests {
 
     #[test]
     fn a_qwen3_tts_speech_keeps_an_explicit_instruct_and_drops_empty_instructions() {
-        let mk = |body: &str| Value::Object(Adapter::Qwen3TTS.speech_to_request(&speech(body)).unwrap().model_kwargs);
+        let mk = |body: &str| Value::Object(Adapter::Qwen3TTS.speech_args(&speech(body)).unwrap().model_kwargs);
         assert_eq!(mk(r#"{"input":"x","instructions":"calm","instruct":"bright"}"#), serde_json::json!({"instruct": "bright"}));
         assert_eq!(mk(r#"{"input":"x","instructions":""}"#), serde_json::json!({}));
         assert_eq!(mk(r#"{"input":"x","speed":null}"#), serde_json::json!({"speed": null}));
-        assert_eq!(mk(r#"{"input":"x","ref_audio":""}"#), serde_json::json!({}));
+        // an empty clip is dropped, as the Python adapter pops it
+        let speech = Adapter::Qwen3TTS.speech_to_request(&speech(r#"{"input":"x","ref_audio":""}"#), Path::new("/unused"), false);
+        assert_eq!(Value::Object(speech.unwrap().args.model_kwargs), serde_json::json!({}));
     }
 
     #[test]
     fn every_speech_adapter_forwards_only_a_sent_speed() {
         for adapter in [Adapter::Qwen3TTS, Adapter::Orpheus, Adapter::Qwen3Omni] {
-            let args = adapter.speech_to_request(&speech(r#"{"input":"x"}"#)).unwrap();
+            let args = adapter.speech_args(&speech(r#"{"input":"x"}"#)).unwrap();
             assert!(!args.model_kwargs.contains_key("speed"), "{adapter:?}");
-            let args = adapter.speech_to_request(&speech(r#"{"input":"x","speed":"2"}"#)).unwrap();
+            let args = adapter.speech_args(&speech(r#"{"input":"x","speed":"2"}"#)).unwrap();
             assert_eq!(args.model_kwargs["speed"], serde_json::json!(2.0), "{adapter:?}");
         }
     }
 
     #[test]
-    fn a_qwen3_tts_voice_clone_is_refused_here() {
-        let err = Adapter::Qwen3TTS
-            .speech_to_request(&speech(r#"{"input":"x","ref_audio":"data:audio/wav;base64,UklGRg=="}"#))
-            .unwrap_err();
-        assert_eq!(err, REF_AUDIO_REFUSAL);
+    fn a_qwen3_tts_voice_clone_saves_its_clip_for_the_loader_to_check() {
+        let dir = std::env::temp_dir().join(format!("mstar_ref_{}", uuid::Uuid::new_v4().simple()));
+        let clone = |body: &str| Adapter::Qwen3TTS.speech_to_request(&speech(body), &dir, false);
+        for (body, bare) in [
+            (r#"{"input":"x","ref_audio":"data:audio/wav;base64,UklGRg=="}"#, false),
+            (r#"{"input":"x","ref_audio":"UklGRg"}"#, true), // bare and unpadded, as Python reads it
+        ] {
+            let Speech { args, ref_audio } = clone(body).unwrap();
+            let check = ref_audio.unwrap();
+            assert_eq!((check.decoder, check.bare), ("soundfile", bare), "{body}");
+            assert_eq!(std::fs::read(&check.path).unwrap(), b"RIFF");
+            assert_eq!(args.file_paths["audio"], vec![check.path.clone()]);
+            assert_eq!(args.input_modalities, ["audio", "text"]);
+            assert!(!args.model_kwargs.contains_key("ref_audio"));
+        }
+        for (body, want) in [
+            (r#"{"input":"x","ref_audio":"/etc/passwd!"}"#, (400, crate::media::BARE_REF_AUDIO_REFUSAL.to_string())),
+            (r#"{"input":"x","ref_audio":7}"#, (400, "ref_audio must be a data URL or base64 string, got int".into())),
+            (r#"{"input":"x","ref_audio":"http://h/a.wav"}"#, (400, "Remote media fetch is disabled on this server".into())),
+        ] {
+            assert_eq!(clone(body).unwrap_err(), want, "{body}");
+        }
+        // no clip: a plain speech, nothing to check
+        assert!(clone(r#"{"input":"x","ref_audio":""}"#).unwrap().ref_audio.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

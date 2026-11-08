@@ -14,6 +14,7 @@ import json
 import random
 import re
 import socket
+from pathlib import Path
 
 import pytest
 
@@ -229,16 +230,6 @@ def test_both_frontends_refuse_a_speech_with_the_same_status_and_text(case, tmp_
     assert (rust[0], json.loads(rust[1])) == (python[0], json.loads(python[3]))
 
 
-def test_what_only_the_rust_frontend_refuses():
-    """It has no audio decoder, so a clip to clone is a 400 that points at the
-    Python frontend."""
-    stub = _RustSpeechStub()
-    with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
-        clone = _post(port, "/v1/audio/speech", {"input": "Hi.", "ref_audio": "data:audio/wav;base64,UklGRg=="})
-    assert clone[0] == 400 and "serve without --rust-frontend" in json.loads(clone[1])["error"]["message"]
-    assert stub.submitted == []
-
-
 def test_without_libsndfile_a_compressed_format_is_refused_as_python_refuses_it_without_soundfile():
     stub = _RustSpeechStub()
     with _model_stack("qwen3_tts_1p7b", stub, env={LIBSNDFILE_ENV: ""}) as (port, _upload):
@@ -337,3 +328,71 @@ def test_split_sentences_matches_python_on_random_long_inputs(tmp_path, monkeypa
                 continue
             assert status == 200
             assert [s["text"] for s in stub.submitted] == want, text
+
+
+# ── voice cloning: ref_audio ────────────────────────────────────────────────
+
+def _wav(seconds: float, rate: int = 16000) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x01\x00" * int(seconds * rate))
+    return buf.getvalue()
+
+
+def _b64(data: bytes) -> str:
+    import base64
+
+    return base64.b64encode(data).decode()
+
+
+CLONES = {
+    "data-url": lambda: f"data:audio/wav;base64,{_b64(_wav(2))}",
+    "bare": lambda: _b64(_wav(2)),
+    "bare-unpadded": lambda: _b64(_wav(2.0001)).rstrip("="),
+    "not-audio": lambda: f"data:audio/wav;base64,{_b64(b'no audio here')}",
+    "bare-server-path": lambda: _b64(b"/etc/passwd"),
+    "too-long": lambda: f"data:audio/wav;base64,{_b64(_wav(61))}",
+    "below-8-khz": lambda: f"data:audio/wav;base64,{_b64(_wav(2, rate=4000))}",
+    "not-a-string": lambda: 7,
+}
+
+
+def _with_bytes(submits: list[dict]) -> list[dict]:
+    """Submits with each uploaded file's bytes in place of its path."""
+    return [{**s, "files": {m: [Path(p).read_bytes() for p in ps] for m, ps in (s["files"] or {}).items()}}
+            for s in submits]
+
+
+@pytest.mark.parametrize("case", sorted(CLONES))
+def test_both_frontends_take_or_refuse_a_voice_clip_alike(case, tmp_path, monkeypatch):
+    """mstar-server saves the clip and the API server checks it with the model's
+    loader (``check_saved_ref_audio``) before anything is submitted, so a clip
+    either frontend takes reaches the backend as the same audio input, and one
+    it refuses gets the same status and text."""
+    pytest.importorskip("soundfile")
+    model = _model_of("Qwen3TTSAdapter")
+    body = {"input": "Hi.", "voice": "ryan", "ref_audio": CLONES[case]()}
+    stub = _RustSpeechStub()
+    with _model_stack(model, stub) as (port, upload):
+        stub.upload_dir = upload
+        status, headers, data = _http(port, body)
+        rust_submits = _with_bytes(_rust_submits(stub.submitted))
+    api = _PythonSpeechServer(model, tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", api)
+    py = TestClient(entrypoint.app).post("/v1/audio/speech", json=body)
+    python_submits = _with_bytes(_python_submits(api.submitted))
+    rust_body = b"".join(data)
+    if py.status_code != 200:
+        assert (status, json.loads(rust_body)) == (py.status_code, py.json())
+        assert rust_submits == python_submits == []
+        return
+    assert status == 200, rust_body
+    assert (headers.get("content-type"), rust_body) == (py.headers.get("content-type"), py.content)
+    assert rust_submits == python_submits
+    assert rust_submits[0]["in"] == ["audio", "text"]

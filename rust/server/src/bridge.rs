@@ -18,11 +18,13 @@
 //!                        | {t:"abort", rid, sub}
 //!                        | {t:"ping", rid, sub}
 //!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
+//!                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
 //!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
 //!                        | {t:"done",  rid, sub}
 //!                        | {t:"pong",  rid, sub}
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
+//!                        | {t:"checked", rid, sub, error?, status?}
 //!
 //! A `metrics` request carries this frontend's cumulative refusal counts
 //! (`refusals.rs`) as three parallel lists, for the API server to export. Its
@@ -41,6 +43,7 @@
 //! abort is sent before its `rid` is freed, so it reaches the backend before
 //! any retry's submit.
 
+use crate::media::RefAudioCheck;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -105,7 +108,8 @@ fn no_parts(parts: &&[Part]) -> bool {
     parts.is_empty()
 }
 
-/// A `ping` or `metrics` request; only `metrics` carries `refusals`.
+/// A `ping`, `metrics` or `check_ref_audio` request; only `metrics` carries
+/// `refusals`, and only `check_ref_audio` the clip.
 #[derive(Serialize)]
 struct ProbeMsg<'a> {
     t: &'a str,
@@ -113,6 +117,8 @@ struct ProbeMsg<'a> {
     sub: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     refusals: Option<&'a Snapshot>,
+    #[serde(flatten)]
+    check: Option<&'a RefAudioCheck>,
 }
 
 /// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
@@ -129,6 +135,11 @@ struct Inbound {
     metadata: Value,
     #[serde(default)]
     msg: String, // error message for t == "err"
+    // t == "checked": the refusal of a ref_audio clip, if it was refused
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    status: Option<u16>,
     // t == "chunks": one entry per chunk
     #[serde(default)]
     subs: Vec<u64>,
@@ -333,13 +344,14 @@ impl Bridge {
         &self,
         t: &str,
         refusals: Option<&Snapshot>,
+        check: Option<&RefAudioCheck>,
         timeout: Duration,
     ) -> Option<StreamItem> {
         let rid = format!("{t}-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = unbounded_channel();
         let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
         self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
-        let msg = ProbeMsg { t, rid: &rid, sub, refusals };
+        let msg = ProbeMsg { t, rid: &rid, sub, refusals, check };
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
             let _ = self.mbox.send("bridge", &payload);
         }
@@ -351,16 +363,28 @@ impl Bridge {
     /// Liveness round-trip for the deep health check: send `{t:"ping"}` and
     /// wait for the backend's pong. False on timeout.
     pub async fn ping(&self, timeout: Duration) -> bool {
-        self.round_trip("ping", None, timeout).await.is_some()
+        self.round_trip("ping", None, None, timeout).await.is_some()
     }
 
     /// The API server's `/metrics` reply, asked with this frontend's refusal
     /// counts: the rendered text in `data` and, when metrics are on, its
     /// `content_type` in `metadata`. None on timeout.
     pub async fn metrics(&self, refusals: &Snapshot, timeout: Duration) -> Option<ResultChunk> {
-        match self.round_trip("metrics", Some(refusals), timeout).await? {
+        match self.round_trip("metrics", Some(refusals), None, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
+        }
+    }
+
+    /// Have the API server check a saved reference clip with the model's
+    /// loader (`media_io.check_saved_ref_audio`): `Ok`, or the refusal's
+    /// `(status, message)`, as the Python adapter refuses it. A refused clip is
+    /// deleted there.
+    pub async fn check_ref_audio(&self, check: &RefAudioCheck, timeout: Duration) -> Result<(), (u16, String)> {
+        match self.round_trip("check_ref_audio", None, Some(check), timeout).await {
+            Some(StreamItem::Done) => Ok(()),
+            Some(StreamItem::Error { status, message }) => Err((status, message)),
+            _ => Err((500, "the server could not check ref_audio".to_string())),
         }
     }
 
@@ -420,6 +444,10 @@ fn deliver(routes: &Routes, msg: Inbound) {
         "done" => (Some(StreamItem::Done), true),
         // Liveness reply: completes the ping's route like a request.
         "pong" => (Some(StreamItem::Done), true),
+        "checked" => match msg.error {
+            Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
+            None => (Some(StreamItem::Done), true),
+        },
         "metrics" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: "metrics".to_string(),
@@ -665,13 +693,18 @@ mod tests {
         };
         let snap = Snapshot { route: vec!["/generate".into()], status: vec![401], count: vec![3] };
         assert_eq!(
-            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap) }),
+            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap), check: None }),
             json!({"t": "metrics", "rid": "m", "sub": 4,
                    "refusals": {"route": ["/generate"], "status": [401], "count": [3]}})
         );
         assert_eq!(
-            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None }),
+            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None, check: None }),
             json!({"t": "ping", "rid": "p", "sub": 5})
+        );
+        let check = RefAudioCheck { path: "/u/a.wav".into(), decoder: "soundfile", bare: true };
+        assert_eq!(
+            encode(&ProbeMsg { t: "check_ref_audio", rid: "c", sub: 6, refusals: None, check: Some(&check) }),
+            json!({"t": "check_ref_audio", "rid": "c", "sub": 6, "path": "/u/a.wav", "decoder": "soundfile", "bare": true})
         );
     }
 

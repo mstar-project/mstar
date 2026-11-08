@@ -13,11 +13,13 @@ protocol are untouched):
                        | {t:"abort", rid, sub}
                        | {t:"ping", rid, sub}
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
+                       | {t:"check_ref_audio", rid, sub, path, decoder, bare}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
                        | {t:"pong", rid, sub}
                        | {t:"metrics", rid, sub, data(bin), metadata}
+                       | {t:"checked", rid, sub, error?, status?}
 
 A ``metrics`` request carries the frontend's cumulative refusal counts as
 three parallel lists (route template, status, count), which the API server
@@ -361,6 +363,32 @@ class RustFrontendBridge:
             reply["metadata"] = {"content_type": metrics.content_type}
         self._send(reply)
 
+    def _check_ref_audio(self, msg: dict) -> None:
+        """``mstar-server`` saved a request's reference clip; the model's own loader
+        judges it (``media_io.check_saved_ref_audio``), off this loop since it
+        decodes. The reply carries the refusal and its status, or no ``error``."""
+        reply = {"t": "checked", "rid": msg.get("rid"), "sub": msg.get("sub")}
+
+        async def check() -> None:
+            # every outcome replies: the frontend waits on it before submitting
+            try:
+                from mstar.api_server import media_io
+
+                path = Path(msg["path"])
+                # it deletes what it refuses, so only a clip the frontend saved under upload_dir
+                if not path.resolve().is_relative_to(Path(self.server.upload_dir).resolve()):
+                    raise RuntimeError(f"ref_audio {path} is outside the upload directory")
+                await asyncio.to_thread(
+                    media_io.check_saved_ref_audio, str(path), msg["decoder"], bool(msg.get("bare")))
+                self._send(reply)
+            except ValueError as exc:
+                self._send({**reply, "error": str(exc), "status": 400})
+            except Exception:  # noqa: BLE001 — the request fails, the bridge goes on
+                logger.exception("bridge: checking a ref_audio clip raised")
+                self._send({**reply, "error": "the server could not check ref_audio", "status": 500})
+
+        self.loop.create_task(check())
+
     def _handle(self, msg: dict) -> None:
         t = msg.get("t")
         if t == "submit":
@@ -373,6 +401,8 @@ class RustFrontendBridge:
             self._send({"t": "pong", "rid": msg["rid"], "sub": msg.get("sub")})
         elif t == "metrics":
             self._metrics(msg)
+        elif t == "check_ref_audio":
+            self._check_ref_audio(msg)
         else:
             logger.warning("bridge: unknown message type %r", t)
 

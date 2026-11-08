@@ -25,6 +25,7 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use serde_json::Value;
 use uuid::Uuid;
 
 /// Map a MIME type (top-level or full) to a file extension for persisting.
@@ -91,14 +92,68 @@ pub fn modality_from_mime(mime: &str) -> &'static str {
 // Inbound: persist request media into upload_dir, return (modality, path)
 // ---------------------------------------------------------------------------
 
-/// Decode base64 the way Python's `base64.b64decode(..., validate=False)` does:
-/// non-alphabet bytes are discarded rather than erroring. In practice the only
-/// such bytes are the interior newlines of line-wrapped payloads (what the
-/// `base64` CLI and `base64.encodebytes` emit by default), so stripping ASCII
-/// whitespace before a strict decode matches Python without accepting garbage.
+/// Decode client base64 as `media_io._decode_base64_payload` does: whitespace
+/// removed (a line-wrapped payload), missing padding restored, then a strict
+/// decode of the alphabet.
 fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    let mut compact: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
+    let pad = (4 - compact.len() % 4) % 4;
+    compact.extend(std::iter::repeat_n('=', pad));
     base64::engine::general_purpose::STANDARD.decode(compact.as_bytes())
+}
+
+/// `media_io.BARE_REF_AUDIO_REFUSAL`.
+pub const BARE_REF_AUDIO_REFUSAL: &str =
+    "server file paths are refused; ref_audio must be a data URL, an http(s) URL or base64 audio the model can decode";
+
+/// A request's reference clip once saved, for the API server to check with the
+/// model's loader (`media_io.check_saved_ref_audio`) before anything is submitted.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RefAudioCheck {
+    pub path: String,
+    /// The library the model's loader opens it with (`check_ref_audio`'s `decoder`).
+    pub decoder: &'static str,
+    /// Sent as bare base64, which could be a server path as well as audio.
+    pub bare: bool,
+}
+
+/// Save a speech request's `ref_audio` as `adapters._resolve_ref_audio` does,
+/// up to its check: a data URL, an http(s) URL when remote fetch is allowed, or
+/// bare base64 (saved as `.wav`). A refusal is `(status, message)`.
+pub fn save_ref_audio(
+    reference: &Value,
+    upload_dir: &Path,
+    allow_remote: bool,
+    decoder: &'static str,
+) -> Result<RefAudioCheck, (u16, String)> {
+    let Value::String(reference) = reference else {
+        let kind = match reference {
+            Value::Bool(_) => "bool",
+            Value::Number(n) if n.is_f64() => "float",
+            Value::Number(_) => "int",
+            Value::Array(_) => "list",
+            Value::Object(_) => "dict",
+            _ => "NoneType",
+        };
+        return Err((400, format!("ref_audio must be a data URL or base64 string, got {kind}")));
+    };
+    let scheme = reference.split(':').next().unwrap_or("").to_ascii_lowercase();
+    if reference.starts_with("data:") || scheme == "http" || scheme == "https" {
+        let (_, path) = resolve_media_ref(reference, upload_dir, allow_remote).map_err(|e| (400, e))?;
+        return Ok(RefAudioCheck { path, decoder, bare: false });
+    }
+    let raw = decode_b64_lenient(reference).map_err(|_| (400, BARE_REF_AUDIO_REFUSAL.to_string()))?;
+    let stored = std::fs::create_dir_all(upload_dir).and_then(|()| {
+        let path = upload_dir.join(format!("{}.wav", Uuid::new_v4()));
+        std::fs::write(&path, raw).map(|()| path)
+    });
+    match stored {
+        Ok(path) => Ok(RefAudioCheck { path: path.to_string_lossy().into_owned(), decoder, bare: true }),
+        Err(e) => {
+            eprintln!("could not store a ref_audio upload under {}: {e}", upload_dir.display());
+            Err((500, "the server could not store ref_audio".to_string()))
+        }
+    }
 }
 
 fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
