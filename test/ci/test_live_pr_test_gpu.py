@@ -137,8 +137,9 @@ class TestSlurm(unittest.TestCase):
         self.globals.update(
             slurm_run=fake_slurm({"sinfo": "node1 gpu:8 gpu:0 idle\n", "sbatch": "42\n",
                                   "squeue": "live-pr-3-9-1 41 RUNNING\njoe-live-pr-5-x 40 RUNNING\n"}, calls),
-            eras=lambda *a, **k: {"items": [{"id": "i1", "name": "live-pr-4-8-1", "status": "active"},
-                                            {"id": "i2", "name": "live-pr-2-1-1", "status": "ended"}]},
+            eras=lambda *a, params=None, **k: (
+                {"items": [{"id": "i1", "name": "live-pr-4-8-1", "status": "active"}]} if params.get("page_token")
+                else {"items": [{"id": "i2", "name": "live-pr-2-1-1", "status": "ended"}], "next_page_token": "p2"}),
             STATE=state, LEDGER=state / "instances.json")
         args = argparse.Namespace(offer="slurm:node1:1", pr=7, hours=1, tag="1-1", run=None, input=[], cache="ro",
                                   allow_over_budget=False, dry_run=False)
