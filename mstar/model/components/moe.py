@@ -510,7 +510,8 @@ class FusedExperts(nn.Module):
         )
 
 
-# GLM-5.2 still uses these three - port it onto `FusedExperts` and delete them
+# GLM-5.2 (`_dispatch` and both loaders) and GLM-5.3-Flash (both loaders) still use these
+# three - port them onto `FusedExperts` and delete them
 def _dispatch(
     hidden_states: torch.Tensor,
     gate_up_proj: torch.Tensor,
