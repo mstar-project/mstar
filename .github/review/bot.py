@@ -366,7 +366,7 @@ def reply(repo, pr, text):
 
 def resolve(out, repo, pr, mode, comment_id, non_write=""):
     """React 👀 to the /review comment (best effort), then the PR's head, its title and the review's
-    settings. A /review continue (`mode` empty) takes the mode, effort and timeout of the review it
+    settings. A /review continue (`mode` empty) takes the mode and timeout of the review it
     continues (restore). The title is untrusted; it only ever reaches the prompt."""
     try:
         gh("api", "-X", "POST", f"repos/{repo}/issues/comments/{comment_id}/reactions", "-f", "content=eyes")
@@ -380,13 +380,12 @@ def resolve(out, repo, pr, mode, comment_id, non_write=""):
         sys.exit(1)
     out["continue"] = "true" if mode == "" else "false"
     out.update(head_sha=pull["head"]["sha"], head_repo=head_repo)
-    # Mode sets the prompt's reporting bar and the reasoning effort. Without --effort, Claude Code
-    # uses its default for Opus (medium).
+    # Mode sets the prompt's reporting bar.
     if mode in ("nogpu", "full"):
-        out.update(mode=mode, effort="xhigh")
+        out["mode"] = mode
         timeout = 45
     else:
-        out.update(mode="light", effort="high")
+        out["mode"] = "light"
         timeout = 25
     # Someone with write access: a timeout that only stops a runaway, like the turn cap.
     out["timeout"] = 300 if not non_write else timeout
@@ -395,7 +394,7 @@ def resolve(out, repo, pr, mode, comment_id, non_write=""):
 
 def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
     """/review continue: fetch the handoff a stopped review saved (handoff) into $RUNNER_TEMP/prev, and
-    that review's mode, effort and timeout. The newest unexpired artifact for this PR wins, and only
+    that review's mode and timeout. The newest unexpired artifact for this PR wins, and only
     from this workflow on issue_comment, a trigger that runs the base repository's copy of it: a fork's
     own workflow can upload an artifact with any name. Only while the stopped review's "didn't
     complete" comment is still open, since any later run that finishes rewrites it as resolved. The
@@ -451,16 +450,16 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
         fail("the PR has new commits since that review stopped; ask for a new review of the current head with "
              "`/review light` or `/review`")
     if mode == "light":
-        effort, timeout = "high", 25
+        timeout = 25
     elif mode == "nogpu":
         if non_write:
             fail("continuing a nogpu review takes write access, like `/review nogpu`")
-        effort, timeout = "xhigh", 45
+        timeout = 45
     elif mode == "full":
         fail("a `/review` that stopped can't be continued (its live test never started); comment `/review` again")
     else:
         fail("the saved handoff is malformed")
-    out.update(dir=str(saved), mode=mode, effort=effort, timeout=300 if not non_write else timeout)
+    out.update(dir=str(saved), mode=mode, timeout=300 if not non_write else timeout)
 
 
 def jq_text(value):
