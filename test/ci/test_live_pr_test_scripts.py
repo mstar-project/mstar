@@ -3,6 +3,7 @@ offers, bootstrap.sh's arguments, and gpu_health.py's choice of GPUs."""
 
 import argparse
 import contextlib
+import http.client
 import io
 import os
 import runpy
@@ -37,11 +38,14 @@ class TestGpu(unittest.TestCase):
         self.g.update(STATE=state, LEDGER=state / "instances.json")
         self.g["time"] = unittest.mock.Mock(wraps=time, sleep=lambda s: None)
         self.addCleanup(self.g.update, {"time": time})
-        os.environ["RUNPOD_API_KEY"] = "k"
-        self.addCleanup(os.environ.pop, "RUNPOD_API_KEY")
+        env = unittest.mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "k"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("LAMBDA_API_KEY", None)  # never reach a real account
 
     def test_a_create_is_not_sent_again_after_a_5xx_or_a_timeout(self):
-        for failure in (http_error(502), TimeoutError("timed out"), urllib.error.URLError("reset")):
+        for failure in (http_error(502), TimeoutError("timed out"), urllib.error.URLError("refused"),
+                        ConnectionResetError("reset"), http.client.RemoteDisconnected("closed")):
             calls = []
 
             def urlopen(req, timeout, failure=failure, calls=calls):
@@ -99,19 +103,25 @@ class TestGpu(unittest.TestCase):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 GPU["cmd_extend"](argparse.Namespace(instance="runpod:p1", hours=hours, allow_over_budget=False), CFG)
             self.assertEqual(GPU["ledger"]()["runpod:p1"]["deadline"], now + 3600)
-        with contextlib.redirect_stdout(io.StringIO()):  # what SKILL.md tells a session without a key to do
+        # What SKILL.md tells a session without a key to do, even for a run approved past the caps
+        GPU["save_ledger"]({"runpod:p1": {**one, "launched_at": now - 5 * 3600, "deadline": now + 3600}})
+        with contextlib.redirect_stdout(io.StringIO()):
             GPU["cmd_extend"](argparse.Namespace(instance="runpod:p1", hours=0, allow_over_budget=False), CFG)
+        self.assertLess(GPU["ledger"]()["runpod:p1"]["deadline"], time.time() + 1)
 
-    def test_offers_with_no_provider_answering_is_not_no_availability(self):
-        os.environ.pop("RUNPOD_API_KEY")
-        self.addCleanup(os.environ.__setitem__, "RUNPOD_API_KEY", "k")
-        out = io.StringIO()
+    def test_offers_with_a_provider_not_answering_is_not_no_availability(self):
+        def erroring(*a, **k):
+            raise GPU["ApiError"](503, "unavailable")
         args = argparse.Namespace(gpus=1, min_vram=80, all_regions=False, allow_arm=False, json=False)
-        with self.assertRaises(SystemExit) as exited, contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(io.StringIO()):
-            GPU["cmd_offers"](args, {**CFG, "lambda": {}})
-        self.assertNotEqual(exited.exception.code, 0)
-        self.assertNotIn("no availability", out.getvalue())
+        self.g["runpod_offers"], saved = erroring, self.g["runpod_offers"]
+        self.addCleanup(self.g.__setitem__, "runpod_offers", saved)
+        for env in ({}, {"RUNPOD_API_KEY": "k"}):  # no key anywhere; RunPod erroring
+            out = io.StringIO()
+            with unittest.mock.patch.dict(os.environ, env, clear=True), self.assertRaises(SystemExit) as exited, \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                GPU["cmd_offers"](args, {**CFG, "lambda": {}})
+            self.assertNotEqual(exited.exception.code, 0)
+            self.assertNotIn("no availability", out.getvalue())
 
 
 class TestBootstrap(unittest.TestCase):
@@ -122,6 +132,22 @@ class TestBootstrap(unittest.TestCase):
                                env={"PATH": "/usr/bin:/bin", "HOME": home, "HF_HOME": f"{home}/hf"}, check=False)
             self.assertEqual(r.returncode, code, r.stderr)
             self.assertEqual(os.listdir(home), [], f"bootstrap.sh {argv} wrote to HOME")
+
+
+    def test_untrusted_caches_stay_in_the_work_directory_and_are_never_saved(self):
+        home = Path(tempfile.mkdtemp())
+        fake = home / "bin"
+        fake.mkdir()
+        for tool in ("git", "uv", "cargo", "curl", "nvidia-smi"):  # nothing is installed or fetched
+            (fake / tool).write_text("#!/bin/sh\nexit 1\n")
+            (fake / tool).chmod(0o755)
+        script = (f"bash {SCRIPTS / 'bootstrap.sh'} 1 --untrusted --workdir {home}/w --hf-home {home}/vol/hf; "
+                  f"source {home}/w/env.sh && echo $TORCHINDUCTOR_CACHE_DIR && save_caches")
+        r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False,
+                           env={"PATH": f"{fake}:/usr/bin:/bin", "HOME": str(home)})
+        self.assertIn(f"{home}/w/compile/inductor", r.stdout)
+        self.assertIn("save_caches:", r.stderr)
+        self.assertFalse((home / "vol/live-pr-compile-cache").exists(), "an untrusted run wrote the shared tarball")
 
 
 class TestHealth(unittest.TestCase):

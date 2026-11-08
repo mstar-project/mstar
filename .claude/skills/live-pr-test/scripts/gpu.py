@@ -32,12 +32,14 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.client import HTTPException  # the module name is taken by http() below
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -85,6 +87,7 @@ def http(method: str, url: str, key_env: str, body: dict | None = None, params: 
     if params:
         url += "?" + urllib.parse.urlencode(params)
     data = json.dumps(body).encode() if body is not None else None
+    last = ApiError(-1, f"{method} {url}: gave up after retries")
     for attempt in range(6):
         req = urllib.request.Request(url, data=data, method=method, headers={
             "Authorization": f"Bearer {key}",
@@ -95,7 +98,10 @@ def http(method: str, url: str, key_env: str, body: dict | None = None, params: 
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
                 raw = resp.read()
+            try:
                 return json.loads(raw) if raw else {}
+            except ValueError:  # a proxy's error page: the request may still have been acted on
+                raise ApiError(-1, f"{method} {url}: a reply that is not JSON: {raw[:200]!r}") from None
         except urllib.error.HTTPError as e:
             raw = e.read().decode(errors="replace")
             try:
@@ -103,14 +109,17 @@ def http(method: str, url: str, key_env: str, body: dict | None = None, params: 
             except ValueError:
                 parsed = raw[:500]
             if e.code == 429 or (retry and e.code >= 500):
+                last = ApiError(e.code, parsed)
                 time.sleep(float(e.headers.get("Retry-After") or 2 ** attempt * 3))
                 continue
             raise ApiError(e.code, parsed) from None
-        except (urllib.error.URLError, TimeoutError) as e:  # a read timeout is not a URLError
+        # every transport failure: URLError, a read timeout, a reset or dropped connection
+        except (OSError, HTTPException) as e:
             if not retry:
-                raise ApiError(-1, f"{method} {url}: {e}") from None
+                raise ApiError(-1, f"{method} {url}: {e!r}") from None
+            last = ApiError(-1, f"{method} {url}: {e!r}")
             time.sleep(2 ** attempt * 3)
-    raise ApiError(-1, f"{method} {url}: gave up after retries")
+    raise last
 
 
 def runpod(method, path, body=None, params=None, retry=True):
@@ -253,7 +262,7 @@ def enabled(cfg, provider) -> bool:
 
 
 def cmd_offers(args, cfg):
-    offers, errors, answered = [], [], 0
+    offers, errors, answered, failed = [], [], 0, []
     for provider, fn in (("runpod", runpod_offers), ("lambda", lambda_offers)):
         if not enabled(cfg, provider):
             errors.append(f"{provider}: skipped (disabled or no API key)")
@@ -264,19 +273,22 @@ def cmd_offers(args, cfg):
             answered += 1
         except ApiError as e:
             errors.append(f"{provider}: {e}")
+            failed.append(provider)
     offers.sort(key=lambda o: (o["usd_per_hour"], o["count"]))
     cap = cfg["budget"]["max_usd_per_hour"]
-    # no provider answered (no key, an error): that says nothing about capacity
-    none_answered = not answered
+    # No offers with a provider that errored, or none answering, says nothing about capacity there:
+    # that is not "no availability".
+    unknown = not offers and (failed or not answered)
     if args.json:
         print(json.dumps({"offers": offers, "errors": errors, "max_usd_per_hour": cap}, indent=1))
-        if none_answered:
+        if unknown:
             sys.exit(1)
         return
     for e in errors:
         print("#", e)
-    if none_answered:
-        die("no provider answered, so availability is unknown; fix the keys or the errors above")
+    if unknown:
+        die(f"availability unknown: {', '.join(failed) or 'no provider'} didn't answer (see above), "
+            "and no provider that did has an offer; fix the keys or the errors")
     if not offers:
         print(f"no availability: no Hopper+ box with >= {args.gpus} GPUs"
               + ("" if args.all_regions else " in a region with team storage (try --all-regions)"))
@@ -366,7 +378,7 @@ def cmd_launch(args, cfg):
     check_hours(cfg, hours, args.allow_over_budget)
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
     # unique per launch: a create whose answer was lost is found again by this name
-    name = f"live-pr-{args.pr}-{time.strftime('%m%d-%H%M%S')}"
+    name = f"live-pr-{args.pr}-{time.strftime('%m%d-%H%M%S')}-{secrets.token_hex(2)}"
     max_instances = cfg["budget"].get("max_concurrent_instances", 1)
 
     if o["provider"] == "runpod":
@@ -397,6 +409,7 @@ def cmd_launch(args, cfg):
 
     # The caps are checked and the launch recorded under one lock, so parallel
     # sessions can't each pass the check and launch together.
+    pending, lost = f"pending:{name}", None
     with ledger_txn() as d:
         if len(d) >= max_instances and not args.allow_over_budget:
             die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
@@ -409,19 +422,26 @@ def cmd_launch(args, cfg):
             else:
                 iid = lambda_("POST", "/instance-operations/launch", body, retry=False)["instance_ids"][0]
         except ApiError as e:
-            if e.status == 409 or "capacity" in f"{e.code()} {e.body}".lower():
+            if e.status == 409 or re.search(r"capacity|no longer any instances|not available",
+                                            f"{e.code()} {e.body}", re.I):
                 die(f"no availability: {o['id']} was taken before launch ({e}); rerun offers")
-            if e.status != -1 and e.status < 500:
+            if e.status not in (-1, 429) and e.status < 500:
                 raise  # refused (a bad config, a bad image): nothing was created
-            # the provider may have created it before the answer was lost
-            iid = adopt(o["provider"], name, e)
-        key = f"{o['provider']}:{iid}"
+            # The provider may have made it before the answer was lost. Until it is found, the
+            # ledger holds its cost under its name, outside this lock.
+            lost, iid = e, None
+        key = pending if lost else f"{o['provider']}:{iid}"
         now = time.time()
         d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
               "usd_per_hour": o["usd_per_hour"], "gpu": o["gpu"], "count": o["count"], "region": o["region"],
               "launched_at": now, "deadline": now + hours * 3600,
               "user": "root" if o["provider"] == "runpod" else "ubuntu",
               "hf_home": hf_home(cfg, o["provider"], o["region"])}
+    if lost:
+        iid = adopt(o["provider"], name, lost, pending)
+        with ledger_txn() as d:
+            key = f"{o['provider']}:{iid}"
+            d[key] = {**d.pop(pending), "instance_id": iid}
     log = STATE / f"{key.replace(':', '_')}.watchdog.log"
     with open(log, "a") as fh:
         subprocess.Popen([sys.executable, __file__, "watchdog", key], stdout=fh, stderr=fh,
@@ -431,8 +451,9 @@ def cmd_launch(args, cfg):
     print(key)
 
 
-def adopt(provider: str, name: str, err: ApiError) -> str:
-    """The instance a create whose answer was lost made, found by its name, or exit saying none was."""
+def adopt(provider: str, name: str, err: ApiError, pending: str) -> str:
+    """The instance a create whose answer was lost made, found by its name, or exit saying none was
+    (its ``pending`` ledger entry stays, so its cost still counts until it is terminated)."""
     for _ in range(12):  # a new instance can take a while to show in the listing
         if provider == "runpod":
             ids = [p["id"] for p in runpod_list("/pods", "pods") if p.get("name") == name]
@@ -441,12 +462,12 @@ def adopt(provider: str, name: str, err: ApiError) -> str:
         if ids:
             if len(ids) > 1:
                 die(f"the create failed ({err}) and left {len(ids)} instances named {name} ({', '.join(ids)}); "
-                    "terminate them from `gpu.py list --all`")
+                    f"terminate them from `gpu.py list --all`, then `gpu.py terminate {pending}`")
             print(f"the create's answer was lost ({err}); adopting {provider}:{ids[0]}, named {name}", file=sys.stderr)
             return ids[0]
         time.sleep(10)
-    die(f"the create failed ({err}), and no instance named {name} showed up in 2 min; "
-        "check `gpu.py list --all` before launching again")
+    die(f"the create failed ({err}), and no instance named {name} showed up in 2 min. Check `gpu.py list --all` "
+        f"and terminate it there if it appears, then `gpu.py terminate {pending}`, before launching again")
 
 
 def hf_home(cfg, provider, region) -> str:
@@ -522,7 +543,9 @@ def cmd_copy(args, cfg):
 
 def terminate(key: str, e: dict) -> None:
     try:
-        if e["provider"] == "runpod":
+        if e["instance_id"] is None:  # a lost create's entry: its instance, if any, is terminated from list --all
+            pass
+        elif e["provider"] == "runpod":
             runpod("DELETE", f"/pods/{e['instance_id']}")
         else:
             lambda_("POST", "/instance-operations/terminate", {"instance_ids": [e["instance_id"]]})
@@ -541,13 +564,14 @@ def cmd_terminate(args, cfg):
 
 def cmd_extend(args, cfg):
     entry(args.instance)
-    # the caps launch applies, on the instance's whole run from launch to the new deadline
+    # a later deadline keeps to launch's caps, on the whole run from launch to the new deadline
     with ledger_txn() as d:
         e = d[args.instance]
         deadline = time.time() + args.hours * 3600
-        check_hours(cfg, (deadline - e["launched_at"]) / 3600, args.allow_over_budget)
-        check_total(cfg, sum(committed_usd(x) for k, x in d.items() if k != args.instance)
-                    + committed_usd({**e, "deadline": deadline}), args.allow_over_budget)
+        if deadline > e["deadline"]:  # an earlier deadline only saves money, whatever was approved
+            check_hours(cfg, (deadline - e["launched_at"]) / 3600, args.allow_over_budget)
+            check_total(cfg, sum(committed_usd(x) for k, x in d.items() if k != args.instance)
+                        + committed_usd({**e, "deadline": deadline}), args.allow_over_budget)
         e["deadline"] = deadline
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
@@ -558,7 +582,7 @@ def cmd_list(args, cfg):
         print("no instances launched by this tool are up")
     for key, e in d.items():
         try:
-            st = status(e)[0]
+            st = status(e)[0] if e["instance_id"] else f"create's answer lost; find {e['name']} in --all"
         except ApiError as err:
             st = f"? ({err.status})"
         hrs = (time.time() - e["launched_at"]) / 3600
