@@ -624,6 +624,10 @@ def test_tensor_conditionals_capture_safe_unselected_branches_and_shared_slots()
         executable.release()
     copies = [torch.empty_like(output) for _, output in graphs]
     parents = [backend.compose((graph, (copy, output))) for (graph, output), copy in zip(graphs, copies, strict=True)]
+    turns = torch.ones(1, dtype=torch.int64, device=device)
+    turns.sub_(1)
+    countdown, _ = capture_into_graph(lambda: turns.sub_(1), pool, device, None, keep_graph=True)
+    repeated = [backend.compose((GraphConditional("while", turns, (parent, countdown)),)) for parent in parents]
     for graph, _ in graphs:
         graph.reset()  # parents must retain every internal predicate/merge/operand
     for predicate, nested, position in [(True, False, 2), (False, True, 99), (True, True, 1)]:
@@ -634,6 +638,12 @@ def test_tensor_conditionals_capture_safe_unselected_branches_and_shared_slots()
         for parent, copy in zip(reversed(parents), reversed(copies), strict=True):
             parent.replay()
             backend.synchronize()
+            torch.testing.assert_close(copy, expected, rtol=0, atol=0)
+        for parent, copy in zip(repeated, copies, strict=True):
+            turns.fill_(2)
+            parent.replay()
+            backend.synchronize()
+            assert turns.item() == 0
             torch.testing.assert_close(copy, expected, rtol=0, atol=0)
 
     def interrupted():
