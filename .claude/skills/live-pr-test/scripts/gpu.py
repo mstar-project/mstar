@@ -587,7 +587,7 @@ ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Noteboo
 
 def eras_ssh_key_id(pubkey: str, name: str) -> str:
     """The organization's id for this public key. A key it doesn't know yet is registered under the
-    instance's name, and terminate deletes it with the instance."""
+    instance's name, and terminate tries to delete it after the release."""
     import base64
     import hashlib
     blob = base64.b64decode(pubkey.split()[1])
@@ -779,9 +779,6 @@ def terminate(key: str, e: dict) -> None:
             slurm_cancel(load_config(), e["instance_id"], e.get("dir"))
         elif e["provider"] == "eras":
             eras("POST", f"/instances/{e['instance_id']}/release", {})
-            for k in eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []:
-                if k.get("name") == e["name"]:
-                    eras("DELETE", f"/ssh-keys/{k['id']}")
         elif e["provider"] == "runpod":
             runpod("DELETE", f"/pods/{e['instance_id']}")
         else:
@@ -791,6 +788,13 @@ def terminate(key: str, e: dict) -> None:
             raise
     with ledger_txn() as d:
         d.pop(key, None)
+    if e["provider"] == "eras":  # best effort: the key may still be bound to the instance while it releases
+        try:
+            for k in eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []:
+                if k.get("name") == e["name"]:
+                    eras("DELETE", f"/ssh-keys/{k['id']}")
+        except ApiError as err:
+            print(f"gpu.py: ssh key {e['name']} not deleted: {err}", file=sys.stderr)
     hours = (time.time() - e["launched_at"]) / 3600
     print(f"terminated {key} after {hours:.2f} h, ~${hours * e['usd_per_hour']:.2f}")
 

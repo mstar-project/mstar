@@ -283,15 +283,25 @@ class TestEras(unittest.TestCase):
 
         def eras(method, path, body=None, params=None):
             calls.append((method, path))
+            if method == "DELETE" and in_use:
+                raise GPU["ApiError"](409, "resource_in_use")
             return {"items": [{"id": "k1", "name": "live-pr-7-1-1"}, {"id": "k2", "name": "someone's laptop"}]}
 
         globs = GPU["terminate"].__globals__
         saved = {k: globs[k] for k in ("eras", "STATE", "LEDGER")}
         self.addCleanup(globs.update, saved)
         globs.update(eras=eras, STATE=state, LEDGER=state / "instances.json")
-        GPU["terminate"]("eras:i-1", {"provider": "eras", "instance_id": "i-1", "name": "live-pr-7-1-1",
-                                      "launched_at": 0, "usd_per_hour": 1.0})
+        e = {"provider": "eras", "instance_id": "i-1", "name": "live-pr-7-1-1", "launched_at": 0, "usd_per_hour": 1.0}
+        in_use = False
+        with contextlib.redirect_stdout(io.StringIO()):
+            GPU["terminate"]("eras:i-1", e)
         self.assertEqual([c for c in calls if c[0] == "DELETE"], [("DELETE", "/ssh-keys/k1")])
+        # The key is still bound to the releasing instance: the release stands, and the watchdog stops.
+        in_use = True
+        GPU["save_ledger"]({"eras:i-1": e})
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            GPU["terminate"]("eras:i-1", e)
+        self.assertEqual(GPU["ledger"](), {}, "the watchdog would retry a released instance forever")
 
 
 if __name__ == "__main__":
