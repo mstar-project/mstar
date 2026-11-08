@@ -58,7 +58,7 @@ class TestApproval(unittest.TestCase):
                          "a low-risk worker or model change couldn't get a counting approval")
 
     def test_a_none_run_counts_as_a_pass_only_when_the_review_chose_none(self):
-        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "joe"}}
+        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}}
         globs = GPU_REVIEW["reasons_not_to_approve"].__globals__
         saved = {k: globs[k] for k in ("gh", "gh_json", "review_threads")}
         self.addCleanup(globs.update, saved)
@@ -133,13 +133,18 @@ class TestCarry(unittest.TestCase):
          {"run": "full", "checks": BOTH}),
     ]
 
-    def carry(self, rereview, run, checks, comments, status, files=("mstar/worker/worker.py",)):
+    def carry(self, rereview, run, checks, comments, status, files=("mstar/worker/worker.py",), review=None,
+              threads=()):
         """cmd_carry's outputs and the earlier report it kept; comments None: the fetch fails. files: the
-        PR's changed files."""
+        PR's changed files. review: more of the review's fields; threads: the PR's review threads."""
         out = Path(tempfile.mkdtemp())
-        (out / "review.json").write_text(json.dumps({"live_test": {"run": run, "checks": checks}}))
+        (out / "review.json").write_text(json.dumps({"outside_diff": [], **(review or {}),
+                                                     "live_test": {"run": run, "checks": checks}}))
 
         def gh(*args, check=True):
+            if args[1] == "graphql":
+                return argparse.Namespace(stdout=json.dumps([{"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": list(threads)}}}}}]))
             if "/compare/" in args[1] and "--jq" not in args:
                 return argparse.Namespace(stdout=json.dumps({"files": [{"filename": f} for f in files]}))
             if args[1].endswith("/pulls/7"):
@@ -156,8 +161,11 @@ class TestCarry(unittest.TestCase):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
             GPU_REVIEW["cmd_carry"](argparse.Namespace(pr=7, sha="1" * 40, review=str(out / "review.json"),
-                                                       earlier_report=str(out / "earlier.md"), rereview=rereview))
+                                                       earlier_report=str(out / "earlier.md"), rereview=rereview,
+                                                       above=str(out / "stacked-above.json"),
+                                                       gate=str(out / "gate.txt")))
         outputs = dict(line.split("=", 1) for line in stdout.getvalue().splitlines() if not line.startswith("::"))
+        self.gate = (out / "gate.txt").read_text() if (out / "gate.txt").exists() else None
         return outputs, (out / "earlier.md").read_text() if (out / "earlier.md").exists() else None
 
     def test_the_review_call_stands_only_on_a_passing_live_test_of_an_ancestor(self):
@@ -172,6 +180,21 @@ class TestCarry(unittest.TestCase):
         self.assertEqual(self.carry(True, "none", ["correctness"], [], "", files=["docs/x.rst"])[0],
                          {"run": "none", "checks": "correctness", "verdict": "skipped"},
                          "a re-review of docs alone would need a GPU run, and fail approval for good without one")
+
+    def test_no_box_starts_while_the_review_left_something_to_fix_first(self):
+        p1 = {"priority": "P1", "claim": "c", "location": "mstar/engine/engine.py:10", "detail": "d"}
+        for review, threads, why in [({"outside_diff": [p1]}, (), "engine.py:10 (P1)"),
+                                     ({}, [thread(4, "**[P2]** an inline finding")], "inline 4 (P2)"),
+                                     ({"questions": ["q"]}, (), "1 open question(s)"),
+                                     ({"skipped": ["a.py"]}, (), "the review skipped files")]:
+            with self.subTest(why):
+                self.assertEqual(self.carry(False, "full", ["correctness"], [], "", review=review,
+                                            threads=threads)[0], {"gated": "true"}, "a box would start")
+                self.assertIn(why, self.gate)
+        p3 = {**p1, "priority": "P3"}
+        self.assertEqual(self.carry(False, "full", ["correctness"], [], "", review={
+            "outside_diff": [p3], "risk": {"level": "high", "reason": "r", "look_at": []}})[0],
+            {"run": "full", "checks": "correctness"}, "a P3 or the design risk would hold the live test back")
 
 
 class TestStart(unittest.TestCase):

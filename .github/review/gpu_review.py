@@ -7,7 +7,8 @@ decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config the workflow writes: the team's
 Slurm node when it has them free, else any open Eras listing under the hourly cap.
 
-    gpu_review.py carry    --pr N --sha SHA --review review.json --earlier-report FILE [--rereview]
+    gpu_review.py carry    --pr N --sha SHA --review review.json --earlier-report FILE --above stacked-above.json
+                           --gate FILE [--rereview]
     gpu_review.py start    --pr N --sha SHA --main-sha SHA [--base BRANCH] --gpus G --hours H --run full|targeted
                            --checks correctness,performance [--since SHA --earlier-report FILE]
                            [--forced failed|untested --asked RUN --asked-checks CHECKS] --review review.json --out DIR
@@ -167,12 +168,21 @@ def touches_runtime(pr, sha):
 
 def cmd_carry(a):
     """What the live test runs, printed as the step's outputs: the review's call, read as its enums only
-    (model output on its way to a shell and the brief). It stands unless the PR's last live test didn't
+    (model output on its way to a shell and the brief). Nothing runs while the review left something to
+    fix first (to_fix_first): `gated=true`, with the reasons in the --gate file, never in the outputs,
+    since they hold model text. Otherwise the call stands unless the PR's last live test didn't
     pass on an ancestor of the head; then the run is full, with every kind of check, whatever the review
     asked for, so a failure is never hidden behind a narrower run. A re-review with no live test before
     it judged only the commits since the last review, which no GPU run has covered: its `targeted` is
     full too, and so is its `none` when the PR touches runtime code (file_gate)."""
-    live = json.loads(Path(a.review).read_text()).get("live_test") or {}
+    review = json.loads(Path(a.review).read_text())
+    first = to_fix_first(review, a.pr, a.above)
+    if first:
+        Path(a.gate).write_text("; ".join(first))
+        print("::notice::No live test: the review left open items to fix first.")
+        print("gated=true")
+        return
+    live = review.get("live_test") or {}
     run = live.get("run") if live.get("run") in ("none", "targeted", "full") else "full"
     asked = live.get("checks") if isinstance(live.get("checks"), list) else []
     out = {"run": run, "checks": ",".join([k for k in CHECKS if k in asked] or CHECKS)}
@@ -277,7 +287,7 @@ def cmd_start(a):
         (out / "anthropic.key").unlink(missing_ok=True)
         if r.returncode == 4:  # budget.max_running, which holds on every provider
             msg = (f"The bot already has {cfg['budget']['max_running']} GPU runs going (REVIEW_GPU_MAX_RUNS); "
-                   "comment `/review gpu` again when one finishes.")
+                   "comment `/review` again when one finishes.")
             (out / "unavailable.md").write_text(msg + "\n")
             print(msg)
             sys.exit(3)
@@ -401,6 +411,21 @@ def file_gate(files, repo_root):
     return blocked, engine, runtime
 
 
+def to_fix_first(review, pr, above):
+    """What the review left open that stops the live test from starting, and approval too: open P0–P2
+    findings (counted as the summary counts them, fixed above judged), open questions and skipped files.
+    The design risk stops only approval."""
+    why = []
+    if review.get("questions"):
+        why.append(f"{len(review['questions'])} open question(s)")
+    if review.get("skipped"):
+        why.append("the review skipped files")
+    open_ = blocking(review, review_threads(pr), SUMMARY["stacked_above"](above))
+    if open_:
+        why.append("open P0–P2 findings: " + ", ".join(open_))
+    return why
+
+
 def reasons_not_to_approve(a, review):
     """(why not, engine files): the rule's failed conditions, and the files that make an approval
     one that doesn't count."""
@@ -423,13 +448,7 @@ def reasons_not_to_approve(a, review):
         level = (review.get("risk") or {}).get("level", "unrated")
         why.append(f"the review rated the design risk {level}: a maintainer owns the decisions its summary's "
                    "\"Where to look\" lists")
-    if review.get("questions"):
-        why.append(f"{len(review['questions'])} open question(s)")
-    if review.get("skipped"):
-        why.append("the review skipped files")
-    open_ = blocking(review, review_threads(a.pr), SUMMARY["stacked_above"](a.above))
-    if open_:
-        why.append("open P0–P2 findings: " + ", ".join(open_))
+    why += to_fix_first(review, a.pr, a.above)
     files = pr_files(pr["base"]["sha"], a.sha)
     if files is None:
         why.append("the file list is too long to check")
@@ -551,7 +570,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("configure")
     p = sub.add_parser("carry")
-    for name in ("--sha", "--review", "--earlier-report"):
+    for name in ("--sha", "--review", "--earlier-report", "--above", "--gate"):
         p.add_argument(name, required=True)
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--rereview", action="store_true", help="the review built on an earlier one (since.diff)")

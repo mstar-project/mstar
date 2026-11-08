@@ -264,5 +264,9 @@ resolution below, and ask why if the PR doesn't say.
   determinism across batch compositions is not bought at a large cost (20% slower decode is not
   worth it). An output change is a finding if `main` doesn't show it, not if it is within the noise
   `main` already has.
+- **First-output latency vs. running streams.** A stream that has started never stalls so that a new
+  request starts sooner: for voice, a gap mid-stream is worse than a late first chunk. A scheduling
+  change that cuts TTFT or time to first audio by adding gaps to running streams, or by losing
+  throughput, is a regression (#348 was closed for this).
 - **Fewer knobs vs. A/B and debugging.** A global, documented, general-purpose switch (one "disable
   torch.compile" flag for all models) is acceptable; a per-model or per-PR switch is not.

@@ -10,7 +10,7 @@ name: PR labels
 # API and never runs its code. Run it by hand (workflow_dispatch) to relabel
 # every open PR, e.g. after changing the rules.
 #
-# It also dismisses the review bot's approval (claude-review.yml, `/review gpu`)
+# It also dismisses the review bot's approval (claude-review.yml, `/review`)
 # when the PR gets new commits or a new base, since the approval was for the
 # commit it tested.
 
@@ -55,7 +55,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
         run: |
           python3 .github/review/gpu_review.py dismiss --pr "$PR" \
-            --message "New commits or a new base since the review bot approved; comment /review gpu for a new review."
+            --message "New commits or a new base since the review bot approved; comment /review for a new review."
 
   label:
     concurrency:
