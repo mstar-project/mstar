@@ -26,7 +26,8 @@
     "hf_home": "~/.cache/huggingface",
     "results_dir": "~/live-pr-results"
   },
-  "slurm": {
+  "slurm": [{
+    "name": "node1",
     "host": "",
     "port": 22,
     "host_key": "",
@@ -41,7 +42,7 @@
     "gpu": "H200",
     "vram_gb": 141,
     "hf_home": "/workspace/shared/hf"
-  },
+  }],
   "eras": {
     "hf_home": "/workspace/hf",
     "template_id": "ed6d2a30-36aa-5d50-b911-1f6b551f2081",
