@@ -511,6 +511,25 @@ def media_grids(layout: Mapping, output: str) -> list[tuple[int, ...]]:
     ]
 
 
+def media_rows_between(layout: Mapping, start: int, end: int) -> dict[str, tuple[int, int]]:
+    """The rows ``[a, b)`` of each encoder output that the pads among tokens
+    ``[start, end)`` of a ``MEDIA_LAYOUT``'s prompt read, by output; an
+    output with no pad there is left out. An output's runs fill its rows in
+    prompt order, so the rows a token range reads are one slice."""
+    rows: dict[str, tuple[int, int]] = {}
+    filled: dict[str, int] = {}
+    for off, tokens, out in zip(
+        layout.get("offset", ()), layout.get("tokens", ()), layout.get("output", ()), strict=True,
+    ):
+        base = filled.get(out, 0)
+        lo, hi = max(off, start), min(off + tokens, end)
+        if hi > lo:
+            first = rows[out][0] if out in rows else base + lo - off
+            rows[out] = (first, base + hi - off)
+        filled[out] = base + tokens
+    return rows
+
+
 def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[MediaEncoder]:
     """The encoders a prompt's ``MEDIA_LAYOUT`` runs, in declaration order:
     those whose output fills one of its runs. Both the prefill walk and

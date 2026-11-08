@@ -32,6 +32,7 @@ from mstar.model.cosmos3.cosmos3_model import (
 from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, REASONER_DECODE_LOOP, SAMPLER
 from mstar.model.keys import ROPE
 from mstar.model.multimodal import MEDIA_LAYOUT
+from mstar.model.submodule_base import chunk_loop_name
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 
@@ -88,7 +89,11 @@ def test_edge_dummy_model_parses_family_and_reasoner(tmp_path) -> None:
     enc, reasoner = prefill_vision.sections
     assert isinstance(enc, GraphNode) and enc.name == VISION_ENCODER_NODE
     assert any(e.next_node == REASONER_NODE and e.name == "vision_embeds" for e in enc.outputs)
-    assert reasoner.name == REASONER_NODE
+    # the prompt prefills in chunks: the reasoner runs in its chunk Loop
+    assert isinstance(reasoner, Loop)
+    assert reasoner.name == chunk_loop_name(REASONER_NODE, Cosmos3Model.REASONER_PREFILL_VISION_WALK)
+    assert reasoner.section.name == REASONER_NODE
+    # the final chunk's token leaves the Loop for the client
     assert any(e.next_node == EMIT_TO_CLIENT and e.output_modality == "text" and e.persist for e in reasoner.outputs)
 
     decode = walks[Cosmos3Model.REASONER_DECODE_WALK]
@@ -516,6 +521,57 @@ def test_a_mixed_step_that_can_carry_media_keeps_host_positions(tmp_path, monkey
     assert sub._rope_in_graph(captured, "decode") and sub._rope_in_graph(captured, "prefill_text")
     assert not sub._rope_in_graph(captured, "mixed")
     assert not sub._rope_in_graph(types.SimpleNamespace(captured=False), "decode")
+
+
+def test_a_media_prompt_cuts_into_chunks_that_add_up_to_it(tmp_path) -> None:
+    """Chunked prefill of an image prompt: each chunk takes its ids and
+    positions, the vision rows its pads read (cuts landing inside an image),
+    and its part of the MRoPE advance, so the chunks rebuild the row and
+    advance the position counter by the whole prompt's."""
+    import types
+
+    from mstar.model.components.mrope import layout_position_ids
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+    from mstar.model.multimodal import MEDIA_LAYOUT, media_rows_between
+    from mstar.model.submodule_base import ARNodeInputs
+
+    model = _model(tmp_path)
+    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
+    pad = model.config.reasoner.image_token_id
+    # text 3, a 2x3 merged image, text 2, a 2x2 merged image, text 1
+    layout = {"offset": [3, 11], "tokens": [6, 4], "output": ["vision_embeds"] * 2,
+              "grid": [[1, 4, 6], [1, 4, 4]]}
+    ids = torch.tensor([1, 2, 3] + [pad] * 6 + [4, 5] + [pad] * 4 + [6])
+    pos, advance = layout_position_ids(layout, 2, 16, 10)
+    rows = torch.arange(10.0).unsqueeze(1).expand(10, 8)
+    full = ARNodeInputs(input_seq_len=16, input_ids=ids, custom_pos_ids=pos,
+                        tensor_inputs={"vision_embeds": rows}, resource_step_info=advance)
+    info = types.SimpleNamespace(step_metadata={MEDIA_LAYOUT: layout})
+    walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
+    assert sub.get_input_sequence_len(walk, info, {"text_inputs": [ids]}).seq_len == 16
+    assert media_rows_between(layout, 5, 13) == {"vision_embeds": (2, 8)}
+
+    chunks = [sub.split_inputs(walk, info, full, a, b) for a, b in ((0, 5), (5, 13), (13, 16))]
+    assert torch.equal(torch.cat([c.input_ids for c in chunks]), ids)
+    assert torch.equal(torch.cat([c.custom_pos_ids for c in chunks], dim=-1), pos)
+    media = [c.tensor_inputs.get("vision_embeds", rows[:0]) for c in chunks]
+    assert [m.shape[0] for m in media] == [int((c.input_ids == pad).sum()) for c in chunks] == [2, 6, 2]
+    assert torch.equal(torch.cat(media), rows)
+    # positions 10-14, then up to 19 inside the second image, then 20
+    assert advance == 11 and [c.resource_step_info for c in chunks] == [5, 5, 1]
+    # an image-free chunk carries no vision rows
+    assert sub.split_inputs(walk, info, full, 0, 3).tensor_inputs == {}
+
+
+def test_the_reasoner_prompts_chunk_under_one_budget(tmp_path) -> None:
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+    policies = _model(tmp_path).chunking_policy_of()
+    budget = Cosmos3ReasonerSubmodule.MAX_BATCH_TOKENS
+    for walk in (Cosmos3Model.REASONER_PREFILL_WALK, Cosmos3Model.REASONER_PREFILL_VISION_WALK):
+        assert policies["reasoner", walk].chunkable and policies["reasoner", walk].max_batch_tokens == budget
+    assert policies["reasoner", "mixed"].max_batch_tokens == budget
+    assert not any(node == "dit" for node, _ in policies)
 
 
 def test_edge_chat_adapter(tmp_path) -> None:

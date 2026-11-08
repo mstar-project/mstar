@@ -46,6 +46,7 @@ its positions under ``POS_KEY`` (``ROPE`` by default).
 import functools
 import os
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from time import perf_counter
 from typing import Any
 
@@ -65,7 +66,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
 from mstar.model.components.token_step import TokenStepNode
 from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE, SAMPLER
-from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_walk_names, splice_media
+from mstar.model.multimodal import MEDIA_LAYOUT, MediaEncoder, media_rows_between, media_walk_names, splice_media
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
@@ -75,6 +76,7 @@ from mstar.model.submodule_base import (
     ModelInputsFromEngine,
     TokenStop,
 )
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
 # A media-mixed step's mask of its prompt rows' tokens (`_mask_prompt_tokens`)
@@ -119,6 +121,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # (a model listing its media walks in its combined walk): its capture then
     # holds every encoder's buffer, so a replay splices them in.
     MIXED_MEDIA: bool = False
+    # Whether the model chunks its media prompt rows (a chunkable
+    # ``ChunkingPolicy`` on its media walks): their lengths are then reported
+    # before prepare, so a token budget can cut them (`split_inputs`).
+    CHUNKS_MEDIA: bool = False
 
     # The attention resource whose plan picks each prefill row's last token.
     ATTN_KEY: str
@@ -186,9 +192,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         """A media prompt's own position ids and how far it advances the
         position counter, for a model whose media do not take one position
         per token (MRoPE). ``start`` is the counter's value, ``layout`` the
-        walk's ``MEDIA_LAYOUT`` (each run's offset, tokens and grid). The
-        default, ``(None, None)``, leaves the position resource to place every
-        token."""
+        walk's ``MEDIA_LAYOUT`` (each run's offset, tokens and grid). Built on
+        the host, from the layout alone: the scaffold moves them to the device,
+        and a chunked row's cut rebuilds them (`split_inputs`). The default,
+        ``(None, None)``, leaves the position resource to place every token."""
         return None, None
 
     def decoder_kwargs(
@@ -327,6 +334,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         # the stream's counter is keyed by the worker's handle (AGENTS.md invariant 14)
         start = self.node_resources[self.POS_KEY].position(rid=fwd_info.rid_handle, label="main")
         pos_ids, advance = self.prompt_positions(start, layout, ids.shape[0])
+        if pos_ids is not None:
+            pos_ids = to_device_nonblocking(pos_ids, self.get_device())
         return ARNodeInputs(
             input_seq_len=ids.shape[0],
             input_ids=ids,
@@ -356,12 +365,51 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList, **kwargs,
     ) -> InputSeqLenInfo | None:
-        # a media row's length depends on its attachments; it is admitted whole
         if graph_walk == self.DECODE_WALK:
             return InputSeqLenInfo(1)
-        if graph_walk == self.PREFILL_WALK and "text_inputs" in inputs:
+        # a media row's ids hold a pad per media token, so they measure it; it
+        # is left unmeasured, and admitted whole, unless the model chunks it
+        media = self.CHUNKS_MEDIA and graph_walk in self._media_walks
+        if (graph_walk == self.PREFILL_WALK or media) and "text_inputs" in inputs:
             return InputSeqLenInfo(inputs["text_inputs"][0].shape[0])
         return None
+
+    def split_inputs(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo,
+        inputs: ARNodeInputs, start: int, end: int,
+    ) -> ARNodeInputs:
+        """A media row's chunk also takes the rows of each encoder output its
+        pads read (from the host layout), and the part of the row's position
+        advance its tokens place: the advance through ``end`` less that
+        through ``start``, so a row's chunks advance by the whole row's."""
+        if graph_walk not in self._media_walks:
+            return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+        cut = super().split_inputs(
+            graph_walk, fwd_info, replace(inputs, tensor_inputs={}, resource_step_info=None), start, end,
+        )
+        layout = fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}
+        cut.tensor_inputs = {
+            out: inputs.tensor_inputs[out][a:b]
+            for out, (a, b) in media_rows_between(layout, start, end).items()
+            if out in inputs.tensor_inputs
+        }
+        if inputs.resource_step_info is not None:
+            through = self._advance_through(layout, inputs, end) - self._advance_through(layout, inputs, start)
+            cut.resource_step_info = through
+        return cut
+
+    def _advance_through(self, layout: Mapping, inputs: ARNodeInputs, t: int) -> int:
+        """How far a media row's first ``t`` tokens move the position counter:
+        one past the largest position they hold, from the row's first. The
+        row's own positions are on the device by now, so they are rebuilt on
+        the host from the layout (based at 0: the advance doesn't depend on
+        where the row starts)."""
+        if t == 0:
+            return 0
+        if t >= inputs.input_seq_len:
+            return int(inputs.resource_step_info)
+        pos, _ = self.prompt_positions(0, layout, inputs.input_seq_len)
+        return int(pos[..., :t].max()) + 1
 
     def speculative_input_seq_len(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, prev_seq_len: int,

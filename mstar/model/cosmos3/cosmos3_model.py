@@ -141,6 +141,7 @@ from mstar.model.multimodal import (
     media_walks,
     parts_from_modalities,
 )
+from mstar.model.submodule_base import ChunkingPolicy
 from mstar.model.utils import load_generation_defaults
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -503,6 +504,22 @@ class Cosmos3Model(Model):
         if not self._reasoner_enabled():
             return {}
         return {REASONER_NODE: {MIXED: set(REASONER_MIXED_SPLIT.prefill_walks) | {self.REASONER_DECODE_WALK}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        # the reasoner's text and media prompts split by its token budget; the
+        # mixed walk carries it for the steps a chunk shares with decode rows
+        if not self._reasoner_enabled():
+            return {}
+        from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+        budget = Cosmos3ReasonerSubmodule.MAX_BATCH_TOKENS
+        return {REASONER_NODE: (
+            ChunkingPolicy(
+                walks=(self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK),
+                chunkable=True, max_batch_tokens=budget,
+            ),
+            ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
+        )}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {**super().get_loop_caps(**model_kwargs), **(model_kwargs.get(self.DENOISE_CAP) or {})}

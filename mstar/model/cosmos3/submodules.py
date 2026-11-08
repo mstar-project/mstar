@@ -3279,6 +3279,11 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     # Image and video prompts join decode steps too, so a burst of them does
     # not stop every decode stream for a step each
     MIXED_MEDIA = True
+    # A long prompt (a video, many images) runs in chunks of at most this many
+    # tokens, a step's decode rows included, rather than as one step that
+    # stops every decode stream for its length: the top of the prefill ladders.
+    CHUNKS_MEDIA = True
+    MAX_BATCH_TOKENS = 2048
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
@@ -3315,9 +3320,8 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     # ------------------------------------------------------------------
 
     def prompt_positions(self, start: int, layout: dict, num_tokens: int) -> tuple[torch.Tensor, int]:
-        return layout_position_ids(
-            layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start, self.get_device(),
-        )
+        # built on the host: the scaffold moves them, and a chunk's cut rebuilds them
+        return layout_position_ids(layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start)
 
     def resident_walks(self) -> frozenset[str]:
         # a captured decode step builds its rope inside the graph (`_rope_in_graph`),
