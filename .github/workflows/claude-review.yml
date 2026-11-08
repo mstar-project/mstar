@@ -91,6 +91,8 @@ permissions: {}
 env:
   # No __pycache__ in the tree the model reads.
   PYTHONDONTWRITEBYTECODE: 1
+  # When set, only the app's login counts as the bot (render_summary.BOTS).
+  REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
 
 jobs:
   # Decides whether a comment starts a review, in which mode and with which

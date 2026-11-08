@@ -3,6 +3,7 @@
 import base64
 import contextlib
 import fnmatch
+import importlib
 import json
 import os
 import subprocess
@@ -15,6 +16,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / ".github/review"))
 import bot  # noqa: E402
+import render_summary  # noqa: E402
 
 
 class Fail:
@@ -208,6 +210,25 @@ class TestCollect(unittest.TestCase):
         out, files = collect(**self.CONVERSATION, **{f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead")})
         self.assertEqual((out.get("rereview"), files["since.diff"]), ("true", "diff --git a/b.py b/b.py\n"))
         self.assertEqual(json.loads(files["last-review.json"])["head"], LAST)
+
+    def test_with_the_review_app_only_its_login_is_the_bot(self):
+        forged = {**summary(LAST), "user": {"login": "github-actions[bot]"}}
+        routes = {"GET repos/o/r/issues/7/comments": [forged],
+                  f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead")}
+        self.assertEqual(collect(**routes)[0].get("rereview"), "true", "a fork, with no app, would lose re-reviews")
+        self.addCleanup(importlib.reload, bot)
+        self.addCleanup(importlib.reload, render_summary)
+        with mock.patch.dict(os.environ, {"REVIEW_APP_CLIENT_ID": "app-id"}):
+            importlib.reload(render_summary)
+            importlib.reload(bot)
+        self.assertIsNone(collect(**routes)[0].get("rereview"),
+                          "any workflow on a branch could post the state a re-review starts from")
+        team_run = {"isResolved": False, "isOutdated": False, "comments": {"nodes": [
+            {"author": {"login": "github-actions"}, "databaseId": 7, "body": "**[P1]** drops a token"}]}}
+        pages = [{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [team_run]}}}}}]
+        review = {"prior_findings": [], "outside_diff": [], "skipped": []}
+        self.assertEqual(len(render_summary.open_findings(review, pages, [])), 1,
+                         "a team run posts its inline findings as github-actions, and they would stop counting")
 
     def test_after_a_rebase_a_re_review_reads_only_the_prs_hunks_that_changed(self):
         reviewed = pr_diff("x = 1", "# unreachable")
