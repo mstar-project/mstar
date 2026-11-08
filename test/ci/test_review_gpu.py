@@ -39,7 +39,7 @@ class TestApproval(unittest.TestCase):
                  {"ref": "3", "priority": "P2", "status": "open", "why": "moved, not fixed"}]
         outside = [{"priority": "P2", "location": "mstar/engine/engine.py:10", "claim": "c", "detail": "d"}]
         found = blocking(review(prior, outside), [{"data": {"repository": {"pullRequest": {
-            "reviewThreads": {"nodes": threads}}}}}])
+            "reviewThreads": {"nodes": threads}}}}}], [])
         self.assertEqual(len(found), 4, found)
         for expected in ("inline 1", "inline 5", "engine.py:10", "earlier 3"):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")
@@ -63,17 +63,20 @@ class TestApproval(unittest.TestCase):
         saved = {k: globs[k] for k in ("gh", "gh_json", "review_threads")}
         self.addCleanup(globs.update, saved)
 
-        def why(verdict, run, files=("docs/models.rst",), since=None):
+        def why(verdict, run, files=("docs/models.rst",), since=None, skipped=()):
             compare = {"files": [{"filename": f} for f in files]}
             globs.update(gh=lambda *a, check=True: argparse.Namespace(stdout="write\n"),
                          gh_json=lambda path: compare if "/compare/" in path else pr, review_threads=lambda pr: [])
-            r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": [],
+            r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": list(skipped),
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "confirm": [], "checks": ["correctness"], "gpus": 1}}
-            a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict, since=since)
+            a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict, since=since,
+                                   above="stacked-above.json")
             return GPU_REVIEW["reasons_not_to_approve"](a, r)[0]
 
         self.assertEqual(why("pass", "full"), [])
+        self.assertEqual(why("pass", "full", skipped=["mstar/worker/worker.py"]), ["the review skipped files"],
+                         "a review that left files unread could approve them")
         self.assertEqual(why("skipped", "none", ("docs/models.rst", "test/ci/test_x.py", "benchmark/run.py")), [],
                          "a change that needs no GPU run could never be approved")
         self.assertEqual(why("skipped", "targeted"), ["the live test's verdict is skipped"],
@@ -193,9 +196,10 @@ class TestStart(unittest.TestCase):
             return argparse.Namespace(returncode=0, stdout=json.dumps(listing), stderr="")
 
         globs = GPU_REVIEW["cmd_start"].__globals__
-        saved = {k: globs[k] for k in ("gpu", "gpu_py")}
+        saved = {k: globs[k] for k in ("gpu", "gpu_py", "gh_json")}
         self.addCleanup(globs.update, saved)
-        globs.update(gpu=gpu, gpu_py=lambda: {"load_config": lambda: cfg})
+        globs.update(gpu=gpu, gpu_py=lambda: {"load_config": lambda: cfg},
+                     gh_json=lambda path: {"title": "Faster decode", "body": self.INJECTED})
         a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="main", gpus=1, hours=4.0,
                                run="full", review=str(out / "review.json"), out=str(out), tag="1-1",
                                model="m", turns=10, claude_version="stable", since=None, earlier_report=None,
@@ -219,6 +223,10 @@ class TestStart(unittest.TestCase):
         self.assertNotIn(self.INJECTED, (out / "brief.md").read_text(),
                          "model text from an untrusted PR would be instructions to a root shell")
         self.assertIn(self.INJECTED, (out / "findings.json").read_text())
+        self.assertIn("`$LIVE_PR_IN/pr-body.md`", (out / "brief.md").read_text(),
+                      "the session would look for the PR's description with gh, which the box doesn't have")
+        self.assertIn(str(out / "pr-body.md"), launched[0])
+        self.assertIn(self.INJECTED, (out / "pr-body.md").read_text())
 
     def test_a_run_past_the_bots_cap_says_so(self):
         out, launched = self.start("sk-test", {"eras": {"run_secret_id": "s"}, "budget": {"max_running": 2}},

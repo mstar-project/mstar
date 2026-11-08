@@ -1,6 +1,6 @@
 # Decisions
 
-Gaurav's calls on PRs and corrections to his drafts, newest first, as of Oct 27 2026. They are newer than `../SKILL.md` and win over it where the two differ. The calls are decisions on record for hard rule R2 and the Overlap pass; the standards are how he finds and states a problem.
+Calls on PRs and corrections to review drafts, newest first, as of Oct 27 2026. They are newer than `../SKILL.md` and win over it where the two differ. The calls are decisions on record for hard rule R2 and the Overlap pass; the standards are how a review finds and states a problem.
 
 ## Calls
 

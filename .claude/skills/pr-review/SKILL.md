@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a design-risk rating (whether a human must make a design or direction call). One session runs every pass itself (a big PR's slices, and in thorough and gpu modes an independent review-standard second pass, go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, hard rules, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (every pass, P0–P2), thorough (all passes, P0–P3 and design questions) and gpu (thorough plus a live GPU test through live-pr-test). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
+description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a design-risk rating (whether a human must make a design or direction call). One session runs every pass itself (a big PR's slices, and in thorough and gpu modes an independent review-standard second pass, go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (every pass, P0–P2), thorough (all passes, P0–P3 and design questions) and gpu (thorough plus a live GPU test through live-pr-test). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
 ---
 
 # Reviewing an M* pull request
@@ -41,8 +41,9 @@ verifies what both return.
 ## Working efficiently
 
 These rules make the review faster, not shallower: never skip a pass, a read or a check to save
-turns. A run someone with write access starts has a turn cap that only stops a loop. A review's cost
-is its turns times its context: every turn re-reads everything read so far.
+turns; only a contributor's capped run may skip files, as below. A run someone with write access
+starts has a turn cap that only stops a loop. A review's cost is its turns times its context: every
+turn re-reads everything read so far.
 
 - **Batch.** Issue independent reads and searches as parallel tool calls in one message. A turn
   with one small call is the exception.
@@ -62,7 +63,8 @@ is its turns times its context: every turn re-reads everything read so far.
   an independent subagent with this skill, the slice's files, the base tree, and the contracts it
   relies on from other slices. Then verify every finding they return yourself, merge duplicates, and
   review what crosses slices (a caller in one and a callee in another, state one writes and another
-  reads): those are the defects no slice sees. Phase A and the big picture stay yours.
+  reads): those are the defects no slice sees. Phase A and the big picture stay yours. A run
+  someone with write access starts never skips a file: it slices.
 - **Nothing runs in light or thorough mode.** No tests, scripts, servers or reproductions: findings
   are traced (§5). In gpu mode the live test runs afterwards, in its own session on
   the GPU box (§7).
@@ -82,17 +84,17 @@ is its turns times its context: every turn re-reads everything read so far.
   the finding asks, and a move, rename or deleted file isn't a fix (#392, above #387, deleted
   `dsa.py` but still planned DSA in `preprocess`). A partial fix is a plain open finding. Before
   folding a finding into another, check its callers at every stacked head. When you can't read the
-  PR above (no shell, as in the bot), a finding said to be fixed there stays a plain open finding
-  that adds "said to be fixed in #N, not checked". If the PR carries another PR's commit, say
-  whether it is byte-identical.
+  PR above (the bot reads only the diffs its workflow fetched), a finding said to be fixed there
+  stays a plain open finding that adds "said to be fixed in #N, not checked". If the PR carries
+  another PR's commit, say whether it is byte-identical.
 - **Rules.** `AGENTS.md` every review; then the skills it points to for the layers the PR touches:
   `async-worker` before judging any worker-loop change, `engine-resources` for resources,
   `prefix-caching` for KV, `benchmarking` for performance claims, `writing-prs` for the description,
   `add-mstar-model` and `diffusion-scaffold` for model ports. Don't read what the change doesn't
   call for.
 - **References in this skill** are opened by the pass that names them: `behaviour-lenses.md`,
-  `hard-rules.md`, `mstar-way.md`, `patterns.md`, `performance.md`, `philosophy.md`.
-- **Citations.** `AGENTS.md` invariant N or style rule SN; "hard rule RN"; "behaviour lens N";
+  `mstar-way.md`, `patterns.md`, `performance.md`, `philosophy.md`.
+- **Citations.** `AGENTS.md` invariant N or style rule SN; "behaviour lens N";
   "factoring pattern AN", "style pattern BN", "pattern CN"; "mstar philosophy §N"; "minimality";
   "mstar way" with the check (disguise, altitude or seam). Cite a rule by its label only: don't name
   people or say where a rule came from. Don't write a checklist of invariants, patterns or
@@ -128,13 +130,18 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   the timing.
 - **A test that can fail under CI load, xdist or another order is at least P2** (behaviour lens 7).
 - **A shared-layer mechanism built beside an existing mstar primitive is P0** (a disguise-check hit,
-  §4.6), even though it may break nothing on `main` yet. It is the foundation later PRs build on, so
+  §4.5), even though it may break nothing on `main` yet. It is the foundation later PRs build on, so
   it is the most expensive thing to get wrong. Look hardest for loops: a node re-queued for
   the same request, a per-request cursor, outputs held until a last pass. (#365 built chunked
   prefill exactly that way, and its first review called the scattered state a cleanup.)
 - **Reachability is grepped, not guessed.** Before calling a finding reachable or latent, find which
   models and configs declare what it depends on (`git grep "PrefixKeys("`, the policy or YAML that
-  turns the path on) and cite the hits. (On #365 one unchecked premise made an unreachable crash P1
+  turns the path on) and cite the hits. Before "nothing can reach this", check padding (a step pads
+  into the smallest bucket that holds it, so a bucket the pool can't admit at full size still serves
+  smaller steps, #729), every model on `main` rather than one (#561), and the transport (the control
+  mesh blocks at the high-water mark and never raises for a dead peer, #465). A gap is pre-existing
+  only if `main` reaches it today: when `main` fails earlier and the PR removes that failure, the
+  gap is the PR's (#729). (On #365 one unchecked premise made an unreachable crash P1
   and a reachable recompute regression P3.)
 - **Evidence and scope are one finding.** Missing per-mechanism measurement, undisclosed shared-layer
   changes and untested models become one "evidence and scope" finding: P1 only when the description
@@ -159,8 +166,8 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
 pattern B1 allows); pre-existing problems the PR doesn't worsen; praise or a restatement of the
 diff; how many tests a PR adds, or that it adds too many (ask for a test only where a finding needs
 one to pin it, and never ask to cut tests for count); GPU timing or numerics you can't establish
-from the code, except a static performance finding with its arithmetic (§4.3) or a measurement from
-the live test. Questioning a performance claim's methodology is in scope (§4.3).
+from the code, except a static performance finding with its arithmetic (§4.2) or a measurement from
+the live test. Questioning a performance claim's methodology is in scope (§4.2).
 
 ## 3. Phase A: the mstar way, before the diff (all modes)
 
@@ -196,15 +203,20 @@ its pin, including what `main` changed under the PR; (4) shared mutable state ac
 streams, async steps, ranks and deployments, then failure and retry; (5) every silent fallback;
 (6) new ops on compiled or captured paths; (7) what can make each added or changed test fail under CI
 and not alone; (8) each claimed benefit traced through the code that decides it. Write each lens's
-coverage line. This pass finds most of the defects the design passes miss.
+coverage line. This pass finds most of the defects the design passes miss. Three checks go with
+the lenses:
 
-### 4.2 Hard rules (all modes)
+- **Structural, not tuned.** Correctness, liveness and scheduling never rest on a wall-clock window,
+  timeout, retry count or tuned constant when a structural signal exists: a step count, the pool's
+  state, a reservation, message order, an explicit marker (#461's one-second windows became a step
+  count). A model's quality default is exempt, but its comment states the rule that picks the value.
+- **Fix the cause.** No stopgap and nothing that hides a failure: a broad `except` over half-updated
+  state, a leak bounded by a budget, a retry for a failure the system never produces, a WARNING
+  where `main` logged an ERROR, an exemption from a check.
+- **Handle-keyed state is purged on every release path** and listed in `mstar/worker/rid_table.py`
+  (invariant 14).
 
-Go through R1–R12, the premise checks and the tests-and-claims checks in
-[hard-rules.md](references/hard-rules.md). Each broken rule is a finding citing "hard rule RN", or
-folds into one with the same root cause. Record one line naming the rules broken, or "none".
-
-### 4.3 Performance (all modes)
+### 4.2 Performance (all modes)
 
 Both kinds count: a **regression** the PR introduces and an **opportunity** in code it adds or
 touches. Go through [performance.md](references/performance.md): where time goes on each hot path
@@ -236,7 +248,7 @@ reservations, scaling).
 - **An alternative you suggest under capture, compile or a collective is a hypothesis** that needs a
   served-output check, not a free speedup (#897's suggested alternatives broke images or capture).
 
-### 4.4 Description (all modes)
+### 4.3 Description (all modes)
 
 Check the description against the `writing-prs` skill, in proportion to the change. Above all,
 check it is accurate: every behaviour, number and "tested on" claim must match the code and diff; a
@@ -247,18 +259,24 @@ Flag padding that hides the point (a debugging narrative, a line-by-line restate
 Problems in the code itself (a stale comment, a missing docs row) are findings, not description
 items.
 
-### 4.5 Big picture (all modes)
+### 4.4 Big picture (all modes)
 
 Judge the PR as a whole, before the line-level design passes.
 
+- **Is the premise true?** The bug exists on current `main`, and nothing merged or open already
+  fixes it. A decision on record (an issue, RFC, review thread or code comment) stands unless the
+  PR brings new evidence that answers the reasons given there; cite where it was made (#449 reopened
+  #348's trade-off without answering why #348 closed). Read the linked issues and their closed
+  predecessors, and the other reviewers' asks and the author's replies, first.
 - **Is it wanted?** What user-visible problem does it solve, for which models and deployments, and is
   it worth its complexity by the PR's own numbers? Does it duplicate work in flight (shell: `gh pr
   list --search <area>`)? Does it pre-empt, depend on, block or get superseded by other work in
   flight, and should it wait or fold into another PR? (A split request stays a note, §1.)
 - **Is the overall approach right?** Name the 2–3 system-level ways to build it, including the PR's,
   and say which you'd pick and why. Compare with how vLLM, SGLang and their -Omni variants (and
-  LMCache, Dynamo or diffusers where relevant) solve it; read their code when you can, and say so
-  when the comparison is from memory.
+  LMCache, Dynamo or diffusers where relevant) solve it. Read their code or docs (the web tools are
+  limited to code hosts, the projects' docs, Hugging Face, PyTorch and arXiv) and say what you read;
+  don't go from memory.
 - **Scope, timing and commitments:** is this the right slice to land now? What does it commit mstar
   to (public config keys, API fields, wire formats, base-class hooks or invariants that are hard to
   undo), and does it make the likely next step (TP, a new modality, disaggregation, another cache
@@ -280,7 +298,7 @@ but this one works; P2 at least when the PR's mechanism is narrower than the pro
 will have (a cosmetic gap is P3). The gap to the north star is a finding too, not only a verdict
 line. A judgement call on direction is a question, not a finding.
 
-### 4.6 Abstraction fit and Phase B (all modes)
+### 4.5 Abstraction fit and Phase B (all modes)
 
 Set Phase A beside the code: one row per design area with what the derivation gives, what the PR
 does, which is better and why, and the cost to converge. Every row where the derivation is better is
@@ -329,7 +347,7 @@ otherwise. When the right abstraction doesn't exist yet, the finding names the m
 (mstar philosophy §2) and, with a shell, any open PR providing it, and says whether to block on that
 PR or stack this one on it.
 
-### 4.7 Factoring (all modes)
+### 4.6 Factoring (all modes)
 
 For every new file, class and function, ask where it should live. The examples are in
 [patterns.md](references/patterns.md) section A.
@@ -353,7 +371,7 @@ New code that duplicates a helper already on `main` is always its own finding, e
 finding's fix would delete it. Usually P2 for a whole architecture or a second copy of a shared
 component (the next model copies it again), P3 for a small helper.
 
-### 4.8 Design (all modes)
+### 4.7 Design (all modes)
 
 For each abstraction the PR adds or changes (class, base-class hook, resource, node, config schema,
 API field, registry entry):
@@ -370,7 +388,7 @@ API field, registry entry):
   where a batched tensor was needed, an API returning host values, state the cache or pool can't
   reach, a fused node that can't be split across GPUs, uncapturable shapes, an interface assuming
   one step per call. Weigh this heavily. A blocker finding sketches the shape that keeps the door
-  open and gives est., probability and expected speedup (§4.3) for the optimization it would
+  open and gives est., probability and expected speedup (§4.2) for the optimization it would
   unlock.
 - **Cost of changing it later:** public HTTP fields, config keys, on-disk formats and hooks other
   models implement get the most scrutiny.
@@ -384,7 +402,7 @@ high-value optimization there; P2 when it works but the next extension needs cop
 abstraction, misplaced responsibilities or duplicated state, or a blocker inside one model; P3 for a
 cleaner shape that is cheap to leave.
 
-### 4.9 Minimality (all modes)
+### 4.8 Minimality (all modes)
 
 The general design usually has *fewer* concepts, because it sits at the layer whose machinery
 already does the work. A PR that got "more general" by adding hooks, states and knobs probably picked
@@ -419,7 +437,7 @@ the wrong layer.
 inside one model or subsystem; P3 for a small helper. Record
 `concepts added: N; deletable: M (finding ids)`.
 
-### 4.10 Style (all modes)
+### 4.9 Style (all modes)
 
 Go through [patterns.md](references/patterns.md) section B; findings are usually P3 with "Nit:":
 names only when wrong rather than a matter of taste (B1: shared code named after one model, protocol
@@ -439,7 +457,7 @@ numbers (B11).
 - **Error paths (C1):** the right 400 vs 500, cleanup in `finally`, the error reaching the client. A
   wrong status or a leak is P2 by the bar, not a nit.
 
-### 4.11 Philosophy (all modes)
+### 4.10 Philosophy (all modes)
 
 Ask each principle's questions in [philosophy.md](references/philosophy.md) of the diff, including
 parts other passes covered, since a principle often shows why a smaller miss matters. Each violation
@@ -473,6 +491,10 @@ does; read it.
   every frame.)
 - **Every P0–P2 finding has a "how to confirm" line:** the request, test or GPU check that would show
   it, and what it would show. Outside gpu mode it is not run.
+- **The PR's tests are evidence too.** Trace each new test against `main`'s code: count apart the
+  ones that fail for the bug and the ones that fail only on a name the PR adds, say what each would
+  accept that is wrong, and name the tests that model a failure the system never produces (#465:
+  about half modelled a dead socket as `send` raising, which neither transport does).
 - **Correctness claims** (parity, numerics): does the PR's evidence compare against the reference
   implementation, with a same-code control and the reference's own spread? Say what is missing; the
   check that would settle it goes in "how to confirm".
@@ -552,8 +574,10 @@ unchanged.
 - **A failed or regressed check is a finding** at the bar's priority, with the run as proof: the
   config, the input, the observed and expected outcome, and where the evidence is.
 - **Outcome**, one of:
-  - `pass`: every planned check ran, reached the changed code and passed. Any ➖ (not reached) or 👂
-    (needs human review) row makes the outcome `partial`;
+  - `pass`: every planned check ran, reached the changed code and passed. Any ➖ for a planned check
+    that wasn't exercised or didn't reach the changed code, or any 👂 (needs human review) row, makes
+    the outcome `partial`. A ➖ for a claimed number that isn't comparable (another GPU, harness or
+    metric) doesn't: the report names it as a problem with the description;
   - `partial`: some planned checks couldn't run, didn't reach the changed code or need a human
     review; name them and why;
   - `fail`: a check failed or regressed (this outranks `partial`);
@@ -582,21 +606,22 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
   doesn't say), then what's missing.
 - **Questions**, each with what its answer would change.
 - **Checked:** the paths and claims traced and found sound, one line each; the eight behaviour
-  coverage lines and the hard-rules line; one line per other pass, with minimality's concept count
+  coverage lines; one line per other pass, with minimality's concept count
   and abstraction fit's per-piece map, one line per piece:
   `<state, computation or path> -> <abstraction>: fits | misfit (<finding id>) | missing system piece (<open PR or "none">)`,
   with each mechanism's state, per-step planning and kernel call on lines of their own.
 - **Design verdict** (thorough, gpu), always present, even when the approach is right; at most six lines:
   the Phase A ideal, the rows where the code differs and which side is better, the north star and
   the PR's distance from it. Every gap named here is also a finding or a question.
-- **Skipped:** files not reviewed, on a diff too large to cover.
+- **Skipped:** files not reviewed, only on a contributor's capped run whose diff is too large for
+  its cap.
 - **Risk:** the design-risk rating, its sentence and, above low, the decisions (§6).
 - **Live test** (gpu): `full`, `targeted` or `none`, the kinds of check, the reason, and the fewest
   GPUs the largest config it needs runs on (§7).
 
 **Before reporting, check:** every cited `path:line` says what the finding claims at the head; every
-gap in the design verdict is a finding or a question; the eight coverage lines and the hard-rules
-line are present; no defect sits inside a minimality or cleanup finding, and evidence and scope are
+gap in the design verdict is a finding or a question; the eight coverage lines are
+present; no defect sits inside a minimality or cleanup finding, and evidence and scope are
 one finding; a finding a PR above fixes is reported as fixed above, not dropped (§1); every pass
 covered every new file, class, piece of state and concept; every performance finding has est.,
 probability, expected speedup, difficulty and how to confirm.
