@@ -830,6 +830,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
@@ -4213,6 +4214,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.OutboxCommunicator.flush">(mstar.communication.communicator.OutboxCommunicator method)</a>
 </li>
         <li><a href="_autosummary/mstar.utils.utf8_stream.html#mstar.utils.utf8_stream.Utf8Stream.flush">(mstar.utils.utf8_stream.Utf8Stream method)</a>
+</li>
+        <li><a href="_autosummary/mstar.worker.phase_timer.html#mstar.worker.phase_timer.PhaseTimer.flush">(mstar.worker.phase_timer.PhaseTimer method)</a>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.worker.node_manager_utils.html#mstar.worker.node_manager_utils.RequestStateManager.flush_publish_info">flush_publish_info() (mstar.worker.node_manager_utils.RequestStateManager method)</a>
@@ -7879,6 +7882,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils">mstar.worker.node_manager_utils</a>
 </li>
+        <li><a href="_autosummary/mstar.worker.phase_timer.html#module-mstar.worker.phase_timer">mstar.worker.phase_timer</a>
+</li>
         <li><a href="_autosummary/mstar.worker.rebuild.html#module-mstar.worker.rebuild">mstar.worker.rebuild</a>
 </li>
         <li><a href="_autosummary/mstar.worker.rid_table.html#module-mstar.worker.rid_table">mstar.worker.rid_table</a>
@@ -9812,6 +9817,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    mstar.worker.phase_timer
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.phase_timer.html#module-mstar.worker.phase_timer">module</a>
+</li>
+      </ul></li>
+      <li>
     mstar.worker.rebuild
 
       <ul>
@@ -11037,6 +11049,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.parts_from_modalities">parts_from_modalities() (in module mstar.model.multimodal)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.phase_timer.html#mstar.worker.phase_timer.PhaseTimer.pass_done">pass_done() (mstar.worker.phase_timer.PhaseTimer method)</a>
+</li>
       <li><a href="_autosummary/mstar.model.waypoint.config.html#mstar.model.waypoint.config.WaypointConfig.patch">patch (mstar.model.waypoint.config.WaypointConfig attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.muse.config.html#mstar.model.muse.config.MuseGlimmerVisionConfig.patch_dim">patch_dim (mstar.model.muse.config.MuseGlimmerVisionConfig property)</a>
@@ -11162,6 +11176,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.phase_start">phase_start() (in module mstar.utils.profiler)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.PhaseLaps">PhaseLaps (class in mstar.utils.profiler)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.phase_timer.html#mstar.worker.phase_timer.PhaseTimer">PhaseTimer (class in mstar.worker.phase_timer)</a>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.g2p.html#mstar.model.kokoro.g2p.Chunk.phonemes">phonemes (mstar.model.kokoro.g2p.Chunk attribute)</a>
 </li>
@@ -11315,10 +11331,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.rust_communicator.html#mstar.communication.rust_communicator.RustZMQCommunicator.poll_for_messages">(mstar.communication.rust_communicator.RustZMQCommunicator method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.pool">pool (mstar.worker.rebuild.Rebuilds property)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.worker.rebuild.html#mstar.worker.rebuild.Rebuilds.pool">pool (mstar.worker.rebuild.Rebuilds property)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.accelerator_graph_backend.html#mstar.engine.accelerator_graph_backend.CapturedGraph.pool">pool() (mstar.engine.accelerator_graph_backend.CapturedGraph method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.pop">pop() (mstar.model.submodule_base.BatchedModelOutput method)</a>
@@ -12196,8 +12212,12 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.utils.h2d.html#mstar.utils.h2d.H2DMirror.record">(mstar.utils.h2d.H2DMirror method)</a>
 </li>
+        <li><a href="_autosummary/mstar.worker.phase_timer.html#mstar.worker.phase_timer.PhaseTimer.record">(mstar.worker.phase_timer.PhaseTimer method)</a>
+</li>
       </ul></li>
       <li><a href="_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.ServingMetrics.record_chunk">record_chunk() (mstar.observability.metrics.ServingMetrics method)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.phase_timer.html#mstar.worker.phase_timer.PhaseTimer.record_gpu_span">record_gpu_span() (mstar.worker.phase_timer.PhaseTimer method)</a>
 </li>
       <li><a href="_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.ServingMetrics.record_preprocess">record_preprocess() (mstar.observability.metrics.ServingMetrics method)</a>
 </li>
@@ -14259,6 +14279,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.step.Segment.span">(mstar.engine.resources.step.Segment attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.worker.phase_timer.html#mstar.worker.phase_timer.PhaseTimer.span">span() (mstar.worker.phase_timer.PhaseTimer method)</a>
+</li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.BatchedModelOutput.span_request_ids">span_request_ids (mstar.model.submodule_base.BatchedModelOutput attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.SpanKind">SpanKind (class in mstar.engine.resources.kv.config)</a>
@@ -14486,6 +14508,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.step_is_input_free">step_is_input_free() (mstar.model.submodule_base.NodeSubmodule method)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.phase_timer.html#mstar.worker.phase_timer.step_key">step_key() (in module mstar.worker.phase_timer)</a>
 </li>
       <li><a href="_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo.step_metadata">step_metadata (mstar.conductor.request_info.CurrentForwardPassInfo attribute)</a>
 </li>
@@ -15254,6 +15278,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.TPNoSpeculation">TPNoSpeculation (class in mstar.utils.ipc_format)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.phase_timer.html#mstar.worker.phase_timer.PhaseTimer.track_gc">track_gc() (mstar.worker.phase_timer.PhaseTimer method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.dsa.manager.html#mstar.engine.resources.dsa.manager.IndexKeyStore.tracked_requests">tracked_requests() (mstar.engine.resources.dsa.manager.IndexKeyStore method)</a>
 </li>

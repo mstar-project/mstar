@@ -830,6 +830,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.side_steps.html">mstar.worker.side_steps</a></li>
@@ -1143,7 +1144,7 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="phase_buffer">
 <a class="viewcode-back" href="../../../_autosummary/mstar.utils.profiler.html#mstar.utils.profiler.phase_buffer">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">phase_buffer</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">float</span><span class="p">]]:</span>
-<span class="w">    </span><span class="sd">"""The shared sample buffer; ``Worker.run`` reads and clears it."""</span>
+<span class="w">    </span><span class="sd">"""The shared sample buffer; ``PhaseTimer.flush`` reads and clears it."""</span>
     <span class="k">return</span> <span class="n">_PHASE_BUF</span></div>
 
 
