@@ -45,6 +45,16 @@ def shape_problems(decl: VerifyNode, token_stop, specs: Mapping[str, NodeResourc
         # ingest refuses the options verify can't honour only on a sampler that says it verifies
         problems.append(f"{where}: sampler {token_stop.sampler!r} doesn't set SamplerSpec.verifies")
     needs = decl.needs
+    if needs.carry is not None and isinstance(sampler, SamplerSpec):
+        from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+
+        state = (sampler.loopback_state or {}).get(DRAFT_CARRY)
+        if state is None or (state.width, state.dtype) != (needs.carry.width, needs.carry.dtype):
+            have = None if state is None else (state.width, state.dtype)
+            problems.append(
+                f"{where}: the drafter carries {needs.carry.width} values of {needs.carry.dtype} a request, which "
+                f"the sampler keeps as loop-back state {DRAFT_CARRY!r}; it declares {have}"
+            )
     if needs.kv_overhang:
         problems.append(f"{where}: the drafter writes {needs.kv_overhang} KV slots past the verify block")
     missing = decl.input_kinds - needs.input_kinds

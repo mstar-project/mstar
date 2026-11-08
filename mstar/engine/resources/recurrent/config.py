@@ -343,6 +343,18 @@ class RecurrentStateConfig:
 class RecurrentStateSpec(NodeResourceSpec):
     config: RecurrentStateConfig
 
+    def verify_refusal(self, draft) -> str | None:
+        if self.config.disable_sink_slot:
+            return "a verify step's padding rows rerun into the sink slot, which disable_sink_slot removes"
+        if len(self.config.labels) != 1:
+            # the undo keeps one label's inputs and maps its rows to the sampler's
+            return f"a verify step settles one label's state, and this pool declares {list(self.config.labels)}"
+        return None
+
+    def async_verify_refusal(self, draft) -> str | None:
+        # its linear-attention resource's rerun, in the graph, needs nothing of the host
+        return None
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.recurrent.pool import RecurrentStatePool

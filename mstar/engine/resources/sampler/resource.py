@@ -733,8 +733,8 @@ class SamplerResource(Resource):
         return group.broadcast(values.contiguous())
 
     def debug_fingerprint(self, rid: str) -> "dict[str, bytes | torch.Tensor]":
-        """``rid``'s loop-back rows (its last token and every declared state): they
-        stay on device across a KV offload."""
+        """``rid``'s loop-back rows (its last token and every declared state, a
+        drafter's carry among them): they stay on device across a KV offload."""
         from mstar.engine.resources.base import tensor_digest
 
         bufs = self._cg_buffers
@@ -830,6 +830,13 @@ class SamplerResource(Resource):
         synchronous host-to-device copy per step, and a node that takes its
         tokens on the host would pay it for nothing. Honours the knob."""
         self._keep_last_token = device_loopback_enabled()
+
+    @property
+    def fixed_loopback_masters(self) -> bool:
+        """Whether the loop-back masters are allocated once at their full rows
+        (the in-graph scatter): what a captured forward reading a loop-back
+        state needs, since a grown master is a new tensor its graph never sees."""
+        return self._keep_last_token and sampler_ingraph_scatter() and self._decides
 
     @property
     def has_slot_masters(self) -> bool:

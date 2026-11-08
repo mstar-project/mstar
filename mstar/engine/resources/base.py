@@ -356,8 +356,21 @@ class Resource(ResidentHooks, ABC):
     def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
         """Its node verifies drafts on ``walk``, ``block`` (``k + 1``) tokens a
         row, and a request's reserved length runs up to ``slack`` past its
-        verified one. Called once at load on every resource of the node; raise to
-        refuse the node."""
+        verified one. Called once at load on every resource of the node, before
+        any `verify_problem`; raise to refuse the node."""
+        return
+
+    def verify_problem(self) -> str | None:
+        """Asked at load once every resource of a verifying node is bound
+        (`bind_verify_walk`): why the node can't verify with this resource as bound,
+        or None."""
+        return None
+
+    def settle_verify_step(self, result) -> None:
+        """Correct the state a verify step's block wrote in place, from the
+        sampler's ``result``, in the step's own graph (`draft_verify_step`).
+        Only an override is called. (Named apart from KDA's own
+        ``settle_verify``, a different contract.)"""
         return
 
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:

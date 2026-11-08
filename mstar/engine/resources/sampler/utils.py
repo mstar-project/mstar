@@ -2541,10 +2541,10 @@ class SamplerBuffers:
 
         The masters hold the trash row (row 0, ``_trash_slot``) plus one row per
         request, ``max_batch_size`` to start with, doubling as registrations
-        outgrow them. With ``ingraph_scatter`` the offset and last-token masters
-        hold ``slots`` request rows (the knob's 4096 by default), allocated
-        once: the captured graphs keep their addresses, so those two never grow,
-        and the others grow up to them. A registration past them raises, so the
+        outgrow them. With ``ingraph_scatter`` the offset, last-token and
+        loop-back state masters hold ``slots`` request rows (the knob's 4096 by
+        default), allocated once: the captured graphs keep their addresses, so
+        those never grow, and the others grow up to them. A registration past them raises, so the
         caller takes rows only while ``free_rows`` says one is left.
 
         ``vocab_size`` (when not None) enables the seen-token mask buffer for the
@@ -2592,9 +2592,12 @@ class SamplerBuffers:
             last_token=Buffer.allocate(max_batch_size, graph_rows, device, torch.long, 0, cg_slots),
             tp_group=tp_group,
             seen_tokens=seen_tokens,
+            # a captured forward reads these masters (`gather_loopback`), so with the in-graph
+            # scatter they are allocated once at its rows, like offset and last_token
             loopback={
                 name: RowBuffer.allocate(
-                    max_batch_size, rows, device, state.dtype, state.default, cg_slots,
+                    max_batch_size, graph_rows if ingraph_scatter else rows, device, state.dtype, state.default,
+                    cg_slots,
                 )
                 for name, state in (loopback_state or {}).items()
             },
@@ -2742,8 +2745,9 @@ class SamplerBuffers:
             self.last_token.grow_master(rows)
         if self.seen_tokens is not None:
             self.seen_tokens.grow_master(rows)
-        for buf in self.loopback.values():
-            buf.grow_master(rows)
+        if not self.ingraph_scatter:
+            for buf in self.loopback.values():
+                buf.grow_master(rows)
         self._device_capacity = cap
 
     @property
