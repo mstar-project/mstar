@@ -499,8 +499,11 @@ never preempted mid-stream. A request no drop can free, because it holds KV made
 another node's outputs or a node that keeps no token ids writes its KV, moves only to the host:
 when it is admitted the host pool sets room aside for its prompt, and it reserves only its prompt.
 The room grows with each page the request takes after that, so its move always fits. When the host
-pool has no room for it, at admission or later, the request reserves its whole footprint in that
-pool, as a voice request does, and the host pool logs it. So ``cpu_offload_pages`` also sets how
+pool has no room for it at admission, or later once the device has room for the rest of its
+footprint, the request reserves its whole footprint in that pool, as a voice request does, and the
+host pool logs it. While the device has no room for that either, nothing is logged: newer requests
+move for it as for any request that runs short, and otherwise it moves to the host, into the room
+set aside for it, and returns once its whole footprint fits. So ``cpu_offload_pages`` also sets how
 many pages such requests can hold with only their prompt reserved.
 
 Above one rank, and on a node with a second paged KV cache, such as Whisper's decoder, a decode
