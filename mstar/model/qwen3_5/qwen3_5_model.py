@@ -93,8 +93,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
         # the vision tower, whose output fills images' and videos' pads in
-        # prompt order
-        pad = self._pad_ids()
+        # prompt order. A text-only checkpoint's tokenizer still has the pad
+        # tokens, so the tower decides whether the model takes media.
+        pad = self._pad_ids() if self.vision_config is not None else {}
         tower = vision_encoder(tuple(pad.values())) if pad else None
         self.media = tuple(
             MediaIntake(m, tower, p, self._image_intake) if m == "image"
