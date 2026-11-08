@@ -724,11 +724,15 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
 
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
-    counts, not their sizes."""
+    counts, not their sizes. A config's ``draft`` block is the model's, as
+    ``Qwen3_5DenseModel.__init__`` reads it (with the checkpoint's MTP layer)."""
+    from mstar.engine.resources.draft.config import DraftConfig
     from mstar.model.multimodal import vision_encoder
     from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.qwen3_5.components.mtp import MTP
     from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+    draft = DraftConfig.from_model_kwargs({"draft": model_kwargs.get("draft")})
     config = Qwen3_5Config(
         num_hidden_layers=4, hidden_size=256, intermediate_size=512,
         layer_types=[LINEAR_ATTENTION] * 3 + [FULL_ATTENTION],
@@ -736,10 +740,13 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
         linear_num_key_heads=4, linear_num_value_heads=8, linear_key_head_dim=128,
         linear_value_head_dim=128, linear_conv_kernel_dim=4,
         vocab_size=1024, rms_norm_eps=1e-6, max_position_embeddings=262144,
+        mtp_num_hidden_layers=1 if draft is not None else 0,
     )
+    drafter = None if draft is None else MTP(config, draft.num_draft_tokens, dtype="bfloat16")
     return _bare(
         Qwen3_5DenseModel, config=config, vision_config=None,
         media=(MediaIntake("image", vision_encoder((0,)), 0, None),),
+        draft=draft, drafter_decl=drafter,
     )
 
 
@@ -897,6 +904,10 @@ _STUBBED_IMPORTS: list[set[str]] = []
 SHIPPED_CONFIGS = sorted((ROOT / "configs").glob("*.yaml"))
 
 
+def _has_draft_block(path: Path) -> bool:
+    return "draft" in (yaml.safe_load(path.read_text()).get("model_kwargs") or {})
+
+
 @pytest.fixture
 def _drop_stubbed_imports():
     """Modules imported against the flashinfer stub must not outlive it."""
@@ -906,6 +917,36 @@ def _drop_stubbed_imports():
         for mod in set(sys.modules) - before:
             if mod.startswith("mstar.model.qwen3_omni"):
                 del sys.modules[mod]
+
+
+@pytest.mark.parametrize("name", [p.name for p in SHIPPED_CONFIGS if _has_draft_block(p)])
+def test_a_shipped_drafters_layer_sets_survive_the_serving_overrides(
+    name, tmp_path, monkeypatch, _drop_stubbed_imports,
+):
+    """The drafter's layers join the pool when the model declares it; the serving path then applies
+    the config's `resources:` overrides and sizes and shards the pool, all in place: the layer sets,
+    the drafter's first layer and the pool's layers come out as the join made them."""
+    from mstar.model.base import serving_resources
+
+    config = yaml.safe_load((ROOT / "configs" / name).read_text())
+    model_name = config["model"]
+    if model_name not in MODEL_REGISTRY:
+        pytest.skip(f"model {model_name!r} is not in MODEL_REGISTRY")
+    factory = _FACTORIES.get(MODEL_REGISTRY[model_name][1], _default)
+    model = factory(model_name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
+    (decl,) = model.verify_nodes()
+    kv = {spec.resource_key: spec for spec in serving_resources(model, config)}["kv_cache"].config
+    joined = decl.needs.kv
+    # the target's own KV layers: Qwen3.5's full-attention layers, every layer of Qwen3's
+    full = getattr(model.config, "full_layer_indices", None)
+    target = len(full) if full is not None else model.config.num_hidden_layers
+    assert kv.num_layers == target + joined.num_layers
+    assert kv.layer_sets == {"target": (0, target), joined.name: (target, joined.num_layers)}
+    if "resources" in config and "max_num_pages" in config["resources"].get("kv_cache", {}):
+        assert kv.max_num_pages == config["resources"]["kv_cache"]["max_num_pages"]
+    kv.shard(2)
+    assert kv.layer_sets[joined.name] == (target, joined.num_layers)
+    assert [list(group.layers) for group in kv.groups] == [list(range(kv.num_layers))]
 
 
 @pytest.mark.parametrize("config_path", SHIPPED_CONFIGS, ids=lambda p: p.name)
