@@ -114,9 +114,12 @@ class ChunkingManagement:
         That is the budget it was scheduled under: that of the combined walk
         it runs in, if any (a combined batch whose rows share one real walk
         runs relabelled to it, `ScheduledBatch.relabel_if_uniform`, and still
-        ran under the combined walk's budget). Or more, by what the step's
-        speculated rows, one-token decode rows, take of ``min_chunk_tokens``
-        (`batch_builder.most_step_tokens`).
+        ran under the combined walk's budget). For a combined walk's step, or
+        more, by what a speculation chain's rows, one-token decode rows, take
+        of ``min_chunk_tokens`` (`batch_builder.most_step_tokens`). A real
+        walk's step carries no chain rows: decode rows beside a prompt make the
+        step the combined walk's (`MicroScheduler.label_for`), and a chain on a
+        prompt walk continues no row, its rows mid-prefill being the step's own.
 
         None too where the step may hold a prompt of a walk whose chunking
         the serving config turned off: it runs whole, however long."""
@@ -131,8 +134,8 @@ class ChunkingManagement:
             return None
         walk = self._combined_walk_of.get((node_name, graph_walk), graph_walk)
         budget = self.max_batch_tokens(node_name, walk)
-        if budget is None:
-            return None
+        if budget is None or not members:
+            return budget
         return most_step_tokens(budget, self.min_chunk_tokens(budget), max_rows - 1)
 
     def set_budgets(

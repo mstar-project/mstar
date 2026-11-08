@@ -348,9 +348,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        batch on the second (a larger batch size's ladder must reach at least as
        far). A walk's ladder runs to the first rung that holds the most tokens a
        step its capture replays runs: its token budget (``max_batch_tokens``; a walk
-       inside a combined walk runs under the combined walk's), or past it where the
-       capture's widest batch of one-token decode rows leaves a prompt less than
-       ``min_chunk_tokens``, which then still runs that many. The rungs past it,
+       inside a combined walk runs under the combined walk's), or, for a combined
+       walk's steps, past it where the capture's widest batch of one-token decode
+       rows leaves a prompt less than ``min_chunk_tokens``, which then still runs
+       that many. The rungs past it,
        which no step would reach, are dropped and logged. A ladder is kept whole
        where its steps run under no budget or may hold a prompt of a walk whose
        chunking ``max_batch_tokens`` turned off, which runs whole, as is a

@@ -768,7 +768,8 @@ def test_a_mixed_ladder_keeps_the_rung_a_prompt_beside_decode_rows_runs_past_the
     """Where a mixed step's decode rows leave a prompt less than
     ``min_chunk_tokens`` of the budget, the prompt still runs that many beside
     them: 127 decode rows and a 2048-token chunk replay at 2176, which stays.
-    At the default floor no step passes the budget, so 2176 is dropped."""
+    At the default floor no step passes the budget, so 2176 is dropped. A
+    ``prefill_text`` step carries no decode rows, so its ladder drops it too."""
     from mstar.model.qwen3_5.submodules import LLMSubmodule
     from mstar.worker.batch_builder import fill_token_budget_in_start_order
 
@@ -787,11 +788,15 @@ def test_a_mixed_ladder_keeps_the_rung_a_prompt_beside_decode_rows_runs_past_the
         take, _ = fill_token_budget_in_start_order(
             [0], {0: 5000}, {0}, 2048 - (rows - 1), engine.min_chunk_tokens(2048),
         )
-        ladder = {"mixed": [1024, 2048, 2176, 4096]}
-        return rows - 1 + take[0], _captured_buckets(llm, "mixed", ladder, engine, bs=rows)
+        ladder = [1024, 2048, 2176, 4096]
+        return (
+            rows - 1 + take[0],
+            _captured_buckets(llm, "mixed", {"mixed": ladder}, engine, bs=rows),
+            _captured_buckets(llm, "prefill_text", {"prefill_text": ladder}, engine),
+        )
 
-    assert buckets(128) == (2048, [1024, 2048])
-    assert buckets(2048) == (2175, [1024, 2048, 2176])
+    assert buckets(128) == (2048, [1024, 2048], [1024, 2048])
+    assert buckets(2048) == (2175, [1024, 2048, 2176], [1024, 2048])
 
 
 @pytest.mark.parametrize("walk, match", [
