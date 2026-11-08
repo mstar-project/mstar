@@ -835,6 +835,8 @@ def test_no_graph_backend_means_no_capture_stream():
 
 
 def test_capture_runs_on_the_stream_it_is_given(monkeypatch):
+    from mstar.engine.accelerator_graph_backend import AcceleratorGraphBackend
+
     seen = {}
 
     class Capture:
@@ -851,6 +853,7 @@ def test_capture_runs_on_the_stream_it_is_given(monkeypatch):
         capture=lambda graph, pool, stream: seen.update(stream=stream) or Capture(),
         synchronize=lambda: None,
     )
+    backend.capture_call = AcceleratorGraphBackend.capture_call.__get__(backend)
     monkeypatch.setattr(runner_module.DeviceCapability, "of", lambda device: SimpleNamespace(graph_backend=backend))
     pool = SimpleNamespace(on_success=lambda: None, on_failure=lambda graph: None)
 
