@@ -1,8 +1,11 @@
-"""Every TP rank's recurrent pool starts serving with the same free slots: each rank admits
-from its own pool, so a divergence here is one in every later verdict. The all-gather is a stub.
+"""Every rank of an instance starts serving with the same free slots in its recurrent pool:
+each rank admits from its own pool, so a divergence here is one in every later verdict. The
+vote is a stub.
 """
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,26 +19,17 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
 
-class _Group:
-    """A comm group whose all-gather returns what the other ranks hold."""
-
-    def __init__(self, values: list[int] | None):
-        self.values = values
-        self.world_size = 1 if values is None else len(values)
-
-    def all_gather(self, local: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        assert dim == 0 and local.shape == (1,)
-        values = self.values or [int(local.item())]
-        return torch.tensor(values, dtype=local.dtype)
-
-
 class _Joint:
-    def __init__(self, tp: list[int] | None, sp: list[int] | None = None):
-        self.tp_group, self.sp_group = _Group(tp), _Group(sp)
+    """A joint group whose agree reduces what each rank of the instance holds."""
 
-    @property
-    def world_size(self):
-        return self.tp_group.world_size * self.sp_group.world_size
+    def __init__(self, free: list[int]):
+        self.free = free
+        self.world_size = len(free)
+        self.tp_group, self.sp_group = SimpleNamespace(world_size=len(free)), SimpleNamespace(world_size=1)
+
+    def agree(self, values: list[int]) -> list[int]:
+        assert len(values) == 2
+        return [min(self.free), -max(self.free)]
 
 
 def build_pool(comm_group) -> RecurrentStatePool:
@@ -53,11 +47,10 @@ def build_pool(comm_group) -> RecurrentStatePool:
 
 @pytest.mark.parametrize("group, diverged", [
     (None, False),
-    (_Joint(tp=None), False),
-    (_Joint(tp=[4, 4]), False),
-    (_Joint(tp=[4, 3]), True),
-    (_Joint(tp=[4, 4], sp=[4, 2]), True),
-], ids=["no-group", "one-rank", "matching", "tp-diverged", "sp-diverged"])
+    (_Joint([4]), False),
+    (_Joint([4, 4, 4, 4]), False),
+    (_Joint([4, 4, 4, 3]), True),
+], ids=["no-group", "one-rank", "matching", "diverged"])
 def test_post_warmup_validate(group, diverged):
     pool = build_pool(group)
     if not diverged:

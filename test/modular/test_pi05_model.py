@@ -495,6 +495,21 @@ def test_pi05_process_prompt_formats_state_into_text():
     assert "255" in stub.last_prompt
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_pi05_process_prompt_refuses_a_non_finite_state(bad):
+    """A NaN or inf joint reading would otherwise bin like an ordinary value
+    (NaN and +inf as 255, -inf as -1): the request is refused, on every route."""
+    model = _make_model()
+    stub = _StubTokenizer()
+    model.tokenizer = stub
+    with pytest.raises(ValueError, match="robot_state must be finite"):
+        model.process_prompt(
+            prompt="pick up the block", input_modalities=["image", "text"], output_modalities=["action"],
+            tensors=_ONE_IMAGE, robot_state=[0.1, bad, 0.3],
+        )
+    assert stub.last_prompt is None
+
+
 def test_pi05_process_prompt_without_state_uses_plain_text():
     model = _make_model()
     stub = _StubTokenizer()

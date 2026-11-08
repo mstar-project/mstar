@@ -7,7 +7,6 @@ lane filter, and which configs the startup decision refuses.
 """
 from __future__ import annotations
 
-import contextlib
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -18,11 +17,13 @@ from test_send_registration_failure import _decode_step, _postprocess_worker
 
 from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import accelerator_graph_runner as runner_module
-from mstar.engine.engine import Engine
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import DeviceLoopback, NodeSubmodule, TokenStop
+from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.threads import ThreadPool
 from mstar.worker import side_steps
 from mstar.worker.engine_manager import EngineManager, _side_lane_keys, side_stream_nodes
@@ -80,13 +81,11 @@ def _step(rids, landed=True, done=True, failed=None, lane=SIDE_LANE):
 def _worker():
     """A real ``Worker`` with what the lane calls around it recorded."""
     log: list = []
-    worker = Worker.__new__(Worker)
+    worker = make_worker()
     worker.log = log
     worker.worker_id = "w0"
     worker.device = torch.device("cpu")
     worker._in_flight_rids = set()
-    worker._phase_period = 0
-    worker._span = lambda *a, **k: contextlib.nullcontext()
     worker._wait_for_step = lambda step: log.append("wait for step")
     worker._clear_in_flight_flag = lambda batch: log.append("clear in flight")
     worker._set_in_flight_flag = lambda batch, value: log.append(f"in flight {value}")
@@ -99,10 +98,8 @@ def _worker():
     worker._execute_on_gpu_thread = lambda *a: log.append("execute") or _OUTPUTS
     worker.wakeup_event = SimpleNamespace(register_future=lambda future: None)
     worker.request_state = SimpleNamespace(get_partition_for_node=lambda node: node)
-    worker.scheduler = SimpleNamespace(
-        clear_batch_limit=lambda *a, **k: log.append("clear limit"),
-        get_next_batch=lambda state, lane=CHAIN_LANE: None,
-    )
+    worker.admission.clear_batch_limit = lambda *a, **k: log.append("clear limit")
+    worker.scheduler = SimpleNamespace(next_batch=lambda lane=CHAIN_LANE: None)
     return worker
 
 
@@ -128,7 +125,7 @@ def test_the_window_collates_on_the_lane_stream_before_the_step_is_submitted(mon
     worker.log = backend.log
     worker._build_executing_batch = lambda batch: backend.log.append("build") or SimpleNamespace()
     worker._submit_gpu_step = lambda *a, **k: backend.log.append("submit") or Future()
-    worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: _batch([1])
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([1])
     lane = SideStepLane(worker)
 
     lane.launch(None)
@@ -139,7 +136,7 @@ def test_the_window_collates_on_the_lane_stream_before_the_step_is_submitted(mon
 def test_every_step_shares_one_stream(monkeypatch):
     backend = _StreamBackend(monkeypatch)
     worker = _worker()
-    worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: _batch([1])
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([1])
     lane = SideStepLane(worker)
 
     lane.launch(None)
@@ -165,9 +162,7 @@ def test_a_step_that_staged_host_rows_fails(monkeypatch):
 
 def test_the_submitted_step_takes_the_lane_body_and_lifts_the_launch_fence(monkeypatch):
     _StreamBackend(monkeypatch)
-    worker = Worker.__new__(Worker)
-    worker.device = torch.device("cpu")
-    worker._execute_on_gpu_thread = lambda *a: _OUTPUTS
+    worker = make_worker(device=torch.device("cpu"), _execute_on_gpu_thread=lambda *a: _OUTPUTS)
     lane = SideStepLane(worker)
     lane._stream = side_steps.torch.Stream(worker.device)
     node_batch = SimpleNamespace(launch_started_event=None)
@@ -233,7 +228,7 @@ def test_rows_in_flight_are_every_lanes_and_an_error_fails_the_chains():
 def test_one_step_in_flight():
     worker = _worker()
     asked = []
-    worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: asked.append(lane) or _batch([len(asked)])
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: asked.append(lane) or _batch([len(asked)])
     lane = SideStepLane(worker)
 
     lane.launch(None)
@@ -333,7 +328,7 @@ def _chain_worker():
 
     w._graph_runtime.clear_pending_loop_stops = clear
     w._graph_runtime.pending_loop_stop_rids = lambda walks, loop_name: set(stops)
-    w.scheduler.clear_batch_limit = lambda *a, **k: None
+    w.admission.clear_batch_limit = lambda *a, **k: None
     return w
 
 
@@ -389,7 +384,7 @@ def test_a_step_that_raised_fails_its_own_rows_and_clears_out():
 
 def test_a_step_that_could_not_launch_fails_its_rows():
     worker = _worker()
-    worker.scheduler.get_next_batch = lambda state, lane=CHAIN_LANE: _batch([3])
+    worker.scheduler.next_batch = lambda lane=CHAIN_LANE: _batch([3])
 
     def refuse(batch):
         raise RuntimeError("boom")
@@ -487,9 +482,7 @@ class _GraphBackend:
 
 
 def _engine(backend, side=("Codec",)):
-    engine = Engine.__new__(Engine)
-    engine._device_capability = SimpleNamespace(graph_backend=backend)
-    engine._side_stream_nodes = frozenset(side)
+    engine = make_engine(_device_capability=SimpleNamespace(graph_backend=backend), _side_stream_nodes=frozenset(side))
     return engine
 
 
@@ -547,7 +540,7 @@ def _codec_node(name="Codec"):
     )
 
 
-class _Model:
+class _Model(StubModel):
     def __init__(self, walks=None, combined=None):
         if walks is None:
             walks = {"codec_chunk": _codec_node(), "talker_decode": _codec_node("Talker")}
@@ -631,7 +624,7 @@ _LOOP = Loop(name="decode_loop", section=_codec_node(), max_iters=4, outputs=[])
 
 @pytest.mark.parametrize("kwargs, reason", [
     (dict(submodules={"Codec": _Plain(), "Talker": object()}), "declares no side_stream_walks"),
-    (dict(groups=_Groups(world=2)), "tensor or sequence parallel"),
+    (dict(groups=_Groups(world=2)), "runs in a lockstep instance"),
     (dict(nodes=("Codec",)), "only node on its worker"),
     (dict(accelerator=False), "no streams"),
     (dict(model=_Model({"codec_chunk": _codec_node(), "codec_warm": _codec_node()})), "also runs"),

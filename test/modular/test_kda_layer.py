@@ -62,7 +62,11 @@ def _resources(cfg: KDAConfig, tp: int = 1, speculative_tokens: int = 0):
     kda_spec = LinearAttnSpec(KDA, {"llm"}, LinearAttnConfig(
         recurrent_state=POOL, variant=LinearAttnVariant.KDA, backend=LinearAttnBackend.TRITON,
     ))
-    group = SimpleNamespace(world_size=tp) if tp > 1 else None
+    group = None
+    if tp > 1:
+        group = SimpleNamespace(
+            world_size=tp, tp_group=SimpleNamespace(world_size=tp), sp_group=SimpleNamespace(world_size=1),
+        )
     pool = build_resource(pool_spec, EngineResourceInfo(device=CPU, joint_comm_group=group))
     kda = build_resource(kda_spec, EngineResourceInfo(
         device=CPU, joint_comm_group=group, dependencies={POOL: pool_spec},

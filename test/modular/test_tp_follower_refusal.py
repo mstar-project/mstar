@@ -18,12 +18,11 @@ from mstar.engine.resources import (
     FullAdmitOutcome,
     RequestOffloading,
 )
+from mstar.testing_utils.engine import make_engine
 
 
 def _engine(cap, follower=True) -> Engine:
-    engine = object.__new__(Engine)
-    engine._tp_follower_nodes = {"LLM"} if follower else set()
-    engine.get_max_batch_size = lambda node, walk: cap
+    engine = make_engine(_tp_follower_nodes={"LLM"} if follower else set(), get_max_batch_size=lambda node, walk: cap)
     return engine
 
 
@@ -43,7 +42,7 @@ def _refused(reason=None) -> FullAdmitOutcome:
 
 def test_a_follower_refusing_past_its_cap_exits():
     with pytest.raises(SystemExit, match=r"TP ranks diverged.*3 requests on LLM/prefill.*cap of 2.*kda_state"):
-        Engine._check_follower_refusal(_engine(cap=2), _batch(3), _refused())
+        _engine(cap=2)._check_follower_refusal(_batch(3), _refused())
 
 
 @pytest.mark.parametrize("engine, rows, outcome", [
@@ -54,4 +53,4 @@ def test_a_follower_refusing_past_its_cap_exits():
         message="being offloaded", label="main", request_id="r0"))),  # not capacity
 ], ids=["within-cap", "leader", "uncapped", "offloading"])
 def test_refusals_both_ranks_share_are_left_to_retry(engine, rows, outcome):
-    Engine._check_follower_refusal(engine, _batch(rows), outcome)
+    engine._check_follower_refusal(_batch(rows), outcome)
