@@ -35,9 +35,8 @@ be rerun on its own:
     reference is reported, not judged.
 ``tp``
     Needs ``--tp 2`` or more GPUs and the captured single-GPU ``serve`` output. For each
-    ``MSTAR_TP_ASYNC_SCHED`` in ``--async-sched`` (default 0; 1, the async scheduler, is
-    refused with LoRA until #1082): the same server with the LLM node tensor-parallel,
-    the ``serve`` requests checked against
+    ``MSTAR_TP_ASYNC_SCHED`` in ``--async-sched`` (default both 0 and 1): the same
+    server with the LLM node tensor-parallel, the ``serve`` requests checked against
     the single-GPU run by the ``graphs`` rule, then an eviction-churn load on the same
     server (every adapter and the base model round-robin, more adapters than slots,
     concurrency 64) that must finish with no failed request and must have evicted.
@@ -617,8 +616,7 @@ def main() -> int:
                    help="fewer slots than adapters exercises eviction in the mixed phase")
     p.add_argument("--tp", type=int, default=1,
                    help="serve / tp: the LLM node's TP size (needs that many GPUs)")
-    # 1 (the async TP scheduler) is refused with a lora block until #1082 lands
-    p.add_argument("--async-sched", default="0",
+    p.add_argument("--async-sched", default="0,1",
                    help="tp: the MSTAR_TP_ASYNC_SCHED values to run, comma-separated")
     args = p.parse_args()
     args.async_sched = args.async_sched.split(",")

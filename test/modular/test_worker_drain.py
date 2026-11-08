@@ -20,14 +20,16 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.streaming.topology import CLIENT
-from mstar.testing_utils.worker import make_worker
-from mstar.utils.containers import RecentSet
+from mstar.testing_utils.worker import deliver, make_worker
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
     InputSignals,
     MessageSource,
     RemoveRequest,
+    ScheduleTPNode,
+    WorkerMessage,
+    WorkerMessageType,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
@@ -46,22 +48,10 @@ def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
     pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(),
 ):
-    w = make_worker(is_tp_follower=is_follower)
-    w.sent = []
-    w.cleared = []
-    w.failed = set()
-    w.forced = []
-    w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
-    w._in_flight_rids = set(in_flight)
-    w._pending_drains = set(pending_drains)
-    w._draining_rids = set(draining)
-    w._reads_done_sent = set(reads_done)
-    w._removed_rids = RecentSet(16)
-    w._unprocessed_messages = {}
-    w._pending_removes = {}
+    sent = []
     # Identity interning: these tests use the rid string as its own handle, so
     # the string/handle split is exercised without a real runtime.
-    w._graph_runtime = _StubRuntime(
+    runtime = _StubRuntime(
         get_rid_handle=lambda r: r if r in known_rids else None,
         register_stop_limits=lambda rid, info: None,
         get_rid_string=lambda h: h,
@@ -72,30 +62,49 @@ def _worker(
             SimpleNamespace(groups=[]) if r in known_rids else None
         ),
     )
-    w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid, rid_str: w.cleared.append(rid),
-        clear_wire_rid=w.cleared.append,
-        fail_rids=lambda rids: w.failed.update(rids),  # noqa: PLW0108
-        failed_rids=w.failed,
-        pending_tp_follow_count=dict.fromkeys(tp_follow, 1),
-    )
-    w.request_state = SimpleNamespace(
+    request_state = SimpleNamespace(
         per_request_info={
             rid: SimpleNamespace(sharding_config=SimpleNamespace(groups=[]))
             for rid in known_rids
         },
         remove_request=lambda rid: None,
     )
-    w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None,
-    )
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w.tensor_manager = SimpleNamespace(
+    forced = []
+    tensor_manager = SimpleNamespace(
         has_inflight_reads=lambda rid: inflight_reads,
-        force_cleanup_request=lambda rid: w.forced.append(rid), # noqa: PLW0108
+        force_cleanup_request=lambda rid: forced.append(rid), # noqa: PLW0108
     )
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    cleared = []
+    w = make_worker(
+        is_tp_follower=is_follower, _graph_runtime=runtime,
+        communicator=SimpleNamespace(send=lambda e, m: sent.append((e, m))),
+        request_state=request_state, tensor_manager=tensor_manager,
+        engine_manager=SimpleNamespace(remove_request=lambda rid: None),
+        streams=StreamBufferManager(request_state, tensor_manager, []),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
+        scheduler=SimpleNamespace(clear_rid=cleared.append, drop_backlogged=lambda rids: None),
+    )
+    w.sent = sent
+    w.cleared = cleared
+    w.forced = forced
+    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
+    for rid in known_rids:
+        w.lifecycle.add(rid, rid)
+    for rid in tp_follow:
+        w.lockstep.enqueue_follow(ScheduleTPNode(node_name="n", graph_walk="w", request_ids=[rid]))
+    w._in_flight_rids = set(in_flight)
+    w.lifecycle.pending_drains.update(pending_drains)
+    w.lifecycle.draining.update(draining)
+    w.lifecycle._reads_done_sent.update(reads_done)
     return w
+
+
+def _drain(w, **kwargs):
+    deliver(w, WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest(**kwargs)))
+
+
+def _remove(w, **kwargs):
+    deliver(w, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(**kwargs)))
 
 
 def _reads_done(w):
@@ -124,7 +133,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
         ),
         node_batch=SimpleNamespace(
-            request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            node_name="LLM", request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
             final_stream_rids={7}, partition_done_rids={7},
         ),
         speculative_new_iter=True, graph_walk="decode", loop_name="decode",
@@ -175,7 +184,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
             node_name="LLM", graph_walk="decode", request_to_worker_graph={7: 0},
         ),
         node_batch=SimpleNamespace(
-            request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
+            node_name="LLM", request_ids=[7], per_request_info={7: object()}, cached_rids=set(),
             final_stream_rids=set(), partition_done_rids=set(),
             completion_event=event,
         ),
@@ -245,9 +254,9 @@ def test_a_walk_the_cache_served_whole_is_still_routed():
 
 def test_draining_and_pending_removal_rids_are_not_published():
     w = _worker(known_rids=("healthy", "draining", "pending", "failed"))
-    w._draining_rids.add("draining")
-    w._pending_removes["pending"] = None
-    w.scheduler.failed_rids.add("failed")
+    w.lifecycle.draining.add("draining")
+    w.lifecycle.pending_removes["pending"] = -1
+    w.lifecycle.failed_rids.add("failed")
     batch = SimpleNamespace(
         request_ids=["healthy", "draining", "pending", "failed"],
         step_context=SimpleNamespace(rebuild_rids=frozenset()),
@@ -257,16 +266,16 @@ def test_draining_and_pending_removal_rids_are_not_published():
         },
     )
 
-    assert w._publishable_request_ids(batch) == ["healthy"]
+    assert w.lifecycle.publishable(batch) == ["healthy"]
 
 
 def test_drain_acks_reads_done_when_no_inflight_reads():
     w = _worker(inflight_reads=False)
-    Worker._drain_request(w, DrainRequest(request_id="X"))
+    _drain(w, request_id="X")
 
-    assert "X" in w._draining_rids  # reads gated until REMOVE
-    assert "X" in w._reads_done_sent
-    assert "X" in w.failed  # scheduler stopped from starting new leader work
+    assert "X" in w.lifecycle.draining  # reads gated until REMOVE
+    assert "X" in w.lifecycle._reads_done_sent
+    assert "X" in w.lifecycle.failed_rids  # scheduler stopped from starting new leader work
     assert "X" not in w.cleared  # but state kept until REMOVE
     acks = _reads_done(w)
     assert len(acks) == 1
@@ -276,12 +285,12 @@ def test_drain_acks_reads_done_when_no_inflight_reads():
 
 def test_drain_waits_for_inflight_reads_then_acks():
     w = _worker(inflight_reads=True)
-    Worker._drain_request(w, DrainRequest(request_id="X"))
-    assert "X" in w._draining_rids and not _reads_done(w)
+    _drain(w, request_id="X")
+    assert "X" in w.lifecycle.draining and not _reads_done(w)
 
     # Async reads finish; the run-loop hook re-checks and now ACKs.
     w.tensor_manager.has_inflight_reads = lambda rid: False
-    Worker._apply_pending_drains(w, set())
+    w._teardown(w._in_flight_rids)
     assert len(_reads_done(w)) == 1
 
 
@@ -289,12 +298,12 @@ def test_drain_waits_for_committed_tp_follow_batches():
     """A queued TP-follow batch (leader already sent the ZMQ) must drain before
     READS_DONE, or REMOVE tears the worker-graph queues out from under it."""
     w = _worker(tp_follow=("X",))
-    Worker._drain_request(w, DrainRequest(request_id="X"))
-    assert "X" in w._draining_rids and not _reads_done(w)
+    _drain(w, request_id="X")
+    assert "X" in w.lifecycle.draining and not _reads_done(w)
 
     # The follow batch gets scheduled; count drops to 0.
-    w.scheduler.pending_tp_follow_count.pop("X")
-    Worker._apply_pending_drains(w, set())
+    w.lockstep.pop_follow_head()
+    w._teardown(w._in_flight_rids)
     assert len(_reads_done(w)) == 1
 
 
@@ -304,18 +313,18 @@ def test_drain_waits_for_a_follow_that_arrived_before_new_request():
     this case still gates READS_DONE -- ACKing here would bring the REMOVE that
     strands the batch at the head of the TP FIFO."""
     w = _worker(known_rids=(), tp_follow=("X",))
-    Worker._drain_request(w, DrainRequest(request_id="X"))
-    assert "X" in w._draining_rids and not _reads_done(w)
+    _drain(w, request_id="X")
+    assert "X" in w.lifecycle.draining and not _reads_done(w)
 
     # NEW_REQUEST lands, the batch runs, the count drops.
-    w.scheduler.pending_tp_follow_count.pop("X")
-    Worker._apply_pending_drains(w, set())
+    w.lockstep.pop_follow_head()
+    w._teardown(w._in_flight_rids)
     assert len(_reads_done(w)) == 1
 
 
 def test_never_admitted_rid_with_no_follow_acks_at_once():
     w = _worker(known_rids=())
-    Worker._drain_request(w, DrainRequest(request_id="X"))
+    _drain(w, request_id="X")
     assert len(_reads_done(w)) == 1
 
 
@@ -323,67 +332,67 @@ def test_remove_of_a_never_admitted_rid_clears_its_wire_keyed_state():
     """No handle to clear anything else with, but the TP-follow count is keyed
     by the string and nothing else would ever pop it."""
     w = _worker(known_rids=(), tp_follow=("X",))
-    Worker._remove_request(w, RemoveRequest(request_id="X"))
-    assert w.cleared == ["X"]
+    assert w.lockstep.pending_follow_count("X") == 1
+    _remove(w, request_id="X")
+    assert w.lockstep.pending_follow_count("X") == 0
 
 
 def test_drain_deferred_behind_inflight_gpu_step():
     w = _worker(in_flight=("X",))
-    Worker._drain_request(w, DrainRequest(request_id="X"))
+    _drain(w, request_id="X")
     # Held until the GPU step referencing the rid is gone.
-    assert "X" in w._pending_drains and "X" not in w._draining_rids
+    assert "X" in w.lifecycle.pending_drains and "X" not in w.lifecycle.draining
     assert not _reads_done(w)
 
-    Worker._apply_pending_drains(w, set())  # step finished
-    assert "X" in w._draining_rids and len(_reads_done(w)) == 1
+    w._in_flight_rids.clear()  # step finished
+    w._teardown(w._in_flight_rids)
+    assert "X" in w.lifecycle.draining and len(_reads_done(w)) == 1
 
 
 def test_speculation_stops_for_a_rid_being_torn_down():
     """A same-node speculation chain keeps its rids in flight every step, so a
     drain deferred behind it only fires once the chain lets the rid go."""
     w = _worker(known_rids=("X", "Y"), in_flight=("X", "Y"))
-    assert not w._is_tearing_down("X")
+    assert not w.lifecycle.is_tearing_down("X")
 
-    Worker._drain_request(w, DrainRequest(request_id="X"))
-    assert "X" in w._pending_drains
-    assert w._is_tearing_down("X")
-    assert not w._is_tearing_down("Y")
+    _drain(w, request_id="X")
+    assert "X" in w.lifecycle.pending_drains
+    assert w.lifecycle.is_tearing_down("X")
+    assert not w.lifecycle.is_tearing_down("Y")
 
-    w._pending_drains.clear()
+    w.lifecycle.pending_drains.clear()
     w._in_flight_rids.clear()
-    Worker._drain_request(w, DrainRequest(request_id="X"))
-    assert "X" in w._draining_rids and "X" in w.scheduler.failed_rids
-    assert w._is_tearing_down("X")
+    _drain(w, request_id="X")
+    assert "X" in w.lifecycle.draining and "X" in w.lifecycle.failed_rids
+    assert w.lifecycle.is_tearing_down("X")
 
-    w._pending_removes["Y"] = None
-    assert w._is_tearing_down("Y")
+    w.lifecycle.pending_removes["Y"] = -1
+    assert w.lifecycle.is_tearing_down("Y")
 
 
 def test_follower_ignores_conductor_drain():
     w = _worker(is_follower=True)
-    Worker._drain_request(w, DrainRequest(request_id="X"))  # source=CONDUCTOR
-    assert "X" not in w._draining_rids and not w.sent
+    _drain(w, request_id="X")  # source=CONDUCTOR
+    assert "X" not in w.lifecycle.draining and not w.sent
 
     # ... but honors the leader's forwarded drain.
-    Worker._drain_request(
-        w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0)
-    )
-    assert "X" in w._draining_rids and len(_reads_done(w)) == 1
+    _drain(w, request_id="X", source=MessageSource.TP_RANK_0)
+    assert "X" in w.lifecycle.draining and len(_reads_done(w)) == 1
 
 
 def test_drain_acks_only_once():
     w = _worker(inflight_reads=False)
-    Worker._drain_request(w, DrainRequest(request_id="X"))
-    Worker._drain_request(w, DrainRequest(request_id="X"))
+    _drain(w, request_id="X")
+    _drain(w, request_id="X")
     assert len(_reads_done(w)) == 1
 
 
 def test_remove_force_cleans_and_clears_drain_state():
     w = _worker(draining=("X",), reads_done=("X",))
-    Worker._remove_request(w, RemoveRequest(request_id="X"))
+    _remove(w, request_id="X")
     assert w.forced == ["X"]
-    assert "X" not in w._draining_rids
-    assert "X" not in w._reads_done_sent
+    assert "X" not in w.lifecycle.draining
+    assert "X" not in w.lifecycle._reads_done_sent
 
 
 def _input(uuid, streaming=True):
@@ -407,7 +416,6 @@ def _input_worker(**kwargs):
     ``reads`` gets the uuids of each read it starts."""
     w = _worker(**kwargs)
     w.enable_nvtx = False
-    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     w._graph_runtime.set_walk = lambda rid, partition, walk: None
     w._graph_runtime.get_dynamic_loop_iters = lambda rids, partition: []
     w.request_state.update_request_info = lambda rid, current_fwd_info, partition_name: None
@@ -428,17 +436,17 @@ def test_a_follower_draining_before_its_input_arrives_still_reads_it(streaming):
     another FIFO, lands behind the drain. Dropped, the committed step would
     wait for it for ever, and READS_DONE behind that step."""
     w, sbuf, reads = _input_worker(is_follower=True, tp_follow=("X",))
-    Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
+    _drain(w, request_id="X", source=MessageSource.TP_RANK_0)
     assert not _reads_done(w)  # behind the committed step
 
-    Worker._process_new_inputs(w, _input(1, streaming))
+    w.ingest._process_new_inputs(_input(1, streaming))
     assert reads == [[1]] and [tid for tid, _walk in sbuf._tensor_ids_in_order] == ([1] if streaming else [])
 
     # the step runs on it, READS_DONE goes, and no read starts after it
-    w.scheduler.pending_tp_follow_count.pop("X")
-    Worker._apply_pending_drains(w, set())
+    w.lockstep.pop_follow_head()
+    w._teardown(w._in_flight_rids)
     assert len(_reads_done(w)) == 1
-    Worker._process_new_inputs(w, _input(2, streaming))
+    w.ingest._process_new_inputs(_input(2, streaming))
     assert reads == [[1]]
 
 
@@ -449,8 +457,6 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
     step can run; refused, the step's head would wait for the handle for ever."""
     known = []
     w = _worker(known_rids=known, is_follower=True, tp_follow=("X",))
-    w._all_wg_nodes = {}
-    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
     w._graph_runtime.add_request = lambda request_id, **kw: known.append(request_id) or request_id
     w.request_state.add_request = lambda rid, info: w.request_state.per_request_info.update(
         {rid: SimpleNamespace(stream_buffers={})}
@@ -459,59 +465,56 @@ def test_a_new_request_behind_the_drain_is_admitted_until_reads_done():
     w.engine_manager.engine = SimpleNamespace(publisher_nodes={})
     w.tensor_manager.register_request = lambda rid, cfg: None
     w.tensor_manager.start_read_tensors = lambda rid, inputs, graph_walk: []
-    w.scheduler.note_arrival = lambda rid: None
 
-    Worker._drain_request(w, DrainRequest(request_id="X", source=MessageSource.TP_RANK_0))
+    _drain(w, request_id="X", source=MessageSource.TP_RANK_0)
     assert not _reads_done(w)
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
-    Worker._add_new_request(w, SimpleNamespace(
+    w.ingest._add_new_request(SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
     ))
     # failed by the drain check, not by an ingest error
-    assert known == ["X"] and w.failed == {"X"}
+    assert known == ["X"] and w.lifecycle.failed_rids == {"X"}
     assert not [m for _e, m in w.sent if m.message_type == ConductorMessageType.FAIL_REQUESTS]
 
     # the step runs, and READS_DONE goes once
-    w.scheduler.pending_tp_follow_count.pop("X")
-    Worker._apply_pending_drains(w, set())
+    w.lockstep.pop_follow_head()
+    w._teardown(w._in_flight_rids)
     assert len(_reads_done(w)) == 1
 
 
 def test_add_new_request_hands_off_the_handle_not_the_string():
-    w = make_worker()
     rids = RidTable()
     rids.intern("other")  # so X's handle is 1, not 0
-    w._graph_runtime = SimpleNamespace(
+    runtime = SimpleNamespace(
         add_request=lambda request_id, **kw: rids.intern(request_id),
         get_rid_handle=rids.handle, get_rid_string=rids.name,
         get_sharding_config=lambda h: None,
         register_stop_limits=lambda rid, info: None,
     )
     seen = {}
+    per_request_info = {}
 
     def _state_add(request_id, request_info):
         seen["state"] = request_id
-        w.request_state.per_request_info[request_id] = SimpleNamespace(
-            sharding_config=None, stream_buffers={},
-        )
+        per_request_info[request_id] = SimpleNamespace(sharding_config=None, stream_buffers={})
 
-    w.request_state = SimpleNamespace(
-        per_request_info={}, add_request=_state_add,
-    )
-    w.engine_manager = SimpleNamespace(
-        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
-    )
-    w.tensor_manager = SimpleNamespace(
+    request_state = SimpleNamespace(per_request_info=per_request_info, add_request=_state_add)
+    tensor_manager = SimpleNamespace(
         register_request=lambda rid, cfg: seen.setdefault("tensors", rid),
         start_read_tensors=lambda rid, inputs, graph_walk: [],
     )
-    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
-    w.scheduler = SimpleNamespace(note_arrival=lambda rid: seen.setdefault("scheduler", rid))
+    w = make_worker(
+        _graph_runtime=runtime, request_state=request_state, tensor_manager=tensor_manager,
+        engine_manager=SimpleNamespace(
+            engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+            add_request=lambda rid, cfgs, info: seen.setdefault("engine", rid),
+        ),
+        wakeup_event=SimpleNamespace(register_futures=lambda f: None),
+        streams=StreamBufferManager(request_state, tensor_manager, []),
+    )
     info = SimpleNamespace(resource_configs={}, graph_walk="g", partition_name="p")
-    Worker._add_new_request(w, SimpleNamespace(
+    w.ingest._add_new_request(SimpleNamespace(
         request_id="X", request_info=info, initial_inputs=[],
         partition_worker_graph_ids=[], worker_graph_to_workers={}, loop_caps={},
     ))
@@ -519,7 +522,8 @@ def test_add_new_request_hands_off_the_handle_not_the_string():
     handle = w._graph_runtime.get_rid_handle("X")
     assert handle == 1
     assert info.rid_handle == handle
-    assert seen == {"state": handle, "scheduler": handle, "engine": handle, "tensors": handle}
+    assert list(w.lifecycle.arrivals) == [handle]
+    assert seen == {"state": handle, "engine": handle, "tensors": handle}
 
 
 # ── preprocess worker ───────────────────────────────────────────────────────

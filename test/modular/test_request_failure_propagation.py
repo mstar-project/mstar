@@ -36,9 +36,9 @@ from mstar.api_server.request_types import (
 from mstar.communication.event import EventWakeup
 from mstar.profile.format import RequestProfile, RequestTiming
 from mstar.testing_utils.model import StubModel
-from mstar.testing_utils.worker import make_worker
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
-from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler, ScheduledBatch
+from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.worker import PendingBatch
 
 # ── worker ─────────────────────────────────────────────────────────────────
@@ -64,23 +64,21 @@ class _Runtime:
 
 
 def _worker(known_rids=("r1", "r2")):
-    w = make_worker()
-    w.sent = []
-    w.communicator = SimpleNamespace(
-        send=lambda entity_id, msg: w.sent.append((entity_id, msg))
-    )
-    w.request_state = SimpleNamespace(
+    sent = []
+    request_state = SimpleNamespace(
         per_request_info={rid: object() for rid in known_rids}
     )
     # Identity interning: the rid string doubles as its own handle here.
-    w._graph_runtime = _Runtime(known_rids)
-    w._in_flight_rids = set()
-    w.scheduler = MicroScheduler.__new__(MicroScheduler)
-    w.scheduler.failed_rids = set()
-    w.scheduler.read_failed_rids = set()
-    w.scheduler.held_until = {}
-    w.scheduler.admit_errors = {}
-    w.scheduler.backlog = {}
+    runtime = _Runtime(known_rids)
+    scheduler = make_scheduler(request_state=request_state, graph_runtime=runtime)
+    w = make_worker(
+        communicator=SimpleNamespace(send=lambda entity_id, msg: sent.append((entity_id, msg))),
+        request_state=request_state, _graph_runtime=runtime,
+        scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
+    )
+    w.sent = sent
+    for rid in known_rids:
+        w.lifecycle.add(rid, rid)
     return w
 
 
@@ -92,7 +90,7 @@ def test_fail_requests_reports_per_rid_errors_once():
     assert entity == "conductor"
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
     assert msg.body == FailRequests(errors={"r1": "boom", "r2": "bang"})
-    assert w.scheduler.failed_rids == {"r1", "r2"}
+    assert w.lifecycle.failed_rids == {"r1", "r2"}
 
 
 def test_fail_requests_ignores_rids_the_worker_already_dropped():
@@ -102,7 +100,7 @@ def test_fail_requests_ignores_rids_the_worker_already_dropped():
     w = _worker(known_rids=("r1",))
     w._fail_requests({"gone": "boom"})
     assert w.sent == []
-    assert w.scheduler.failed_rids == set()
+    assert w.lifecycle.failed_rids == set()
 
 
 def _pending_batch(rids, future=None):
