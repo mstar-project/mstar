@@ -131,9 +131,9 @@ pub fn flatten_messages(
                 "image_url" | "video_url" | "audio_url" => {
                     let url = nested_url(obj, ptype);
                     if !url.is_empty() {
-                        let fallback = ptype.trim_end_matches("_url");
+                        // An `unknown` MIME type stays unknown, as in Python, for
+                        // the submission to refuse; the part's kind is no evidence.
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
-                        let m = if m == "unknown" { fallback.to_string() } else { m };
                         add_file(&mut parts, &mut saved.paths, m, p);
                     }
                 }
@@ -386,7 +386,7 @@ impl Adapter {
                 let mut args = text_chat(req, upload_dir, allow_remote)?;
                 args.model_kwargs.remove("chat_template_kwargs");
                 if let Some(on) = thinking {
-                    set_default(&mut args.model_kwargs, "enable_thinking", Value::Bool(on));
+                    set_default(&mut args.model_kwargs, "enable_thinking", on);
                 }
                 Ok(args)
             }
@@ -694,15 +694,16 @@ fn text_chat(
 }
 
 /// `chat_template_kwargs.enable_thinking` read as `Cosmos3EdgeAdapter` does:
-/// `(kwargs or {})`, then `bool(kwargs["enable_thinking"])` when it has the
-/// key. A falsy value is no kwargs; a value Python cannot look the key up in
+/// `(kwargs or {})`, then `kwargs["enable_thinking"]` as sent when it has the
+/// key, so the model refuses a non-boolean rather than reading `"false"` as
+/// true. A falsy value is no kwargs; a value Python cannot look the key up in
 /// is the `TypeError` that answers 400 there.
-fn template_enable_thinking(kwargs: Option<&Value>) -> Result<Option<bool>, String> {
+fn template_enable_thinking(kwargs: Option<&Value>) -> Result<Option<Value>, String> {
     const KEY: &str = "enable_thinking";
     match kwargs {
         None => Ok(None),
         Some(v) if !truthy(v) => Ok(None),
-        Some(Value::Object(m)) => Ok(m.get(KEY).map(truthy)),
+        Some(Value::Object(m)) => Ok(m.get(KEY).cloned()),
         Some(Value::Array(items)) if items.iter().any(|i| i.as_str() == Some(KEY)) => {
             Err("list indices must be integers or slices, not str".to_string())
         }
@@ -962,8 +963,9 @@ mod tests {
         let thinking = |fields: &str| chat(fields).unwrap().model_kwargs.get("enable_thinking").cloned();
         for (fields, want) in [
             (r#""chat_template_kwargs":{"enable_thinking":false}"#, Some(Value::Bool(false))),
-            (r#""chat_template_kwargs":{"enable_thinking":1}"#, Some(Value::Bool(true))),
-            (r#""chat_template_kwargs":{"enable_thinking":""}"#, Some(Value::Bool(false))),
+            // as sent: the model refuses what is not a boolean
+            (r#""chat_template_kwargs":{"enable_thinking":1}"#, Some(serde_json::json!(1))),
+            (r#""chat_template_kwargs":{"enable_thinking":"false"}"#, Some(serde_json::json!("false"))),
             (r#""chat_template_kwargs":{"enable_thinking":false},"enable_thinking":true"#, Some(Value::Bool(true))),
             (r#""chat_template_kwargs":{"other":1}"#, None),
             (r#""chat_template_kwargs":{}"#, None),

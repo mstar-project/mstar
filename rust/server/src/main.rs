@@ -372,6 +372,16 @@ fn multipart_failure(e: &MultipartError, fallback: String) -> (u16, String) {
     }
 }
 
+/// Blocking work off the async workers: decoding a data URL, writing an
+/// upload, a remote fetch of up to 30 s. On a worker it stalls every
+/// connection that worker drives; the Python routes run it in a thread too.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
 fn body_too_large() -> String {
     let mb = body_limit_mb();
     format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)")
@@ -569,7 +579,13 @@ async fn chat_completions(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let mut args = match adapter.chat_to_request(&req, &st.upload_dir, st.allow_remote) {
+    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let (req, translated) = blocking(move || {
+        let args = adapter.chat_to_request(&req, &dir, remote);
+        (req, args)
+    })
+    .await;
+    let mut args = match translated {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
@@ -978,7 +994,9 @@ async fn videos_generations(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let args = match adapter.video_to_request(&req, &st.upload_dir, st.allow_remote) {
+    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let translated = blocking(move || adapter.video_to_request(&req, &dir, remote)).await;
+    let args = match translated {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
@@ -1066,7 +1084,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
         .unwrap_or_else(|| ".png".to_string());
     let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
-    if let Err(e) = std::fs::write(&image_path, &image_bytes) {
+    let path = image_path.clone();
+    if let Err(e) = blocking(move || std::fs::write(&path, &image_bytes)).await {
         return error(500, &e.to_string(), "server_error");
     }
 
@@ -1229,7 +1248,8 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 .filter(|s| !s.is_empty())
                 .unwrap_or("upload");
             let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
-            if let Err(e) = std::fs::write(&save_path, &bytes) {
+            let path = save_path.clone();
+            if let Err(e) = blocking(move || std::fs::write(&path, &bytes)).await {
                 return detail_error(500, &e.to_string());
             }
             uploads

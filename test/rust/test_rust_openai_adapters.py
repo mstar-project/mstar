@@ -243,6 +243,30 @@ def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields,
     assert rust_files == _files(want.file_paths) == {"image": [base64.b64decode(PNG)]}
 
 
+@pytest.mark.parametrize("cls", CHAT_CLASSES)
+def test_a_part_of_no_media_type_reaches_the_backend_untyped_as_from_python(cls, tmp_path):
+    """A data URL whose MIME type is no image, audio or video is ``unknown`` on
+    both frontends, which ``submit_request`` refuses with a 400. Rust used to
+    type it by its part (an ``image_url`` became an image)."""
+    model = _model_of(cls)
+    stub = _StubAPIServer()
+    body = {"model": "ignored", "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": f"data:application/octet-stream;base64,{PNG}"}},
+        {"type": "text", "text": "hi"},
+    ]}]}
+    with _model_stack(model, stub) as (port, _upload):
+        status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+        assert status == 200, data
+        (sub,) = stub.submitted
+        rust_files = _files(sub["files"])
+    want = ADAPTER_REGISTRY[model].chat_to_request(_python_request(body), tmp_path)
+
+    assert "unknown" in want.input_modalities
+    assert sub["in"] == want.input_modalities
+    assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
+    assert rust_files == _files(want.file_paths)
+
+
 # ── both frontends answer a chat the same way ────────────────────────────────
 
 class _PythonServer:
