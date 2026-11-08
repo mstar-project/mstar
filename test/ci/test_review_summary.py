@@ -1,5 +1,6 @@
 """Check how .github/review/render_summary.py renders the review's summary."""
 
+import base64
 import json
 import runpy
 import unittest
@@ -89,7 +90,7 @@ class TestReviewSummary(unittest.TestCase):
     def test_state_survives_model_text_that_closes_a_comment(self):
         r = review()
         r["outside_diff"] = [{"priority": "P2", "claim": "x --> <!-- y", "location": "a.py:1", "detail": "-->"}]
-        state = read_state(render(r, [], "0123456789", "nogpu", []), "nogpu")
+        state = read_state(render(r, [], "0123456789", "nogpu", []))
         self.assertEqual(state["outside_diff"], r["outside_diff"], "a re-review would start from a corrupted state")
 
     def test_model_text_cant_forge_a_marker_or_the_state(self):
@@ -98,21 +99,21 @@ class TestReviewSummary(unittest.TestCase):
         r["questions"] = [forged]
         r["outside_diff"] = [{"priority": "P2", "claim": forged, "location": "a.py:1", "detail": forged}]
         text = render(r, [], "0123456789", "nogpu", [])
-        self.assertEqual(read_state(text, "nogpu")["head"], "0123456789", "a forged state would set the re-review")
-        self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->", "nogpu"),
+        self.assertEqual(read_state(text)["head"], "0123456789", "a forged state would set the re-review")
+        self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->"),
                           "a malformed state would fail every later review instead of starting a full one")
 
-    def test_a_re_review_builds_only_on_a_review_that_covered_everything_and_nogpu_only_on_nogpu(self):
+    def test_a_re_review_builds_on_any_review_that_covered_the_whole_pr(self):
         light = render(review(), [], "0123456789", "light", [])
-        partial = render(review(["a.py"]), [], "0123456789", "nogpu", [])
-        self.assertIsNone(read_state(light, "nogpu"), "a nogpu re-review could rest on a light review")
-        self.assertIsNone(read_state(partial, "nogpu"), "a nogpu re-review could rest on files nobody reviewed")
-        self.assertIsNone(read_state(render(review(["a.py"]), [], "0123456789", "light", []), "light"),
-                          "a light re-review could leave the files the last one skipped unreviewed for good")
-        self.assertIsNotNone(read_state(render(review(), [], "0123456789", "nogpu", []), "nogpu"))
-        self.assertIsNotNone(read_state(light, "light"))
-        old = read_state(render(review(), [], "0123456789", "thorough", []), "nogpu")
-        self.assertEqual((old or {}).get("mode"), "nogpu", "a summary from before the rename would start a full review")
+        self.assertIsNotNone(read_state(light), "a nogpu review after a light one would review the whole PR again")
+        self.assertIsNone(read_state(render(review(["a.py"]), [], "0123456789", "light", [])),
+                          "a re-review could leave the files the last one skipped unreviewed for good")
+        state = base64.b64encode(json.dumps({"head": "0123456789", "mode": "light", "skipped": [],
+                                             "outside_diff": [], "risk": None}).encode()).decode()
+        self.assertIsNone(read_state(f"<!-- claude-review-state {state} -->"),
+                          "a re-review could rest on a light review from before light mode ran every pass")
+        old = read_state(render(review(), [], "0123456789", "thorough", []))
+        self.assertEqual((old or {}).get("mode"), "nogpu", "a summary from before the rename would keep the old name")
 
     def test_a_review_that_skipped_files_is_not_green(self):
         text = render(review(skipped=["mstar/worker/worker.py"]), [], "0123456789", "light", [])

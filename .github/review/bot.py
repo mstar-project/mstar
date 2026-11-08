@@ -416,7 +416,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     if not prev:
         summaries = [c for c in conversation
                      if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
-        state = render_summary.read_state(summaries[-1]["body"], mode) if summaries else None
+        state = render_summary.read_state(summaries[-1]["body"]) if summaries else None
         last = (state or {}).get("head")
         since = f"repos/{repo}/compare/{last}...{head_sha}"
         try:
