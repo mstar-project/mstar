@@ -31,7 +31,7 @@ def _conduct(model: Glm5NextModel, model_kwargs: dict, tmp_path, monkeypatch) ->
     """What the real conductor sends for one request: a NEW_REQUEST, or its refusal."""
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump({
-        "max_seq_len": model.config.max_seq_len, "node_groups": [{"node_names": ["LLM"], "ranks": [0]}],
+        "max_seq_len": None, "node_groups": [{"node_names": ["LLM"], "ranks": [0]}],
     }))
     comm = _Comm()
     monkeypatch.setattr(Conductor, "_launch_workers", lambda self: None)

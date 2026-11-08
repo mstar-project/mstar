@@ -14,6 +14,7 @@ model_kwargs:
   prefill_graphs: true
 resources:
   kv_cache:
+    max_seq_len: 8192  # 2048 tokens plus the rejected drafts retained by MTP
     # The 11 MLA layers and the MTP layer are paged, a 576-wide latent each (512
     # + the rope slot that masks rejected drafts): ~13.8 KB/token. Every verify
     # step keeps its rejected drafts, so a request holds up to 2048 x 4 = 8192
