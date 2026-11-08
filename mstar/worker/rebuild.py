@@ -193,8 +193,10 @@ class Rebuilds:
             "host copies spend the engine's StepAllowance"
         )
         self._allowance = allowance
-        # the copies to the host not yet started, oldest first
+        # the copies to the host not yet started, oldest first, and the event recorded after the last one `flush`
+        # started, None before one or where copies run in place
         self._queued: deque[QueuedCopy] = deque()
+        self._last_landed: torch.Event | None = None
         # nodes that have logged a request the pool couldn't hold
         self._logged_full: set[str] = set()
 
@@ -390,7 +392,7 @@ class Rebuilds:
             if not nbytes:
                 return
             copy = self._pool.copy_out(queued.src[:nbytes], HostSlice(queued.into.offset, nbytes), queued.after)
-            queued.copies.landed = copy.landed
+            queued.copies.landed = self._last_landed = copy.landed
             if nbytes < queued.src.numel():
                 self._queued[0] = queued._replace(
                     src=queued.src[nbytes:], into=HostSlice(queued.into.offset + nbytes, queued.into.nbytes - nbytes),
@@ -400,12 +402,19 @@ class Rebuilds:
             queued.copies.queued -= 1
 
     def flush_idle(self) -> None:
-        """`flush` with a step's allowance on a pass of the worker's loop that runs no step. A drop waits for the
-        queued copies, so with every request waiting, no step would ever start them."""
+        """`flush` on a pass of the worker's loop that runs no step, with a step's allowance once the last copy it
+        started has landed. A drop waits for the queued copies, so with every request waiting, no step would ever
+        start them. Waiting for the last copy keeps a burst of such passes from queuing more than one allowance."""
         if not self._queued:
             return
+        if self._last_landed is not None:
+            self._last_landed.synchronize()
         self._allowance.refill()
         self.flush()
+
+    @property
+    def copies_queued(self) -> bool:
+        return bool(self._queued)
 
     def _trim(self, node: str, rid: int, used: int) -> None:
         """Give back what ``rid``'s slice on ``node`` holds past its first ``used`` bytes."""

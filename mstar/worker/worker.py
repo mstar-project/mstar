@@ -3983,7 +3983,8 @@ class Worker:
                         side_steps.finish(block=True)
                         continue
                     self._rebuilds.flush_idle()
-                    self.communicator.wait_for_work(10)
+                    # the next pass's `flush_idle` waits for the copies just started, so it needn't wait the tick too
+                    self.communicator.wait_for_work(0 if self._rebuilds.copies_queued else 10)
                     continue
 
                 if self.enable_nvtx:
