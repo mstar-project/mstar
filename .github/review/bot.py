@@ -56,6 +56,14 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
       pageInfo { hasNextPage endCursor }
       nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
     } } } }"""
+# Every merged PR with its live approvals. Each author's __typename separates the bot from a person who took its
+# name, which GraphQL's bare logins (no `[bot]`) can't.
+MERGED_APPROVALS = """query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: MERGED, first: 100, after: $endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number mergedAt reviews(states: APPROVED, first: 100) { nodes { author { __typename login } } } }
+    } } }"""
 # What starts the status issue's body, how the bot finds its own issue.
 STATUS_ISSUE = "<!-- review-bot-status -->"
 # The monitor's state in the status issue's body (signals already reported), base64 JSON.
@@ -132,10 +140,11 @@ def read(fetch, *args):
         return None
 
 
-def graphql(query, repo, pr):
-    """The pages of a paginated GraphQL query on the PR."""
+def graphql(query, repo, pr=None):
+    """The pages of a paginated GraphQL query on the repository, or on PR `pr`."""
     owner, name = repo.split("/")
-    return api("graphql", "--paginate", "--slurp", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"pr={pr}",
+    number = () if pr is None else ("-F", f"pr={pr}")
+    return api("graphql", "--paginate", "--slurp", "-F", f"owner={owner}", "-F", f"name={name}", *number,
                "-f", f"query={query}")
 
 
@@ -977,19 +986,18 @@ def monitor(out, repo, approvals=""):
     except (ValueError, TypeError):
         state = {}
     last = state.get("last") or window
-    merged = sorted((i["number"] for i in api_list(f"repos/{repo}/issues?state=closed&since={window}&per_page=100")
-                     if ((i.get("pull_request") or {}).get("merged_at") or "") >= window), reverse=True)
+    approved = sorted((p["number"] for page in graphql(MERGED_APPROVALS, repo)
+                       for p in page["data"]["repository"]["pullRequests"]["nodes"] if p["mergedAt"] >= window
+                       and any((r.get("author") or {}).get("__typename") == "Bot"
+                               and r["author"]["login"] in render_summary.BOTS for r in p["reviews"]["nodes"])),
+                      reverse=True)
     commits = main_commits(window)
     bug_prs = {i["number"] for i in api_list(f"repos/{repo}/issues?state=closed&labels=type%2Fbug&since={window}"
                                              "&per_page=100")
                if (i.get("pull_request") or {}).get("merged_at")}
     rows, signals, linked, unread = [], [], set(), set()
-    for pr in merged:
+    for pr in approved:
         try:
-            reviews = api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
-            if not any(r.get("state") == "APPROVED" and (r.get("user") or {}).get("login") in BOT_USERS
-                       for r in reviews):
-                continue
             pull = api(f"repos/{repo}/pulls/{pr}")
             found, mentions = pr_signals(repo, {**pull, "number": pr}, commits, bug_prs, window)
         except UNREADABLE as e:
@@ -1019,7 +1027,7 @@ def monitor(out, repo, approvals=""):
     saved = {"last": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "signals": sorted(set(current) | kept)}
     tail.append(f"\n<!-- review-monitor-state {base64.b64encode(json.dumps(saved).encode()).decode()} -->")
     while len("\n".join(head + rows + tail)) > 60_000 and rows:
-        rows.pop()  # the oldest PRs go first: `merged` is newest first
+        rows.pop()  # the oldest PRs go first: `approved` is newest first
     if fresh:  # first: the body below records these as reported, so a failed post goes out tomorrow
         comment_on_issue(repo, number, "**New signals on PRs the bot approved:**\n\n"
                          + "\n".join(f"- {text}" for text in fresh) + "\n")
