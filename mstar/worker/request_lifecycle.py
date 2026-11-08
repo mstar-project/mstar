@@ -12,7 +12,7 @@ outstanding.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Set
 
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 # matches them. Every submission has its own key, so a remembered key never gets
 # another NEW_REQUEST.
 _REMOVED_RIDS_KEEP = 4096
+
+# `no_new_work` with nothing to exclude, so a scan with no teardown allocates nothing
+_NONE: frozenset[int] = frozenset()
 
 
 class RequestLifecycle:
@@ -239,33 +242,43 @@ class RequestLifecycle:
             or self.pending_drains or self.draining
         )
 
+    def no_new_work(self, *also: Iterable[int]) -> Set[int]:
+        """The rids a scan gives no new step: failed or with a remove pending,
+        plus ``also``'s. Unlike `closing`, a drain counts only once begun, when
+        it marks its rid failed."""
+        if not also and not self.failed_rids and not self.pending_removes:
+            return _NONE
+        return self.failed_rids.union(self.pending_removes, *also)
+
+    def closing(self, rid: int, wire_rid: str | None) -> bool:
+        """Whether ``rid`` (``wire_rid`` on the wire) is on its way out:
+        `no_new_work`'s, or with a drain pending or begun."""
+        return (
+            rid in self.pending_removes or rid in self.failed_rids
+            or wire_rid in self.pending_drains or wire_rid in self.draining
+        )
+
     def is_tearing_down(self, rid: int) -> bool:
-        """Removed, aborted or failed: no further speculative work for ``rid``.
+        """`closing`, for a rid without its wire id: no further speculative
+        work for ``rid``.
 
         A deferred drain only fires once no step holds the rid, and a same-node
         speculation chain keeps holding it every step, so a drain the chain does
         not see would never fire and the rollout would run to ``max_iters`` for
         a client that has gone."""
-        if rid in self.pending_removes or rid in self.failed_rids:
-            return True
-        if rid not in self.arrivals or not (self.pending_drains or self.draining):
-            return False
-        wire = self._runtime.get_rid_string(rid)
-        return wire in self.pending_drains or wire in self.draining
+        wire = None
+        if (self.pending_drains or self.draining) and rid in self.arrivals:
+            wire = self._runtime.get_rid_string(rid)
+        return self.closing(rid, wire)
 
     def publishable(self, batch) -> list[int]:
         """The rows of a landed step that may publish: no late KV snapshot for a
         request on its way out, whose remove waits behind this very step, and
         none for a rebuild row, whose request keeps the publication from before
         its drop. Called on the GPU thread, so it reads these live."""
-        removing, failed = self.pending_removes, self.failed_rids
-        pending_drains, draining = self.pending_drains, self.draining
+        closing, rebuild_rids = self.closing, batch.step_context.rebuild_rids
         return [
             rid for rid in batch.request_ids
             if (info := batch.per_request_info.get(rid)) is not None
-            if rid not in removing
-            and rid not in batch.step_context.rebuild_rids
-            and rid not in failed
-            and info.request_id not in pending_drains
-            and info.request_id not in draining
+            if rid not in rebuild_rids and not closing(rid, info.request_id)
         ]
