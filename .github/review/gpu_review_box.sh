@@ -41,6 +41,9 @@ finish() {
   fi
   exit 0
 }
+# Slurm preempts the job with a TERM: say so, rather than leaving no result at all. `wait`, below, lets
+# the trap run at once instead of after the session has exited.
+trap 'kill "${claude_pid:-}" 2> /dev/null; finish "preempted before the session finished"' TERM
 
 # Trusted: main's skills, AGENTS.md and scripts, at the commit the workflow read its rules from.
 git clone -q "https://github.com/$REPO.git" "$W/main" && git -C "$W/main" checkout -q "$MAIN_SHA" \
@@ -52,5 +55,7 @@ cd "$W" || finish "no work directory"
 "$HOME/.local/bin/claude" -p "$(cat "$IN/brief.md")" \
   --model "$(field model)" --effort high --max-turns "$(field turns)" --output-format json \
   --allowedTools "Bash,Read,Write,Edit,Glob,Grep" --disallowedTools "Skill,WebSearch" \
-  > "$OUT/claude.json" 2> "$OUT/claude.err"
+  > "$OUT/claude.json" 2> "$OUT/claude.err" &
+claude_pid=$!
+wait "$claude_pid"
 finish "the session ended without a result (exit $?)"
