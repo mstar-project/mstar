@@ -77,8 +77,9 @@ FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd]|ing)?|bugs?|bugfix(?:es)?|revert(?:s
                          r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?\b|(?:comments?|docs?|lint|format\w*)\s*\.?\s*"
                          r"(?:\(#\d+\)\s*)?$))",
                          re.IGNORECASE)
-# A commenter's author_association that makes them a contributor (see the workflow's header).
-CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
+# author_association values: the team, and the team plus anyone with a merged PR (see the workflow's header).
+TEAM = ("OWNER", "MEMBER", "COLLABORATOR")
+CONTRIBUTORS = (*TEAM, "CONTRIBUTOR")
 # The weekly improvement run: how much a reader needs (PRs read, and comments kept per PR; characters of a
 # comment), and what the model returns.
 IMPROVE_ITEMS = 30
@@ -190,6 +191,17 @@ def permission(repo, login):
     return (read(api, f"repos/{repo}/collaborators/{login}/permission") or {}).get("permission", "none")
 
 
+def head_trusted(repo, pull, listed=None):
+    """Whether the PR's code is held by someone `repo` trusts: a branch of `repo` itself, or a fork whose owner has
+    write access (or is in `listed`, when given). An author with write access can open a PR from anyone's fork, so
+    the author alone doesn't say. A head repository GitHub no longer shows means no."""
+    head = (pull.get("head") or {}).get("repo") or {}
+    owner = (head.get("owner") or {}).get("login")
+    if head.get("full_name") == repo:
+        return True
+    return bool(owner) and (owner in listed if listed is not None else permission(repo, owner) in WRITE)
+
+
 def redact(text, exact=()):
     """`text` without the exact values in `exact`, then without credential-shaped strings."""
     for value in exact:
@@ -236,7 +248,8 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
     one-line reply. Write access is checked against the actor's permission; a contributor may run
     `/review light` or `/review continue` on their own PR, and only then is `non_write_user` set. A
     full review runs the PR's code, so it also takes an author with write access (author_association
-    can't tell write from read)."""
+    can't tell write from read) and a head repository head_trusted accepts; a PR that can't be read
+    means no."""
     if key_set != "true":
         print("::warning::ANTHROPIC_API_KEY is not set; skipping the review.")
         out["run"] = "false"
@@ -248,12 +261,13 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
 
     perm = permission(repo, actor)
     if perm in WRITE:
-        author_perm = permission(repo, author) if command == "full" else ""
-        if command == "full" and author_perm not in WRITE:
-            print(f"::notice::{author} has '{author_perm}' access, not write; a full review runs the PR's code.")
+        if command == "full" and not (permission(repo, author) in WRITE
+                                      and head_trusted(repo, read(api, f"repos/{repo}/pulls/{pr}") or {})):
+            print(f"::notice::{author} or the PR's head repository lacks write access; a full review runs its code.")
             out["run"] = "false"
-            reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes an author with write access; "
-                            "comment `/review nogpu` for the review without the live test.")
+            reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes an author with write access and a "
+                            "head branch on this repository or a fork owned by someone with write access; comment "
+                            "`/review nogpu` for the review without the live test.")
             return
         out.update(run="true", mode=mode, turns=team_turns)
         return
@@ -495,34 +509,42 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     last-review.json with since.diff and since-commits.txt or interdiff.diff (rereview_inputs),
     stacked-above.json and above-<n>.diff, and open-issues.json; and the diff's length and the summary's
     schema as outputs. The PR's text and comments are untrusted: they only ever reach files the prompt
-    calls untrusted."""
+    calls untrusted. In full mode, whose review steers a session with a shell, only the team's comments and
+    issue titles (from_the_team) reach those files, and always the bot's own."""
     if prev:
         shutil.copyfile(Path(prev, "handoff.md"), "handoff.md")
     pull = api(f"repos/{repo}/pulls/{pr}")
-    # GitHub refuses `gh pr diff` past 20,000 lines or 300 files. Fall back to the files API (up to
-    # 3,000 files; it omits the patch of a file that is too large on its own).
-    r = gh("pr", "diff", str(pr), "--repo", repo, check=False)
+    # The commit `resolve` fixed, not the PR's live head: three dots, as the PR's own diff. GitHub refuses
+    # a diff past 20,000 lines or 300 files. Fall back to the files API (up to 3,000 files; it omits the
+    # patch of a file that is too large on its own).
+    r = gh("api", "-H", "Accept: application/vnd.github.diff",
+           f"repos/{repo}/compare/{pull['base']['sha']}...{head_sha}", check=False)
     if r.returncode == 0:
         diff = r.stdout
     else:
-        print(f"::warning::gh pr diff failed ({r.stderr[:300]}); building pr.diff from the files API.")
+        print(f"::warning::The diff failed ({r.stderr[:300]}); building pr.diff from the files API.")
         diff = "".join(map(file_patch, api_list(f"repos/{repo}/pulls/{pr}/files")))
     write("pr.diff", diff)
     write("pr-body.md", (pull["body"] or "") + "\n")
 
     comments, conversation = discussion(repo, pr)
-    write_json("pr-comments.json", comments)
-    write_json("pr-conversation.json", conversation)
+    write_json("pr-comments.json", from_the_team(comments) if mode == "full" else comments)
+    write_json("pr-conversation.json", from_the_team(conversation) if mode == "full" else conversation)
 
     if not prev:
         rereview_inputs(out, repo, pull, head_sha, diff, conversation)
     if mode == "full":
         since_live_test(repo, head_sha, conversation)
     write_stacked_above(out, repo, pull, head_sha)
-    write_open_issues(repo)
+    write_open_issues(repo, mode)
     out["lines"] = diff.count("\n")
     # The summary's fields, from main, for --json-schema.
     out["schema"] = json.dumps(render_summary.SCHEMA, separators=(",", ":"))
+
+
+def from_the_team(comments):
+    """Of `comments` (`discussion`), those by the team or the bot (its findings, which a re-review judges)."""
+    return [c for c in comments if c["user"] in POSTING_BOT_USERS or c.get("author_association") in TEAM]
 
 
 def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
@@ -612,14 +634,15 @@ def write_stacked_above(out, repo, pull, head_sha):
         out["above"] = json.dumps(above, separators=(",", ":"))
 
 
-def write_open_issues(repo):
-    """The open issues, [{number, title}], so a latent bug on main can name the one that tracks it. Titles are
-    user text: the model reads them as untrusted data. A failed fetch leaves no file, and the review says
-    it couldn't check."""
-    r = gh("issue", "list", "--repo", repo, "--state", "open", "--limit", "1000", "--json", "number,title",
-           check=False)
-    if r.returncode == 0:
-        write("open-issues.json", r.stdout)
+def write_open_issues(repo, mode):
+    """The open issues, [{number, title}], so a latent bug on main can name the one that tracks it, in full mode
+    only the team's. Titles are user text: the model reads them as untrusted data. A failed fetch leaves no
+    file, and the review says it couldn't check."""
+    issues = read(api_list, f"repos/{repo}/issues?state=open&per_page=100")
+    if issues is not None:
+        write_json("open-issues.json", [{"number": i["number"], "title": i["title"]} for i in issues
+                                        if "pull_request" not in i
+                                        and (mode != "full" or i.get("author_association") in TEAM)])
 
 
 # ---------------------------------------------------------------- review job: after the review
@@ -889,17 +912,9 @@ def referenced(timeline, number, repo):
     return signals, mentions
 
 
-# The first character of anything that can start markup, a link, or a reference to a person, issue or commit.
-MARKUP = re.compile(r"(?i)(?:[@#<&\\]|\](?=\()|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))(?!\u200b)")
-
-
 def safe(text):
-    """Untrusted text for an issue or comment: redacted, on one line, and with a zero-width space after the first
-    character of every `@`, `#`, `<`, `&`, `\\`, `](`, `![`, `://`, `GH-` and `www.`, in any case. So it can't ping
-    anyone, mark another issue's timeline, link, load an image, open HTML or a comment, or spell any of those as an
-    entity or a backslash escape. Nothing is escaped, so text in a code span still reads right and a second pass
-    changes nothing."""
-    return MARKUP.sub("\\g<0>\u200b", redact(" ".join(str(text or "").split())))
+    """Untrusted text for an issue or comment: redacted, on one line, and made inert (render_summary.inert)."""
+    return render_summary.inert(redact(" ".join(str(text or "").split())))
 
 
 def szz(commits, shas, number, files, bug_prs=(), since=""):

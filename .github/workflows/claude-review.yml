@@ -59,8 +59,9 @@ name: Claude Review
 #     team plus anyone who has had a PR merged here, from a fork or not;
 #   - nogpu, when someone with write access comments `/review nogpu`;
 #   - full, when someone with write access comments `/review` on a PR whose
-#     author also has write access: nogpu, then the live test, then approval
-#     if the rule holds.
+#     author also has write access and whose head is on this repository or a
+#     fork owned by someone with write access: nogpu, then the live test, then
+#     approval if the rule holds.
 #     A `/review` or `/review nogpu` that lacks the write access it takes gets a
 #     one-line reply and nothing runs: a contributor without it, on their own
 #     PR, is pointed to `/review light`; a `/review` on a PR whose author lacks
@@ -122,6 +123,9 @@ jobs:
   # group, so a refused or unrelated request never cancels a review in progress.
   preflight:
     name: Preflight
+    # The key check below reads ANTHROPIC_API_KEY, which is in the environment. (The job's `if` runs first,
+    # so an unrelated comment makes no deployment.)
+    environment: review-bot
     # No repository pin: a fork with no ANTHROPIC_API_KEY exits green at the
     # preflight below, which is the same protection and visible in the log
     # rather than a silently skipped job. It also means a fork that *does* set
@@ -168,8 +172,8 @@ jobs:
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
       # be the PR's author, a contributor, on `/review light` or `/review
-      # continue`; a full review also needs an author with write access (see the
-      # header). A request that fails only those checks gets a one-line reply;
+      # continue`; a full review also needs an author and head repository with
+      # write access (see the header). A request that fails only those checks gets a one-line reply;
       # anyone else exits green with a notice (bot.py, preflight).
       - name: Preflight
         id: pre
@@ -328,8 +332,10 @@ jobs:
           allowed_non_write_users: ${{ needs.preflight.outputs.non_write_user }}
           # Reads stay inside the checkout (main at the root, the PR in pr-head/), so the model
           # can't read the runner's files, and with --permission-mode dontAsk below any call
-          # that would otherwise prompt is refused.
-          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+          # that would otherwise prompt is refused. No .git: the action writes this job's token
+          # into the root checkout's .git/config. `.git` is the directory itself (Grep and Glob
+          # are checked against the directory they search), `//` an absolute path.
+          settings: '{"permissions":{"blockReadsOutsideWorkingDirectories":true,"deny":["Read(.git)","Read(.git/**)","Read(//**/.git/**)"]}}'
           prompt: |
             Read .github/review/review-prompt.md from the repository root and follow it
             exactly. It defines your trust boundary, inputs and output format, and points

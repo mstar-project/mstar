@@ -31,6 +31,10 @@ def thread(comment_id, body, outdated=False, resolved=False):
     return {"isOutdated": outdated, "isResolved": resolved, "comments": {"nodes": [first]}}
 
 
+OWN_HEAD = {"full_name": R, "owner": {"login": "mstar-project"}}
+BASE_REPO = {"default_branch": "main"}
+
+
 def review(prior=(), outside=()):
     return {"outside_diff": list(outside), "prior_findings": list(prior)}
 
@@ -54,13 +58,14 @@ class TestApproval(unittest.TestCase):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")
 
     def test_only_a_listed_author_and_commenter_can_use_the_slurm_nodes(self):
-        def slurm(authors, commenter):
-            fake = FakeGh({f"GET repos/{R}/pulls/7": {"user": {"login": "someone"}}, "ssh-keygen*": ""})
+        def slurm(authors, commenter, nodes='[{"name": "n", "host": "root@h", "host_key": "k"}]', head=None):
+            fake = FakeGh({f"GET repos/{R}/pulls/7": {"user": {"login": "someone"},
+                                                      "head": {"repo": head or OWN_HEAD}}, "ssh-keygen*": ""})
             with tempfile.TemporaryDirectory() as d, \
                     unittest.mock.patch.object(gpu_review, "GPU", Path(d, "s/gpu.py")), \
                     unittest.mock.patch.object(Path, "home", return_value=Path(d)), \
                     unittest.mock.patch.object(bot, "run", fake):
-                gpu_review.configure({}, d, pr=7, ssh_key="k", slurm_nodes='[{"name": "n", "host": "h"}]',
+                gpu_review.configure({}, d, pr=7, ssh_key="k", slurm_nodes=nodes,
                                      slurm_authors=authors, commenter=commenter)
                 return json.loads(Path(d, "config.local.json").read_text())["slurm"]
 
@@ -69,26 +74,36 @@ class TestApproval(unittest.TestCase):
                          "any write-access author would run code as root on the shared nodes")
         self.assertEqual(slurm("alice someone", "bob"), [],
                          "someone not on the nodes could send a listed author's PR there")
-        self.assertEqual(len(slurm("alice someone", "alice")), 1)
+        with contextlib.redirect_stdout(io.StringIO()) as log:
+            self.assertEqual(len(slurm("alice someone", "alice")), 1)
+        self.assertIn("::add-mask::root@h\n", log.getvalue(), "ssh's errors would put the host in a public log")
+        self.assertIn("::add-mask::h\n", log.getvalue(), "ssh's errors print the bare host too")
+        fork = {"full_name": "bob/mstar", "owner": {"login": "bob"}}
+        self.assertEqual(slurm("alice someone", "alice", head=fork), [],
+                         "a listed author could send an unlisted fork's code to the shared nodes")
+        with self.assertRaises(ValueError, msg="a node without a pinned key would fall back to accept-new"):
+            slurm("alice someone", "alice", nodes='[{"name": "n", "host": "h"}]')
 
     def test_rules_and_dependencies_never_approve_and_engine_approvals_dont_count(self):
         for path in (".github/review/review-prompt.md", ".claude/skills/pr-review/SKILL.md", "AGENTS.md",
                      "CLAUDE.md", "uv.lock", "rust/server/Cargo.lock", "pyproject.toml", "setup.py",
                      "rust/Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml", "docs/requirements.txt",
                      "scripts/ci/check.sh", "scripts/release.sh", "docker/Dockerfile", "tools/x.py",
-                     "packaging/deb.sh", "MANIFEST.in"):
+                     "packaging/deb.sh", "MANIFEST.in", "rust/.cargo/config.toml", "sub/.claude/settings.json",
+                     "CLAUDE.local.md", ".gitmodules", "setup.cfg", "uv.toml"):
             self.assertTrue(file_gate([path], REPO_ROOT)[0], f"a change to {path} could be approved")
         self.assertEqual(file_gate(["mstar/engine/engine.py", "mstar/engine/resources/kv_cache.py",
                                     "mstar/worker/worker.py", "mstar/model/kokoro/model.py", "docs/models.rst"],
                                    REPO_ROOT)[0], [], "a low-risk engine or model change couldn't be approved")
 
     def test_a_none_run_counts_as_a_pass_only_when_the_review_chose_none(self):
-        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}, "title": "T"}
+        pr = {"head": {"sha": "0123456789", "repo": OWN_HEAD}, "base": {"sha": "abcdef", "repo": BASE_REPO},
+              "user": {"login": "an-author"}, "title": "T"}
 
         def why(verdict, run, files=("docs/models.rst",), since="", skipped=(), questions=()):
             fake = FakeGh({f"GET repos/{R}/pulls/7": pr, f"GET repos/{R}/collaborators/an-author/permission":
                            {"permission": "write"}, "POST graphql": threads_page(),
-                           f"GET repos/{R}/compare/abcdef...0123456789": {"files": [{"filename": f} for f in files]}})
+                           f"GET repos/{R}/compare/main...0123456789": {"files": [{"filename": f} for f in files]}})
             r = {"outside_diff": [], "prior_findings": [], "questions": list(questions), "skipped": list(skipped),
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "checks": ["correctness"], "gpus": 1}}
@@ -181,6 +196,21 @@ class TestCarry(unittest.TestCase):
             result = json.dumps({"live_test": {"gpus": 8}})
             out, _ = step(gpu_review.inputs, routes, pr="7", result=result, max_gpus="4")
         self.assertEqual(out["gpus"], 4)
+
+    def test_the_live_test_runs_only_code_held_by_someone_with_write_access(self):
+        def trusted(head):
+            routes = {f"GET repos/{R}/pulls/7": {"user": {"login": "an-author"}, "base": {"ref": "main"},
+                                                 "head": {"repo": head}},
+                      f"GET repos/{R}/collaborators/an-author/permission": {"permission": "write"},
+                      f"GET repos/{R}/collaborators/a-peer/permission": {"permission": "write"},
+                      f"GET repos/{R}/collaborators/a-stranger/permission": {"permission": "read"}}
+            with workspace():
+                return step(gpu_review.inputs, routes, pr="7", result="{}", max_gpus="4")[0].get("trusted")
+
+        self.assertEqual(trusted(OWN_HEAD), "true")
+        self.assertEqual(trusted({"full_name": "a-peer/m", "owner": {"login": "a-peer"}}), "true")
+        self.assertIsNone(trusted({"full_name": "a-stranger/m", "owner": {"login": "a-stranger"}}))
+        self.assertIsNone(trusted(None), "a head repository GitHub no longer shows would count as trusted")
 
     def test_a_re_review_that_cant_approve_isnt_made_full(self):
         for run, outputs in (("targeted", {"run": "targeted", "checks": "correctness"}),
@@ -359,6 +389,15 @@ class TestComment(unittest.TestCase):
         self.assertTrue(text.startswith("<!-- claude-live-test sha=0123456789 verdict=fail -->\n"))
         self.assertEqual(text.count("<!--"), 1, "the box's report could carry a passing verdict")
 
+    def test_the_report_cant_ping_or_load_an_image_but_the_gallery_still_links(self):
+        report = "## Results\n@org/team ![x](https://evil.example/x.png) `List<int>`\n![a](media/a.png)\n"
+        _, text = self.comment(report, [("a.png", 10)], media_url="https://o.github.io/m/pr-7/1")
+        self.assertNotIn("@org/team", text, "the report could ping a team")
+        self.assertNotIn("![x]", text, "the report could load an image from anywhere")
+        self.assertIn("## Results\n", text, "headings would break")
+        self.assertIn("![a](https://o.github.io/m/pr-7/1/media/a.png)", text, "the gallery's image would stop showing")
+        self.assertIn("`List<\u200bint>`", text, "a code span should still read right")
+
     def test_the_gallery_serves_only_media_within_the_cap_and_is_linked_once_published(self):
         cap = unittest.mock.patch.object(gpu_review, "MEDIA_CAP", 1000)
         cap.start()
@@ -371,19 +410,20 @@ class TestComment(unittest.TestCase):
         _, text = self.comment(report, out=out, media_url="https://x.github.io/m/pr-7/1-1")
         self.assertIn("https://x.github.io/m/pr-7/1-1/index.html", text)
         self.assertIn("](https://x.github.io/m/pr-7/1-1/media/a.png)", text)
-        self.assertIn("[c](media/c.wav)", text, "a link to a file the gallery left out would point at nothing")
+        self.assertNotIn("m/pr-7/1-1/media/c.wav", text, "a link to a file the gallery left out points at nothing")
 
 
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
-                outside=(), above=None, extra=None, untestable=""):
+                outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
         `verdict` or the other arguments fail it; its decision text, the outputs and the writes."""
-        pr = {"head": {"sha": head}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}, "title": "T"}
+        pr = {"head": {"sha": head, "repo": head_repo}, "base": {"sha": "abcdef", "repo": BASE_REPO},
+              "user": {"login": "an-author"}, "title": "T"}
         routes = {f"GET repos/{R}/pulls/7": pr,
                   f"GET repos/{R}/collaborators/an-author/permission": {"permission": perm},
                   "POST graphql": threads_page(), f"GET repos/{R}/actions/variables/REVIEW_APPROVALS": variable,
-                  f"GET repos/{R}/compare/abcdef...0123456789": {"files": files or [{"filename": "docs/models.rst"}]},
+                  f"GET repos/{R}/compare/main...0123456789": {"files": files or [{"filename": "docs/models.rst"}]},
                   f"POST repos/{R}/pulls/7/reviews": {},
                   **(extra or {})}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
@@ -405,6 +445,18 @@ class TestApprove(unittest.TestCase):
                                    ("design risk", {"risk": "medium"}, ""),
                                    ("a blocked file", {"files": [{"filename": ".github/workflows/ci.yml"}]}, "rules"),
                                    ("a blocked file renamed away", {"files": [blocked]}, "rules"),
+                                   ("a head on a stranger's fork", {
+                                       "head_repo": {"full_name": "a/b", "owner": {"login": "a"}},
+                                       "extra": {f"GET repos/{R}/collaborators/a/permission": {"permission": "read"}}},
+                                    "head repository"),
+                                   ("a head repository that's gone", {"head_repo": None}, "head repository"),
+                                   ("a submodule", {"files": [{"filename": "third_party/x", "patch":
+                                                    "@@ -1 +1 @@\n-Subproject commit " + "a" * 40
+                                                    + "\n+Subproject commit " + "b" * 40}]}, "rules"),
+                                   ("a blocked file a retarget hides from the PR's base", {
+                                       "files": [{"filename": ".github/workflows/ci.yml"}],
+                                       "extra": {f"GET repos/{R}/compare/abcdef...0123456789": {
+                                           "files": [{"filename": "docs/models.rst"}]}}}, "rules"),
                                    ("the review says the GPUs can't run it", {"untestable": "AMD kernels"},
                                     "the bot's live test can't cover this: AMD kernels"),
                                    ("a changed line names AMD hardware", {"files": [
@@ -482,7 +534,7 @@ class TestPost(unittest.TestCase):
         (_, gated), = gated.writes()
         (_, none), = none.writes()
         self.assertEqual(gated.count("<!--"), 0, "the review's text could forge a passing live test")
-        self.assertEqual(none, "<!-- claude-live-test-none -->\nNo GPU run: docs &lt;!-- x -->\n\n"
+        self.assertEqual(none, "<!-- claude-live-test-none -->\nNo GPU run: docs <\u200b!-- x -->\n\n"
                                "**Approved** on `0123456` by the rule in `.github/review/gpu_review.py`.\n")
 
 
