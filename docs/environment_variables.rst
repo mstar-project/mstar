@@ -539,8 +539,7 @@ Worker scheduling
      - Where a worker runs a step's host work. ``threaded`` runs admit, plan and
        the forward's launch on its GPU thread, and the pre-plan on its plan
        thread. ``serial`` runs them on the main thread, so host work overlaps the
-       GPU but not other host work. The worker refuses ``serial`` at startup with
-       lockstep-parallel nodes or a side lane. Read by ``knobs.step_threads``.
+       GPU but not other host work. Read by ``knobs.step_threads``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``auto``
      - Pin each worker's main, GPU and plan threads, and the API server's
