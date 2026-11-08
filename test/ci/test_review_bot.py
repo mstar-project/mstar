@@ -155,6 +155,18 @@ class TestRestore(unittest.TestCase):
                 "run download": download,
             }, repo="o/r", pr="7", head_sha=HEAD, runner_temp=temp, non_write=non_write)[0]
 
+    def test_a_failure_nobody_expected_is_still_a_refusal(self):
+        fake = FakeGh({
+            "GET repos/o/r/pulls/7": {"head": {"sha": HEAD, "repo": {"full_name": "o/r"}}, "title": "t"},
+            "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
+                                                 "body": bot.INCOMPLETE + "\nThe review didn't complete"}],
+            "GET repos/o/r/actions/artifacts?*": {"artifacts": [
+                {"expired": False, "created_at": "2026-11-01", "workflow_run": None}]}})
+        out = {}
+        with tempfile.TemporaryDirectory() as temp, mock.patch.object(bot, "run", fake), self.assertRaises(TypeError):
+            bot.resolve(out, "o/r", "7", "", temp)
+        self.assertEqual(out["refused"], "true", "it would overwrite the stopped review's comment")
+
     def test_a_continue_takes_only_this_workflows_handoff_of_this_head(self):
         self.assertEqual(self.restore({"mode": "thorough"})["mode"], "nogpu",
                          "a review stopped before the rename couldn't continue")
@@ -273,6 +285,11 @@ class TestInterdiff(unittest.TestCase):
         faked_header = self.REVIEWED.replace("+    guard()\n",
                                              "+    guard()\n+    evil()\n+    s = '\fdiff --git a/a.py b/a.py\n")
         below = self.REVIEWED.replace("     z = 4\n", "     w = 5\n")
+        cat = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"]
+        carriage_return = bot.run(cat, input=self.REVIEWED.replace(
+            "+    guard()\n", "+    guard()\n+    evil()\rdiff --git a/a.py b/a.py\n")).stdout
+        type_change = ("diff --git a/l b/l\ndeleted file mode 100644\n--- a/l\n+++ /dev/null\n@@ -1 +0,0 @@\n-{}\n"
+                       "diff --git a/l b/l\nnew file mode 120000\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+t\n")
         for name, old, new, shown in (
                 ("a guard moved to another function", self.REVIEWED, moved, "def h()"),
                 ("a guard moved inside its function", self.REVIEWED, moved_inside, "pass"),
@@ -280,14 +297,21 @@ class TestInterdiff(unittest.TestCase):
                  between_blanks.format("c()", "d()"), "c()"),
                 ("the line below a change", self.REVIEWED, below, "w = 5"),
                 ("a form feed faking a file header", self.REVIEWED, faked_header, "evil()"),
+                ("a carriage return faking a file header", self.REVIEWED, carriage_return, "evil()"),
+                ("the first half of a type change", type_change.format("a"), type_change.format("b"), "-b"),
                 ("a dropped hunk", self.REVIEWED, without_hunk, "def g()"),
                 ("a dropped file", self.REVIEWED + other, self.REVIEWED, "b.py"),
                 ("a mode change beside hunks", self.REVIEWED, mode, "new mode"),
                 ("a binary swapped", binary.format("1..2 100644"), binary.format("1..3 100644"), "1..3")):
             with self.subTest(name):
                 self.assertIn(shown, bot.interdiff(old, new))
+        self.assertIn("evil()\rdiff --git", carriage_return, "a bare \\r would end the line, faking a file header")
         self.assertEqual(bot.interdiff(binary.format("1..2 100644"), binary.format("9..2 100644")), "",
                          "main changing a binary's old side would read as the PR's change")
+        rename = ("diff --git a/x b/y\nsimilarity index {}%\nrename from x\nrename to y\n--- a/x\n+++ b/y\n"
+                  "@@ -1 +1 @@\n-a\n+b\n")
+        self.assertEqual(bot.interdiff(rename.format(90), rename.format(85)), "",
+                         "a rebase changing how similar a renamed file is would read as the PR's change")
         self.assertIn(bot.DROPPED, bot.interdiff(self.REVIEWED + other, self.REVIEWED))
 
 
