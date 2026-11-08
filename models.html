@@ -711,6 +711,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#per-request-lora-adapters">Per-request LoRA adapters</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-notes">OmniVoice notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#higgs-audio-notes">Higgs Audio notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#orpheus-notes">Orpheus notes</a></li>
@@ -1044,6 +1045,88 @@ the expert shape, and default tiles otherwise. The server logs the sweep command
 for each shape it serves untuned; see “Tuned kernel configs” in <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></li>
 <li><p>To add a new family, see <a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>.</p></li>
 </ul>
+<section id="per-request-lora-adapters">
+<h3>Per-request LoRA adapters<a class="headerlink" href="#per-request-lora-adapters" title="Link to this heading">#</a></h3>
+<p>A <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block in a serving config serves PEFT adapters per request
+(sized and loaded as described under Qwen3.5 below). A request picks one with the
+<code class="docutils literal notranslate"><span class="pre">model</span></code> field on any OpenAI route, or with <code class="docutils literal notranslate"><span class="pre">lora_adapter:</span> <span class="pre">&lt;name&gt;</span></code> in <code class="docutils literal notranslate"><span class="pre">extra_body</span></code>
+or <code class="docutils literal notranslate"><span class="pre">/generate</span></code>’s <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>; an adapter the deployment does not serve is a 400.
+Without the block a model runs exactly as before. The table lists the models that take
+one and their targets, by the names a <code class="docutils literal notranslate"><span class="pre">targets:</span></code> list in the block uses. Every row is
+validated on CPU (each model’s own stack against merged weights at simulated tensor
+parallelism); the GPU checks are in <code class="docutils literal notranslate"><span class="pre">benchmark/lora/README.md</span></code>. Qwen3.5 passes them,
+Orpheus agrees with transformers + PEFT on every row and misses the merged check on a
+few, and Higgs Audio passes them, though its transformers check has not been rerun since
+that reference moved to fp32 RoPE. The rows marked <em>not validated</em> do not yet, and serve
+adapters at your own risk. None of their misses in the eager checks so far is an adapter
+error: the checks are tighter than bf16 noise on these models, and when each layer is fed
+an fp32 reference’s input, an adapter’s median error is within about 10% of a bf16
+merge’s.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<colgroup>
+<col style="width: 18.0%" />
+<col style="width: 40.0%" />
+<col style="width: 42.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Model (node)</p></th>
+<th class="head"><p>Targets</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Qwen3.5 / Qwen3.8 (<code class="docutils literal notranslate"><span class="pre">LLM</span></code>, <code class="docutils literal notranslate"><span class="pre">vision_encoder</span></code>)</p></td>
+<td><p>every linear of the text stack, <code class="docutils literal notranslate"><span class="pre">lm_head</span></code>, <code class="docutils literal notranslate"><span class="pre">embed_tokens</span></code>; the vision tower’s
+blocks, merger and patch embed</p></td>
+<td><p>See the Qwen3.5 notes.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Orpheus (<code class="docutils literal notranslate"><span class="pre">LLM</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_head</span></code>,
+<code class="docutils literal notranslate"><span class="pre">embed_tokens</span></code></p></td>
+<td><p>Hub Orpheus adapters (PEFT on <code class="docutils literal notranslate"><span class="pre">q/k/v/o/gate/up/down</span></code>, ranks 8 to 512) are
+served; set <code class="docutils literal notranslate"><span class="pre">max_rank</span></code> to the largest.</p></td>
+</tr>
+<tr class="row-even"><td><p>Higgs Audio (<code class="docutils literal notranslate"><span class="pre">LLM</span></code>)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> (the
+checkpoint’s <code class="docutils literal notranslate"><span class="pre">audio_decoder_proj.text_lm_head</span></code>)</p></td>
+<td><p>No embedding target: text prefill embeds before the step.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Qwen3-Omni (<code class="docutils literal notranslate"><span class="pre">Thinker</span></code>), <em>not validated</em></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, dense-layer <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_head</span></code></p></td>
+<td><p>Attention only on MoE layers: an adapter on the routed experts or the router is
+refused. Talker, code predictor and encoders take none. Not validated: this MoE
+model’s bf16 noise is about 10x a dense model’s (its router flips experts on
+near-ties), so even base rows, run in a larger batch than the reference’s, miss
+the check against merged weights.</p></td>
+</tr>
+<tr class="row-even"><td><p>Qwen3-TTS (<code class="docutils literal notranslate"><span class="pre">Talker</span></code>), <em>not validated</em></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">codec_head</span></code></p></td>
+<td><p>Not the text projection (runs before the step) or the CodePredictor. Not
+validated: both checks fail on some rows, but against an fp32 reference LoRA
+gets every row’s top-1 right while a bf16 merge of the adapter (the merged
+check’s yardstick) flips one.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Chatterbox (<code class="docutils literal notranslate"><span class="pre">T3</span></code>), <em>not validated</em></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">speech_head</span></code></p></td>
+<td><p>English and multilingual; a request’s guidance (uncond) rows run its adapter too.
+Not Turbo (GPT-2’s fused <code class="docutils literal notranslate"><span class="pre">c_attn</span></code>), nor the conditioning encoder. Not
+validated: the check against merged weights fails on some rows, and an early
+layer’s massive activation (its largest value grows from 8 to about 1200)
+amplifies bf16 noise.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Not yet: Whisper (its encoder node plans no step rows, and the decoder’s cross-attention
+K/V run over encoder rows, so the usual <code class="docutils literal notranslate"><span class="pre">q_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">v_proj</span></code> adapters cannot be served
+whole), BAGEL and Cosmos3 (mixture-of-transformers weights chosen per row inside one
+forward, and guidance branches run as separate forwards), π0.5 (openpi’s adapters are
+not PEFT), FLUX.2 [klein] (merges a LoRA into its weights at load, not per request), and
+every other family, which declares no LoRA specs yet: Canary, Canary-Qwen, Command A+,
+CosyVoice3, Fish Audio S2-Pro, GLM-5.2, Kokoro, LingBot-World, LTX-2.5, Nemotron
+VoiceChat, Omnilingual ASR, OmniVoice, Parakeet and Nemotron ASR, Qwen3-ASR, V-JEPA 2,
+VoxCPM2, Wan2.2, Waypoint and Z-Image.</p>
+</section>
 <section id="omnivoice-notes">
 <h3>OmniVoice notes<a class="headerlink" href="#omnivoice-notes" title="Link to this heading">#</a></h3>
 <ul class="simple">
@@ -1367,6 +1450,98 @@ supported yet. On any deployment,
 <code class="docutils literal notranslate"><span class="pre">&quot;return_token_ids&quot;:</span> <span class="pre">true</span></code> adds each text chunk’s sampled ids
 (<code class="docutils literal notranslate"><span class="pre">{&quot;token_ids&quot;:</span> <span class="pre">[...]}</span></code>), stop tokens included, so a trainer need not
 re-tokenize the text.</p>
+<p><strong>LoRA adapters.</strong> A <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block in the serving config serves
+per-request LoRA adapters (PEFT <code class="docutils literal notranslate"><span class="pre">adapter_model.safetensors</span></code>; the scaling comes
+from the <code class="docutils literal notranslate"><span class="pre">adapter_config.json</span></code> beside it). The OpenAI <code class="docutils literal notranslate"><span class="pre">model</span></code> field picks one,
+as in vLLM: the base model’s name (or its HF repo id, or no <code class="docutils literal notranslate"><span class="pre">model</span></code> at all) runs
+the base model, an adapter’s name runs that adapter, and any other name is a 400.
+<code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/models</span></code> lists the adapters beside the base model. On <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code>,
+pass <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{lora_adapter:</span> <span class="pre">&lt;name&gt;}</span></code>, checked the same way. Rows on different adapters, and on
+none, share a batch:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">resources</span><span class="p">:</span>
+  <span class="n">lora</span><span class="p">:</span>
+    <span class="n">max_slots</span><span class="p">:</span> <span class="mi">4</span>        <span class="c1"># adapters resident on the GPU at once</span>
+    <span class="n">max_rank</span><span class="p">:</span> <span class="mi">16</span>        <span class="c1"># the largest rank served; slots are sized to it</span>
+    <span class="n">cpu_capacity</span><span class="p">:</span> <span class="mi">16</span>    <span class="c1"># adapters kept in pinned host memory</span>
+    <span class="n">adapters</span><span class="p">:</span>
+      <span class="n">sql</span><span class="p">:</span> <span class="o">/</span><span class="n">adapters</span><span class="o">/</span><span class="n">qwen3_5</span><span class="o">-</span><span class="mi">4</span><span class="n">b</span><span class="o">-</span><span class="n">sql</span><span class="o">/</span><span class="n">adapter_model</span><span class="o">.</span><span class="n">safetensors</span>
+      <span class="n">chat</span><span class="p">:</span> <span class="o">/</span><span class="n">adapters</span><span class="o">/</span><span class="n">qwen3_5</span><span class="o">-</span><span class="mi">4</span><span class="n">b</span><span class="o">-</span><span class="n">chat</span>   <span class="c1"># a PEFT directory names its adapter_model.safetensors</span>
+</pre></div>
+</div>
+<p>Every adapter the config names is checked at startup, before any worker starts (LoRA
+layers present, rank within <code class="docutils literal notranslate"><span class="pre">max_rank</span></code>, only the targets below, shapes that fit them),
+and one that fails stops the server with an error naming it.</p>
+<p>Adapters may touch every module PEFT adapters for Qwen3.5 on the Hub touch:</p>
+<ul class="simple">
+<li><p>every linear of the text stack, as <code class="docutils literal notranslate"><span class="pre">target_modules=&quot;all-linear&quot;</span></code> picks them: the
+full-attention layers’ <code class="docutils literal notranslate"><span class="pre">q_proj</span></code> (its output gate included), <code class="docutils literal notranslate"><span class="pre">k_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">v_proj</span></code>
+and <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, the gated DeltaNet layers’ <code class="docutils literal notranslate"><span class="pre">linear_attn.in_proj_qkv</span></code> (or
+<code class="docutils literal notranslate"><span class="pre">in_proj_q</span></code> / <code class="docutils literal notranslate"><span class="pre">_k</span></code> / <code class="docutils literal notranslate"><span class="pre">_v</span></code> split, as Tinker trains them), <code class="docutils literal notranslate"><span class="pre">in_proj_z</span></code>,
+<code class="docutils literal notranslate"><span class="pre">in_proj_a</span></code>, <code class="docutils literal notranslate"><span class="pre">in_proj_b</span></code> and <code class="docutils literal notranslate"><span class="pre">out_proj</span></code>, and every layer’s <code class="docutils literal notranslate"><span class="pre">gate_proj</span></code>,
+<code class="docutils literal notranslate"><span class="pre">up_proj</span></code> and <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>;</p></li>
+<li><p>the LM head (<code class="docutils literal notranslate"><span class="pre">lm_head</span></code>, or Tinker’s <code class="docutils literal notranslate"><span class="pre">unembed_tokens</span></code>) and the token embedding
+(PEFT’s <code class="docutils literal notranslate"><span class="pre">lora_embedding_A</span></code> / <code class="docutils literal notranslate"><span class="pre">_B</span></code> on <code class="docutils literal notranslate"><span class="pre">embed_tokens</span></code>). With tied weights (0.8B,
+2B, 4B) each delta stays on its own side, as PEFT applies them;</p></li>
+<li><p>the vision tower, as unsloth’s vision fine-tunes adapt it: each block’s
+<code class="docutils literal notranslate"><span class="pre">attn.qkv</span></code>, <code class="docutils literal notranslate"><span class="pre">attn.proj</span></code>, <code class="docutils literal notranslate"><span class="pre">mlp.linear_fc1</span></code> and <code class="docutils literal notranslate"><span class="pre">mlp.linear_fc2</span></code>, the merger’s
+<code class="docutils literal notranslate"><span class="pre">linear_fc1</span></code> / <code class="docutils literal notranslate"><span class="pre">linear_fc2</span></code>, and the conv <code class="docutils literal notranslate"><span class="pre">patch_embed.proj</span></code>. The vision
+encoder node has its own pool (<code class="docutils literal notranslate"><span class="pre">vision_lora</span></code>), sized by the same <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block,
+and runs the request’s adapter too.</p></li>
+</ul>
+<p>Module names may be in any layout PEFT writes for the model: the released checkpoint’s
+(<code class="docutils literal notranslate"><span class="pre">model.language_model.layers.*</span></code>, <code class="docutils literal notranslate"><span class="pre">model.visual.*</span></code>), the text-only causal LM’s
+(<code class="docutils literal notranslate"><span class="pre">model.layers.*</span></code>), the inner model’s (<code class="docutils literal notranslate"><span class="pre">language_model.layers.*</span></code>) or the bare text
+model’s (<code class="docutils literal notranslate"><span class="pre">layers.*</span></code>). An adapter on the MTP head is accepted and that part ignored
+(the head never runs). The DeltaNet in-projections are one fused GEMM, so their deltas
+are one shrink and one expand per layer, added before the conv reads the output.</p>
+<p>Refused with a 400 that says why, when the adapter is named: DoRA (<code class="docutils literal notranslate"><span class="pre">use_dora</span></code>),
+<code class="docutils literal notranslate"><span class="pre">modules_to_save</span></code> (full copies of a module, e.g. a classifier <code class="docutils literal notranslate"><span class="pre">score</span></code> head or a
+retrained <code class="docutils literal notranslate"><span class="pre">lm_head</span></code>), trainable tokens, bias LoRA, other PEFT methods (OFT), a module
+outside the list above, a module whose shapes do not fit (an adapter for another size),
+and a linear-shaped LoRA on <code class="docutils literal notranslate"><span class="pre">embed_tokens</span></code> (<code class="docutils literal notranslate"><span class="pre">lora_A.weight</span></code> of <code class="docutils literal notranslate"><span class="pre">[r,</span> <span class="pre">hidden]</span></code>, as
+some Tinker exports name a tied head’s LoRA; rename its keys to <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> to serve it
+on the head).</p>
+<p>Every target is sized into each slot and runs its kernels on every step that has an
+adapter row, whether that row’s adapter uses it or not. The LM head and embedding are
+vocabulary-sized: at <code class="docutils literal notranslate"><span class="pre">max_rank:</span> <span class="pre">16</span></code> and 4 slots, about 40 MB each per GPU (the head’s
+split over TP ranks, the embedding’s whole on each). So the pools keep only the targets
+the configured adapters touch, and a vision encoder whose adapters are all text-only
+builds no pool, unless the YAML lists the ones to keep:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">resources</span><span class="p">:</span>
+  <span class="n">lora</span><span class="p">:</span>
+    <span class="n">targets</span><span class="p">:</span> <span class="p">[</span><span class="n">qkv_proj</span><span class="p">,</span> <span class="n">o_proj</span><span class="p">,</span> <span class="n">in_proj_fused</span><span class="p">,</span> <span class="n">out_proj</span><span class="p">,</span> <span class="n">gate_up_proj</span><span class="p">,</span> <span class="n">down_proj</span><span class="p">,</span>
+              <span class="n">qkv</span><span class="p">,</span> <span class="n">attn_proj</span><span class="p">,</span> <span class="n">mlp_linear_fc1</span><span class="p">,</span> <span class="n">mlp_linear_fc2</span><span class="p">,</span> <span class="n">merger_linear_fc1</span><span class="p">,</span>
+              <span class="n">merger_linear_fc2</span><span class="p">,</span> <span class="n">patch_embed_proj</span><span class="p">]</span>
+</pre></div>
+</div>
+<p>An adapter deployment captures and compiles the LLM node as one without adapters does,
+each bucket twice: with the LoRA kernels, and base-only for steps none of whose rows names
+an adapter. The vision encoder’s block loop is captured base-only; a step with an adapter
+row runs it uncaptured. The LoRA pool keeps no resident table yet, so a <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block
+turns resident decode planning off on the LLM node (the server logs it): every decode
+step, base-only ones included, is planned on the host as before resident planning.</p>
+<p>Every size takes the same <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block; <code class="docutils literal notranslate"><span class="pre">max_rank</span></code> must cover the
+largest adapter served. Example blocks (Hub adapters, ranks as published; no shipped
+config has one, so add the line to that size’s serving config):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="c1"># e.g. in configs/qwen3_5_0.8b.yaml: a vision fine-tune (blocks and merger, rank 16)</span>
+<span class="n">lora</span><span class="p">:</span> <span class="p">{</span><span class="n">max_slots</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="n">max_rank</span><span class="p">:</span> <span class="mi">16</span><span class="p">,</span> <span class="n">adapters</span><span class="p">:</span> <span class="p">{</span><span class="n">agnews</span><span class="p">:</span> <span class="o">&lt;</span><span class="n">hammamwahab</span><span class="o">/</span><span class="n">jev</span><span class="o">-</span><span class="n">agnews</span><span class="o">-</span><span class="n">lora</span><span class="o">&gt;/</span><span class="n">adapter_model</span><span class="o">.</span><span class="n">safetensors</span><span class="p">}}</span>
+<span class="c1"># e.g. in configs/qwen3_5_2b.yaml: vision with the conv patch embed (rank 32)</span>
+<span class="n">lora</span><span class="p">:</span> <span class="p">{</span><span class="n">max_slots</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="n">max_rank</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span> <span class="n">adapters</span><span class="p">:</span> <span class="p">{</span><span class="n">comma</span><span class="p">:</span> <span class="o">&lt;</span><span class="n">wjbmattingly</span><span class="o">/</span><span class="n">comma</span><span class="o">-</span><span class="n">qwen</span><span class="o">-</span><span class="mf">3.5</span><span class="o">-</span><span class="mi">2</span><span class="n">b</span><span class="o">&gt;/</span><span class="n">adapter_model</span><span class="o">.</span><span class="n">safetensors</span><span class="p">}}</span>
+<span class="c1"># e.g. in configs/qwen3_5_4b.yaml: LM head and embedding (rank 8), Tinker (rank 32)</span>
+<span class="n">lora</span><span class="p">:</span> <span class="p">{</span><span class="n">max_slots</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="n">max_rank</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span> <span class="n">adapters</span><span class="p">:</span> <span class="p">{</span><span class="n">pirate</span><span class="p">:</span> <span class="o">&lt;</span><span class="n">William</span><span class="o">-</span><span class="n">Gao1</span><span class="o">/</span><span class="n">qwen3</span><span class="mf">.5</span><span class="o">-</span><span class="mi">4</span><span class="n">b</span><span class="o">-</span><span class="n">pirate</span><span class="o">-</span><span class="n">lora</span><span class="o">&gt;/...</span><span class="p">,</span>
+                                              <span class="n">oneinbox</span><span class="p">:</span> <span class="o">&lt;</span><span class="n">dKhRr</span><span class="o">/</span><span class="n">oneinbox</span><span class="o">-</span><span class="n">qwen3</span><span class="mf">.5</span><span class="o">-</span><span class="mi">4</span><span class="n">b</span><span class="o">-</span><span class="n">lora</span><span class="o">&gt;/...</span><span class="p">}}</span>
+<span class="c1"># e.g. in configs/qwen3_5_9b.yaml or qwen3_5_9b_tp2.yaml: released layout (16), Tinker (32)</span>
+<span class="n">lora</span><span class="p">:</span> <span class="p">{</span><span class="n">max_slots</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="n">max_rank</span><span class="p">:</span> <span class="mi">32</span><span class="p">,</span> <span class="n">adapters</span><span class="p">:</span> <span class="p">{</span><span class="n">nimble</span><span class="p">:</span> <span class="o">&lt;</span><span class="n">bespokelabs</span><span class="o">/</span><span class="n">Bespoke</span><span class="o">-</span><span class="n">Nimble</span><span class="o">-</span><span class="mi">9</span><span class="n">B</span><span class="o">&gt;/...</span><span class="p">,</span>
+                                              <span class="n">rlvr</span><span class="p">:</span> <span class="o">&lt;</span><span class="n">lucabaroni</span><span class="o">/</span><span class="n">qwen3</span><span class="mf">.5</span><span class="o">-</span><span class="mi">9</span><span class="n">b</span><span class="o">-</span><span class="n">rlvr</span><span class="o">-</span><span class="n">reward</span><span class="o">-</span><span class="n">hacking</span><span class="o">&gt;/...</span><span class="p">}}</span>
+<span class="c1"># e.g. in configs/qwen3_5_27b_tp4.yaml: text and vision (rank 16)</span>
+<span class="n">lora</span><span class="p">:</span> <span class="p">{</span><span class="n">max_slots</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="n">max_rank</span><span class="p">:</span> <span class="mi">16</span><span class="p">,</span> <span class="n">adapters</span><span class="p">:</span> <span class="p">{</span><span class="n">tcg</span><span class="p">:</span> <span class="o">&lt;</span><span class="n">heftyTuna</span><span class="o">/</span><span class="n">qwen35</span><span class="o">-</span><span class="mi">27</span><span class="n">b</span><span class="o">-</span><span class="n">tcg</span><span class="o">-</span><span class="n">lora</span><span class="o">&gt;/...</span><span class="p">}}</span>
+</pre></div>
+</div>
+<p>Under TP the LLM’s targets split as its linears do (the 27B’s single K/V head per rank
+at TP4, and the DeltaNet <code class="docutils literal notranslate"><span class="pre">a</span></code> gate padded per rank, included); the vision encoder runs
+on one GPU in every shipped config.</p>
+<p>LoRA needs the Python frontend (<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> refuses to start with a <code class="docutils literal notranslate"><span class="pre">lora</span></code>
+block).</p>
 <p>Qwen3.8-27B (<code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>) is the Qwen3.5 architecture and runs on the same
 code, served from <code class="docutils literal notranslate"><span class="pre">configs/qwen3_8_27b_tp4.yaml</span></code> (TP4):</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">mstar</span> <span class="n">serve</span> <span class="n">qwen3_8_27b</span> <span class="o">--</span><span class="n">gpus</span> <span class="mi">0</span><span class="p">,</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">,</span><span class="mi">3</span>
@@ -2869,6 +3044,7 @@ since its magnitudes would be dropped from the merge.</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#per-request-lora-adapters">Per-request LoRA adapters</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#omnivoice-notes">OmniVoice notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#higgs-audio-notes">Higgs Audio notes</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#orpheus-notes">Orpheus notes</a></li>

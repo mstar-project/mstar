@@ -1111,7 +1111,8 @@ that key, which the client sends as <code class="docutils literal notranslate"><
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/models</span></code></p></td>
 <td><p>all</p></td>
-<td><p>Lists the served model.</p></td>
+<td><p>Lists the served model, and any LoRA adapters it serves (each with <code class="docutils literal notranslate"><span class="pre">parent</span></code>
+naming the base model; see the Qwen3.5 notes in <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/chat/completions</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>

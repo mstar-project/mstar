@@ -1878,18 +1878,18 @@ one batch can run different adapters, or none. The engine owns the adapter weigh
 model declares which linears adapters may touch; it never indexes the pool itself.</p>
 <p>A model declares LoRA from its own modules: the shared linears add the delta
 themselves once bound, and <code class="docutils literal notranslate"><span class="pre">module_lora_spec</span></code> builds the spec by walking each node’s
-weights root. For an autoregressive LLM node such as Orpheus’s:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.lora.modules</span><span class="w"> </span><span class="kn">import</span> <span class="n">PER_SEGMENT</span><span class="p">,</span> <span class="n">module_lora_spec</span>
+weights root. Orpheus is the reference (<code class="docutils literal notranslate"><span class="pre">OrpheusModel.get_lora_specs</span></code>):</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.components.lora.modules</span><span class="w"> </span><span class="kn">import</span> <span class="n">PER_SEGMENT</span><span class="p">,</span> <span class="n">meta_root</span><span class="p">,</span> <span class="n">module_lora_spec</span>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">get_lora_specs</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">LoraSpec</span><span class="p">]:</span>
     <span class="c1"># the module the node's weight loader fills, at one rank, on the meta device</span>
-    <span class="k">with</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">"meta"</span><span class="p">):</span>
-        <span class="n">root</span> <span class="o">=</span> <span class="n">OrpheusForCausalLM</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">CommGroup</span><span class="o">.</span><span class="n">trivial</span><span class="p">())</span>
+    <span class="n">root</span> <span class="o">=</span> <span class="n">meta_root</span><span class="p">(</span><span class="k">lambda</span> <span class="n">group</span><span class="p">:</span> <span class="n">OrpheusForCausalLM</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">group</span><span class="p">))</span>
     <span class="k">return</span> <span class="p">[</span><span class="n">module_lora_spec</span><span class="p">(</span>
         <span class="n">root</span><span class="p">,</span> <span class="n">resource_key</span><span class="o">=</span><span class="n">LORA_RESOURCE_KEY</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
-        <span class="n">root_path</span><span class="o">=</span><span class="s2">"language_model"</span><span class="p">,</span>    <span class="c1"># the root's attribute path in the node submodule</span>
-        <span class="n">rows</span><span class="o">=</span><span class="p">{</span><span class="s2">"lm_head"</span><span class="p">:</span> <span class="n">PER_SEGMENT</span><span class="p">},</span>  <span class="c1"># rows that are not the step's tokens</span>
-        <span class="n">embeddings</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>                <span class="c1"># every embedding call is in the forward</span>
+        <span class="n">root_path</span><span class="o">=</span><span class="s2">"language_model"</span><span class="p">,</span>      <span class="c1"># the root's attribute path in the node submodule</span>
+        <span class="n">adapter_roots</span><span class="o">=</span><span class="p">[(</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"model."</span><span class="p">)],</span>  <span class="c1"># adapters saved on the bare LlamaModel</span>
+        <span class="n">rows</span><span class="o">=</span><span class="p">{</span><span class="s2">"lm_head"</span><span class="p">:</span> <span class="n">PER_SEGMENT</span><span class="p">},</span>    <span class="c1"># rows that are not the step's tokens</span>
+        <span class="n">embeddings</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>                  <span class="c1"># every embedding call is in the forward</span>
     <span class="p">)]</span>
 </pre></div>
 </div>
@@ -1928,12 +1928,9 @@ levels, vision stages), which is named by its path but keeps its role for <code 
 one row per segment (<code class="docutils literal notranslate"><span class="pre">PER_SEGMENT</span></code>: a head after the last-token select) or one per
 <code class="docutils literal notranslate"><span class="pre">k</span></code> folded tokens. <code class="docutils literal notranslate"><span class="pre">exclude</span></code> (with a reason): modules called outside the planned
 step, a text projection or a conditioning encoder run in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>.
-<code class="docutils literal notranslate"><span class="pre">deferred</span></code>: modules called both before the step and in it, whose delta the node adds
-itself where the step’s rows are planned (Qwen3.5 embeds a vision prompt’s text in
-<code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>): bound as <code class="docutils literal notranslate"><span class="pre">lora_deferred</span></code>, which the module’s forward never adds.
-<code class="docutils literal notranslate"><span class="pre">embeddings=True</span></code> only when every embedding call is in the step; a deferred
-embedding is served without it. <code class="docutils literal notranslate"><span class="pre">adapter_roots</span></code> / <code class="docutils literal notranslate"><span class="pre">aliases</span></code> / <code class="docutils literal notranslate"><span class="pre">adapter_stacked_params</span></code>: the prefixes,
-names and split projections adapters write, rewritten to the checkpoint’s before the
+<code class="docutils literal notranslate"><span class="pre">embeddings=True</span></code> only when every embedding call is in the step.
+<code class="docutils literal notranslate"><span class="pre">adapter_roots</span></code> / <code class="docutils literal notranslate"><span class="pre">aliases</span></code> / <code class="docutils literal notranslate"><span class="pre">adapter_stacked_params</span></code>: the prefixes, names and
+split projections adapters write, rewritten to the checkpoint’s before the
 root’s rules place them. <code class="docutils literal notranslate"><span class="pre">ignore</span></code>: modules an adapter may carry that never run.</p></li>
 <li><p><strong>Several nodes.</strong> A model whose adapters reach several nodes (an LLM and its vision
 encoder, which a TP config may put on different ranks) returns a spec per node, the
@@ -2085,9 +2082,10 @@ takes removes from rank 0 and ingests from the conductor, and a remove that race
 ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
 agreement holds the pool’s lock, so the main thread’s ingests and removes go on
 meanwhile.</p>
-<p>A node that runs sequence parallelism (SP &gt; 1) cannot serve LoRA yet: the pool lays rows
-out per request, while each SP rank holds a shard of the tokens, so building the pool
-refuses the deployment.</p>
+<p>A node that runs sequence parallelism (SP &gt; 1) or CFG parallelism (cfg_size &gt; 1) cannot
+serve LoRA yet: the pool lays rows out per request over the whole batch, while each SP rank
+holds a shard of the tokens and each CFG rank one guidance branch’s rows, so building the
+pool refuses the deployment.</p>
 </section>
 </section>
 <section id="step-3-declare-the-computation-graph">
@@ -3830,7 +3828,9 @@ LayerNorm, which autocast returns in fp32). The runner refuses an <code class="d
 buffers may round, and widens a narrower one, so a declaration wider than <code class="docutils literal notranslate"><span class="pre">embed</span></code>’s
 output replays the loop in more precision than the eager loop runs. A step whose spans
 under some label exceed the ragged resource’s <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code> takes no lease and
-runs eagerly. Qwen3-Omni’s ViT node is one too, off the scaffold: its region also returns
+runs eagerly. On a node serving LoRA adapters a leased step still declares its spans, with
+no attention step, so the engine plans the LoRA rows of the bound modules around the loop
+(<code class="docutils literal notranslate"><span class="pre">lora_rows</span></code>). Qwen3-Omni’s ViT node is one too, off the scaffold: its region also returns
 the deepstack taps (its <code class="docutils literal notranslate"><span class="pre">_capture_block_loop</span></code>), which its own <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code> reads
 off the replay.
 A tower builds on the pieces in <code class="docutils literal notranslate"><span class="pre">mstar/model/components/qwen3_vit.py</span></code>:

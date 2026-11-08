@@ -29,6 +29,7 @@ mstar.model.qwen3\_5
 
    components
    config
+   lora
    qwen3_5_model
    submodules
    video
