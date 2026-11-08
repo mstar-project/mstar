@@ -2,7 +2,7 @@
 
 What mstar reviewers ask for again and again, mined from human review comments on past PRs. Much of
 it is written down nowhere else. Section A is factoring and placement, B is style, C is everything
-else. The factoring pass (SKILL.md §4.7) and style pass (§4.10) list every check; open a pattern here
+else. The factoring pass (SKILL.md §4.6) and style pass (§4.9) list every check; open a pattern here
 for its examples when a finding needs one.
 
 Cite a miss as "factoring pattern A3", "style pattern B1" or "pattern C1". Where AGENTS.md states

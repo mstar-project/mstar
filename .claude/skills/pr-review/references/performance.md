@@ -1,6 +1,6 @@
 # Performance checklist
 
-What the performance pass (SKILL.md §4.3) looks for. Leads, not rules: AGENTS.md's "Performance
+What the performance pass (SKILL.md §4.2) looks for. Leads, not rules: AGENTS.md's "Performance
 ideas from past work" and patterns C4, C6 and C15 are further leads, and AGENTS.md invariants 6, 7
 and 10 are the citable rules.
 
@@ -23,7 +23,7 @@ scheduler tick, the data worker):
 
 ## Standard techniques first
 
-A missing one on a default path is a finding (SKILL.md §4.3 gives the priority). Name the shared
+A missing one on a default path is a finding (SKILL.md §4.2 gives the priority). Name the shared
 component that already does it (the engine's KV pool, `mstar/model/components/`, the ragged
 attention resources) when the PR rolls its own or skips it.
 
