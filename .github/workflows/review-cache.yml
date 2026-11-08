@@ -1,7 +1,7 @@
 name: Review bot cache
 
 # Fills the review bot's Eras cache volumes (ERAS_CACHE_VOLUMES) with compile caches (and, with
-# `weights`, model weights) from main, so a `/review gpu` live test on Eras starts warm. An Eras box
+# `weights`, model weights) from main, so a full review's live test on Eras starts warm. An Eras box
 # binds one volume, so the volumes are replicas, one per box: each gets a box of its own, two at a
 # time. Run by hand (it takes write access to dispatch) after models are added or main's kernels
 # change. It runs only main's code, with the volume read-write; live tests mount one read-only. See
