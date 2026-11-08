@@ -24,7 +24,6 @@ that split once per forward for a ``[B, L, H, D]`` DiT stream.
 """
 from __future__ import annotations
 
-import functools
 from typing import Callable, NamedTuple
 
 import torch
@@ -71,7 +70,7 @@ def gather_sequence(
     if world_size == 1:
         return x_shard
     dim %= x_shard.dim()  # positive: unflatten below adds a dim, which would shift a negative one
-    max_sz = functools.reduce(torch.sym_max, seq_sizes)
+    max_sz = max(seq_sizes)  # Dynamo keeps a dynamic length's max symbolic; torch.sym_max breaks a static graph
     shape = list(x_shard.shape)
     shape[dim] = max_sz
     local = x_shard.new_empty(shape)

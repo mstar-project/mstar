@@ -13,6 +13,8 @@ Wan2.2 DiT under Ulysses against the same DiT on one rank.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -179,6 +181,16 @@ def _compiled_packs(rank, world):
 @pytest.mark.parametrize("world", [2, 3])
 def test_compiled_sequence_parallel_stack_takes_new_pack_lengths_without_recompiling(tmp_path, world):
     _run(_compiled_packs, world, tmp_path / "store")
+
+
+def test_a_static_compile_gathers_the_sequence_in_one_graph():
+    """Wan2.2 compiles its dit with ``dynamic=False``, so the shares are plain ints there:
+    the output gather must not break the graph (``torch.sym_max`` on ints does)."""
+    group = SimpleNamespace(world_size=2, all_gather=lambda x, dim: torch.cat([x, x], dim=dim))
+    sizes = sp_seq_split(9, 2)
+    shard = torch.arange(sizes[0] * 3, dtype=torch.float32).view(sizes[0], 3)
+    gather = torch.compile(gather_sequence, fullgraph=True, dynamic=False, backend="eager")
+    torch.testing.assert_close(gather(group, shard, sizes), torch.cat([shard, shard[: sizes[1]]]))
 
 
 def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
