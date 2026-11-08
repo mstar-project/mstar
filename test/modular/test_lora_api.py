@@ -447,7 +447,7 @@ def _finish_when_read(worker):
     loads = worker.ingest.lora_loads
     if loads:
         wait([f for load in loads._loads for _, f in load.reads], timeout=30)
-        loads.finish()
+        worker.ingest.process_messages()  # the main loop's pass, which acks what was read
 
 
 class _Deployment:
@@ -469,7 +469,7 @@ class _Deployment:
             self.workers[worker_id] = make_worker(
                 worker_id=worker_id,
                 engine_manager=SimpleNamespace(engine=make_engine(_resources={"lora": pool})),
-                communicator=SimpleNamespace(send=self._from_worker),
+                communicator=SimpleNamespace(send=self._from_worker, get_all_new_messages=list),
             )
 
     def _to_conductor(self, message: ConductorMessage):

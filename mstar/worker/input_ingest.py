@@ -1,7 +1,8 @@
 """Everything inbound: the message dispatch, input reads, ready tensors and
-stream polls. Holds no state of its own: lifecycle messages are recorded on
-``RequestLifecycle`` for the worker to apply at its next teardown point,
-TP-follow messages go to ``Lockstep``, and runtime LoRA loads to ``LoraLoads``."""
+stream polls. Holds no state of its own beside ``LoraLoads``, the runtime LoRA
+loads in flight, which it builds and finishes after each message pass: lifecycle
+messages are recorded on ``RequestLifecycle`` for the worker to apply at its next
+teardown point, and TP-follow messages go to ``Lockstep``."""
 from __future__ import annotations
 
 import logging
