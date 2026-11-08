@@ -300,7 +300,7 @@ class TestSlurm(unittest.TestCase):
 
 
 class TestEras(unittest.TestCase):
-    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview"):
+    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", dry_run=False):
         """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview (or the
         create, `refused_by`) refuses those `held` (as the spec has it), as when another box took them in
         between; the calls it made."""
@@ -342,7 +342,7 @@ class TestEras(unittest.TestCase):
         cfg = {"ssh_public_key": str(key), "eras": {"cache_volume_ids": ["v1", "v2"]},
                "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": max_running}}
         args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=None, input=[], cache="ro",
-                                  cache_write=write, allow_over_budget=False, dry_run=False)
+                                  cache_write=write, allow_over_budget=False, dry_run=dry_run)
         with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()), \
                 unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}), contextlib.redirect_stderr(io.StringIO()):
             try:
@@ -360,6 +360,18 @@ class TestEras(unittest.TestCase):
             self.assertEqual([[v["volume_id"] for k, v in b["run"]["bindings"]["volumes"].items() if k == "cache"]
                               for b in created], [bound],
                              "a live test would give up on Eras rather than take the next free volume or start cold")
+
+    def test_a_box_makes_sshd_host_keys_before_starting_it(self):
+        created = next(c[2] for c in self.eras_launch(held=()) if c[:2] == ("POST", "/instances"))
+        script = created["run"]["pod"]["containers"][0]["args"][0]
+        self.assertIn("ssh-keygen -A\n", script.split("sshd -D")[0],
+                      "sshd would exit with no host keys, and the Pod with it, about 49 s after every launch")
+
+    def test_a_dry_run_writes_nothing_to_eras(self):
+        self.assertEqual([c[:2] for c in self.eras_launch(dry_run=True) if c[0] != "GET"], [],
+                         "a dry run would register the ssh key with the organization")
+        self.assertIn(("POST", "/ssh-keys"), [c[:2] for c in self.eras_launch(held=())],
+                      "a real launch would have no key to sign in with")
 
     def test_each_launch_attempt_has_its_own_idempotency_key(self):
         keys = [c[2]["idempotency_key"] for c in self.eras_launch(held=["v1", "v2"], refused_by="create")

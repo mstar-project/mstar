@@ -369,7 +369,8 @@ class Provider:
         raise NotImplementedError
 
     def plan(self, o: dict, name: str, pubkey: str, hours: float, args) -> tuple[dict | str, object]:
-        """(the request a dry run prints, the call that sends it and returns the instance id, once)."""
+        """(the request a dry run prints, the call that sends it and returns the instance id, once). Writes
+        nothing on a dry run."""
         raise NotImplementedError
 
     def stage(self, name: str, args) -> None:
@@ -606,7 +607,8 @@ class Eras(Provider):
         # tried in turn: each free cache volume, then none (cold); a refresh only its own
         free = eras_cache_volumes(self.cfg, args.cache, args.cache_write)
         candidates = free if args.cache_write else [*free, None]
-        body_for = functools.partial(eras_launch_body, self.cfg, o, name, pubkey, hours, args.run, args.input,
+        key_id = "<registered at launch>" if args.dry_run else eras_ssh_key_id(pubkey, name)
+        body_for = functools.partial(eras_launch_body, self.cfg, o, name, key_id, hours, args.run, args.input,
                                      rw=bool(args.cache_write))
         first = body_for(candidates[0])
 
@@ -905,7 +907,7 @@ def cmd_launch(args, cfg):
 
     # The caps are checked and the launch recorded under one lock, so parallel sessions can't each
     # pass the check and launch together; and the body is built after the caps, since building an
-    # Eras one registers an ssh key. A dry run checks nothing and records nothing.
+    # Eras one registers an ssh key. A dry run checks nothing, records nothing and writes nothing.
     pending, lost = f"pending:{name}", None
     with contextlib.nullcontext({}) if args.dry_run else ledger_txn() as d:
         if not args.dry_run:
@@ -993,7 +995,7 @@ def eras_ssh_key_id(pubkey: str, name: str) -> str:
     return eras("POST", "/ssh-keys", {"name": name, "public_key": pubkey})["id"]
 
 
-def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float, run: str | None = None,
+def eras_launch_body(cfg: dict, o: dict, name: str, ssh_key_id: str, hours: float, run: str | None = None,
                      inputs: list[str] = (), volume: str | None = None, rw: bool = False) -> dict:
     """The GPU notebook template's container and image, with sshd as root, every GPU of the
     listing and a big /dev/shm. Kubernetes stops the Pod at the deadline and never restarts
@@ -1011,7 +1013,8 @@ def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float, r
     box["ports"] = [p for p in box.get("ports") or [] if p.get("name") == "ssh"]
     box["env"] = [v for v in box.get("env") or [] if not v["name"].startswith("ERAS_JUPYTER")]
     sshd = "/usr/sbin/sshd -D -e -o StrictModes=no -o 'AuthorizedKeysFile /etc/ssh/keys/authorized_keys'"
-    box["args"] = ["set -e\ninstall -d -m 0700 /root/.ssh /run/sshd\n"
+    # These args replace the template's, and with them its entrypoint, which makes sshd's host keys.
+    box["args"] = ["set -e\ninstall -d -m 0700 /root/.ssh /run/sshd\nssh-keygen -A\n"
                    + (f"{sshd} &\nexec bash /run/live-pr/{Path(run).name}\n" if run else f"exec {sshd}\n")]
     pod["restartPolicy"] = "Never"
     pod["activeDeadlineSeconds"] = int(hours * 3600)
@@ -1036,7 +1039,7 @@ def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float, r
     return {
         "listing_id": o["id"].split(":", 1)[1], "name": name,
         "run": {"pod": pod, "endpoints": {"ssh": tpl["endpoints"]["ssh"]}, "config_maps": config_maps,
-                "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [eras_ssh_key_id(pubkey, name)]},
+                "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [ssh_key_id]},
                                          **({"live-pr-key": {"secret_id": er["run_secret_id"]}}
                                             if run and er.get("run_secret_id") else {})},
                              "volumes": {"workspace": "emptyDir", **claims}},
