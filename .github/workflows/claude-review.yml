@@ -815,18 +815,21 @@ jobs:
 
       # `none` and `targeted` build on the last live test: only when it passed, on a commit
       # that is an ancestor of this head. Otherwise the live test runs in full. A `none` that
-      # holds carries that pass.
+      # holds carries that pass; a `targeted` one is told that commit and given that report.
       - name: Check the last live test
         if: steps.cfg.outputs.run != 'full' && steps.cfg.outputs.trusted == 'true'
         id: carry
         env:
           RUN: ${{ steps.cfg.outputs.run }}
         run: |
-          # Only the first line of the bot's live-test comments: the report below it is the box's text.
-          marker=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
+          # The marker is only the first line of the bot's live-test comments: the report below it
+          # is the box's text, which goes to a targeted run as data.
+          gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[] |
               select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
-                (.body | startswith("<!-- claude-live-test sha="))) | .body | split("\n")[0]' \
-            | grep -x '<!-- claude-live-test sha=[0-9a-f]* verdict=[a-z]* -->' | tail -n 1)
+                (.body | startswith("<!-- claude-live-test sha="))) | {marker: (.body | split("\n")[0]), body}' \
+            | jq -s '[.[] | select(.marker | test("^<!-- claude-live-test sha=[0-9a-f]{40} verdict=[a-z]+ -->$"))] | last // {}' \
+            > earlier.json
+          marker=$(jq -r '.marker // empty' earlier.json)
           sha=$(sed -E 's/.*sha=([0-9a-f]*).*/\1/' <<< "$marker"); verdict=$(sed -E 's/.*verdict=([a-z]*).*/\1/' <<< "$marker")
           status=$( [ -n "$sha" ] && gh api "repos/$REPO/compare/$sha...$HEAD_SHA" --jq .status 2> /dev/null || true )
           if [ "$verdict" != "pass" ] || { [ "$status" != "ahead" ] && [ "$status" != "identical" ]; }; then
@@ -838,6 +841,8 @@ jobs:
             echo "note=No GPU run: nothing since the passing live test of \`${sha:0:7}\` reaches code it exercised." >> "$GITHUB_OUTPUT"
           else
             echo "run=targeted" >> "$GITHUB_OUTPUT"
+            echo "since=$sha" >> "$GITHUB_OUTPUT"
+            jq -r .body earlier.json > earlier-live-test.md
           fi
 
       - name: Get GPUs and start the live test
@@ -851,12 +856,13 @@ jobs:
           LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
           RUN: ${{ steps.carry.outputs.run || steps.cfg.outputs.run }}
+          SINCE: ${{ steps.carry.outputs.since }}
         run: |
           set +e
           python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
             --base "$BASE" \
             --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
-            --run "$RUN" \
+            --run "$RUN" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
             --max-runs "${{ vars.REVIEW_GPU_MAX_RUNS || '2' }}" \
             --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
           code=$?
