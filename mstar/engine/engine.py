@@ -42,9 +42,8 @@ from mstar.engine.resources import (
     StepRunner,
     SubmoduleStep,
 )
-from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, StepAllowance, build_resource
 from mstar.engine.resources.kv.config import instance_size, opening_prefix_caches, unrestorable
-from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.lora.config import LoraBaseOnly, node_capture_key

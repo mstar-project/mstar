@@ -20,6 +20,7 @@ from mstar.engine.resources.base import (
     PublishedInfo,
     Rebuild,
     Residency,
+    StepAllowance,
 )
 from mstar.engine.resources.kv.arena import PageArena, StreamPages, columns_from_raw, new_page_arena, plan_columns
 from mstar.engine.resources.kv.cache import GroupPages, KVCache, held_pages, on_pages
@@ -36,7 +37,7 @@ from mstar.engine.resources.kv.config import (
     StreamLayout,
 )
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool, PageCopies
-from mstar.engine.resources.kv.host_writes import HostWrites, StepAllowance
+from mstar.engine.resources.kv.host_writes import HostWrites
 from mstar.engine.resources.kv.keys import PageItem, chain, fingerprint, page_items, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -536,7 +537,7 @@ class KVManager(AttentionResource):
         host_allowance: StepAllowance | None = None,
     ):
         self.config = cfg
-        self._host_allowance = StepAllowance() if host_allowance is None else host_allowance
+        self._host_allowance = host_allowance
         if len(cfg.groups) > 1 and needs_remote_transfer:
             raise ValueError(
                 f"KV {name}: a node on another instance reads this pool (replicas, or walks "
@@ -849,6 +850,7 @@ class KVManager(AttentionResource):
             self._open_host_writes()
 
     def _open_host_writes(self) -> None:
+        assert self._host_allowance is not None, f"KV {self.name}: copies to the host spend the engine's StepAllowance"
         self._host_writes = HostWrites(
             self._cpu_pool, self._index, self.kv_cache.tensor[:, 0].nbytes, self._host_allowance,
         )

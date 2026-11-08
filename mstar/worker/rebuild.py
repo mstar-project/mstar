@@ -16,9 +16,8 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.resources import Rebuild
+from mstar.engine.resources import Rebuild, StepAllowance
 from mstar.engine.resources.kv.config import SpanKind, StreamLayout, rebuild_refusal
-from mstar.engine.resources.kv.host_writes import StepAllowance
 from mstar.graph.base import GraphSection
 from mstar.model.rebuild import RebuildPolicy
 from mstar.utils.h2d import to_device_nonblocking
@@ -190,7 +189,10 @@ class Rebuilds:
         self._droppable: dict[str, dict[int, LogRoom]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
-        self._allowance = StepAllowance() if allowance is None else allowance
+        assert allowance is not None or not any(names for walks in self._copied.values() for names in walks.values()), (
+            "host copies spend the engine's StepAllowance"
+        )
+        self._allowance = allowance
         # the copies to the host not yet started, oldest first
         self._queued: deque[QueuedCopy] = deque()
         # nodes that have logged a request the pool couldn't hold
@@ -400,6 +402,8 @@ class Rebuilds:
     def flush_idle(self) -> None:
         """`flush` with a step's allowance on a pass of the worker's loop that runs no step. A drop waits for the
         queued copies, so with every request waiting, no step would ever start them."""
+        if not self._queued:
+            return
         self._allowance.refill()
         self.flush()
 

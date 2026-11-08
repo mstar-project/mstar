@@ -874,7 +874,7 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     from test_worker_rebuild import NODE, R, _worker
 
     from mstar.communication.tensors import LocalTransferEngine
-    from mstar.engine.resources import StepContext
+    from mstar.engine.resources import StepAllowance, StepContext
     from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
     from mstar.engine.resources.kv.manager import KVManager
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -939,7 +939,7 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     w, eng = _worker()
     w._rebuilds = Rebuilds(
         model.rebuild_policies(), model.get_graph_walk_graphs(), HostPool(1 << 20, torch.device("cpu")),
-        node_dtypes={NODE: torch.float32},
+        StepAllowance(), {NODE: torch.float32},
     )
     writes = {"kv": {NODE: NodeWrites(frozenset({step.walk, "decode"}), frozenset({"decode_loop"}))}}
     assert w._rebuilds.ingest_request(R, writes, {"kv": config.kv_layout.values()}, unpausable=False)["kv"], (

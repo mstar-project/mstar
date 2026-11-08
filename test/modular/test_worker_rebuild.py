@@ -23,7 +23,7 @@ from test_kv_prefix_lease import _StubTransfer
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AllocationFailed, Residency, StepContext
+from mstar.engine.resources import AllocationFailed, Residency, StepAllowance, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
 from mstar.model.rebuild import RebuildPolicy
@@ -188,7 +188,7 @@ def test_postprocess_keeps_a_host_copy_of_what_a_prefill_row_read_besides_its_id
     w._rebuilds._policies = {node: replace(POLICY, walks=frozenset({walk}))}
     w._rebuilds._copied = {node: {walk: frozenset({"embeds"})}}
     w._rebuilds._kept = {node: {1: replace(_kept(), walk=walk, copies=HostCopies())}}
-    w._rebuilds._pool = pool = HostPool(1 << 10, torch.device("cpu"))
+    w._rebuilds._pool, w._rebuilds._allowance = (pool := HostPool(1 << 10, torch.device("cpu"))), StepAllowance()
     w._rebuilds._droppable = {node: {1: LogRoom(pool.take(64), 0, 0)}}
     embeds = {rid: torch.full((2,), rid) for rid in (R, 1, 2)}
     batch = _step((R, 1, 2), walk, node, per_request_input_tensors={

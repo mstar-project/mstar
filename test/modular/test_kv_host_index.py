@@ -10,6 +10,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources import StepAllowance
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
@@ -89,6 +90,7 @@ def _manager(max_num_pages: int = 128, host_pages: int = 64) -> KVManager:
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
+        host_allowance=StepAllowance(),
     )
     kv.enable_prefix_cache(ROOT)
     kv._cpu_pool = _HostPool(host_pages)
