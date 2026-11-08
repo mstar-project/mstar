@@ -1765,6 +1765,17 @@ step, correct but no faster. For throughput under concurrency,
 at 4 concurrent vs 4.7 CFG-parallel (whose rank 1 idles through rank 0's VAE
 decode; measured on that earlier version), while one request takes the 1-GPU time.
 
+**Four GPUs.** ``configs/wan22_cfg2_sp2_4gpu.yaml`` also splits each branch's
+tokens over a pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's
+self-attention) to cut one request's latency. Split the guidance branches
+first (``cfg_size: 2``), then add ``sp_size`` on top: on two GPUs,
+``sp_size: 2`` alone is slower than ``cfg_size: 2``.
+``sp_size`` must divide the dit's 24 attention heads. Under concurrency, data
+parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
+replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
+against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
+H100s.
+
 LTX-2.5 (``ltx2_5``)
 --------------------
 
