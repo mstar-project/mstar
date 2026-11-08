@@ -100,6 +100,9 @@ class TestReviewSummary(unittest.TestCase):
         text = render(r, threads(thread("P1", comment_id=7)), "0123456789", "light", [13])
         self.assertIn("🔴 **2 P1**", text, "a fix in a PR whose diff the review never had would stop blocking")
         self.assertEqual(text.count("Said to be fixed in #12, not checked."), 2)
+        r["outside_diff"][0]["detail"] = "d Said to be fixed in #12, not checked."
+        text = render(r, threads(thread("P1", comment_id=7)), "0123456789", "light", [13])
+        self.assertEqual(text.count("Said to be fixed in #12, not checked."), 2, "each run would repeat the note")
 
     def test_a_latent_bug_on_main_is_reported_but_doesnt_block(self):
         r = review()
