@@ -280,7 +280,7 @@ merge's.
    * - Higgs Audio (``LLM``)
      - ``qkv_proj``, ``o_proj``, ``gate_up_proj``, ``down_proj``, ``lm_head`` (the
        checkpoint's ``audio_decoder_proj.text_lm_head``)
-     - No embedding target: text prefill embeds before the step.
+     - No embedding target.
    * - Qwen3-Omni (``Thinker``), *not validated*
      - ``qkv_proj``, ``o_proj``, dense-layer ``gate_up_proj`` / ``down_proj``, ``lm_head``
      - Attention only on MoE layers: an adapter on the routed experts or the router is
