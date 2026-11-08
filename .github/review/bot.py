@@ -71,9 +71,12 @@ EJECTIONS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Str
 # The monitor's state in the status issue's body (signals already reported), base64 JSON.
 MONITOR = re.compile(r"<!-- review-monitor-state ([A-Za-z0-9+/=]+) -->")
 MONITOR_DAYS = 60
+ISSUE_COMMENTS = 2_000  # a bot issue past this rolls over to a new one; GitHub stops an issue at 2,500
 # How a PR's body says it fixes or reverts another, and the subjects `szz` treats as fixes.
 FIXES = re.compile(r"\b(?:fix(?:e[sd])?|revert(?:s|ed)?)\s+#(\d+)\b", re.IGNORECASE)
-FIX_SUBJECT = re.compile(r"\b(?:fix|bug|revert)", re.IGNORECASE)
+# A fix-word that isn't straight away about a typo, a comment, docs or lint.
+FIX_SUBJECT = re.compile(r"\b(?:fix(?:e[sd])?|bug(?:fix)?|revert(?:s|ed)?)\b"
+                         r"(?!:?\s+(?:a\s+|the\s+)?(?:typos?|comments?|docs?|lint|format\w*)\b)", re.IGNORECASE)
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
 # The weekly improvement run: how much a reader needs (PRs read, and comments kept per PR; characters of a
@@ -146,7 +149,7 @@ def marked(comments, marker):
 
 
 def oneline(commits):
-    """since-commits.txt: one line per commit, merges marked."""
+    """since-commits.txt and since-live-test-commits.txt: one line per commit, merges marked."""
     lines = []
     for c in commits:
         merge = "[merge] " if len(c["parents"]) > 1 else ""
@@ -188,7 +191,8 @@ def utcnow():
 
 def issues(repo, kind):
     """The bot's own issues of `kind`, lowest number first: those a bot login created whose body starts
-    with the kind's marker. Created in a race, two can exist; readers take them all, writers the lowest."""
+    with the kind's marker. Created in a race, or rolled over when one is full, several can exist; readers
+    take them all, writers the lowest with room (`issue`)."""
     found = {}
     for login in BOT_USERS:
         creator = login.replace("[", "%5B").replace("]", "%5D")
@@ -200,10 +204,11 @@ def issues(repo, kind):
 
 
 def issue(repo, kind):
-    """The number of the bot's issue of `kind`, created if there is none."""
-    found = issues(repo, kind)
-    if found:
-        return found[0]["number"]
+    """The number of the bot's issue of `kind` to write to: the lowest with room for more comments, created if
+    there is none."""
+    for i in issues(repo, kind):
+        if i.get("comments", 0) < ISSUE_COMMENTS:
+            return i["number"]
     title, text = ISSUES[kind]
     body = json.dumps({"title": title, "body": f"{issue_marker(kind)}\n{text}\n"})
     return json.loads(gh("api", "-X", "POST", f"repos/{repo}/issues", "--input", "-", input=body).stdout)["number"]
@@ -215,8 +220,8 @@ def comment_on_issue(repo, number, body):
 
 
 def ledger(repo, since):
-    """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments, each run and
-    attempt once, from every ledger issue. A failed read raises."""
+    """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments, each run once
+    (re-running its spend job records the same costs again), from every ledger issue. A failed read raises."""
     records, seen = [], set()
     for i in issues(repo, "ledger"):
         for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
@@ -227,9 +232,8 @@ def ledger(repo, since):
                 record = json.loads(base64.b64decode(m[1]))
             except ValueError:
                 continue
-            key = (record.get("run"), record.get("attempt"))
-            if key not in seen:
-                seen.add(key)
+            if record.get("run") not in seen:
+                seen.add(record.get("run"))
                 records.append((c["created_at"], record))
     return records
 
@@ -239,10 +243,16 @@ def spend(repo, now):
     day, month = now.strftime("%Y-%m-%d"), now.strftime("%Y-%m")
     used = {"day": 0, "month": 0}
     for created, record in ledger(repo, f"{month}-01T00:00:00Z"):
-        usd = record.get("usd") if isinstance(record.get("usd"), (int, float)) else 0
+        usd = finite_usd(record)
         used["month"] += usd if created.startswith(month) else 0
         used["day"] += usd if created.startswith(day) else 0
     return used
+
+
+def finite_usd(record):
+    """A record's USD, or 0 when it isn't a finite, non-negative number."""
+    usd = record.get("usd")
+    return usd if isinstance(usd, (int, float)) and not isinstance(usd, bool) and 0 <= usd < float("inf") else 0
 
 
 def over_cap(repo):
@@ -499,27 +509,35 @@ def diff_files(diff):
 
 
 def changes(hunk):
-    """What a hunk changes: its runs of added and removed lines, without the context or the line numbers
-    around them, which a rebase shifts."""
-    runs, run = [], []
+    """What a hunk changes: its runs of added and removed lines, each with the function on its `@@` line
+    and the context line on either side, so a change moved elsewhere in a file counts. The line numbers
+    stay out: a rebase shifts them."""
+    section, runs, run, above = hunk[0].split("@@", 2)[-1], [], [], ""
     for line in hunk[1:]:
         if line.startswith(("+", "-", "\\")):
             run.append(line)
-        elif run:
-            runs.append(tuple(run))
-            run = []
-    return runs + [tuple(run)] if run else runs
+        else:
+            if run:
+                runs.append((section, above, tuple(run), line))
+                run = []
+            above = line
+    return runs + [(section, above, tuple(run), "")] if run else runs
 
 
-def interdiff(old, new):
-    """The hunks of `new`, a PR's diff, that make a change `old`, its diff at the last review, doesn't:
-    after a rebase, only the PR's own changes that differ, whatever moved around them. A file with no
-    hunks (binary, a mode change, a pure rename) counts when its header changed, its blob ids aside."""
-    before = diff_files(old)
+def header_change(head, hunks):
+    """What a file's diff header says the PR changes: its mode lines and, for a file with no hunks (binary,
+    a pure rename), its other lines and new blob. Not the old blob, which a rebase moves."""
+    if hunks:
+        return [x for x in head if x.startswith(("old mode", "new mode", "new file mode", "deleted file mode"))]
+    return [x.split("..")[-1] if x.startswith("index ") else x for x in head]
+
+
+def not_in(files, others):
+    """The lines of the files and hunks of `files` (diff_files) whose changes `others` doesn't make."""
     parts = []
-    for header, (head, hunks) in diff_files(new).items():
-        old_head, old_hunks = before.get(header, ([], []))
-        made = collections.Counter(run for h in old_hunks for run in changes(h))
+    for header, (head, hunks) in files.items():
+        other_head, other_hunks = others.get(header, ([], []))
+        made = collections.Counter(run for h in other_hunks for run in changes(h))
         kept = []
         for h in hunks:
             runs = collections.Counter(changes(h))
@@ -527,10 +545,21 @@ def interdiff(old, new):
                 kept.append(h)
             else:
                 made -= runs
-        if kept or not hunks and [x for x in head if not x.startswith("index ")] != \
-                [x for x in old_head if not x.startswith("index ")]:
+        if kept or header_change(head, hunks) != header_change(other_head, other_hunks):
             parts += head + [line for h in kept for line in h]
-    return "".join(parts)
+    return parts
+
+
+DROPPED = "=== dropped since the last review: these were in the PR then, and aren't now ===\n"
+
+
+def interdiff(old, new):
+    """What differs between `old`, a PR's diff at the last review, and `new`, its diff now: the hunks of
+    `new` that make a change `old` doesn't and, after DROPPED, the hunks and files of `old` that `new` no
+    longer has. Empty means the PR's own changes are the same, whatever a rebase moved around them."""
+    before, after = diff_files(old), diff_files(new)
+    dropped = not_in(before, after)
+    return "".join(not_in(after, before) + ([DROPPED] + dropped if dropped else []))
 
 
 def discussion(repo, pr):
@@ -585,8 +614,9 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
 
     # A re-review starts from this bot's last summary and reviews only what changed since
     # (review-prompt.md, "Re-review"): the commits since, when that commit is still an ancestor of the
-    # head (since.diff, since-commits.txt), and after a force-push or rebase the interdiff, the PR's own
-    # hunks whose changes differ from its diff then (interdiff.diff). read_state says when it reviews the
+    # head and none of them is a merge (since.diff, since-commits.txt), and otherwise the interdiff, the
+    # PR's own hunks whose changes differ from its diff then and what it dropped (interdiff.diff), so a
+    # merge of main or a force-push isn't read as the author's change. read_state says when it reviews the
     # whole PR again instead. The state is read only from the bot's own summaries: comments that start
     # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
     # (too large, say) means a full review, never an empty since.diff.
@@ -600,16 +630,19 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
             status = api(since)["status"] if last else ""
         except (RuntimeError, ValueError, KeyError, TypeError):
             status = ""
-        r = None
+        listing = None  # since-commits.txt, when the range can be read as the author's commits alone
         if last and (status == "ahead" or last == head_sha):
+            try:
+                commits = [c for page in api(since, "--paginate", "--slurp") for c in page["commits"]]
+                listing = None if any(len(c["parents"]) > 1 for c in commits) else oneline(commits)
+            except (RuntimeError, ValueError, KeyError, TypeError):
+                listing = None
+        r = None
+        if listing is not None:
             r = gh("api", "-H", "Accept: application/vnd.github.diff", since, check=False)
             if r.returncode == 0:
                 write("since.diff", r.stdout)
-                try:
-                    write("since-commits.txt", oneline(c for page in api(since, "--paginate", "--slurp")
-                                                       for c in page["commits"]))
-                except (RuntimeError, ValueError, KeyError):
-                    write("since-commits.txt", "")
+                write("since-commits.txt", listing)
         elif last:
             # The PR's diff at that commit: from where it forked from the base branch.
             r = gh("api", "-H", "Accept: application/vnd.github.diff",
@@ -882,8 +915,14 @@ def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="
              "attempt": github_run_attempt, "usage": review, "gpu_usd": gpu, "box_usd": box, "approval": approval,
              "usd": usd}
     b64 = base64.b64encode(json.dumps(entry).encode()).decode()
-    what = f"PR #{pr}" if pr else "Weekly improvement run"
-    comment_on_issue(repo, issue(repo, "ledger"), f"{what}: ${usd:,.2f}.\n<!-- review-spend {b64} -->\n")
+    what = f"PR `#{pr}`" if pr else "Weekly improvement run"
+    try:
+        comment_on_issue(repo, issue(repo, "ledger"), f"{what}: ${usd:,.2f}.\n<!-- review-spend {b64} -->\n")
+    except (RuntimeError, ValueError, KeyError, TypeError) as e:
+        alert(repo, f"ledger-{github_run_id}-{github_run_attempt}",
+              f"Run {github_run_id}'s spend (${usd:,.2f}) didn't reach the ledger, so the caps don't count it: "
+              f"{safe(e)}")
+        raise
 
 
 # ---------------------------------------------------------------- monitor (a daily job; no model)
@@ -913,21 +952,26 @@ def reverted(commits, shas, number, merge):
     return [c for c in after_merge(commits, merge) if names_a_commit(c) or subject.match(c["subject"])]
 
 
-def referenced(timeline, number):
-    """(signals, mentions) from the PR's cross-references: an issue labeled `bug`, a `type/bug` PR or one whose
-    body says it fixes or reverts this PR is a signal, any other reference a mention."""
+def referenced(timeline, number, repo):
+    """(signals, mentions) from the PR's cross-references: an issue labeled `bug`, a `type/bug` PR or one that
+    says it fixes or reverts this PR, merged or by someone with write access, is a signal; any other reference a
+    mention, the bot's own issues aside."""
     signals, mentions = [], []
     for event in timeline:
         if event.get("event") != "cross-referenced":
             continue
         source = (event.get("source") or {}).get("issue") or {}
+        if (source.get("user") or {}).get("login") in BOT_USERS:
+            continue
         ref, labels = source.get("number"), {x.get("name") for x in source.get("labels") or []}
-        claims = number in map(int, FIXES.findall(source.get("body") or ""))
         is_pr = "pull_request" in source
+        claims = is_pr and number in map(int, FIXES.findall(source.get("body") or "")) and bool(
+            (source.get("pull_request") or {}).get("merged_at")
+            or permission(repo, (source.get("user") or {}).get("login")) in WRITE)
         if (is_pr and (claims or "type/bug" in labels)) or (not is_pr and "bug" in labels):
             how = "fixes or reverts" if claims else "reports a bug in"
             signals.append({"key": f"{number}:ref:{ref}",
-                            "text": f"#{ref} ({safe(source.get('title'))}) {how} #{number}"})
+                            "text": f"`#{ref}` ({safe(source.get('title'))}) {how} `#{number}`"})
         else:
             mentions.append(f"#{ref}")
     return signals, mentions
@@ -938,10 +982,10 @@ def safe(text):
     return redact(" ".join(str(text or "").split())).replace("@", "@\u200b").replace("<!--", "&lt;!--")
 
 
-def szz(commits, shas, number, files, bug_prs=()):
+def szz(commits, shas, number, files, bug_prs=(), since=""):
     """Signals for the fixes on main that changed lines PR `number` wrote (`shas` are its commits and merge,
-    `files` the files it touched): `git blame` of each fix's parent on the lines it removed or changed.
-    A hit means the fix touched those lines, not that the PR broke them."""
+    `files` the files it touched): `git blame` of each fix's parent, back to `since`, on the lines it removed
+    or changed. A hit means the fix touched those lines, not that the PR broke them."""
     hits = []
     for c in commits:
         match = re.search(r"\(#(\d+)\)\s*$|Merge pull request #(\d+)", c["subject"])
@@ -955,14 +999,14 @@ def szz(commits, shas, number, files, bug_prs=()):
             hunk = re.match(r"@@ -(\d+)(?:,(\d+))? \+", line) if path in files else None
             if not hunk or not int(hunk[2] or 1):
                 continue
-            blame = run(["git", "blame", "-l", "-s", "-L", f"{hunk[1]},+{hunk[2] or 1}", f"{c['sha']}^", "--", path],
-                        check=False).stdout
+            blame = run(["git", "blame", "-l", "-s", *([f"--since={since}"] if since else []), "-L",
+                         f"{hunk[1]},+{hunk[2] or 1}", f"{c['sha']}^", "--", path], check=False).stdout
             for offset, row in enumerate(blame.splitlines()):
                 if row.lstrip("^").split(" ")[0] in shas:
-                    name = f"#{fix_pr}" if fix_pr else f"`{c['sha'][:10]}`"
+                    name = f"`#{fix_pr}`" if fix_pr else f"`{c['sha'][:10]}`"
                     at = int(hunk[1]) + offset
                     hits.append({"key": f"{number}:szz:{c['sha'][:10]}:{path}:{at}",
-                                 "text": f"{name} changed lines #{number} wrote at `{path}:{at}`"})
+                                 "text": f"{name} changed lines `#{number}` wrote at `{path}:{at}`"})
                     break
     return hits
 
@@ -978,23 +1022,23 @@ def ci_regressions(repo, number, merge, parent):
     except (RuntimeError, ValueError, KeyError, TypeError):
         return []
     return [{"key": f"{number}:ci:{name}",
-             "text": f"#{number}: check `{safe(name)}` failed on `{merge[:10]}`, its parent passed"}
+             "text": f"`#{number}`: check `{safe(name)}` failed on `{merge[:10]}`, its parent passed"}
             for name, c in after.items() if c in ("failure", "timed_out") and before.get(name) == "success"]
 
 
-def pr_signals(repo, pull, commits, bug_prs):
+def pr_signals(repo, pull, commits, bug_prs, window=""):
     """Everything known about what happened to a PR the bot approved: (signals, mentions), each signal
     {key, text} (key stable across days)."""
     number, merge = pull["number"], pull.get("merge_commit_sha")
     timeline = api_list(f"repos/{repo}/issues/{number}/timeline?per_page=100")
-    signals, mentions = referenced(timeline, number)
+    signals, mentions = referenced(timeline, number, repo)
     if pull.get("merged_at") and merge:
         shas = {merge} | {c["sha"] for c in api_list(f"repos/{repo}/pulls/{number}/commits?per_page=100")}
         signals += [{"key": f"{number}:reverted:{c['sha'][:10]}",
-                     "text": f"#{number} reverted by `{c['sha'][:10]}` ({safe(c['subject'])})"}
+                     "text": f"`#{number}` reverted by `{c['sha'][:10]}` ({safe(c['subject'])})"}
                     for c in reverted(commits, shas, number, merge)]
         files = set(run(["git", "diff", "--name-only", f"{merge}^", merge], check=False).stdout.split())
-        signals += szz(after_merge(commits, merge), shas, number, files, bug_prs)
+        signals += szz(after_merge(commits, merge), shas, number, files, bug_prs, window)
         parents = next((c["parents"].split() for c in commits if c["sha"] == merge), [])
         if parents:
             signals += ci_regressions(repo, number, merge, parents[0])
@@ -1002,7 +1046,7 @@ def pr_signals(repo, pull, commits, bug_prs):
         for page in graphql(EJECTIONS, repo, number):
             for e in page["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]:
                 signals.append({"key": f"{number}:ejected:{e['createdAt']}",
-                                "text": f"#{number} removed from the merge queue ({safe(e.get('reason'))})"})
+                                "text": f"`#{number}` removed from the merge queue ({safe(e.get('reason'))})"})
     return signals, mentions
 
 
@@ -1028,19 +1072,24 @@ def monitor(out, repo, approvals=""):
                if (i.get("pull_request") or {}).get("merged_at")}
     rows, signals, linked = [], [], set()
     for pr in approved:
-        pull = api(f"repos/{repo}/pulls/{pr}")
-        reviews = api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
-        stood = any(r.get("state") == "APPROVED" and (r.get("user") or {}).get("login") in BOT_USERS for r in reviews)
-        if not stood or not (pull.get("merged_at") or pull.get("state") == "open"):
+        try:
+            pull = api(f"repos/{repo}/pulls/{pr}")
+            reviews = api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
+            stood = any(r.get("state") == "APPROVED" and (r.get("user") or {}).get("login") in BOT_USERS
+                        for r in reviews)
+            if not stood or not (pull.get("merged_at") or pull.get("state") == "open"):
+                continue
+            found, mentions = pr_signals(repo, {**pull, "number": pr}, commits, bug_prs, window)
+        except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
+            rows.append(f"| `#{pr}` | ? | couldn't read: {safe(e).replace('|', '/')} |")
             continue
-        found, mentions = pr_signals(repo, {**pull, "number": pr}, commits, bug_prs)
         signals += found
         linked |= {s["key"].split(":")[-1] for s in found if ":ref:" in s["key"]} | {m.lstrip("#") for m in mentions}
         cell = "; ".join(s["text"] for s in found) or "none"
         if mentions:
-            cell += f" (also mentioned in {', '.join(mentions)})"
+            cell += " (also mentioned in " + ", ".join(f"`{m}`" for m in mentions) + ")"
         merged = "merged" if pull.get("merged_at") else "open"
-        rows.append(f"| #{pr} {safe(pull.get('title')).replace('|', '/')} | {merged} | {cell.replace('|', '/')} |")
+        rows.append(f"| `#{pr}` {safe(pull.get('title')).replace('|', '/')} | {merged} | {cell.replace('|', '/')} |")
     bugs = [i for i in api_list(f"repos/{repo}/issues?state=all&labels=bug&since={last}&per_page=100")
             if "pull_request" not in i and (i.get("created_at") or "") >= last and str(i["number"]) not in linked]
     new_prs = [p for p in api(f"repos/{repo}/pulls?state=all&sort=created&direction=desc&per_page=100") or []
@@ -1056,16 +1105,16 @@ def monitor(out, repo, approvals=""):
             f"#### PRs the bot approved, last {MONITOR_DAYS} days", "| PR | State | Signals |", "| --- | --- | --- |"]
     tail = ["", f"New PRs since the last report: {len(new_prs)}.",
             "#### New bug reports not linked to an approved PR"]
-    tail += [f"- #{i['number']} {safe(i.get('title'))}" for i in bugs] or ["None."]
+    tail += [f"- `#{i['number']}` {safe(i.get('title'))}" for i in bugs] or ["None."]
     saved = {"last": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "signals": sorted(current)}
     tail.append(f"\n<!-- review-monitor-state {base64.b64encode(json.dumps(saved).encode()).decode()} -->")
     while len("\n".join(head + rows + tail)) > 60_000 and rows:
         rows.pop()  # the oldest PRs go first: `approved` is newest first
-    gh("api", "-X", "PATCH", f"repos/{repo}/issues/{number}", "--input", "-",
-       input=json.dumps({"body": "\n".join(head + (rows or ["| | | none yet |"]) + tail) + "\n"}))
-    if fresh:
+    if fresh:  # first: the body below records these as reported, so a failed post goes out tomorrow
         comment_on_issue(repo, number, "**New signals on PRs the bot approved:**\n\n"
                          + "\n".join(f"- {text}" for text in fresh) + "\n")
+    gh("api", "-X", "PATCH", f"repos/{repo}/issues/{number}", "--input", "-",
+       input=json.dumps({"body": "\n".join(head + (rows or ["| | | none yet |"]) + tail) + "\n"}))
 
 
 # ---------------------------------------------------------------- improve (a weekly job)

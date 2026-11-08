@@ -39,6 +39,7 @@ NEVER_DIRS = (".github/", ".claude/", ".cargo/", "scripts/ci/")
 NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py", "Cargo.toml", "rust-toolchain.toml",
                "requirements*.txt")
 # Approved only as a comment that doesn't count toward required reviews.
+MAX_BOX_USD = 500  # what a box's own claude.json can claim for one run; a box controls that file
 NO_COUNT_AREAS = {"area/engine", "area/resources"}
 # No runtime code: a review's `none` alone approves a change only to these.
 NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
@@ -158,9 +159,12 @@ def last_live_test(pr):
 
 
 def pr_files(base_sha, sha):
-    """The files changed from BASE_SHA to SHA, or None when GitHub's list is too long to check (300 max)."""
+    """The files changed from BASE_SHA to SHA, a rename's old name too, or None when GitHub's list is too
+    long to check (300 max)."""
     files = bot.api(f"repos/{REPO}/compare/{base_sha}...{sha}").get("files")
-    return None if files is None or len(files) >= 300 else [f["filename"] for f in files]
+    if files is None or len(files) >= 300:
+        return None
+    return [name for f in files for name in (f["filename"], f.get("previous_filename")) if name]
 
 
 def touches_runtime(pr, sha):
@@ -388,14 +392,17 @@ def wait(out, runner_temp, start_timeout: int = 30):
 
 def run_cost(lt, now):
     """(GPU, box session) USD of this run: the hours from launch to now or the deadline, whichever came
-    first, at the offer's price (Slurm's is $0), and the box's own Claude Code total."""
+    first, at the offer's price (Slurm's is $0), and the box's own Claude Code total, believed only up to
+    MAX_BOX_USD."""
     gpu_usd = 0.0
     if (lt / "entry.json").is_file():
         e = json.loads((lt / "entry.json").read_text())
         gpu_usd = max(0.0, e["usd_per_hour"] * (min(now, e["deadline"]) - e["launched_at"]) / 3600)
     try:
         box_usd = float(json.loads((lt / "results/claude.json").read_text()).get("total_cost_usd") or 0)
-    except (OSError, ValueError, AttributeError):
+    except (OSError, ValueError, AttributeError, TypeError, OverflowError):
+        box_usd = 0.0
+    if not 0 <= box_usd <= MAX_BOX_USD:  # NaN fails this too
         box_usd = 0.0
     return gpu_usd, box_usd
 
@@ -404,7 +411,10 @@ def cleanup(out, pr: int, tag, runner_temp):
     """Release whatever this run launched, and delete the ssh key it registered, from the ledger and by
     name, for a run cancelled mid-launch; and first what the run's GPUs and box session cost, for the
     ledger, so a failed release can't lose it."""
-    out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
+    try:  # nothing here may stop the release below
+        out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
+    except Exception as e:
+        print(f"::warning::Couldn't read the run's cost: {type(e).__name__}: {e}")
     print(gpu("list", check=False).stdout)
     state = gpu_py()
     for key in list(state["ledger"]()):
@@ -470,12 +480,9 @@ def reasons_not_to_approve(pr, sha, verdict, since, review):
     why, engine = [], []
     if pull["head"]["sha"] != sha:
         why.append("the PR has new commits since the reviewed one")
-    try:
-        perm = bot.api(f"repos/{REPO}/collaborators/{pull['user']['login']}/permission")["permission"]
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        perm = ""
+    perm = bot.permission(REPO, pull["user"]["login"])
     if perm not in WRITE:
-        why.append(f"the author has {perm or 'no'} access, not write")
+        why.append(f"the author has {perm} access, not write")
     # `skipped`: the review chose `none` and the workflow let it stand (the last live test passed on an
     # ancestor, or there is none and the review didn't build on an earlier one or the PR changes no
     # runtime code). On runtime code it counts only after that passing live test (below).
@@ -505,6 +512,24 @@ def reasons_not_to_approve(pr, sha, verdict, since, review):
     return why, engine, extra
 
 
+def refresh_above():
+    """Keep in stacked-above.json only the PRs still open at the head the review read. An approval comes
+    hours after the review, and a finding counts as fixed above only while that PR still holds the fix. A
+    PR that can't be read drops out, so its findings stay open."""
+    path = Path("stacked-above.json")
+    if not path.exists():
+        return
+    kept = []
+    for p in json.loads(path.read_text()):
+        try:
+            pull = bot.api(f"repos/{REPO}/pulls/{p['number']}")
+        except (RuntimeError, ValueError, KeyError, TypeError):
+            continue
+        if pull.get("state") == "open" and (pull.get("head") or {}).get("sha") == p["head_sha"]:
+            kept.append(p)
+    path.write_text(json.dumps(kept))
+
+
 def approvals_on():
     """The kill switch, the repository variable REVIEW_APPROVALS, read now rather than from the job's
     start, so a live test that began hours ago still obeys it. Unset, any other value or a failed read
@@ -527,6 +552,7 @@ def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
     what's left, which with approvals off also says what the rule would have done; then no GitHub review
     is posted at all. The review finished cleanly: the live-test job runs only then."""
     review = json.loads(Path("review.json").read_text())
+    refresh_above()
     why, engine, extra = reasons_not_to_approve(pr, head_sha, verdict, since, review)
     decision = Path(runner_temp, "decision.md")
     if not approvals_on():
@@ -552,7 +578,9 @@ def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
                                        f"P0–P2 finding, and {tested}. A push dismisses it.")
     # A push between the check and the approval would leave it on a commit nobody tested.
     if bot.api(f"repos/{REPO}/pulls/{pr}")["head"]["sha"] != head_sha:
+        decision.write_text(f"**Not approved:** new commits arrived while approving `{head_sha[:7]}`.\n")
         dismiss_approvals(pr, "new commits arrived while approving")
+        return
     out["approval"] = "approve"
     decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")
 
@@ -563,10 +591,18 @@ def review_pr(pr, sha, event, body):
 
 
 def dismiss_approvals(pr, message):
-    for r in bot.api(f"repos/{REPO}/pulls/{pr}/reviews?per_page=100") or []:
-        if r["state"] == "APPROVED" and r["user"]["login"].removesuffix("[bot]") in render_summary.BOTS:
-            bot.gh("api", "-X", "PUT", f"repos/{REPO}/pulls/{pr}/reviews/{r['id']}/dismissals", "--input", "-",
-                   input=json.dumps({"message": message, "event": "DISMISS"}), check=False)
+    """Dismiss every approval of the bot's on the PR; a failed one warns and fails the step, after the rest."""
+    failed = False
+    for r in bot.api_list(f"repos/{REPO}/pulls/{pr}/reviews?per_page=100"):
+        if r.get("state") == "APPROVED" and ((r.get("user") or {}).get("login") or "").removesuffix("[bot]") \
+                in render_summary.BOTS:
+            done = bot.gh("api", "-X", "PUT", f"repos/{REPO}/pulls/{pr}/reviews/{r['id']}/dismissals", "--input", "-",
+                          input=json.dumps({"message": message, "event": "DISMISS"}), check=False)
+            if done.returncode:
+                print(f"::warning::Couldn't dismiss review {r['id']}: {done.stderr}")
+                failed = True
+    if failed:
+        sys.exit(1)
 
 
 def dismiss(out, pr, message="New commits or a new base since the review bot approved; comment /review for a "
@@ -721,10 +757,6 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
 
 def incomplete(out, pr, run_url):
     bot.comment(REPO, pr, f"The live test didn't complete. [Log]({run_url}). Comment `/review` to retry.")
-
-
-
-
 
 
 STEPS = {"configure": configure, "inputs": inputs, "carry": carry, "start": start, "wait": wait, "redact": redact,

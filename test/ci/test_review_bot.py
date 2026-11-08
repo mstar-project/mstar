@@ -166,8 +166,8 @@ class TestSpend(unittest.TestCase):
                                      spent(99, "2026-10-31T23:59:59Z", run="3")]), {"day": 1.5, "month": 3.5})
         self.assertEqual(self.spend([spent(1), spent(1)]), {"day": 1, "month": 1},
                          "a re-recorded run would count twice")
-        self.assertEqual(self.spend([spent(1, attempt="2"), spent(1, attempt="1")])["day"], 2,
-                         "a retried run's spend would be dropped")
+        self.assertEqual(self.spend([spent(1, attempt="2"), spent(1, attempt="1")])["day"], 1,
+                         "re-running a run's spend job would count its costs twice")
         self.assertEqual(self.spend([spent(1), spent(100, run="2", login="mallory")])["day"], 1,
                          "anyone could add a record to a public issue and reach the cap")
 
@@ -180,6 +180,27 @@ class TestSpend(unittest.TestCase):
                 "GET repos/o/r/issues/1/comments*": comments[1], "GET repos/o/r/issues/2/comments*": comments[2]})):
             self.assertEqual(bot.spend("o/r", NOW)["day"], 3, "a run in the second ledger issue would be missed")
             self.assertEqual(bot.issue("o/r", "ledger"), 1, "writers would split across ledger issues")
+
+    def test_a_full_ledger_issue_rolls_over_and_a_failed_record_alerts(self):
+        full = {**LEDGER, "comments": bot.ISSUE_COMMENTS}
+        spare = {**LEDGER, "number": 3, "comments": 0}
+        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [full, spare]})):
+            self.assertEqual(bot.issue("o/r", "ledger"), 3, "a full issue would keep being written to")
+        with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/issues[?]*": [full],
+                                                   "POST repos/o/r/issues": {"number": 4}})):
+            self.assertEqual(bot.issue("o/r", "ledger"), 4, "no new ledger issue when the last one is full")
+        comments = []
+
+        def comment(argv, stdin):
+            comments.append(stdin)
+            return Fail("HTTP 502") if len(comments) == 1 else ""
+
+        with self.assertRaises(RuntimeError, msg="the step would pass, with the spend lost"):
+            step(bot.record, {"GET repos/o/r/issues[?]*": [LEDGER, STATUS], "GET repos/o/r/issues/2/comments*": [],
+                              "issue comment": comment}, repo="o/r", pr="7", github_run_id="9",
+                 github_run_attempt="1", gpu_usd="3")
+        self.assertEqual(len(comments), 2, "the ledger write and its alert")
+        self.assertIn("ledger", comments[1], "a lost ledger write would pass silently")
 
     def test_the_record_step_appends_what_spend_reads_back(self):
         recorded = {}
@@ -254,16 +275,30 @@ class TestMonitor(unittest.TestCase):
                          "a revert before the merge, or one of another PR's commit, would be blamed on this PR")
 
     def test_timeline_cross_references_are_signals_only_when_they_report_or_fix_a_bug(self):
-        def ref(number, labels=(), pr=False, body=""):
-            issue = {"number": number, "title": "t", "labels": [{"name": n} for n in labels], "body": body}
-            return {"event": "cross-referenced", "source": {"issue": {**issue, **({"pull_request": {}} if pr else {})}}}
+        def ref(number, labels=(), pr=False, body="", merged=None, login="someone"):
+            issue = {"number": number, "title": "t", "labels": [{"name": n} for n in labels], "body": body,
+                     "user": {"login": login}}
+            return {"event": "cross-referenced",
+                    "source": {"issue": {**issue, **({"pull_request": {"merged_at": merged}} if pr else {})}}}
 
-        timeline = [ref(10, ["bug"]), ref(11, ["enhancement"]), ref(12, pr=True, body="Fixes #7"),
+        timeline = [ref(10, ["bug"]), ref(11, ["enhancement"]), ref(12, pr=True, body="Fixes #7", merged="t"),
                     ref(13, ["type/bug"], pr=True), ref(14, pr=True, body="Fixes #70"),
-                    {"event": "labeled"}]
-        signals, mentions = bot.referenced(timeline, 7)
-        self.assertEqual({int(s["key"].split(":")[-1]) for s in signals}, {10, 12, 13})
-        self.assertEqual(len(mentions), 2, "an unrelated mention would be reported as a bug")
+                    ref(15, pr=True, body="Fixes #7", login="a-maintainer"),
+                    ref(16, pr=True, body="Fixes #7", login="a-stranger"),
+                    ref(17, body="`#7`", login="github-actions[bot]"), {"event": "labeled"}]
+        with mock.patch.object(bot, "run", FakeGh({
+                "GET repos/o/r/collaborators/a-maintainer/permission": {"permission": "write"},
+                "GET repos/o/r/collaborators/a-stranger/permission": {"permission": "read"}})):
+            signals, mentions = bot.referenced(timeline, 7, "o/r")
+        self.assertEqual({int(s["key"].split(":")[-1]) for s in signals}, {10, 12, 13, 15},
+                         "anyone could write `Fixes #7` on an open PR and make it a signal")
+        self.assertEqual(sorted(mentions), ["#11", "#14", "#16"], "an unrelated mention or the bot's own would count")
+
+    def test_only_a_bug_fix_subject_counts_as_a_fix(self):
+        for subject in ("Fix a crash (#9)", "[Worker][Critical fix] Drop late messages", "Revert \"x\"", "bugfix: y"):
+            self.assertTrue(bot.FIX_SUBJECT.search(subject), subject)
+        for subject in ("fix typo in README", "Fix a typo", "fix: docs for x", "prefix cache"):
+            self.assertFalse(bot.FIX_SUBJECT.search(subject), subject)
 
     def test_a_fix_that_changes_a_prs_lines_is_blamed_on_it(self):
         with workspace() as ws:
@@ -282,8 +317,20 @@ class TestMonitor(unittest.TestCase):
             git("commit", "-qam", "Fix a crash (#9)")
             fix = git("rev-parse", "HEAD")
             hits = bot.szz([{"sha": fix, "subject": "Fix a crash (#9)", "body": ""}], {pr_sha}, 7, {"a.py"})
-        self.assertEqual([s["text"] for s in hits], ["#9 changed lines #7 wrote at `a.py:2`"],
-                         "a fix of the PR's lines would go unseen")
+            self.assertEqual([s["text"] for s in hits], ["`#9` changed lines `#7` wrote at `a.py:2`"],
+                             "a fix of the PR's lines would go unseen")
+            self.assertEqual(bot.szz([{"sha": fix, "subject": "Fix a crash (#9)", "body": ""}], {"e" * 40}, 7,
+                                     {"a.py"}), [], "a fix of lines another PR wrote would be blamed on this one")
+
+    def test_a_ci_failure_counts_only_against_a_parent_that_passed(self):
+        def checks(argv, stdin):
+            sha = next(a for a in argv if "check-runs" in a).split("/")[-2]
+            return {"check_runs": [{"name": "cpu-tests", "conclusion": "failure" if sha == "m" else parent}]}
+
+        for parent, regressed in (("success", True), ("failure", False), ("cancelled", False)):
+            with mock.patch.object(bot, "run", FakeGh({"GET repos/o/r/commits/*/check-runs*": checks})):
+                found = bot.ci_regressions("o/r", 7, "m", "p")
+            self.assertEqual(bool(found), regressed, f"a parent that {parent}")
 
     def test_an_open_approved_pr_the_merge_queue_threw_out_is_a_signal(self):
         nodes = [{"createdAt": "2026-11-07T00:00:00Z", "reason": "FAILED_CHECKS"}]
@@ -291,9 +338,9 @@ class TestMonitor(unittest.TestCase):
                 "data": {"repository": {"pullRequest": {"timelineItems": {"nodes": nodes}}}}}})):
             signals, _ = bot.pr_signals("o/r", {"number": 8, "state": "open"}, [], set())
         self.assertEqual(signals, [{"key": "8:ejected:2026-11-07T00:00:00Z",
-                                    "text": "#8 removed from the merge queue (FAILED_CHECKS)"}])
+                                    "text": "`#8` removed from the merge queue (FAILED_CHECKS)"}])
 
-    def run_monitor(self, body, bug_title="crash in decode"):
+    def run_monitor(self, body, bug_title="crash in decode", **routes_over):
         calls = {"body": None}
 
         def issue_status(argv, stdin):
@@ -319,7 +366,7 @@ class TestMonitor(unittest.TestCase):
             "GET repos/o/r/pulls[?]*": [],
             "git log": (f'{"c" * 40}\x1f{"d" * 40}\x1fRevert "Faster decode (#7)"\x1f\x1e\n'
                         f'{"d" * 40}\x1f{"b" * 40}\x1fFaster decode (#7)\x1f\x1e\n'),
-            "git diff": "a.py\n", "git show": "", "git blame": "",
+            "git diff": "a.py\n", "git show": "", "git blame": "", **routes_over,
         }
         with mock.patch.object(bot, "utcnow", lambda: NOW):
             out, fake = step(bot.monitor, routes, repo="o/r", approvals="on")
@@ -338,6 +385,24 @@ class TestMonitor(unittest.TestCase):
         _, fake = self.run_monitor(body)
         self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [],
                          "a signal already reported would notify subscribers every day")
+
+    def test_a_failed_post_leaves_the_state_unwritten_so_the_signal_goes_out_tomorrow(self):
+        patched = []
+        with self.assertRaises(RuntimeError):
+            self.run_monitor(STATUS["body"], **{"issue comment": Fail("HTTP 502"),
+                                                "PATCH repos/o/r/issues/2": lambda a, i: patched.append(i) or {}})
+        self.assertEqual(patched, [], "the day's signals would count as reported though the post failed")
+
+    def test_a_pr_that_cant_be_read_is_reported_and_the_rest_goes_on(self):
+        body, _ = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": Fail("HTTP 502")})
+        self.assertIn("couldn't read", body)
+        self.assertIn("`#7`", body)
+
+    def test_a_dismissed_approval_is_not_one_that_stood(self):
+        body, fake = self.run_monitor(STATUS["body"], **{"GET repos/o/r/pulls/7/reviews*": [
+            {"state": "DISMISSED", "user": {"login": "mstar-review[bot]"}}]})
+        self.assertNotIn("Faster decode", body, "a PR whose approval was withdrawn would count as approved")
+        self.assertEqual([k for k, _ in fake.writes() if k == "issue comment"], [])
 
 
 class TestRestore(unittest.TestCase):
@@ -396,10 +461,10 @@ def collect(mode="light", diff="diff --git a/a.py b/a.py\n", **routes):
         return out, {p.name: p.read_text() for p in ws.iterdir()}
 
 
-def compare(status, diff="diff --git a/b.py b/b.py\n"):
+def compare(status, diff="diff --git a/b.py b/b.py\n", commits=()):
     """A compare of two commits, as JSON or, asked for the diff media type, as `diff`."""
     return lambda argv, stdin: diff if "Accept: application/vnd.github.diff" in argv \
-        else json.dumps([{"status": status, "commits": []}] if "--slurp" in argv else {"status": status})
+        else json.dumps([{"status": status, "commits": list(commits)}] if "--slurp" in argv else {"status": status})
 
 
 def pr_diff(context, added, index="1111111..2222222"):
@@ -420,15 +485,69 @@ class TestCollect(unittest.TestCase):
         reviewed = pr_diff("x = 1", "# unreachable")
         routes = {**self.CONVERSATION, f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("diverged"),
                   f"GET repos/o/r/compare/{BASE}...{LAST}": compare("ahead", reviewed)}
-        out, files = collect(diff=pr_diff("x = 10", "# unreachable", "3333333..4444444").replace("@@ -10,3 +10,3",
-                                                                                                 "@@ -12,3 +12,3"),
+        out, files = collect(diff=pr_diff("x = 1", "# unreachable", "3333333..4444444").replace("@@ -10,3 +10,3",
+                                                                                                "@@ -12,3 +12,3"),
                              **routes)
         self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
                          "a rebase that moved the PR's changes would read as new changes")
+        header = "diff --git a/a.py b/a.py\nindex 1111111..2222222 100644\n--- a/a.py\n+++ b/a.py\n"
+        hunk = "@@ -40,2 +40,3 @@ def g():\n     return 1\n+    # "
         out, files = collect(diff=pr_diff("x = 1", "# dead code"), **routes)
-        self.assertEqual(files["interdiff.diff"], "diff --git a/a.py b/a.py\nindex 1111111..2222222 100644\n"
-                         "--- a/a.py\n+++ b/a.py\n@@ -40,2 +40,3 @@ def g():\n     return 1\n+    # dead code\n")
+        self.assertEqual(files["interdiff.diff"],
+                         f"{header}{hunk}dead code\n{bot.DROPPED}{header}{hunk}unreachable\n")
         self.assertNotIn("since.diff", files)
+
+    def test_a_merge_in_the_range_takes_the_interdiff(self):
+        merge = {"sha": HEAD, "parents": [{"sha": LAST}, {"sha": BASE}], "commit": {"message": "Merge main"}}
+        reviewed = pr_diff("x = 1", "# unreachable")
+        out, files = collect(**self.CONVERSATION, diff=reviewed, **{
+            f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead", commits=[merge]),
+            f"GET repos/o/r/compare/{BASE}...{LAST}": compare("ahead", reviewed)})
+        self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
+                         "what the merge brought in from main would be reviewed as the author's change")
+        self.assertNotIn("since.diff", files)
+
+
+class TestInterdiff(unittest.TestCase):
+    REVIEWED = pr_diff("x = 1", "guard()")
+
+    def test_it_shows_what_moved_or_went_and_not_what_a_rebase_shifted(self):
+        moved = self.REVIEWED.replace("def g():", "def h():")
+        moved_inside = self.REVIEWED.replace("     return 1\n", "     pass\n")
+        without_hunk = self.REVIEWED[:self.REVIEWED.index("@@ -40")]
+        other = "diff --git a/b.py b/b.py\nindex 1..2 100644\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-a\n+b\n"
+        mode = self.REVIEWED.replace("index 1111111", "old mode 100644\nnew mode 100755\nindex 1111111")
+        binary = "diff --git a/w.bin b/w.bin\nindex {}\nBinary files a/w.bin and b/w.bin differ\n"
+        for name, old, new, shown in (
+                ("a guard moved to another function", self.REVIEWED, moved, "def h()"),
+                ("a guard moved inside its function", self.REVIEWED, moved_inside, "pass"),
+                ("a dropped hunk", self.REVIEWED, without_hunk, "def g()"),
+                ("a dropped file", self.REVIEWED + other, self.REVIEWED, "b.py"),
+                ("a mode change beside hunks", self.REVIEWED, mode, "new mode"),
+                ("a binary swapped", binary.format("1..2 100644"), binary.format("1..3 100644"), "1..3")):
+            with self.subTest(name):
+                self.assertIn(shown, bot.interdiff(old, new))
+        self.assertEqual(bot.interdiff(binary.format("1..2 100644"), binary.format("9..2 100644")), "",
+                         "main changing a binary's old side would read as the PR's change")
+        self.assertIn(bot.DROPPED, bot.interdiff(self.REVIEWED + other, self.REVIEWED))
+
+
+class TestDispatcher(unittest.TestCase):
+    def test_a_step_that_exits_still_writes_its_outputs_with_env_as_parameters(self):
+        seen = {}
+
+        def failing(out, pr: int, mode="light"):
+            seen.update(pr=pr, mode=mode)
+            out["reason"] = "a\nb"
+            sys.exit(1)
+
+        output = Path(tempfile.mkdtemp()) / "output"
+        with mock.patch.dict(os.environ, {"PR": "7", "MODE": "", "GITHUB_OUTPUT": str(output)}), \
+                mock.patch.object(sys, "argv", ["bot.py", "failing"]), self.assertRaises(SystemExit):
+            bot.main({"failing": failing})
+        self.assertEqual(seen, {"pr": 7, "mode": "light"})
+        self.assertRegex(output.read_text(), r"^reason<<EOF_\w+\na\nb\nEOF_\w+\n$",
+                         "the steps after a failed one read what it had found from $GITHUB_OUTPUT")
 
 
 COMMENT = "mcp__github_inline_comment__create_inline_comment"

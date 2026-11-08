@@ -322,6 +322,10 @@ class TestComment(unittest.TestCase):
         self.assertIn("[c](media/c.wav)", text, "a link to a file the gallery left out would point at nothing")
 
 
+class Done:
+    stdout = ""
+
+
 class TestCost(unittest.TestCase):
     def test_a_run_costs_its_gpu_hours_to_the_deadline_and_the_boxs_session(self):
         lt = Path(tempfile.mkdtemp())
@@ -332,26 +336,99 @@ class TestCost(unittest.TestCase):
         self.assertEqual(gpu_review.run_cost(lt, 5400), (1.5, 1.5), "the GPU cost would not be pro-rated")
         self.assertEqual(gpu_review.run_cost(lt, 100_000), (3.0, 1.5),
                          "a run past its deadline would cost more than its Pod can")
+        for cost in ("1e12", "Infinity", "NaN", "-1e12", "[1]"):  # claude.json is the box's own file
+            (lt / "results/claude.json").write_text('{"total_cost_usd": %s}' % cost)
+            self.assertEqual(gpu_review.run_cost(lt, 5400)[1], 0.0, f"a box could claim a cost of {cost}")
+
+    def test_a_cost_that_cant_be_read_still_releases_the_run(self):
+        calls, state = [], {"ledger": lambda: {"eras:1": {}}, "load_config": dict, "slurm_nodes": lambda cfg: [],
+                            "enabled": lambda cfg, provider: False}
+        with unittest.mock.patch.object(gpu_review, "gpu_py", return_value=state), \
+                unittest.mock.patch.object(gpu_review, "gpu", side_effect=lambda *a, **k: calls.append(a) or Done()), \
+                unittest.mock.patch.object(gpu_review, "run_cost", side_effect=ValueError("bad entry.json")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gpu_review.cleanup({}, 7, "1-1", tempfile.mkdtemp())
+        self.assertIn(("terminate", "eras:1"), calls, "a corrupt cost file would leave the box running")
 
 
 class TestApprove(unittest.TestCase):
-    def approve(self, variable, verdict="pass"):
+    def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
+                outside=(), above=None, extra=None, head_after=None):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
-        `verdict` fails it; its decision text, the outputs and the writes."""
-        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}}
-        routes = {f"GET repos/{R}/pulls/7": pr, f"GET repos/{R}/collaborators/an-author/permission":
-                  {"permission": "write"}, "POST graphql": threads_page(),
-                  f"GET repos/{R}/actions/variables/REVIEW_APPROVALS": variable,
-                  f"GET repos/{R}/compare/abcdef...0123456789": {"files": [{"filename": "docs/models.rst"}]},
-                  f"POST repos/{R}/pulls/7/reviews": {}, f"GET repos/{R}/pulls/7/reviews?per_page=100": []}
+        `verdict` or the other arguments fail it; its decision text, the outputs and the writes, as a
+        list unless `head_after` (the head on the read after the POST) asks for the fake and its calls."""
+        pr = {"head": {"sha": head}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}}
+        heads = iter(() if head_after is None else (pr,))
+        routes = {f"GET repos/{R}/pulls/7": (lambda a, i: next(heads, {**pr, "head": {"sha": head_after}}))
+                  if head_after else pr,
+                  f"GET repos/{R}/collaborators/an-author/permission": {"permission": perm},
+                  "POST graphql": threads_page(), f"GET repos/{R}/actions/variables/REVIEW_APPROVALS": variable,
+                  f"GET repos/{R}/compare/abcdef...0123456789": {"files": files or [{"filename": "docs/models.rst"}]},
+                  f"POST repos/{R}/pulls/7/reviews": {}, f"GET repos/{R}/pulls/7/reviews?per_page=100": [],
+                  **(extra or {})}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
             (ws / "review.json").write_text(json.dumps({
-                "outside_diff": [], "prior_findings": [], "questions": [], "skipped": [],
-                "risk": {"level": "low", "reason": "docs only", "look_at": []},
+                "outside_diff": list(outside), "prior_findings": [], "questions": [], "skipped": [],
+                "risk": {"level": risk, "reason": "docs only", "look_at": []},
                 "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1}}))
+            if above is not None:
+                (ws / "stacked-above.json").write_text(json.dumps(above))
             out, fake = step(gpu_review.approve, routes, pr=7, head_sha="0123456789", runner_temp=temp, verdict=verdict)
             text = Path(temp, "decision.md").read_text()
-        return text, out, [key for key, _ in fake.writes()]
+        return text, out, fake if head_after else [key for key, _ in fake.writes()]
+
+    def test_each_condition_of_the_rule_stops_the_approval(self):
+        blocked = {"filename": "docs/x.rst", "previous_filename": ".github/review/bot.py"}
+        for name, kwargs, says in (("the head moved", {"head": "fedcba9876"}, "new commits"),
+                                   ("the author can't write", {"perm": "read"}, "read"),
+                                   ("design risk", {"risk": "medium"}, ""),
+                                   ("a blocked file", {"files": [{"filename": ".github/workflows/ci.yml"}]}, "rules"),
+                                   ("a blocked file renamed away", {"files": [blocked]}, "rules")):
+            with self.subTest(name):
+                text, out, writes = self.approve({"value": "on"}, **kwargs)
+                self.assertEqual((writes, out.get("approval")), ([], None), f"{name} would still approve")
+                self.assertIn(says, text)
+        text, out, writes = self.approve({"value": "On"})
+        self.assertEqual((writes, out.get("approval")), ([], None), "only the exact word `on` turns approvals on")
+
+    def test_an_engine_change_gets_a_comment_that_cant_count(self):
+        for files in ([{"filename": "mstar/engine/engine.py"}],
+                      [{"filename": "docs/x.rst", "previous_filename": "mstar/engine/engine.py"}]):
+            with self.subTest(files):
+                _, out, _ = self.approve({"value": "on"}, files=files)
+                self.assertEqual(out["approval"], "comment", "an engine change's approval would count")
+
+    def test_a_push_during_the_approval_withdraws_it_and_says_so(self):
+        text, out, fake = self.approve({"value": "on"}, head_after="fedcba9876", extra={
+            f"GET repos/{R}/pulls/7/reviews?per_page=100": [
+                {"id": 3, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
+            f"PUT repos/{R}/pulls/7/reviews/3/dismissals": {}})
+        self.assertIn(f"PUT repos/{R}/pulls/7/reviews/3/dismissals", [key for key, _ in fake.writes()],
+                      "the approval would stand on a commit nobody tested")
+        self.assertNotIn("approval", out, "the ledger would record an approval that was withdrawn")
+        self.assertIn("Not approved", text)
+
+    def test_a_finding_counts_as_fixed_above_only_while_that_pr_still_holds_the_fix(self):
+        finding = {"priority": "P1", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}
+        above = [{"number": 9, "head_sha": "a" * 40}]
+        for name, reply, approved in (("still open at its head", {"state": "open", "head": {"sha": "a" * 40}}, True),
+                                      ("moved on", {"state": "open", "head": {"sha": "b" * 40}}, False),
+                                      ("closed", {"state": "closed", "head": {"sha": "a" * 40}}, False),
+                                      ("unreadable", Fail("HTTP 502"), False)):
+            with self.subTest(name):
+                _, out, writes = self.approve({"value": "on"}, outside=[finding], above=above,
+                                              extra={f"GET repos/{R}/pulls/9": reply})
+                self.assertEqual("approval" in out, approved, f"a PR above that is {name}")
+
+    def test_dismissal_reads_every_page_and_reports_one_that_failed(self):
+        reviews = [{"id": 3, "state": "APPROVED", "user": None},
+                   {"id": 4, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}]
+        def listed(argv, stdin):
+            return reviews if "--paginate" in argv else Fail("called without --paginate")
+
+        out, fake = step(gpu_review.dismiss, {f"GET repos/{R}/pulls/7/reviews*": listed,
+                                              f"PUT repos/{R}/pulls/7/reviews/4/dismissals": Fail("HTTP 502")}, pr=7)
+        self.assertEqual(out.get("exit"), 1, "a failed dismissal would leave an approval on a commit nobody tested")
 
     def test_approvals_happen_only_when_the_variable_reads_on(self):
         text, out, writes = self.approve({"value": "on"})
