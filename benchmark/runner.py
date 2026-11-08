@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import copy
 import os
 import random
 import time
@@ -284,6 +285,11 @@ class Benchmark:
             "aggregate": {
                 "max_concurrency": agg.max_concurrency,
                 "ttft_s": {modality: _stats(stats) for modality, stats in agg.ttft.items()},
+                "itl_s": {modality: _stats(stats) for modality, stats in agg.itl.items()},
+                "text_token_throughput": agg.text_token_throughput,
+                "total_text_tokens": agg.total_text_tokens,
+                "mean_text_tokens": agg.mean_text_tokens,
+                "total_input_tokens": agg.total_input_tokens,
                 "e2e_latency_s": _stats(agg.e2e_latency),
                 "rtf": _stats(agg.rtf),
                 "audio_seconds_throughput": agg.audio_seconds_throughput,
@@ -446,9 +452,13 @@ class Benchmark:
         if (lo is None) != (hi is None):
             raise ValueError("output_len_min and output_len_max must be set together")
         rng = random.Random(cfg.output_len_seed)
-        for req in requests:
+        for i, req in enumerate(requests):
             if req.req_type.get_output_modalities() not in ("text", "audio"):
                 continue
+            # A dataset resized past its length repeats the same RequestInput
+            # objects; stamp a copy so each request keeps its own length.
+            requests[i] = req = copy.copy(req)
+            req.model_kwargs = dict(req.model_kwargs)
             if lo is not None:
                 length = rng.randint(lo, hi)
                 req.model_kwargs["max_tokens"] = length
@@ -457,20 +467,24 @@ class Benchmark:
                 req.model_kwargs["ignore_eos"] = True
 
     async def run(self) -> tuple[list[RequestMetrics], AggregateMetrics]:
-        dataset = self._get_dataset()
         if self.config.profiling_type == ProfilingType.OFFLINE:
             bs = self.config.batch_size
-            # make even multiple of batch size
+            # make even multiple of batch size, before the dataset is sized
             self.config.num_requests = ((self.config.num_requests + bs - 1) // bs) * bs
+        dataset = self._get_dataset()
         requests = dataset.get_requests()[: self.config.num_requests]
         self._assign_output_lengths(requests)
 
-        # Bump the connection-pool cap so closed-loop runs at high
-        # max_concurrency don't bottleneck on aiohttp's default 100/host limit.
-        connector_limit = max(100, (self.config.max_concurrency or 1) + 10)
+        # No connection-pool cap (limit=0): the profiling mode alone sets how
+        # many requests are in flight. A capped pool would hold an offline
+        # batch or an online burst back on the client, and that wait would be
+        # counted as server latency.
         async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300),
-            connector=aiohttp.TCPConnector(limit=connector_limit),
+            # Bound a stalled read, not the whole request: every baseline
+            # overrides `total` per request, so M* must not be the only system
+            # cut at 300 s.
+            timeout=aiohttp.ClientTimeout(total=None, sock_read=300),
+            connector=aiohttp.TCPConnector(limit=0),
             read_bufsize=5 * 2**20,  # 1MB read buffer
         ) as session:
             await self._warmup(session, requests)
@@ -671,12 +685,12 @@ def parse_args() -> BenchmarkConfig:
     # it so robotics models (Pi05, VJepa2AC) don't see a stray kwarg.
     model_type = ModelType(args.model)
     # `--model-id` is what the request names, so a size other than the family's
-    # default (e.g. Qwen3.5-9B) reaches the server. Only Qwen3.5 is a family of
-    # sizes today; the rest pin one checkpoint and their constructors take no
+    # default (e.g. Qwen3.5-9B) reaches the server. Only the Qwen3.5 code takes
+    # other checkpoints today; the rest pin one checkpoint and their constructors take no
     # such argument, so passing it would be a TypeError rather than a no-op.
     extra = (
         {"model_id": args.model_id}
-        if args.model_id and model_type == ModelType.QWEN3_5 else {}
+        if args.model_id and model_type in (ModelType.QWEN3_5, ModelType.QWEN3_8) else {}
     )
     if model_type == ModelType.BAGEL:
         model = model_type.inst(disable_cfg=args.disable_cfg, image_preprocess=args.bagel_image_preprocess)

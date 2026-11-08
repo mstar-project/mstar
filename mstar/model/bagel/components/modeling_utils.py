@@ -89,6 +89,32 @@ class TimestepEmbedder(nn.Module):
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.frequency_embedding_size = frequency_embedding_size
+        half = frequency_embedding_size // 2
+        self.register_buffer(
+            "timestep_freqs",
+            torch.exp(
+                -math.log(10000)
+                * torch.arange(half, dtype=torch.float32)
+                / half
+            ),
+            persistent=False,
+        )
+
+    def _apply(self, fn, recurse=True):
+        self._buffers.pop("timestep_freqs")
+        result = super()._apply(fn, recurse=recurse)
+        device = self.mlp[0].weight.device
+        half = self.frequency_embedding_size // 2
+        if device.type == "meta":
+            frequencies = torch.empty(half, dtype=torch.float32, device=device)
+        else:
+            frequencies = torch.exp(
+                -math.log(10000)
+                * torch.arange(half, dtype=torch.float32)
+                / half
+            ).to(device=device)
+        self._buffers["timestep_freqs"] = frequencies
+        return result
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
@@ -111,9 +137,13 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq.float())
-        return t_emb
+        args = t[:, None].float() * self.timestep_freqs[None]
+        t_freq = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if self.frequency_embedding_size % 2:
+            t_freq = torch.cat(
+                [t_freq, torch.zeros_like(t_freq[:, :1])], dim=-1
+            )
+        return self.mlp(t_freq)
 
 
 class BagelMLPconnector(nn.Module):
@@ -225,7 +255,11 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
             height, width = img.shape[-2:]
         else:
             width, height = img.size
+        new_height, new_width = self.target_size(height, width, img_num)
+        return F.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
 
+    def target_size(self, height: int, width: int, img_num: int = 1) -> tuple[int, int]:
+        """The ``(height, width)`` an image of this size is resized to."""
         scale = min(self.max_size / max(width, height), 1.0)
         scale = max(scale, self.min_size / min(width, height))
         new_width, new_height = self._apply_scale(width, height, scale)
@@ -240,7 +274,7 @@ class MaxLongEdgeMinShortEdgeResize(torch.nn.Module):
             scale = self.max_size / max(new_width, new_height)
             new_width, new_height = self._apply_scale(new_width, new_height, scale)
 
-        return F.resize(img, (new_height, new_width), self.interpolation, antialias=self.antialias)
+        return new_height, new_width
 
 
 class ImageTransform:
@@ -262,7 +296,7 @@ class ImageTransform:
             max_pixels=max_pixels,
         )
         self.to_tensor_transform = transforms.ToTensor()
-        self.normalize_transform = transforms.Normalize(mean=image_mean, std=image_std, inplace=True)
+        self.normalize_transform = transforms.Normalize(mean=image_mean, std=image_std)
 
     def __call__(self, img, img_num=1):
         img = self.resize_transform(img, img_num=img_num)
@@ -271,13 +305,23 @@ class ImageTransform:
 
 
 def vllm_vit_resize(image: torch.Tensor, size: int) -> torch.Tensor:
-    """vllm-omni's SigLIP ViT preprocessing: resize to a fixed ``size``x``size``
-    square, discarding aspect ratio. Mirrors HF ``SiglipImageProcessor`` with
-    ``size={"height": size, "width": size}`` (BICUBIC, antialias), which is what
-    vllm-omni feeds BAGEL for image understanding. ``image`` is a CHW float
+    """Fixed-square SigLIP ViT preprocessing: resize to a fixed
+    ``size``x``size`` square, discarding aspect ratio. Mirrors HF
+    ``SiglipImageProcessor`` with ``size={"height": size, "width": size}``
+    (BICUBIC, antialias). ``image`` is a CHW float
     tensor in [0, 1]; normalization is applied separately by the caller.
     """
     return F.resize(image, (size, size), InterpolationMode.BICUBIC, antialias=True)
+
+
+def vllm_vae_size(h: int, w: int, stride: int, max_img_size: int, min_img_size: int = 256) -> tuple[int, int]:
+    """The ``(height, width)`` `vllm_vae_resize` resizes an ``h`` x ``w`` image to."""
+    scale = min(max_img_size / max(w, h), 1.0)
+    min_size = min(min_img_size, max_img_size)
+    scale = max(scale, min_size / min(w, h))
+    new_w = max(stride, int(round(w * scale / stride) * stride))
+    new_h = max(stride, int(round(h * scale / stride) * stride))
+    return min(new_h, max_img_size), min(new_w, max_img_size)
 
 
 def vllm_vae_resize(
@@ -286,19 +330,12 @@ def vllm_vae_resize(
     max_img_size: int,
     min_img_size: int = 256,
 ) -> torch.Tensor:
-    """vllm-omni's img2img VAE input resize (``_resize_to_stride`` in
-    vllm_omni/diffusion/models/bagel/pipeline_bagel.py): aspect-preserving,
+    """Stride-multiple img2img VAE input resize: aspect-preserving,
     longest edge <= ``max_img_size``, shortest edge >= ``min_img_size``, both
     rounded to a multiple of ``stride`` and clamped to ``max_img_size``
     (BICUBIC, antialias). ``image`` is a CHW float tensor in [0, 1];
     normalization is applied separately by the caller.
     """
     _, h, w = image.shape
-    scale = min(max_img_size / max(w, h), 1.0)
-    min_size = min(min_img_size, max_img_size)
-    scale = max(scale, min_size / min(w, h))
-    new_w = max(stride, int(round(w * scale / stride) * stride))
-    new_h = max(stride, int(round(h * scale / stride) * stride))
-    new_w = min(new_w, max_img_size)
-    new_h = min(new_h, max_img_size)
-    return F.resize(image, (new_h, new_w), InterpolationMode.BICUBIC, antialias=True)
+    size = vllm_vae_size(h, w, stride, max_img_size, min_img_size)
+    return F.resize(image, size, InterpolationMode.BICUBIC, antialias=True)

@@ -7,7 +7,10 @@ import pytest
 import torch
 import yaml
 
+from mstar.communication import tensors
 from mstar.communication.tensors import LocalTransferEngine
+from mstar.conductor.request_info import CurrentForwardConductorMetadata, CurrentForwardPassInfo
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import KVReqConfig, PagedKVConfig
 from mstar.engine.resources.kv.manager import (
@@ -25,12 +28,15 @@ from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
     make_deployment_kv_shm_dir,
 )
+from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.model.bagel.bagel_model import BagelModel
-from mstar.model.bagel.submodules import CombineCFGSubmodule
+from mstar.model.bagel.components.modeling_utils import TimestepEmbedder
+from mstar.model.bagel.submodules import SAMPLER, CombineCFGSubmodule, LLMSubmodule
+from mstar.model.submodule_base import END_PARTITION
 
 
 def test_offload_reset_preserves_remote_content_epoch():
-    stream = CacheStream(remote_reset_generation=7)
+    stream = CacheStream(page_indices=new_page_arena(1).new_stream(), remote_reset_generation=7)
     stream.reset(content_reset=False)
     assert stream.remote_reset_generation == 7
     stream.reset()
@@ -40,7 +46,7 @@ def test_offload_reset_preserves_remote_content_epoch():
 def _bare_model() -> BagelModel:
     model = BagelModel.__new__(BagelModel)
     model.config = SimpleNamespace(
-        num_timesteps=50,
+        num_timesteps=50, max_position_embeddings=32768,
         temperature=1.0,
         top_k=0,
         top_p=1.0,
@@ -60,13 +66,13 @@ def test_cfg_graph_is_reused_for_tp_branches():
 
     assert set(walks) == {
         "prefill_text", "prefill_vit", "prefill_vae", "decode",
-        "image_gen", "image_gen_cfg",
+        "image_gen", "image_gen_head", "image_gen_cfg2", "image_gen_cfg3", "image_decode",
     }
     assert model.get_default_sharding_config().tp_enabled_nodes == {
         "LLM", "LLM_cfg_text", "LLM_cfg_img",
     }
-    assert set(walks["image_gen_cfg"].get_nodes()) == {
-        "LLM", "LLM_cfg_text", "LLM_cfg_img", "combine_cfg", "vae_decoder",
+    assert set(walks["image_gen_cfg3"].get_nodes()) == {
+        "LLM", "LLM_cfg_text", "LLM_cfg_img", "combine_cfg",
     }
 
 
@@ -83,7 +89,9 @@ def test_xpu_cfg_replicas_match_main_tp_and_walk():
 
     assert len(cfg_groups) == 2
     assert all(group["tp_size"] == main["tp_size"] for group in cfg_groups)
-    assert all(group.get("graph_walks") == ["image_gen_cfg"] for group in cfg_groups)
+    assert [group.get("graph_walks") for group in cfg_groups] == [
+        ["image_gen_cfg2", "image_gen_cfg3"], ["image_gen_cfg3"],
+    ]
 
 
 def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
@@ -91,7 +99,7 @@ def test_pd_disaggregation_publishes_main_only_at_handoff_boundaries():
     model._has_llm_disaggregation = True
     args = {
         "default": SimpleNamespace(
-            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True})
+            full_metadata=SimpleNamespace(kwargs={"requires_cfg": True, "target_output": "image"})
         )
     }
 
@@ -135,6 +143,73 @@ def test_bagel_configs_detect_only_graph_walk_split_llm_as_disaggregated():
     image_gen = model.get_graph_walk_graphs()["image_gen"]
     assert not image_gen.sections[0].section.enable_async_scheduling
 
+
+@pytest.mark.parametrize(
+    ("schedule", "target", "think", "ignore_eos", "stop"),
+    [
+        (["prefill_vit", "prefill_text"], "text", False, False, {END_PARTITION}),
+        (["prefill_vit", "prefill_text"], "text", False, True, set()),
+        # an earlier prefill's token is not the reply's
+        (["prefill_text", "prefill_vit", "prefill_text"], "text", False, False, set()),
+        # thinking ends here, but image_gen still has to run
+        (["prefill_text", "prefill_text"], "image", True, False, set()),
+        (["prefill_text"], "text", False, False, {"decode_loop"}),
+    ],
+    ids=["last-prefill", "ignore-eos", "earlier-prefill", "think-then-image", "decode"],
+)
+def test_a_stop_token_sampled_at_the_last_prefill_ends_a_text_reply(schedule, target, think, ignore_eos, stop):
+    """The prefill's token comes before decode_loop exists, so a stop there
+    ends the partition rather than naming a loop the walk doesn't have."""
+    metadata = CurrentForwardConductorMetadata(graph_walk=schedule[0], is_prefill=True, kwargs={
+        "prefill_schedule": [(walk, object()) for walk in schedule], "prefill_step": 0,
+        "target_output": target, "think_mode": think, "requires_cfg": False,
+        "cfg_text_scale": 1.0, "cfg_img_scale": 1.0, "cfg_interval": (0.0, 1.0),
+        "cfg_renorm_type": "global", "cfg_renorm_min": 0.0, "width": 0, "height": 0, "image_preprocess": None,
+    })
+    step = _bare_model().get_partition_forward_pass_args("default", metadata, {})
+    info = CurrentForwardPassInfo(
+        request_id="r", graph_walk=step.full_metadata.graph_walk, fwd_index=0, random_seed=0, max_tokens=100,
+        resource_configs={SAMPLER: SamplingReqConfig(ignore_eos=ignore_eos)}, step_metadata=step.step_metadata,
+    )
+    llm = SimpleNamespace(eos_token_id=4)
+    outputs = {"new_token": [torch.tensor([4])]}
+    LLMSubmodule.postprocess(llm, "r", info, outputs)
+    assert LLMSubmodule.check_stop(llm, "r", info, outputs) == stop
+
+
+def test_timestep_embedding_preserves_fp32_frequencies_after_bf16_cast():
+    module = TimestepEmbedder(64, frequency_embedding_size=256).to(
+        dtype=torch.bfloat16
+    )
+    expected = torch.exp(
+        -torch.log(torch.tensor(10000.0))
+        * torch.arange(128, dtype=torch.float32)
+        / 128
+    )
+
+    assert module.timestep_freqs.dtype == torch.float32
+    torch.testing.assert_close(module.timestep_freqs, expected, rtol=0, atol=0)
+
+
+def test_timestep_embedding_survives_meta_to_empty_round_trip():
+    module = TimestepEmbedder(64, frequency_embedding_size=256).to("meta")
+    module.to_empty(device="cpu")
+    expected = torch.exp(
+        -torch.log(torch.tensor(10000.0))
+        * torch.arange(128, dtype=torch.float32)
+        / 128
+    )
+    torch.testing.assert_close(module.timestep_freqs, expected, rtol=0, atol=0)
+
+
+def test_timestep_embedding_buffer_matches_reference_formula():
+    module = TimestepEmbedder(64, frequency_embedding_size=256)
+    timesteps = torch.tensor([0.0, 0.25, 0.5, 1.0])
+    buffered = module(timesteps)
+    reference = module.mlp(
+        module.timestep_embedding(timesteps, module.frequency_embedding_size)
+    )
+    torch.testing.assert_close(buffered, reference, rtol=0, atol=0)
 
 def test_combine_cfg_is_parameterless():
     module = CombineCFGSubmodule(SimpleNamespace())
@@ -182,6 +257,34 @@ def test_shm_kv_transfer_copies_only_requested_page_ranges(tmp_path):
         source[:, 3, :, :2],
     )
     assert torch.count_nonzero(destination_cache.tensor[:, 1]) == 0
+
+
+def test_shm_kv_transfer_reads_an_mla_cache_by_token(tmp_path):
+    """MLA is [layers, pages, page_size, latent]: the reader took NHD's K/V axis
+    first and sliced latent columns, not tokens."""
+    from mstar.engine.resources.kv.cache import KVLayout
+
+    def mla_cache():
+        config = PagedKVConfig(max_num_pages=4, page_size=4, num_layers=2, num_kv_heads=1,
+                               head_dim=12, max_seq_len=16, num_qo_heads=2,
+                               layout=KVLayout.MLA, kv_lora_rank=8, qk_rope_head_dim=4)
+        return KVCache(config, torch.device("cpu"), torch.float32)
+
+    source_cache, destination_cache = mla_cache(), mla_cache()
+    source_cache.tensor.copy_(torch.arange(source_cache.tensor.numel(), dtype=torch.float32)
+                              .reshape(source_cache.tensor.shape))
+    producer = ShmKVTransferEngine(source_cache, "producer", str(tmp_path))
+    consumer = ShmKVTransferEngine(destination_cache, "consumer", str(tmp_path))
+    info = producer.get_kv_transfer_info(
+        request_id="request", label="main", page_indices=[1, 3], seq_len=6,
+    )
+    consumer.read_batched_async(
+        info, [r for layer in range(2)
+               for r in (KVReadInfo(layer, 0, 1, 0, 4), KVReadInfo(layer, 2, 3, 0, 2))])
+    src, dst = source_cache.tensor, destination_cache.tensor
+    torch.testing.assert_close(dst[:, 0], src[:, 1])
+    torch.testing.assert_close(dst[:, 2, :2], src[:, 3, :2])
+    assert torch.count_nonzero(dst[:, 2, 2:]) == 0
 
 
 def test_shm_kv_transfer_requires_deployment_directory():
@@ -508,21 +611,23 @@ def test_shm_read_failure_is_latched_to_one_request(tmp_path):
     )
 
     broken = manager.admit_retrieve(
-        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+        "broken", "LLM_cfg_text", "image_gen_cfg2", broken_publish,
     )
     broken_again = manager.admit_retrieve(
-        "broken", "LLM_cfg_text", "image_gen_cfg", broken_publish,
+        "broken", "LLM_cfg_text", "image_gen_cfg2", broken_publish,
     )
     healthy = manager.admit_retrieve(
-        "healthy", "LLM_cfg_text", "image_gen_cfg", healthy_publish,
+        "healthy", "LLM_cfg_text", "image_gen_cfg2", healthy_publish,
     )
 
     healthy_page = manager._streams["healthy"]["main"].page_indices[0]
 
+    # the refusal reaches clients: an error id, the file error itself only in the log
     assert not broken.ok
-    assert "FileNotFoundError" in broken.reason.message
+    assert "internal error (error id" in broken.reason.message
+    assert "missing.pt" not in broken.reason.message
     assert not broken_again.ok
-    assert "FileNotFoundError" in broken_again.reason.message
+    assert broken_again.reason.message == broken.reason.message
     assert healthy.ok and healthy.ready
     torch.testing.assert_close(
         manager.kv_cache.tensor[:, healthy_page, :, :1],
@@ -662,23 +767,22 @@ def test_kv_shm_directory_is_private_to_the_deployment(
     tmp_path, monkeypatch,
 ):
     monkeypatch.setenv("MSTAR_KV_SHM_DIR", str(tmp_path))
-    owner_pid = os.getpid()
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    stale = tmp_path / f"mstar_kv_{uid}_99999999_stale"
+    held: dict[str, int] = {}
+    monkeypatch.setattr(tensors, "_held_namespace_locks", held)
+    stale = tmp_path / f"mstar_{'d' * 12}_kv"
     stale.mkdir()
     (stale / "orphan.pt").touch()
+    (tmp_path / f"mstar_{'d' * 12}.lock").touch()
 
-    first = make_deployment_kv_shm_dir(
-        "/tmp/server-a", "tcp://host:1234", owner_pid=owner_pid,
-    )
-    second = make_deployment_kv_shm_dir(
-        "/tmp/server-b", "tcp://host:5678", owner_pid=owner_pid,
-    )
+    first = make_deployment_kv_shm_dir("a" * 12)
+    second = make_deployment_kv_shm_dir("b" * 12)
 
     assert first != second
     assert not stale.exists()
     assert Path(first).stat().st_mode & 0o777 == 0o700
     assert Path(second).stat().st_mode & 0o777 == 0o700
+    for fd in held.values():
+        os.close(fd)
 
 
 def test_local_only_cpu_cache_does_not_publish_shm_snapshots():

@@ -11,16 +11,23 @@ room for that.
 """
 from mstar.model.components.attention import Attention, CrossAttention
 from mstar.model.components.decoder_layer import DecoderLayer, GatedDecoderLayer
+from mstar.model.components.kda import KDAConfig, KimiDeltaAttention
 from mstar.model.components.linear import FusedColumnLinear
 from mstar.model.components.linear_attn import GatedDeltaNet, GDNProjLayout
 from mstar.model.components.mlp import MLP, FusedGatedMLP, GatedMLP
 from mstar.model.components.moe import (
+    ExpertParallelSparseMoeBlock,
     ParallelSparseMoeBlock,
     ParallelSparseMoeBlockWithSharedExpert,
     SparseMoeBlock,
     SparseMoeBlockWithSharedExpert,
     TopKRouter,
     dispatch_experts_fused,
+)
+from mstar.model.components.moe_parallel import (
+    MoeParallelConfig,
+    MoeParallelMixin,
+    instantiate_moe_block,
 )
 from mstar.model.components.norm import AdaRMSNorm, RMSNorm, RMSNormGated
 
@@ -33,6 +40,10 @@ __all__ = [
     "FusedGatedMLP",
     "MLP",
     "GatedMLP",
+    "ExpertParallelSparseMoeBlock",
+    "MoeParallelConfig",
+    "MoeParallelMixin",
+    "instantiate_moe_block",
     "ParallelSparseMoeBlock",
     "ParallelSparseMoeBlockWithSharedExpert",
     "SparseMoeBlock",
@@ -42,6 +53,8 @@ __all__ = [
     "AdaRMSNorm",
     "GDNProjLayout",
     "GatedDeltaNet",
+    "KDAConfig",
+    "KimiDeltaAttention",
     "RMSNormGated",
     "RMSNorm",
 ]

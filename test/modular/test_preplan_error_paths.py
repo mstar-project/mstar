@@ -8,8 +8,8 @@ so the runner's foreign-step guard stays the backstop it is meant to be.
 from __future__ import annotations
 
 import sys
-from collections import defaultdict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures.thread import BrokenThreadPool
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -17,20 +17,16 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
-from mstar.engine.engine import Engine
+from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.worker import make_worker
 from mstar.worker import worker as worker_mod
-from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
 def _fake_worker() -> Worker:
-    w = Worker.__new__(Worker)
-    w.worker_id = 0
-    w.enable_nvtx = False
-    w._phase_period = 0
-    w._phase_buf = defaultdict(list)
-    w.device = torch.device("cpu")
-    w._in_flight_rids = set()
+    w = make_worker(worker_id=0, device=torch.device("cpu"))
     w.failed = []
     w.resets = []
     w.pushed_back = []
@@ -38,7 +34,7 @@ def _fake_worker() -> Worker:
     w._reset_skip_plan_flags = w.resets.append
     w._rid_str = str
     w.despeculated = []
-    w._pending_removes = set()
+    w._pending_removes = {}
     w._pending_drains = set()
     w._draining_rids = set()
     w.scheduler = SimpleNamespace(failed_rids=set())
@@ -46,7 +42,7 @@ def _fake_worker() -> Worker:
     w._graph_runtime = SimpleNamespace(
         push_back_node=lambda node_name, rids, wg_ids: w.pushed_back.extend(rids),
         set_in_flight=(
-            lambda node_name, wg_id, rids, value: w.despeculated.extend(rids)
+            lambda node_name, rids, wg_ids, value: w.despeculated.extend(rids)
         ),
         commit_speculation=(
             lambda spec_id, success, dropped, **kw: w.settled.append(
@@ -54,8 +50,12 @@ def _fake_worker() -> Worker:
             )
         ),
     )
-    # No stream buffers in the fake, so _return_streaming_edge no-ops.
+    # No stream buffers in the fake, so returning a chunk is a no-op.
     w.request_state = SimpleNamespace(per_request_info={})
+    w.streams = StreamBufferManager(w.request_state, None, [])
+    w.engine_manager = SimpleNamespace(
+        get_engine=lambda node: SimpleNamespace(release_cached_prefix=lambda batch: None),
+    )
     return w
 
 
@@ -92,14 +92,15 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
     the plan future is drained, the stage dropped through the engine, the
     fresh rid goes back to its queue and the continuing rid fails with N."""
     w = _fake_worker()
-    w._in_flight_rids = {"a"}
+    w._hold_rows(CHAIN_LANE, {"a"})
     spec = _speculation(_done_future(), "a", "b", continuing=("a",))
     Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [spec.node_batch]
     assert spec.plan_future is None
     assert sorted(w.despeculated) == ["a", "b"]
     assert w.pushed_back == ["b"]
-    assert w.failed == [{"a": "Error in worker: RuntimeError: boom"}]
+    assert list(w.failed[0]) == ["a"] and len(w.failed) == 1
+    assert w.failed[0]["a"].startswith("Error in worker: internal error (error id ")
     # The step never ran, so its staged stream chunks are un-ingested and go
     # back to their buffers -- the fresh rid pushed back above would otherwise
     # hold one in a slot the next ingest can overtake.
@@ -107,10 +108,11 @@ def test_main_loop_error_drops_an_armed_unsubmitted_speculation() -> None:
 
 
 def test_main_loop_error_leaves_a_submitted_speculation_alone() -> None:
-    """Once the GPU thread has the plan future, the speculation carries no
-    future any more and the handler has nothing to drain or reset."""
+    """Once the GPU thread has the speculation (and its plan future), its rids
+    are that step's, so the handler has nothing to drain, reset or give back."""
     w = _fake_worker()
     spec = _speculation(None, "a")
+    spec.submitted = True
     Worker._handle_main_loop_error(w, RuntimeError("boom"), (None, None), None, spec)
     assert w.resets == [] and w.pushed_back == []
     assert w.despeculated == []  # nothing de-speculated: not this handler's batch
@@ -127,11 +129,13 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
     w.engine_manager = SimpleNamespace(get_engine=lambda name: engine)
     released = []
     node_batch = SimpleNamespace(
-        node_name="dit", launch_started_event=None, preplanned_rids=("a",),
-        request_ids=("a",), release_waiters=lambda: released.append(True),
+        node_name="dit", launch_started_event=None, preplanned_rids=("a",), read_check_rids=None,
+        request_ids=("a",), step_context=SimpleNamespace(rebuild_rids=frozenset()),
+        release_waiters=lambda: released.append(True),
         per_request_info={"a": SimpleNamespace(request_id="a")},
     )
-    batch = SimpleNamespace(node_name="dit", graph_walk="decode", output_signals=())
+    batch = SimpleNamespace(node_name="dit", graph_walk="decode", output_signals=(),
+                            request_walks={})
     with pytest.raises(RuntimeError, match="bad inputs"):
         Worker._execute_on_gpu_thread(w, batch, node_batch, _done_future())
     assert resets == [node_batch]
@@ -144,19 +148,43 @@ def test_gpu_thread_drops_the_stage_when_prepare_inputs_raises() -> None:
         Worker._execute_on_gpu_thread(w, batch, node_batch, None)
     assert resets == []
 
+    # A plan that raised fails the step before prepare_inputs. It still releases
+    # the plan thread, and its launch event is set when it ends, or the admit
+    # fence on it would never lift.
+    released.clear()
+    failed_plan: Future = Future()
+    failed_plan.set_exception(RuntimeError("plan failed"))
+    with ThreadPoolExecutor(max_workers=1) as gpu:
+        future = Worker._submit_gpu_step(w, gpu, batch, node_batch, failed_plan)
+        with pytest.raises(RuntimeError, match="plan failed"):
+            future.result()
+    assert node_batch.launch_started_event.is_set()
+    assert released == [True]
+
+
+def test_a_step_the_executor_never_runs_still_lifts_the_fence() -> None:
+    """The admit fence waits on the launch event without a limit, so a step whose
+    future fails without ever running (a GPU thread whose initializer raised) must
+    still set it, or the main loop never reaches the ``future.result()`` that
+    raises the real error."""
+    w = _fake_worker()
+    node_batch = SimpleNamespace(node_name="dit", launch_started_event=None)
+    batch = SimpleNamespace(node_name="dit", graph_walk="decode")
+    with ThreadPoolExecutor(max_workers=1, initializer=_raiser(RuntimeError("init"))) as gpu:
+        future = Worker._submit_gpu_step(w, gpu, batch, node_batch, None)
+        assert isinstance(future.exception(), BrokenThreadPool)
+    assert node_batch.launch_started_event.is_set()
+
 
 def _exec_fake(runner, raise_with):
-    fake = SimpleNamespace(
-        _enable_nvtx=False, _enable_profile=False, _device=torch.device("cpu"),
-        _submodules={"dit": SimpleNamespace(submodule=object())},
+    return make_engine(
+        _submodules={"dit": make_mgmt(submodule=object())},
         _autocast_dtype_for=lambda submodule: None,
         reserve_replay_slot=lambda batch: None,
         _exec_single=_raiser(raise_with),
         _exec_per_request=_raiser(raise_with),
         _runner=runner,
     )
-    fake.exec = Engine.exec.__get__(fake)
-    return fake
 
 
 def _batch(preplanned) -> SimpleNamespace:
@@ -198,13 +226,10 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     # exec), then prepare_inputs dropped "b": the stale step must not reach
     # admit, so the reset clears it even though the batch still has inputs
     cleared = []
-    fake = SimpleNamespace(
-        _enable_nvtx=False,
-        _submodules={"dit": SimpleNamespace(cuda_graph_runner=None)},
+    fake = make_engine(
+        _submodules={"dit": make_mgmt()},
         _runner=SimpleNamespace(clear_preplan=lambda: cleared.append(True)),
     )
-    fake.reset_pre_plan_for_batch = Engine.reset_pre_plan_for_batch.__get__(fake)
-    fake.preplan_is_stale = Engine.preplan_is_stale.__get__(fake)
     batch = SimpleNamespace(
         request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
         preplanned_rids=("a", "b"), preplan_event=object(),
@@ -214,3 +239,83 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     fake.reset_pre_plan_for_batch(batch)
     assert batch.step is None and batch.preplanned_rids is None and batch.preplan_event is None
     assert cleared == [True]
+
+
+class _FakeEvent:
+    def __init__(self, device=None):
+        self.recorded_on = "unrecorded"
+
+    def record(self, stream=None):
+        self.recorded_on = stream
+
+
+def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
+    # a later step may skip a copy into a slot buffer this pre-plan issued,
+    # so its plan-stream copies must be waited on even if it never finishes
+    monkeypatch.setattr(torch, "Event", _FakeEvent)
+    fake = make_engine(
+        _order_after_pre_plans=lambda: None,
+        _runner=SimpleNamespace(
+            pre_admit=lambda step: SimpleNamespace(ok=True),
+            pre_plan=_raiser(RuntimeError("plan failed")),
+        ),
+    )
+    step = SimpleNamespace(set_ctx=lambda ctx: None)
+    submodule = SimpleNamespace(declare_step=lambda **kw: step)
+    cg_runner = SimpleNamespace(
+        declare_inputs_for=lambda lease: [], step_ids=lambda lease, rids: rids,
+        plan_stream=lambda: None,
+    )
+    batch = SimpleNamespace(
+        node_name="dit", inputs=None, request_ids=["a"], per_request_info={},
+        step=None, preplan_event=None, preplanned_rids=None,
+        step_context=SimpleNamespace(
+            graph_walk="decode", padded_request_ids=["a"], is_preplan=False,
+            set_padded_rids=lambda rids: None, resident=None,
+        ),
+    )
+    submodule.step_is_input_free = lambda walk: False
+    mgmt = make_mgmt(submodule)
+    with pytest.raises(RuntimeError):
+        fake._pre_plan_for_batch(batch, mgmt, cg_runner, object())
+    event = fake._pre_plan_done["dit"]
+    assert isinstance(event, _FakeEvent) and event.recorded_on is None
+    assert batch.preplan_event is None
+
+
+def test_a_step_is_ordered_after_every_plan_streams_pre_plans(monkeypatch) -> None:
+    # nodes can share a resource's slot buffers, so every node's latest
+    # pre-plan is waited on, not just the stepping node's
+    waits = []
+    stream = SimpleNamespace(wait_event=waits.append)
+    monkeypatch.setattr(torch.accelerator, "current_stream", lambda device=None: stream)
+    fake = make_engine()
+    fake._order_after_pre_plans()
+    assert waits == []
+    fake._pre_plan_done.update(enc="e1", dec="e2")
+    fake._order_after_pre_plans()
+    assert waits == ["e1", "e2"]
+
+
+def test_an_inline_plan_waits_on_pre_plans_before_the_resident_stage_copies() -> None:
+    # the resident stage copies into the bucket's cells and slots, which a
+    # dropped pre-plan may still be copying into on its plan stream
+    from mstar.engine.resources.step import BucketKey, SlotLease, StepContext, SubmoduleStep
+
+    calls = []
+
+    def plan(step, phase):
+        calls.append("runner")
+        raise NotImplementedError("reached plan")
+
+    engine = make_engine(_runner=SimpleNamespace(plan=plan), _order_after_pre_plans=lambda: calls.append("wait"))
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", 1, 1))
+    ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False, slot_lease=lease)
+    ctx.resident = SimpleNamespace(plan=lambda step, ctx: calls.append("resident"))
+    mgmt = make_mgmt()
+    with pytest.raises(NotImplementedError, match="reached plan"):
+        engine._drive_step(
+            SimpleNamespace(node_name="LLM", preplan_event=None), mgmt, [1], [], {},
+            ctx, lease, True, SubmoduleStep(steps={}, cg_key_info=None), False,
+        )
+    assert calls == ["wait", "resident", "runner"]

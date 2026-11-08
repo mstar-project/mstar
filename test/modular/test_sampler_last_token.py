@@ -28,6 +28,15 @@ def test_eager_write_and_read_go_by_request():
     assert bufs.has_slot("a") and not bufs.has_slot("zz")
 
 
+def test_an_eager_write_leaves_the_master_of_a_row_outside_kept_rids():
+    bufs = _buffers()
+    for rid in ("kept", "dropped"):
+        bufs.register_request(rid)
+    bufs.write_last_tokens(["kept", "dropped"], torch.tensor([1, 2]))
+    bufs.write_last_tokens(["kept", "dropped"], torch.tensor([11, 12]), kept_rids=frozenset({"kept"}))
+    assert bufs.last_tokens_for(["kept", "dropped"]).tolist() == [11, 2], "a discarded sample overwrote its row's token"
+
+
 def test_the_captured_row_scatters_to_the_slot_master_and_gathers_back():
     bufs = _buffers(max_bs=4, cg_slots=2)
     for rid in ("a", "b", "c"):
@@ -153,12 +162,27 @@ def test_ingraph_scatter_rows_land_by_slot_and_padding_hits_the_trash_row():
     assert got[:2] == [22, 21] and got[2] == got[3] == bufs.last_token.master[0].item()
 
 
-def test_ingraph_scatter_masters_never_grow():
-    bufs = _ingraph(max_bs=2, slots=2)
-    bufs.register_request("a")
-    bufs.register_request("b")
+def test_ingraph_scatter_graph_masters_never_grow():
+    """The two masters a captured graph indexes are allocated in full and
+    kept; the others start small and grow up to them, and a registration
+    past them is refused."""
+    bufs = SamplerBuffers.allocate(
+        max_batch_size=2, device=torch.device("cpu"), vocab_size=16,
+        ingraph_scatter=True, slots=4,
+    )
+    offset, last_token = bufs.offset.master, bufs.last_token.master
+    assert offset.shape[0] == last_token.shape[0] == 5
+    assert bufs.temperature.master.shape[0] == bufs.seen_tokens.master.shape[0] == 3
+    assert bufs.free_rows == 4
+    for rid in ("a", "b", "c", "d"):
+        bufs.register_request(rid)
+    assert bufs.free_rows == 0
+    bufs.write_last_tokens(["d"], torch.tensor([7]))  # a gpu-thread access grows the device rows
+    assert bufs.temperature.master.shape[0] == bufs.seen_tokens.master.shape[0] == 5
+    assert bufs.offset.master is offset and bufs.last_token.master is last_token
+    assert bufs.last_tokens_for(["d"]).tolist() == [7]
     with pytest.raises(RuntimeError, match="MSTAR_SAMPLER_SLOTS"):
-        bufs.register_request("c")
+        bufs.register_request("e")
     # the default path still grows
     plain = SamplerBuffers.allocate(max_batch_size=2, device=torch.device("cpu"))
     for rid in ("a", "b", "c"):
@@ -179,3 +203,28 @@ def test_capture_padding_rows_take_no_slot():
     assert bufs.last_tokens_for([-2, "a"]).tolist() == [
         bufs.last_token.master[0].item(), 5,
     ]
+
+
+def test_a_dropped_row_keeps_its_offset_and_token_in_graph():
+    """``SamplerStep.kept_rids``: a dropped row still draws at its own offset,
+    but the captured scatter sends its offset and token to the trash row."""
+    bufs = _ingraph()
+    for rid in ("a", "b"):
+        bufs.register_request(rid)
+    bufs.write_last_tokens(["a", "b"], torch.tensor([1, 2]))
+    slot_a, slot_b = bufs._rid_to_slot["a"], bufs._rid_to_slot["b"]
+    bufs.gather_static(["a", "b"], 4, 1)
+    bufs.gather_dynamic(["a", "b"], 4, 1, kept=frozenset({"a"}))
+    bufs.offset.master[slot_a], bufs.offset.master[slot_b] = 10, 20
+    s = bufs.sampler_for(4, 1)
+    assert s.slot_idx_view.tolist() == [slot_a, slot_b, 0, 0]
+    assert s.scatter_idx_view.tolist() == [slot_a, 0, 0, 0]
+    s.gather_in_graph()
+    assert s.offset_buf.tolist()[:2] == [10, 20]
+    s.offset_buf += 1
+    s.scatter_in_graph(torch.tensor([21, 22, 99, 98]))
+    assert bufs.offset.master[[slot_a, slot_b]].tolist() == [11, 20]
+    assert bufs.last_tokens_for(["a", "b"]).tolist() == [21, 2]
+    # the next step keeps every row, and stages that into the same views
+    bufs.gather_dynamic(["a", "b"], 4, 1)
+    assert s.scatter_idx_view.tolist() == [slot_a, slot_b, 0, 0]

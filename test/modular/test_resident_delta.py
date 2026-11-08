@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -26,14 +27,19 @@ sys.path.insert(0, ".")
 
 from mstar.engine import engine as engine_mod
 from mstar.engine.engine import Engine
-from mstar.engine.resources.step import FULL_ADMIT_OK
+from mstar.engine.resources import Residency
+from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext
+from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     OffloadDelta,
     RemoveRequest,
     ScheduleTPNode,
 )
 from mstar.worker import worker as worker_mod
-from mstar.worker.micro_scheduler import MicroScheduler
+from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.rebuild import Rebuilds
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 
@@ -122,6 +128,8 @@ def test_an_empty_delta_is_falsy():
 
 class _Resource:
     supports_eviction = True
+    supports_preplan = False
+    force_double_buffer = False
 
     def __init__(self):
         self.offloaded: set[str] = set()
@@ -129,8 +137,8 @@ class _Resource:
         self.refuse_offload = False
         self.refuse_reload = False
 
-    def is_offloaded(self, rid):
-        return rid in self.offloaded
+    def residency(self, rid):
+        return Residency.ON_HOST if rid in self.offloaded else Residency.RESIDENT
 
     def reclaimable(self, rid):
         return 0 if rid in self.holds_nothing else 1
@@ -181,33 +189,29 @@ class _Rids:
         return handle if handle in self._live else None
 
 
-class _Engine:
+class _Engine(Engine):
     """``Engine``'s eviction surface over one stub resource."""
 
-    apply_resident_delta = Engine.apply_resident_delta
-    check_ready = Engine.check_ready
-    is_offloaded = Engine.is_offloaded
-    offload_request = Engine.offload_request
-    reclaimable = Engine.reclaimable
-    reload_request = Engine.reload_request
-    take_resident_delta = Engine.take_resident_delta
+    def decide_cached_prefix(self, batch):
+        return {}
+
+    def page_trails(self, node_name):
+        return {}
 
     def __init__(self, role: str = "leader"):
         """``role`` is this rank's part for ``"node"``: ``leader`` (rank 0 of a
         sharded node — decides and journals), ``follower`` (another rank of one —
         replays only), or ``solo`` (not sharded — owns its own eviction)."""
         assert role in ("leader", "follower", "solo"), role
+        super().__init__(graph_runtime=_Rids())
         self.resource = _Resource()
         self._resources = {"kv": self.resource}
-        self._submodules = {
-            "node": SimpleNamespace(resources={"kv": self.resource})
-        }
+        self._submodules["node"] = make_mgmt(resources={"kv": self.resource})
         self._runner = SimpleNamespace(admit_retrieve=lambda **kw: FULL_ADMIT_OK)
         self._resident_delta = (
             {"node": OffloadDelta.new()} if role == "leader" else {}
         )
         self._tp_follower_nodes = {"node"} if role == "follower" else set()
-        self._graph_runtime = _Rids()
 
 
 def _info():
@@ -221,7 +225,7 @@ def test_a_follower_may_not_start_an_offload_of_its_own():
     engine = _Engine("follower")
 
     assert engine.offload_request("node", "a") == 0
-    assert not engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is not Residency.ON_HOST
     assert engine.resource.offloaded == set(), "the resource was touched anyway"
 
 
@@ -232,7 +236,7 @@ def test_a_follower_may_not_start_a_reload_of_its_own():
     engine.resource.offloaded = {"a"}
 
     assert engine.reload_request("node", "a") is False
-    assert engine.is_offloaded("node", "a"), "reloaded despite following"
+    assert engine.residency("node", "a") is Residency.ON_HOST, "reloaded despite following"
 
 
 def test_replay_is_exempt_from_both_guards():
@@ -243,12 +247,12 @@ def test_replay_is_exempt_from_both_guards():
     delta.add_offloaded("wire-a")
 
     assert engine.apply_resident_delta("node", delta) is True
-    assert engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is Residency.ON_HOST
 
     back = OffloadDelta.new()
     back.add_reloaded("wire-a")
     assert engine.apply_resident_delta("node", back) is True
-    assert not engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is not Residency.ON_HOST
 
 
 def test_an_unsharded_node_still_evicts_for_itself():
@@ -257,7 +261,7 @@ def test_an_unsharded_node_still_evicts_for_itself():
     engine = _Engine("solo")
 
     assert engine.offload_request("node", "a") == 1
-    assert engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is Residency.ON_HOST
     assert engine.reload_request("node", "a") is True
 
 
@@ -269,7 +273,7 @@ def test_reload_request_reports_whether_it_worked():
     engine.resource.offloaded = {"a"}
 
     assert engine.reload_request("node", "a") is True
-    assert not engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is not Residency.ON_HOST
 
     engine.resource.offloaded = {"b"}
     engine.resource.refuse_reload = True
@@ -308,13 +312,13 @@ def test_a_partial_reload_gives_back_what_it_reloaded():
     first.offloaded = {"a"}
     second.offloaded = {"a"}
     engine._submodules = {
-        "node": SimpleNamespace(resources={"first": first, "second": second})
+        "node": make_mgmt(resources={"first": first, "second": second})
     }
 
     assert engine.reload_request("node", "a") is False
     assert len(engine.take_resident_delta("node")) == 0
-    assert second.is_offloaded("a")
-    assert first.is_offloaded("a") and first.free == 8, (
+    assert "a" in second.offloaded
+    assert "a" in first.offloaded and first.free == 8, (
         "the first resource kept pages the delta never mentions"
     )
 
@@ -337,11 +341,11 @@ def test_a_resource_that_never_offloaded_the_request_does_not_block_its_reload()
     holder, bystander = _Unsure(), _Unsure()
     holder.offloaded = {"a"}
     engine._submodules = {
-        "node": SimpleNamespace(resources={"holder": holder, "bystander": bystander})
+        "node": make_mgmt(resources={"holder": holder, "bystander": bystander})
     }
 
     assert engine.reload_request("node", "a") is True
-    assert not engine.is_offloaded("node", "a")
+    assert engine.residency("node", "a") is not Residency.ON_HOST
 
 
 def test_a_resource_that_cannot_fit_stops_the_reload_before_anything_moves():
@@ -351,7 +355,7 @@ def test_a_resource_that_cannot_fit_stops_the_reload_before_anything_moves():
     second.offloaded = {"a"}
     first.reload = second.reload = lambda rid: pytest.fail("reloaded past a refusal")
     engine._submodules = {
-        "node": SimpleNamespace(resources={"first": first, "second": second})
+        "node": make_mgmt(resources={"first": first, "second": second})
     }
 
     assert engine.reload_request("node", "a") is False
@@ -387,7 +391,7 @@ def test_a_rank_that_leads_nothing_journals_nothing():
     engine = _Engine("solo")
     engine.offload_request("node", "a")
 
-    assert engine.is_offloaded("node", "a"), "a solo rank still evicts"
+    assert engine.residency("node", "a") is Residency.ON_HOST, "a solo rank still evicts"
     assert len(engine.take_resident_delta("node")) == 0
 
 
@@ -399,7 +403,7 @@ def test_replaying_a_delta_reproduces_the_leaders_state():
     delta.add_offloaded("wire-a")
 
     assert engine.apply_resident_delta("node", delta) is True
-    assert engine.is_offloaded("node", "a"), (
+    assert engine.residency("node", "a") is Residency.ON_HOST, (
         "replay ended with 'a' resident; the leader has it on the host"
     )
     assert len(delta) == 0
@@ -419,7 +423,7 @@ def test_a_refused_entry_stops_the_replay_where_it_is():
 
     engine.resource.refuse_offload = False
     assert engine.apply_resident_delta("node", delta) is True
-    assert engine.is_offloaded("node", "a") and engine.is_offloaded("node", "b")
+    assert engine.residency("node", "a") is Residency.ON_HOST and engine.residency("node", "b") is Residency.ON_HOST
 
 
 def test_a_move_for_a_request_this_rank_no_longer_has_is_spent():
@@ -437,7 +441,7 @@ def test_a_move_for_a_request_this_rank_no_longer_has_is_spent():
 
     assert engine.apply_resident_delta("node", delta) is True
     assert len(delta) == 0, "the moot entry was left to be retried for ever"
-    assert engine.is_offloaded("node", "a"), "it stopped short of the next move"
+    assert engine.residency("node", "a") is Residency.ON_HOST, "it stopped short of the next move"
     assert None not in engine.resource.offloaded, "None reached the resources"
 
 
@@ -535,9 +539,8 @@ class _Groups:
 
 
 def _roles(layout):
-    engine = _Engine.__new__(_Engine)
-    engine._resident_delta = {}
-    Engine._classify_tp_roles(engine, set(layout), _Groups(layout))
+    engine = make_engine()
+    engine._classify_tp_roles(set(layout), _Groups(layout))
     return engine
 
 
@@ -590,6 +593,7 @@ class _Leader:
 
     maybe_send_zmq_to_tp_followers = Worker.maybe_send_zmq_to_tp_followers
     _rid_str = Worker._rid_str
+    _step_reads = Worker._step_reads
 
     def __init__(self, followers=("rank1", "rank2")):
         self.engine = _Engine("leader")
@@ -614,11 +618,17 @@ class _Leader:
         self.communicator = SimpleNamespace(
             send=lambda worker, msg: self.sent.append((worker, msg))
         )
+        # nothing the followers read: no step goes out read-checked
+        self._lockstep_unread: dict = {}
+        self._streaming_edge_names: set[str] = set()
 
 
 def _node_batch():
     return SimpleNamespace(
-        node_name="node", graph_walk="walk", request_ids=("r0",),
+        node_name="node", graph_walk="walk", request_ids=("r0",), chunk_ranges={},
+        step_context=StepContext(
+            request_ids=("r0",), graph_walk="walk", slot=0, capture=False,
+        ),
     )
 
 
@@ -711,19 +721,15 @@ class _Rank:
         self.flushed_removes += 1
         self.flush_protected = set(in_flight_rids)
 
-    def _try_offload_cold_request(self, node_name, batch_ids, affected_resources=None):
-        del batch_ids, affected_resources
+    def _try_offload_cold_request(self, node_name, graph_walk, batch_ids, affected_resources=None, inside_only=False):
+        del graph_walk, batch_ids, affected_resources, inside_only
         self.offload_attempts.append(node_name)
         return "victim"
 
 
 def _oom(rank, referenced_rids=frozenset()):
-    batch = SimpleNamespace(
-        node_name="node", graph_walk="walk",
-        node_objects={"r0": object(), "r1": object()},
-        request_to_worker_graph={"r0": "wg", "r1": "wg"},
-    )
-    node_batch = SimpleNamespace(node_name="node", failed_resource=None)
+    batch = ScheduledBatch(node_name="node", graph_walk="walk", request_to_worker_graph={"r0": "wg", "r1": "wg"})
+    node_batch = SimpleNamespace(node_name="node", failed_resource=None, admit_error=None)
     rank._handle_allocation_failure(batch, node_batch, referenced_rids)
 
 
@@ -811,7 +817,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     here what they meant on the leader. Wait rather than build."""
     engine = SimpleNamespace(
         apply_resident_delta=lambda node, delta: False,  # refuses
-        is_offloaded=lambda node, rid: False,
+        residency=lambda node, rid: Residency.RESIDENT,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
     )
@@ -909,21 +915,24 @@ class _ForwardingLeader:
     _remove_request = Worker._remove_request
     _removal_step_reached = Worker._removal_step_reached
     _rid = Worker._rid
+    _mark_removed = Worker._mark_removed
 
     def __init__(self, broadcast_seq: int):
         self.is_tp_follower = False
+        self._lockstep_led = frozenset()
         self._tp_broadcast_seq = broadcast_seq
         # handle-keyed state, per rid_table's list
         self._in_flight_rids: set[int] = set()
-        self._pending_removes: set[int] = set()
-        self._last_active: dict = {}
-        self.streaming_buffers: dict = {}
+        self._pending_removes: dict[int, None] = {}
+        self._rebuilds = Rebuilds({}, {})
         # wire-string-keyed: parked teardowns and the drain bookkeeping, because
         # a handle is recycled and would reattach to the next request to get it
         self._removes_awaiting_step: dict[int, list[str]] = {}
         self._draining_rids: set[str] = set()
         self._pending_drains: set[str] = set()
         self._reads_done_sent: set[str] = set()
+        self._removed_rids: RecentSet[str] = RecentSet(16)
+        self._unprocessed_messages: dict = {}
         group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
         # The runtime owns the handle table and the sharding config now, and
         # ``remove_request`` there is what frees the handle.
@@ -935,9 +944,10 @@ class _ForwardingLeader:
         )
         self.request_state = SimpleNamespace(remove_request=lambda rid: None)
         self.engine_manager = SimpleNamespace(
-            remove_request=lambda rid: None, evictable_nodes=lambda: (),
+            remove_request=lambda rid: None,
         )
         self.tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+        self.streams = StreamBufferManager(self.request_state, self.tensor_manager, [])
         self.profile_info = SimpleNamespace(pop_request=lambda rid: None)
         self.scheduler = SimpleNamespace(
             clear_rid=lambda rid, wire_rid: None,
@@ -1042,7 +1052,7 @@ class _FollowSpec:
         self.worker_id = "worker_1"
         self.engine = SimpleNamespace(
             apply_resident_delta=lambda node, delta: not replay_refuses,
-            is_offloaded=lambda node, rid: False,
+            residency=lambda node, rid: Residency.RESIDENT,
             reclaimable=lambda node, rid: 0,
             check_ready=lambda *a, **kw: FULL_ADMIT_OK,
             get_max_batch_size=lambda node, walk: None,
@@ -1088,6 +1098,7 @@ class _SpecParent:
 
         class _Batch:
             node_name = "node"
+            incomplete_node_rids = frozenset()
 
             @property
             def request_to_worker_graph(self):
@@ -1095,6 +1106,7 @@ class _SpecParent:
                 return {"r0": 0}
 
         self.batch = _Batch()
+        self.node_batch = SimpleNamespace(commit_done=threading.Event())
 
 
 def test_the_async_follow_path_will_not_build_mid_replay():

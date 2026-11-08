@@ -19,7 +19,7 @@ PORT="${PORT:-20001}"
 export PORT
 USERNAME="${USER:-keisuke}"
 CACHE_DIR="/m-coriander/coriander/${USERNAME}/mstar_cache/orpheus/"
-SOCKET_PREFIX="/tmp/mstar_${USERNAME}/"
+SOCKET_PREFIX="/tmp/mstar_${USERNAME}_${PORT}/"
 UPLOAD_DIR="/tmp/mstar_uploads_${USERNAME}/"
 OUTPUT_DIR="nsys_profiles"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"

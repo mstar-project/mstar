@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -26,7 +26,8 @@ class LinearAttnVariant(Enum):
 
 
 class LinearAttnBackend(Enum):
-    FLASHINFER = "flashinfer"
+    FLASHINFER = "flashinfer"  # GDN: FlashInfer's kernels
+    TRITON = "triton"  # KDA: the fused kernels in kda_triton.py
 
 
 @dataclass
@@ -39,18 +40,18 @@ class LinearAttnConfig:
     # own default does.
     sm_scale: float | None = None
 
-    # GLM-5.3 sets this (`gate_lower_bound: -5.0`), selecting a different gate
-    # formula in the KDA kernel. None keeps the softplus one.
-    gate_lower_bound: float | None = None
-
     # L2-normalise q and k for the delta rule: in the kernel where it can, by
     # `GDNManager.run` where it cannot (the SM90 chunked prefill). Qwen3.5 needs
-    # it (HF and vLLM both pass it) and skipping it diverges silently.
+    # it (the HF reference passes it) and skipping it diverges silently.
     qk_l2norm: bool = True
 
     # Mamba-2 only: clamp on dt after softplus, as HF's ``time_step_limit``
     # (Nemotron-H leaves it open: (0, inf)).
     time_step_limit: tuple[float, float] = (0.0, float("inf"))
+
+    # GDN only: combined walks whose steps run decode rows on the decode kernel
+    # and prompt rows on the chunked one (`GDNMixedWrapper`)
+    splits: tuple[CombinedSplit, ...] = ()
 
 
 @dataclass
@@ -59,6 +60,19 @@ class LinearAttnSpec(NodeResourceSpec):
 
     def depends_on(self) -> set[str]:
         return {self.config.recurrent_state}
+
+    def combined_splits(self) -> tuple[CombinedSplit, ...]:
+        return self.config.splits
+
+    @property
+    def writes_prefix_snapshots(self) -> bool:
+        # only the GDN wrapper writes state checkpoints into the pool's snapshot slots
+        return self.config.variant is LinearAttnVariant.GDN
+
+    @property
+    def restores_prefix(self) -> bool:
+        # its state is the pool's
+        return True
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -81,4 +95,10 @@ class LinearAttnStep(ResourceStep):
     Carries no state semantics: the segments give the rows and spans, and the
     pool's own step says what becomes of the slots. The walk is derived from
     the spans.
+
+    ``speculative``: every row is a verify block of a speculating node, which
+    first replays the accepted part of the row's last block (the pool's
+    speculative blocks); the span is the block's length, the same for every row.
     """
+
+    speculative: bool = False

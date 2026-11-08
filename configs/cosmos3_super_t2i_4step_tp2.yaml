@@ -6,7 +6,7 @@ resources:
   kv:
     max_num_pages: 384
 model_kwargs:
-  cuda_graph: true
+  accelerator_graph: true
   graph_max_latent_area: 2000
   # Distilled: 4 fixed sigmas, guidance baked into the weights. The distilled
   # sampler reads its sigma list from the checkpoint scheduler config.

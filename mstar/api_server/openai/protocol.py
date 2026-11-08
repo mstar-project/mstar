@@ -37,7 +37,7 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     stream: bool | None = False
 
-    # Multimodal output (vllm-omni / sglang-omni style)
+    # Multimodal output (OpenAI chat-completions ``modalities`` and ``audio``)
     modalities: list[str] | None = None
     audio: dict[str, Any] | None = None  # {"voice": ..., "format": "wav"}
 
@@ -141,6 +141,8 @@ class ModelCard(BaseModel):
     object: str = "model"
     created: int = 0
     owned_by: str = "mstar"
+    # a LoRA adapter's base model; None (and left out of the JSON) for the base itself
+    parent: str | None = None
 
 
 class ModelList(BaseModel):

@@ -1,3 +1,4 @@
+from datetime import timedelta
 from typing import Sequence
 
 import torch
@@ -43,3 +44,16 @@ def split_tensor_along_last_dim(
         return tuple(chunk.contiguous() for chunk in tensor_list)
 
     return tensor_list
+
+
+def resolve_dist_timeout(dist_timeout_s: float | None = None) -> dict[str, timedelta]:
+    """Build the ``timeout`` kwarg for ``init_process_group`` / ``new_group``
+    from the config's ``dist_timeout_s``; unset, PyTorch's default applies
+    (``{}``). Large checkpoint loads (hundreds of GB at TP8) exceed that
+    default, so deployments opt in.
+    """
+    if dist_timeout_s is None:
+        return {}
+    if dist_timeout_s <= 0:
+        raise ValueError(f"dist_timeout_s must be positive, got {dist_timeout_s}")
+    return {"timeout": timedelta(seconds=float(dist_timeout_s))}

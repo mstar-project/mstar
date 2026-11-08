@@ -17,6 +17,8 @@ sys.path.insert(0, ".")
 
 import torch
 
+from mstar.engine.resources.base import CachedPrefix
+from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import StepContext
@@ -27,6 +29,7 @@ NODE = "LLM"
 WALK = "prefill"
 PROMPT = torch.arange(100)
 MATCHED = 96
+HIT = CachedPrefix("main", MATCHED, MATCHED)
 
 
 def _sampler(penalty: float = 1.2) -> SamplerResource:
@@ -61,7 +64,7 @@ def test_a_cut_prefill_still_ends_with_the_whole_prompt_in_the_mask():
     resource = _sampler()
     inputs = ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT))
 
-    resource.apply_cached_prefix(RID, NODE, WALK, inputs, MATCHED)
+    resource.apply_cached_prefix(RID, NODE, WALK, inputs, HIT)
     _prefill(resource, PROMPT[MATCHED:])
 
     assert _seen(resource) == PROMPT.tolist(), (
@@ -73,7 +76,7 @@ def test_the_skipped_tokens_are_folded_in_once():
     resource = _sampler()
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), HIT,
     )
     _prefill(resource, PROMPT[MATCHED:])
 
@@ -92,7 +95,7 @@ def test_a_miss_keeps_nothing():
 
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), 0,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), None,
     )
 
     assert RID not in resource._cached_prefix, (
@@ -106,7 +109,7 @@ def test_a_walk_without_token_ids_keeps_nothing():
     resource.apply_cached_prefix(
         RID, NODE, WALK,
         ARNodeInputs(input_embeds=torch.zeros(100, 8), input_seq_len=100),
-        MATCHED,
+        HIT,
     )
 
     assert RID not in resource._cached_prefix, (
@@ -118,7 +121,7 @@ def test_an_inert_penalty_leaves_the_mask_alone():
     resource = _sampler(penalty=1.0)
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), HIT,
     )
 
     _prefill(resource, PROMPT[MATCHED:])
@@ -132,7 +135,7 @@ def test_a_preplan_folds_nothing_in():
     resource = _sampler()
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), HIT,
     )
 
     resource.plan(
@@ -152,11 +155,25 @@ def test_removing_the_request_drops_what_was_kept_for_it():
     resource = _sampler()
     resource.apply_cached_prefix(
         RID, NODE, WALK,
-        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), MATCHED,
+        ARNodeInputs(input_ids=PROMPT, input_seq_len=len(PROMPT)), HIT,
     )
 
     resource.remove_request(RID)
 
     assert RID not in resource._cached_prefix, (
         "the skipped prompt outlived the request it was kept for"
+    )
+
+
+def test_a_token_the_model_throws_away_is_not_seen(monkeypatch):
+    # The sampling kernel needs a device, and this test doesn't depend on which token it picks.
+    monkeypatch.setattr(sampler_utils, "sample_tokens", lambda **kwargs: torch.tensor([200]))
+    resource = _sampler()
+
+    resource.plan(SamplerStep(prefill_tracked_tokens={RID: PROMPT[:4]}, kept_rids=frozenset()), _ctx())
+    resource.sample([RID], torch.zeros(1, 256))
+
+    assert _seen(resource) == PROMPT[:4].tolist(), (
+        "a walk the cache serves never samples this token, so a request that "
+        "ran the walk is penalized for a token the served one is not"
     )

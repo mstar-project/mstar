@@ -86,7 +86,10 @@ serve_sglang() {
 # M* DROID policy deployment (4 steps, guidance 3.0, shift 5.0).
 #   usage: serve_mstar_droid <gpu> <port>
 serve_mstar_droid() {
+  local sock upload
+  sock=$(mktemp -d); upload=$(mktemp -d)
   CUDA_VISIBLE_DEVICES="$1" python "$MSTAR/mstar/api_server/entrypoint.py" --config "$MSTAR/configs/cosmos3_edge_droid.yaml" \
+    --socket-path-prefix "$sock/" --upload-dir "$upload/" \
     --port "$2" --mooncake-port "$(( $2 + 1000 ))" --tensor-comm-protocol SHM
 }
 # SGLang generator rows, same knobs as bench_generator.

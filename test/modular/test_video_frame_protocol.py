@@ -22,19 +22,22 @@ sys.path.insert(0, str(REPO_ROOT))
 np = pytest.importorskip("numpy")
 pytest.importorskip("requests")
 
+from api_server_helpers import make_test_api_server  # noqa: E402
+
 from mstar.api_server import entrypoint  # noqa: E402
 from mstar.api_server.data_worker import (  # noqa: E402
     PreprocessWorkerThread,
     RequestOutputState,
     _video_frame_metadata,
 )
-from mstar.api_server.entrypoint import SUPPORTED_MODALITIES, APIServer  # noqa: E402
+from mstar.api_server.entrypoint import SUPPORTED_MODALITIES  # noqa: E402
 from mstar.api_server.request_types import PreprocessInput, ResultTensors  # noqa: E402
 from mstar.client import MStarClient, VideoFrameChunk  # noqa: E402
 from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.graph.loop_indices import NestedLoopIndices  # noqa: E402
 from mstar.model.waypoint.submodules import PRIME_WALK, ROLLOUT_WALK  # noqa: E402
 from mstar.model.waypoint.waypoint_model import WaypointModel  # noqa: E402
+from mstar.testing_utils.model import StubModel, make_model  # noqa: E402
 
 
 def _metadata(**overrides):
@@ -95,7 +98,7 @@ def test_sdk_rejects_nonstreaming_raw_frames_before_http():
 
 
 def test_api_core_rejects_nonstreaming_raw_frames_before_preprocessing():
-    server = APIServer.__new__(APIServer)
+    server = make_test_api_server()
     assert "video_frame" in SUPPORTED_MODALITIES
 
     with pytest.raises(ValueError, match="requires streaming=True"):
@@ -113,13 +116,20 @@ def test_api_core_rejects_nonstreaming_raw_frames_before_preprocessing():
         )
 
 
+def _form_request(**fields):
+    async def form():
+        return fields
+
+    return SimpleNamespace(form=form)
+
+
 def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypatch):
     monkeypatch.setattr(entrypoint, "api_server", object())
 
     with pytest.raises(HTTPException) as raised:
         asyncio.run(
             entrypoint.generate(
-                request=SimpleNamespace(),
+                request=_form_request(streaming="false"),
                 text=None,
                 files=None,
                 input_modalities=None,
@@ -131,7 +141,11 @@ def test_native_endpoint_reports_nonstreaming_raw_frames_as_bad_request(monkeypa
         )
 
     assert raised.value.status_code == 400
-    assert "requires streaming=true" in str(raised.value.detail)
+    # test/rust/test_rust_frontend.py checks mstar-server sends the same
+    assert raised.value.detail == (
+        "Output modality video_frame requires streaming=true; raw frame "
+        "chunks cannot be returned as an aggregated response."
+    )
 
 
 def test_native_endpoint_rejects_raw_frames_as_input(monkeypatch):
@@ -140,7 +154,7 @@ def test_native_endpoint_rejects_raw_frames_as_input(monkeypatch):
     with pytest.raises(HTTPException) as raised:
         asyncio.run(
             entrypoint.generate(
-                request=SimpleNamespace(),
+                request=_form_request(input_modalities="video_frame"),
                 text=None,
                 files=None,
                 input_modalities="video_frame",
@@ -174,7 +188,7 @@ def test_server_metadata_is_canonical_and_counts_raw_frames():
     }
 
 
-class _FrameModel:
+class _FrameModel(StubModel):
     def postprocess(self, tensor, modality, request_kwargs=None):
         assert modality == "video_frame"
         return tensor.cpu().contiguous().numpy().tobytes()
@@ -191,6 +205,11 @@ class _ReadyTensorManager:
         self.ready = tensors_by_request
         self.dereferenced = []
         self.cleaned = []
+
+    def take_failed_reads(self):
+
+        return []
+
 
     def get_ready_tensors(self):
         ready, self.ready = self.ready, {}
@@ -380,10 +399,13 @@ def test_data_worker_cleanup_drops_all_frame_protocol_state():
     assert "reused" not in worker.request_output_state
     assert worker.request_output_state["other"].frame_index == 8
 
-    worker.model = SimpleNamespace(process_prompt=lambda *args, **kwargs: {})
+    worker.model = make_model(process_prompt=lambda *args, **kwargs: {})
     worker.device = "cpu"
     worker.enable_prof = False
-    worker._prefix_streams = {}
+    worker.timing_requested = threading.Event()
+    worker._keyed_labels = {}
+    worker._live_requests = {}
+    worker._client_edges = frozenset()
     worker.communicator = SimpleNamespace(send=lambda *args: None)
     worker._process_input(
         PreprocessInput(
@@ -618,14 +640,18 @@ def test_rollout_harness_requires_worker_schedule_interleaving_and_cleanup_marke
             "DEBUG Executing: dit graph_walk=rollout ('rid-b',)",
             "DEBUG Executing: dit graph_walk=rollout ('rid-a',)",
             "DEBUG Executing: dit graph_walk=rollout ('rid-b',)",
-            "INFO Request cleanup complete: rid-a",
-            "INFO Request cleanup complete: rid-b",
+            "DEBUG Request cleanup complete: rid-a",
+            "DEBUG Request cleanup complete: rid-b",
         ]
     )
 
     assert interleaving_failure(log, ("rid-a", "rid-b")) is None
     assert harness["_execution_count_failure"](log, ("rid-a", "rid-b"), 2) is None
     assert harness["_cleaned_request_ids"](log) == {"rid-a", "rid-b"}
+    # the server logs the internal id: the client's plus a "#<n>" suffix
+    suffixed = log.replace("rid-a", "rid-a#0").replace("rid-b", "rid-b#0")
+    assert harness["_dit_schedule"](suffixed, {"rid-a", "rid-b"}) == harness["_dit_schedule"](log, {"rid-a", "rid-b"})
+    assert harness["_cleaned_request_ids"](suffixed) == {"rid-a", "rid-b"}
     serial = "\n".join(
         [
             "DEBUG Executing: dit graph_walk=rollout ('rid-a',)",

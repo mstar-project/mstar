@@ -8,13 +8,15 @@ patchified 2x2 into ``[B, 4C, H/2, W/2]`` and packed to tokens ``[B, (H/2)(W/2),
 from __future__ import annotations
 
 import io
-import os
 import struct
+import threading
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
+
+from mstar.utils import cpus
+from mstar.utils.threads import ThreadPool
 
 
 def patchify_latents(latents: torch.Tensor) -> torch.Tensor:
@@ -80,17 +82,15 @@ def pixels_to_uint8(image: torch.Tensor) -> torch.Tensor:
     return (image * 255).round().to(torch.uint8)
 
 
-PNG_WORKERS = min(8, os.cpu_count() or 1)
-
-
 def uint8_to_png(
-    image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int = PNG_WORKERS,
+    image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int | None = None,
 ) -> bytes:
     """Encode one uint8 ``[3, H, W]`` (or ``[1, 3, H, W]``) tensor as PNG bytes, losslessly.
 
     The default writer emits every scanline with PNG filter 0 and deflates the image in
-    ``workers`` independent blocks stitched into one zlib stream (pigz-style: each block ends
-    on a byte boundary with a sync flush, one adler32 over the whole image). At level 1 on
+    ``workers`` independent blocks (default: the CPU plan's ``png_threads``) stitched into one
+    zlib stream (pigz-style: each block ends on a byte boundary with a sync flush, one adler32
+    over the whole image). At level 1 on
     8 threads a 1024x1024 image encodes in ~15 ms against ~440 ms for PIL's default
     (adaptive filters, zlib 6), which was half of a served request, at ~30% larger files.
     ``adaptive_filters=True`` hands the encode to PIL at the same zlib level for the smaller
@@ -114,36 +114,85 @@ def uint8_to_png(
     return b"".join((
         b"\x89PNG\r\n\x1a\n",
         _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),  # 8-bit RGB
-        _png_chunk(b"IDAT", _zlib_parallel(raw.tobytes(), compress_level, workers)),
+        _png_chunk(b"IDAT", _zlib_parallel(
+            memoryview(raw).cast("B"), compress_level, workers or cpus.plan().png_threads,
+        )),
         _png_chunk(b"IEND", b""),
     ))
 
 
-def _zlib_parallel(data: bytes, level: int, workers: int, min_block: int = 1 << 18) -> bytes:
-    """One valid zlib stream from ``workers`` independently deflated blocks.
+def _zlib_parallel(data, level: int, workers: int, min_block: int = 1 << 18) -> bytes:
+    """One valid zlib stream from ``workers`` independently deflated blocks of the
+    bytes-like ``data``.
 
     Raw deflate blocks ended with ``Z_SYNC_FLUSH`` finish on a byte boundary, so their
     concatenation is one deflate stream once the last block carries the final bit; zlib
-    releases the GIL, so the blocks compress in parallel. Small inputs take the plain path.
+    releases the GIL, so the blocks compress in parallel, on the process's deflate pool
+    (:func:`_deflate_pool`). Small inputs take the plain path.
     """
     blocks = max(1, min(workers, len(data) // min_block))
     if blocks == 1:
         return zlib.compress(data, level)
     size = -(-len(data) // blocks)
-    parts = [data[i * size:(i + 1) * size] for i in range(blocks)]
+    view = memoryview(data)
 
-    def deflate(index: int, part: bytes) -> bytes:
+    def deflate(index: int) -> bytes:
         compressor = zlib.compressobj(level, zlib.DEFLATED, -zlib.MAX_WBITS)
-        out = compressor.compress(part)
+        out = compressor.compress(view[index * size:(index + 1) * size])
         return out + compressor.flush(zlib.Z_FINISH if index == blocks - 1 else zlib.Z_SYNC_FLUSH)
 
-    with ThreadPoolExecutor(max_workers=blocks) as pool:
-        deflated = list(pool.map(deflate, range(blocks), parts))
+    futures = [_deflate_pool().submit(deflate, index) for index in range(blocks)]
+    adler = zlib.adler32(view) & 0xFFFFFFFF
     # zlib header: deflate, 32K window, no preset dictionary, "fastest" level hint (FCHECK ok)
-    return b"\x78\x01" + b"".join(deflated) + struct.pack(">I", zlib.adler32(data) & 0xFFFFFFFF)
+    return b"\x78\x01" + b"".join(future.result() for future in futures) + struct.pack(">I", adler)
+
+
+_deflate_threads: ThreadPool | None = None
+_deflate_lock = threading.Lock()
+
+
+def _deflate_pool() -> ThreadPool:
+    """The threads every PNG of this process deflates its blocks on, the CPU plan's
+    ``deflate_threads``. Images encoded at once queue their blocks here instead of
+    each starting threads of its own, and the images the data worker encodes at
+    once still deflate all their blocks together."""
+    global _deflate_threads
+    if _deflate_threads is None:
+        with _deflate_lock:
+            if _deflate_threads is None:
+                _deflate_threads = ThreadPool(
+                    max_workers=cpus.plan().deflate_threads, thread_name_prefix="mstar-deflate",
+                )
+    return _deflate_threads
 
 
 OUTPUT_FORMATS = ("png", "jpeg", "webp")
+
+
+def image_output_format(request_kwargs: dict | None) -> str:
+    """The request's ``output_format`` (default ``png``; ``jpg`` means ``jpeg``), or ValueError
+    for one :func:`encode_image` cannot write, or a value it cannot apply for that format's
+    knob (``png_compress_level`` 0-9 for PNG, ``output_compression`` 0-100 otherwise). A model
+    calls it at intake too, so a bad value fails the request before generation rather than after."""
+    kwargs = request_kwargs or {}
+    fmt = str(kwargs.get("output_format") or "png").lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if fmt not in OUTPUT_FORMATS:
+        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, got {fmt!r}")
+    key, top = ("png_compress_level", 9) if fmt == "png" else ("output_compression", 100)
+    value = kwargs.get(key)
+    if value is None:
+        return fmt
+    try:
+        # a whole number as encode_image's int() reads it (90, 90.0, "90"), not True or 50.9
+        ok = not isinstance(value, bool) and (isinstance(value, str) or int(value) == value)
+        ok = ok and 0 <= int(value) <= top
+    except (TypeError, ValueError, OverflowError):
+        ok = False
+    if not ok:
+        raise ValueError(f"{key} must be a whole number from 0 to {top}, got {value!r}")
+    return fmt
 
 
 def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> bytes:
@@ -155,13 +204,10 @@ def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> byt
     Everything else decodes to the pixels the VAE produced (PNG losslessly).
     """
     kwargs = request_kwargs or {}
-    fmt = str(kwargs.get("output_format") or "png").lower()
-    if fmt == "jpg":
-        fmt = "jpeg"
-    if fmt not in OUTPUT_FORMATS:
-        raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}, got {fmt!r}")
+    fmt = image_output_format(kwargs)
     if fmt == "png":
-        return uint8_to_png(image, compress_level=int(kwargs.get("png_compress_level", 1)))
+        level = kwargs.get("png_compress_level")
+        return uint8_to_png(image, compress_level=1 if level is None else int(level))
     from PIL import Image
 
     if image.ndim == 4:
@@ -170,7 +216,7 @@ def encode_image(image: torch.Tensor, request_kwargs: dict | None = None) -> byt
     quality = int(quality) if quality is not None else (95 if fmt == "jpeg" else 80)
     buffer = io.BytesIO()
     Image.fromarray(image.permute(1, 2, 0).contiguous().cpu().numpy(), mode="RGB").save(
-        buffer, format=fmt.upper(), quality=max(0, min(100, quality)),
+        buffer, format=fmt.upper(), quality=quality,
     )
     return buffer.getvalue()
 

@@ -43,20 +43,21 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
     partition = PartitionState(
         partition_name="default",
         metadata=CurrentForwardConductorMetadata(
-            graph_walk="image_gen_cfg",
+            graph_walk="image_gen_cfg2",
             is_prefill=False,
         ),
         current_worker_graph_ids={"wg"},
     )
     request = SimpleNamespace(
         partition_states={"default": partition},
-        final_outputs={},
+        output_chunk_counts={},
         persist_signals={},
         streaming_connections={},
         worker_graph_to_workers={"wg": ["worker_0", "worker_1"]},
     )
     conductor = Conductor.__new__(Conductor)
     conductor.enable_prof = False
+    conductor.producer_triggered_partitions = set()
     conductor.requests = {"request": request}
 
     for rank in (1, 0):
@@ -76,16 +77,19 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
 
 
 def _tp2_manager(rank: int, entity_id: str, shm_dir: str) -> KVManager:
+    cfg = PagedKVConfig(
+        num_layers=1,
+        num_kv_heads=2,
+        num_qo_heads=2,
+        head_dim=1,
+        max_seq_len=16,
+        max_num_pages=8,
+        page_size=4,
+    )
+    # one rank's head, as ``KVManager.build`` shards it
+    cfg.shard(2)
     return KVManager(
-        cfg=PagedKVConfig(
-            num_layers=1,
-            num_kv_heads=2,
-            num_qo_heads=2,
-            head_dim=1,
-            max_seq_len=16,
-            max_num_pages=8,
-            page_size=4,
-        ),
+        cfg=cfg,
         name="kv",
         joint_comm_group=SimpleNamespace(rank=rank, world_size=2),
         transfer_engine_info=TransferEngineInfo(
@@ -140,7 +144,7 @@ def test_tp2_kv_managers_transfer_each_published_rank_shard(tmp_path):
             outcome = consumer.admit_retrieve(
                 request_id,
                 node_name="LLM",
-                graph_walk="image_gen_cfg",
+                graph_walk="image_gen_cfg2",
                 published=rank_shards,
             )
             assert outcome.ok and outcome.ready

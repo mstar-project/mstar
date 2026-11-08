@@ -1,6 +1,6 @@
 """Wan22Model: Wan2.2-TI2V-5B text/image-to-video generation.
 
-Architecture (4 nodes, no engine resources — nothing here is cached):
+Architecture (4 nodes; nothing here is cached, the dit's self-attention is a ragged resource):
     text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
     vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
     dit          - dense 5B video DiT; CFG as one batch-2 forward,
@@ -26,11 +26,9 @@ request's ``num_inference_steps`` stops it via ``Wan22DitSubmodule.check_stop``.
 """
 
 import html
-import io
 import logging
 import os
 import re
-from fractions import Fraction
 
 import torch
 
@@ -40,6 +38,7 @@ from mstar.conductor.request_info import (
     StreamingConnectionState,
 )
 from mstar.engine.resources import NodeResourceSpec
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -50,6 +49,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
@@ -62,6 +62,9 @@ from mstar.model.wan22.submodules import (
 )
 
 logger = logging.getLogger(__name__)
+
+# libx264, which postprocess encodes with, refuses a frame wider or taller than this
+_MP4_MAX_SIDE = 16384
 
 
 class Wan22Model(Model):
@@ -81,7 +84,13 @@ class Wan22Model(Model):
         model_path_hf: str,
         cache_dir: str | None = None,
         variant: str = WAN22_VARIANT_TI2V_5B,
+        compile_dit_sizes: tuple[str, ...] | None = None,
+        dit_max_batch_size: int = Wan22Config.dit_max_batch_size,
+        max_video_pixels: int = Wan22Config.max_video_pixels,
         skip_weight_loading: bool = False,
+        vae_decode_fast: bool = True,
+        vae_decode_fast_sizes: tuple[str, ...] | None = None,
+        attention_backend: str = "flashinfer",
         **kwargs,
     ):
         if variant != WAN22_VARIANT_TI2V_5B:
@@ -91,7 +100,14 @@ class Wan22Model(Model):
             )
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
-        self.config = Wan22Config(variant=variant)
+        self.config = Wan22Config(
+            variant=variant, compile_dit_sizes=compile_dit_sizes,
+            dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
+            max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
+            vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
+            attention_backend=attention_backend,
+        )
+        self.config.compile_dit_grids()  # a malformed list fails at startup
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
@@ -111,7 +127,8 @@ class Wan22Model(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No engine-built resources: every node here is stateless.
+        """The DiT's self-attention as a cacheless ragged resource (with
+        ``attention_backend: flashinfer``); nothing here keeps state.
 
         Nothing in this model reads K/V back across steps. The text encoder
         and both VAE passes are one-shot forwards, and the DiT recomputes
@@ -119,7 +136,28 @@ class Wan22Model(Model):
         the only state that crosses a step is the UniPC solver's, which
         rides the loop-back edges as ordinary tensors rather than a cache.
         """
-        return []
+        if self.config.attention_backend != "flashinfer":
+            return []
+        cfg = self.config
+        # Self-attention only: the cross-attention over the 512 text tokens runs
+        # SDPA (cuDNN), which measured faster than FlashInfer's ragged kernel at
+        # that shape (0.46 vs 0.59 ms per layer at 1280x704x81 on an H200), while
+        # FA3 beats it on the self-attention (12.4 vs 14.8 ms).
+        return [
+            RaggedAttentionSpec(
+                resource_key=Wan22DitSubmodule.SELF_ATTN, nodes={"dit"},
+                config=RaggedAttentionConfig(
+                    num_qo_heads=cfg.num_attention_heads,
+                    num_kv_heads=cfg.num_attention_heads,
+                    head_dim=cfg.attention_head_dim,
+                    # one segment per guidance branch
+                    max_segments_per_request=2,
+                    # the DiT is compiled, not captured: keep attention in its graph
+                    compile_op=True,
+                    dtype=torch.bfloat16,
+                ),
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
@@ -163,11 +201,10 @@ class Wan22Model(Model):
         if i2v:
             dit_inputs.append("image_latent")
         # Loop-carried state: see Wan22DitSubmodule's docstring for the
-        # definitive shape/dtype inventory (latents, 0-based step index, the
-        # order-2 UniPC ring buffer, and the corrector's last_sample).
+        # definitive shape/dtype inventory (latents, the order-2 UniPC ring
+        # buffer, and the corrector's last_sample).
         dit_inputs += [
             "latents",
-            "time_index",
             "unipc_model_outputs",
             "unipc_last_sample",
         ]
@@ -179,7 +216,6 @@ class Wan22Model(Model):
                 input_names=dit_inputs,
                 outputs=[
                     GraphEdge(next_node="dit", name="latents"),
-                    GraphEdge(next_node="dit", name="time_index"),
                     GraphEdge(next_node="dit", name="unipc_model_outputs"),
                     GraphEdge(next_node="dit", name="unipc_last_sample"),
                 ],
@@ -267,7 +303,9 @@ class Wan22Model(Model):
 
         height and width must be multiples of 32 (VAE downsample 16 x DiT patch 2),
         num_frames must be 4k+1 (the VAE compresses time by 4 around an anchor
-        frame), and fps must be positive.
+        frame), height x width x num_frames must not exceed ``max_video_pixels``, each
+        axis must fit the DiT's rotary table and each side the mp4 encoder, and fps
+        must be positive.
 
         This runs on the data worker because that is where a ValueError becomes a
         400 for the one bad request. Left to fail later, none of these fail well:
@@ -279,11 +317,12 @@ class Wan22Model(Model):
         the raise is swallowed and the client hangs.
         """
         cfg = self.config
+        size = {}
         for name, patch, align, default in (
             ("height", cfg.patch_size[1], cfg.spatial_alignment[0], cfg.default_height),
             ("width", cfg.patch_size[2], cfg.spatial_alignment[1], cfg.default_width),
         ):
-            value = self._require_positive_int(name, model_kwargs.get(name, default))
+            value = size[name] = self._require_positive_int(name, model_kwargs.get(name, default))
             if value % align:
                 lower = value // align * align
                 upper = lower + align
@@ -307,6 +346,30 @@ class Wan22Model(Model):
                 f"(the VAE compresses time by {temporal} around an anchor frame). "
                 f"An unaligned count is silently floored rather than honored. "
                 f"Nearest valid num_frames: {lower} or {upper}."
+            )
+
+        height, width = size["height"], size["width"]
+        if height * width * frames > cfg.max_video_pixels:
+            raise ValueError(
+                f"Wan2.2 height x width x num_frames = {height}x{width}x{frames} = "
+                f"{height * width * frames} exceeds this server's max_video_pixels={cfg.max_video_pixels}."
+            )
+        # One rotary position per post-patch cell on each axis.
+        rope = cfg.rope_max_seq_len
+        max_h, max_w = (rope * a for a in cfg.spatial_alignment)
+        max_frames = (rope - 1) * temporal + 1
+        if height > max_h or width > max_w or frames > max_frames:
+            raise ValueError(
+                f"Wan2.2 supports at most height {max_h}, width {max_w} and num_frames "
+                f"{max_frames} (the DiT's {rope} rotary positions per axis); got "
+                f"{height}x{width}x{frames}."
+            )
+        # postprocess encodes the clip with libx264, which opens no stream past this
+        # side; checked here, not after the video is generated
+        if max(height, width) > _MP4_MAX_SIDE:
+            raise ValueError(
+                f"Wan2.2 supports at most {_MP4_MAX_SIDE} pixels per side (the mp4 encoder's "
+                f"limit); got {height}x{width}."
             )
 
         # An explicit ``fps: null`` means "unset", same as an absent key.
@@ -406,7 +469,7 @@ class Wan22Model(Model):
             )
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        """Mux the emitted uint8 ``[1, 3, F, H, W]`` video tensor to mp4 bytes.
+        """Mux the emitted uint8 ``[F, H, W, 3]`` frames to mp4 bytes.
 
         PyAV is the encoder because it bundles its own FFmpeg; torchcodec needs
         system FFmpeg libraries. ``fps`` is a PLAYBACK rate, not a generation knob:
@@ -415,7 +478,6 @@ class Wan22Model(Model):
         """
         if modality != "video":
             raise ValueError(f"Unsupported modality for Wan2.2: {modality!r}")
-        import av
 
         # An explicit ``fps: null`` means "unset", same as an absent key.
         raw_fps = (request_kwargs or {}).get("fps")
@@ -428,22 +490,7 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        frames = output[0].permute(1, 2, 3, 0).cpu().numpy()
-        buffer = io.BytesIO()
-        container = av.open(buffer, mode="w", format="mp4")
-        # PyAV rejects float rates, so the rate is handed over as an exact
-        # Fraction: integer rates stay integral (24 -> 24) and fractional ones
-        # become a rational the container can carry (23.976 -> 2997/125).
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
-        stream.height, stream.width = frames.shape[1], frames.shape[2]
-        stream.pix_fmt = "yuv420p"
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():  # flush encoder delay
-            container.mux(packet)
-        container.close()
-        return buffer.getvalue()
+        return encode_mp4(output.cpu().numpy(), fps)
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration
@@ -462,7 +509,7 @@ class Wan22Model(Model):
         }
 
     def _log_config_echo(self, model_kwargs: dict, resolved: dict) -> None:
-        """Emit one vllm-style line per request at generation start, echoing every
+        """Emit one ``key=value`` log line per request at generation start, echoing every
         resolved setting so an operator can read back exactly what ran instead of
         asserting the knobs. ``decode`` is the configured tiling POLICY
         (auto/tiled/untiled, resolved from config + env); the actual per-request
@@ -584,7 +631,6 @@ class Wan22Model(Model):
             inputs.append(edge)
         inputs += [
             GraphEdge(next_node="dit", name="latents"),
-            GraphEdge(next_node="dit", name="time_index"),
             GraphEdge(next_node="dit", name="unipc_model_outputs"),
             GraphEdge(next_node="dit", name="unipc_last_sample"),
         ]
@@ -719,7 +765,7 @@ class Wan22Model(Model):
         """
         from diffusers import UniPCMultistepScheduler
 
-        from mstar.model.wan22.components.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
+        from mstar.model.components.diffusion.unipc import NUM_TRAIN_TIMESTEPS, SOLVER_ORDER
 
         scheduler_config = UniPCMultistepScheduler.load_config(
             self.model_path_hf, subfolder="scheduler", cache_dir=self.cache_dir,

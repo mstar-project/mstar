@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from mstar.testing_utils.worker import make_worker
+from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     MessageSource,
@@ -17,6 +19,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.micro_scheduler import REMOVED_RID, MicroScheduler
 from mstar.worker.rid_table import RidTable
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 # ── the table ──────────────────────────────────────────────────────────────
@@ -116,12 +119,13 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     """A worker whose graph runtime is only the rid table: the boundary is
     what these tests are about, and the runtime owns the table."""
     t = RidTable()
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w.is_tp_follower = False
+    w = make_worker()
     w.sent = []
     w.communicator = SimpleNamespace(send=lambda e, m: w.sent.append((e, m)))
     w.removed_in_runtime = []
+    w._removed_rids = RecentSet(16)
+    w._unprocessed_messages = {}
+    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
 
     def _runtime_remove(h):
         # The handle must be freed only after every worker-side map dropped it.
@@ -132,6 +136,7 @@ def _worker(*rids: str) -> tuple[Worker, RidTable]:
     w._graph_runtime = SimpleNamespace(
         # The runtime mints the handle now; interning is still the whole of it.
         add_request=lambda request_id, **kw: t.intern(request_id),
+        register_stop_limits=lambda rid, info: None,
         get_rid_handle=t.handle, get_rid_string=t.name,
         get_sharding_config=lambda h: SimpleNamespace(groups=[]),
         remove_request=_runtime_remove,
@@ -161,21 +166,26 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     w, t = _worker("req-a", "req-b")
     a, b = t.handle("req-a"), t.handle("req-b")
     w._in_flight_rids = set()
-    w._pending_removes = set()
+    w._pending_removes = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w._last_active = {}
-    w.streaming_buffers = {a: {}}
-    w.engine_manager = SimpleNamespace(remove_request=lambda h: None, evictable_nodes=lambda: [])
+    w._rebuilds._kept = {"n": {a: None, b: None}}
+    w._rebuilds._cursors[("n", a)] = None
+    w.engine_manager = SimpleNamespace(remove_request=lambda h: None)
     w.tensor_manager = SimpleNamespace(force_cleanup_request=lambda h: None)
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
+    w.streams._rids.add(a)
     w.profile_info = SimpleNamespace(pop_request=lambda h: None)
     w.scheduler.held_until[a] = float("inf")
 
     w._remove_request(RemoveRequest(request_id="req-a", source=MessageSource.SELF))
 
+    assert not w.streams.possible(), "the stream manager forgets the handle"
+
     assert w.removed_in_runtime == [a]
     assert b in w.request_state.per_request_info
-    assert a not in w.streaming_buffers
     assert a not in w.scheduler.held_until
+    assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
+    assert not w._rebuilds._cursors, "the next request would run this one's rebuild"
     # Freed last, and reused by the next request: nothing of req-a's may remain.
     assert t.handle("req-a") is None
     assert t.intern("req-c") == a
@@ -197,34 +207,9 @@ def test_tensor_ack_is_keyed_by_uuid_alone():
         dereference_batch=lambda uuids, counts: acked.append((uuids, counts)),
     )
     w._handle_tensor_received(TensorReceived(
-        request_id="gone", successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
+        successful_tensors={1: 2, 3: 1}, failed_tensor_ids=[],
     ))
     assert acked == [([1, 3], [2, 1])]
-
-
-# ── handles never leave the process in text ────────────────────────────────
-
-def test_worker_graph_errors_name_the_wire_rid_not_the_handle():
-    """A FAIL_REQUESTS body becomes the client's HTTP error detail. Handles
-    are worker-internal and recycled, so one in that text names whatever
-    request holds it by the time anyone reads it."""
-    from mstar.worker.node_manager_utils import _rid_name
-
-    t = RidTable()
-    a = t.intern("req-abc")
-    assert _rid_name(t.name, a) == "req-abc"
-
-
-def test_rendering_a_released_handle_does_not_raise():
-    """These messages report a rid the worker could not find, so the render
-    is as likely to fail as the lookup that got there."""
-    from mstar.worker.node_manager_utils import _rid_name
-
-    t = RidTable()
-    a = t.intern("req-abc")
-    t.release(a)
-    assert "released" in _rid_name(t.name, a)
-    assert "unresolved" in _rid_name(None, a)
 
 
 def test_add_new_request_hands_the_handle_to_every_subsystem():
@@ -234,20 +219,22 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     w, t = _worker()
     got: dict[str, object] = {}
     cfg = SimpleNamespace(sharding_config="cfg", stream_buffers={})
-    w.request_state.add_request = (
-        lambda request_id, request_info: got.__setitem__("state", request_id)
-    )
+
+    def _state_add(request_id, request_info):
+        got["state"] = request_id
+        w.request_state.per_request_info[request_id] = cfg
+
+    w.request_state.add_request = _state_add
     w.engine_manager = SimpleNamespace(
-        add_request=lambda rid, cfgs: got.__setitem__("engine", rid),
-        evictable_nodes=lambda: [],
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+        add_request=lambda rid, cfgs, info: got.__setitem__("engine", rid),
     )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sc: got.__setitem__("tensors", rid),
         start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
     w._draining_rids = set()
-    w._last_active = {}
-    w._my_consumer_connections = []
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
     w._unprocessed_messages = {}
     info = SimpleNamespace(
@@ -257,10 +244,8 @@ def test_add_new_request_hands_the_handle_to_every_subsystem():
     body = SimpleNamespace(
         request_id="wire-1", request_info=info,
         partition_worker_graph_ids={}, worker_graph_to_workers={},
-        initial_inputs=[],
+        initial_inputs=[], loop_caps={},
     )
-    w.request_state.per_request_info = {0: cfg}
-
     Worker._add_new_request(w, body)
 
     handle = t.handle("wire-1")
@@ -283,17 +268,20 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
     req = SimpleNamespace(stream_buffers={}, stream_buffers_by_consumer={})
     w.request_state.add_request = lambda request_id, request_info: None
     w.request_state.per_request_info = collections.defaultdict(lambda: req)
-    w.engine_manager = SimpleNamespace(add_request=lambda rid, cfgs: None, evictable_nodes=lambda: [])
+    w.engine_manager = SimpleNamespace(
+        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+        add_request=lambda rid, cfgs, info: None,
+    )
     w.tensor_manager = SimpleNamespace(
         register_request=lambda rid, sc: None, start_read_tensors=lambda rid, inputs, graph_walk=None: [],
     )
-    w._draining_rids, w._last_active, w._unprocessed_messages = set(), {}, {}
+    w._draining_rids, w._unprocessed_messages = set(), {}
     w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w._consumer_node_cache = {"codec_tokens": "Codec"}
-    w._my_consumer_connections = [Connection(
+    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [Connection(
         from_partition="Talker", to_partition="Codec", edge_name="codec_tokens",
         chunk_policy_factory=lambda: ScheduledLeftContextChunkPolicy(schedule=(1,), chunk=2, left_context=3),
-    )]
+    )])
+    w.streams.consumer_node = {"codec_tokens": "Codec"}
 
     def new(partition, lead):
         info = SimpleNamespace(
@@ -302,7 +290,7 @@ def test_add_new_request_keeps_the_stream_buffer_and_primes_it_for_its_consumer(
         )
         body = SimpleNamespace(
             request_id="wire-1", request_info=info, partition_worker_graph_ids={},
-            worker_graph_to_workers={}, initial_inputs=[],
+            worker_graph_to_workers={}, initial_inputs=[], loop_caps={},
         )
         Worker._add_new_request(w, body)
 

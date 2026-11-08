@@ -64,6 +64,8 @@ class ShardingConfig:
     # group is the lockstep unit, spanning the whole tp*sp instance. This
     # set itself only gates config validation.
     sp_enabled_nodes: set[str] = field(default_factory=set)
+    # Nodes whose routed experts honour a node group's ``ep_config``; gates validation.
+    ep_enabled_nodes: set[str] = field(default_factory=set)
 
     def clone_empty(self):
         return ShardingConfig(
@@ -71,6 +73,7 @@ class ShardingConfig:
             tp_enabled_nodes=self.tp_enabled_nodes,
             shard_dim=self.shard_dim,
             sp_enabled_nodes=self.sp_enabled_nodes,
+            ep_enabled_nodes=self.ep_enabled_nodes,
         )
 
     def get_sharding_group(
@@ -83,6 +86,7 @@ class ShardingConfig:
         self.node_to_worker: dict[NodeAndGraphWalk, list[str]] = {}
         self.tp_enabled_nodes = set(self.tp_enabled_nodes)
         self.sp_enabled_nodes = set(self.sp_enabled_nodes)
+        self.ep_enabled_nodes = set(self.ep_enabled_nodes)
         self._setup_done = False
 
     def assert_stream_consumer_compatibility(self, streaming_consumers: set[str]):
@@ -97,6 +101,42 @@ class ShardingConfig:
                     "configuration. For streaming consumers, it is disallowed to to map different "
                     "graph walks to different workers."
                 ))
+
+    def assert_streams_keep_tp_size(
+        self, stream_edges: list[tuple[str, str, str, str]],
+    ):
+        """Refuses a sharded streamed signal whose producer and consumer
+        differ in TP size, given (signal, producer node, the graph walk it
+        emits from, consumer node).
+
+        Between equal TP sizes each rank streams its own shard to its peer.
+        Across sizes the fanout gathers shards, which the consumer buffers per
+        (request, signal) rather than per chunk and emits under a uuid its
+        StreamBuffer never registered, or slices them, which local streaming
+        ignores.
+        """
+        def tp_size(node: str, walk: str | None) -> int:
+            # A streaming consumer's group covers every walk; a producer's
+            # may be walk-specific, and a node in no group is TP 1.
+            for group in self.groups:
+                if node in group.nodes and (
+                    walk is None or group.graph_walks is None or walk in group.graph_walks
+                ):
+                    return group.tp_size
+            return 1
+
+        for signal, producer, walk, consumer in stream_edges:
+            if self.shard_dim.get(signal) is None:
+                continue
+            producer_tp, consumer_tp = tp_size(producer, walk), tp_size(consumer, None)
+            if producer_tp != consumer_tp:
+                raise RuntimeError(
+                    f"Streamed signal {signal!r} has a shard_dim, but its producer {producer!r} "
+                    f"in graph walk {walk!r} (TP {producer_tp}) and consumer {consumer!r} "
+                    f"(TP {consumer_tp}) differ in TP size. A streamed signal can only be "
+                    "sharded between equal TP sizes: drop its sharding_config.shard_dim entry "
+                    "or give both nodes the same tp_size."
+                )
 
     def setup(
         self, node_to_workers: dict[NodeAndGraphWalk, list[str]]
@@ -221,7 +261,7 @@ class ShardingConfig:
                         tp_rank=dest_worker_to_tp_rank.get(worker, 0)
                     ))
         else:  # sharded
-            # like in vLLM, we will enforce that the TP size divides the shard dim size
+            # we enforce that the TP size divides the shard dim size
             total_sizes = [s * source_tp_size for s in shard_dim_sizes]
             assert all([s % dest_tp_size == 0 for s in total_sizes]), (
                 f"some total shard dim size from {total_sizes} not divisible by "
@@ -265,10 +305,16 @@ class ShardingConfig:
         dest_graph_walk: str | None,
         source_tp_rank: int | None = None,
     ) -> dict[str, GraphEdge]: # dest worker to graph edge
-        # canonical form: leading shard dim
-        shard_dim_sizes = [
-            info.dims[0] for info in graph_edge.tensor_info
-        ]
+        # Canonical form has the shard dim leading, so only a sharded signal is
+        # cut along dims[0]; a replicated one may be 0-dim. A missing leading
+        # dim counts as 0 rows, as in the Rust fanout.
+        if self.shard_dim.get(graph_edge.name) is None:
+            shard_dim_sizes = []
+        else:
+            shard_dim_sizes = [
+                info.dims[0] if len(info.dims) else 0
+                for info in graph_edge.tensor_info
+            ]
         fanout = self.compute_fanout(
             signal=graph_edge.name, source_graph_walk=source_graph_walk,
             source_node=source_node, dest_node=graph_edge.next_node,
@@ -315,9 +361,9 @@ class ShardingConfig:
                     # canonical form has leading shard dim
                     new_dims[0] = end_idx - start_idx
 
-                    # compute offset and new nbytes
-                    element_size = info.nbytes // math.prod(info.dims)
-                    row_nbytes = element_size * math.prod(info.dims[1:])
+                    # compute offset and new nbytes; a row can hold zero
+                    # bytes (a [4, 0] tensor), so never divide by the size
+                    row_nbytes = info.dtype.itemsize * math.prod(info.dims[1:])
                     # start_idx is a row of the LOGICAL tensor, but offset is
                     # a read into this rank's own shard (the reader does
                     # `canonical_tensor[offset // row : ...]`, and the

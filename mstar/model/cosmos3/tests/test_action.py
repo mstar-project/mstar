@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from mstar.model.components.diffusion.unipc import SOLVER_STATE, initial_state
 from mstar.model.cosmos3.components.packing import (
     action_condition_frame_indexes,
     build_action_static_inputs,
@@ -191,7 +192,7 @@ def test_action_denoise_step_matches_fused() -> None:
         )
         with torch.no_grad():
             dv, da = model.denoise_step(
-                latents, vts, s["position_ids"][:, und_len:],
+                latents, vts, model._rotary(s["gen_position_ids"], latents.device, latents.dtype),
                 s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
                 s["vision_mse_loss_indexes"] - und_len, "main", cache.attn,
                 action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
@@ -235,7 +236,7 @@ def test_action_batched_one_matches_single() -> None:
         cache.plan("main", [("main", n_gen)], causal=False)
         with torch.no_grad():
             dv, da = model.denoise_step(
-                latents, vts, s["position_ids"][:, und_len:],
+                latents, vts, model._rotary(s["gen_position_ids"], latents.device, latents.dtype),
                 s["vision_token_shapes"], s["vision_noisy_frame_indexes"],
                 s["vision_mse_loss_indexes"] - und_len, "main", cache.attn,
                 action_latents=action_lat, action_token_shapes=s["action_token_shapes"],
@@ -253,7 +254,7 @@ def test_action_batched_one_matches_single() -> None:
         req = {
             "latents": latents, "action_latents": action_lat,
             "vision_timesteps": vts, "action_timesteps": ats,
-            "position_ids_cond": s["position_ids"][:, und_len:],
+            "rotary_cond": model._rotary(s["gen_position_ids"], latents.device, latents.dtype),
             "vision_token_shapes": s["vision_token_shapes"],
             "vision_noisy_frame_indexes": s["vision_noisy_frame_indexes"],
             "vision_mse_loss_indexes": s["vision_mse_loss_indexes"] - und_len,
@@ -328,29 +329,36 @@ def test_action_engine_matches_fused() -> None:
         video_latents=cond_latent, num_frames=nf, height=h, width=w, fps=fps, action_fps=fps,
         num_inference_steps=steps, guidance_scale=1.0, flow_shift=fshift, generator=gen)
 
+    from mstar.model.cosmos3.submodules import LATENT_DTYPE
+
+    # the served loop state's dtype, as the fused pipeline draws it
     gen2 = torch.Generator(device=device).manual_seed(0)
-    a_noise = randn_tensor((1, chunk, dit.transformer.action_dim), generator=gen2, device=device, dtype=dtype)
+    a_noise = randn_tensor((1, chunk, dit.transformer.action_dim), generator=gen2, device=device, dtype=LATENT_DTYPE)
     a_noise[..., raw:] = 0
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
-    cond_ids, _ = tokenize_prompt(model.tokenizer, prompt, "", num_frames=nf, height=h, width=w, fps=fps)
+    cond_ids, _ = tokenize_prompt(model.tokenizer, prompt, "", num_frames=nf, height=h, width=w, fps=fps,
+                                  use_system_prompt=False, add_resolution_template=False,
+                                  add_duration_template=False)
     rid = "ra"
     md = {"height": h, "width": w, "num_frames": nf, "fps": fps, "action_fps": fps, "guidance_scale": 1.0,
           "num_inference_steps": steps, "action_mode": "inverse_dynamics", "action_chunk_size": chunk,
           "raw_action_dim": raw, "domain_id": dom, "flow_shift": fshift}
-    fwd = CurrentForwardPassInfo(request_id=rid, graph_walk="prefill", fwd_index=0,
+    fwd = CurrentForwardPassInfo(request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
                                  random_seed=0, max_tokens=0, step_metadata=md)
     resources = _SdpaResources().as_dict()
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor(cond_ids, dtype=torch.long, device=device)]})
     _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
     fwd.graph_walk = "action_gen"
-    latents, action_latents = cond_latent.clone(), a_noise.clone()
-    time_index = torch.zeros(1, dtype=torch.long, device=device)
-    for _ in range(steps):
+    latents, action_latents = cond_latent.to(LATENT_DTYPE), a_noise.clone()
+    solver = initial_state(dit._packed(latents, action_latents))
+    for k in range(steps):
+        fwd.dynamic_loop_iter_counts["action_gen_loop"] = k
         ni = dit.prepare_inputs("action_gen", fwd, {
-            "latents": [latents], "action_latents": [action_latents], "time_index": [time_index]})
+            "latents": [latents], "action_latents": [action_latents], **{n: [t] for n, t in solver.items()}})
         out = _forward_step(dit, "action_gen", resources, [rid], {rid: fwd}, [ni])
-        latents, action_latents, time_index = out["latents"][0], out["action_latents"][0], out["time_index"][0]
+        latents, action_latents = out["latents"][0], out["action_latents"][0]
+        solver = {n: out[n][0] for n in solver}
     dit.cleanup_request(rid)
     # The loop emits the full action latents (self-edge); trim to the raw action
     # width to compare with the fused pipeline's trimmed output.
@@ -358,6 +366,16 @@ def test_action_engine_matches_fused() -> None:
     diff = (act_fused.float() - pred_action.float()).abs().max().item()
     assert diff <= 1e-3, f"engine action differs from fused by {diff:.3e}"
     print(f"  action engine cache-once (sdpa) abs-max diff = {diff:.3e}")
+
+
+def _read_mp4_rgb(path: str) -> torch.Tensor:
+    """[T, H, W, 3] uint8 frames via PyAV (torchvision 0.27 dropped io.read_video)."""
+    import av
+
+    with av.open(path) as container:
+        return torch.stack([
+            torch.from_numpy(frame.to_ndarray(format="rgb24")) for frame in container.decode(video=0)
+        ])
 
 
 def test_action_id_golden_gate() -> None:
@@ -369,7 +387,6 @@ def test_action_id_golden_gate() -> None:
         return
     import json
 
-    import torchvision
     from PIL import Image
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
@@ -383,7 +400,7 @@ def test_action_id_golden_gate() -> None:
         return
     prompt, chunk, raw, dom, fps = "You are an autonomous vehicle planning system.", 60, 9, 1, 10.0
     nf = chunk + 1
-    frames, _, _ = torchvision.io.read_video(inp, pts_unit="sec")
+    frames = _read_mp4_rgb(inp)
     frames = frames[:nf]
     h, w = int(frames.shape[1]), int(frames.shape[2])
     procs = [mpipe.video_processor.preprocess(Image.fromarray(frames[i].numpy()), height=h, width=w).squeeze(0)
@@ -419,7 +436,6 @@ def test_action_fd_agibotworld_golden_gate() -> None:
         return
     import json
 
-    import torchvision
     from PIL import Image
 
     from mstar.model.cosmos3.components.packing import tokenize_prompt
@@ -455,7 +471,7 @@ def test_action_fd_agibotworld_golden_gate() -> None:
         out.append(pred.cpu())
         cond_frame = (pred[:, -1].clamp(0, 1) * 2 - 1).to(device=device, dtype=dtype)
     pred_video = torch.cat(out, dim=1)
-    g, _, _ = torchvision.io.read_video(gold_mp4, pts_unit="sec")
+    g = _read_mp4_rgb(gold_mp4)
     gold = (g.permute(3, 0, 1, 2).float() / 255.0)
     n = min(pred_video.shape[1], gold.shape[1])
     mse = (pred_video[:, :n] - gold[:, :n]).pow(2).mean().item()
@@ -511,7 +527,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
         # its output to the first denoise iteration as the ``cond_latents`` edge.
         enc = model.get_submodule("vae_encoder", device=device)
         fwd = CurrentForwardPassInfo(
-            request_id=rid, graph_walk="prefill_cond_video", fwd_index=0,
+            request_id=rid, rid_handle=rid, graph_walk="prefill_cond_video", fwd_index=0,
             random_seed=seeds[0], max_tokens=0, step_metadata=_md())
         ei = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: fwd})
         ni = enc.prepare_inputs("prefill_cond_video", fwd, {"video_inputs": [cond_videos[rid].to(device)]})
@@ -522,7 +538,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
 
     def _prefill(rid, idx, resources):
         fwd = CurrentForwardPassInfo(
-            request_id=rid, graph_walk="prefill", fwd_index=0,
+            request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
             random_seed=seeds[idx], max_tokens=0, step_metadata=_md())
         ni = dit.prepare_inputs("prefill", fwd, {
             "text_inputs": [torch.tensor(conds[idx], dtype=torch.long, device=device)],
@@ -538,15 +554,18 @@ def test_action_cross_request_batch_matches_individual() -> None:
             model, [rid], device, dtype, max_num_pages=128,
         )
         fwd = _prefill(rid, idx, resources)
-        lat = act = ti = None
-        for _ in range(steps):
+        lat = act = None
+        solver = {}
+        for k in range(steps):
+            fwd.dynamic_loop_iter_counts["action_gen_loop"] = k
             inp = ({"cond_latents": [cond_lat[rid]]} if lat is None
-                   else {"latents": [lat], "action_latents": [act], "time_index": [ti]})
+                   else {"latents": [lat], "action_latents": [act], **{n: [t] for n, t in solver.items()}})
             ni = dit.prepare_inputs("action_gen", fwd, inp)
             out = _forward_step(
                 dit, "action_gen", resources, [rid], {rid: fwd}, [ni],
             )
-            lat, act, ti = out["latents"][0], out["action_latents"][0], out["time_index"][0]
+            lat, act = out["latents"][0], out["action_latents"][0]
+            solver = {n: out[n][0] for n in SOLVER_STATE}
         dit.cleanup_request(rid)
         return act[:, :, :raw].float().cpu()
 
@@ -559,19 +578,23 @@ def test_action_cross_request_batch_matches_individual() -> None:
             fwds[rid] = _prefill(rid, i, resources)
         lat = {r: None for r in rids}
         act = {r: None for r in rids}
-        ti = {r: None for r in rids}
-        for _ in range(steps):
+        solver = {r: {} for r in rids}
+        for k in range(steps):
             inputs = []
             for rid in rids:
+                fwds[rid].dynamic_loop_iter_counts["action_gen_loop"] = k
                 inp = {"cond_latents": [cond_lat[rid]]} if lat[rid] is None else {
-                    "latents": [lat[rid]], "action_latents": [act[rid]], "time_index": [ti[rid]]}
+                    "latents": [lat[rid]], "action_latents": [act[rid]],
+                    **{n: [t] for n, t in solver[rid].items()},
+                }
                 inputs.append(dit.prepare_inputs("action_gen", fwds[rid], inp))
             out = _forward_step(
                 dit, "action_gen", resources, rids, fwds, inputs, batched=True,
             )
             for rid in rids:
                 o = out[rid]
-                lat[rid], act[rid], ti[rid] = o["latents"][0], o["action_latents"][0], o["time_index"][0]
+                lat[rid], act[rid] = o["latents"][0], o["action_latents"][0]
+                solver[rid] = {n: o[n][0] for n in SOLVER_STATE}
         res = {rid: act[rid][:, :, :raw].float().cpu() for rid in rids}
         for rid in rids:
             dit.cleanup_request(rid)

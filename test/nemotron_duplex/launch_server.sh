@@ -2,10 +2,10 @@
 # Launch the Nemotron-Duplex (VoiceChat-11B) full-duplex server.
 #
 #   ./launch_server.sh              # single-GPU layout (configs/nemotron_duplex.yaml)
-#   ./launch_server.sh disagg       # 3-GPU disaggregated layout (nemotron_duplex_disagg.yaml)
+#   ./launch_server.sh disagg       # 2-GPU disaggregated layout (nemotron_duplex_disagg.yaml)
 #
-# Both layouts serve the same text + audio; disagg puts each stream-consuming
-# loop (Encoder+LLM / Talker / Codec) on its own GPU/worker thread.
+# Both layouts serve the same text + audio; disagg puts Encoder+LLM and the
+# Talker (which runs the codec) on their own GPU/worker thread.
 
 if [ -f "./.env" ]; then
     source "./.env"
@@ -32,7 +32,7 @@ fi
 CUDA_VISIBLE_DEVICES=$DEVICES python mstar/api_server/entrypoint.py \
     --config $CONFIG --host ${HOST:-127.0.0.1} --port $PORT \
     $CACHE_ARG \
-    --socket-path-prefix /tmp/mstar_${WHO}/ \
+    --socket-path-prefix /tmp/mstar_${WHO}_${PORT}/ \
     --upload-dir /tmp/mstar_uploads_${WHO}/ \
     --tensor-comm-protocol ${TENSOR_PROTOCOL:-SHM} \
     --tcp-transfer-device ${TCP_DEVICE:-0.0.0.0.0}

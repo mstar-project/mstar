@@ -22,6 +22,7 @@ modules, classes, and functions.
    mstar.engine
    mstar.graph
    mstar.model
+   mstar.observability
    mstar.streaming
    mstar.utils
    mstar.worker

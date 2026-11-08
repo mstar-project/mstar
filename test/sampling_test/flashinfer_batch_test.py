@@ -7,33 +7,42 @@ at different positions (padding the rest with random distractor rows), and check
 its sampled token never changes.
 
 Two paths are checked:
-  - ``sample_cuda_graphable_gpu`` — mstar's path (fused softmax → flashinfer).
+  - ``sample_accelerator_graphable_gpu`` — mstar's captured path. At this
+    vocabulary (V <= ``FUSED_SAMPLE_MAX_VOCAB``) it is ``fused_sample``, one
+    Triton kernel drawing from each row's own (seed, offset).
   - raw ``flashinfer...top_k_top_p_sampling_from_probs`` on **fixed pre-computed
-    probs**, skipping the fused kernel entirely.
+    probs**, which larger vocabularies (and the eager sampler) use.
 
-If the raw-flashinfer path is also batch-variant, the position-dependence is
-flashinfer's own RNG (it folds the batch row index into philox) — nothing mstar
-does can beat it, and batched decoding cannot be bit-reproducible.
+FlashInfer folds the batch row index into philox, so the raw path is expected
+to be batch-variant; ``fused_sample`` is not.
 
     python test/sampling_test/flashinfer_batch_test.py
 
 Requires a GPU + flashinfer.
 """
 
+import importlib.util
+
+import pytest
 import torch
 
-from mstar.engine.resources.sampler.utils import sample_cuda_graphable_gpu
+from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gpu
 
 DEV = "cuda"
 V = 2048
 BATCH_SIZES = [1, 2, 4, 8, 16, 32]
 TOP_K, TOP_P, TEMP = 50, 1.0, 1.0
 
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or importlib.util.find_spec("flashinfer") is None,
+    reason="needs a GPU and flashinfer",
+)
+
 
 def _mstar_sample(logits_rows, seeds, offsets):
-    """mstar path: fused_temperature_softmax → flashinfer, on raw logits."""
+    """mstar's captured path on raw logits (``fused_sample`` at this V)."""
     bs = logits_rows.shape[0]
-    return sample_cuda_graphable_gpu(
+    return sample_accelerator_graphable_gpu(
         logits_rows,
         temperature=torch.full((bs,), TEMP, device=DEV),
         top_k=torch.full((bs,), TOP_K, dtype=torch.int32, device=DEV),
@@ -117,7 +126,7 @@ def main() -> int:
         print("needs CUDA")
         return 2
     rc = 0
-    rc |= _batch_invariance("mstar sample_cuda_graphable_gpu", _mstar_sample, _logits_row)
+    rc |= _batch_invariance("mstar sample_accelerator_graphable_gpu", _mstar_sample, _logits_row)
     rc |= _batch_invariance("raw flashinfer from_probs", _raw_flashinfer_sample, _probs_row)
     rc |= test_offset_determinism()
     print("\nPASS" if rc == 0 else "\nFAIL")

@@ -26,6 +26,7 @@ from pathlib import Path
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.model.components.diffusion.qwen3.submodule import TEXT_INPUTS
 from mstar.model.flux2_klein.config import DENOISE_LOOP, Flux2KleinConfig
 from mstar.model.flux2_klein.flux2_klein_model import IMAGE_GEN_WALK, Flux2KleinModel
 from mstar.model.flux2_klein.submodules import LATENTS, TEXT_EMBEDS
@@ -60,10 +61,12 @@ def _fwd_info(height, width, steps, seed, k):
 def generate(model, subs, prompt, height, width, steps, seed, timer: _Timer, oracle: Path | None = None):
     text, dit, decoder = subs["text_encoder"], subs["dit"], subs["vae_decoder"]
     engine_inputs = ModelInputsFromEngine(request_ids=["direct"], per_request_info={})
-    ids, mask = model.tokenize(prompt)
+    row = text.prepare_inputs(IMAGE_GEN_WALK, None, {TEXT_INPUTS: [model.tokenize(prompt)]})
     with torch.inference_mode():
-        embeds = timer.time("text_encoder", text.forward, IMAGE_GEN_WALK, engine_inputs,
-                            text_inputs=ids[None], text_mask=mask[None])[TEXT_EMBEDS][0]
+        packed = timer.time("text_encoder", text.forward_batched, IMAGE_GEN_WALK, engine_inputs,
+                            **text.preprocess(IMAGE_GEN_WALK, engine_inputs, [row]))
+        unpacked = text.unpack_packed_outputs(packed, ["direct"], [row.input_seq_len], [row], {})
+        embeds = unpacked["direct"][TEXT_EMBEDS][0]
         inputs = {TEXT_EMBEDS: [embeds]}
         latents = None
         for k in range(steps):
@@ -136,7 +139,7 @@ def main():
     device = torch.device("cuda")
     model = Flux2KleinModel(
         model_path_hf=args.repo, attention_backend="sdpa", compile=args.compile,
-        compile_exact_ops=["norms"] if args.exact_ops else False, vae_compile=args.vae_compile, cuda_graph=False,
+        compile_exact_ops=["norms"] if args.exact_ops else False, vae_compile=args.vae_compile, accelerator_graph=False,
         capture_sizes=[[args.height, args.width]],
     )
     model.set_config(Flux2KleinConfig.from_snapshot(resolve_snapshot_dir(args.repo)))

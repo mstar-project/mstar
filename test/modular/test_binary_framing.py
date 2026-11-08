@@ -219,6 +219,7 @@ class _ChunkServer:
 
     enable_nvtx = False
     async_stream_results = entrypoint.APIServer.async_stream_results
+    open_result_stream = entrypoint.APIServer.open_result_stream
     _stream_ndjson = entrypoint.APIServer._stream_ndjson
     _stream_binary = entrypoint.APIServer._stream_binary
     _chunk_to_ndjson = entrypoint.APIServer._chunk_to_ndjson
@@ -226,8 +227,17 @@ class _ChunkServer:
     def __init__(self, chunks):
         self._chunks = chunks
 
+    async def wait_for_request_id(self, request_id):
+        pass
+
     def submit_request(self, **kwargs):
         return None
+
+    def submission_key(self, request_id):
+        return None
+
+    def release_submission(self, key):
+        pass
 
     async def iter_result_chunks(self, request_id):
         for chunk in self._chunks:

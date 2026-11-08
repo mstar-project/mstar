@@ -31,9 +31,9 @@ class TensorPointerInfo:
     source_tp_size: int = 1
     source_tp_rank: int = 0
 
-    # SHM-arena transport (MSTAR_SHM_ARENA): the producer wrote this tensor's
-    # bytes at `shm_offset` inside the named arena segment. None for the
-    # other transports (per-uuid files, Mooncake).
+    # SHM arena: the producer wrote this tensor's bytes at `shm_offset` inside
+    # the named arena segment. None for a tensor the arena spilled to a
+    # per-uuid file, and for Mooncake.
     shm_segment: str | None = None
     shm_offset: int = 0
 
@@ -109,6 +109,9 @@ class NodeCompletionOutput:
     # loop-back (name, dest) pairs the caller must NOT route; the loop has finished so
     # we do not want the loop-back signals to propagate
     filtered_signals: set[NameAndDest] = field(default_factory=set)
+    # Cache holds relinquished by finished loops, settled AFTER routing/persist.
+    # A list preserves multiplicity when nested loops hold the same UUID.
+    transferred_refs: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -377,8 +380,10 @@ class GraphNode(GraphSection):
         for out in self.outputs:
             out.tensor_info.clear()
 
-    def complete(self) -> NodeCompletionOutput:
-        return self._managing_registry.mark_entity_complete(self.name)
+    def complete(self, loop_stride: int = 1) -> NodeCompletionOutput:
+        """``loop_stride``: how far the enclosing loop's count moves if this
+        completion ends its iteration (``Loop.complete_iter``)."""
+        return self._managing_registry.mark_entity_complete(self.name, loop_stride)
 
 
 @dataclass
@@ -525,8 +530,8 @@ class Loop(GraphSection):
         inp_out.ext_outputs = self.outputs + self.accumulated_outputs
         return inp_out
 
-    def _advance_one_iter(self):
-        self.curr_iter += 1
+    def _advance_one_iter(self, stride: int = 1):
+        self.curr_iter += stride
         self.inner_registry.reset_for_iter()
         self._uncache_outputs()
 
@@ -546,8 +551,12 @@ class Loop(GraphSection):
         node = self.section.get_nodes().get(graph_edge.next_node)
         return node is not None and graph_edge.name in node._streaming_inputs
 
-    def complete_iter(self):
+    def complete_iter(self, stride: int = 1):
         """Called when every entity in the loop's section has finished for this iteration.
+
+        The count moves ``stride`` on, and the loop ends once it reaches
+        ``max_iters``: one per iteration, except a chunk loop, which counts the
+        tokens its chunks ran.
 
         If the loop is done (last iter or finish signal received): populates output
         tensor_info from the cache, marks itself complete in the outer registry, and
@@ -555,7 +564,7 @@ class Loop(GraphSection):
         Otherwise: advances curr_iter, resets the inner registry, and returns the
         saved external inputs so they can be re-routed into the next iteration.
         """
-        if self.max_iters == self.curr_iter + 1 or self._finish_signal:
+        if self.curr_iter + stride >= self.max_iters or self._finish_signal:
             self.is_done = True
             # Clear buffered loop-back inputs so no stale ready state lingers after termination.
             # Note: wg_state_registry.ready_next_iter may still hold node names added via
@@ -575,17 +584,25 @@ class Loop(GraphSection):
             # (the parent reads them off ``managed_entities``) already filtered
             # by its loop-back, so they are not added again here; the
             # accumulated ones are disjoint by name and ride separately.
-            outer = self._managing_registry.mark_entity_complete(self.name)
-
-            # Don't dereference, becaue the tensors will be used downstream
+            transferred = [
+                info.uuid
+                for cache in (self._cached_outputs, self._accumulated_cache)
+                for infos in cache.values() for info in infos
+            ]
+            # Detach before cascading: a finishing parent clears its children,
+            # which would otherwise release these same accumulated holds again.
+            # The descriptors on our output edges keep the lists; the reference
+            # holds stay alive until routing has established consumer ownership.
             self._cached_outputs.clear()
             self._accumulated_cache.clear()
+            outer = self._managing_registry.mark_entity_complete(self.name)
             return NodeCompletionOutput(
                 output_edges=list(outer.output_edges) + self.accumulated_outputs,
                 filtered_signals=self._loop_back_inputs | outer.filtered_signals,
+                transferred_refs=transferred + outer.transferred_refs,
             )
         else:
-            self._advance_one_iter()
+            self._advance_one_iter(stride)
             return NodeCompletionOutput(
                 output_edges=self._ingested_external_inputs
             )
@@ -684,28 +701,46 @@ class Loop(GraphSection):
         self._uncache_accumulated_outputs()
 
 
+def top_level_entities(section: GraphSection) -> dict[str, "GraphNode | Loop"]:
+    """The "outer-level" nodes and loops of a section, keyed by name: the
+    entities a registry over it counts toward completion."""
+    entities: dict[str, GraphNode | Loop] = {}
+
+    def _collect(sec: GraphSection):
+        if isinstance(sec, GraphNode) or isinstance(sec, Loop):
+            # stop here: a Loop's inner entities are owned by its own LoopStateRegistry
+            entities[sec.name] = sec
+            return
+        assert isinstance(sec, Sequential) or isinstance(sec, Parallel)
+        for s in sec.sections:
+            _collect(s)
+    _collect(section)
+    return entities
+
+
+def self_triggered(entity: "GraphNode | Loop") -> bool:
+    """Whether the stream alone can re-run a top-level entity once it completes:
+    it is, or (a Loop) holds, a consumer with every input streamed. Completion
+    reseeds streaming readiness only for such nodes (see
+    ``WorkerGraphStateRegistry.reseed_streaming_ready``); a consumer with a
+    non-streamed input has to receive it again first."""
+    return any(
+        node.consumes_stream and node.input_names <= node._streaming_inputs
+        for node in entity.get_nodes().values()
+    )
+
+
 class GraphStateRegistry(ABC):
     def __init__(
         self, graph_section: GraphSection,
     ):
-        # "Outer-level" nodes and loops
-        self.managed_entities: dict[str, GraphNode|Loop] = {}
-
-        def _set_managed_entities(section: GraphSection):
-            if isinstance(section, GraphNode) or isinstance(section, Loop):
-                # stop here — Loop's inner entities are owned by its own LoopStateRegistry
-                self.managed_entities[section.name] = section
-                return
-            assert isinstance(section, Sequential) or isinstance(section, Parallel)
-            for sec in section.sections:
-                _set_managed_entities(sec)
-        _set_managed_entities(graph_section)
+        self.managed_entities: dict[str, GraphNode|Loop] = top_level_entities(graph_section)
 
         self.is_done = False
         self._num_completed_entities = 0
         self._num_managed_entities = len(self.managed_entities)
 
-    def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
+    def mark_entity_complete(self, entity_name: str, loop_stride: int = 1) -> NodeCompletionOutput:
         """Record that an entity has finished; no-ops if already done (safeguard only)."""
         if not self.is_done and entity_name in self.managed_entities:
             self._num_completed_entities += 1
@@ -738,12 +773,13 @@ class LoopStateRegistry(GraphStateRegistry):
         super().__init__(loop.section)
         self.loop = loop
 
-    def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
+    def mark_entity_complete(self, entity_name: str, loop_stride: int = 1) -> NodeCompletionOutput:
         output = super().mark_entity_complete(entity_name)
         self.loop.maybe_cache_output(self.managed_entities[entity_name].outputs)
         if self.is_done:
-            loop_out = self.loop.complete_iter()
+            loop_out = self.loop.complete_iter(loop_stride)
             output.filtered_signals.update(loop_out.filtered_signals)
+            output.transferred_refs.extend(loop_out.transferred_refs)
             # strip loop-back edges from this entity's raw outputs, then append the
             # loop's declared outputs (either the external outputs if done, or the
             # re-injected external inputs if advancing to the next iteration)
@@ -819,7 +855,7 @@ class WorkerGraphStateRegistry(GraphStateRegistry):
             if not node._in_flight:
                 self.ready_streaming_next_iter.add(node.name)
 
-    def mark_entity_complete(self, entity_name: str) -> NodeCompletionOutput:
+    def mark_entity_complete(self, entity_name: str, loop_stride: int = 1) -> NodeCompletionOutput:
         # Top-level entities have no outer loop to drive a reset_for_iter, so
         # we clear the entity's ready_signals here so the same node can be
         # ingested for a future forward pass without ingest_input falling

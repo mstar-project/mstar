@@ -1,54 +1,45 @@
 """Qwen3.5's node submodules: the hybrid LLM and the vision encoder.
 
-``prefill_vision`` hands the LLM encoder embeddings rather than ids, so steps
-are declared off ``input_seq_len``. The rotation is Qwen3.5's interleaved 3D
-MRoPE (``components/rope.py``): the position resource is only a per-request
-counter, and the 3D ids are built here and passed in as cos/sin.
+Both build on the shared scaffolds (`SampledTokenDecoder`,
+`PackedBlockLoopEncoder`). What is Qwen3.5's own: the hybrid layers'
+resource steps, and the rotation, interleaved 3D MRoPE
+(``components/rope.py``). The position resource is only a per-request
+counter here; the 3D ids are built in this module and passed in as cos/sin.
 """
 
 import logging
 import os
-from collections.abc import Mapping
-from time import perf_counter
+from collections.abc import Sequence
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.cuda_graph_config import (
-    BatchedCudaGraphConfig,
-    CudaGraphConfig,
-    PackedCudaGraphConfig,
-    PiecewiseCallInputs,
-    PiecewiseCaptureShape,
-    PiecewiseCudaGraphConfig,
-    PiecewisePackedConfig,
-)
-from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.accelerator_graph_config import DETERMINISTIC_COMPILE_MODE
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.kv.config import KVStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
-from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.engine.resources.sampler.config import SamplerStep
-from mstar.engine.resources.sampler.resource import SamplerResource
-from mstar.engine.resources.step import Segment, SlotLease, SubmoduleStep
+from mstar.engine.resources.step import ResourceStep
+from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
+from mstar.model.components.mrope import mrope_position_ids
+from mstar.model.components.qwen3_vit import (
+    vision_interpolation,
+    vision_seq_lengths,
+)
+from mstar.model.components.qwen3_vit import (
+    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    vision_position_ids as vision_grid_position_ids,
+)
+from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.keys import MIXED
+from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
 from mstar.model.qwen3_5.components.rope import (
     text_position_ids,
     vision_position_advance,
     vision_position_ids,
-)
-from mstar.model.qwen3_5.components.vision import (
-    Qwen3_5VisionModel,
-    vision_interpolation,
-    vision_seq_lengths,
-)
-from mstar.model.qwen3_5.components.vision import (
-    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
-    vision_position_ids as vision_grid_position_ids,
 )
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -56,44 +47,40 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTN,
     ROPE,
-    SAMPLER,
-    VISION_ATTN,
     Qwen3_5Config,
     Qwen3_5VisionConfig,
 )
-from mstar.model.qwen3_5.qwen3_5_model import TEXT_PART
-from mstar.model.submodule_base import (
-    ARNodeInputs,
-    ARNodeSubmodule,
-    BatchedModelOutput,
-    HostRows,
-    ModelInputsFromEngine,
-    NodeInputs,
-    NodeSubmodule,
-    device_loopback_enabled,
-)
-from mstar.utils.knobs import ingraph_decode_rope
-from mstar.utils.profiler import PHASE_PERIOD, phase_record
+from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs
+from mstar.utils.h2d import to_device_nonblocking
+from mstar.utils.knobs import compile_deterministic, ingraph_decode_rope
+from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
 
 
-class LLMSubmodule(ARNodeSubmodule):
-    # the decode walk reads its input ids off the sampler's slot masters
-    reads_device_loopback = True
+def _mixed_token_buckets(prefill_buckets) -> list[int]:
+    """The prefill ladder up to 2176, then its powers of two (see
+    ``LLMSubmodule.MIXED_TOKEN_BUCKETS``)."""
+    return [b for b in prefill_buckets if b <= 2176 or b & (b - 1) == 0]
 
-    # Total tokens of a packed text-prefill step, one captured graph per
-    # (bucket, batch size). A prompt past the top bucket prefills eagerly, and
-    # an eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
+
+class LLMSubmodule(SampledTokenDecoder):
+    ATTN_KEY = ATTN
+
+    # An eager 8k prefill is launch-bound (~1,100 kernel launches, the GPU
     # idle half the time: 78 ms of wall for 36 ms of kernels on 0.8B), so the
-    # ladder runs to 8192. MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS narrows or
-    # extends it (static buffers are sized by the largest bucket).
-    PREFILL_TOKEN_BUCKETS = [
-        int(x) for x in os.environ.get(
-            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "32,64,128,256,512,1024,2048,4096,8192",
-        ).split(",")
-    ]
-    PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    # ladder runs past 8192. The powers of two stay, since a batch of prompts
+    # up to a power of two long fills one exactly. 2176, 4352 and 8704 add 1/16
+    # above them for the decode rows a mixed step carries beside four prompts
+    # and for batches a few tokens over, which would otherwise pad to twice the
+    # width. A deployment sets its own with `model_kwargs.prefill_token_buckets`
+    # (static buffers are sized by the largest bucket).
+    PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 2176, 4096, 4352, 8192, 8704]
+    # Four prompts and their decode rows reach 2176, the only slack bucket a
+    # mixed step needs. Every (rows, tokens) pair here is one more recompile of
+    # the forward all these captures share, and past Dynamo's limit the buckets
+    # compiled last run uncompiled inside their graphs.
+    MIXED_TOKEN_BUCKETS = _mixed_token_buckets(PREFILL_TOKEN_BUCKETS)
     # Capture rows and a replay's padding rows address the pool's sink and
     # hold no slot, so these buckets do not size `gdn_state.max_slots`; that is
     # set by the concurrency a deployment wants (see configs/qwen3_5_*.yaml).
@@ -110,229 +97,100 @@ class LLMSubmodule(ARNodeSubmodule):
             or os.environ.get("MSTAR_DECODE_BUCKETS", "1,2,4,8,16,32,48,64,96,128")
         ).split(",")
     ]
-
-    # Text plus image tokens of a whole prompt. Capped at 4096, not the
-    # processor's 16384, because static buffers are sized by the largest
-    # bucket; a longer prompt runs eagerly.
-    PREFILL_VISION_TOKEN_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096]
-    # Requests per `prefill_vision` step, so a packed step stays inside the
-    # 4096-token top bucket: 4 fit ~1000 tokens a request (a ~1000 px square
-    # image plus text). Past the top bucket the step runs eagerly and every
-    # new packed length recompiles. Chunked prefill replaces this cap.
-    PREFILL_VISION_MAX_BATCH_SIZE = 4
-    PREFILL_VISION_CAPTURE_BATCH_SIZES = [1, 2, 4]
+    # Tokens a step runs (the model's chunking budget), on a prefill capture
+    # bucket since a step over it pads to the next bucket up. 2048 measured
+    # best on 0.8B-9B: 1024 costs 3-10% throughput in steps and speculation,
+    # 4096 gives back most of the short-prompt TTFT gain and doubles decode
+    # ITL p99 at c48
+    MAX_BATCH_TOKENS = 2048
 
     def __init__(
         self,
         model: Qwen3_5ForCausalLM,
         config: Qwen3_5Config,
         vision_config: Qwen3_5VisionConfig | None = None,
+        encoders: tuple[MediaEncoder, ...] = (),
+        prefill_token_buckets: list[int] | None = None,
     ):
-        super().__init__()
-        self.model = model
-        self.config = config
-        self.vision_config = vision_config
-        self._vision_sentinels: tuple[torch.Tensor, torch.Tensor] | None = None
-
-    # ------------------------------------------------------------------
-    # Engine lifecycle
-    # ------------------------------------------------------------------
-
-    def get_cuda_graph_configs(
-        self, device: torch.device, tp_world_size: int = 1,
-    ) -> list[CudaGraphConfig]:
-        """Decode, text prefill and vision prefill all capture."""
-        def dummy(n: int) -> ARNodeInputs:
-            return ARNodeInputs(
-                input_ids=torch.zeros(n, dtype=torch.long, device=device),
-                input_seq_len=n,
+        super().__init__(model, config, encoders, prefill_token_buckets)
+        if "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS" in os.environ:
+            logger.warning(
+                "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS is no longer read; set the ladder "
+                "with `model_kwargs.prefill_token_buckets` in the serving config",
             )
+        # follows a deployment's own prefill ladder
+        self.MIXED_TOKEN_BUCKETS = _mixed_token_buckets(self.PREFILL_TOKEN_BUCKETS)
+        # patches per merged token along each axis, for the MRoPE grids
+        self._merge_size = vision_config.spatial_merge_size if vision_config is not None else None
 
-        def vision_dummy(n: int) -> ARNodeInputs:
-            return ARNodeInputs(
-                input_seq_len=n,
-                input_embeds=torch.zeros(
-                    (n, self.config.hidden_size),
-                    device=device, dtype=self.model.model.embed_tokens.weight.dtype,
-                ),
-                custom_pos_ids=torch.zeros(
-                    (3, n), dtype=torch.float, device=device,
-                ),
-                # read by `declare_step`; replay restages the real values
-                tensor_inputs={
-                    "mrope_advance": max(n - 2, 0),
-                    "text_token_ids": torch.zeros(
-                        n, dtype=torch.long, device=device,
-                    ),
-                },
-            )
+    def capture_compile_mode(self, graph_walk: str) -> str | None:
+        # Prefill loses nothing to deterministic mode and compiles faster.
+        # Decode keeps its tuned kernels, which win at one row, unless the
+        # deployment asks for output that reproduces across processes: both
+        # the cost and that guarantee sit on this graph.
+        if graph_walk == self.DECODE_WALK and not compile_deterministic():
+            return None
+        return DETERMINISTIC_COMPILE_MODE
 
-        return [
-            BatchedCudaGraphConfig(
-                capture_graph_walk="decode",
-                single_request_inputs=dummy(1),
-                capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
-            ),
-            PackedCudaGraphConfig(
-                capture_graph_walk="prefill_text",
-                capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                make_node_input=dummy,
-                capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
-            ),
-            PackedCudaGraphConfig(
-                capture_graph_walk="prefill_vision",
-                capture_token_lengths=self.PREFILL_VISION_TOKEN_BUCKETS,
-                make_node_input=vision_dummy,
-                capture_batch_sizes=self.PREFILL_VISION_CAPTURE_BATCH_SIZES,
-            ),
-        ]
+    def layer_steps(self) -> dict[str, ResourceStep]:
+        return {
+            KV_CACHE: KVStep(),
+            ATTN: AttentionStep(causal=True),
+            GDN_STATE: RecurrentStep(),
+            LINEAR_ATTN: LinearAttnStep(),
+        }
 
     # ------------------------------------------------------------------
-    # Step declaration
+    # MRoPE
     # ------------------------------------------------------------------
 
-    def _sentinel_embeds(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """``<|vision_start|>`` / ``<|vision_end|>`` embeddings, cached.
+    def prompt_positions(
+        self, start: int, layout: dict, num_tokens: int,
+    ) -> tuple[torch.Tensor, int]:
+        """A media prompt's ``[3, tokens]`` MRoPE ids, from the intake's
+        layout (no read of the ids).
 
-        `split_around_spans` drops them with the pad interior, so this walk
-        re-adds them.
+        Text, sentinels included, takes one position a token. An image (or a
+        video's frame group) spans ``max(h', w')`` MRoPE positions but
+        ``t * h' * w'`` tokens, so the cursor advances by the real amount and
+        the position resource is handed the total.
         """
-        if self._vision_sentinels is None:
-            ids = torch.tensor(
-                [self.config.vision_start_token_id, self.config.vision_end_token_id],
-                dtype=torch.long, device=self.get_device(),
-            )
-            embeds = self.model.model.embed_tokens(ids)
-            self._vision_sentinels = (embeds[:1], embeds[1:])
-        return self._vision_sentinels
-
-    def _vision_inputs(
-        self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList,
-    ) -> ARNodeInputs:
-        """A whole multimodal prompt as one row, spliced in prompt order.
-
-        `prefill_order` tags each part text (0) or image (1); the nth tag of a
-        kind takes the nth tensor of that kind.
-
-        An image spans ``max(h', w')`` MRoPE positions but ``t * h' * w'``
-        tokens, so the cursor advances by the real amount and `declare_step`
-        hands the total to the position resource; its default (the token
-        count) would misplace everything after the first image.
-        """
-        if self.vision_config is None:
-            raise ValueError(
-                "prefill_vision needs the vision config for its spatial merge "
-                "size; this LLM submodule was built without one"
-            )
         device = self.get_device()
-        merge = self.vision_config.spatial_merge_size
-        texts = inputs.get("text_inputs", [])
-        grids = inputs.get("image_grid_thw", [])
-        packed = inputs["vision_embeds"][0].to(device)
-        start_embed, end_embed = self._sentinel_embeds()
-
-        pos = self.node_resources[ROPE].position(
-            rid=fwd_info.request_id, label="main",
-        )
-        start_pos = pos
-        embeds: list[torch.Tensor] = []
+        merge = self._merge_size
+        pos = start
         pos_ids: list[torch.Tensor] = []
-        tracked: list[torch.Tensor] = []
-        text_i = image_i = 0
-        # into `packed`, which holds every image's merged tokens end to end
         cursor = 0
+        for offset, tokens, grid in zip(
+            layout.get("offset", ()), layout.get("tokens", ()), layout.get("grid", ()), strict=True,
+        ):
+            # built on the host, copied once below
+            if offset > cursor:
+                pos_ids.append(text_position_ids(offset - cursor, pos))
+                pos += offset - cursor
+            grid = torch.tensor(grid)
+            pos_ids.append(vision_position_ids(grid, merge, pos))
+            pos += vision_position_advance(grid, merge)
+            cursor = offset + tokens
+        if num_tokens > cursor:
+            pos_ids.append(text_position_ids(num_tokens - cursor, pos))
+            pos += num_tokens - cursor
+        return to_device_nonblocking(torch.cat(pos_ids, dim=1), device), pos - start
 
-        for kind in fwd_info.step_metadata.get("prefill_order", ()):
-            if kind == TEXT_PART:
-                ids = texts[text_i].to(device)
-                text_i += 1
-                span = ids.shape[0]
-                embeds.append(self.model.model.embed_tokens(ids))
-                pos_ids.append(text_position_ids(span, pos, device))
-                tracked.append(ids)
-                pos += span
-                continue
-            grid = grids[image_i]
-            image_i += 1
-            grid = grid[0] if grid.dim() == 2 else grid
-            t, h, w = (int(v) for v in grid.tolist())
-            span = t * (h // merge) * (w // merge)
-            advance = vision_position_advance(grid, merge)
-            embeds += [start_embed, packed[cursor:cursor + span], end_embed]
-            pos_ids += [
-                text_position_ids(1, pos, device),
-                vision_position_ids(grid, merge, pos + 1, device),
-                text_position_ids(1, pos + 1 + advance, device),
-            ]
-            cursor += span
-            # two sentinels either side, and the image between them
-            pos += advance + 2
-
-        input_embeds = torch.cat(embeds, dim=0)
-        return ARNodeInputs(
-            input_seq_len=input_embeds.shape[0],
-            input_embeds=input_embeds,
-            custom_pos_ids=torch.cat(pos_ids, dim=1),
-            tensor_inputs={
-                "mrope_advance": pos - start_pos,
-                # Ids cannot ride `input_ids` — that is what `preprocess` keys
-                # the embeds-vs-ids branch on — so the repetition penalty
-                # takes them from here.
-                "text_token_ids": (
-                    torch.cat(tracked) if tracked
-                    else torch.zeros(0, dtype=torch.long, device=device)
-                ),
-            },
-        )
-
-    def prepare_inputs(
-        self,
-        graph_walk: str,
-        fwd_info: CurrentForwardPassInfo,
-        inputs: NameToTensorList,
-        has_loopback: bool = False,
-        **kwargs: Any,
-    ) -> ARNodeInputs:
-        if graph_walk == "prefill_vision":
-            return self._vision_inputs(fwd_info, inputs)
-
-        if graph_walk == "decode" and has_loopback and self._device_loopback():
-            # one token per row, read off the sampler's slot master in
-            # `preprocess`; the routed signal is empty (or ignored) here
-            return ARNodeInputs(input_seq_len=1)
-        input_ids = inputs["text_inputs"][0]
-        return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
-
-    def uniform_row_inputs(
-        self, graph_walk: str, has_loopback: bool = False,
-    ) -> ARNodeInputs | None:
-        # the loop-back decode row above, built once for the step's rows
-        if graph_walk == "decode" and has_loopback and self._device_loopback():
-            return ARNodeInputs(input_seq_len=1)
-        return None
-
-    def _device_loopback(self) -> bool:
-        return (
-            device_loopback_enabled()
-            and self.node_resources[SAMPLER].has_slot_masters
-        )
-
-    def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
-        if graph_walk == "decode" and self._device_loopback():
-            return frozenset({"text_inputs"})
-        return frozenset()
+    def resident_walks(self) -> frozenset[str]:
+        # a captured decode step builds its rope inside the graph on every config
+        # (`_rope_in_graph`), so its `preprocess` reads nothing the tables fill
+        return frozenset({"decode"})
 
     @staticmethod
-    def _captured_decode(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
-        """A decode step replayed on a leased slot, or being captured for one.
-        The caller's walk decides (a capture's own context carries the
-        piecewise walk), the lease says the slot's static buffers are in
-        play."""
-        if graph_walk != "decode":
+    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+        """A step of a text walk replayed on a leased slot, or being captured
+        for one, whose rotary tables come from the planned positions inside
+        the graph: always for decode, with ``ingraph_decode_rope`` on for text
+        prefill and mixed steps. Only media walks' rows bring their own 3D
+        positions."""
+        if not engine_inputs.captured:
             return False
-        step = getattr(engine_inputs, "step", None)
-        ctx = getattr(step, "ctx", None) if step is not None else None
-        return ctx is not None and getattr(ctx, "slot_lease", None) is not None
+        return graph_walk == "decode" or (graph_walk in ("prefill_text", MIXED) and ingraph_decode_rope())
 
     def _decode_cos_sin(
         self, engine_inputs: ModelInputsFromEngine, num_tokens: int,
@@ -345,40 +203,10 @@ class LLMSubmodule(ARNodeSubmodule):
             "before the forward"
         )
         pos = pos_ids[:num_tokens].unsqueeze(0).expand(3, -1)
-        return self.model.model.build_cos_sin(
-            pos, dtype=self.model.model.embed_tokens.weight.dtype,
-        )
+        return self.model.model.build_cos_sin(pos, dtype=self.model.embed_dtype)
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
-        """``[3, total_tokens]`` for the step, in packed request order.
-
-        A pure-text step is the position resource's planned 1D positions
-        broadcast across the three grids (a view, no copy). An image's grids
-        do not advance together, so a request with `custom_pos_ids` supplies
-        its own and the step concatenates, using the resource's slice for text.
-        """
-        total_tokens = sum(inp.input_seq_len for inp in inputs)
-        pos_ids = self.node_resources[ROPE].pos_ids("main")
-        assert pos_ids is not None, (
-            "position resource has no plan for this step; `plan` must run "
-            "before `preprocess`"
-        )
-        if not any(inp.custom_pos_ids is not None for inp in inputs):
-            return pos_ids[:total_tokens].unsqueeze(0).expand(3, -1)
-
-        parts: list[torch.Tensor] = []
-        offset = 0
-        for inp in inputs:
-            span = inp.input_seq_len
-            if inp.custom_pos_ids is not None:
-                parts.append(inp.custom_pos_ids.float())
-            else:
-                parts.append(
-                    pos_ids[offset:offset + span].float()
-                    .unsqueeze(0).expand(3, -1)
-                )
-            offset += span
-        return torch.cat(parts, dim=1)
+        return mrope_position_ids(self.node_resources[ROPE].pos_ids("main"), inputs)
 
     def preprocess(
         self,
@@ -386,308 +214,79 @@ class LLMSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
-        out: dict[str, torch.Tensor | Any] = {}
-        captured = self._captured_decode(engine_inputs, graph_walk)
-        first = inputs[0]
-        if first.input_embeds is None and (
-            first.input_ids is None or any(inp.input_ids is None for inp in inputs)
-        ):
-            # device loop-back: every row of a decode step is its request's
-            # last sampled token, read by slot (padding rows read slot 0)
-            sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-            t0 = perf_counter() if PHASE_PERIOD else 0.0
-            ids = sampler.loopback_tokens(engine_inputs.request_ids)
-            # rows whose last step ran elsewhere brought their token
-            routed = [
-                i for i, inp in enumerate(inputs)
-                if inp.input_ids is not None and inp.input_seq_len
-            ]
-            if routed:
-                ids.index_copy_(
-                    0, torch.tensor(routed, device=ids.device),
-                    torch.cat([inputs[i].input_ids for i in routed]).to(ids.dtype),
-                )
-            out["input_ids"] = ids
-            if PHASE_PERIOD:
-                phase_record("engine.preprocess.loopback", perf_counter() - t0)
-            if captured and ingraph_decode_rope():
-                # the captured forward builds the rotary tables itself
-                return out
-        elif inputs[0].input_ids is not None:
-            out["input_ids"] = torch.cat([inp.input_ids for inp in inputs], dim=0)
-        else:
-            out["input_embeds"] = torch.cat(
-                [inp.input_embeds for inp in inputs], dim=0,
+        out = super().preprocess(graph_walk, engine_inputs, inputs)
+        if self._rope_in_graph(engine_inputs, graph_walk):
+            assert self._has_loopback_rows(inputs) or all(inp.custom_pos_ids is None for inp in inputs), (
+                "a text walk's rows take the planned 1D positions"
             )
-
+            # the captured forward builds the rotary tables itself
+            return out
+        laps = PhaseLaps("engine.preprocess.")
         position_ids_3d = self._position_ids_3d(inputs)  # (3, total_tokens)
+        laps.lap("position_ids")
         cos, sin = self.model.model.build_cos_sin(
-            position_ids_3d, dtype=self.model.model.embed_tokens.weight.dtype,
+            position_ids_3d, dtype=self.model.embed_dtype,
         )
+        laps.lap("cos_sin")
         out["cos_3d"] = cos
         out["sin_3d"] = sin
         return out
 
-    def declare_step(
-        self,
-        graph_walk: str,
-        request_ids: list[str],
-        inputs: list[ARNodeInputs],
-        per_request_info: Mapping[int, CurrentForwardPassInfo] | None = None,
-        **kwargs,
-    ) -> SubmoduleStep:
-        prefill_tokens = {}
-        if graph_walk == "prefill_text":
-            prefill_tokens = {
-                rid: inp.input_ids
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            }
-        elif graph_walk == "prefill_vision":
-            # the prompt's text ids still feed the repetition penalty
-            prefill_tokens = {
-                rid: inp.tensor_inputs["text_token_ids"]
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            }
-
-        kept_rids = None
-        if graph_walk != "decode":
-            # only the last prefill's token survives `postprocess`
-            info = per_request_info or {}
-            kept_rids = frozenset(
-                rid for rid in request_ids
-                if rid in info and info[rid].step_metadata.get("last_prefill", False)
-            )
-
-        # `advance=None` advances by the span, which is wrong for an image:
-        # its 3D grid covers fewer positions than tokens.
-        advance = None
-        if graph_walk == "prefill_vision":
-            advance = tuple(
-                int(inp.tensor_inputs["mrope_advance"]) for inp in inputs
-            )
-
-        return SubmoduleStep(
-            segments=[
-                Segment(
-                    request_id=rid,
-                    label="main",
-                    span=inp.input_seq_len,
-                )
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
-            steps={
-                KV_CACHE: KVStep(),
-                ATTN: AttentionStep(causal=True),
-                GDN_STATE: RecurrentStep(),
-                LINEAR_ATTN: LinearAttnStep(),
-                SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens,
-                    kept_rids=kept_rids,
-                ),
-                ROPE: PositionStep(advance=advance),
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
-    def _forward(
+    def decoder_kwargs(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
+        num_tokens: int,
         cos_3d: torch.Tensor | None = None,
         sin_3d: torch.Tensor | None = None,
-        input_ids: torch.Tensor | None = None,
-        input_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        attn: AttentionManager = engine_inputs.resources[ATTN]
-        sampler: SamplerResource = engine_inputs.resources[SAMPLER]
-        captured = self._captured_decode(engine_inputs, graph_walk)
-        if input_ids is None and input_embeds is None:
-            input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
-        if (captured and ingraph_decode_rope()) or cos_3d is None or sin_3d is None:
-            # MSTAR_INGRAPH_DECODE_ROPE: the tables come from the planned
-            # positions, inside the graph; the static cos/sin stay unread
-            num_tokens = (input_ids if input_ids is not None else input_embeds).shape[0]
+        **tensors: torch.Tensor,
+    ) -> dict[str, Any]:
+        if self._rope_in_graph(engine_inputs, graph_walk) or cos_3d is None or sin_3d is None:
+            # the tables come from the planned positions, inside the graph
+            # (off a captured decode's per-step critical path); the static
+            # cos/sin stay unread
             cos_3d, sin_3d = self._decode_cos_sin(engine_inputs, num_tokens)
-
-        embeds = (
-            self.model.model.embed_tokens(input_ids)
-            if input_embeds is None
-            else input_embeds
-        )
-        hidden = self.model.model(embeds, label="main", cos_sin=(cos_3d, sin_3d))
-
-        if graph_walk != "decode":
-            # only the last token of each prefill row feeds the head
-            hidden = attn.select_last_hidden(hidden)
-        logits = self.model.lm_head(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
-
-    def forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor | None = None,
-        sin_3d: torch.Tensor | None = None,
-        input_ids: torch.Tensor | None = None,
-        input_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> NameToTensorList:
-        return {
-            "new_token": self._forward(
-                graph_walk, engine_inputs, cos_3d, sin_3d,
-                input_ids=input_ids, input_embeds=input_embeds,
-            )
-        }
-
-    def can_batch(
-        self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
-    ) -> bool:
-        return True
-
-    def max_batch_size(self, graph_walk: str) -> int | None:
-        if graph_walk == "prefill_vision":
-            return self.PREFILL_VISION_MAX_BATCH_SIZE
-        return None
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        cos_3d: torch.Tensor | None = None,
-        sin_3d: torch.Tensor | None = None,
-        input_ids: torch.Tensor | None = None,
-        input_embeds: torch.Tensor | None = None,
-        **kwargs,
-    ) -> BatchedModelOutput:
-        new_tokens = self._forward(
-            graph_walk, engine_inputs, cos_3d, sin_3d,
-            input_ids=input_ids, input_embeds=input_embeds,
-        )
-        # Row i is request i: one clone and one D2H copy per step instead of
-        # one per request.
-        return BatchedModelOutput(
-            row_outputs={"new_token": new_tokens},
-            check_stop_buffers={"new_token": new_tokens},
-        )
-
-    # ------------------------------------------------------------------
-    # Post-step
-    # ------------------------------------------------------------------
-
-    def postprocess(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-        **kwargs,
-    ):
-        if request_info.graph_walk != "decode" and \
-                not request_info.step_metadata.get("last_prefill", False):
-            outputs.pop("new_token", None)
-            return
-        # Rebind, not copy: the decode loop routes on `text_inputs`. EOS is
-        # tested in `check_stop` so the GPU thread never syncs on `.item()`.
-        if "new_token" not in outputs:
-            return
-        outputs["text_inputs"] = outputs["new_token"]
-
-    def check_stop(
-        self,
-        request_id: str,
-        request_info: CurrentForwardPassInfo,
-        outputs: dict[str, list[torch.Tensor]],
-    ) -> set[str]:
-        if "new_token" not in outputs:
-            return set()
-        token = outputs["new_token"][0].item()
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        hit_eos = not ignore_eos and token in self.config.stop_token_ids
-        out_of_budget = (
-            request_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-            >= request_info.max_tokens
-        )
-        return {"decode_loop"} if hit_eos or out_of_budget else set()
-
-    def step_is_input_free(self, graph_walk: str) -> bool:
-        # decode rows are one token each, like the template; the prefill walks
-        # feed `prefill_tokens` from the inputs
-        return graph_walk == "decode"
-
-    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
-        # the decode loop's client edge carries the sampled token the stop
-        # check already has on the host; prefill's new_token edge is persisted
-        return {"text_inputs": "new_token"} if graph_walk == "decode" else {}
-
-    def check_stop_batched(
-        self,
-        request_ids: list[str],
-        request_infos: dict[str, CurrentForwardPassInfo],
-        host_rows: HostRows,
-    ) -> dict[str, set[str]] | None:
-        """``check_stop`` for every request off one ``tolist``."""
-        tokens = host_rows.buffers.get("new_token")
-        if not torch.is_tensor(tokens) or tokens.dim() == 0:
-            return None
-        values = tokens.reshape(tokens.shape[0], -1)[:, 0].tolist()
-        rows = host_rows.request_ids
-        if len(rows) >= len(request_ids) and all(
-            a == b for a, b in zip(request_ids, rows, strict=False)
-        ):
-            # the common case: the batch in forward order, no row map needed
-            pairs = zip(request_ids, values, strict=False)
-        else:
-            row_of = {rid: i for i, rid in enumerate(rows)}
-            pairs = (
-                (rid, values[i]) for rid in request_ids
-                if (i := row_of.get(rid)) is not None and i < len(values)
-            )  # no row, no output: the per-request path skips it too
-        stop_ids = self.config.stop_token_ids
-        stops: dict[str, set[str]] = {}
-        for rid, value in pairs:
-            info = request_infos[rid]
-            # the set test first: a stop id is rare, the config read behind it
-            # goes through the wrapper
-            if (
-                value in stop_ids
-                and not info.resource_configs[SAMPLER].ignore_eos
-            ) or (
-                info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
-                >= info.max_tokens
-            ):
-                stops[rid] = {"decode_loop"}
-        return stops
+        return {"cos_sin": (cos_3d, sin_3d)}
 
 
-# The vision tower's block loop, as a piecewise capture region
-VISION_BLOCK_LOOP = "vision_block_loop"
-
-
-class VisionEncoderSubmodule(NodeSubmodule):
+class VisionEncoderSubmodule(PackedBlockLoopEncoder):
     """Qwen3.5's ViT, which turns pixel patches into LLM-width embeddings.
 
-    A prompt's images go through packed, in one call. Grid maths runs in
-    `prepare_inputs` and attention boundaries are declared as step segments,
-    so the compiled tower's only symbolic shape is its token count.
-
-    The block loop is captured one prompt per replay, which beats batching:
-    eager, the tower is launch-bound (~500 kernels, ~4 ms of GPU work in a
-    ~20 ms forward on 9B). So the encoder takes one request a step.
+    Grid maths runs in `prepare_inputs`, and each frame is its own attention
+    segment, so the compiled tower's only symbolic shape is its token count.
+    A step's requests replay together as one packed row: every image and
+    video frame group of every request is its own attention segment, and the
+    resource's ceiling counts them per step; see
+    `Qwen3_5DenseModel._vision_resources`. A request too large for a replay
+    (a long video) runs the block loop uncaptured; while the block loop is
+    captured for other steps, it gets a step of its own (`cg_key_info`).
     """
 
-    # Patch-count buckets, one prompt per replay. 16384 patches merge to the
-    # LLM's 4096 `prefill_vision` bucket; a larger prompt runs eagerly.
-    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
+    # 16384 patches merge to the LLM's 4096 media-walk bucket; a larger step
+    # runs uncaptured. 12288 holds a 30 s video at 2 fps (~11.8k patches),
+    # which 16384 pads by 39%.
+    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 12288, 16384]
+    # They share one replay, so a burst of image requests pays the per-step
+    # host cost once per this many, not per image.
+    MAX_BATCH_SIZE = 8
+
+    # The engine would compile `forward_batched` whole, and its per-step
+    # bookkeeping (each request's slice of the output, the segment lengths)
+    # guards on the batch size: every new size recompiled (~0.6 s, on a live
+    # request). The tensor stages are compiled on their own instead
+    # (`compile_regions`), dynamic in the patch count, so one graph serves
+    # every capture bucket and the uncaptured steps past the top one.
+    # Uncompiled, the blocks' fp32 rope, norms and activations were over half
+    # the tower's GPU time on long videos.
+    disable_torch_compile = True
 
     def __init__(
-        self, model: Qwen3_5VisionModel, config: Qwen3_5VisionConfig,
+        self, model: torch.nn.Module, config: Qwen3_5VisionConfig, output: str,
+        pixel_normalizer: tuple[torch.Tensor, torch.Tensor],
     ):
-        super().__init__()
-        self.model = model
-        self.config = config
+        super().__init__(model, config, output)
+        # per-column (mean, std) for byte patches; see `Qwen3_5DenseModel.pixel_normalizer`
+        self._pixel_normalizer = pixel_normalizer
 
     def prepare_inputs(
         self,
@@ -696,178 +295,91 @@ class VisionEncoderSubmodule(NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs: Any,
     ) -> NodeInputs:
-        # (num_images, 3): a bare [t, h, w] would read as three images
         device = self.get_device()
         merge = self.config.spatial_merge_size
-        grid = [
-            (int(t), int(h), int(w))
-            for g in inputs["image_grid_thw"]
-            for t, h, w in g.reshape(-1, 3).tolist()
-        ]
+        # a video's runs are its temporal groups, each a one-frame grid
+        grid = self.grids(fwd_info)
         # Built here, not in the compiled forward: a `.tolist()` there breaks
-        # the graph and makes h, w symints inductor cannot codegen from.
-        indices, weights = vision_interpolation(
-            grid, self.config.num_grid_per_side, merge, device,
-        )
-        num_patches = sum(t * h * w for t, h, w in grid)
+        # the graph and makes h, w symints inductor cannot codegen from. And
+        # built on the host: on the device, the grid upload and the
+        # `repeat_interleave`s each block on the stream.
+        indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge)
         return NodeInputs(
             # what the engine leases the captured block loop's bucket by
-            input_seq_len=num_patches,
+            input_seq_len=sum(t * h * w for t, h, w in grid),
             tensor_inputs={
                 "pixel_values": torch.cat(inputs["pixel_values"], dim=0),
-                "indices": indices,
-                "weights": weights,
-                "position_ids": vision_grid_position_ids(grid, merge, device),
-                # not forward args: `declare_step` makes segments of the
-                # lengths, `forward_batched` cuts the output at the count
-                "seq_lengths": vision_seq_lengths(grid),
+                "indices": to_device_nonblocking(indices, device),
+                "weights": to_device_nonblocking(weights, device),
+                "position_ids": to_device_nonblocking(vision_grid_position_ids(grid, merge), device),
             },
+            # one segment per frame: a frame attends to itself alone
+            resource_step_info={"main": vision_seq_lengths(grid)},
         )
 
-    def declare_step(
-        self,
-        graph_walk: str,
-        request_ids: list[str],
-        inputs: list[NodeInputs],
-        piecewise_leases: Mapping[str, SlotLease] | None = None,
-        **kwargs,
-    ) -> SubmoduleStep | None:
-        # leased, the captured block loop plans its own attention per replay
-        if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
-            return None
-        # one segment per frame: a frame attends to itself alone
-        segments = [
-            Segment(request_id=rid, label="main", span=span)
-            for rid, inp in zip(request_ids, inputs, strict=True)
-            for span in inp.tensor_inputs["seq_lengths"]
-        ]
-        return SubmoduleStep(
-            segments=segments,
-            steps={VISION_ATTN: AttentionStep(causal=False)},
-        )
-
-    def can_batch(
-        self, batch: ExecutingBatch, model_inputs: list[NodeInputs],
-    ) -> bool:
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
         return True
 
-    def max_batch_size(self, graph_walk: str) -> int | None:
-        # one request a step, so it can take the captured block loop
-        return 1
+    def cg_key_info(
+        self, graph_walk: str, per_request_info: dict, **kwargs: Any,
+    ) -> Any:
+        """The scheduler's group (``split_batches_by_capture_key``): requests
+        that each fit a replay alone pack together (None); one too large for
+        a replay (a long video) is a group of its own, so it gets a step of
+        its own. Beside others it would run back to back with them in one
+        step (`can_batch`), which holds every request's embeddings, and so
+        their prefills, until the last one is encoded."""
+        def too_large(info: CurrentForwardPassInfo) -> bool:
+            grid = self.grids(info)
+            return not self._fits_replay(sum(t * h * w for t, h, w in grid), sum(t for t, _, _ in grid))
 
-    def get_piecewise_cuda_graph_configs(
-        self, device: torch.device, autocast_dtype: torch.dtype,
-        tp_world_size: int = 1, **kwargs,
-    ) -> dict[str, PiecewiseCudaGraphConfig]:
-        """The block loop, one prompt per replay, by patch-count bucket.
+        return tuple(rid for rid, info in per_request_info.items() if too_large(info)) or None
 
-        Patch embed, position resample and rope run eagerly before it, the
-        merger after (it quarters the row count, which a region's output view
-        cannot express). Batch size 1: one replay is one prompt's segments.
-        """
-        hidden, head_dim = self.config.hidden_size, self.config.head_dim
-
-        def make_static_inputs(shape: PiecewiseCaptureShape) -> dict[str, torch.Tensor]:
-            n = shape.total_tokens
-            return {
-                "hidden": torch.zeros(n, hidden, dtype=autocast_dtype, device=device),
-                "cos": torch.zeros(n, head_dim, dtype=autocast_dtype, device=device),
-                "sin": torch.zeros(n, head_dim, dtype=autocast_dtype, device=device),
-            }
-
-        def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
-            (rid,) = request_ids
-            return SubmoduleStep(
-                segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
-                steps={VISION_ATTN: AttentionStep(causal=False)},
-            )
-
+    def compile_regions(self) -> dict[str, list[tuple]]:
+        """Warmed at start-up on the smallest image the processor makes (256 x
+        256 pixels), in the dtypes a step brings: float32 pixels out of
+        `_normalize`, merger rows in the tower's dtype. Dynamic in the patch
+        count from that call, so no image compiles them on a live request. The
+        blocks take no example (they need a planned attention step): they
+        compile in the block loop's capture warm-up, or on the first image when
+        capture is off. Each block compiles on its own rather than the whole
+        block loop: every block runs one code object, so Dynamo traces it once
+        and the others reuse the graph, where tracing the unrolled loop took
+        ~80 s of every start."""
+        device, merge = self.get_device(), self.config.spatial_merge_size
+        grid = [(1, 16, 16)]
+        indices, weights = vision_interpolation(grid, self.config.num_grid_per_side, merge)
+        position_ids = vision_grid_position_ids(grid, merge)
+        patch = self.config.in_channels * self.config.temporal_patch_size * self.config.patch_size ** 2
+        pixels = torch.zeros(16 * 16, patch, device=device)
+        rows = torch.zeros(16 * 16, self.config.hidden_size, dtype=next(self.model.merger.parameters()).dtype,
+                           device=device)
+        blocks = {f"model.blocks.{i}": [] for i in range(len(self.model.blocks))}
         return {
-            VISION_BLOCK_LOOP: PiecewisePackedConfig(
-                capture_fn=self._capture_block_loop,
-                make_static_inputs=make_static_inputs,
-                declare_step=declare_step,
-                lease_before_step=True,
-                total_tokens=self.BLOCK_LOOP_PATCH_BUCKETS,
-                capture_batch_sizes=[1],
-            )
+            "model.embed": [(pixels, indices.to(device), weights.to(device), position_ids.to(device))],
+            **blocks,
+            "model.merger": [(rows,)],
         }
-
-    def _capture_block_loop(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-        """The captured region: reads the runner's buffers, never rebinds."""
-        s = inp.static_inputs
-        return {"hidden": self.model.encode(s["hidden"], s["cos"], s["sin"])}
-
-    @torch.compiler.disable
-    def _replay_block_loop(
-        self,
-        engine_inputs: ModelInputsFromEngine,
-        hidden: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        seq_lengths: tuple[int, ...],
-    ) -> torch.Tensor | None:
-        """The block loop replayed once per prompt, or None if not leased.
-
-        Decided as the engine leased, on batch size and total patch count.
-        """
-        runner = engine_inputs.piecewise_runners.get(VISION_BLOCK_LOOP)
-        if runner is None or not runner.can_run(
-            len(engine_inputs.request_ids), int(hidden.shape[0]),
-        ):
-            return None
-        # one replay for every image, not one each: a second plan overwrites the schedule a queued replay still reads
-        return runner.run(
-            static_inputs={"hidden": hidden, "cos": cos, "sin": sin},
-            request_ids=[engine_inputs.request_ids[0]],
-            seq_lens=list(seq_lengths),
-            real_bs=1,
-        ).get_view("hidden")
 
     def preprocess(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        inputs: list[NodeInputs],
+        inputs: Sequence[NodeInputs],
     ) -> dict[str, Any]:
-        """The batch's one request (see `max_batch_size`), its images packed
-        in `declare_step`'s segment order."""
-        (inp,) = inputs
-        device = self.get_device()
-        tensors = inp.tensor_inputs
-        return {
-            "pixel_values": tensors["pixel_values"].to(device),
-            "indices": tensors["indices"].to(device),
-            "weights": tensors["weights"].to(device),
-            "position_ids": tensors["position_ids"].to(device),
-            "seq_lengths": tuple(tensors["seq_lengths"]),
-        }
+        out = super().preprocess(graph_walk, engine_inputs, inputs)
+        out["pixel_values"] = self._normalize(out["pixel_values"])
+        return out
 
-    def forward(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        **kwargs,
-    ) -> NameToTensorList:
-        rid = engine_inputs.request_ids[0]
-        return self.forward_batched(graph_walk, engine_inputs, **kwargs)[rid]
-
-    def forward_batched(
-        self,
-        graph_walk: str,
-        engine_inputs: ModelInputsFromEngine,
-        pixel_values: torch.Tensor,
-        indices: torch.Tensor,
-        weights: torch.Tensor,
-        position_ids: torch.Tensor,
-        seq_lengths: tuple[int, ...] = (),
-        **kwargs,
-    ) -> dict[str, NameToTensorList]:
-        # One call for every image; the ragged kernel's per-frame segments
-        # keep them apart.
-        hidden, cos, sin = self.model.embed(pixel_values, indices, weights, position_ids)
-        encoded = self._replay_block_loop(engine_inputs, hidden, cos, sin, seq_lengths)
-        if encoded is None:
-            encoded = self.model.encode(hidden, cos, sin)
-        embeds = self.model.merger(encoded)
-        return {engine_inputs.request_ids[0]: {"vision_embeds": [embeds]}}
+    def _normalize(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """Byte patches to the processors' float pixels. Eager, not in the
+        compiled embed, so the arithmetic (a subtract, a true divide) is the
+        processors' exactly."""
+        if pixel_values.dtype != torch.uint8:
+            # the intake ships bytes; anything else would skip normalization
+            raise ValueError(f"vision patches must be uint8, got {pixel_values.dtype}")
+        mean, std = self._pixel_normalizer
+        if mean.device != pixel_values.device:
+            mean, std = mean.to(pixel_values.device), std.to(pixel_values.device)
+            self._pixel_normalizer = (mean, std)
+        return (pixel_values.to(torch.float32) - mean) / std

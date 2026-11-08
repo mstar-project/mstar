@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.decoder_layer import DecoderLayer
+from mstar.model.components.decoder_layer import DecoderLayer, run_layers
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
     ParallelAttention,
@@ -27,6 +27,36 @@ from mstar.model.components.distributed import (
     VocabParallelEmbedding,
 )
 from mstar.model.components.norm import RMSNorm
+
+
+class Qwen3Attention(ParallelAttention):
+    """``ParallelAttention`` with Qwen3's per-head q/k RMSNorm, its 1D RoPE and
+    the step's KV write in one Triton kernel, through
+    ``AttentionCallable.norm_rope_attend``. At decode width a step is a few
+    small kernels per layer, and the separate norm, RoPE and KV-write kernels
+    were a sizeable share of it. Falls back to the unfused path off CUDA or
+    without planned positions."""
+
+    _fuse_qk = False
+
+    def bind_resources(self, resources: dict) -> None:
+        super().bind_resources(resources)
+        # the kernel is plain non-interleaved RoPE over the whole head dim;
+        # anything else the position resource would apply stays unfused
+        self._rope_theta = self.pos.fusable_rope_theta(self.head_dim)
+        self._fuse_qk = (
+            self._rope_theta is not None and self.q_norm is not None and self.rope_scale == 1.0
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        pos_ids = self.pos.pos_ids(self.attend.label) if self._fuse_qk else None
+        if pos_ids is None or not hidden_states.is_cuda:
+            return super().forward(hidden_states)
+        num_tokens = hidden_states.shape[0]
+        q, k, v = self._project_qkv(hidden_states)
+        attn_output = self.attend.norm_rope_attend(q, k, v, self.q_norm, self.k_norm, pos_ids, self._rope_theta)
+        attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
+        return self.o_proj(attn_output)
 
 
 @dataclass
@@ -71,7 +101,7 @@ class Qwen3DenseLM(nn.Module):
         )
         self.layers = nn.ModuleList([
             DecoderLayer(
-                self_attn=ParallelAttention(
+                self_attn=Qwen3Attention(
                     comm_group=comm_group,
                     hidden_size=config.num_attention_heads * config.head_dim,
                     num_heads=config.num_attention_heads,
@@ -115,7 +145,9 @@ class Qwen3DenseLM(nn.Module):
         if "lm_head.weight" not in loaded:
             if not self.config.tie_word_embeddings:
                 raise RuntimeError("Qwen3 checkpoint has no lm_head.weight and does not tie embeddings")
-            self.lm_head.weight_loader(self.lm_head.weight, self.embed_tokens.weight.data.clone())
+            # Both shard the vocab dim by TP rank over the same rows, so the
+            # local embedding shard is this rank's head shard.
+            self.lm_head.weight.data.copy_(self.embed_tokens.weight.data)
             loaded.add("lm_head.weight")
         missing = sorted(set(dict(self.named_parameters())) - loaded)
         if missing:
@@ -134,12 +166,8 @@ class Qwen3DenseLM(nn.Module):
         the label once, advance the index per layer. Passing them as
         arguments instead would make inductor specialize on the int.
         """
-        hidden_states = input_embeds
         self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
-            hidden_states = layer(hidden_states=hidden_states)
-        return self.norm(hidden_states)
+        return run_layers(self.layers, input_embeds, self.norm)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)

@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import torch
 
-from mstar.engine.engine import Engine
 from mstar.model.submodule_base import BatchedModelOutput, NodeSubmodule
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 
 class _Sub(NodeSubmodule):
@@ -42,7 +42,7 @@ def _raw(bs=4, with_per_rid=False):
 
 
 def _collect(sub, raw, rids):
-    eng = Engine.__new__(Engine)
+    eng = make_engine()
     outputs = {}
     row_clones, _ = eng._merge_per_rid(outputs, raw, rids, rids, sub, {})
     return outputs, row_clones
@@ -125,7 +125,7 @@ def test_rows_only_keeps_the_views_and_builds_no_per_rid_dicts():
     stop buffer are what its readers use, so no per-rid dict is built."""
     rids = [1, 2, 3, 4]
     raw = _raw(bs=4)
-    eng = Engine.__new__(Engine)
+    eng = make_engine()
     outputs = {}
     row_clones, row_views = eng._merge_per_rid(
         outputs, raw, rids, rids, _Sub(), {}, rows_only=True,
@@ -142,14 +142,14 @@ def test_rows_only_keeps_the_views_and_builds_no_per_rid_dicts():
 def test_rows_only_collect_takes_no_clone():
     """On a rows-only step the gpu thread copies the rows to the host right
     behind the step, so the graph's own output buffer is handed over as is."""
-    from types import SimpleNamespace
 
     rids = [1, 2, 3, 4]
     raw = _raw(bs=4)
-    eng = Engine.__new__(Engine)
+    eng = make_engine()
     out = eng._collect_outputs(
-        SimpleNamespace(submodule=_Sub(), cuda_graph_runner=None), None, raw,
-        [], {}, request_ids=rids, step_request_ids=tuple(rids), rows_only=True,
+        make_mgmt(_Sub()), None, raw,
+        [], {}, request_ids=rids, step_request_ids=tuple(rids), graph_walk="decode",
+        rows_only=True,
     )
     assert out.rows_only and out.per_rid_outputs == {} and out.row_views is None
     assert out.check_stop_buffers["new_token"] is raw.check_stop_buffers["new_token"]

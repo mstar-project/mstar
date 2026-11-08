@@ -3,6 +3,7 @@ into the Rust shared-memory arena, the location rides the TensorPointerInfo,
 a separate consumer manager reads them zero-copy, and reclaim frees the
 arena slots. Skipped unless the ``mstar_rust`` extension is installed."""
 import os
+import sys
 
 import pytest
 import torch
@@ -35,12 +36,13 @@ class _NullCommunicator:
         return []
 
 
-def _manager(entity, tmp_path):
+def _manager(entity, tmp_path, copy_workers=1):
     os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
     os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
     return ArenaShmCommunicationManager(
         my_entity_id=entity, hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+        copy_workers=copy_workers,
     )
 
 
@@ -199,10 +201,9 @@ def test_strict_mode_backpressures_then_fails(tmp_path):
 
 
 def test_transport_mismatch_fails_loudly(tmp_path):
-    """A mixed deployment (arena producer + file consumer, or the reverse)
-    fails with an explicit MSTAR_SHM_ARENA message where data would be
-    unreachable (arena producer -> file consumer); the reverse direction
-    interops via the arena consumer's file fallback."""
+    """The file manager on its own (the spill path) cannot read an arena slot
+    and says so; the reverse direction interops via the arena consumer's
+    file fallback."""
     arena_prod = _manager("mx0", tmp_path)
     file_cons = SharedMemoryCommunicationManager(
         my_entity_id="mx1", hostname="localhost", device="cpu",
@@ -211,7 +212,7 @@ def test_transport_mismatch_fails_loudly(tmp_path):
         "rm", {"x": [torch.randn(4)]})
     arena_prod.register_for_send("rm", [infos["x"][0]])
     edge = GraphEdge(next_node="B", name="x", tensor_info=infos["x"])
-    with pytest.raises(RuntimeError, match="MSTAR_SHM_ARENA"):
+    with pytest.raises(RuntimeError, match="staged in an SHM arena"):
         file_cons.start_read_tensors("rm", [edge])
 
     # The reverse direction now INTEROPS: a file-producer's tensors carry
@@ -230,20 +231,331 @@ def test_transport_mismatch_fails_loudly(tmp_path):
     assert torch.equal(got, y)
 
 
-def test_factory_flag(tmp_path, monkeypatch):
-    def make(value):
-        monkeypatch.setenv("MSTAR_SHM_ARENA", value)
-        return create_tensor_communication_manager(
-            protocol=CommProtocol.SHM, my_entity_id=f"f_{value}",
-            hostname="localhost", device="cpu",
-            communicator=_NullCommunicator(), shm_dir=str(tmp_path),
-        )
+def test_the_shm_protocol_builds_the_arena(tmp_path):
+    mgr = create_tensor_communication_manager(
+        protocol=CommProtocol.SHM, my_entity_id="f0",
+        hostname="localhost", device="cpu",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    assert type(mgr) is ArenaShmCommunicationManager
 
-    assert type(make("0")) is SharedMemoryCommunicationManager
-    assert type(make("1")) is ArenaShmCommunicationManager
-    assert type(make("AUTO")) is ArenaShmCommunicationManager
-    with pytest.raises(ValueError):
-        make("yes")
+
+def _fake_dev_shm(monkeypatch, mib, segment_mb=None, max_segments=None,
+                  free_mib=None):
+    """/dev/shm reports ``mib`` MiB, ``free_mib`` of it free (all by
+    default); the sizing knobs as given."""
+    from types import SimpleNamespace
+
+    from mstar.communication import arena
+
+    blocks = (mib << 20) // 4096
+    free = blocks if free_mib is None else (free_mib << 20) // 4096
+    monkeypatch.setattr(arena.os, "statvfs", lambda path: SimpleNamespace(
+        f_frsize=4096, f_blocks=blocks, f_bavail=free))
+    monkeypatch.setattr(arena, "_sizing_logged", False)
+    monkeypatch.delenv(arena.ARENA_PLAN_ENV, raising=False)
+    for k, v in (("SEGMENT_MB", segment_mb), ("MAX_SEGMENTS", max_segments)):
+        if v is None:
+            monkeypatch.delenv(f"MSTAR_SHM_ARENA_{k}", raising=False)
+        else:
+            monkeypatch.setenv(f"MSTAR_SHM_ARENA_{k}", str(v))
+    return arena
+
+
+@pytest.mark.parametrize("mib, free_mib, sizes", [
+    (64, 64, (16, 1)), (1024, 1024, (256, 1)), (64 << 10, 64 << 10, (256, 32)),
+    (64 << 10, 200, (32, 1)),
+], ids=["64MiB", "1GiB", "64GiB", "64GiB-200MiB-free"])
+def test_unset_sizing_knobs_fit_four_entities_in_free_dev_shm(
+        monkeypatch, caplog, mib, free_mib, sizes):
+    arena = _fake_dev_shm(monkeypatch, mib, free_mib=free_mib)
+    with caplog.at_level("INFO", logger=arena.__name__):
+        assert arena._arena_sizing()[:2] == arena._arena_sizing()[:2] == sizes
+    assert [r.getMessage() for r in caplog.records] == [  # once per process
+        f"ARENA: /dev/shm has {free_mib} MiB free; each entity's arena grows to {sizes[1]} "
+        f"segments of {sizes[0]} MiB (MSTAR_SHM_ARENA_MAX_SEGMENTS and _SEGMENT_MB override)"]
+
+
+def test_sizing_knobs_set_by_hand_are_taken_as_given(monkeypatch, tmp_path):
+    assert _fake_dev_shm(monkeypatch, 64, 1, 4)._arena_sizing()[:2] == (1, 4)
+    assert _fake_dev_shm(monkeypatch, 64, None, 4)._arena_sizing()[:2] == (256, 4)
+    assert _fake_dev_shm(monkeypatch, 64 << 10, 1, 4, free_mib=10)._arena_sizing()[:2] == (1, 4)
+    with pytest.raises(ValueError, match="at least 1"):
+        _fake_dev_shm(monkeypatch, 64 << 10, 0, 4)._arena_sizing()
+    _fake_dev_shm(monkeypatch, 1024, 256, 32)
+    with pytest.raises(RuntimeError, match="exceeds /dev/shm"):
+        ArenaShmCommunicationManager(
+            my_entity_id="big", hostname="localhost", device="cpu",
+            communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+
+
+@pytest.mark.parametrize("budget_mib, entities, sizes", [
+    (1024, 9, (64, 1)), (64 << 10, 9, (256, 25)), (64, 1, (32, 1)),
+    (1024, 3, (256, 1)), (150, 9, None),
+])
+def test_a_budget_is_split_among_arenas_and_a_spill_share(budget_mib, entities, sizes):
+    from mstar.communication import arena
+
+    assert arena._default_sizing(budget_mib << 20, entities) == sizes
+
+
+def test_the_plan_counts_the_api_server_and_each_arena_worker(monkeypatch, fake_rocm):
+    arena = _fake_dev_shm(monkeypatch, 1024)
+    arena.export_arena_plan(["cpu"] * 8)
+    assert os.environ[arena.ARENA_PLAN_ENV] == "64x1"  # 1024 MiB // (8 + 1 + 1)
+    arena.export_arena_plan(["cuda:0", "cuda:1"])  # ROCm workers send by files
+    assert os.environ[arena.ARENA_PLAN_ENV] == "256x2"  # 1024 MiB // (1 + 1)
+    arena.export_arena_plan(None)  # no deployment config
+    assert arena.ARENA_PLAN_ENV not in os.environ
+    _fake_dev_shm(monkeypatch, 150).export_arena_plan(["cpu"] * 8)
+    assert os.environ[arena.ARENA_PLAN_ENV] == "0x0"
+
+
+def test_the_plan_measures_after_a_dead_runs_files_are_swept(monkeypatch):
+    """A crashed run's files would otherwise leave the restart no arena at all."""
+    from types import SimpleNamespace
+
+    arena = _fake_dev_shm(monkeypatch, 256, free_mib=16)
+
+    def sweep(*args):
+        monkeypatch.setattr(arena.os, "statvfs", lambda path: SimpleNamespace(
+            f_frsize=1 << 20, f_blocks=256, f_bavail=256))
+
+    monkeypatch.setattr(arena, "_sweep_dead_namespaces", sweep)
+    monkeypatch.setattr(arena, "_sweep_orphan_segments", lambda: None)
+    arena.export_arena_plan(["cpu"] * 2)
+    assert os.environ[arena.ARENA_PLAN_ENV] == "64x1"
+
+
+def test_the_plan_sweeps_a_dead_namespaces_files_and_leaves_a_live_ones(monkeypatch, tmp_path):
+    import fcntl
+
+    arena = _fake_dev_shm(monkeypatch, 1024)
+    monkeypatch.setattr(arena, "_default_shm_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(arena, "_sweep_orphan_segments", lambda: None)
+    dead, live = "a" * 12, "b" * 12
+    for ns in (dead, live):
+        (tmp_path / f"mstar_{ns}.lock").touch()
+        (tmp_path / f"mstar_{ns}_1").write_bytes(b"x")
+    # its deployment is alive: another open file description holds the shared lock
+    held = os.open(tmp_path / f"mstar_{live}.lock", os.O_RDONLY)
+    fcntl.flock(held, fcntl.LOCK_SH)
+    try:
+        arena.export_arena_plan(["cpu"])
+    finally:
+        os.close(held)
+    assert not (tmp_path / f"mstar_{dead}_1").exists()
+    assert (tmp_path / f"mstar_{live}_1").exists()
+
+
+def test_no_deployment_config_sweeps_nothing(monkeypatch):
+    arena = _fake_dev_shm(monkeypatch, 1024)
+    monkeypatch.setattr(arena, "_sweep_dead_namespaces", lambda *a: pytest.fail("swept"))
+    monkeypatch.setattr(arena, "_sweep_orphan_segments", lambda: pytest.fail("swept"))
+    arena.export_arena_plan(None)
+
+
+@pytest.mark.parametrize("planned", [True, False])
+def test_planned_arenas_do_not_depend_on_start_order(monkeypatch, tmp_path, planned):
+    """An arena commits its first segment when it is built, so each one that
+    sizes itself from the free space it finds gets less than the last."""
+    from types import SimpleNamespace
+
+    arena = _fake_dev_shm(monkeypatch, 1024, free_mib=160)
+    if planned:
+        arena.export_arena_plan(["cpu"] * 8)
+    free_mib = [160]
+    monkeypatch.setattr(arena.os, "statvfs", lambda path: SimpleNamespace(
+        f_frsize=1 << 20, f_blocks=1024, f_bavail=free_mib[0]))
+    sizes = []
+    for i in range(4):
+        mgr = ArenaShmCommunicationManager(
+            my_entity_id=f"p{i}", hostname="localhost", device="cpu",
+            communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+        sizes.append(mgr._segment_bytes >> 20)
+        free_mib[0] -= sizes[-1]
+        mgr.close()
+    assert sizes == ([16] * 4 if planned else [32, 32, 16, 16])
+
+
+def test_sizing_knobs_set_by_hand_override_the_plan(monkeypatch):
+    arena = _fake_dev_shm(monkeypatch, 1024, 1, 4)
+    monkeypatch.setenv(arena.ARENA_PLAN_ENV, "64x1")
+    assert arena._arena_sizing()[:2] == (1, 4)
+
+
+def test_a_small_dev_shm_gets_an_arena_that_spills(monkeypatch, tmp_path):
+    """64 MiB of /dev/shm free: one 16 MiB segment, and a 20 MiB tensor goes
+    to a file instead of failing."""
+    _fake_dev_shm(monkeypatch, 64)
+    prod, cons = (ArenaShmCommunicationManager(
+        my_entity_id=e, hostname="localhost", device="cpu",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path)) for e in ("s0", "s1"))
+    assert prod._segment_bytes == 16 << 20 and prod._arena.num_segments == 1
+    infos = prod.store_and_return_tensor_info("r", {"x": [torch.ones(8), torch.ones(5 << 20)]})["x"]
+    prod.register_for_send("r", list(infos))
+    assert infos[0].shm_segment is not None and infos[1].shm_segment is None
+    cons.start_read_tensors("r", [GraphEdge(next_node="B", name="x", tensor_info=infos)])
+    assert torch.equal(cons.tensor_store.get_tensor(infos[1].uuid), torch.ones(5 << 20))
+
+
+class _CreateFails:
+    """``SegmentedShmArena`` whose first segment cannot be created."""
+
+    @staticmethod
+    def create(base, segment_size, max_segments):
+        raise RuntimeError(f"arena full: no space to back {segment_size} B "
+                           f"at /dev/shm/{base}.seg0: only 0 B free")
+
+
+def _arena_warnings(caplog):
+    return [r.getMessage() for r in caplog.records
+            if r.name == "mstar.communication.arena"
+            and r.levelname == "WARNING"]
+
+
+def test_no_first_segment_sends_by_files_and_reads_peer_arenas(
+        monkeypatch, tmp_path, caplog):
+    import mstar_rust
+
+    peer = _manager("sp_peer", tmp_path)
+    cons = _manager("sp_cons", tmp_path)
+    with monkeypatch.context() as m, caplog.at_level("WARNING"):
+        m.setattr(mstar_rust, "SegmentedShmArena", _CreateFails)
+        mgr = _manager("sp0", tmp_path)
+        assert mgr._arena is None and mgr._own_segment_paths == []
+        assert mgr.stats_summary()["segments"] == 0
+        xs = [torch.randn(4, 8), torch.arange(300_000, dtype=torch.uint8)]
+        infos = mgr.store_and_return_tensor_info("r", {"x": xs})["x"]
+        mgr.register_for_send("r", infos[:1])
+        mgr.register_for_send_uuids(ParallelList(["r"], [[infos[1].uuid]]))
+        assert all(i.shm_segment is None and i.uuid in mgr._shm_files for i in infos)
+        cons.start_read_tensors("r", [GraphEdge(next_node="B", name="x", tensor_info=infos)])
+        for x, info in zip(xs, infos, strict=True):
+            assert torch.equal(cons.tensor_store.get_tensor(info.uuid), x)
+
+        y = torch.randn(16)
+        (y_info,) = peer.store_and_return_tensor_info("r", {"y": [y]})["y"]
+        peer.register_for_send("r", [y_info])
+        assert y_info.shm_segment is not None
+        mgr.start_read_tensors("r", [GraphEdge(next_node="B", name="y", tensor_info=[y_info])])
+        assert torch.equal(mgr.tensor_store.get_tensor(y_info.uuid), y)
+
+        path = mgr._shm_files[infos[0].uuid]
+        mgr._cleanup_by_uuid(infos[0].uuid)
+        assert not os.path.exists(path)
+        mgr.unlink_owned_files()
+        assert not mgr._shm_files
+        mgr.close()
+    warnings = _arena_warnings(caplog)
+    assert len(warnings) == 1, warnings
+    assert "cannot create this entity's first segment" in warnings[0]
+    assert "only 0 B free" in warnings[0] and "spill to per-uuid files" in warnings[0]
+
+
+def test_under_four_minimum_segments_free_sends_by_files_without_trying(
+        monkeypatch, tmp_path, caplog):
+    import mstar_rust
+
+    class _NotCalled:
+        @staticmethod
+        def create(*args):
+            raise AssertionError("created an arena in a full /dev/shm")
+
+    arena = _fake_dev_shm(monkeypatch, 64 << 10, free_mib=60)
+    monkeypatch.setattr(mstar_rust, "SegmentedShmArena", _NotCalled)
+    assert arena._arena_sizing()[:2] == (0, 0)
+    with caplog.at_level("WARNING"):
+        mgr = ArenaShmCommunicationManager(
+            my_entity_id="sp1", hostname="localhost", device="cpu",
+            communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    assert mgr._arena is None
+    assert _arena_warnings(caplog) == [
+        "ARENA: /dev/shm has 60 MiB free, too little for a 16 MiB arena per "
+        "entity and room for spill files; this entity sends by per-uuid files"]
+    (info,) = mgr.store_and_return_tensor_info("r", {"x": [torch.ones(8)]})["x"]
+    mgr.register_for_send("r", [info])
+    assert info.shm_segment is None and info.uuid in mgr._shm_files
+
+
+@pytest.fixture
+def fake_rocm(monkeypatch):
+    """torch reports a ROCm build; ``_cudart`` records any call."""
+    from mstar.communication import arena as arena_mod
+    from mstar.platforms import resolve_platform
+
+    calls = []
+
+    def cudart():
+        calls.append(1)
+        raise OSError("ROCm has no libcudart")
+
+    monkeypatch.setattr(torch.version, "hip", "6.3.0")
+    monkeypatch.setattr(torch.version, "cuda", None)
+    monkeypatch.setattr(arena_mod, "_cudart", cudart)
+    resolve_platform.cache_clear()
+    yield calls
+    resolve_platform.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_rocm_sends_by_files_and_never_loads_libcudart(
+        monkeypatch, tmp_path, caplog, fake_rocm):
+    from mstar.communication import arena as arena_mod
+
+    assert not arena_mod._arena_supported("cuda:0")
+    assert arena_mod._arena_supported("cpu")
+    peer = _manager("rocm_peer", tmp_path)   # a CPU entity keeps its arena
+    with caplog.at_level("INFO", logger=arena_mod.__name__):
+        gpu = ArenaShmCommunicationManager(
+            my_entity_id="rocm0", hostname="localhost", device="cuda",
+            communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    assert gpu._arena is None and not gpu._pin_segments
+    assert [r.getMessage() for r in caplog.records if "not used on" in r.getMessage()] == [
+        "ARENA: not used on cuda (rocm); this entity sends by per-uuid files "
+        "and reads its peers' arenas"]
+
+    x = torch.randn(64, device="cuda")
+    (info,) = gpu.store_and_return_tensor_info("r", {"x": [x]})["x"]
+    gpu.register_for_send("r", [info])
+    assert info.shm_segment is None
+    peer.start_read_tensors("r", [GraphEdge(next_node="B", name="x", tensor_info=[info])])
+    assert torch.equal(peer.tensor_store.get_tensor(info.uuid), x.cpu())
+
+    y = torch.randn(64)
+    (y_info,) = peer.store_and_return_tensor_info("r", {"y": [y]})["y"]
+    peer.register_for_send("r", [y_info])
+    gpu.start_read_tensors("r", [GraphEdge(next_node="B", name="y", tensor_info=[y_info])])
+    assert torch.equal(gpu.tensor_store.get_tensor(y_info.uuid).cpu(), y)
+    gpu.close()
+    assert not fake_rocm, "loaded libcudart on ROCm"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("copy_stream", [True, False])
+def test_a_read_is_async_only_with_a_copy_stream(monkeypatch, tmp_path, copy_stream):
+    """Without a copy stream (XPU) no event gates the ACK, so the copy out of
+    the peer's slot must be done when the read returns."""
+    peer = _manager("nb_peer", tmp_path)
+    gpu = ArenaShmCommunicationManager(
+        my_entity_id="nb0", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path))
+    if not copy_stream:
+        gpu._h2d_stream = None
+    y = torch.randn(1 << 16)
+    (info,) = peer.store_and_return_tensor_info("r", {"y": [y]})["y"]
+    peer.register_for_send("r", [info])
+    seen, real_to = [], torch.Tensor.to
+
+    def to(self, *args, **kwargs):
+        seen.append(kwargs.get("non_blocking"))
+        return real_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to)
+    futures = gpu.start_read_tensors("r", [GraphEdge(next_node="B", name="y", tensor_info=[info])])
+    monkeypatch.undo()
+    assert seen == [copy_stream] and bool(futures) == copy_stream
+    assert torch.equal(gpu.tensor_store.get_tensor(info.uuid).cpu(), y)
 
 
 def test_instance_unique_names_no_collision(tmp_path):
@@ -283,6 +595,85 @@ def test_orphan_sweep(tmp_path):
                 os.unlink(f)
             except FileNotFoundError:
                 pass
+
+
+class _IpcCommunicator(_NullCommunicator):
+    """A deployment's communicator: over IPC, so its manager has a namespace."""
+
+    protocol = CommProtocol.IPC
+    ipc_socket_path_prefix = "/tmp/mstar/"
+
+    def _endpoint(self, entity_id):
+        return f"ipc://{self.ipc_socket_path_prefix}/{entity_id}.ipc"
+
+
+def _deployment_manager(entity, shm_dir, token, monkeypatch):
+    monkeypatch.setenv("MSTAR_DEPLOYMENT_TOKEN", token)
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    return ArenaShmCommunicationManager(
+        my_entity_id=entity, hostname="localhost", device="cpu",
+        communicator=_IpcCommunicator(), shm_dir=str(shm_dir),
+    )
+
+
+def test_a_start_in_another_pid_namespace_keeps_live_segments(
+        monkeypatch, tmp_path):
+    """Containers sharing /dev/shm cannot see each other's pids: a second
+    deployment's startup used to unlink every live segment of the first."""
+    a = _deployment_manager("w0", tmp_path, "a" * 16, monkeypatch)
+    x = torch.arange(64, dtype=torch.uint8)
+    infos = a.store_and_return_tensor_info("r", {"x": [x]})
+    a.register_for_send("r", list(infos["x"]))
+    seg_path = a._own_segment_paths[0]
+
+    real_exists, hidden = os.path.exists, f"/proc/{os.getpid()}"
+    monkeypatch.setattr(
+        os.path, "exists", lambda p: p != hidden and real_exists(p))
+    _deployment_manager("w0", tmp_path, "b" * 16, monkeypatch)
+    monkeypatch.setattr(os.path, "exists", real_exists)
+
+    assert os.path.exists(seg_path), "a live neighbour's segment was swept"
+    cons = _deployment_manager("w1", tmp_path, "a" * 16, monkeypatch)
+    cons.start_read_tensors(
+        "r", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])])
+    assert torch.equal(cons.tensor_store.get_tensor(infos["x"][0].uuid), x)
+
+
+def test_a_dead_namespaces_segments_are_swept(monkeypatch, tmp_path):
+    dead = "d" * 12
+    lock = f"/dev/shm/mstar_{dead}.lock"
+    seg = f"/dev/shm/mstar_{dead}_arena_w0_deadbeef.seg0"
+    open(lock, "wb").close()
+    with open(seg, "wb") as f:
+        f.write(b"x" * 64)
+    try:
+        _deployment_manager("sweeper", tmp_path, "c" * 16, monkeypatch)
+        assert not os.path.exists(seg), "a dead namespace's segment was kept"
+        assert not os.path.exists(lock)
+    finally:
+        for p in (seg, lock):
+            if os.path.exists(p):
+                os.unlink(p)
+
+
+def test_a_dead_process_in_another_shm_dir_keeps_live_segments(
+        monkeypatch, tmp_path):
+    """One deployment's processes can use different shm_dirs: the unheld lock
+    a dead one leaves in its shm_dir must not let a sweep take the live
+    segments in /dev/shm."""
+    live_dir, dead_dir = tmp_path / "live", tmp_path / "dead"
+    live_dir.mkdir()
+    dead_dir.mkdir()
+    a = _deployment_manager("w0", live_dir, "e" * 16, monkeypatch)
+    infos = a.store_and_return_tensor_info(
+        "r", {"x": [torch.arange(64, dtype=torch.uint8)]})
+    a.register_for_send("r", list(infos["x"]))
+    seg_path = a._own_segment_paths[0]
+    (dead_dir / f"mstar_{a._shm_namespace}.lock").touch()
+
+    _deployment_manager("w0", dead_dir, "f" * 16, monkeypatch)
+    assert os.path.exists(seg_path), "a live process's segment was swept"
 
 
 def test_dead_peer_segments_evicted(tmp_path):
@@ -687,6 +1078,184 @@ def test_a_peer_reads_its_own_half_of_a_sharded_edge(tmp_path):
         assert torch.equal(got, expected), f"rank {rank} read the wrong rows"
 
 
+@pytest.mark.parametrize("shape", [
+    pytest.param((4, 3), id="rows"),
+    # Zero-byte rows: both slices are offset 0, nbytes 0; only dims differ.
+    pytest.param((4, 0), id="empty-rows"),
+])
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_two_slices_of_one_tensor_on_one_worker_do_not_alias(tmp_path, backend, shape):
+    """``x`` goes from a TP=1 producer to a TP=2 ``B`` and a TP=4 ``C``, both
+    with rank 0 on worker_1, which so receives rows [0, 2) and row 0 under one
+    producer uuid. Keyed by the uuid alone, ``C`` got ``B``'s rows."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes=["A"], tp_size=1, graph_walks=["decode"], _tp_rank=0),
+            ShardingGroup(nodes=["B"], tp_size=2, graph_walks=["decode"]),
+            ShardingGroup(nodes=["C"], tp_size=4, graph_walks=["decode"]),
+        ],
+        tp_enabled_nodes={"A", "B", "C"},
+        shard_dim={"x": 0},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["worker_0"],
+        NodeAndGraphWalk("B", "decode"): ["worker_1", "worker_2"],
+        NodeAndGraphWalk("C", "decode"): [f"worker_{i}" for i in range(1, 5)],
+    })
+    prod = _manager("worker_0", tmp_path)
+    cons = _manager("worker_1", tmp_path)
+    cons.communicator = _RecordingCommunicator()
+    if backend == "rust":
+        cons.tensor_store = TensorStore(RustTensorBookkeeping())
+    for mgr in (prod, cons):
+        mgr.register_request(7, cfg)
+
+    x = torch.arange(shape[0] * shape[1], dtype=torch.float32).reshape(shape)
+    (info,) = prod.store_and_return_tensor_info(
+        7, {"x": [x]}, node_name="A", graph_walk="decode",
+    )["x"]
+    edges = [
+        cfg.fanout_graph_edges(
+            GraphEdge(next_node=node, name="x", tensor_info=[info]),
+            source_node="A", source_graph_walk="decode", dest_graph_walk="decode",
+        )["worker_1"]
+        for node in ("B", "C")
+    ]
+    prod.register_for_send_uuids(ParallelList([7], [[info.uuid]]))
+    prod.refresh_shm_placement(edges)
+
+    for fut in cons.start_read_tensors(7, edges, graph_walk="decode") or []:
+        fut.result()
+    ready = cons.get_ready_tensors(graph_walk="decode")[7]
+    got = {e.next_node: cons.get_tensor(e.tensor_info[0].uuid) for e in ready}
+    assert torch.equal(got["B"], x[:2])
+    assert torch.equal(got["C"], x[:1]), "C got the slice stored for B"
+    assert [msg.body.successful_tensors for _, msg in cons.communicator.sent] == [
+        {info.uuid: 2}
+    ]
+    for edge in ready:
+        cons.dereference(edge.tensor_info[0].uuid)
+    assert cons.tensor_store.get_all_uuids(7) == []
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_a_slice_read_again_after_its_release_leaves_no_origin_behind(tmp_path, backend):
+    """``B`` holds rows [0, 2) of ``x`` under the producer's uuid, so ``C``'s
+    row 0 is read into a local uuid. ``C`` releases it and reads the slice
+    again on a later step, into a new local. Both reads ack the producer's
+    uuid, and the request's teardown leaves no local -> producer entry for
+    either local."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes=["A"], tp_size=1, graph_walks=["decode"], _tp_rank=0),
+            ShardingGroup(nodes=["B"], tp_size=2, graph_walks=["decode"]),
+            ShardingGroup(nodes=["C"], tp_size=4, graph_walks=["decode"]),
+        ],
+        tp_enabled_nodes={"A", "B", "C"},
+        shard_dim={"x": 0},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["worker_0"],
+        NodeAndGraphWalk("B", "decode"): ["worker_1", "worker_2"],
+        NodeAndGraphWalk("C", "decode"): [f"worker_{i}" for i in range(1, 5)],
+    })
+    prod = _manager("worker_0", tmp_path)
+    cons = _manager("worker_1", tmp_path)
+    cons.communicator = _RecordingCommunicator()
+    if backend == "rust":
+        cons.tensor_store = TensorStore(RustTensorBookkeeping())
+    for mgr in (prod, cons):
+        mgr.register_request(7, cfg)
+
+    x = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    (info,) = prod.store_and_return_tensor_info(
+        7, {"x": [x]}, node_name="A", graph_walk="decode",
+    )["x"]
+
+    def edge(node):
+        return cfg.fanout_graph_edges(
+            GraphEdge(next_node=node, name="x", tensor_info=[info]),
+            source_node="A", source_graph_walk="decode", dest_graph_walk="decode",
+        )["worker_1"]
+
+    def read(edges):
+        prod.refresh_shm_placement(edges)
+        for fut in cons.start_read_tensors(7, edges, graph_walk="decode") or []:
+            fut.result()
+        return {e.next_node: e.tensor_info[0].uuid for e in cons.get_ready_tensors("decode")[7]}
+
+    prod.register_for_send_uuids(ParallelList([7], [[info.uuid]]))
+    first = read([edge("B"), edge("C")])
+    assert first["B"] == info.uuid and first["C"] != info.uuid
+    cons.dereference(first["C"])
+
+    prod.register_for_send_uuids(ParallelList([7], [[info.uuid]]))
+    again = read([edge("C")])
+    assert again["C"] not in (info.uuid, first["C"])  # a new local
+    assert torch.equal(cons.get_tensor(again["C"]), x[:1])
+    assert [msg.body.successful_tensors for _, msg in cons.communicator.sent] == [
+        {info.uuid: 2}, {info.uuid: 1},
+    ]
+
+    cons.dereference(again["C"])
+    cons.dereference(first["B"])
+    cons.cleanup_request(7)
+    assert cons.slice_origins == {}
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
+def test_an_edge_mixing_a_reused_and_a_new_slice_is_read_in_full(tmp_path, backend):
+    """``x`` holds a tensor with rows and one with none. ``C``'s slice of the
+    empty one is ``B``'s, so it is reused while its other slice is new: the
+    new one still drops its transit ref."""
+    cfg = ShardingConfig(
+        groups=[
+            ShardingGroup(nodes=["A"], tp_size=1, graph_walks=["decode"], _tp_rank=0),
+            ShardingGroup(nodes=["B"], tp_size=2, graph_walks=["decode"]),
+            ShardingGroup(nodes=["C"], tp_size=4, graph_walks=["decode"]),
+        ],
+        tp_enabled_nodes={"A", "B", "C"},
+        shard_dim={"x": 0},
+    )
+    cfg.setup({
+        NodeAndGraphWalk("A", "decode"): ["worker_0"],
+        NodeAndGraphWalk("B", "decode"): ["worker_1", "worker_2"],
+        NodeAndGraphWalk("C", "decode"): [f"worker_{i}" for i in range(1, 5)],
+    })
+    prod = _manager("worker_0", tmp_path)
+    cons = _manager("worker_1", tmp_path)
+    cons.communicator = _RecordingCommunicator()
+    if backend == "rust":
+        cons.tensor_store = TensorStore(RustTensorBookkeeping())
+    for mgr in (prod, cons):
+        mgr.register_request(7, cfg)
+
+    full = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    infos = prod.store_and_return_tensor_info(
+        7, {"x": [full, torch.zeros(0, 3)]}, node_name="A", graph_walk="decode",
+    )["x"]
+    edges = [
+        cfg.fanout_graph_edges(
+            GraphEdge(next_node=node, name="x", tensor_info=infos),
+            source_node="A", source_graph_walk="decode", dest_graph_walk="decode",
+        )["worker_1"]
+        for node in ("B", "C")
+    ]
+    prod.register_for_send_uuids(ParallelList([7], [[i.uuid for i in infos]]))
+    prod.refresh_shm_placement(edges)
+
+    for fut in cons.start_read_tensors(7, edges, graph_walk="decode") or []:
+        fut.result()
+    ready = cons.get_ready_tensors(graph_walk="decode")[7]
+    got = {e.next_node: cons.get_tensor(e.tensor_info[0].uuid) for e in ready}
+    assert torch.equal(got["B"], full[:2])
+    assert torch.equal(got["C"], full[:1])
+    for edge in ready:
+        for info in edge.tensor_info:
+            cons.dereference(info.uuid)
+    assert cons.tensor_store.get_all_uuids(7) == [], "a slice kept its transit ref"
+
+
 def test_arena_stages_the_stored_host_copy(tmp_path):
     """A stored host copy is what lands in the arena (a host memcpy, no D2H);
     it differs from the stored tensor only so the test can tell."""
@@ -704,3 +1273,534 @@ def test_arena_stages_the_stored_host_copy(tmp_path):
         "r1", [GraphEdge(next_node="B", name="tok", tensor_info=infos["tok"])],
     )
     assert torch.equal(cons.tensor_store.get_tensor(infos["tok"][0].uuid), host)
+
+
+@pytest.mark.parametrize("make", [
+    lambda: torch.tensor(3.5),
+    lambda: torch.arange(40_000, dtype=torch.float32),
+    lambda: torch.arange(24, dtype=torch.int16).reshape(4, 6).t(),
+], ids=["scalar", "past_torch_grain", "transposed"])
+def test_a_host_source_is_staged_without_tensor_copy(tmp_path, monkeypatch, make):
+    """A host tensor lands in the arena as one memcpy, not through
+    Tensor.copy_, which splits a copy of more than 32K elements over torch's
+    OpenMP pool and leaves that pool spinning on the serving cores."""
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path)
+    src = make()
+    infos = prod.store_and_return_tensor_info("r1", {"x": [src]})
+
+    def no_copy(self, *args, **kwargs):
+        raise AssertionError("a host source went through Tensor.copy_")
+
+    monkeypatch.setattr(torch.Tensor, "copy_", no_copy)
+    prod.register_for_send("r1", infos["x"])
+    monkeypatch.undo()
+    cons.start_read_tensors(
+        "r1", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])],
+    )
+    got = cons.tensor_store.get_tensor(infos["x"][0].uuid)
+    assert got.dtype == src.dtype and got.shape == src.shape and torch.equal(got, src)
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.bool])
+def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, parallel):
+    """A CPU consumer's tensor is a copy: the producer reclaiming the slot and
+    staging another tensor into it must not change what was read. ``parallel``
+    takes the copier's sliced path, which a video read uses."""
+    from mstar.utils import host_copy
+
+    monkeypatch.setattr(host_copy, "MIN_SLICE_BYTES", 1)
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path, copy_workers=4 if parallel else 1)
+    assert cons._host_copier.slices(1152) == (4 if parallel else 1)
+    original = (torch.arange(3 * 16 * 24) % 7 == 3) if dtype == torch.bool else (
+        torch.arange(3 * 16 * 24) % 251).to(dtype)
+    original = original.reshape(1, 3, 16, 24)
+    infos = prod.store_and_return_tensor_info("r1", {"img": [original]})
+    prod.register_for_send("r1", infos["img"])
+    (info,) = infos["img"]
+    cons.start_read_tensors("r1", [GraphEdge(next_node="B", name="img", tensor_info=infos["img"])])
+    got = cons.tensor_store.get_tensor(info.uuid)
+    assert got.dtype == dtype and got.shape == original.shape and torch.equal(got, original)
+
+    location = prod._arena_locs[info.uuid]
+    prod._cleanup_by_uuid(info.uuid)
+    again = prod.store_and_return_tensor_info("r2", {"img": [torch.zeros_like(original)]})
+    prod.register_for_send("r2", again["img"])
+    assert prod._arena_locs[again["img"][0].uuid] == location, "the test needs the slot reused"
+    assert torch.equal(got, original), "the read aliased the producer's slot"
+
+
+def _is_mapped(ptr: int) -> bool:
+    with open("/proc/self/maps") as f:
+        for line in f:
+            lo, hi = (int(x, 16) for x in line.split()[0].split("-"))
+            if lo <= ptr < hi:
+                return True
+    return False
+
+
+@pytest.fixture
+def fake_pins(monkeypatch):
+    """Stand-in for cudaHostRegister/Unregister on a CPU host: records each
+    unregister and whether the range was still mapped at that moment."""
+    from mstar.communication import arena as arena_mod
+
+    pinned, unpinned = [], []
+
+    def pin(ptr, nbytes):
+        pinned.append(ptr)
+        return True
+
+    def unpin(ptr):
+        unpinned.append((ptr, _is_mapped(ptr)))
+        return True
+
+    monkeypatch.setattr(arena_mod, "_pin", pin)
+    monkeypatch.setattr(arena_mod, "_unpin", unpin)
+    return pinned, unpinned
+
+
+def test_own_pinned_segments_are_unregistered_before_the_arena_unmaps(
+        tmp_path, fake_pins):
+    import gc
+
+    pinned, unpinned = fake_pins
+    prod = _manager("pin_own", tmp_path)
+    prod._pin_segments = True
+    for i in range(2):  # the second tensor grows a pinned segment
+        infos = prod.store_and_return_tensor_info(
+            f"r{i}", {"x": [torch.zeros(700_000, dtype=torch.uint8)]})
+        prod.register_for_send(f"r{i}", list(infos["x"]))
+    assert prod._arena.num_segments == 2 and len(pinned) == 1
+    del prod, infos
+    gc.collect()
+    assert unpinned == [(pinned[0], True)]
+
+
+def test_close_unregisters_own_and_peer_segments_once(tmp_path, fake_pins):
+    import gc
+
+    pinned, unpinned = fake_pins
+    prod = _manager("pin_prod", tmp_path)
+    infos = prod.store_and_return_tensor_info(
+        "r", {"x": [torch.arange(64, dtype=torch.uint8)]})
+    prod.register_for_send("r", list(infos["x"]))
+    cons = _manager("pin_cons", tmp_path)
+    cons._pin_segments = True
+    cons.start_read_tensors(
+        "r", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])])
+    assert len(pinned) == 1 and cons._pinned_bytes > 0
+
+    cons.close()
+    assert unpinned == [(pinned[0], True)]
+    assert cons._pinned_bytes == 0
+    assert all(p == 0 for _, _, p in cons._peer_segments.values())
+    del cons
+    gc.collect()
+    assert len(unpinned) == 1
+
+
+def test_close_during_a_segment_registration_still_unregisters_it(
+        tmp_path, monkeypatch):
+    import threading
+
+    from mstar.communication import arena as arena_mod
+
+    prod = _manager("pin_race", tmp_path)
+    prod._pin_segments = True
+    unpinned, closer = [], []
+
+    def pin(ptr, nbytes):
+        t = threading.Thread(target=prod.close)
+        t.start()
+        t.join(0.2)
+        assert t.is_alive(), "close() did not wait for the registration"
+        closer.append(t)
+        return True
+
+    monkeypatch.setattr(arena_mod, "_pin", pin)
+    monkeypatch.setattr(arena_mod, "_unpin",
+                        lambda ptr: unpinned.append(ptr) or True)
+    infos = prod.store_and_return_tensor_info(
+        "r", {"x": [torch.zeros(1_500_000, dtype=torch.uint8)]})
+    prod.register_for_send("r", list(infos["x"]))
+    closer[0].join(5)
+    assert unpinned == [prod._arena.segment(1).ptr_len()[0]]
+    assert prod._pinned_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_no_host_registration_outlives_a_dropped_arena(tmp_path):
+    import gc
+
+    from mstar.communication.arena import _cudart
+
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    m = ArenaShmCommunicationManager(
+        my_entity_id="pin_gpu", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    (ptr,) = m._own_pinned
+    del m
+    gc.collect()
+    lib = _cudart()
+    rc = lib.cudaHostUnregister(ptr)  # 0 if the registration was left behind
+    lib.cudaGetLastError()
+    assert rc != 0
+
+
+def _bigger_than_dev_shm() -> int:
+    """A size no segment in /dev/shm can have: preallocating it fails with
+    ENOSPC up front, without filling the real /dev/shm."""
+    if not sys.platform.startswith("linux") or not os.path.isdir("/dev/shm"):
+        pytest.skip("Linux /dev/shm only")
+    st = os.statvfs("/dev/shm")
+    if not st.f_blocks:
+        pytest.skip("/dev/shm has no size limit")
+    return st.f_frsize * st.f_blocks + (1 << 20)
+
+
+class _NoRoomToGrow:
+    """The producer's arena, except that every reserve asks for a segment
+    /dev/shm cannot hold: what growth meets once /dev/shm is full."""
+
+    def __init__(self, arena, too_big):
+        self._arena, self._too_big = arena, too_big
+
+    def reserve(self, nbytes):
+        return self._arena.reserve(self._too_big)
+
+    def __getattr__(self, name):
+        return getattr(self._arena, name)
+
+
+@pytest.mark.parametrize("spill", ["1", "0"])
+def test_no_room_to_grow_spills_or_fails_clearly(tmp_path, monkeypatch, spill):
+    monkeypatch.setenv("MSTAR_SHM_ARENA_SPILL", spill)
+    monkeypatch.setenv("MSTAR_SHM_ARENA_FULL_TIMEOUT_S", "0.05")
+    prod = _manager("w0", tmp_path)
+    cons = _manager("w1", tmp_path)
+    prod._arena = _NoRoomToGrow(prod._arena, _bigger_than_dev_shm())
+    t = torch.arange(64, dtype=torch.int64)
+    infos = prod.store_and_return_tensor_info("r1", {"x": [t]})
+    if spill == "0":
+        with pytest.raises(RuntimeError, match="arena full.*no space"):
+            prod.register_for_send("r1", infos["x"])
+        return
+    prod.register_for_send("r1", infos["x"])
+    (info,) = infos["x"]
+    assert info.shm_segment is None and info.uuid in prod._shm_files
+    cons.start_read_tensors(
+        "r1", [GraphEdge(next_node="B", name="x", tensor_info=infos["x"])])
+    assert torch.equal(cons.tensor_store.get_tensor(info.uuid), t)
+
+
+# Two producers and a consumer whose per-entity ceilings (3 x 4 MiB) each fit
+# a 16 MiB /dev/shm, but whose staged tensors together do not. Spills go to
+# argv[1], off the small tmpfs, so they can be read back; the last step spills
+# into the full tmpfs itself, the default spill directory.
+_SMALL_DEV_SHM_SCRIPT = """
+import errno, os, sys
+os.environ.update(MSTAR_SHM_ARENA_SEGMENT_MB="4", MSTAR_SHM_ARENA_MAX_SEGMENTS="3")
+import torch
+from mstar.communication.arena import ArenaShmCommunicationManager
+from mstar.graph.base import GraphEdge
+
+class Comm:
+    def send(self, *a):
+        raise AssertionError
+    def get_all_new_messages(self):
+        return []
+
+def manager(entity):
+    return ArenaShmCommunicationManager(
+        my_entity_id=entity, hostname="localhost", device="cpu",
+        communicator=Comm(), shm_dir=sys.argv[1])
+
+prods, cons = [manager("p0"), manager("p1")], manager("c0")
+sent, spilled = {}, 0
+for p in prods:
+    for i in range(3):
+        t = torch.full((3_500_000,), i + 1, dtype=torch.uint8)
+        (info,) = p.store_and_return_tensor_info("r", {"x": [t]})["x"]
+        p.register_for_send("r", [info])
+        spilled += info.shm_segment is None
+        sent[info.uuid] = (t, info)
+edge = GraphEdge(next_node="B", name="x", tensor_info=[i for _, i in sent.values()])
+cons.start_read_tensors("r", [edge])
+assert all(torch.equal(cons.tensor_store.get_tensor(u), t) for u, (t, _) in sent.items())
+late = manager("late")
+assert late._arena is None
+assert not [n for n in os.listdir("/dev/shm") if "_late_" in n]
+z = torch.full((1000,), 9, dtype=torch.uint8)
+(info,) = late.store_and_return_tensor_info("r", {"x": [z]})["x"]
+late.register_for_send("r", [info])
+assert info.shm_segment is None
+cons.start_read_tensors("r", [GraphEdge(next_node="B", name="x", tensor_info=[info])])
+assert torch.equal(cons.tensor_store.get_tensor(info.uuid), z)
+prods[1].shm_dir = "/dev/shm"
+(info,) = prods[1].store_and_return_tensor_info("r", {"x": [torch.ones(3_500_000)]})["x"]
+try:
+    prods[1].register_for_send("r", [info])
+except OSError as e:
+    assert e.errno == errno.ENOSPC, e
+else:
+    raise AssertionError("a spill into a full /dev/shm succeeded")
+print(f"spilled={spilled}")
+"""
+
+
+def _private_small_dev_shm_cmd(inner: str) -> list[str]:
+    """Run ``inner`` in a private mount namespace whose /dev/shm is a 16 MiB
+    tmpfs, so the host's /dev/shm is never touched. Needs passwordless sudo."""
+    return ["sudo", "-n", "unshare", "-m", "sh", "-c",
+            "mount -t tmpfs -o size=16m,mode=1777 tmpfs /dev/shm && " + inner]
+
+
+def _run_in_small_dev_shm(tmp_path, source: str, *args: str):
+    """Run ``source`` as this user, in a private 16 MiB /dev/shm; skip where
+    that mount is not possible."""
+    import shlex
+    import shutil
+    import subprocess
+
+    if not sys.platform.startswith("linux") or not all(
+            shutil.which(b) for b in ("sudo", "unshare", "setpriv")):
+        pytest.skip("needs Linux with sudo, unshare and setpriv")
+    probe = subprocess.run(_private_small_dev_shm_cmd("true"), check=False,
+                           capture_output=True, timeout=30)
+    if probe.returncode:
+        pytest.skip("cannot mount a private tmpfs: "
+                    f"{probe.stderr.decode(errors='replace').strip()}")
+    script = tmp_path / "small_dev_shm.py"
+    script.write_text(source)
+    env = [f"{k}={v}" for k, v in os.environ.items()
+           if not k.startswith("MSTAR_SHM_ARENA_")]
+    inner = shlex.join([
+        "setpriv", f"--reuid={os.getuid()}", f"--regid={os.getgid()}",
+        "--clear-groups", "env", "-i", *env,
+        sys.executable, str(script), *args])
+    proc = subprocess.run(_private_small_dev_shm_cmd("exec " + inner),
+                          check=False, capture_output=True, text=True,
+                          timeout=300)
+    assert proc.returncode == 0, (
+        f"exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}")
+    return proc
+
+
+def test_a_full_dev_shm_spills_instead_of_crashing(tmp_path):
+    """Real tmpfs exhaustion: before segments were preallocated, the second
+    producer's copy into a sparse segment died with SIGBUS."""
+    spill_dir = tmp_path / "spill"
+    spill_dir.mkdir()
+    proc = _run_in_small_dev_shm(tmp_path, _SMALL_DEV_SHM_SCRIPT, str(spill_dir))
+    spilled = int(proc.stdout.strip().rsplit("=", 1)[1])
+    assert spilled > 0, proc.stdout
+
+
+# /dev/shm keeps 3 MiB free, less than one 4 MiB segment. Preallocating there
+# would fill the tmpfs and then fail; the arena must refuse the growth up
+# front, and grow as soon as room is back.
+_LESS_THAN_A_SEGMENT_FREE_SCRIPT = """
+import os
+from mstar_rust import SegmentedShmArena
+
+MiB = 1 << 20
+filler = f"/dev/shm/filler_{os.getpid()}"
+with open(filler, "wb") as f:
+    f.write(b"\\1" * (9 * MiB))
+a = SegmentedShmArena.create(f"mstar_test_lowroom_{os.getpid()}", 4 * MiB, 4)
+assert a.reserve(4 * MiB) == (0, 0)
+st = os.statvfs("/dev/shm")
+free = st.f_bavail * st.f_frsize
+assert 0 < free < 4 * MiB, free
+for _ in range(2):
+    try:
+        a.reserve(256)
+    except RuntimeError as e:
+        assert str(e).endswith(f"only {free} B free"), e
+    else:
+        raise AssertionError("grew a segment /dev/shm cannot hold")
+os.remove(filler)
+assert a.reserve(256) == (1, 0) and a.num_segments == 2
+print("ok")
+"""
+
+
+def test_less_than_a_segment_free_fails_growth_up_front(tmp_path):
+    proc = _run_in_small_dev_shm(tmp_path, _LESS_THAN_A_SEGMENT_FREE_SCRIPT)
+    assert proc.stdout.strip() == "ok", proc.stdout
+
+
+# RLIMIT_FSIZE makes posix_fallocate itself fail (EFBIG) while the
+# free-space check passes: that growth is not repeated within the window.
+_FALLOCATE_FAILS_SCRIPT = """
+import os, resource, signal, time
+from mstar_rust import SegmentedShmArena
+
+signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+resource.setrlimit(resource.RLIMIT_FSIZE, (1 << 20, resource.RLIM_INFINITY))
+a = SegmentedShmArena.create(f"mstar_test_fsize_{os.getpid()}", 4096, 4)
+failed_at, errors = time.monotonic(), []
+for _ in range(2):
+    try:
+        a.reserve(2 << 20)
+    except RuntimeError as e:
+        errors.append(str(e))
+first, again = errors
+assert "arena full: no space" in first and "not retried" not in first, first
+assert "not retried" in again or time.monotonic() - failed_at >= 1, again
+assert a.num_segments == 1
+del a
+print("ok")
+"""
+
+
+def test_a_failed_fallocate_is_not_repeated_within_the_window():
+    import subprocess
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux only")
+    proc = subprocess.run([sys.executable, "-c", _FALLOCATE_FAILS_SCRIPT],
+                          check=False, capture_output=True, text=True,
+                          timeout=60)
+    assert proc.stdout.strip() == "ok", proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_a_failed_pin_leaves_cuda_usable():
+    from mstar.communication import arena
+
+    assert not arena._pin(4096, 4096)  # not a mapping of this process
+    assert (torch.ones(4, device="cuda") + 1).sum().item() == 8
+
+
+def test_several_requests_read_in_one_call_as_in_one_call_each(tmp_path):
+    """``start_read_tensors_multi`` (an EDGE_ITEMS frame's reads) leaves the
+    store and the pending reads as one ``start_read_tensors`` per request
+    does: every tensor read, each request's edge pending under its own rid."""
+    prod = _manager("w0", tmp_path)
+    sent = {}
+    for rid in ("r1", "r2"):
+        infos = prod.store_and_return_tensor_info(rid, {"tok": [torch.arange(4) + len(sent)]})
+        prod.register_for_send(rid, infos["tok"])
+        sent[rid] = infos["tok"]
+    edges = {
+        rid: [GraphEdge(next_node="B", name="tok", tensor_info=il, is_streaming=True)]
+        for rid, il in sent.items()
+    }
+    together, apart = _manager("w1", tmp_path), _manager("w2", tmp_path)
+    together.start_read_tensors_multi(list(edges.items()))
+    for rid, e in edges.items():
+        apart.start_read_tensors(rid, e)
+    for cons in (together, apart):
+        for il in sent.values():
+            for info in il:
+                assert torch.equal(cons.tensor_store.get_tensor(info.uuid), prod.tensor_store.get_tensor(info.uuid))
+    assert [(fp.request_id, [e.name for e in fp.graph_edges]) for fp in together.pending] == [
+        (fp.request_id, [e.name for e in fp.graph_edges]) for fp in apart.pending
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gathered read is for a device consumer")
+def test_a_frames_small_items_are_read_as_one_gathered_copy(tmp_path):
+    """Small items of one shape and dtype (a step's streamed tokens) arrive as
+    slices of one device copy, with the values of the item-by-item read. An
+    item of another shape is read on its own, and a uuid read twice in the call
+    is stored once with both references."""
+    prod = _manager("w0", tmp_path)
+    sent = {}
+    for i, rid in enumerate(("r1", "r2", "r3")):
+        infos = prod.store_and_return_tensor_info(rid, {"tok": [torch.tensor([7 + i])]})
+        prod.register_for_send(rid, infos["tok"])
+        sent[rid] = infos["tok"]
+    odd = prod.store_and_return_tensor_info("r4", {"x": [torch.arange(3, dtype=torch.float32)]})["x"]
+    prod.register_for_send("r4", odd)
+    edges = [(rid, [GraphEdge(next_node="B", name="tok", tensor_info=il, is_streaming=True)])
+             for rid, il in sent.items()]
+    edges.append(("r4", [GraphEdge(next_node="B", name="x", tensor_info=odd, is_streaming=True)]))
+    edges.append(("r1", [GraphEdge(next_node="B", name="tok", tensor_info=sent["r1"], is_streaming=True)]))
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    cons = ArenaShmCommunicationManager(
+        my_entity_id="w1", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    cons.start_read_tensors_multi(edges)
+    torch.cuda.synchronize()
+    toks = [cons.tensor_store.get_tensor(il[0].uuid) for il in sent.values()]
+    assert [t.item() for t in toks] == [7, 8, 9]
+    assert len({t.untyped_storage().data_ptr() for t in toks}) == 1, "one copy for the frame's tokens"
+    x = cons.tensor_store.get_tensor(odd[0].uuid)
+    assert torch.equal(x.cpu(), torch.arange(3, dtype=torch.float32))
+    assert x.untyped_storage().data_ptr() != toks[0].untyped_storage().data_ptr()
+    # transit + usage for the first read, + one for the second
+    r1 = sent["r1"][0].uuid
+    assert r1 not in cons.tensor_store.dereference_batch_uniform([r1], 2)[0]
+    assert r1 in cons.tensor_store.dereference_batch_uniform([r1], 1)[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gathered read is for a device consumer")
+@pytest.mark.parametrize("numel,dtype", [
+    (1, torch.int64),      # 8 B: gathered by 8-byte words
+    (3, torch.int32),      # 12 B: not a whole number of words, a slice each
+    (300, torch.int32),    # 1200 B: past the word gather, a slice each
+    (4096, torch.int32),   # 16 KB: the largest gathered item
+])
+def test_gathered_items_of_every_size_keep_their_values(tmp_path, numel, dtype):
+    prod = _manager("w0", tmp_path)
+    sent = {}
+    for i, rid in enumerate(("r1", "r2", "r3")):
+        t = torch.arange(numel, dtype=dtype) * (i + 1) + i
+        infos = prod.store_and_return_tensor_info(rid, {"tok": [t]})
+        prod.register_for_send(rid, infos["tok"])
+        sent[rid] = (infos["tok"], t)
+    os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
+    os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
+    cons = ArenaShmCommunicationManager(
+        my_entity_id="w1", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    cons.start_read_tensors_multi([
+        (rid, [GraphEdge(next_node="B", name="tok", tensor_info=il, is_streaming=True)])
+        for rid, (il, _) in sent.items()
+    ])
+    torch.cuda.synchronize()
+    got = [cons.tensor_store.get_tensor(il[0].uuid) for il, _ in sent.values()]
+    for g, (_, t) in zip(got, sent.values(), strict=True):
+        assert torch.equal(g.cpu(), t)
+    assert len({g.untyped_storage().data_ptr() for g in got}) == 1, "one copy for the frame's items"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the gathered read is for a device consumer")
+@pytest.mark.parametrize("env,gathered", [
+    ({"MSTAR_SHM_ARENA_GATHER_MAX_BYTES": "0"}, False),        # gather off
+    ({"MSTAR_SHM_ARENA_GATHER_MAX_BYTES": "4"}, False),        # 8 B items past the limit
+    ({"MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES": "0"}, True),   # a slice each, no word index
+])
+def test_the_gather_limits_come_from_the_environment(tmp_path, monkeypatch, env, gathered):
+    prod = _manager("w0", tmp_path)
+    sent = {}
+    for i, rid in enumerate(("r1", "r2", "r3")):
+        infos = prod.store_and_return_tensor_info(rid, {"tok": [torch.tensor([7 + i])]})
+        prod.register_for_send(rid, infos["tok"])
+        sent[rid] = infos["tok"]
+    monkeypatch.setenv("MSTAR_SHM_ARENA_SEGMENT_MB", "1")
+    monkeypatch.setenv("MSTAR_SHM_ARENA_MAX_SEGMENTS", "4")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    cons = ArenaShmCommunicationManager(
+        my_entity_id="w1", hostname="localhost", device="cuda",
+        communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+    )
+    cons.start_read_tensors_multi([
+        (rid, [GraphEdge(next_node="B", name="tok", tensor_info=il, is_streaming=True)])
+        for rid, il in sent.items()
+    ])
+    torch.cuda.synchronize()
+    toks = [cons.tensor_store.get_tensor(il[0].uuid) for il in sent.values()]
+    assert [t.item() for t in toks] == [7, 8, 9]
+    assert (len({t.untyped_storage().data_ptr() for t in toks}) == 1) == gathered

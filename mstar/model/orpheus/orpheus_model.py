@@ -15,9 +15,9 @@ Partitions:
     SNAC — walks: snac_chunk (streaming decode, triggered when tokens accumulate)
 
 The LLM and SNAC partitions run asynchronously. The LLM produces tokens that
-stream directly to the SNAC worker via StreamingGraphEdge. The conductor
-triggers SNAC chunks using a sliding window (28 tokens, stride 7) and extracts
-the middle region of the decoded audio for low-latency output.
+stream directly to the SNAC worker via StreamingGraphEdge, which releases
+windows of frames with left and right context (``OrpheusModelConfig.snac_*``);
+the SNAC decoder emits the audio of each window's own frames.
 """
 
 import logging
@@ -42,16 +42,24 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, PrefixStream
+from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
-from mstar.model.submodule_base import NodeSubmodule
-from mstar.streaming.chunk_policy import SlidingWindowChunkPolicy
+from mstar.model.rebuild import RebuildPolicy
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
+# What the LLM checkpoint is loaded from (configs, tokenizer, safetensors shards).
+# The Orpheus repos also ship optimizer and FSDP state, ~72 GB nobody reads.
+LLM_FILES = ["*.json", "*.safetensors"]
+TOKENIZER_FILES = ["*.json"]
+
+
+def _resolve_local_hf_snapshot(
+    repo_id: str, cache_dir: str | None = None, allow_patterns: list[str] | None = None,
+) -> str:
     from huggingface_hub import snapshot_download
 
     try:
@@ -59,6 +67,7 @@ def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> st
             repo_id=repo_id,
             cache_dir=cache_dir,
             local_files_only=False,
+            allow_patterns=allow_patterns,
         )
     except Exception as e:
         logger.warning("Error downloading from huggingface: %s", str(e))
@@ -73,15 +82,28 @@ class OrpheusModel(Model):
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
+        snac_chunk_schedule: list[int] | None = None,
+        snac_chunk_frames: int | None = None,
+        snac_left_context_frames: int | None = None,
+        snac_right_context_frames: int | None = None,
         **kwargs,
     ):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
-        self.config = OrpheusModelConfig()
+        snac_overrides = {
+            "snac_chunk_schedule": snac_chunk_schedule,
+            "snac_chunk_frames": snac_chunk_frames,
+            "snac_left_context_frames": snac_left_context_frames,
+            "snac_right_context_frames": snac_right_context_frames,
+        }
+        self.config = OrpheusModelConfig(
+            **{k: v for k, v in snac_overrides.items() if v is not None}
+        )
 
         tokenizer_source = _resolve_local_hf_snapshot(
             "canopylabs/orpheus-3b-0.1-pretrained",
             cache_dir=cache_dir,
+            allow_patterns=TOKENIZER_FILES,
         )
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_source,
@@ -94,6 +116,23 @@ class OrpheusModel(Model):
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
     # -------------------------------------------------------------------
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        return {"LLM": {"mixed": {"prefill", "decode"}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+
+        budget = OrpheusLLMSubmodule.MAX_BATCH_TOKENS
+        return {"LLM": (
+            ChunkingPolicy(walks=("prefill",), chunkable=True, max_batch_tokens=budget),
+            # carries the budget for the steps that mix a chunk with decode rows
+            ChunkingPolicy(walks=("mixed",), max_batch_tokens=budget),
+        )}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        return {"LLM": RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token",
+                                     loop="decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
@@ -131,7 +170,7 @@ class OrpheusModel(Model):
                     ),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            max_iters=self.config.max_position_embeddings,
             outputs=[],
         )
 
@@ -165,10 +204,7 @@ class OrpheusModel(Model):
                     from_partition="LLM",
                     to_partition="SNAC",
                     edge_name="new_token",
-                    chunk_policy_factory=lambda: SlidingWindowChunkPolicy(
-                        window=self.config.snac_window_tokens,
-                        stride=self.config.snac_stride_tokens,
-                    ),
+                    chunk_policy_factory=self.config.snac_chunk_policy,
                 ),
             ],
         )
@@ -278,10 +314,13 @@ class OrpheusModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         # Orpheus is text-only; raw multimodal tensors are unused.
-        if prompt is None:
-            return {}
+        # Refused here, where it is a 400 before admission: the LLM's prefill
+        # has no input without text, and blank text would generate from the voice
+        # prefix alone.
+        if prompt is None or not prompt.strip():
+            raise ValueError("Orpheus requires a non-empty text prompt")
 
         # An explicit empty/None voice keeps the unprefixed prompt.
         voice = kwargs.get("voice", self.config.default_voice)
@@ -302,7 +341,11 @@ class OrpheusModel(Model):
         end_tokens = torch.tensor(self.config.end_token_ids, dtype=torch.long)
         all_input_ids = torch.cat([start_token, prompt_tokens.input_ids[0], end_tokens])
 
-        return {"text_inputs": [all_input_ids]}
+        length = all_input_ids.numel()
+        layout = LabelLayout(
+            spans=(Span("ids", "prefill", length, length, "text_inputs"),), growth=(("decode_loop", 1),),
+        )
+        return ProcessPromptOutput({"text_inputs": [all_input_ids]}, {"kv_layout": {KV_CACHE: {"main": layout}}})
 
     # -------------------------------------------------------------------
     # Model ABC: forward pass args
@@ -358,14 +401,21 @@ class OrpheusModel(Model):
     # Model ABC: resources
     # -------------------------------------------------------------------
 
-    def prefix_key_streams(self) -> dict[str, dict[str, PrefixStream]]:
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the prefill samples the first of max_output_tokens, so the loop runs one fewer
+        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         """The LLM's prompt is its token ids. Its generated audio codes never
         come back in a prompt, so they are not keyed."""
-        return {KV_CACHE: {"main": PrefixStream("text_inputs", "ids", "prefill")}}
+        return {KV_CACHE: {"main": KVLabel(
+            growth=(("decode", "decode_loop"),),
+            keys=PrefixKeys("text_inputs", ("prefill",)),
+        )}}
 
     def checkpoint_path(self) -> str:
         return _resolve_local_hf_snapshot(
-            self.model_path_hf, cache_dir=self.cache_dir,
+            self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=LLM_FILES,
         )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
@@ -503,6 +553,7 @@ class OrpheusModel(Model):
         local_dir = _resolve_local_hf_snapshot(
             self.model_path_hf,
             cache_dir=self.cache_dir,
+            allow_patterns=LLM_FILES,
         )
 
         with torch.device("meta"):

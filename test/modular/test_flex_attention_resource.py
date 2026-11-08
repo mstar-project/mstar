@@ -452,7 +452,7 @@ def test_capture_plan_requires_preallocated_mask_addresses():
         request_ids=("r",), graph_walk="rollout", slot=0, capture=True,
         plan_results={"kv": RingPlan(("r",), (0,), (0,))},
     )
-    with pytest.raises(RuntimeError, match="not allocated before CUDA graph capture"):
+    with pytest.raises(RuntimeError, match="not allocated before accelerator graph capture"):
         manager.plan(AttentionStep(), ctx)
 
 

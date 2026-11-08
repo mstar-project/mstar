@@ -1,7 +1,7 @@
 """ASR evaluation script: compute Word Error Rate (WER) on LibriSpeech test-clean.
 
 Runs inference against a running mstar server and compares transcription output
-against ground-truth transcripts.  Supports Whisper-large-v3 and Higgs Audio.
+against ground-truth transcripts, for the models in ``_ASR_MODELS``.
 
 Usage:
     python -m benchmark.asr_eval \\
@@ -26,8 +26,13 @@ import aiohttp
 from benchmark.base import Model, ModelType, RequestType
 from benchmark.dataset import LibriSpeechEvalDataset
 from benchmark.request import RequestInput
+from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 
-_ASR_MODELS = {ModelType.WHISPER_LARGE, ModelType.HIGGS_AUDIO}
+_ASR_MODELS = {
+    ModelType.WHISPER_LARGE, ModelType.WHISPER_LARGE_V3_TURBO, ModelType.QWEN3_ASR,
+    ModelType.QWEN3_ASR_REALTIME, ModelType.HIGGS_AUDIO,
+    ModelType.CANARY, ModelType.CANARY_QWEN, ModelType.PARAKEET, ModelType.NEMOTRON_ASR,
+}
 
 
 async def _transcribe(
@@ -74,7 +79,9 @@ async def _transcribe(
                 if msg.get("modality") == "text":
                     text_chunks.append(base64.b64decode(msg["data"]))
 
-        transcript = b"".join(text_chunks).decode("utf-8", errors="replace").strip()
+        transcript = b"".join(text_chunks).decode("utf-8", errors="replace")
+        # Qwen3-ASR's raw text starts with "language X<asr_text>"; score only the transcript.
+        transcript = transcript.split(ASR_TEXT_TAG, 1)[-1].strip()
         return request_id, transcript, None
 
     except Exception as exc:

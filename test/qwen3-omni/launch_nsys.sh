@@ -22,7 +22,7 @@ CUDA_VISIBLE_DEVICES=$DEVICES nsys profile --trace=cuda,nvtx --output=qwen3omni_
     python mstar/api_server/entrypoint.py --enable-nvtx \
     --config configs/qwen3omni_2gpu.yaml \
     --cache-dir $QWEN3OMNI_CACHE_DIR \
-    --socket-path-prefix /tmp/mstar_${WHO}/ \
+    --socket-path-prefix /tmp/mstar_${WHO}_${PORT}/ \
     --upload-dir /tmp/mstar_uploads_${WHO}/ \
     --port $PORT \
     --tensor-comm-protocol ${TENSOR_PROTOCOL:SHM} \

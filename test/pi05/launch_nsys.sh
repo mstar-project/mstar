@@ -25,7 +25,7 @@ echo "  cache:   ${PI05_CACHE_DIR}"
 CUDA_VISIBLE_DEVICES=$DEVICES nsys profile --trace=cuda,nvtx --output=pi05_profile --force-overwrite=true \
     python -m mstar.api_server.entrypoint --config configs/pi05_droid.yaml --enable-nvtx \
     --cache-dir $PI05_CACHE_DIR \
-    --socket-path-prefix /tmp/mstar_$WHO/ \
+    --socket-path-prefix /tmp/mstar_${WHO}_${PORT}/ \
     --upload-dir /tmp/mstar_uploads_$WHO/ \
     --port $PORT \
     --tensor-comm-protocol $TENSOR_PROTOCOL \

@@ -42,8 +42,9 @@ def main():
             decoded = base64.b64decode(data_b64)
 
             if modality == "text":
-                sys.stdout.write(decoded.decode("utf-8", errors="replace"))
-                sys.stdout.flush()
+                # raw bytes: a character can span two chunks
+                sys.stdout.buffer.write(decoded)
+                sys.stdout.buffer.flush()
 
             elif modality == "image":
                 with open("output.png", "wb") as f:

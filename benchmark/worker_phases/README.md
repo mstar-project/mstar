@@ -77,6 +77,11 @@ Consequences:
   into a projected 2x.
 * Waits GROW when the CPU side gets faster, because the CPU arrives at them
   sooner. A larger wait is not automatically worse.
+* `postprocess_side` is a side step's `postprocess_batch`, run off the chain (see
+  `mstar/worker/side_steps.py`). It is work, like `postprocess_batch`, and not part of it.
+* `gpu_exec` is a step's GPU time, from an event recorded on its stream after
+  `prepare_inputs` to one after its last launch, so it includes any gaps the host
+  leaves inside the step. `gpu_exec.<walk>` is the same per graph walk.
 * `postprocess_batch` contains several of the `postprocess.*` phases, so it
   does not sum with them.
 * **GPU busy time is not in this table**, and `iter_total - event_sync` is not
@@ -89,9 +94,12 @@ Consequences:
   `event_sync`.** A `.tolist()` in `prepare_inputs` reports as expensive
   `prepare_inputs`, and `event_sync` gets *smaller* because the wait moved
   upstream. Watching `event_sync` will not find syncs.
+* **`<span>.cpu` is the thread's CPU time over the same span** (`time.thread_time`), and wall minus CPU is time the thread was blocked (GIL, an event, a lock). The worker's three threads share the GIL, so when their CPU sums to about 100% of wall the step is host-bound and moving work between threads gains nothing; only removing CPU does.
+* **`gc.gen{0,1,2}` (and `.main` / `.gpu` / `.plan`) are garbage collections**, which are also charged to whichever span was allocating when one triggered. Check them before reading a span that grew between two runs.
 
 ### Adding spans
 
+* `profiler.phase_start` / `phase_end` and `PhaseLaps` record wall and `.cpu` together; prefer them to bare `perf_counter` pairs.
 * Phase names must match `[\w.]+`. The parser silently drops anything else,
   so `foo[bar/baz]` vanishes without an error. Use dots.
 * Instrumentation is not free. Per-step f-string span names have cost 7% of

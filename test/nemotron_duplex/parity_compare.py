@@ -8,10 +8,13 @@
     python test/nemotron_duplex/parity_compare.py --audio user.wav --engine-text engine.txt --precision fp32
 
 ``--precision bf16`` runs the standalone path with bf16 weights under autocast,
-the engine's serving precision: the two must agree token for token. ``fp32``
-is the reference-verified oracle; it can legitimately differ from a bf16 run
-where the text channel's decision is a knife-edge, which the printed top-2
-logit margins show (e.g. the agent's turn start: <s> vs <SPECIAL_12>).
+the engine's serving precision: the two must agree token for token, save the
+last frame, which the server encodes in a pass of its own when the upload's
+end of input reaches the encoder after its audio. ``fp32`` is the
+reference-verified oracle; it can legitimately differ from a bf16 run where
+the text channel's decision is a knife-edge, which the printed top-2 logit
+margins show (e.g. the agent's turn start: <s> vs <SPECIAL_12>). A mismatch
+prints the first differing frame and its margin.
 
 Loads the full model on the GPU (fp32 ~44 GB, bf16 ~22 GB): with a bf16 server
 resident (~31 GB) prefer ``--precision bf16``. offline_inference is O(T^2) in
@@ -107,17 +110,27 @@ def main():
     if args.margins:
         json.dump({"tokens": toks, "text": standalone_text, "margins": records}, open(args.margins, "w"))
 
-    same = engine_text == standalone_text
-    print(f"engine text == standalone {args.precision} text: {same}")
-    if not same:
-        pairs = zip(engine_text, standalone_text, strict=False)
-        n = next((i for i, (a, b) in enumerate(pairs) if a != b), min(len(engine_text), len(standalone_text)))
-        print(f"first difference at char {n}:")
-        print(f"  engine:     {engine_text[n:n + 80]!r}")
-        print(f"  standalone: {standalone_text[n:n + 80]!r}")
+    # The first frame whose token the engine's text does not continue with.
+    first, at = None, 0
+    for frame, t in enumerate(toks):
+        piece = tok.decode([t])
+        if not engine_text.startswith(piece, at):
+            first = frame
+            break
+        at += len(piece)
+    if first is None and at != len(engine_text):
+        first = len(toks)                       # the engine's text runs on past the standalone's
+    print(f"engine text == standalone {args.precision} text: {first is None}")
+    if first is not None:
+        margin = next((r["margin"] for r in records if r["frame"] == first), None)
+        print(f"first differing frame {first} of {len(toks)} (standalone margin {margin}):")
+        print(f"  engine:     {engine_text[at:at + 80]!r}")
+        print(f"  standalone: {''.join(tok.decode([t]) for t in toks[first:])[:80]!r}")
     print("standalone reply:", standalone_text.replace("<SPECIAL_12>", "").strip())
     print("engine reply:    ", engine_text.replace("<SPECIAL_12>", "").strip())
-    return 0 if same else 1
+    if first is None or (args.precision == "bf16" and first == len(toks) - 1):
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

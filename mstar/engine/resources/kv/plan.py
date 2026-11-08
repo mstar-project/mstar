@@ -79,15 +79,6 @@ class PagedIndptrs(NamedTuple):
     # rebuild it with torch ops.
     kv_lens: torch.Tensor | None = None
 
-    def to_device(self, device: torch.device):
-        return PagedIndptrs(
-            qo_indptr=self.qo_indptr.to(device, non_blocking=True),
-            paged_kv_indptr=self.paged_kv_indptr.to(device, non_blocking=True),
-            paged_kv_indices=self.paged_kv_indices.to(device, non_blocking=True),
-            paged_kv_last_page_len=self.paged_kv_last_page_len.to(device, non_blocking=True),
-            kv_lens=self.kv_lens,
-        )
-
     def to_kwargs_dict(self):
         return dict(
             qo_indptr=self.qo_indptr,
@@ -96,6 +87,20 @@ class PagedIndptrs(NamedTuple):
             paged_kv_last_page_len=self.paged_kv_last_page_len,
             kv_lens=self.kv_lens,
         )
+
+
+def context_only_views(
+    views: list[SequenceView], query_spans: list[int], page_size: int,
+) -> list[SequenceView]:
+    """The views of a step's streams without the tokens the step appends: ``length`` shrinks by
+    ``to_compute`` (the pages beyond it dropped) and ``to_compute`` becomes the row's query count.
+    For attention over the stored context alone (``AttentionStep.context_only``)."""
+    out = []
+    for view, queries in zip(views, query_spans, strict=True):
+        length = view.length - view.to_compute
+        pages = -(-(view.start + length) // page_size) if length > 0 else 0
+        out.append(view._replace(page_idxs=view.page_idxs[:pages], length=length, to_compute=queries))
+    return out
 
 
 def build_paged_indptrs(
@@ -142,60 +147,58 @@ class PinnedIndexRing:
     hands FlashInfer, so its ``copy_(non_blocking=True)`` calls are really
     asynchronous (from pageable memory the driver stages each one).
 
-    ``take`` fills the next buffer and returns a view of it. A buffer is
-    rewritten only after the copies out of it have completed: the stream a
-    plan ran on records an event when the next ``take`` happens on that
-    stream (by then the plan's copies were issued), and a slot waits on its
-    event before reuse. Plans do not overlap, so one pending slot suffices.
-    Without CUDA the buffers are plain tensors and nothing is recorded.
+    The ring holds ``depth`` buffer sets, one per plan. ``begin_plan`` moves to
+    the next set, and each ``take`` until the next ``begin_plan`` fills a buffer
+    of that set no other take uses (the set grows if needed), so every label
+    of a plan keeps its arrays (four takes each) however many labels there
+    are. A set is rewritten only after the copies out of it have completed:
+    the next ``begin_plan`` records an event on the stream the plan ran on (by
+    then the plan's copies, and its consumers', were issued), and a set waits
+    on its event before reuse. Plans do not overlap, so one pending set
+    suffices. Without CUDA the buffers are plain tensors and nothing is
+    recorded.
     """
 
-    def __init__(self, numel: int = 4096, depth: int = 8):
+    def __init__(self, numel: int = 4096, depth: int = 2, per_plan: int = 4):
         self._depth = depth
-        self._numel = 0
+        self._numel = max(numel, 256)
         self._pinned = torch.cuda.is_available()
-        self._bufs: list[torch.Tensor] = []
+        self._sets: list[list[torch.Tensor]] = [
+            [self._alloc(self._numel) for _ in range(per_plan)] for _ in range(depth)
+        ]
         self._events: list = [None] * depth
         self._streams: list = [None] * depth
-        self._next = 0
-        self._last: int | None = None
-        self._grow(numel)
+        self._set = 0
+        self._used = 0
 
-    def _grow(self, numel: int) -> None:
-        numel = max(numel, self._numel * 2, 256)
-        self._bufs = [
-            torch.empty(numel, dtype=torch.int32, pin_memory=self._pinned)
-            for _ in range(self._depth)
-        ]
-        self._numel = numel
+    def _alloc(self, numel: int) -> torch.Tensor:
+        return torch.empty(numel, dtype=torch.int32, pin_memory=self._pinned)
+
+    def begin_plan(self) -> None:
+        cur = self._set
+        nxt = (cur + 1) % self._depth
+        if self._pinned:
+            if self._streams[cur] is not None:
+                ev = self._events[cur] or torch.cuda.Event()
+                self._events[cur] = ev
+                ev.record(self._streams[cur])
+            ev = self._events[nxt]
+            if ev is not None:
+                ev.synchronize()
+            self._streams[nxt] = torch.cuda.current_stream()
+        self._set = nxt
+        self._used = 0
 
     def take(self, values) -> torch.Tensor:
         n = len(values)
-        if n > self._numel:
-            self._grow(n)
-        if self._pinned:
-            stream = torch.cuda.current_stream()
-            if self._last is not None and self._streams[self._last] is not stream:
-                # the previous plan's copies were issued on another stream
-                # (an inline plan on the gpu thread after a pre-plan): record
-                # there, where they are
-                ev = self._events[self._last] or torch.cuda.Event()
-                self._events[self._last] = ev
-                ev.record(self._streams[self._last])
-            elif self._last is not None:
-                ev = self._events[self._last] or torch.cuda.Event()
-                self._events[self._last] = ev
-                ev.record(stream)
-            i = self._next
-            ev = self._events[i]
-            if ev is not None:
-                ev.synchronize()
-            self._streams[i] = stream
-        else:
-            i = self._next
-        self._next = (i + 1) % self._depth
-        self._last = i
-        out = self._bufs[i][:n]
+        bufs = self._sets[self._set]
+        i = self._used
+        if i == len(bufs):
+            bufs.append(self._alloc(max(n, self._numel)))
+        elif n > bufs[i].numel():
+            bufs[i] = self._alloc(max(n, bufs[i].numel() * 2))
+        self._used = i + 1
+        out = bufs[i][:n]
         out.numpy()[:] = values
         return out
 
@@ -209,8 +212,11 @@ class HostLens(torch.Tensor):
     plan thread every decode step). Iterating the numpy view costs 0.1 us a
     row and the numpy scalar has ``.item()`` too. Everything else FlashInfer
     does with the row (``.cpu()``, ``.min()``, ``len``, a ``copy_`` into its
-    device buffer) is plain tensor behaviour.
+    device buffer) is plain tensor behaviour, so torch ops skip the subclass
+    dispatch (about 6 us a call) and treat it as a plain tensor.
     """
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
 
     def __iter__(self):
         return iter(self.numpy())
@@ -225,12 +231,15 @@ class KVPlanOutput:
     Output of KVManager.plan for a single label
     """
 
-    __slots__ = ("cpu_indptrs", "_views", "_view_builder", "cuda_indptrs", "decode_pages", "decode_offsets", "rows")
+    __slots__ = (
+        "cpu_indptrs", "_views", "_view_builder", "decode_pages", "decode_offsets",
+        "rows", "_decode", "columns",
+    )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
-        cuda_indptrs: "PagedIndptrs | None" = None, decode_pages=None, decode_offsets=None,
-        rows=None, view_builder=None,
+        decode_pages=None, decode_offsets=None,
+        rows=None, view_builder=None, decode: bool | None = None, columns=None,
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
@@ -238,9 +247,6 @@ class KVPlanOutput:
         # made on first use (the FlashInfer path never asks for them)
         self._views = views
         self._view_builder = view_builder
-        # only the packed write addressing needs these on device, and only the
-        # resource that builds them reads them; see KVManager._setup_plan_states
-        self.cuda_indptrs = cuda_indptrs
         # a decode step planned off the previous one (KVManager's plan cache):
         # each row's write page and offset in it, so staging need not walk the views
         self.decode_pages = decode_pages
@@ -248,6 +254,13 @@ class KVPlanOutput:
         # (request_id, label, to_compute) per view, for consumers that need no
         # pages or lengths (the position resource); None means read the views
         self.rows = rows
+        # whether every row computes one token, when the plan already knows;
+        # None reads the views
+        self._decode = decode
+        # the plan's host arrays (``PlanColumns``), when it was built from
+        # columns. Unlike ``cpu_indptrs``, which may sit in a pinned ring a
+        # later plan rewrites, they stay valid as long as the output does.
+        self.columns = columns
 
     @property
     def views(self) -> "list[SequenceView]":
@@ -266,6 +279,8 @@ class KVPlanOutput:
     def is_decode(self) -> bool:
         if self.decode_pages is not None:
             return True
+        if self._decode is not None:
+            return self._decode
         return all(view.to_compute == 1 for view in self.views)
 
 
@@ -279,19 +294,32 @@ class KVPlanOutputs(dict[str, KVPlanOutput]):
     nowhere else to ride.
     """
 
-    __slots__ = ("pre_forks", "post_forks")
+    __slots__ = ("pre_forks", "post_forks", "fork_rids", "later_groups")
 
     def __init__(
         self,
         mapping: dict[str, KVPlanOutput] | None = None,
         pre_forks: tuple[tuple[str, str], ...] = (),
         post_forks: tuple[tuple[str, str], ...] = (),
+        fork_rids: frozenset | None = None,
+        later_groups: tuple[dict[str, KVPlanOutput], ...] = (),
     ):
         super().__init__(mapping or {})
         # applied by `plan`; the consumer mirrors them at plan time
         self.pre_forks = pre_forks
         # applied by `commit`, after this step's spans land
         self.post_forks = post_forks
+        # the rows both apply to, as `KVStep.fork_rids`; None is every row
+        self.fork_rids = fork_rids
+        # the labels' plans in each group of the pool past the first (`PagedKVConfig.groups`)
+        self.later_groups = later_groups
+
+    @property
+    def groups(self) -> tuple[dict[str, KVPlanOutput], ...]:
+        """The labels' plans in each group: these, then ``later_groups``, as `CacheStream.groups`
+        holds a stream's pages. Not a field, which would make every step's plan a reference
+        cycle, held with its indptrs until the cyclic GC runs."""
+        return (self, *self.later_groups)
 
 
 # Page the padding tail of a captured step scatters into. Reserved at

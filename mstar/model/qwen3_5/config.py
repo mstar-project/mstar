@@ -8,18 +8,20 @@ import json
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+from mstar.model import keys
+
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
-# resource keys this model declares
-KV_CACHE = "kv_cache"
+# resource keys this model declares; the shared scaffolds read `keys`' ones
+KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
 GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
-ROPE = "rope"
-SAMPLER = "sampler"
+ROPE = keys.ROPE
+SAMPLER = keys.SAMPLER
 # the ViT tower's cacheless attention, on the `vision_encoder` node
-VISION_ATTN = "vision_attn"
+VISION_ATTN = keys.VISION_ATTN
 
 
 @dataclass

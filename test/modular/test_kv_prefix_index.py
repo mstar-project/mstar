@@ -15,26 +15,16 @@ from collections import Counter
 sys.path.insert(0, ".")
 
 import pytest
-import torch
 
-from mstar.engine.resources.kv.cache import KVCache, PageAllocator
-from mstar.engine.resources.kv.config import PagedKVConfig
-from mstar.engine.resources.kv.manager import PageArena
+from mstar.engine.resources.kv.arena import PageArena, new_page_arena
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
 
 PAGE_SIZE = 16
 
 
 def _arena(max_num_pages: int = 16) -> PageArena:
-    """A page arena over a CPU cache, with no manager above it."""
-    cfg = PagedKVConfig(
-        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
-        max_num_pages=max_num_pages, page_size=PAGE_SIZE,
-    )
-    return PageArena(
-        kv_cache=KVCache(cfg, torch.device("cpu"), torch.float32),
-        allocator=PageAllocator(max_num_pages),
-    )
+    """A page arena with no manager above it."""
+    return new_page_arena(max_num_pages)
 
 
 def _assert_pages_partition(arena: PageArena) -> None:
@@ -43,16 +33,16 @@ def _assert_pages_partition(arena: PageArena) -> None:
     `KVManager.assert_pages_conserved` cannot stand in here: it counts a page's
     owners against the streams naming it, and this arena has no streams.
     """
-    free = list(arena.allocator.free_pages.queue)
+    free = arena.free_pages()
     owned = [
-        page for page in range(arena.allocator.max_num_pages)
-        if arena.num_owners[page] > 0
+        page for page in range(arena.max_num_pages)
+        if arena.owners(page) > 0
     ]
     assert not set(free) & set(owned), (
         f"pages both free and owned: {sorted(set(free) & set(owned))}"
     )
-    assert len(free) + len(owned) == arena.allocator.max_num_pages, (
-        f"{arena.allocator.max_num_pages} pages in the pool, but "
+    assert len(free) + len(owned) == arena.max_num_pages, (
+        f"{arena.max_num_pages} pages in the pool, but "
         f"{len(free)} free and {len(owned)} owned"
     )
 
@@ -78,8 +68,8 @@ def test_an_indexed_page_is_sealed_and_kept_by_a_second_owner():
 
     index.insert(b"k", page)
 
-    assert arena.num_owners[page] == 2, "the index did not take a reference"
-    assert arena.sealed[page], "an indexed page was left writable"
+    assert arena.owners(page) == 2, "the index did not take a reference"
+    assert arena.is_sealed(page), "an indexed page was left writable"
     _assert_pages_partition(arena)
 
 
@@ -89,10 +79,10 @@ def test_a_page_its_request_still_owns_is_passed_over():
     page, = arena.acquire(1)
     index.insert(b"k", page)
 
-    freed = index.evict(1)
+    freed = len(index.evict(1))
 
     assert freed == 0, "a page a request still owns was counted as freed"
-    assert arena.num_owners[page] == 2, "the index let go of a page it still names"
+    assert arena.owners(page) == 2, "the index let go of a page it still names"
     assert index.lookup([b"k"]) == [page], (
         "an entry that is still good was dropped to free nothing"
     )
@@ -110,7 +100,7 @@ def test_two_inserts_of_one_key_keep_one_entry_and_one_count():
     )
 
     assert index.lookup([b"k"]) == [first], "the second writer took the key"
-    assert arena.num_owners[second] == 1, "a refused insert still retained"
+    assert arena.owners(second) == 1, "a refused insert still retained"
     _assert_pages_partition(arena)
 
 
@@ -139,7 +129,7 @@ def test_eviction_after_a_hit_takes_the_cold_branch_and_stops_at_the_fork():
         "the branch this test warms was not the one the index walked"
     )
 
-    freed = index.evict(1)
+    freed = len(index.evict(1))
 
     assert freed == 1, "the eviction stopped before it had given a page back"
     assert index.lookup([b"A", b"B", b"D"]) == [pages["A"], pages["B"], pages["D"]], (
@@ -156,7 +146,7 @@ def test_eviction_walks_up_a_chain_once_it_is_childless():
     index = PrefixIndex(arena)
     pages = _chain(index, arena)
 
-    freed = index.evict(4)
+    freed = len(index.evict(4))
 
     assert freed == 4, f"a whole chain of 4 freed only {freed} pages"
     assert index.lookup([b"A"]) == [], "the root outlived every child"
@@ -168,7 +158,7 @@ def test_eviction_stops_when_no_leaf_is_left():
     index = PrefixIndex(arena)
     _chain(index, arena)
 
-    assert index.evict(99) == 4, "eviction claimed more pages than it held"
+    assert len(index.evict(99)) == 4, "eviction claimed more pages than it held"
     _assert_pages_partition(arena)
 
 
@@ -216,7 +206,7 @@ def test_children_churning_under_a_held_parent_leave_it_one_heap_entry():
         arena.release([child])
         index.lookup([b"parent", key])
 
-        assert index.evict(1) == 1, "the one child nobody holds was not given back"
+        assert len(index.evict(1)) == 1, "the one child nobody holds was not given back"
         _one_entry_per_indexed_page(index)
     _assert_pages_partition(arena)
 

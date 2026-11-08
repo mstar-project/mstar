@@ -5,7 +5,8 @@
 //!    URLs or base64 blobs) into files under the server's `upload_dir`, so the
 //!    Python data-worker can read them by path (the same contract `/generate`
 //!    uses for multipart uploads). `http(s)` fetch is SSRF surface and is gated
-//!    off by default here (data-URL / base64 / local path only).
+//!    off by default here (data-URL / base64 only). Paths on the server are
+//!    refused.
 //!  * **Outbound** — wrap raw model audio output (16-bit PCM, no header) into a
 //!    real container (WAV by default) and encode PNG image bytes as a `data:`
 //!    URL for OpenAI chat image output.
@@ -189,10 +190,11 @@ fn save_remote_url(url: &str, upload_dir: &Path) -> Result<(String, String), Str
     save_bytes(&raw, &mime, upload_dir).map_err(|e| e.to_string())
 }
 
-/// Resolve a media reference (data URL, `http(s)` URL, or local path).
-/// Returns `(modality, path)`. Local paths pass through unchanged (modality
-/// from extension). `http(s)` is refused unless `allow_remote` is set — remote
-/// fetch is SSRF surface, off by default, matching mstar's `allow_remote` gate.
+/// Resolve a media reference from a request: a data URL, or an `http(s)` URL
+/// when `allow_remote` is set (remote fetch is SSRF surface, off by default).
+/// Returns `(modality, path)`. A request cannot name a file on the server, not
+/// even one under `upload_dir`: plain paths and other URL schemes are refused
+/// without accessing client-named server files.
 pub fn resolve_media_ref(
     reference: &str,
     upload_dir: &Path,
@@ -208,12 +210,7 @@ pub fn resolve_media_ref(
         }
         return save_remote_url(reference, upload_dir);
     }
-    // Treat as a local filesystem path.
-    let suffix = PathBuf::from(reference)
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
-        .unwrap_or_default();
-    Ok((modality_from_ext(&suffix).to_string(), reference.to_string()))
+    Err("server file paths are refused; send media as a data URL or a file upload".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -258,6 +255,59 @@ pub fn pcm16_to_container(pcm: &[u8], sample_rate: u32, fmt: &str) -> (Vec<u8>, 
     }
 }
 
+/// `response_format` lower-cased (`wav` when empty), or the 400's text. A
+/// stream carries an open-ended WAV or bare PCM on either frontend, so its
+/// refusal reads as `media_io.check_audio_format`'s; the compressed containers
+/// the Python frontend encodes with soundfile have no encoder here.
+pub fn check_audio_format(fmt: &str, stream: bool) -> Result<String, String> {
+    let fmt = if fmt.is_empty() { "wav".to_string() } else { fmt.to_lowercase() };
+    if matches!(fmt.as_str(), "wav" | "pcm") {
+        return Ok(fmt);
+    }
+    if stream {
+        return Err(format!(
+            "response_format {} cannot be streamed by this server; use one of: wav, pcm",
+            py_repr(&fmt)
+        ));
+    }
+    Err(format!(
+        "response_format {fmt:?} is not supported by the Rust frontend (only 'wav' and \
+         'pcm'); run the Python frontend for compressed containers"
+    ))
+}
+
+/// Python's `repr` of a str, for a refusal that quotes the client's value as
+/// the Python frontend's does.
+fn py_repr(s: &str) -> String {
+    static UNPRINTABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let unprintable = UNPRINTABLE
+        .get_or_init(|| regex::Regex::new(r"[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]").unwrap());
+    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+    let mut out = String::from(quote);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if c != ' ' && unprintable.is_match(c.encode_utf8(&mut [0; 4])) => {
+                out.push_str(&match c as u32 {
+                    n @ ..=0xff => format!("\\x{n:02x}"),
+                    n @ ..=0xffff => format!("\\u{n:04x}"),
+                    n => format!("\\U{n:08x}"),
+                });
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
+}
+
 /// A 44-byte WAV header with streaming (unknown-length) size fields. Emit this,
 /// then 16-bit PCM frames as they arrive, to stream TTS over one HTTP response.
 /// The `0xFFFFFFFF` placeholders signal an open-ended stream.
@@ -294,4 +344,34 @@ pub fn png_to_data_url(png_bytes: &[u8]) -> String {
 /// base64-encode arbitrary bytes (audio deltas, container blobs) for JSON.
 pub fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_refuses_a_container_with_the_python_text() {
+        assert_eq!(check_audio_format("WAV", true).unwrap(), "wav");
+        assert_eq!(check_audio_format("", false).unwrap(), "wav");
+        assert_eq!(
+            check_audio_format("MP3", true).unwrap_err(),
+            "response_format 'mp3' cannot be streamed by this server; use one of: wav, pcm"
+        );
+        assert!(check_audio_format("mp3", false).unwrap_err().contains("not supported by the Rust frontend"));
+    }
+
+    #[test]
+    fn repr_quotes_and_escapes_as_python_does() {
+        for (s, want) in [
+            ("mp3", "'mp3'"),
+            ("it's", "\"it's\""),
+            ("'\"", "'\\'\"'"),
+            ("a\\b\n\t", "'a\\\\b\\n\\t'"),
+            ("\u{0}\u{7f}\u{a0}\u{200b}", "'\\x00\\x7f\\xa0\\u200b'"),
+            ("海 é", "'海 é'"),
+        ] {
+            assert_eq!(py_repr(s), want, "{s:?}");
+        }
+    }
 }

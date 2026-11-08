@@ -65,14 +65,16 @@ def steps(rids, spans):
     return RecurrentStep(segments=segs), segs
 
 
-def plan(pool, manager, rids, spans, walk="decode"):
-    """admit + plan both resources for one step, the way the runner does."""
+def plan(pool, manager, rids, spans, walk="decode", ingest=True):
+    """admit + plan both resources for one step, the way the runner does. ``ingest``
+    opens the rows' requests first, which the worker does once per request."""
     from mstar.engine.resources.linear_attn.config import LinearAttnStep
 
     rstep, segs = steps(rids, spans)
     c = ctx(rids, walk)
-    for rid in rids:
-        pool.ingest_request(rid)
+    if ingest:
+        for rid in rids:
+            pool.ingest_request(rid)
     assert pool.admit(rstep, c).ok
     c.plan_results[POOL] = pool.plan(rstep, c)
     manager.plan(LinearAttnStep(segments=segs), c)
@@ -108,6 +110,19 @@ def test_build_dispatches_on_the_variant_and_reads_the_geometry():
     assert pool.block("ssm", 1).shape == (8, 4, 8, 16) and pool.block("conv", 0).shape == (8, GEOM.conv_dim, 3)
 
 
+def test_a_state_in_the_engine_dtype_reaches_the_manager_as_the_pool_stores_it():
+    spec = RecurrentStateSpec(POOL, {"llm"}, RecurrentStateConfig(
+        num_layers=NUM_LAYERS, blocks=GEOM.to_blocks(state_dtype=None), max_slots=8,
+    ))
+    info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float16, dependencies={POOL: spec})
+    pool = RecurrentStatePool.build(spec, info)
+    manager = LinearAttnManager.build(
+        LinearAttnSpec(MAMBA, {"llm"}, LinearAttnConfig(recurrent_state=POOL, variant=LinearAttnVariant.MAMBA2)),
+        info,
+    )
+    assert manager.state_dtype is pool.block("ssm", 0).dtype is torch.float16
+
+
 def test_plan_is_a_narrow_of_the_pools_addressing():
     pool, manager = build()
     _, c = plan(pool, manager, ["a", "b", "c"], [1, 1, 1])
@@ -130,7 +145,7 @@ def test_step_matches_scan_and_persists_in_the_pool():
     layer = pool.block("ssm", 0)
     y1 = manager.run(x1, dt1, b1, c1, layer, prm["a_log"], prm["d"], prm["dt_bias"])
     pool.commit(rstep, c)
-    rstep, c = plan(pool, manager, rids, [1, 1])
+    rstep, c = plan(pool, manager, rids, [1, 1], ingest=False)
     assert manager.current_plan().has_state.tolist() == [True, True]
     y2 = manager.run(x2, dt2, b2, c2, layer, prm["a_log"], prm["d"], prm["dt_bias"])
     slots = manager.current_plan().slots.tolist()
@@ -159,7 +174,7 @@ def test_prefill_then_decode_continues_from_the_scattered_state():
     assert not manager.current_plan().is_decode
     y_pre = manager.run(x, dt, b, c, layer, prm["a_log"], prm["d"], prm["dt_bias"])
     pool.commit(rstep, ctx_)
-    rstep, ctx_ = plan(pool, manager, ["a"], [1])
+    rstep, ctx_ = plan(pool, manager, ["a"], [1], ingest=False)
     y_dec = manager.run(xd, dtd, bd, cd, layer, prm["a_log"], prm["d"], prm["dt_bias"])
 
     a = -torch.exp(prm["a_log"])

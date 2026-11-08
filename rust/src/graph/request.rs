@@ -2,9 +2,9 @@
 //! is running, and which workers own which nodes for it.
 //!
 //! Deliberately NOT stored inside the worker graph queues. A partition's walk
-//! and its stream-done flag are per (request, partition); a partition can span
-//! several worker graphs, so putting them there would duplicate the value and
-//! turn `set_walk` into a scatter-write. The worker graph -> partition
+//! and its partition-done flag are per (request, partition); a partition can
+//! span several worker graphs, so putting them there would duplicate the value
+//! and turn `set_walk` into a scatter-write. The worker graph -> partition
 //! direction is static, so it lives on `WorkerGraphMeta` and costs nothing per
 //! request.
 
@@ -32,8 +32,9 @@ pub struct RequestPartitionInfo {
     /// Local worker graphs live in the CURRENT walk. Derived from the walk, so
     /// it is a cache: `set_walk` recomputes it, and nothing else may write it.
     pub walk_worker_graphs: Vec<WgIndex>,
-    /// Set when the consuming pass sees the final streaming chunk.
-    pub stream_partition_done: bool,
+    /// Set when the consuming pass sees the final streaming chunk, or a stop
+    /// check returns `END_PARTITION`.
+    pub partition_done: bool,
 }
 
 /// Python's `NestedLoopIndices`, as the runtime stores it.
@@ -96,6 +97,11 @@ pub struct RequestInfo {
     /// persist signals and token counts to whichever request draws that
     /// integer next. Here, remove_request frees them with everything else.
     pub pending: PendingOutputs,
+
+    /// Per (node, walk), this request's limits for its declared stop rules
+    /// (`GraphRuntime.stop_rules`): (max_iters, ignore_eos) per rule. Set by
+    /// `set_stop_limits` as the request arrives.
+    pub stop_limits: Vec<((Sym, Sym), Vec<(u32, bool)>)>,
 }
 
 /// What a request has accumulated since its last WORKER_GRAPHS_DONE.
@@ -104,22 +110,55 @@ pub struct PendingOutputs {
     /// signal -> uuids. Uuids, not descriptors: the bookkeeper is shared, so
     /// resolving at send time cannot go stale against it.
     pub persist: Vec<(Sym, Vec<u64>)>,
-    pub new_tokens: Vec<(String, i64)>,
-    /// Emitted signal names, in emission order.
+    /// partition -> signal -> count; each report carries its own partition's.
+    pub new_tokens: Vec<(PartitionId, Vec<(String, i64)>)>,
+    /// One name per chunk emitted to the client, in emission order. The
+    /// conductor counts them to tell the API server how many chunks to wait
+    /// for.
     pub output_signals: Vec<Sym>,
-    /// signal -> the loop context it was emitted at.
-    pub output_loop_indices: Vec<(Sym, (Vec<Sym>, Vec<(Sym, u32)>, u32))>,
+    /// stream edge -> destination worker -> items sent, local ones included.
+    /// The conductor forwards the totals with `producer_done`, so a consumer
+    /// whose done signal overtakes the last items waits for them.
+    pub stream_items: Vec<(Sym, Vec<(Sym, i64)>)>,
 }
 
+/// What one WORKER_GRAPHS_DONE drains: persist signals, token counts,
+/// emitted signal names and stream item counts.
+pub type TakenOutputs = (
+    Vec<(Sym, Vec<u64>)>,
+    Vec<(String, i64)>,
+    Vec<Sym>,
+    Vec<(Sym, Vec<(Sym, i64)>)>,
+);
+
 impl PendingOutputs {
-    /// Everything but `output_loop_indices`, which the conductor keeps for the
-    /// life of the request -- Python re-sends it on every WGD.
-    pub fn take_for_send(&mut self) -> (Vec<(Sym, Vec<u64>)>, Vec<(String, i64)>, Vec<Sym>) {
+    /// Everything pending, with only `partition`'s token counts.
+    pub fn take_for_send(&mut self, partition: Option<PartitionId>) -> TakenOutputs {
+        let new_tokens = match self.new_tokens.iter().position(|(p, _)| Some(*p) == partition) {
+            Some(i) => self.new_tokens.swap_remove(i).1,
+            None => Vec::new(),
+        };
         (
             std::mem::take(&mut self.persist),
-            std::mem::take(&mut self.new_tokens),
+            new_tokens,
             std::mem::take(&mut self.output_signals),
+            std::mem::take(&mut self.stream_items),
         )
+    }
+
+    pub fn add_stream_items(&mut self, edge: Sym, worker: Sym, n: i64) {
+        let i = match self.stream_items.iter().position(|(e, _)| *e == edge) {
+            Some(i) => i,
+            None => {
+                self.stream_items.push((edge, Vec::new()));
+                self.stream_items.len() - 1
+            }
+        };
+        let per_worker = &mut self.stream_items[i].1;
+        match per_worker.iter_mut().find(|(w, _)| *w == worker) {
+            Some((_, v)) => *v += n,
+            None => per_worker.push((worker, n)),
+        }
     }
 
     /// Every uuid of a signal, in order and deduped, matching Python: a loop
@@ -140,23 +179,21 @@ impl PendingOutputs {
         }
     }
 
-    /// Accumulate, matching Python: a repeated signal's count adds up, and a
-    /// repeated loop index overwrites.
-    pub fn add_new_tokens(&mut self, counts: &[(String, i64)]) {
-        for (name, n) in counts {
-            match self.new_tokens.iter_mut().find(|(k, _)| k == name) {
-                Some((_, v)) => *v += n,
-                None => self.new_tokens.push((name.clone(), *n)),
+    /// Accumulate, matching Python: a repeated signal's count adds up.
+    pub fn add_new_tokens(&mut self, partition: PartitionId, counts: &[(String, i64)]) {
+        let i = match self.new_tokens.iter().position(|(p, _)| *p == partition) {
+            Some(i) => i,
+            None => {
+                self.new_tokens.push((partition, Vec::new()));
+                self.new_tokens.len() - 1
             }
-        }
-    }
-
-    pub fn set_loop_indices(
-        &mut self, signal: Sym, idx: (Vec<Sym>, Vec<(Sym, u32)>, u32),
-    ) {
-        match self.output_loop_indices.iter_mut().find(|(s, _)| *s == signal) {
-            Some(slot) => slot.1 = idx,
-            None => self.output_loop_indices.push((signal, idx)),
+        };
+        let pending = &mut self.new_tokens[i].1;
+        for (name, n) in counts {
+            match pending.iter_mut().find(|(k, _)| k == name) {
+                Some((_, v)) => *v += n,
+                None => pending.push((name.clone(), *n)),
+            }
         }
     }
 }
@@ -176,7 +213,7 @@ impl RequestInfo {
             RequestPartitionInfo {
                 graph_walk: walk,
                 walk_worker_graphs: live,
-                stream_partition_done: false,
+                partition_done: false,
             },
         );
     }
@@ -202,16 +239,16 @@ impl RequestInfo {
         true
     }
 
-    pub fn mark_stream_done(&mut self, partition: PartitionId) {
+    pub fn mark_partition_done(&mut self, partition: PartitionId) {
         if let Some(info) = self.partitions.get_mut(&partition) {
-            info.stream_partition_done = true;
+            info.partition_done = true;
         }
     }
 
-    pub fn stream_done(&self, partition: PartitionId) -> bool {
+    pub fn partition_done(&self, partition: PartitionId) -> bool {
         self.partitions
             .get(&partition)
-            .is_some_and(|p| p.stream_partition_done)
+            .is_some_and(|p| p.partition_done)
     }
 }
 
@@ -227,6 +264,21 @@ mod tests {
             loop_indices: idx,
             wg_fwd_pass_idx: fwd,
         }
+    }
+
+    #[test]
+    fn new_tokens_drain_only_for_the_reporting_partition() {
+        let mut p = PendingOutputs::default();
+        p.add_new_tokens(1, &[("tok".to_string(), 1)]);
+        p.add_new_tokens(1, &[("tok".to_string(), 2)]);
+        p.add_new_tokens(2, &[("audio".to_string(), 4)]);
+        let (_, n, _, _) = p.take_for_send(Some(2));
+        assert_eq!(n, vec![("audio".to_string(), 4)]);
+        let (_, n, _, _) = p.take_for_send(None);
+        assert!(n.is_empty());
+        let (_, n, _, _) = p.take_for_send(Some(1));
+        assert_eq!(n, vec![("tok".to_string(), 3)]);
+        assert!(p.new_tokens.is_empty());
     }
 
     #[test]
@@ -297,12 +349,24 @@ mod tests {
     }
 
     #[test]
-    fn stream_done_is_per_partition() {
+    fn stream_items_add_up_per_edge_and_worker_and_drain() {
+        let mut p = PendingOutputs::default();
+        p.add_stream_items(1, 10, 2);
+        p.add_stream_items(1, 11, 1);
+        p.add_stream_items(1, 10, 3);
+        p.add_stream_items(2, 10, 1);
+        let (_, _, _, items) = p.take_for_send(None);
+        assert_eq!(items, vec![(1, vec![(10, 5), (11, 1)]), (2, vec![(10, 1)])]);
+        assert!(p.stream_items.is_empty());
+    }
+
+    #[test]
+    fn partition_done_is_per_partition() {
         let mut info = RequestInfo::default();
         info.set_partition(1, 10, vec![]);
         info.set_partition(2, 20, vec![]);
-        info.mark_stream_done(1);
-        assert!(info.stream_done(1));
-        assert!(!info.stream_done(2));
+        info.mark_partition_done(1);
+        assert!(info.partition_done(1));
+        assert!(!info.partition_done(2));
     }
 }

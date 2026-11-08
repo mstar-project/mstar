@@ -3,7 +3,8 @@ wrappers — using lightweight fakes (no real weights / GPU).
 
 Covers the engine contract of the nano node (host-only ``prepare_inputs``,
 AddFusion in ``preprocess``, the step declaration per walk, the reference's
-prompt priming, stop rule) and the codec's per-request left context.
+prompt priming, stop rule). The streaming encoder is the shared one
+(``test_fastconformer``); the codec's stream is in ``test_nemotron_duplex_codec``.
 """
 from types import SimpleNamespace
 
@@ -22,11 +23,7 @@ from mstar.model.nemotron_duplex.config import (
     NANO_SAMPLER,
     NemotronDuplexConfig,
 )
-from mstar.model.nemotron_duplex.submodules import (
-    NO_PROMPT,
-    AudioCodecDecoderSubmodule,
-    NemotronHLLMSubmodule,
-)
+from mstar.model.nemotron_duplex.submodules import NO_PROMPT, NemotronHLLMSubmodule
 from mstar.model.submodule_base import BatchedModelOutput
 
 H = 8
@@ -187,17 +184,17 @@ def test_nano_captures_the_decode_step():
     only, whose dummy row is a fused frame (host-only prepare_inputs shape)
     and whose largest bucket fits the model's default recurrent-pool sizing
     (padding rows take a slot each during the step)."""
-    from mstar.engine.cuda_graph_config import BatchedCudaGraphConfig
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
     from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 
     nano = _make_nano()
-    configs = nano.get_cuda_graph_configs(torch.device("cpu"))
+    configs = nano.get_accelerator_graph_configs(torch.device("cpu"))
     assert len(configs) == 1
     cfg = configs[0]
-    assert isinstance(cfg, BatchedCudaGraphConfig)
+    assert isinstance(cfg, BatchedAcceleratorGraphConfig)
     assert cfg.capture_graph_walk == "decode" and cfg.replay_graph_walks == ["decode"]
     assert cfg.compile is False and cfg.additional_key_info == nano.DECODE_KEY
-    assert max(cfg.capture_batch_sizes) <= NemotronDuplexModel.DEFAULT_MAMBA_SLOTS
+    assert max(cfg.capture_batch_sizes) <= NemotronDuplexModel.DEFAULT_SESSIONS
     row = cfg.single_request_inputs
     assert row.input_seq_len == 1 and row.kwargs["mode"] == "frame"
     assert row.tensor_inputs["audio_frame"].shape == (1, nano.config.nano.hidden_size)
@@ -209,6 +206,54 @@ def test_nano_captures_the_decode_step():
     assert pre["input_embeds"].shape == (3, nano.config.nano.hidden_size) and pre["seq_lens"] == [1, 1, 1]
 
 
+@pytest.mark.parametrize("done_before_last_pop", [True, False])
+def test_nano_emits_one_token_per_frame_however_the_stream_ends(done_before_last_pop):
+    """The audio stream's end can reach the LLM's buffer after its last frame was
+    taken; the buffer then releases an empty final chunk, whose step only ends
+    the loop. Either way the call gets one token per frame, as offline."""
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.stream_buffer import StreamBuffer
+
+    nano = _make_nano()
+    buf = StreamBuffer(request_id="r", edge_name="audio_frame", from_partition="Encoder",
+                       policy=FixedChunkPolicy(chunk_size=1, continue_after_done=False))
+    for k in range(3):
+        buf.pre_read_register(f"f{k}")
+        buf.put(f"f{k}", torch.randn(H))
+    emitted, finals = [], 0
+    while True:
+        if len(emitted) == (2 if done_before_last_pop else 3):
+            buf.signal_done()
+        if not buf.has_chunk_ready():
+            break
+        chunk = buf.pop_chunk()
+        data = chunk.data["data"]
+        inputs = {"audio_frame": [] if data is None else [data], "prev_text": [torch.tensor([3])],
+                  "prev_func": [torch.tensor([4])], "text_inputs": [torch.tensor([NO_PROMPT])]}
+        ni = nano.prepare_inputs("decode", None, inputs, resources={}, is_final_stream_chunk=chunk.is_final)
+        out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([8])],
+               "text_inputs": [torch.tensor([NO_PROMPT])]}
+        nano.postprocess("r", None, out, inputs=ni)
+        emitted += out.get("new_token", [])
+        finals += chunk.is_final
+        if chunk.is_final:
+            break
+    assert finals == 1 and len(emitted) == 3
+
+
+@pytest.mark.parametrize("final", [True, False])
+def test_nano_drops_the_token_of_an_empty_chunk_only_when_it_is_final(final):
+    """The engine's final flag, not a missing frame, marks the step that only
+    ends the loop."""
+    nano = _make_nano()
+    inputs = {"audio_frame": [], "prev_text": [torch.tensor([3])], "prev_func": [torch.tensor([4])],
+              "text_inputs": [torch.tensor([NO_PROMPT])]}
+    ni = nano.prepare_inputs("decode", None, inputs, resources={}, is_final_stream_chunk=final)
+    out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([8])]}
+    nano.postprocess("r", None, out, inputs=ni)
+    assert ("new_token" in out) is not final
+
+
 def test_nano_postprocess_feeds_tokens_back():
     nano = _make_nano()
     out = {"new_token": [torch.tensor([7])], "new_func": [torch.tensor([12])]}
@@ -216,166 +261,35 @@ def test_nano_postprocess_feeds_tokens_back():
     assert out["prev_text"] is out["new_token"] and out["prev_func"] is out["new_func"]
 
 
-class _FakeCodec(nn.Module):
-    """Stand-in vocoder: emits SPF samples per code frame, valued by the frame's
-    first code (so a chunk's emitted length AND content are checkable), and
-    counts its calls."""
+def _live_tensors() -> int:
+    import gc
 
-    SPF = 16
-
-    def __init__(self):
-        super().__init__()
-        self.calls = 0
-
-    def decode(self, codes, code_len):
-        self.calls += 1
-        b, tf = codes.shape[0], codes.shape[1]
-        per_frame = codes[:, :, 0].float() / 1000.0                     # (B, Tf)
-        wav = torch.repeat_interleave(per_frame, self.SPF, dim=1)       # (B, Tf * SPF)
-        return wav.view(b, 1, -1), torch.full((b,), tf * self.SPF)
+    gc.collect()
+    return sum(type(o) is torch.Tensor for o in gc.get_objects())
 
 
-def _make_codec() -> AudioCodecDecoderSubmodule:
-    return AudioCodecDecoderSubmodule(codec=_FakeCodec(), config=NemotronDuplexConfig())
+def test_codec_inverse_stft_keeps_nothing_per_length():
+    """The standalone stream re-decodes the whole code history every frame, so
+    each frame is a new length: the inverse STFT must hold nothing per length."""
+    from mstar.model.nemotron_duplex.components.audio_codec import _spec_to_wav
+
+    n_fft, hop = 16, 4
+    _spec_to_wav(torch.randn(1, n_fft // 2 + 1, 3, dtype=torch.complex64), n_fft, hop, n_fft)
+    before = _live_tensors()
+    for frames in range(4, 40):
+        _spec_to_wav(torch.randn(1, n_fft // 2 + 1, frames, dtype=torch.complex64), n_fft, hop, n_fft)
+    assert _live_tensors() == before
 
 
-def _codes(n_frames, value=0):
-    return torch.full((n_frames, 4), value, dtype=torch.long)
+def test_codec_refuses_a_window_whose_overlap_add_has_a_gap():
+    """The inverse STFT divides by the overlap-added squared window and zeroes
+    it where that is ~0; a window and hop that leave a gap are refused when the
+    codec is built, not met as silence mid-call."""
+    from mstar.model.nemotron_duplex.components.audio_codec import check_window_envelope
 
-
-def _run_codec(codec, rid, n_frames, value=0):
-    eng = SimpleNamespace(request_ids=[rid])
-    return codec.forward("codec_chunk", eng, codes=_codes(n_frames, value))["audio_chunk"][0]
-
-
-def _run_codec_batch(codec, rids, frames):
-    eng = SimpleNamespace(request_ids=list(rids))
-    inputs = [codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [_codes(n, v)]})
-              for n, v in frames]
-    pre = codec.preprocess("codec_chunk", eng, inputs)
-    return codec.forward_batched("codec_chunk", eng, **pre)
-
-
-def test_codec_prepare_inputs_flattens_stacked_row_views():
-    """The talker emits one [1, num_q] row view per frame; the stream stacks a
-    chunk of them to (T, 1, num_q). A whole window arrives as (1, T, num_q)."""
-    codec = AudioCodecDecoderSubmodule(_FakeCodec(), NemotronDuplexConfig())
-    q = codec.config.eartts.num_quantizers
-    stacked = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [torch.arange(5 * q).view(5, 1, q)]})
-    whole = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [torch.arange(5 * q).view(1, 5, q)]})
-    single = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [torch.arange(q)]})
-    assert stacked.input_seq_len == whole.input_seq_len == 5 and single.input_seq_len == 1
-    torch.testing.assert_close(stacked.tensor_inputs["codes"], whole.tensor_inputs["codes"])
-    assert stacked.tensor_inputs["codes"].shape == (5, q) and single.tensor_inputs["codes"].shape == (1, q)
-
-
-def test_codec_runs_an_empty_final_chunk_as_a_flush():
-    """A frame count divisible by the chunk size ends on an empty final chunk. The codec
-    must run it, since a skipped rid in a shared batch never finishes its stream."""
-    codec = _make_codec()
-    for chunk in ({"codec_tokens": []}, {}):
-        inp = codec.prepare_inputs("codec_chunk", None, chunk, is_final_stream_chunk=True)
-        assert inp is not None and inp.kwargs["flush"] and not inp.tensor_inputs
-    _run_codec(codec, "a", 5, 1)
-    eng = SimpleNamespace(request_ids=["a", "b"])
-    inputs = [codec.prepare_inputs("codec_chunk", None, {}, is_final_stream_chunk=True),
-              codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [_codes(5, 2)]})]
-    out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, inputs))
-    assert out["a"]["audio_chunk"][0].numel() == 0     # the fake vocoder holds nothing back
-    assert out["b"]["audio_chunk"][0].shape[0] == 5 * _FakeCodec.SPF
-
-
-def test_codec_batches_requests_with_equal_windows():
-    """Requests at the same window length share one decode; a newcomer with a
-    shorter window gets its own; every request emits only its new frames with
-    its own content."""
-    codec = _make_codec()
-    _run_codec(codec, "a", 5, 1)
-    _run_codec(codec, "b", 5, 2)
-    codec.codec.calls = 0
-    out = _run_codec_batch(codec, ["a", "b", "c"], [(5, 3), (5, 4), (5, 5)])
-    assert codec.codec.calls == 2                      # {a, b} at 10 frames, c at 5
-    spf = _FakeCodec.SPF
-    for rid, value in (("a", 3), ("b", 4), ("c", 5)):
-        wav = out[rid]["audio_chunk"][0]
-        assert wav.shape[0] == 5 * spf
-        assert torch.all(wav == int(value / 1000.0 * 32767))    # the new frames' own content
-    lc = codec.config.eartts.codec_left_context_frames
-    assert _ctx(codec, "c").shape[0] == min(5, lc) and _ctx(codec, "a").shape[0] == min(10, lc)
-
-
-def _ctx(codec, rid):
-    return codec.request_state(rid).get(AudioCodecDecoderSubmodule.CONTEXT_KEY)
-
-
-def test_codec_emits_only_new_frames_with_left_context():
-    """First chunk emits all its frames; later chunks decode context+new but
-    emit ONLY the new frames — so a 5+5 frame stream yields 10 frames of audio,
-    not 5+10 (the overlap-re-emission balloon)."""
-    codec = _make_codec()
-    spf = _FakeCodec.SPF
-    assert codec._hold == 0                            # the fake vocoder has no overlap-add edge
-    a = _run_codec(codec, "r", 5)
-    assert a.shape[0] == 5 * spf                       # first chunk: all 5 frames
-    b = _run_codec(codec, "r", 5)
-    assert b.shape[0] == 5 * spf                       # second chunk: only the 5 NEW frames
-    # context rolled forward, capped at codec_left_context_frames
-    assert _ctx(codec, "r").shape[0] == min(10, codec.config.eartts.codec_left_context_frames)
-
-
-def test_codec_cleanup_clears_per_request_context():
-    """The context lives in engine-owned per-request state, so the engine's
-    ``cleanup_request`` drops it with everything else."""
-    codec = _make_codec()
-    _run_codec(codec, "r", 5)
-    assert _ctx(codec, "r") is not None
-    codec.cleanup_request("r")
-    assert "r" not in codec.request_states
-
-
-@pytest.mark.parametrize("frames", [23, 25])
-def test_codec_stream_is_the_full_history_decode_with_the_real_decoder(frames):
-    """With the real (tiny-channel, real kernel / rates / block count) decoder,
-    the chunked stream -- 3 frames of left context, right edge carried into the
-    next chunk -- equals the one-shot decode of all frames, sample for sample.
-    The final chunk flushes the held tail; 25 frames end on an empty one."""
-    from mstar.model.nemotron_duplex.components.audio_codec import AudioCodec
-    from mstar.model.nemotron_duplex.config import CodecConfig
-
-    torch.manual_seed(0)
-    ccfg = CodecConfig(base_hidden_size=8, latent_size=16, codebook_size=16, num_quantizers=4)
-    real = AudioCodec(ccfg).eval()
-    for prm in real.parameters():
-        if prm.is_floating_point():
-            prm.data.normal_(0, 0.05)
-    cfg = NemotronDuplexConfig()
-    codec = AudioCodecDecoderSubmodule(codec=real, config=cfg)
-    assert cfg.eartts.codec_left_context_frames == 3 and codec._hold == ccfg.n_fft - ccfg.hop_length == 12
-    chunk = 5
-    codes = torch.randint(0, ccfg.codebook_size, (frames, ccfg.num_quantizers))
-    with torch.no_grad():
-        whole, _ = real.decode(codes.unsqueeze(0))
-        whole = (whole[0, 0].clamp(-1, 1) * 32767).to(torch.int16)
-        pieces = []
-        starts = list(range(0, frames + (frames % chunk == 0), chunk))
-        for start in starts:
-            piece = codes[start:start + chunk]
-            inp = codec.prepare_inputs("codec_chunk", None, {"codec_tokens": [piece] if len(piece) else []},
-                                       is_final_stream_chunk=start == starts[-1])
-            eng = SimpleNamespace(request_ids=["r"], resources={}, per_request_states=None)
-            out = codec.forward_batched("codec_chunk", eng, **codec.preprocess("codec_chunk", eng, [inp]))
-            pieces.append(out["r"]["audio_chunk"][0])
-    stream = torch.cat(pieces)
-    assert stream.shape[0] == whole.shape[0]
-    torch.testing.assert_close(stream, whole, atol=1, rtol=0)   # int16: one quantization step
-
-
-def test_codec_requests_are_isolated():
-    codec = _make_codec()
-    _run_codec(codec, "a", 5)
-    _run_codec(codec, "b", 3)
-    lc = codec.config.eartts.codec_left_context_frames
-    assert _ctx(codec, "a").shape[0] == min(5, lc) and _ctx(codec, "b").shape[0] == min(3, lc)
+    check_window_envelope(torch.hann_window(16), 4)
+    with pytest.raises(ValueError, match="overlap-add"):
+        check_window_envelope(torch.tensor([0.0, 0, 0, 1, 1, 0, 0, 0]), 4)
 
 
 def test_nano_frame_batch_fuses_rows_exactly_like_the_per_request_path():

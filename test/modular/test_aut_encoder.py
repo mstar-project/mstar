@@ -9,7 +9,7 @@ output must match each of them).
 import pytest
 import torch
 
-pytest.importorskip("transformers")
+transformers = pytest.importorskip("transformers")
 
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (  # noqa: E402
     Qwen3OmniMoeAudioEncoderConfig,
@@ -27,14 +27,16 @@ TINY = dict(
     downsample_hidden_size=8, output_dim=48, max_source_positions=1500,
 )
 
-
 @pytest.fixture(autouse=True)
 def _windowed_hf_attention(monkeypatch):
-    """HF's SDPA/eager path never applies the window mask its encoder builds
-    (``_prepare_attention_mask`` is only relevant to FA2, which reads
-    ``cu_seqlens`` directly), so on CPU the reference attends across windows.
-    The released checkpoints and every GPU engine (vLLM, FA2) are windowed;
-    hand the layers the reference's own block-diagonal mask so the oracle is."""
+    """Before transformers 5, HF's SDPA/eager path never applied the window
+    mask its encoder builds (``_prepare_attention_mask`` is only relevant to
+    FA2, which reads ``cu_seqlens`` directly), so on CPU the reference attended
+    across windows. The released checkpoints and every GPU engine (vLLM, FA2)
+    are windowed; hand the layers the reference's own block-diagonal mask so
+    the oracle is. From 5.x the SDPA path attends window by window itself."""
+    if int(transformers.__version__.split(".")[0]) >= 5:
+        return
     original = Qwen3OmniMoeAudioEncoderLayer.forward
 
     def windowed(self, hidden_states, cu_seqlens, attention_mask=None, **kwargs):
@@ -70,6 +72,10 @@ def test_token_arithmetic_matches_hf_formula():
     cfg = AuTEncoderConfig()
     for n in [1, 37, 99, 100, 101, 230, 1000, 3000, 30017]:
         assert cfg.tokens_for_frames(n) == int(_get_feat_extract_output_lengths(torch.tensor(n)))
+    # chunks of the checkpoint's own n_window, as HF counts them
+    wide = AuTEncoderConfig(n_window=52)
+    for n in [104, 164, 1000]:
+        assert wide.tokens_for_frames(n) == int(_get_feat_extract_output_lengths(torch.tensor(n), n_window=52))
     assert cfg.chunk_frames == 100 and cfg.tokens_per_chunk == 13 and cfg.window_tokens == 104
     assert cfg.window_lengths(30) == [30]
     assert cfg.window_lengths(104 * 3 + 5) == [104, 104, 104, 5]
@@ -103,7 +109,7 @@ def test_single_request_matches_hf(num_frames):
     feats = torch.randn(TINY["num_mel_bins"], num_frames)
     expected = _hf_encode(hf, feats)
     with torch.no_grad():
-        actual, layout = ours(feats.unsqueeze(0), [num_frames])
+        actual, layout = ours([feats])
     assert layout.tokens_per_request == [expected.shape[0]]
     assert actual.shape == expected.shape
     assert torch.allclose(actual, expected, atol=1e-4), (actual - expected).abs().max()
@@ -114,11 +120,8 @@ def test_packed_requests_match_hf_one_by_one():
     torch.manual_seed(2)
     lens = [230, 150, 305]
     feats = [torch.randn(TINY["num_mel_bins"], n) for n in lens]
-    padded = torch.zeros(len(lens), TINY["num_mel_bins"], max(lens))
-    for i, f in enumerate(feats):
-        padded[i, :, : f.shape[-1]] = f
     with torch.no_grad():
-        actual, layout = ours(padded, lens)
+        actual, layout = ours(feats)
     cfg = ours.config
     assert layout.tokens_per_request == [cfg.tokens_for_frames(n) for n in lens]
     # every request's windows, back to back: 26-token windows plus remainders
@@ -160,8 +163,25 @@ def test_encode_runs_through_a_bound_ragged_resource():
         if hasattr(module, "bind_resources"):
             module.bind_resources({"aut_attn": rec})
     assert all(layer.self_attn.ragged is rec for layer in keyed.layers)
-    feats = torch.randn(1, TINY["num_mel_bins"], 120)
+    feats = torch.randn(TINY["num_mel_bins"], 120)
     with torch.no_grad():
-        out, layout = keyed(feats, [120])
+        out, layout = keyed([feats])
     assert len(calls) == TINY["encoder_layers"] and calls[0] == (layout.total_tokens, 4, 16)
     assert out.shape == (layout.total_tokens, TINY["output_dim"])
+
+
+def test_a_float16_layer_keeps_its_residual_stream_finite():
+    """As HF's encoder layer does, an fp16 layer clamps its residual stream
+    short of the dtype's max, so a long clip's embeddings never overflow to inf."""
+    from mstar.model.components.aut_encoder import AuTEncoderLayer
+
+    layer = AuTEncoderLayer(AuTEncoderConfig(**TINY), attn_key=None).half()
+    with torch.no_grad():
+        for param in layer.parameters():
+            param.normal_(std=0.02)
+        # the MLP's output is fp16's largest value, so adding the stream to it overflows
+        layer.fc2.weight.zero_()
+        layer.fc2.bias.fill_(torch.finfo(torch.float16).max)
+        out = layer(torch.full((4, TINY["d_model"]), 40.0, dtype=torch.float16), [0, 4])
+    assert torch.isfinite(out).all()
+    assert out.max() == torch.finfo(torch.float16).max - 1000

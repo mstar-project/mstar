@@ -19,12 +19,16 @@ no fused params) just call ``load_weights_into(module, weights)``.
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,33 @@ class StackedParamRule:
     target_suffix: str
     source_suffix: str
     shard_id: str | int
+
+
+class CheckpointRules(NamedTuple):
+    """How a checkpoint's tensors land on a module's parameters: the prefix the
+    checkpoint names them under (stripped before anything else), then ``remap``, then
+    the stacked-shard rules. A weights root states its rules once
+    (``checkpoint_rules()``), for its weight loader and for anything else that must
+    place checkpoint names the same way (LoRA adapters: ``module_lora_spec``)."""
+
+    stacked_params: tuple[StackedParamRule, ...] = ()
+    remap: Callable[[str], str | None] | None = None
+    prefix: str = ""
+
+    def native(self, name: str) -> str | None:
+        """The checkpoint name ``name`` (prefix included) as the module's parameter
+        name, before the stacked rules; None for a name the remap drops."""
+        if self.prefix:
+            if not name.startswith(self.prefix):
+                return None
+            name = name[len(self.prefix):]
+        return name if self.remap is None else self.remap(name)
+
+    def load(self, module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]], **kw) -> set[str]:
+        """``load_hf_weights`` under these rules (names already stripped of ``prefix``)."""
+        return load_hf_weights(
+            module, weights, stacked_params=list(self.stacked_params), name_remapper=self.remap, **kw,
+        )
 
 
 def default_weight_loader(
@@ -83,7 +114,7 @@ def _dispatch_loader(
         loader(param, loaded_weight, shard_id)
 
 
-def _apply_stacked(
+def apply_stacked(
     name: str, stacked: list[StackedParamRule],
 ) -> tuple[str, str | int | None]:
     """Return ``(target_name, shard_id)`` after applying stacked rules,
@@ -94,12 +125,52 @@ def _apply_stacked(
     return name, None
 
 
+class _StackedMatcher:
+    """``apply_stacked`` without trying every rule on every name.
+
+    Per-expert rule lists run to thousands of rules. A suffix with a token
+    between two dots (``.experts.gate_proj.__expert7__.weight``) can only
+    occur in a name holding that token between dots, so each such rule is
+    indexed by its rarest one; a name tries the rules its own tokens select
+    plus the rules with no such token, still first-win in list order.
+    """
+
+    def __init__(self, stacked: list[StackedParamRule]) -> None:
+        self._rules = stacked
+        inner = [rule.source_suffix.split(".")[1:-1] for rule in stacked]
+        uses: dict[str, int] = {}
+        for tokens in inner:
+            for token in set(tokens):
+                uses[token] = uses.get(token, 0) + 1
+        self._always: list[int] = []
+        self._by_token: dict[str, list[int]] = {}
+        for i, tokens in enumerate(inner):
+            if tokens:
+                key = min(tokens, key=uses.__getitem__)
+                self._by_token.setdefault(key, []).append(i)
+            else:
+                self._always.append(i)
+
+    def __call__(self, name: str) -> tuple[str, str | int | None]:
+        selected = [
+            i for token in set(name.split("."))
+            for i in self._by_token.get(token, ())
+        ]
+        order = sorted(self._always + selected) if selected else self._always
+        for i in order:
+            rule = self._rules[i]
+            if rule.source_suffix in name:
+                return name.replace(rule.source_suffix, rule.target_suffix), rule.shard_id
+        return name, None
+
+
 def load_weights_into(
     module: nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
     stacked_params: list[StackedParamRule] | None = None,
     name_remapper: Callable[[str], str | None] | None = None,
     skip_predicate: Callable[[str], bool] | None = None,
+    strict: bool = False,
 ) -> set[str]:
     """Walk a ``(name, tensor)`` stream and load each into the matching
     parameter of ``module``.
@@ -116,32 +187,70 @@ def load_weights_into(
             ``None`` to drop the key entirely.
         skip_predicate: optional ``(name) -> bool``; returning ``True``
             skips the key. Applied before ``name_remapper``.
+        strict: raise ``ValueError`` if a key that is neither skipped nor
+            dropped names no parameter, or if a parameter gets no tensor (a
+            stacked one, a tensor for each of its shards).
 
     Returns: set of parameter paths that received a tensor.
     """
     stacked = stacked_params or []
+    match_stacked = _StackedMatcher(stacked)
     params_dict = dict(module.named_parameters())
     loaded: set[str] = set()
+    # each stacked parameter's shards that got a tensor
+    shards: dict[str, set[str | int]] = {}
+    unmatched: list[str] = []
+    dropped: list[str] = []
+    num_dropped = 0
 
-    for name, tensor in weights:
-        if skip_predicate is not None and skip_predicate(name):
+    for key, tensor in weights:
+        if skip_predicate is not None and skip_predicate(key):
             continue
+        name = key
         if name_remapper is not None:
-            mapped = name_remapper(name)
-            if mapped is None:
+            name = name_remapper(key)
+            if name is None:
                 continue
-            name = mapped
 
-        target, shard_id = _apply_stacked(name, stacked)
+        target, shard_id = match_stacked(name)
         if target not in params_dict:
-            # Not an error: the checkpoint may carry extra keys (lm_head
-            # ties, kv-scale, etc.). Caller can verify completeness via
-            # the returned set.
+            # Not an error unless strict: the checkpoint may carry extra
+            # keys (lm_head ties, kv-scale, etc.). Caller can verify
+            # completeness via the returned set.
+            if strict:
+                unmatched.append(key)
+            num_dropped += 1
+            if len(dropped) < 3:
+                dropped.append(target)
             continue
 
         _dispatch_loader(params_dict[target], tensor, shard_id)
         loaded.add(target)
+        if strict and shard_id is not None:
+            shards.setdefault(target, set()).add(shard_id)
 
+    if strict:
+        if unmatched:
+            raise ValueError(
+                f"{len(unmatched)} checkpoint tensor(s) have no parameter here, e.g. {unmatched[:5]}"
+            )
+        missing = sorted(params_dict.keys() - loaded) + sorted(
+            f"{target} shard {shard!r}"
+            for target, got in shards.items()
+            for shard in {r.shard_id for r in stacked if r.target_suffix in target} - got
+        )
+        if missing:
+            raise ValueError(f"{len(missing)} parameter(s) got no weight, e.g. {missing[:5]}")
+    if num_dropped:
+        # Dropped keys are fine while every parameter got a weight. Both at
+        # once usually means the key layout drifted from the module's.
+        unloaded = len(params_dict) - len(loaded)
+        logger.log(
+            logging.WARNING if unloaded else logging.INFO,
+            "%s: %d checkpoint keys matched no parameter (e.g. %s); %d of %d "
+            "parameters got no weight",
+            type(module).__name__, num_dropped, dropped, unloaded, len(params_dict),
+        )
     return loaded
 
 

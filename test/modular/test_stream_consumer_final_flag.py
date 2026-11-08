@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 
 class _RecordingSubmodule(NodeSubmodule):
@@ -28,9 +29,7 @@ class _RecordingSubmodule(NodeSubmodule):
 
 
 def _engine_with(submodule) -> Engine:
-    engine = object.__new__(Engine)
-    engine._submodules = {"vocoder": SimpleNamespace(submodule=submodule, resources={})}
-    engine._enable_nvtx = False
+    engine = make_engine(_submodules={"vocoder": make_mgmt(submodule)})
     return engine
 
 

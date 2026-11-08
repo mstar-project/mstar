@@ -3,8 +3,9 @@
 Two things separate a stream from the pages the index holds for it. Two requests
 filling the same page in one batch both write a copy, but only the first to
 commit gets the entry, so the loser goes on holding a page nobody else can
-reach. And a reloaded request is given fresh pages and copied back into them,
-while the entries it left behind still name the originals.
+reach. And when a request is reloaded, the pages the index dropped are copied
+from the host into fresh pages, and another request can index those keys before
+the reload does.
 
 In both cases the stream's next page has to chain onto what the index named. Off
 its own page list it would name a page the index has never heard of, and the
@@ -21,7 +22,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.keys import chain, fingerprint
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
@@ -85,6 +86,7 @@ def _ingest(kv: KVManager, rid: str, tokens: list[int]) -> None:
             tokens[at:at + PAGE_SIZE] for at in range(0, len(tokens), PAGE_SIZE)
         ])},
         prefix_tail={"main": tokens[whole * PAGE_SIZE:]},
+        kv_layout={"main": StreamLayout(spans=(PrefixSpan(len(tokens), len(tokens), WALK),), keyed_spans=1)},
     ))
 
 
@@ -156,13 +158,24 @@ def test_the_loser_keeps_its_own_page_and_the_index_keeps_one_entry():
 def test_a_reloaded_request_chains_its_next_page_onto_the_original():
     kv = _manager(cpu_offload_pages=64)
     tokens = list(range(160))
-    _ingest(kv, "a", tokens)
+    for rid in ("a", "b"):
+        _ingest(kv, rid, tokens)
     _batch(kv, ("a",), 80)
     indexed = len(kv._index.pages())
-    original = _indexed_page(kv, "a", 4)
 
     assert kv.offload("a") > 0, "the request did not move to the host"
+    # a's pages leave the index, so its reload copies them back from the host,
+    # and b fills the same pages while that copy is queued
+    kv._index.evict(5)
+    copy_in = kv._cpu_pool.copy_in
+
+    def copy_in_then_b(*args):
+        copy_in(*args)
+        _batch(kv, ("b",), 80)
+
+    kv._cpu_pool.copy_in = copy_in_then_b
     assert kv.reload("a"), "the request could not come back"
+    original = _indexed_page(kv, "b", 4)
     _batch(kv, ("a",), 80)
 
     assert len(kv._index.pages()) == indexed + 5, (

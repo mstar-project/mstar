@@ -12,6 +12,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+# a submodule of the reference: mstar/model/chatterbox also answers to `chatterbox` once pytest
+# puts mstar/model on sys.path for the model-local tests
+pytest.importorskip("chatterbox.models")
 chatterbox = pytest.importorskip("chatterbox")
 from chatterbox.models.t3 import T3 as RefT3  # noqa: E402, N811
 from chatterbox.models.t3.modules.cond_enc import T3Cond  # noqa: E402

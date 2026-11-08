@@ -50,6 +50,9 @@ class Mamba2Plan:
 
 
 class Mamba2Manager(LinearAttnManager):
+    # the state is the recurrent pool's, which a drop zeroes
+    supports_drop = True
+
     def __init__(
         self,
         config: LinearAttnConfig,
@@ -240,7 +243,7 @@ class Mamba2Manager(LinearAttnManager):
 
     # Engine lifecycle
 
-    def build_cuda_graph_buffers(
+    def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
         del slots, max_seq_len

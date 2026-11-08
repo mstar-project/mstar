@@ -14,7 +14,9 @@ from pathlib import Path
 import pytest
 import torch
 
-pytest.importorskip("chatterbox")
+# a submodule of the reference: mstar/model/chatterbox also answers to `chatterbox` once pytest
+# puts mstar/model on sys.path for the model-local tests
+pytest.importorskip("chatterbox.models")
 from safetensors.torch import load_file  # noqa: E402
 
 from mstar.model.chatterbox.components.s3gen import ReferenceConditioning, S3Gen  # noqa: E402

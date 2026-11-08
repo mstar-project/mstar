@@ -20,7 +20,7 @@ fi
 CUDA_VISIBLE_DEVICES=$DEVICES python mstar/api_server/entrypoint.py \
     --config configs/bagel_cfg_parallel.yaml \
     --cache-dir $BAGEL_CACHE_DIR \
-    --socket-path-prefix /tmp/mstar_$WHO/ \
+    --socket-path-prefix /tmp/mstar_${WHO}_${PORT}/ \
     --upload-dir /tmp/mstar_uploads_$WHO/ \
     --port $PORT \
     --tensor-comm-protocol $TENSOR_PROTOCOL \

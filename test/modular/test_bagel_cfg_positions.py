@@ -27,7 +27,7 @@ from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, S
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.manager import RopeManager
-from mstar.model.bagel.submodules import LLMSubmodule, active_labels
+from mstar.model.bagel.submodules import MIXED_TEXT, LLMSubmodule, active_labels
 from mstar.model.submodule_base import ARNodeInputs
 
 pytestmark = pytest.mark.skipif(
@@ -94,7 +94,7 @@ class _Harness:
     def denoise(self) -> dict[str, int]:
         """One Euler step, latents pinned at each branch's current position."""
         positions = self.positions()
-        self.run("image_gen", S_LATENT, pos_ids={
+        self.run("image_gen_guided3", S_LATENT, pos_ids={
             label: torch.zeros(
                 S_LATENT, dtype=torch.int32, device=self.device
             ) + start
@@ -189,7 +189,7 @@ def test_published_positions_travel_to_a_branch_on_another_node(harness):
 
     remote = _Harness(torch.device("cuda:0"))
     published = harness.rope.publish(RID)
-    remote.rope.admit_retrieve(RID, "LLM_cfg_text", "image_gen_cfg", published)
+    remote.rope.admit_retrieve(RID, "LLM_cfg_text", "image_gen_cfg2", published)
 
     assert remote.positions() == harness.positions()
 
@@ -200,12 +200,13 @@ def test_published_positions_travel_to_a_branch_on_another_node(harness):
 def _decode_capture_inputs(cfg_on: bool):
     """The template rows a decode capture hands declare_step and preprocess."""
     stub = types.SimpleNamespace(
+        config=types.SimpleNamespace(accelerator_graph=True),
         PREFILL_TEXT_TOKEN_BUCKETS=LLMSubmodule.PREFILL_TEXT_TOKEN_BUCKETS,
         PREFILL_TEXT_CAPTURE_BATCH_SIZES=(
             LLMSubmodule.PREFILL_TEXT_CAPTURE_BATCH_SIZES
         ),
     )
-    configs = LLMSubmodule.get_cuda_graph_configs(stub, torch.device("cuda"))
+    configs = LLMSubmodule.get_accelerator_graph_configs(stub, torch.device("cuda"))
     config = next(
         c for c in configs
         if getattr(c, "capture_graph_walk", None) == "decode"
@@ -224,6 +225,47 @@ def _llm_stub():
             object()
         ),
     )
+
+
+def _segments_by_label(step):
+    out: dict[str, set[str]] = {}
+    for segment in step.steps["kv"].segments:
+        out.setdefault(segment.label, set()).add(segment.request_id)
+    return out
+
+
+def test_a_mixed_step_forks_only_its_prompt_rows():
+    """cfg_text forks off main before a guided prompt writes; a decode row
+    sharing the step keeps its own cfg_text."""
+    submodule = _llm_stub()
+    guided = ARNodeInputs(
+        input_seq_len=4, graph_walk="prefill_text", resource_step_info={"cfg": True},
+    )
+    decoding = ARNodeInputs(
+        input_seq_len=1, graph_walk="decode", resource_step_info={"cfg": True},
+    )
+
+    step = LLMSubmodule.declare_step(
+        submodule, MIXED_TEXT, ["guided", "decoding"], [guided, decoding],
+    )
+
+    kv = step.steps["kv"]
+    assert kv.pre_forks == (("main", "cfg_text"),)
+    assert kv.fork_rids == {"guided"}
+
+
+def test_a_mixed_step_of_unguided_rows_declares_no_branch():
+    """The other direction: nothing to scope, so the step is plain."""
+    submodule = _llm_stub()
+    rows = [
+        ARNodeInputs(input_seq_len=4, graph_walk="prefill_text", resource_step_info=None),
+        ARNodeInputs(input_seq_len=1, graph_walk="decode", resource_step_info=None),
+    ]
+
+    step = LLMSubmodule.declare_step(submodule, MIXED_TEXT, ["a", "b"], rows)
+
+    assert set(_segments_by_label(step)) == {"main"}
+    assert step.cg_key_info is False
 
 
 @pytest.mark.parametrize("cfg_on", [False, True], ids=["cfg_off", "cfg_on"])
