@@ -1903,7 +1903,9 @@ Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
    B=1), and AITER's asm flash attention on MI300X/MI325X, where torch's SDPA is AOTriton's
    Triton kernel and well short of it. Both are graph-replayable. ``resources: dit_attn:
    backend: flashinfer|aiter`` in the YAML pins a kernel; ``flashinfer`` as the value of
-   this knob is the earlier spelling of ``auto`` and means the same.
+   this knob is the earlier spelling of ``auto`` and means the same. On AMD GPUs the shipped
+   klein and Z-Image configs serve ``auto`` through their :ref:`platform_overrides
+   <platform-overrides>` entries; everywhere else they keep ``sdpa``.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
