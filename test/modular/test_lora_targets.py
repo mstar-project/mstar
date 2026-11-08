@@ -368,8 +368,7 @@ def _old_embedding(self, input_):
 OLD = {
     "column": _old_column, "column_gather": _old_column, "merged": _old_column, "qkv": _old_column,
     "gdn_packs": _old_column, "lm_head": _old_column, "row": _old_row,
-    "fused_column": lambda self, x: F.linear(x, self.weight, self.bias),
-    "fused_column_whole": lambda self, x: F.linear(x, self.weight, self.bias), "embedding": _old_embedding,
+    "fused_column": lambda self, x: F.linear(x, self.weight, self.bias), "embedding": _old_embedding,
     "linear": nn.Linear.forward, "patch_conv": nn.Conv3d.forward,
 }
 
@@ -407,7 +406,8 @@ def _guards(module, x) -> list[str]:
     return [str(g) for g in torch._dynamo.explain(module)(x).out_guards]
 
 
-@pytest.mark.parametrize("name", sorted(CASES))
+# fused_column_whole is fused_column's module under another checkpoint layout, which this never reads
+@pytest.mark.parametrize("name", sorted(set(CASES) - {"fused_column_whole"}))
 def test_unbound_module_runs_the_pre_lora_forward(name):
     """Same aten ops and outputs (under TP its collectives too), dynamo graph, and no guard
     on LoRA: a deployment without a lora block traces as it did before."""
