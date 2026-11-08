@@ -46,8 +46,8 @@ jobs:
         env:
           VOLUMES: ${{ inputs.volumes || vars.ERAS_CACHE_VOLUMES }}
         run: |
-          [ -n "${VOLUMES// /}" ] || { echo "::error::Set ERAS_CACHE_VOLUMES, or name the volumes."; exit 1; }
-          echo "ids=$(jq -cn --arg v "$VOLUMES" '$v | split(" ") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+          [ -n "${VOLUMES//[[:space:]]/}" ] || { echo "::error::Set ERAS_CACHE_VOLUMES, or name the volumes."; exit 1; }
+          echo "ids=$(jq -cn --arg v "$VOLUMES" '[$v | splits("\\s+")] | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
 
   refresh:
     needs: volumes
