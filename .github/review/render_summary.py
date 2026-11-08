@@ -46,7 +46,14 @@ SCHEMA = {
         }},
         "since_last": {"type": "string"},
         "description_problems": STRINGS,
-        "questions": STRINGS,
+        "questions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "path:line it applies to, or empty for the whole PR"},
+                "text": {"type": "string"},
+            },
+            "required": ["location", "text"],
+        }},
         "checked": STRINGS,
         "skipped": {**STRINGS, "description": "files not reviewed: only with a small turn cap (a contributor run) "
                                               "and a diff too large for it; else empty"},
@@ -129,7 +136,7 @@ def judged(review, stacked):
 
 
 def open_findings(review, pages, stacked):
-    """(where, priority) of every open finding: the bot's inline threads, this run's findings outside
+    """(where, priority, what) of every open finding: the bot's inline threads, this run's findings outside
     the diff, and the earlier findings a later review judged still open. A thread someone resolved stays
     open: only a later review that judged it fixed, fixed above or moot, or a commit that outdated it,
     clears it. An untagged bot thread counts as a P2, since its priority is unknown and it should still
@@ -146,18 +153,20 @@ def open_findings(review, pages, stacked):
             if thread["isOutdated"] or ref in cleared or not (first["author"] and first["author"]["login"] in BOTS):
                 continue
             match = TAG.match(first["body"])
-            found.append((f"inline {ref}", match[1] if match else "P2"))
+            where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
+            found.append((where, match[1] if match else "P2",
+                          first["body"][match.end() if match else 0:].strip().split("\n")[0]))
             counted.add(ref)
-    found += [(f"outside the diff, {f['location']}", f["priority"]) for f in review["outside_diff"]
+    found += [(f"outside the diff, {f['location']}", f["priority"], f["claim"]) for f in review["outside_diff"]
               if not f.get("fixed_in")]
     # Judged still open, though its thread went outdated or it was outside the diff.
-    found += [(f"earlier {f['ref']}", f["priority"]) for f in prior
+    found += [(f"earlier {f['ref']}", f["priority"], f["why"]) for f in prior
               if f["status"] == "open" and f["ref"] not in counted]
     return found
 
 
 def status(review, pages, head, mode, stacked):
-    found = [p for _, p in open_findings(review, pages, stacked)]
+    found = [p for _, p, _ in open_findings(review, pages, stacked)]
     review = judged(review, stacked)
     counts = {p: found.count(p) for p in PRIORITIES}
     if counts["P0"] or counts["P1"]:
@@ -186,6 +195,36 @@ def latent(bug):
     return f"**[{bug['priority']}]** `{bug['location']}`: {bug['detail']} {issue}"
 
 
+def checklist(review, pages, stacked, extra=()):
+    """The "What's left for you" list: what a human must decide before approving, most important first,
+    one line each with its place: open P0/P1, then `extra` (what the live-test job's rule found), the
+    design decisions, questions, open P2s and skipped files. P3s and latent bugs aren't decisions. Past
+    ten lines the rest fold away, so a question or decision, whose only home this is, is never lost."""
+    found = open_findings(review, pages, stacked)
+    review = judged(review, stacked)
+
+    def where(item):
+        return f"`{item['location']}`" if item.get("location") else "(PR-wide)"
+
+    def findings(*priorities):
+        return [f"**[{p}]** `{w}`: {what}" for wanted in priorities for w, p, what in found if p == wanted]
+
+    items = [*findings("P0", "P1"), *extra,
+             *[f"{where(d)}: {d['why']}" for d in (review.get("risk") or {}).get("look_at", [])],
+             *[f"{where(q)}: {q['text']}" for q in review["questions"]],
+             *findings("P2"), *[f"Not reviewed: `{path}`" for path in review["skipped"]]]
+    title = "#### What's left for you"
+    if not items:
+        return f"{title}\nNothing left from the review."
+    # Model text and file names: kept to one line, and unable to open an HTML comment.
+    lines = [f"- [ ] {' '.join(str(item).split()).replace('<!--', '&lt;!--')}" for item in items]
+    text = "\n".join([title, *lines[:10]])
+    if lines[10:]:
+        rest = "\n".join(lines[10:])
+        text += f"\n\n<details><summary>and {len(lines) - 10} more</summary>\n\n{rest}\n\n</details>"
+    return f"{text}\n\nApprove if you're OK with these."
+
+
 def render(review, pages, head, mode, stacked, salvaged=False):
     """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above).
     `salvaged`: the review went past its turn limit, so the action failed it and no live test follows."""
@@ -207,9 +246,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
          + [f"**[{f['priority']}]** `{f['location']}`: {f['claim']} {above(f)}\n\n  {f['detail']}"
             for f in review["outside_diff"] if f.get("fixed_in")]),
         ("Description", review["description_problems"]),
-        ("Questions", review["questions"]),
         ("Design", review.get("design", [])),
-        ("Where to look", [f"`{p['location']}`: {p['why']}" for p in (review.get("risk") or {}).get("look_at", [])]),
         ("Latent bugs on main (not from this PR)", [latent(b) for b in review.get("latent", [])]),
     ]
     for title, items in sections:
@@ -226,13 +263,16 @@ def render(review, pages, head, mode, stacked, salvaged=False):
         after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
+    left = checklist(review, pages, stacked)
+    parts.append(f"{left} The live-test comment adds its own items." if mode == "full" and not salvaged else left)
     # Only full mode can lead to an approval, by gpu_review.py's rule.
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
     risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
-             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "live_test": live}
+             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": review.get("latent", []),
+             "live_test": live}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
     text = "\n\n".join(parts).replace("<!--", "&lt;!--")
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
@@ -243,11 +283,10 @@ def current_mode(mode):
     return RENAMED_MODES.get(mode, mode)
 
 
-def read_state(body, mode):
-    """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
-    None, and that run reviews the whole PR. None too when it doesn't decode, when the earlier review
-    skipped files, and for a nogpu or full review unless the earlier one was nogpu or full, since a
-    full review's result can approve and may build on a nogpu one."""
+def read_state(body):
+    """The state a summary comment carries (its last), for a re-review to start from; else None, and
+    that run reviews the whole PR. None too when it doesn't decode and when the earlier review skipped
+    files. Any mode can build on any other, since every mode runs every pass."""
     found = STATE.findall(body)
     try:
         state = json.loads(base64.b64decode(found[-1])) if found else None
@@ -256,7 +295,8 @@ def read_state(body, mode):
     if not isinstance(state, dict):
         return None
     state["mode"] = current_mode(state.get("mode"))
-    # A state from before `skipped` was kept counts as having skipped files.
-    if state.get("skipped", [None]) or mode in ("nogpu", "full") and state.get("mode") not in ("nogpu", "full"):
+    # A state without `latent` is from before light mode ran every pass, so it counts as a partial review;
+    # one without `skipped` is older still.
+    if state.get("skipped", [None]) or "latent" not in state:
         return None
     return state

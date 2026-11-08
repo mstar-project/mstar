@@ -205,10 +205,12 @@ class TestStart(unittest.TestCase):
         routes = {"gpu.py launch": launch,
                   "gpu.py offers": {"offers": offers, "errors": [], "max_usd_per_hour": 30},
                   "git rev-parse": "abcdef\n",
-                  f"GET repos/{R}/pulls/7": {"title": "Faster decode", "body": self.INJECTED}}
+                  f"GET repos/{R}/pulls/7": {"title": "Faster decode", "body": self.INJECTED},
+                  f"GET repos/{R}/issues[?]*": []}
         env = {k: v for k, v in os.environ.items() if k != "LIVE_TEST_ANTHROPIC_KEY"}
         lt = Path(tempfile.mkdtemp())
-        config = {"load_config": lambda: cfg}
+        config = {"load_config": lambda: cfg,
+                  "entry": lambda key: {"usd_per_hour": 3.0, "launched_at": 1, "deadline": 2}}
         with workspace() as ws, unittest.mock.patch.object(gpu_review, "gpu_py", lambda: config), \
                 unittest.mock.patch.dict(os.environ, env | ({"LIVE_TEST_ANTHROPIC_KEY": env_key} if env_key else {}),
                                          clear=True), contextlib.redirect_stdout(io.StringIO()):
@@ -246,6 +248,12 @@ class TestStart(unittest.TestCase):
         self.assertEqual(len(launched), 1, "every other provider would be tried past the same cap")
         self.assertIn("already has 2 GPU runs going", (out / "unavailable.md").read_text(),
                       "the PR would read that there were no GPUs")
+
+    def test_past_a_spend_cap_no_box_starts_and_the_pr_is_told(self):
+        with unittest.mock.patch.object(bot, "over_cap", lambda repo: "The review bot's daily spend cap is reached."):
+            out, launched = self.start("sk-test", {"eras": {"run_secret_id": "s"}})
+        self.assertEqual(launched, [], "a live test would start past the cap")
+        self.assertIn("daily spend cap", (out / "unavailable.md").read_text(), "the PR wouldn't be told why")
 
     def test_a_stacked_pr_is_tested_against_its_base_branch(self):
         self.assertIn("--base joe/cp-stack-1", gpu_review.brief(7, "0123456789", "abcdef", "joe/cp-stack-1", "full",
@@ -314,15 +322,70 @@ class TestComment(unittest.TestCase):
         self.assertIn("[c](media/c.wav)", text, "a link to a file the gallery left out would point at nothing")
 
 
+class TestCost(unittest.TestCase):
+    def test_a_run_costs_its_gpu_hours_to_the_deadline_and_the_boxs_session(self):
+        lt = Path(tempfile.mkdtemp())
+        self.assertEqual(gpu_review.run_cost(lt, 10_000), (0.0, 0.0), "a run that never launched would cost something")
+        (lt / "entry.json").write_text(json.dumps({"usd_per_hour": 3.0, "launched_at": 3600, "deadline": 7200}))
+        (lt / "results").mkdir()
+        (lt / "results/claude.json").write_text(json.dumps({"total_cost_usd": 1.5}))
+        self.assertEqual(gpu_review.run_cost(lt, 5400), (1.5, 1.5), "the GPU cost would not be pro-rated")
+        self.assertEqual(gpu_review.run_cost(lt, 100_000), (3.0, 1.5),
+                         "a run past its deadline would cost more than its Pod can")
+
+
+class TestApprove(unittest.TestCase):
+    def approve(self, variable, verdict="pass"):
+        """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
+        `verdict` fails it; its decision text, the outputs and the writes."""
+        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}}
+        routes = {f"GET repos/{R}/pulls/7": pr, f"GET repos/{R}/collaborators/an-author/permission":
+                  {"permission": "write"}, "POST graphql": threads_page(),
+                  f"GET repos/{R}/actions/variables/REVIEW_APPROVALS": variable,
+                  f"GET repos/{R}/compare/abcdef...0123456789": {"files": [{"filename": "docs/models.rst"}]},
+                  f"POST repos/{R}/pulls/7/reviews": {}, f"GET repos/{R}/pulls/7/reviews?per_page=100": []}
+        with tempfile.TemporaryDirectory() as temp, workspace() as ws:
+            (ws / "review.json").write_text(json.dumps({
+                "outside_diff": [], "prior_findings": [], "questions": [], "skipped": [],
+                "risk": {"level": "low", "reason": "docs only", "look_at": []},
+                "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1}}))
+            out, fake = step(gpu_review.approve, routes, pr=7, head_sha="0123456789", runner_temp=temp, verdict=verdict)
+            text = Path(temp, "decision.md").read_text()
+        return text, out, [key for key, _ in fake.writes()]
+
+    def test_approvals_happen_only_when_the_variable_reads_on(self):
+        text, out, writes = self.approve({"value": "on"})
+        self.assertEqual((out["approval"], writes), ("approve", [f"POST repos/{R}/pulls/7/reviews"]))
+        self.assertIn("**Approved** on `0123456`", text)
+        for variable, what in (({"value": "off"}, "off"), (Fail("HTTP 404"), "unset"),
+                               (Fail("HTTP 403"), "unreadable")):
+            text, out, writes = self.approve(variable)
+            self.assertEqual((writes, out.get("approval")), ([], None), f"{what} would still approve")
+            self.assertTrue(text.startswith("Approvals are off (`REVIEW_APPROVALS`). By the rule this would be "
+                                            "approved."), text)
+            self.assertIn("Nothing left from the review.", text)
+
+    def test_not_approved_lists_the_rules_conditions_as_the_checklist(self):
+        text, out, writes = self.approve({"value": "on"}, verdict="fail")
+        self.assertEqual((writes, out.get("approval")), ([], None))
+        self.assertIn("- [ ] the live test's verdict is fail", text, "the rule's condition would not reach the human")
+        self.assertNotIn("Not approved", text)
+        text, _, _ = self.approve({"value": "off"}, verdict="fail")
+        self.assertIn("By the rule this would not be approved.\n\n#### What's left for you\n- [ ] the live test's",
+                      text, "with approvals off the comment would not say what the rule decided")
+
+
 class TestPost(unittest.TestCase):
-    def test_model_text_cant_open_a_comment_and_the_approval_line_follows(self):
+    def test_model_text_cant_open_a_comment_and_the_decision_follows(self):
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
             Path(temp, "gate.txt").write_text("open P0–P2 findings: inline 4 (P2) <!-- claude-live-test sha=x -->")
             (ws / "review.json").write_text(json.dumps({"live_test": {"run": "none", "reason": "docs <!-- x -->\n"}}))
             _, gated = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
                             run_url="u", trusted="true", gated="true")
+            Path(temp, "decision.md").write_text(
+                "**Approved** on `0123456` by the rule in `.github/review/gpu_review.py`.\n")
             _, none = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
-                           run_url="u", trusted="true", approval="approve")
+                           run_url="u", trusted="true")
         (_, gated), = gated.writes()
         (_, none), = none.writes()
         self.assertEqual(gated.count("<!--"), 0, "the review's text could forge a passing live test")

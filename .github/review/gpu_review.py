@@ -281,6 +281,12 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
     (lt / "pr-body.md").write_text(f"# {pull['title']}\n\n{pull['body'] or ''}\n")
     (lt / "run.json").write_text(json.dumps({"repo": REPO, "pr": pr, "sha": head_sha, "main_sha": main_sha,
                                              "model": MODEL, "turns": turns, "claude": CLAUDE}))
+    stop = bot.over_cap(REPO)  # a review can take hours, so again right before the spend, as at preflight
+    if stop:
+        (lt / "unavailable.md").write_text(stop + "\n")
+        print(stop)
+        out["unavailable"] = "true"
+        sys.exit(3)
     cfg = gpu_py()["load_config"]()
     listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json").stdout)
     cap = listing["max_usd_per_hour"]
@@ -312,6 +318,8 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
         if r.returncode == 0:
             (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (lt / "offer.json").write_text(json.dumps(o))
+            # gpu.py drops its entry when it terminates the instance; this copy prices the run (run_cost).
+            (lt / "entry.json").write_text(json.dumps(gpu_py()["entry"](r.stdout.strip().splitlines()[-1])))
             print(f"launched on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
             return
         tried.append(f"{o['id']}: {(r.stderr or r.stdout).strip()[-200:]}")
@@ -378,9 +386,23 @@ def wait(out, runner_temp, start_timeout: int = 30):
     print(f"collected: {sorted(p.name for p in results.iterdir())}")
 
 
-def cleanup(out, pr: int, tag):
+def run_cost(lt, now):
+    """(GPU, box session) USD of this run: the hours from launch to now or the deadline, whichever came
+    first, at the offer's price (Slurm's is $0), and the box's own Claude Code total."""
+    gpu_usd = 0.0
+    if (lt / "entry.json").is_file():
+        e = json.loads((lt / "entry.json").read_text())
+        gpu_usd = max(0.0, e["usd_per_hour"] * (min(now, e["deadline"]) - e["launched_at"]) / 3600)
+    try:
+        box_usd = float(json.loads((lt / "results/claude.json").read_text()).get("total_cost_usd") or 0)
+    except (OSError, ValueError, AttributeError):
+        box_usd = 0.0
+    return gpu_usd, box_usd
+
+
+def cleanup(out, pr: int, tag, runner_temp):
     """Release whatever this run launched, and delete the ssh key it registered, from the ledger and by
-    name, for a run cancelled mid-launch."""
+    name, for a run cancelled mid-launch; then what the run's GPUs and box session cost, for the ledger."""
     print(gpu("list", check=False).stdout)
     state = gpu_py()
     for key in list(state["ledger"]()):
@@ -398,21 +420,18 @@ def cleanup(out, pr: int, tag):
             if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
         state["eras_delete_key"](name)
+    out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
 
 
 # ---------------------------------------------------------------- approval
 
 def review_threads(pr):
-    q = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
-      repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-        reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor }
-          nodes { isOutdated comments(first: 1) { nodes { databaseId author { login } body } } } } } } }"""
-    return bot.graphql(q, REPO, pr)
+    return bot.graphql(bot.THREADS, REPO, pr)
 
 
 def blocking(review, pages, stacked):
     """The open P0–P2 findings, by the summary's own rule (render_summary.open_findings)."""
-    return [f"{where} ({p})" for where, p in render_summary.open_findings(review, pages, stacked) if p != "P3"]
+    return [f"{where} ({p})" for where, p, _ in render_summary.open_findings(review, pages, stacked) if p != "P3"]
 
 
 def file_gate(files, repo_root):
@@ -444,8 +463,8 @@ def to_fix_first(review, pr, above):
 
 
 def reasons_not_to_approve(pr, sha, verdict, since, review):
-    """(why not, engine files): the rule's failed conditions, and the files that make an approval
-    one that doesn't count."""
+    """(why not, engine files, the conditions only this rule knows): the rule's failed conditions, the files
+    that make an approval one that doesn't count, and what the checklist has no field for, its `extra`."""
     pull = bot.api(f"repos/{REPO}/pulls/{pr}")
     why, engine = [], []
     if pull["head"]["sha"] != sha:
@@ -460,14 +479,7 @@ def reasons_not_to_approve(pr, sha, verdict, since, review):
     # ancestor, or there is none and the review didn't build on an earlier one or the PR changes no
     # runtime code). On runtime code it counts only after that passing live test (below).
     if not (verdict == "pass" or (verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none")):
-        why.append(f"the live test's verdict is {verdict}")
-    if (review.get("risk") or {}).get("level") != "low":
-        level = (review.get("risk") or {}).get("level", "unrated")
-        why.append(f"the review rated the design risk {level}: a maintainer owns the decisions its summary's "
-                   "\"Where to look\" lists")
-    if review.get("questions"):
-        why.append(f"{len(review['questions'])} open question(s)")
-    why += to_fix_first(review, pr, "stacked-above.json")
+        why.append(f"the live test's verdict is {verdict}" + ("; judge its 👂 rows" if verdict == "partial" else ""))
     files = pr_files(pull["base"]["sha"], sha)
     if files is None:
         why.append("the file list is too long to check")
@@ -478,18 +490,51 @@ def reasons_not_to_approve(pr, sha, verdict, since, review):
                        + (" and more" if len(blocked) > 8 else ""))
         if verdict == "skipped" and not since and runtime:
             why.append("no GPU run on runtime code")
-    return why, engine
+    extra = list(why)
+    if engine:
+        extra.append("touches area/engine or area/resources, so the bot's approval wouldn't count: "
+                     + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else ""))
+    if (review.get("risk") or {}).get("level") != "low":
+        level = (review.get("risk") or {}).get("level", "unrated")
+        why.append(f"the review rated the design risk {level}: a maintainer owns the decisions its summary's "
+                   "\"What's left for you\" lists")
+    if review.get("questions"):
+        why.append(f"{len(review['questions'])} open question(s)")
+    why += to_fix_first(review, pr, "stacked-above.json")
+    return why, engine, extra
+
+
+def approvals_on():
+    """The kill switch, the repository variable REVIEW_APPROVALS, read now rather than from the job's
+    start, so a live test that began hours ago still obeys it. Unset, any other value or a failed read
+    (the job's own token can't read variables) means off."""
+    try:
+        return bot.api(f"repos/{REPO}/actions/variables/REVIEW_APPROVALS").get("value") == "on"
+    except (RuntimeError, ValueError, AttributeError):
+        return False
+
+
+def left_for_you(pr, review, extra):
+    stacked = render_summary.stacked_above("stacked-above.json")
+    return render_summary.checklist(review, review_threads(pr), stacked, extra)
 
 
 def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
-    """Approve the PR when the rule holds (reasons_not_to_approve), as a comment that doesn't count toward
-    required reviews when it touches area/engine or area/resources; else the reasons, in
-    $RUNNER_TEMP/why.txt. The review finished cleanly: the live-test job runs only then."""
+    """Approve the PR when the rule holds (reasons_not_to_approve) and REVIEW_APPROVALS is on, as a comment
+    that doesn't count toward required reviews when it touches area/engine or area/resources. What the
+    live-test comment says of it goes in $RUNNER_TEMP/decision.md: the approval line, or the checklist of
+    what's left, which with approvals off also says what the rule would have done; then no GitHub review
+    is posted at all. The review finished cleanly: the live-test job runs only then."""
     review = json.loads(Path("review.json").read_text())
-    why, engine = reasons_not_to_approve(pr, head_sha, verdict, since, review)
+    why, engine, extra = reasons_not_to_approve(pr, head_sha, verdict, since, review)
+    decision = Path(runner_temp, "decision.md")
+    if not approvals_on():
+        decision.write_text(f"Approvals are off (`REVIEW_APPROVALS`). By the rule this would {'not ' if why else ''}be "
+                            f"approved.\n\n{left_for_you(pr, review, extra)}\n")
+        return
     if why:
         print("not approved: " + "; ".join(why))
-        Path(runner_temp, "why.txt").write_text("; ".join(why))
+        decision.write_text(left_for_you(pr, review, extra) + "\n")
         return
     tested = "the live test passed on it" if verdict == "pass" else "the review found nothing that needs a GPU run"
     if engine:  # a comment, not an approval, so it can't count toward required reviews
@@ -499,6 +544,8 @@ def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
                 + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else "") + ").")
         review_pr(pr, head_sha, "COMMENT", body)
         out["approval"] = "comment"
+        decision.write_text(f"**Would approve** `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`; "
+                            "doesn't count toward required reviews: touches area/engine or area/resources.\n")
         return
     review_pr(pr, head_sha, "APPROVE", f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open "
                                        f"P0–P2 finding, and {tested}. A push dismisses it.")
@@ -506,6 +553,7 @@ def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
     if bot.api(f"repos/{REPO}/pulls/{pr}")["head"]["sha"] != head_sha:
         dismiss_approvals(pr, "new commits arrived while approving")
     out["approval"] = "approve"
+    decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")
 
 
 def review_pr(pr, sha, event, body):
@@ -640,7 +688,7 @@ def redact(out, runner_temp, s1="", s2="", s3="", nodes=""):
             f.write_text(bot.redact(f.read_text(), exact=(s1, s2, s3, *hosts)))
 
 
-def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approval="", approve_outcome=""):
+def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_outcome=""):
     """Post the live test's outcome and the approval decision, from the redacted copies: why nothing ran,
     the report, the providers' answer when no GPUs were free, or the review's `none`. Model text (the
     gate's reasons, the review's reason) can't open an HTML comment, so it can't forge a marker."""
@@ -662,14 +710,9 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approval
         reason = (json.loads(Path("review.json").read_text()).get("live_test") or {}).get("reason")
         reason = bot.jq_text("" if reason is None else reason).replace("<!--", "&lt;!--").rstrip("\n")
         body = f"<!-- claude-live-test-none -->\nNo GPU run: {reason}\n"
-    if approval == "approve":
-        body += f"\n**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n"
-    elif approval == "comment":
-        body += (f"\n**Would approve** `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`; doesn't count "
-                 "toward required reviews: touches area/engine or area/resources.\n")
-    elif text(Path(runner_temp, "why.txt")):
-        why = text(Path(runner_temp, "why.txt")).rstrip("\n")
-        body += f"\nNot approved: {why}.\n"
+    decision = text(Path(runner_temp, "decision.md"))  # what approve decided: one approval line, or the checklist
+    if decision:
+        body += "\n" + decision
     elif approve_outcome == "failure":
         body += f"\nNot approved: the approval check failed. [Log]({run_url}).\n"
     bot.comment(REPO, pr, bot.redact(body))
