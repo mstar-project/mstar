@@ -489,8 +489,9 @@ what the change can affect, and says why:
   proved unchanged by reading the code. Give it with `none` too; it is ignored there.
 
 The bot holds one line of its own: when the PR's last live test didn't pass on an ancestor of the
-head (it failed, was partial or unavailable, or ran on a commit since rebased away), `targeted` and
-`none` run in full, with both kinds of check, so a failure is never hidden behind a narrower run.
+head (it failed, was partial or unavailable, or ran on a commit since rebased away), the live test
+runs in full, with both kinds of check, whatever the review asked for, so a failure is never hidden
+behind a narrower run.
 After a pass on an ancestor, a `targeted` run is told that commit and given its report. A `none`
 starts no box; the PR's comment says "No GPU run" with your reason, and it counts as a pass for
 approval.

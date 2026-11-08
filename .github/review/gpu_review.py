@@ -149,27 +149,26 @@ def last_live_test(pr):
 
 def cmd_carry(a):
     """What the live test runs, printed as the step's outputs: the review's call, read as its enums only
-    (model output on its way to a shell and the brief). `none` and `targeted` build on the last live
-    test, so they stand only when it passed on an ancestor of the head; otherwise the run is full, with
-    every kind of check."""
+    (model output on its way to a shell and the brief). It stands unless the PR's last live test didn't
+    pass on an ancestor of the head; then the run is full, with every kind of check, whatever the review
+    asked for, so a failure is never hidden behind a narrower run."""
     live = json.loads(Path(a.review).read_text()).get("live_test") or {}
     run = live.get("run") if live.get("run") in ("none", "targeted", "full") else "full"
     asked = live.get("checks") if isinstance(live.get("checks"), list) else []
     out = {"run": run, "checks": ",".join([k for k in CHECKS if k in asked] or CHECKS)}
-    if run != "full":
-        last = last_live_test(a.pr)
-        passed = bool(last) and last["verdict"] == "pass" and gh(
-            "api", f"repos/{REPO}/compare/{last['sha']}...{a.sha}", "--jq", ".status",
-            check=False).stdout.strip() in ("ahead", "identical")
-        if last and not passed:
-            print(f"::notice::The review asked for a {run} live test, but the last one didn't pass on an ancestor; "
-                  "running it in full.")
-            out.update(run="full", checks=",".join(CHECKS))
-        elif run == "none":
-            out["verdict"] = "skipped"
-        elif passed:
-            out["since"] = last["sha"]
-            Path(a.earlier_report).write_text(last["body"])
+    last = last_live_test(a.pr)
+    passed = bool(last) and last["verdict"] == "pass" and gh(
+        "api", f"repos/{REPO}/compare/{last['sha']}...{a.sha}", "--jq", ".status",
+        check=False).stdout.strip() in ("ahead", "identical")
+    if last and not passed:
+        print(f"::notice::The review asked for a {run} live test, but the last one didn't pass on an ancestor; "
+              "running it in full, every kind of check.")
+        out.update(run="full", checks=",".join(CHECKS))
+    elif run == "none":
+        out["verdict"] = "skipped"
+    elif run == "targeted" and passed:
+        out["since"] = last["sha"]
+        Path(a.earlier_report).write_text(last["body"])
     print("\n".join(f"{k}={v}" for k, v in out.items()))
 
 

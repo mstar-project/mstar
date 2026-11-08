@@ -98,6 +98,8 @@ class TestCarry(unittest.TestCase):
         ("pass on an ancestor, full", "full", ["correctness"], [live_test("pass")], "ahead",
          {"run": "full", "checks": "correctness"}),
         ("fail", "targeted", ["correctness"], [live_test("fail")], "ahead", {"run": "full", "checks": BOTH}),
+        ("fail, full with fewer checks", "full", ["correctness"], [live_test("fail")], "ahead",
+         {"run": "full", "checks": BOTH}),
         ("partial", "none", ["correctness"], [live_test("partial")], "ahead", {"run": "full", "checks": BOTH}),
         ("unavailable", "targeted", ["performance"], [live_test("unavailable")], "ahead",
          {"run": "full", "checks": BOTH}),
