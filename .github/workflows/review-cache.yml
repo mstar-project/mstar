@@ -81,6 +81,10 @@ jobs:
           HOURS: ${{ inputs.hours }}
         run: |
           set -o pipefail  # a failed launch fails the step, rather than tail's exit 0 hiding it
+          # --allow-over-budget below lifts the hours cap: a dispatcher's typo must not rent a box for days.
+          { [[ "$GPUS" =~ ^[0-9]+$ ]] && [ "$GPUS" -ge 1 ] && [ "$GPUS" -le 8 ] && [[ "$HOURS" =~ ^[0-9]+$ ]] \
+            && [ "$HOURS" -ge 1 ] && [ "$HOURS" -le 11 ]; } \
+            || { echo "::error::gpus must be 1 to 8, and hours a whole number from 1 to 11 (the wait below allows 700 min)."; exit 1; }
           [ -n "$ERAS_API_KEY" ] || { echo "::error::Set ERAS_API_KEY."; exit 1; }
           echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
           export LIVE_PR_STATE=$RUNNER_TEMP/live-pr
