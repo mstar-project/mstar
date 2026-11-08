@@ -199,6 +199,9 @@ class ArrayHandle(StepHandle):
         if self._kept and self._kept != self.array.layers:
             raise self._refusal(f"layers {sorted(self.array.layers - self._kept)} have no add in a step that keeps "
                                 "adds on others, and every layer stays the same length")
+        if self._held is not None and self._kv is not None:
+            raise self._refusal(f"the step ends with layer {self._held_layer}'s add unread, on a kernel that takes k "
+                                "and v at the read, so no page holds it")
         if self._grows and not self._kept:
             raise self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages "
                                 "would keep entries no add wrote; list those rows at span 0")
@@ -298,6 +301,9 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"an add on layer {layer} after its kept add")
         if not self.array.max_len:
             return
+        if self._held is not None and self._held_layer != layer:
+            raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s add waits for its read, on "
+                                "a kernel that takes k and v at the read")
         if keep and not self._keep:
             raise self._refusal(f"keep=True on layer {layer} in a step with keep=False, whose commit keeps no add")
         (self._kept if self._keep and keep is not False else self._scratch).add(layer)
