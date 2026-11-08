@@ -24,7 +24,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from mstar.kernels import Impl, KernelOp, register
+from mstar.kernels import Choice, Impl, KernelOp, register
 from mstar.kernels.registry import on_reset, row_bounds
 from mstar.platforms import current_platform
 from mstar.utils.fp8_block import FP8_DTYPE
@@ -650,13 +650,16 @@ def _builtin(device: torch.device, n: int, k: int, glu: bool, m: int) -> str:
 def _choose(device: torch.device, n: int, k: int, glu: bool, m: int, block_size=(128, 128)):
     """``(implementation, config)`` for ``m`` tokens: the table's row where it names one that runs
     on ``device`` (a w8a16 row without a config takes the built-in tile), else the built-in rule.
-    The table is keyed by 128 x 128 scale blocks; any other block runs w8a16."""
+    DeepGEMM is optional, so a deepgemm row takes flashinfer's GEMM (the same activation quantize) where
+    DeepGEMM doesn't run. The table is keyed by 128 x 128 scale blocks; any other block runs w8a16."""
     if tuple(block_size) != (128, 128):
         return ("dequant" if _BLACKWELL.get(device) and m > _DEQUANT_MIN_TOKENS else "w8a16"), None
     rows = _table_rows(device, n, k, glu) if device.type == "cuda" else None
     if rows is not None:
         bounds, choices = rows
         choice = choices[bisect.bisect_left(bounds, m)]
+        if choice.impl == "deepgemm" and not _DG_OK.get(device):
+            choice = Choice("flashinfer")
         if (choice.impl in ("w8a16", "dequant", "triton8") or (choice.impl == "flashinfer" and _FI_OK.get(device))
                 or (choice.impl == "cublas" and _W8A8_OK.get(device))
                 or (choice.impl == "deepgemm" and _DG_OK.get(device))):
