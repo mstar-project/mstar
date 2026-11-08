@@ -193,9 +193,9 @@ def test_a_rebuild_whose_request_the_scheduler_wouldnt_run_waits(why):
     if why == "held":
         sched.admission.held_until[R] = math.inf
     elif why == "failed":
-        sched.failed_rids.add(R)
+        sched.lifecycle.failed_rids.add(R)
     else:
-        sched.pending_removes[R] = None
+        sched.lifecycle.pending_removes[R] = -1
 
     assert sched.next_batch() is None, "a torn-down or held request would prefill again"
     assert sched.rebuilds.rebuilding(R, NODE), "the rebuild left the log before anything decided its request"
@@ -203,8 +203,8 @@ def test_a_rebuild_whose_request_the_scheduler_wouldnt_run_waits(why):
 
 def test_a_rebuild_left_out_of_a_full_step_stays_in_the_log():
     sched, _, state, _ = _scheduler({"p0": PREFILL}, max_bs=1)
-    sched.note_arrival("p0")
-    sched.note_arrival(R)
+    sched.lifecycle.add("p0", "p0")
+    sched.lifecycle.add(R, R)
     _rebuilding(sched)
 
     assert _rids(sched.next_batch()) == ["p0"]
@@ -218,8 +218,8 @@ def test_a_rebuild_left_out_of_a_full_step_stays_in_the_log():
 def test_a_prompt_popped_beside_a_rebuild_row_routes_its_walks_outputs(step):
     parked = step == "parked_behind_it"
     sched, _, state, _ = _scheduler({R: DECODE, "p0": PREFILL}, max_bs=1 if parked else 8)
-    sched.note_arrival(R)
-    sched.note_arrival("p0")
+    sched.lifecycle.add(R, R)
+    sched.lifecycle.add("p0", "p0")
     _rebuilding(sched)
 
     if step == "a_chains":
