@@ -384,8 +384,9 @@ class Rebuilds:
 
     def flush(self) -> None:
         """Start the queued copies to the host, oldest first, up to what the step's allowance has left, once the
-        step's outputs are sent. A copy that runs past the allowance is split there, and the rest waits for the next
-        step's. The device tensor a queued copy reads stays held until its copy starts."""
+        step's outputs are sent or on a pass of the worker's loop that runs no step (`flush_idle`). A copy that runs
+        past the allowance is split there, and the rest waits for the next allowance. The device tensor a queued copy
+        reads stays held until its copy starts."""
         while self._queued:
             queued = self._queued[0]
             nbytes = self._allowance.spend(queued.src.numel())

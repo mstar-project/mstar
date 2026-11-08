@@ -140,7 +140,8 @@ _WRITE_BYTES_PER_STEP = 32 << 20
 class StepAllowance:
     """What a step may still queue for the host once its outputs are sent, shared by every copy to the host on the
     device: the worker's host copies for rebuilds first, then each pool's cached pages. The engine refills it once
-    the pools have taken theirs."""
+    the pools have taken theirs, and the worker refills it for its host copies on a pass of its loop that runs no
+    step, once its last copy has landed."""
 
     def __init__(self, nbytes: int = _WRITE_BYTES_PER_STEP) -> None:
         self._per_step = nbytes
