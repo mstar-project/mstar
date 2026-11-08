@@ -135,7 +135,7 @@ class SeqRange(NamedTuple):
     # B of a [B, S, ...] layout split along S (axis 1); None for a packed label (axis 0)
     rows: int | None
     # the step is a warm-up or capture, whose exchanges every replay repeats
-    captured: bool = False
+    captured: bool
 
     @property
     def start(self) -> int:

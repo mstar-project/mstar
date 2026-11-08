@@ -253,10 +253,15 @@ def _rows(label, span, n=2):
 
 
 @pytest.mark.parametrize("capture", [False, True], ids=["replayed", "capture"])
-def test_a_range_is_captured_only_when_the_runner_captures_its_step(capture):
-    shard = _shard()
-    _split(shard, [("r0", "main", 10)], capture=capture)
-    assert shard.split_range("main").captured == capture
+@pytest.mark.parametrize("shard, segments, combined, label", [
+    ({}, [("r0", "main", 10)], None, "main"),
+    (dict(labels=("video",), axis=1), _rows("video", 5), None, "video"),
+    (dict(labels=("cond", "text")), [("r0", "cond", 5), ("r0", "text", 5)], {("cond", "text"): "cfg"}, "cfg"),
+], ids=["packed", "rows", "combined"])
+def test_a_range_is_captured_only_when_the_runner_captures_its_step(shard, segments, combined, label, capture):
+    shard = _shard(**shard)
+    _split(shard, segments, combined=combined, capture=capture)
+    assert shard.split_range(label).captured == capture
 
 
 @pytest.mark.parametrize("shard, step, ranges", [
