@@ -557,8 +557,9 @@ def cmd_launch(args, cfg):
 ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Notebook (NVIDIA GPU): sshd as root
 
 
-def eras_ssh_key_id(pubkey: str) -> str:
-    """The organization's id for this public key, registering it once."""
+def eras_ssh_key_id(pubkey: str, name: str) -> str:
+    """The organization's id for this public key. A key it doesn't know yet is registered under the
+    instance's name, and terminate deletes it with the instance."""
     import base64
     import hashlib
     blob = base64.b64decode(pubkey.split()[1])
@@ -566,7 +567,7 @@ def eras_ssh_key_id(pubkey: str) -> str:
     for k in eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []:
         if k.get("fingerprint") == fingerprint:
             return k["id"]
-    return eras("POST", "/ssh-keys", {"name": "live-pr-test", "public_key": pubkey})["id"]
+    return eras("POST", "/ssh-keys", {"name": name, "public_key": pubkey})["id"]
 
 
 def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float,
@@ -605,7 +606,7 @@ def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float,
     return {
         "listing_id": o["id"].split(":", 1)[1], "name": name, "idempotency_key": name,
         "run": {"pod": pod, "endpoints": {"ssh": tpl["endpoints"]["ssh"]}, "config_maps": config_maps,
-                "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [eras_ssh_key_id(pubkey)]},
+                "bindings": {"secrets": {"authorized-keys": {"ssh_key_ids": [eras_ssh_key_id(pubkey, name)]},
                                          **({"live-pr-key": {"secret_id": er["run_secret_id"]}}
                                             if run and er.get("run_secret_id") else {})},
                              "volumes": {"workspace": "emptyDir"}},
@@ -739,6 +740,9 @@ def terminate(key: str, e: dict) -> None:
             slurm_cancel(load_config(), e["instance_id"], e.get("dir"))
         elif e["provider"] == "eras":
             eras("POST", f"/instances/{e['instance_id']}/release", {})
+            for k in eras("GET", "/ssh-keys", params={"page_size": 100}).get("items") or []:
+                if k.get("name") == e["name"]:
+                    eras("DELETE", f"/ssh-keys/{k['id']}")
         elif e["provider"] == "runpod":
             runpod("DELETE", f"/pods/{e['instance_id']}")
         else:

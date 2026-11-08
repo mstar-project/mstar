@@ -142,5 +142,21 @@ class TestEras(unittest.TestCase):
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
 
 
+    def test_terminate_deletes_the_ssh_key_the_launch_registered(self):
+        calls, state = [], Path(tempfile.mkdtemp())
+
+        def eras(method, path, body=None, params=None):
+            calls.append((method, path))
+            return {"items": [{"id": "k1", "name": "live-pr-7-1-1"}, {"id": "k2", "name": "someone's laptop"}]}
+
+        globs = GPU["terminate"].__globals__
+        saved = {k: globs[k] for k in ("eras", "STATE", "LEDGER")}
+        self.addCleanup(globs.update, saved)
+        globs.update(eras=eras, STATE=state, LEDGER=state / "instances.json")
+        GPU["terminate"]("eras:i-1", {"provider": "eras", "instance_id": "i-1", "name": "live-pr-7-1-1",
+                                      "launched_at": 0, "usd_per_hour": 1.0})
+        self.assertEqual([c for c in calls if c[0] == "DELETE"], [("DELETE", "/ssh-keys/k1")])
+
+
 if __name__ == "__main__":
     unittest.main()
