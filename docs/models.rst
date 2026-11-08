@@ -508,7 +508,9 @@ deployment's own ladder (distinct positive token counts, checked when the
 worker loads): ``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048
 and 2176 for a mixed step, since the LLM's 2048-token step budget
 (``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
-reached. Each bucket adds captures and startup time.
+reached. On AMD GPUs the shipped configs run with no budget (*Chunked prefill
+budgets* in docs/serving.rst), and prefill past 512 tokens runs eagerly there
+anyway. Each bucket adds captures and startup time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay

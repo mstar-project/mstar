@@ -1,5 +1,5 @@
 """A serving YAML's ``platform_overrides``: what each platform serves, and the
-Qwen3-Omni, FLUX.2 klein and Z-Image configs that rely on them."""
+Qwen3-Omni, FLUX.2 klein, Z-Image and Qwen3.5 configs that rely on them."""
 
 from pathlib import Path
 
@@ -145,3 +145,34 @@ def test_z_image_serves_sdpa_on_cuda_and_the_ragged_resource_on_rocm(monkeypatch
     assert {k: v for k, v in resolved.items() if k != "model_kwargs"} == {
         k: v for k, v in expected.items() if k != "model_kwargs"
     }
+
+
+QWEN3_5_NO_STEP_BUDGET_ON_ROCM = [
+    "qwen3_5_0.8b.yaml",
+    "qwen3_5_0.8b_bf16state.yaml",
+    "qwen3_5_27b_tp4.yaml",
+    "qwen3_5_2b.yaml",
+    "qwen3_5_2b_bf16state.yaml",
+    "qwen3_5_4b.yaml",
+    "qwen3_5_9b.yaml",
+    "qwen3_5_9b_bf16state.yaml",
+    "qwen3_5_9b_dp2.yaml",
+    "qwen3_5_9b_tp2.yaml",
+]
+
+
+@pytest.mark.parametrize("name", QWEN3_5_NO_STEP_BUDGET_ON_ROCM)
+def test_qwen3_5_keeps_the_step_budget_on_cuda_and_drops_it_on_rocm(monkeypatch, name):
+    """On AMD GPUs the override turns the LLM's chunked prefill budget off, so prompts run
+    whole in pure prefill steps; CUDA serves the file as written, with the model's default."""
+    shipped = _shipped(name)
+    expected = {k: v for k, v in shipped.items() if k != OVERRIDES_KEY}
+    assert "max_batch_tokens" not in expected
+    monkeypatch.setattr(serving_config, "_built_for", CudaPlatform)
+    assert load_serving_config(str(CONFIGS / name)) == expected
+
+    monkeypatch.setattr(serving_config, "_built_for", RocmPlatform)
+    resolved = load_serving_config(str(CONFIGS / name))
+    assert resolved["max_batch_tokens"] == {"LLM": None}
+    # the rest of the file as written, plus the rest of the ROCm entry (eager yield where the config has it)
+    assert resolved == {**expected, **shipped[OVERRIDES_KEY]["rocm"]}

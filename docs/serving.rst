@@ -511,6 +511,19 @@ that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or t
 budget if that is smaller. When less than that is left of a step's budget, the prompt waits
 for the next step rather than running the step over its budget.
 
+On AMD GPUs the shipped Qwen3.5 configs turn the LLM's budget off (``max_batch_tokens:
+{LLM: null}`` under ``platform_overrides.rocm``; CUDA reads the same files with the
+default). AITER's chunked GDN prefill is captured only to 512 tokens, so there every
+prefill or mixed step past that runs eagerly at a near-flat cost (about 25 ms on MI325X
+for Qwen3.5 0.8B, whatever its length), and the budget turns one eager step per burst of
+whole prompts into one per prompt or two. With no budget prompts run whole, up to the
+prefill capture's row cap a step, and decode takes its rows afterwards. MI325X, 1k-token
+prompts, c=64, output tok/s with the budget and without: 0.8B 4.1k and 8.4k, 2B 3.8k and
+5.8k, 9B TP2 1.56k and 1.80k; chat prompts within 2 %.
+What it costs there is time to first token under load (9B TP2 at c=64: p50 280 ms with
+the budget, 970 without, p95 level) and chunked prefill itself: a long prompt runs whole
+in one step and decode waits for it.
+
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
 BAGEL's, ``thinker_mixed`` for Qwen3-Omni's Thinker. Such a step runs under the combined
