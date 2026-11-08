@@ -456,7 +456,10 @@ class _Deployment:
     def __init__(self, paths, fail_on: str | None = None):
         self.roots = AdapterPrefixRoots()
         self.served = ServedModels(base=("base",), lora=True)
-        self.admin = LoraAdmin(make_spec({}, runtime_updates=True), self.served, self.roots, self._to_conductor)
+        # a lost ack fails the load in 5 s, not the default 300
+        self.admin = LoraAdmin(
+            make_spec({}, runtime_updates=True), self.served, self.roots, self._to_conductor, timeout_s=5.0,
+        )
         self.ops = LoraAdapterOps(make_spec({}, runtime_updates=True), ["worker_0", "worker_1"], self._from_conductor)
         self.pools, self.workers, self.unload_seen = {}, {}, []
         for rank in range(2):
@@ -558,8 +561,9 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
     d.ops.load(LoadLoraAdapter(op_id="op2", lora_name="a1", lora_path=paths["a1"]))
     _finish_when_read(d.workers["worker_0"])
     gate.set()
-    while d.workers["worker_1"].ingest.lora_loads:
+    for _ in range(3):  # the first load, then the retry queued behind its rollback
         _finish_when_read(d.workers["worker_1"])
+    assert not d.workers["worker_1"].ingest.lora_loads
     assert answers[-1] == LoraAdapterResult(op_id="op2", status=200, served=True)
     assert all(pool.serves("a1") for pool in d.pools.values())
 
