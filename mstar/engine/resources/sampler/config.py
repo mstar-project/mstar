@@ -198,6 +198,16 @@ class SamplingReqConfig(ResourceReqConfig):
             raise ValueError(
                 "this model does not support repetition_penalty; send 1 or leave it unset"
             )
+        # the node's capabilities for the generation-aware knobs, as its ingest checks them
+        # (`SamplerResource._generation_controls_problem`), refused here, before dispatch
+        if (self.repetition_window or 0) > spec.max_repetition_window:
+            raise ValueError(
+                f"this model takes repetition_window up to {spec.max_repetition_window}; got {self.repetition_window}"
+            )
+        if (self.min_tokens or 0) > 0 and not spec.min_tokens_stop_ids:
+            raise ValueError("this model does not support min_tokens; send 0 or leave it unset")
+        if (self.top_p_first or (self.top_p_min_keep or 1) > 1) and not spec.enable_top_p_first:
+            raise ValueError("this model does not support top_p_first or top_p_min_keep; leave them unset")
 
 
 def derive_seed(seed: int, stream: str) -> int:
