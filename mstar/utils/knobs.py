@@ -224,7 +224,13 @@ def uclamp_min() -> int:
     of a worker and of the API server ask for whenever they run, of 1024
     (``threads.hold_clock_from_knob``). A ``schedutil`` governor otherwise keeps
     threads that take turns near its lowest clock."""
-    return _uclamp_min_value(_setting("uclamp_min", "0"))
+    try:
+        return _uclamp_min_value(_setting("uclamp_min", "0"))
+    except ValueError:
+        # `configure` checked the config's value, so a bad one here is the variable's
+        raise ValueError(
+            f"MSTAR_UCLAMP_MIN must be 0 to 1024, got {os.environ.get('MSTAR_UCLAMP_MIN')!r}",
+        ) from None
 
 
 def pre_plan_enabled() -> bool:

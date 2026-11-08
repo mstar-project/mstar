@@ -32,6 +32,8 @@ CUDA_HOME=... PYTHONPATH=$WT .claude/skills/benchmarking/scripts/server.sh start
 .claude/skills/benchmarking/scripts/server.sh stop main
 ```
 
+`server.sh start ... --uclamp-min N -- <command>` runs the command under a uclamp clock floor of N of 1024, inherited by everything it starts. Use it to give a competitor the floor M*'s `knobs: uclamp_min` gives M* (see "Match the configuration before comparing").
+
 `server.sh mps-start <gpu>` / `mps-stop <gpu>` run a per-user MPS daemon for one GPU. Several worker processes on one GPU (M*'s per-node workers, vllm-omni's stages) otherwise time-slice it instead of overlapping kernels; measure with and without, and give the competitor the same. MPS clients see the daemon's GPU as device 0, so a client launched with `CUDA_VISIBLE_DEVICES=<physical index>` finds no GPU.
 
 The rest of this section is what the script does for you, and why.
@@ -165,6 +167,7 @@ Comparing against vLLM or SGLang has its own ways to go wrong.
 - **Sampling.** `benchmark.runner` sends no sampling parameters unless the model's `get_model_kwargs` adds them. In one Qwen3.5 comparison mstar sampled at its default temperature through top-k/top-p kernels while SGLang took a plain argmax, about 50 µs a step at 9B TP2 that had nothing to do with the engines.
 - **Recurrent-state dtype.** vLLM and SGLang honour a checkpoint's fp32 `mamba_ssm_dtype` (SGLang only when passed `--mamba-ssm-dtype float32`); fp32 state costs a few percent.
 - **Prefix caching.** Check both whether it is on and whether it hits: SGLang's radix cache was on for short prompts and hit 0%.
+- **CPU clock floor.** The Whisper large-v3-turbo, Qwen3-ASR and Qwen3.5 0.8B configs set `knobs: uclamp_min: 1024`, which asks the kernel to run M*'s worker and API server threads at full clock; on a `schedutil` host that alone moved host-bound throughput by up to 2x. The other engine must run under the same floor: start it with `server.sh start <name> <port> --uclamp-min 1024 -- <command>` (the floor is inherited by everything it starts; the wrapper exits rather than start without it), or run M* with `MSTAR_UCLAMP_MIN=0`. Report which. Check the M* log for `uclamp_min 1024 applied` from both the API server and the worker.
 
 **Use worker phases, not nsys, to decide CPU- vs GPU-bound.** nsys inflates host time. Under nsys a 9B TP2 decode step showed ~430 µs of GPU idle per step, which read as host-bound; `worker_phases` without nsys, on both ranks, showed the GPU busy for the whole step. nsys is the tool for *what* the GPU runs, not for whether it is waiting.
 

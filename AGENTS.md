@@ -143,6 +143,8 @@ Don't assert a speedup without a number. Which tool depends on *where* you think
 
 Getting a trustworthy number out of these is its own skill: concurrency sweeps, warmup, which metrics survive run-to-run variance, and why a cross-process A/B can move without any code change. See [.claude/skills/benchmarking/SKILL.md](.claude/skills/benchmarking/SKILL.md) before running one.
 
+**Against another engine, run both under the same CPU clock policy.** Configs that set `knobs: uclamp_min` give M*'s worker and API server threads a clock floor, which can move host-bound throughput by up to 2x on a `schedutil` host. Give the other engine the same floor (`server.sh start --uclamp-min 1024`, in the benchmarking skill), or run M* with `MSTAR_UCLAMP_MIN=0`, and say which alongside the numbers. A comparison where only one side has the floor measures the floor, not the engines.
+
 A PR that changes a hot path, e.g., scheduling, attention planning, capture buckets, transport, should say which harness was run and on what hardware, or say why measurement doesn't apply. Benchmarking should be done on many representative models instead of optimizing for a single model only. Micro-optimizations without a measurement are not improvements.
 
 Two things about what the number is for. **Don't optimize against one benchmark.** Being better than or on par with the competition across a comprehensive set is the goal; a win on a single configuration usually means it was tuned for. And **check the workloads you didn't measure**: an optimization that helps `image_to_text` at the expense of `text_to_text` or a mixed workload is a regression, and it is the cross-workload analogue of invariant 5. Say which workloads you checked, not just which one improved.

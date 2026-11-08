@@ -8,7 +8,7 @@
 #   - multiprocessing workers orphaned after a hard kill.
 #
 # usage:
-#   server.sh start <name> <port> [--health PATH] [--timeout SEC] [--log FILE] -- <command ...>
+#   server.sh start <name> <port> [--health PATH] [--timeout SEC] [--log FILE] [--uclamp-min N] -- <command ...>
 #   server.sh stop <name>
 #   server.sh status
 #   server.sh mps-start <gpu>     # per-user MPS daemon for one physical GPU
@@ -20,12 +20,16 @@
 # is the command or one of its descendants, and `stop` signals both, escalates to the
 # group, then reaps every descendant and anything left in the session.
 #
+# --uclamp-min N runs the command under uclamp_exec.py, so it and everything it starts ask for
+# a clock floor of N of 1024: give a competitor the floor M*'s `knobs: uclamp_min` gives M*.
+#
 # Environment for the command is inherited: e.g.
 #   CUDA_HOME=... PYTHONPATH=$WT server.sh start main 8100 -- mstar serve qwen3 --gpus 0
 # State: ${SERVER_STATE_DIR:-/tmp/servers_$USER}/<name>.{pid,port,log,cmd}
 set -uo pipefail
 
 STATE=${SERVER_STATE_DIR:-/tmp/servers_$USER}
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 mkdir -p "$STATE"
 
 die() { echo "server.sh: $*" >&2; exit 1; }
@@ -54,17 +58,20 @@ gpu_memory() {
 
 cmd_start() {
   local name=$1 port=$2; shift 2
-  local health=/health timeout=900 log="$STATE/$name.log"
+  local health=/health timeout=900 log="$STATE/$name.log" uclamp=""
   while [ $# -gt 0 ] && [ "$1" != "--" ]; do
     case $1 in
       --health) health=$2; shift 2;;
       --timeout) timeout=$2; shift 2;;
       --log) log=$2; shift 2;;
+      --uclamp-min) uclamp=$2; shift 2;;
       *) die "unknown option $1";;
     esac
   done
   [ "${1:-}" = "--" ] || die "missing -- before the command"; shift
   [ $# -gt 0 ] || die "no command"
+  # it execs the command, so the recorded PID is still the server's
+  [ -z "$uclamp" ] || set -- python3 "$HERE/uclamp_exec.py" "$uclamp" -- "$@"
   if [ -f "$STATE/$name.pid" ] && kill -0 "$(cat "$STATE/$name.pid")" 2>/dev/null; then
     die "'$name' is already running (pid $(cat "$STATE/$name.pid")); stop it first"
   fi

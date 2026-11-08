@@ -513,7 +513,12 @@ Worker scheduling
        process warns and carries on; a cgroup's ``cpu.uclamp.max`` can cap it
        without the process seeing. It does nothing under a governor that
        doesn't read utilization. The shipped configs for Whisper large-v3-turbo,
-       Qwen3-ASR and Qwen3.5 0.8B set 1024. Read by ``knobs.uclamp_min``.
+       Qwen3-ASR and Qwen3.5 0.8B set 1024. A benchmark against another engine
+       runs both under the same floor, since it can move host-bound throughput by up to
+       2x: start the other engine with the benchmarking skill's
+       ``server.sh start --uclamp-min 1024``, or turn M*'s off with
+       ``MSTAR_UCLAMP_MIN=0``, and say which with the numbers. Read by
+       ``knobs.uclamp_min``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``auto``
      - Pin each worker's main, GPU and plan threads, and the API server's
