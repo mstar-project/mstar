@@ -326,13 +326,13 @@ For example, an older and a newer request hold 5 pages each of a 10-page pool, a
 
 ## 6. TP followers
 
-Rank 0 journals a decision only when it reads state a follower lacks. It decides every reservation and its undo, the room a short grant counted, a request that waits for its shortage, a flip to guaranteed at admission, each earmark, drop and return, and records it in the `OffloadDelta` ([ipc_format.py](../../mstar/utils/ipc_format.py)) it sends with the next `ScheduleTPNode` of any of the worker's lockstep nodes, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts. Every rank works out the rest from those counts: the host room a reservation sets aside, as a follower replays the reservation, and the host room and the flip to guaranteed inside a step's admit. At TP the host holds no cached pages, since `prefix_cache_tp` refuses a host pool, so its room moves only with moves every rank makes in rank 0's order and is the same on every rank at each of those points.
+Rank 0 journals a decision only when it reads state a follower lacks. It decides every reservation and its undo, the room a short grant counted, a request that waits for its shortage, a flip to guaranteed at admission, each earmark, drop and return, and a request that keeps no ids, and records it in the `OffloadDelta` ([ipc_format.py](../../mstar/utils/ipc_format.py)) it sends with the next `ScheduleTPNode` of any of the worker's lockstep nodes, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts. Every rank works out the rest from those counts: the host room a reservation sets aside, as a follower replays the reservation, and the host room and the flip to guaranteed inside a step's admit. At TP the host holds no cached pages, since `prefix_cache_tp` refuses a host pool, so its room moves only with moves every rank makes in rank 0's order and is the same on every rank at each of those points.
 
 ```python
 @dataclass
 class OffloadDelta:
     rids: list[str]
-    kinds: list[MoveKind]   # offload, reload, reserve, unreserve, earmark, drop, land, guarantee, allot or wait
+    kinds: list[MoveKind]   # offload, reload, reserve, unreserve, earmark, drop, land, guarantee, allot, wait or forget
     ...                     # the page counts and victims the kinds carry
 ```
 
