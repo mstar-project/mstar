@@ -506,8 +506,9 @@ def cmd_launch(args, cfg):
                                 shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
                                else ["-o /dev/null", "--wrap 'sleep infinity'"])])
         elif o["provider"] == "eras":
-            volume = eras_cache_volume(cfg, args.cache, args.cache_volume)
-            body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input, volume, args.cache == "rw")
+            volumes = eras_cache_volumes(cfg, args.cache, args.cache_volume)
+            body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input, volumes[0] if volumes else None,
+                                    args.cache == "rw")
         elif o["provider"] == "runpod":
             rp = cfg["runpod"]
             vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
@@ -542,15 +543,20 @@ def cmd_launch(args, cfg):
                                        capture_output=True, timeout=300)
                 iid = slurm_run(cfg, body).strip().split(";")[0]
             elif o["provider"] == "eras":
-                try:
+                for held, nxt in zip(volumes, [*volumes[1:], None], strict=True):
+                    try:
+                        iid = eras_create(body)
+                        break
+                    except ApiError as err:  # another box took the cache volume since: the next free one, then cold
+                        if not volume_refused(err):
+                            raise
+                        if args.cache == "rw":  # a refresh without its volume would write nothing that lasts
+                            die(f"cache volume {held} is held: {err}")
+                        print(f"gpu.py: cache volume {held} is held ({str(err)[:200]}); launching "
+                              f"{f'with {nxt}' if nxt else 'cold'}", file=sys.stderr)
+                        body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input, nxt)
+                else:
                     iid = eras_create(body)
-                except ApiError as err:  # another box took the cache volume since: a live test starts cold
-                    if not volume or not volume_refused(err):
-                        raise
-                    if args.cache == "rw":  # a refresh without its volume would write nothing that lasts
-                        die(f"cache volume {volume} is held: {err}")
-                    print(f"gpu.py: cache volume {volume} is held ({str(err)[:200]}); launching cold", file=sys.stderr)
-                    iid = eras_create(eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input))
             elif o["provider"] == "runpod":
                 iid = runpod("POST", "/pods", body)["id"]
             else:
@@ -613,7 +619,7 @@ def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float, r
     it, and a run that ends releases the instance, so the box goes even if nothing that
     launched it is left to. With `run`, the script is the Pod's work and its inputs are a
     ConfigMap at /run/live-pr; the instance stays 15 minutes after it exits, for copying back.
-    A cache volume (weights, compile caches; see eras_cache_volume) mounts at /cache, read-only
+    A cache volume (weights, compile caches; see eras_cache_volumes) mounts at /cache, read-only
     unless `rw`."""
     er = cfg.get("eras", {})
     tpl = eras("GET", f"/templates/{er.get('template_id', ERAS_GPU_NOTEBOOK)}")
@@ -657,47 +663,47 @@ def eras_launch_body(cfg: dict, o: dict, name: str, pubkey: str, hours: float, r
     }
 
 
-def eras_cache_volume(cfg: dict, cache: str, named: str | None) -> str | None:
-    """The cache volume a launch binds. An instance binds one volume, so eras.cache_volume_ids are
-    replicas, one per box: "ro" takes the first one no box holds, or none (the box starts cold);
-    "rw" takes only `named`, and dies if a box holds it."""
+def eras_cache_volumes(cfg: dict, cache: str, named: str | None) -> list[str]:
+    """The cache volumes a launch tries to bind, in order. An instance binds one volume, so
+    eras.cache_volume_ids are replicas, one per box: "ro" tries those no box holds, then none (the
+    box starts cold); "rw" takes only `named`, and dies if a box holds it."""
     if cache == "none":
-        return None
+        return []
     if cache == "rw" and not named:
         die("--cache rw needs --cache-volume ID: the volume to write")
+    free = []
     for vid in [named] if named else cfg.get("eras", {}).get("cache_volume_ids") or []:
         att = eras("GET", f"/volumes/{vid}").get("attachment") or {}
         if not att.get("instance_id") or att.get("detached_at"):
-            return vid
-        if cache == "rw":
+            free.append(vid)
+        elif cache == "rw":
             die(f"cache volume {vid} is held by instance {att['instance_id']}; wait for it to end")
-    if named or cfg.get("eras", {}).get("cache_volume_ids"):
+    if not free and (named or cfg.get("eras", {}).get("cache_volume_ids")):
         print("gpu.py: every cache volume is held by another box; launching cold", file=sys.stderr)
-    return None
+    return free
 
 
 # The error codes of a launch refused over a volume another instance holds.
-VOLUME_HELD = ("volume_bound", "volume_binding_conflict", "volume_binding_deleting", "resource_in_use")
+VOLUME_HELD = ("volume_bound", "volume_deleting", "volume_binding_conflict", "volume_binding_deleting",
+               "resource_in_use")
 
 
 def volume_refused(err: ApiError) -> bool:
-    """Whether Eras refused a launch over a volume binding, by its error codes (the error's own, or a
-    preview's problems), never by its wording."""
-    body = err.body if isinstance(err.body, dict) else {}
-    items = [body, body.get("error") or {}, *(body.get("problems") or []), *(body.get("errors") or [])]
-    codes = {i.get("code") for i in items if isinstance(i, dict)}
-    paths = " ".join(str(i.get("path") or i.get("field") or "") for i in items if isinstance(i, dict))
-    return bool(codes & set(VOLUME_HELD)) or ("validation_failed" in codes and "binding" in paths)
+    """Whether Eras refused a launch over a volume binding, by its error code, never by its wording."""
+    return err.code() in VOLUME_HELD
 
 
 def eras_create(body: dict) -> str:
     """Preview, accept the quoted prices, create; the instance id."""
     preview = eras("POST", "/instances/preview", body)
-    problems = ((preview.get("run") or {}).get("problems") or []) + (preview.get("problems") or [])
-    if problems:  # a cache volume another box holds shows up here
+    problems = (preview.get("run") or {}).get("problems") or []
+    if problems:
         raise ApiError(409, {"code": problems[0].get("code"), "problems": problems})
     if not preview.get("is_available"):
-        raise ApiError(409, f"capacity: {preview.get('unavailable_detail') or preview.get('unavailable_reason')}")
+        reason, detail = preview.get("unavailable_reason"), preview.get("unavailable_detail")
+        if reason in VOLUME_HELD:  # another box binds the cache volume (or it is being deleted)
+            raise ApiError(409, {"code": reason, "message": detail})
+        raise ApiError(409, f"capacity: {detail or reason}")
     for w in preview.get("warnings") or []:
         print(f"gpu.py: eras preview: {w.get('message')}", file=sys.stderr)
     body = dict(body, accepted_prices={i["usage_type"]: i["unit_price"] for i in preview["quote"]["line_items"]},
