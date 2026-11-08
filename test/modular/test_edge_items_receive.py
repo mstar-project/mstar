@@ -13,9 +13,9 @@ from mstar.communication.edge_items import EdgeItemsBuilder, row_input_signals, 
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import WorkerMessage, WorkerMessageType
-from mstar.worker.worker import Worker
 
 EDGE, NODE = "new_token", "snac_decoder"
 HANDLES = {"r1": 1, "r2": 2, "draining": 3}
@@ -41,14 +41,13 @@ def _frame():
 
 
 def _worker(join_dim=None):
-    w = Worker.__new__(Worker)
+    w = make_worker(
+        _reads_done_sent={"draining"},
+        worker_id="w1",
+        _draining_rids={"draining"},
+        _removed_rids=RecentSet(16),
+    )
     # drained past READS_DONE: it takes no input (`_takes_input`)
-    w._reads_done_sent = {"draining"}
-    w.worker_id = "w1"
-    w.enable_nvtx = False
-    w._walk_driven_edges = {}  # no producer-driven walk transitions here
-    w._draining_rids = {"draining"}
-    w._removed_rids = RecentSet(16)
     w._removed_rids.add("removed")
     w._unprocessed_messages = {}
     w._rid = HANDLES.get

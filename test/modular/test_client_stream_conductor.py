@@ -43,6 +43,7 @@ from mstar.streaming.topology import (  # noqa: E402
     find_client_streams,
 )
 from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ClientStreamRoute,
     ConductorMessage,
@@ -311,7 +312,7 @@ def _stub_worker(sbuf):
     """What ``Worker._process_new_inputs`` touches for a streaming-only signal."""
     reads = []
     req_info = SimpleNamespace(stream_buffers={"audio_in": sbuf})
-    stub = Worker.__new__(Worker)
+    stub = make_worker()
     vars(stub).update(
         _reads_done_sent=set(), worker_id="worker_0", enable_nvtx=False, _walk_driven_edges={},
         _rid=lambda rid: 7 if rid == "r" else None,

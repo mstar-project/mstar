@@ -31,9 +31,9 @@ from mstar.graph.runtime.base import PhasedPostprocess  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.engine_manager import _refuse_speculated_spans, _refuse_unroutable_withholds  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.rebuild import Rebuilds  # noqa: E402
 from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
 
 NODE, WALK = "vocoder", "synth"
@@ -155,26 +155,22 @@ def _worker(engine: Engine) -> tuple[Worker, dict]:
         stored.update({rid: outputs.get(rid) for rid in rids}, signals=signals)
         raise _ReachedStoreError
 
-    worker = Worker.__new__(Worker)
-    worker._phase_period = 0
-    worker.enable_nvtx = False
-    worker.enable_prof = False
-    worker.device = torch.device("cpu")
-    worker._graph_runtime = _Runtime(
+    worker = make_worker(
+        device=torch.device("cpu"),
+        _graph_runtime=_Runtime(
         cleanup_consumed_inputs=lambda node, rids, wgs: ([], []),
         clear_pending_loop_stops=lambda: None,
         stop_loops_batched=lambda **kwargs: [],
         supports_inline_emit=False,
-    )
-    worker.tensor_manager = SimpleNamespace(
+    ),
+        tensor_manager=SimpleNamespace(
         cleanup_collectable=lambda *args: None,
         store_and_return_tensor_info_batch=store,
+    ),
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        request_state=SimpleNamespace(buffer_publish_info=lambda *args: None),
+        scheduler=SimpleNamespace(failed_rids=set()),
     )
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    worker._innermost_loop_by_node, worker._rebuilds = {}, Rebuilds({}, {})
-    worker._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    worker.request_state = SimpleNamespace(buffer_publish_info=lambda *args: None)
-    worker.scheduler = SimpleNamespace(failed_rids=set())
     return worker, stored
 
 
@@ -367,8 +363,7 @@ def test_startup_refuses_a_withheld_output_the_worker_cannot_leave_unrouted():
 def test_gpu_thread_stages_spans_to_the_host_behind_the_step():
     from mstar.utils.device import DeviceCapability
 
-    worker = Worker.__new__(Worker)
-    worker.device = torch.device("cuda", torch.cuda.current_device())
+    worker = make_worker(device=torch.device("cuda", torch.cuda.current_device()))
     worker.device_capability = DeviceCapability(worker.device)
     worker._host_rows_slot = 0
     worker._pinned_d2h_buffers = __import__("collections").defaultdict(list)

@@ -41,9 +41,9 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.rebuild import Rebuilds
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Speculation, Worker
 
@@ -185,14 +185,12 @@ def _check_rank(rank, layout, failed_here, store, out):
             timeout=datetime.timedelta(seconds=acc.RENDEZVOUS_S),
         )
         tp, sp = _groups(rank, layout)
-        w = Worker.__new__(Worker)
-        w._walk_drivers = {}
-        w._walk_driven_edges = {}
-        w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
-        w._rebuilds = Rebuilds({}, {})
-        w.scheduler = SimpleNamespace(read_failed_rids=set(failed_here))
-        w.parallel_groups = SimpleNamespace(
+        w = make_worker(
+            streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
+            scheduler=SimpleNamespace(read_failed_rids=set(failed_here)),
+            parallel_groups=SimpleNamespace(
             get_joint_group_for_node=lambda node: JointGroups(tp_group=tp, sp_group=sp),
+        ),
         )
         # a follower that could not read a row left it out; the others hold it
         rows = [r for r in ROWS if r not in failed_here]
@@ -333,14 +331,13 @@ def test_a_read_that_fails_after_its_request_failed_still_goes_to_the_check(tmp_
     sched, manager = _follower_scheduler(ready=["r0"])
     sched.fail_rids({"r1"})
     tm, _ = _shm_manager(tmp_path)
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), tm, [])  # no streams
-    w._rebuilds = Rebuilds({}, {})
-    w.scheduler, w.request_state, w.tensor_manager = sched, manager, tm
-    w.wakeup_event = SimpleNamespace(drain=lambda: None)
-    w.enable_nvtx = False
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
+        scheduler=sched,
+        request_state=manager,
+        tensor_manager=tm,
+        wakeup_event=SimpleNamespace(drain=lambda: None),
+    )
     reported = []
     w._fail_requests = reported.append
     tm.pending.append(_read("r1", _input(17, "text_inputs"), _failed_future()))
@@ -404,12 +401,7 @@ def _spec_follower(read_failed, continuing, fresh, head_rids):
     sched, manager = _follower_scheduler(
         ready=[r for r in fresh if r not in read_failed], read_failed=read_failed,
     )
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w._rebuilds = Rebuilds({}, {})
-    w.scheduler, w.request_state, w.enable_nvtx = sched, manager, False
-    w._in_flight_rids = set()
+    w = make_worker(scheduler=sched, request_state=manager)
     w.preps, w.assembled = [], []
 
     def prep(prep_input):
@@ -555,15 +547,11 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None):
     an edge carries from ``source`` to ``dest``."""
     consumed = consumed or {}
     tm, _ = _shm_manager(tmp_path)
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), tm, [])  # no streams
-    w._rebuilds = Rebuilds({}, {})
-    w.worker_id = "w0"
-    w.parallel_nodes, w.parallel_leader_nodes = set(nodes), set(nodes)
-    w.is_tp_follower, w.enable_nvtx = False, False
-    w._tp_broadcast_seq = 0
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), tm, []),
+        parallel_nodes=set(nodes),
+        parallel_leader_nodes=set(nodes),
+    )
     w.sent = []
     w.communicator = SimpleNamespace(
         send=lambda dest, msg=None: w.sent.append((dest, decode(encode(msg)))),
