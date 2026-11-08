@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY, Qwen3_5Adapter
-from mstar.api_server.openai.protocol import SpeechRequest, VideoGenerationRequest
+from mstar.api_server.openai.protocol import ImageGenerationRequest, SpeechRequest, VideoGenerationRequest
 from mstar.integrations.dynamo.bridges import (
     TENSOR_SPECS,
     RealtimeBridge,
@@ -62,6 +62,8 @@ def test_image_body_flattens_nvext_and_rejects_url():
         "nvext": {"seed": 3, "guidance_scale": 5.0},
     })
     assert body["seed"] == 3 and body["guidance_scale"] == 5.0 and body["size"] == "512x512"
+    # a null response_format is the default, not a str the request model refuses
+    ImageGenerationRequest.model_validate(_image_body({"prompt": "x", "response_format": None}))
     with pytest.raises(ValueError, match="b64_json"):
         _image_body({"prompt": "x", "response_format": "url"})
 
@@ -521,29 +523,36 @@ def _chat_through_bridge(server, fields, adapter=ADAPTER_REGISTRY["qwen3_omni"])
     return asyncio.run(run())
 
 
-@pytest.mark.parametrize("fields", [
-    {"tools": [{"type": "function", "function": {"name": "get_weather"}}]},
-    {"tool_choice": "required"},
-    {"tool_choice": {"type": "function", "function": {"name": "get_weather"}}},
-], ids=["tools", "required", "named"])
-def test_a_chat_that_asks_for_a_tool_call_is_a_400_with_the_adapters_message(tmp_path, fields):
-    """Stripped before the adapter, the fields left a chat that ran and answered in plain text.
+TOOLS_REFUSED = "tool calling is not supported for this model"
+
+
+@pytest.mark.parametrize(("fields", "message"), [
+    ({"tools": [{"type": "function", "function": {"name": "get_weather"}}]}, TOOLS_REFUSED),
+    ({"tool_choice": "required"}, TOOLS_REFUSED),
+    ({"tool_choice": {"type": "function", "function": {"name": "get_weather"}}}, TOOLS_REFUSED),
+    ({"presence_penalty": 0.5}, "presence_penalty is not supported"),
+    ({"response_format": {"type": "json_object"}},
+     "response_format needs constrained decoding; only {'type': 'text'} is served"),
+], ids=["tools", "required", "named", "penalty", "json"])
+def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_message(tmp_path, fields, message):
+    """Stripped before the adapter, the fields left a chat that ran and ignored them.
 
     Dynamo's worker sends the client the ``code`` and ``message`` it finds on the exception.
     """
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
     with pytest.raises(ValueError) as refused:
         _chat_through_bridge(server, fields)
-    assert (refused.value.code, refused.value.message) == (400, "tool calling is not supported for this model"), (
+    assert (refused.value.code, refused.value.message) == (400, message), (
         "the client gets a 400 without the adapter's own message"
     )
-    assert not server.submitted, "the chat reached the model, which answers in plain text"
+    assert not server.submitted, "the chat reached the model, which ignores the field"
 
 
-def test_the_tool_fields_clients_send_by_default_reach_the_model(tmp_path):
+def test_the_chat_fields_clients_send_by_default_reach_the_model(tmp_path):
     server = _FakeRealtimeServer([_chunk("text", b"hi")], tmp_path)
-    _chat_through_bridge(server, {"tools": [], "tool_choice": "auto"})
-    assert server.submitted, "a client's default tool fields refused a plain chat"
+    _chat_through_bridge(server, {"tools": [], "tool_choice": "auto", "presence_penalty": 0, "logprobs": False,
+                                  "response_format": None})
+    assert server.submitted, "a client's default chat fields refused a plain chat"
 
 
 def test_a_chat_s_template_kwargs_reach_the_model(tmp_path):

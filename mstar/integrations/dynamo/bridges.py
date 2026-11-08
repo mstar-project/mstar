@@ -75,12 +75,11 @@ _STRIP_KEYS = {
     "guided_decoding",
     "nvext", "extra_args", "annotations", "trace", "disaggregated_params",
     "backend_instance_id",
-    # OpenAI-standard, no M* mapping today
-    "min_tokens", "eos_token_ids",
-    "stream_options", "frequency_penalty", "presence_penalty", "logit_bias",
-    # not tools or tool_choice: the adapter refuses a chat that asks for a tool call
-    "logprobs", "top_logprobs", "parallel_tool_calls",
-    "response_format", "user", "store", "metadata", "service_tier",
+    # OpenAI-standard, no M* mapping today. Not tools, tool_choice, the
+    # penalties, logit_bias, logprobs, top_logprobs or response_format: the chat
+    # adapter refuses a chat that sets one of them on.
+    "min_tokens", "eos_token_ids", "stream_options", "parallel_tool_calls",
+    "user", "store", "metadata", "service_tier",
 }
 
 # Image-request fields that ride nvext (mirrors Dynamo's NvCreateImageRequest);
@@ -112,6 +111,7 @@ def _image_body(request: dict) -> dict:
     """NvCreateImageRequest -> body for the native image request model."""
     _inline_result(request.get("response_format"))  # n is served, as on the native route
     body = _clean(request)
+    body.pop("response_format", None)  # checked above; null would fail the request model
     for key in _IMAGE_NVEXT_KEYS:
         value = (request.get("nvext") or {}).get(key)
         if value is not None:
@@ -125,6 +125,7 @@ def _video_body(request: dict) -> dict:
     if request.get("output_format") not in (None, "mp4"):
         raise ValueError(f"unsupported output_format {request['output_format']!r}; only 'mp4'")
     body = _clean(request)
+    body.pop("response_format", None)  # checked above; null would fail the request model
     for key in _VIDEO_NVEXT_KEYS:
         value = (request.get("nvext") or {}).get(key)
         if value is not None:
@@ -146,8 +147,7 @@ def _speech_body(request: dict) -> dict:
     """NvCreateAudioSpeechRequest -> body for the native speech request model."""
     if request.get("data_source") == "url":
         raise ValueError("data_source 'url' needs a media store; use 'b64_json'")
-    # For speech, response_format is the audio codec (wav/mp3/...), not the
-    # chat-style field _clean strips — reattach it after cleaning.
+    # For speech, response_format is the audio codec (wav/mp3/...); null is the default.
     fmt = (request.get("response_format") or "wav").lower()
     body = _clean(request)
     body.pop("data_source", None)
