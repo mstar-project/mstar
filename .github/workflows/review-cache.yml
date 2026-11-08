@@ -52,6 +52,8 @@ jobs:
 
   refresh:
     needs: volumes
+    # Holds ERAS_API_KEY, which a refresh spends: the environment's branch rule keeps it from branch workflows.
+    environment: review-bot
     runs-on: ubuntu-latest
     timeout-minutes: 720
     permissions:
