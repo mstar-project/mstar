@@ -203,7 +203,8 @@ def render(review, pages, head, mode, stacked):
     live = review.get("live_test")
     if live and mode == "gpu":
         checks = f" ({', '.join(live.get('checks') or [])})" if live["run"] != "none" and live.get("checks") else ""
-        parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}")
+        after = " Results follow in a separate comment." if live["run"] != "none" else ""
+        parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
     # Only gpu mode can lead to an approval, by gpu_review.py's rule.
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "gpu"
             else "Advisory: this review doesn't approve or block.")
