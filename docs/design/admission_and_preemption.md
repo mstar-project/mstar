@@ -51,7 +51,7 @@ Each pool decides the class from two facts. The conductor marks a request that s
 | 4 | No rebuild policy on the node that writes its KV | moves only to the host there, or guaranteed | the model declares no way to rebuild the node's KV, as when its decode reads embeddings |
 | 5 | Only `ids` spans | preemptible | its token ids reproduce all of its KV |
 
-R5 keeps a host copy of the encoder's output for the rebuild of a row 3 request. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Without a copy, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker, so such a request stays guaranteed.
+R5 keeps a host copy of the encoder's output for the rebuild of a row 3 request. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Without a copy, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker, so such a request stays guaranteed. On the VLM scaffold (Qwen3.5, Muse Glimmer) a media prompt prefills as one row, laid out as one `rows` span whose `text_inputs` carry the pads the encoder's output fills, so its rebuild policy names only `prefill_text` and such a prompt is row 2.
 
 On initial tests, I measured that keeping row 3 guaranteed costs about 9% of TTFT under pressure. On a 48-page pool at c16, Qwen3.5 image requests' TTFT p50 fell from 3.48 s to 3.18 s once R5a made them preemptible.
 
@@ -117,7 +117,7 @@ Why this shape:
 
 ## 3. Preemption
 
-Preemption starts when a grant past a reservation fails, in `Worker._handle_allocation_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Worker._preempt`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, or makes the request wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
+Preemption starts when a grant past a reservation fails, in `Worker._handle_admit_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Preemption.preempt` ([preemption.py](../../mstar/worker/preemption.py)) before `Admission.relieve`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, or makes the request wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
 Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler's in-graph rows and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
 

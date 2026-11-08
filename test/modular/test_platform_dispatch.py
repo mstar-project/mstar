@@ -18,6 +18,7 @@ from mstar.engine.engine import Engine
 from mstar.platforms import CpuPlatform, CudaPlatform, Platform, RocmPlatform, XpuPlatform
 from mstar.platforms.compile import with_inductor_overrides
 from mstar.platforms.dispatch import PlatformDispatch
+from mstar.testing_utils.engine import make_mgmt
 
 
 @pytest.fixture
@@ -267,7 +268,7 @@ def test_compiled_submodule_forwards_take_overrides_for_any_token_count(
     platform = on_platform(_EverythingOnAten() if overrides else CudaPlatform())
     engine = Engine(graph_runtime=None, device_capability=SimpleNamespace(is_available=True))
     engine._submodules = {
-        "node": SimpleNamespace(submodule=_Submodule(), forward=None, forward_batched=None),
+        "node": make_mgmt(submodule=_Submodule(), forward=None, forward_batched=None),
     }
     engine._item_encoders = set()
     engine._compile_submodules()

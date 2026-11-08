@@ -35,6 +35,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
 
 PS = 16
@@ -70,8 +71,7 @@ class _ScriptDoneError(Exception):
     pass
 
 
-class _Model(Model):
-
+class _Model(StubModel):
     def __init__(self, layout=LAYOUT, max_seq_len=4096):
         self._layout, self._max_seq_len = layout, max_seq_len
 
@@ -121,18 +121,9 @@ class _Model(Model):
     def get_partition_forward_pass_args(self, *args, **kwargs):
         raise AssertionError("the request never leaves its first walk")
 
-    def max_input_files(self):
-        return {}
-
     def process_prompt(self, *args, **kwargs):
         tensors = {"text_inputs": [torch.arange(PROMPT)]}
         return tensors if self._layout is None else ProcessPromptOutput(tensors, {"kv_layout": self._layout})
-
-    def postprocess(self, *args, **kwargs):
-        return b""
-
-    def get_submodule(self, *args, **kwargs):
-        return None
 
 
 def _preprocess(model: _Model, model_kwargs: dict, **config) -> dict:

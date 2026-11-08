@@ -44,6 +44,7 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
+from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
@@ -60,6 +61,7 @@ from mstar.model.base import (
     serving_resources,
 )
 from mstar.model.media_limits import (
+    RAW_INPUT_CHARGES,
     RequestMediaBudget,
     charge_decoded_audio,
     check_audio_duration,
@@ -211,7 +213,7 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     YAML has been applied."""
     specs = serving_resources(model, model_config)
     groups = [
-        (group["ranks"], int(group.get("tp_size", 1)) * int(group.get("sp_size", 1)), group["node_names"])
+        (group["ranks"], math.prod(node_group_axis_sizes(group).values()), group["node_names"])
         for group in model_config.get("node_groups") or []
     ]
     opened = frozenset().union(*prefix_caches_by_rank(specs, groups, names_checkpoint(model)).values())
@@ -321,12 +323,12 @@ class PreprocessWorker:
         # directly once a request is done (no cross-thread queue / race).
         # Sends never block the thread (OutboxCommunicator): the conductor and
         # the workers block on sends to it, so it has to keep reading.
-        self.communicator = OutboxCommunicator(make_communicator(
+        self.communicator = make_communicator(
             my_id="api_server_preprocess_worker",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
             nonblocking_send=True,
-        ))  # only used to send (from the worker thread)
+        )  # only used to send (from the worker thread)
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
             my_entity_id="api_server_preprocess_worker",
@@ -840,16 +842,31 @@ class PreprocessWorkerThread:
 
     def _load_media(
         self, file_paths: dict[str, list[str]] | None,
+        raw_inputs: dict[str, list[torch.Tensor]] | None = None,
     ) -> tuple[NameToTensorList, dict[str, list[dict]]]:
         """Raw modality tensors and their metadata, keyed ``{modality}_inputs``.
-        The files are held to one media budget together."""
+        The files, and ``raw_inputs`` (which stand in for their modality's
+        files), are held to one media budget together."""
         tensors: NameToTensorList = {}
         input_metadata = {}
-        if not file_paths:
+        if not file_paths and not raw_inputs:
             return tensors, input_metadata
-        counts = {modality: len(paths) for modality, paths in file_paths.items()}
+        counts = {modality: len(paths) for modality, paths in (file_paths or {}).items()}
+        for modality, items in (raw_inputs or {}).items():
+            counts[modality] = len(items)
         check_file_counts(counts, self.model.max_input_files())
         budget = RequestMediaBudget(sum(counts.values()))
+        for modality, items in (raw_inputs or {}).items():
+            key = f"{modality}_inputs"
+            charge, load = RAW_INPUT_CHARGES[modality], getattr(self.model, f"load_decoded_{modality}")
+            tensors[key], input_metadata[key] = [], []
+            for item in items:
+                with budget.file():
+                    charge(item)
+                    out = load(item, self.device)
+                tensors[key].append(out.data)
+                input_metadata[key].append(out.metadata)
+        file_paths = file_paths or {}
         for modality, paths in file_paths.items():
             key = f"{modality}_inputs"
             tensors[key] = []
@@ -894,7 +911,10 @@ class PreprocessWorkerThread:
             # is hashed, its KV would be keyed by bytes we never decoded.
             for modality, paths in input.file_paths.items():
                 file_states[modality] = [_file_state(path) for path in paths]
-        tensors, input_metadata = self._load_media(input.file_paths)
+        if input.raw_inputs and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
+            # a prefix key hashes each input's file, and these have none
+            raise ValueError("this deployment keys prompts by their media files; send the media as files")
+        tensors, input_metadata = self._load_media(input.file_paths, input.raw_inputs)
 
 
         # Then, tokenize the prompt and let the model augment/transform the
@@ -1016,6 +1036,8 @@ class PreprocessWorkerThread:
                     found.append(os.stat(path).st_size)
                 except (OSError, ValueError):
                     pass  # gone or not a valid path: its load fails, and the failure is counted
+        for modality, items in (input.raw_inputs or {}).items():
+            sizes[modality] = [item.nbytes for item in items]
         return DataWorkerProfile(
             request_id=input.request_id,
             dequeue_time=dequeue_time,
@@ -1382,6 +1404,12 @@ class PreprocessWorkerThread:
                 modality=modality,
                 count=len(paths),
                 total_bytes=total_bytes,
+            ))
+        for modality, items in (input.raw_inputs or {}).items():
+            infos.append(InputInfo(
+                modality=modality,
+                count=len(items),
+                total_bytes=sum(item.nbytes for item in items),
             ))
         return infos
 

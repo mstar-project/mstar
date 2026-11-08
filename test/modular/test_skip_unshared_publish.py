@@ -8,7 +8,7 @@ import pytest
 from test_resource_runner import _Stub
 
 from mstar.engine.resources import StepRunner
-from mstar.worker.worker import Worker
+from mstar.testing_utils.worker import make_worker
 
 
 def _runner():
@@ -84,11 +84,11 @@ class _Engine:
 
 
 def _worker(worker_id, wg_nodes, publisher_nodes):
-    worker = Worker.__new__(Worker)
-    worker.worker_id = worker_id
-    worker._all_wg_nodes = wg_nodes
     engine = _Engine(publisher_nodes)
-    worker.engine_manager = type("EM", (), {"engine": engine})()
+    worker = make_worker(
+        worker_id=worker_id, _all_wg_nodes=wg_nodes,
+        engine_manager=type("EM", (), {"engine": engine})(),
+    )
     return worker, engine
 
 
@@ -110,7 +110,7 @@ TP = ["worker_0", "worker_1"]
 ])
 def test_a_request_skips_what_only_its_own_instance_declares(worker_id, wg_to_workers, skipped):
     worker, engine = _worker(worker_id, WG_NODES, PUBLISHERS)
-    worker._skip_unshared_publish(7, wg_to_workers)
+    worker.ingest._skip_unshared_publish(7, wg_to_workers)
     assert engine.skipped == {7: skipped}
 
 
@@ -136,5 +136,5 @@ CFG_WORKERS = {0: ["worker_0"], 1: ["worker_1"], 2: ["worker_2"]}
 def test_a_resource_another_worker_declares_under_another_name_is_published():
     worker, engine = _worker("worker_0", CFG_WG_NODES, CFG_PUBLISHERS)
     worker._never_publish_unshared({wg: [w] for wg, w in CFG_WORKERS.items()})
-    worker._skip_unshared_publish(7, CFG_WORKERS)
+    worker.ingest._skip_unshared_publish(7, CFG_WORKERS)
     assert engine.never == [] and engine.skipped == {}
