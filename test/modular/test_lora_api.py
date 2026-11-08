@@ -587,24 +587,28 @@ def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, 
     other.write_text("not an adapter")
     model = tmp_path / "model.safetensors"
     save_file({"model.layers.0.self_attn.q_proj.weight": torch.zeros(2, 2)}, str(model))
-    # a FIFO is refused without being opened: its open waits for a writer, holding every
-    # later load and unload behind it (in a child, as such an open blocks holding the GIL)
+    # a FIFO is refused without being opened, by the API server's check and by a worker's
+    # reads alike: its open waits for a writer while holding the GIL, freezing the process
+    # (so in a child, which would otherwise freeze pytest)
     fifo = tmp_path / "adapter.fifo"
     os.mkfifo(fifo)
     check = (
         "import sys, types\n"
-        "from mstar.engine.resources.lora.store import check_adapter_file\n"
+        "from mstar.engine.resources.lora.checkpoint import load_lora_file\n"
+        "from mstar.engine.resources.lora.store import adapter_targets, check_adapter_file\n"
         "spec = types.SimpleNamespace(convert_keys=None, check_adapter=print)\n"
-        "try:\n"
-        "    check_adapter_file(spec, 'x', sys.argv[1])\n"
-        "except OSError as exc:\n"
-        "    print('refused:', exc)\n"
+        "for read in (lambda: check_adapter_file(spec, 'x', sys.argv[1]),\n"
+        "             lambda: load_lora_file(sys.argv[1]), lambda: adapter_targets(spec, sys.argv[1])):\n"
+        "    try:\n"
+        "        read()\n"
+        "    except OSError as exc:\n"
+        "        print('refused:', exc)\n"
     )
     child = subprocess.run(
         [sys.executable, "-c", check, str(fifo)], capture_output=True, text=True, timeout=30, check=False,
         env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
     )
-    assert child.stdout.startswith("refused:"), child.stderr
+    assert child.stdout.count("refused:") == 3, child.stdout + child.stderr
     answers = set()
     for path in (str(tmp_path / "missing.safetensors"), str(other), str(tmp_path), str(model), str(fifo)):
         with pytest.raises(REFUSED) as err:
