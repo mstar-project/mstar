@@ -694,7 +694,8 @@ Qwen3-Omni notes
   needed. A deployment can pick the kernel under ``resources:`` in its YAML,
   e.g. ``vision_attn: {flashinfer_backend: cutlass}``. Each encoder's block stack
   is captured as a CUDA graph per token-count bucket; a request past the
-  largest bucket (32768 patches, about 5 minutes of audio) runs it eagerly.
+  largest bucket (8192 patches, about a 1920x1080 image; 4096 audio tokens)
+  runs it eagerly.
 - A request with no audio output decodes on its own walk, ``thinker_text_decode``:
   its token stays on the device between steps and reaches the client inline, as
   Qwen3.5's does, and nothing goes to the Talker. A request with audio output
