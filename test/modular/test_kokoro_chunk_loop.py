@@ -14,7 +14,6 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.engine.chunking import ChunkingManagement  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.kokoro.components import KokoroTTS  # noqa: E402
@@ -33,6 +32,7 @@ from mstar.model.kokoro.config import (  # noqa: E402
 )
 from mstar.model.kokoro.submodules import KokoroSynthSubmodule  # noqa: E402
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
 
 
 def _tiny_config() -> KokoroModelConfig:
@@ -67,12 +67,7 @@ def _submodule() -> KokoroSynthSubmodule:
 
 
 def _engine(submodule: KokoroSynthSubmodule) -> Engine:
-    engine = Engine.__new__(Engine)
-    engine._submodules = {SYNTH_NODE: type("Mgmt", (), {"submodule": submodule, "resources": {}})()}
-    engine._enable_nvtx = False
-    engine._loopback_steps = {}
-    engine._chunking = ChunkingManagement(engine._submodules)
-    return engine
+    return make_engine(_submodules={SYNTH_NODE: make_mgmt(submodule)})
 
 
 def _prompt_tensors(lengths: list[int], seed: int) -> dict[str, list[torch.Tensor]]:

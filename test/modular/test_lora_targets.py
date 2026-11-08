@@ -56,6 +56,7 @@ from mstar.model.components.lora.modules import (  # noqa: E402
 )
 from mstar.model.loader.base import CheckpointRules, StackedParamRule, load_weights_into  # noqa: E402
 from mstar.model.submodule_base import NodeSubmodule, engine_step  # noqa: E402
+from mstar.testing_utils.model import make_model
 
 HIDDEN = 8
 ROWS = [("r0", "a1", 3), ("r1", None, 2), ("r2", "a2", 4)]
@@ -515,7 +516,7 @@ def test_the_engine_adds_each_pools_rows_to_a_bound_nodes_step(tmp_path):
 def test_a_lora_spec_not_built_by_module_lora_spec_is_refused_where_specs_are_declared():
     """Nothing would bind its nodes' modules: refused before any worker starts."""
     hand = replace(_spec(CASES["qkv"]), module_map=lambda m: None)
-    model = SimpleNamespace(get_lora_specs=lambda: [hand])
+    model = make_model(get_lora_specs=lambda: [hand])
     with pytest.raises(ValueError, match="module_lora_spec"):
         declared_lora_specs(model, {"resources": {"lora": {"adapters": {}}}})
 
@@ -688,6 +689,14 @@ def _bagel_patch_embed() -> nn.Module:
     return BagelVisionEmbeddings(BagelViTConfig(hidden_size=HIDDEN, image_size=4, patch_size=2))
 
 
+def _qwen3_vit_patch_embed() -> nn.Module:
+    from types import SimpleNamespace
+
+    from mstar.model.components.qwen3_vit import VisionPatchEmbed
+
+    return VisionPatchEmbed(SimpleNamespace(in_channels=3, temporal_patch_size=2, patch_size=2, hidden_size=HIDDEN))
+
+
 def _omnivoice() -> nn.Module:
     from mstar.model.omnivoice.components.backbone import OmniVoiceBackbone
 
@@ -720,6 +729,7 @@ ANNOTATED = {
     "fastconformer_triton_convs": (lambda: _fastconformer("subsampling"), {"layers.0", "layers.3", "layers.6"}),
     "chatterbox_positions": (_chatterbox_attention, {"linear_pos"}),
     "bagel_converted_patch_embed": (_bagel_patch_embed, {"patch_embedding"}),
+    "qwen3_vit_patch_embed": (_qwen3_vit_patch_embed, {"proj"}),
     "omnivoice_fused": (_omnivoice, {f"model.llm.layers.0.{p}" for p in (
         "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj")}),
 }

@@ -18,6 +18,7 @@ from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import CHUNK_LOOP_END
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.worker import Worker
@@ -213,9 +214,10 @@ def test_after_a_mixed_step_the_chain_continues_decode_rather_than_the_chunk_tic
     from types import SimpleNamespace
 
     ready = [SimpleNamespace(node_name=NODE, graph_walk=walk) for walk in ("prefill", "decode")]
-    w = Worker.__new__(Worker)
-    w._graph_runtime = SimpleNamespace(speculate_node=lambda *args: ready)
-    w.chunk_loops = ChunkLoops([(NODE, "prefill")])
+    w = make_worker(
+        _graph_runtime=SimpleNamespace(speculate_node=lambda *args: ready),
+        chunk_loops=ChunkLoops([(NODE, "prefill")]),
+    )
 
     target = w._choose_spec_target(_batch({1: "prefill", 2: "decode"}, {1: ChunkRange(0, 4, 10, 4)}))
 
@@ -225,9 +227,7 @@ def test_after_a_mixed_step_the_chain_continues_decode_rather_than_the_chunk_tic
 def test_a_submitted_step_carries_its_nodes_chunk_loop_walks():
     """Every step reaches the GPU thread through ``_submit_gpu_step``, so the
     stamp there is what the step's strides read, speculated or not."""
-    w = Worker.__new__(Worker)
-    w.chunk_loops = ChunkLoops({(NODE, "prefill")})
-    w._execute_on_gpu_thread = lambda *a: None
+    w = make_worker(chunk_loops=ChunkLoops({(NODE, "prefill")}), _execute_on_gpu_thread=lambda *a: None)
     batch = _batch({1: "prefill"})
     node_batch = type("_NodeBatch", (), {})()
 

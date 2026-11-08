@@ -169,7 +169,10 @@ def main() -> int:
     p.add_argument("--models", default=",".join(MODELS))
     args = p.parse_args()
     args.models = args.models.split(",")
-    {"setup": setup, "run": run, "compare": compare}[args.phase](args)
+    from benchmark.eval.server import exit_on_signals
+
+    with exit_on_signals():   # a stop signal unwinds `with ManagedServer`, and can't cut its teardown short
+        {"setup": setup, "run": run, "compare": compare}[args.phase](args)
     return 0
 
 

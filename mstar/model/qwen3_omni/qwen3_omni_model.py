@@ -77,6 +77,7 @@ from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
+    as_uint8_chw,
     check_attachments,
     check_plan,
     find_media_spans,
@@ -102,6 +103,7 @@ from mstar.model.qwen3_omni.config import (
     VISION_ATTN,
 )
 from mstar.model.qwen3_omni.video_reader import header_charged, install_budgeted_readers
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import Operation, TextOutput, WeightConverter
 from mstar.streaming.chunk_policy import FixedChunkPolicy, ScheduledLeftContextChunkPolicy
@@ -375,6 +377,10 @@ class Qwen3OmniModel(Model):
                     num_kv_heads=audio.encoder_attention_heads,
                     head_dim=audio.head_dim,
                     max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(audio),
+                    # The 512 MB default costs 2 GB across both encoders and slots.
+                    # FA3 plans take none of it; FA2's captured plans split KV at
+                    # the bucket's segment ceiling, ~230 MB here at bs=8.
+                    workspace_mb=256,
                 ),
             ),
             RaggedAttentionSpec(
@@ -384,9 +390,11 @@ class Qwen3OmniModel(Model):
                     num_kv_heads=vision.num_heads,
                     head_dim=vision.head_dim,
                     # Frames of 256 patches or more fill the largest captured
-                    # bucket at this many; a request with more frames runs the
-                    # block loop eagerly (`VisionEncoderSubmodule._fits_capture`).
-                    max_segments_per_request=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+                    # bucket at this many; a step with more frames runs the
+                    # block loop eagerly (`PackedBlockLoopEncoder._fits_capture`).
+                    max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+                    # FA2's split-KV partials at the 8192-patch bucket: ~95 MB.
+                    workspace_mb=128,
                 ),
             ),
         ]
@@ -447,6 +455,11 @@ class Qwen3OmniModel(Model):
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=(THINKER_MIXED,), max_batch_tokens=budget),
         )}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        # the Talker's KV is built from the Thinker's states, which no ids recompute
+        return {"Thinker": RebuildPolicy(walk="prefill_text", ids_input="text_inputs", sample_output="new_token",
+                                         loop="thinker_decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphNode | Sequential]:
         """Define all graph walks for the 3-partition architecture.
@@ -1264,20 +1277,9 @@ class Qwen3OmniModel(Model):
         raw_audio_inputs = tensors.get("audio_inputs", [])
         raw_video_inputs = tensors.get("video_inputs", [])
 
-        pil_images: list = []
-        for img in raw_image_inputs:
-            # data_worker.py provides images as (C, H, W) float32 in [0, 1]
-            # on the GPU.  HF processors expect PIL/numpy uint8 (H, W, C)
-            # in [0, 255] -- otherwise the default do_rescale=True double-
-            # rescales and the model sees a near-zero (essentially black)
-            # tensor regardless of the actual image content.
-            if img.dtype.is_floating_point:
-                img_u8 = (img * 255.0).clamp(0, 255).to(torch.uint8)
-            else:
-                img_u8 = img
-            if img_u8.dim() == 3 and img_u8.shape[0] in (1, 3):
-                img_u8 = img_u8.permute(1, 2, 0)  # CHW -> HWC
-            pil_images.append(img_u8.cpu().contiguous().numpy())
+        # HF processors expect uint8 (H, W, C): their default do_rescale=True
+        # would rescale the data worker's [0, 1] floats a second time.
+        pil_images = [as_uint8_chw(img, truncate=True).permute(1, 2, 0).numpy() for img in raw_image_inputs]
 
         np_audios: list = []
         for waveform in raw_audio_inputs:

@@ -512,7 +512,7 @@ def test_engine_stop_check_takes_the_batched_path():
     back to one ``check_stop`` per row."""
     from types import SimpleNamespace
 
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     sub = _llm_submodule(_tiny_config())
 
@@ -533,10 +533,9 @@ def test_engine_stop_check_takes_the_batched_path():
         node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
     )
-    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=sub)})
+    engine = make_engine(_submodules={"llm": make_mgmt(submodule=sub)})
     tokens = torch.tensor([[IM_END], [1234]])
-    stops = Engine.check_stop_for_batch(
-        engine, batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
+    stops = engine.check_stop_for_batch(batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
     )
     assert stops == {"end": {"decode_loop"}} and not failures
 

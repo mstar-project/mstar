@@ -15,12 +15,12 @@ from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, R
 from mstar.api_server.request_types import PreprocessInput
 from mstar.communication.event import EventWakeup
 from mstar.model.base import ProcessPromptOutput
-from mstar.streaming.topology import PartitionTopology
+from mstar.testing_utils.model import StubModel
 from mstar.utils import cpus
 from mstar.utils.ipc_format import ConductorMessageType
 
 
-class _Model:
+class _Model(StubModel):
     """process_prompt blocks on the gate named by the prompt, so a test decides
     when each preparation finishes."""
     PREPROCESS_PARALLEL = True
@@ -31,12 +31,6 @@ class _Model:
         self.overlap = 0
         self._running = 0
         self._lock = threading.Lock()
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
-
-    def kv_labels(self):
-        return {}
 
     def gate(self, text: str) -> threading.Event:
         return self.gates.setdefault(text, threading.Event())

@@ -96,3 +96,18 @@ def test_the_printed_swap_is_the_one_the_install_docs_give(monkeypatch):
     for command in ("uv pip uninstall mooncake-transfer-engine",
                     "uv pip install --reinstall --no-deps mooncake-transfer-engine-cuda13"):
         assert command in message and command in docs
+
+
+def test_a_failed_initialize_stops_startup(monkeypatch):
+    """Mooncake reports a bad transfer device or fabric by ``initialize``'s
+    return code, not a raise, so startup has to check it."""
+    class _FailingEngine:
+        def initialize(self, *args):
+            return -1
+
+    monkeypatch.setattr(tensors, "TransferEngine", _FailingEngine)
+    monkeypatch.setattr(tensors, "_warn_if_mooncake_unpatched", lambda: None)
+    with pytest.raises(SystemExit, match=r"initialize failed \(rc=-1\)"):
+        tensors.MooncakeTransferEngine(
+            hostname="localhost", protocol=CommProtocol.TCP, tcp_transfer_device="eth9",
+        )

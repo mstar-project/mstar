@@ -13,9 +13,9 @@ from mstar.communication.edge_items import EdgeItemsBuilder, row_input_signals, 
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.utils.containers import RecentSet
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.ipc_format import WorkerMessage, WorkerMessageType
-from mstar.worker.worker import Worker
+from mstar.worker.stream_buffers import StreamBufferManager
 
 EDGE, NODE = "new_token", "snac_decoder"
 HANDLES = {"r1": 1, "r2": 2, "draining": 3}
@@ -41,43 +41,43 @@ def _frame():
 
 
 def _worker(join_dim=None):
-    w = Worker.__new__(Worker)
-    # drained past READS_DONE: it takes no input (`_takes_input`)
-    w._reads_done_sent = {"draining"}
-    w.worker_id = "w1"
-    w.enable_nvtx = False
-    w._walk_driven_edges = {}  # no producer-driven walk transitions here
-    w._draining_rids = {"draining"}
-    w._removed_rids = RecentSet(16)
-    w._removed_rids.add("removed")
-    w._unprocessed_messages = {}
-    w._rid = HANDLES.get
-    w.request_state = SimpleNamespace(per_request_info={
+    reads, acked = [], []
+
+    def start_read_tensors(rid, edges, graph_walk=None):
+        reads.extend((rid, e.name, [i.uuid for i in e.tensor_info]) for e in edges if e.tensor_info)
+        return []
+
+    def start_read_tensors_multi(batch):
+        for rid, edges in batch:
+            start_read_tensors(rid, edges)
+        return []
+
+    request_state = SimpleNamespace(per_request_info={
         h: SimpleNamespace(stream_buffers={
             EDGE: StreamBuffer(h, EDGE, "LLM", FixedChunkPolicy(1), join_dim=join_dim),
         })
         for h in HANDLES.values()
     })
-    w.scheduler = SimpleNamespace(failed_rids=set())
-    w.reads, w.acked = [], []
-
-    def start_read_tensors(rid, edges, graph_walk=None):
-        w.reads.extend((rid, e.name, [i.uuid for i in e.tensor_info]) for e in edges if e.tensor_info)
-        return []
-
-    def start_read_tensors_multi(reads):
-        for rid, edges in reads:
-            start_read_tensors(rid, edges)
-        return []
-
-    w.tensor_manager = SimpleNamespace(
-        start_read_tensors=start_read_tensors,
-        start_read_tensors_multi=start_read_tensors_multi,
-        ack_unread_tensors=lambda edges: w.acked.append(
-            [i.uuid for e in edges for i in e.tensor_info],
+    w = make_worker(
+        worker_id="w1",
+        _graph_runtime=SimpleNamespace(get_rid_handle=HANDLES.get),
+        request_state=request_state,
+        streams=StreamBufferManager(request_state, None, []),
+        tensor_manager=SimpleNamespace(
+            start_read_tensors=start_read_tensors,
+            start_read_tensors_multi=start_read_tensors_multi,
+            ack_unread_tensors=lambda edges: acked.append(
+                [i.uuid for e in edges for i in e.tensor_info],
+            ),
         ),
+        wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
-    w.wakeup_event = SimpleNamespace(register_futures=lambda futures: None)
+    w.reads, w.acked = reads, acked
+    for wire_rid, h in HANDLES.items():
+        w.lifecycle.add(h, wire_rid)
+    # drained past READS_DONE: it takes no input
+    w.lifecycle.reads_done("draining")
+    w.lifecycle.removed(None, "removed")
     return w
 
 
@@ -87,17 +87,17 @@ def _state(w):
         {h: [uuid for uuid, _walk in i.stream_buffers[EDGE]._tensor_ids_in_order]
          for h, i in w.request_state.per_request_info.items()
          if EDGE in i.stream_buffers},
-        {r: [m.body for m in ms] for r, ms in w._unprocessed_messages.items()},
+        {r: [m.body for m in ms] for r, ms in w.lifecycle._parked.items()},
     )
 
 
 def test_a_frame_does_what_its_rows_as_input_signals_did():
     frame = _frame()
     batched = _worker()
-    batched._process_edge_items(frame)
+    batched.ingest._process_edge_items(frame)
     one_by_one = _worker()
     for row in rows(frame):
-        one_by_one._process_message_list([WorkerMessage(
+        one_by_one.ingest._dispatch([WorkerMessage(
             message_type=WorkerMessageType.INPUT_SIGNALS, body=row_input_signals(frame, row),
         )])
     assert _state(batched) == _state(one_by_one)
@@ -113,10 +113,10 @@ def test_a_rows_items_join_as_its_input_signals_did():
     one joined item on a buffer with a ``join_dim``, as INPUT_SIGNALS does."""
     frame = _frame()
     batched = _worker(join_dim=0)
-    batched._process_edge_items(frame)
+    batched.ingest._process_edge_items(frame)
     one_by_one = _worker(join_dim=0)
     for row in rows(frame):
-        one_by_one._process_message_list([WorkerMessage(
+        one_by_one.ingest._dispatch([WorkerMessage(
             message_type=WorkerMessageType.INPUT_SIGNALS, body=row_input_signals(frame, row),
         )])
     assert _state(batched) == _state(one_by_one)
@@ -127,7 +127,7 @@ def test_a_frame_starts_its_reads_in_one_call():
     w = _worker()
     calls = []
     w.tensor_manager.start_read_tensors_multi = lambda reads: calls.append(reads) or []
-    w._process_edge_items(_frame())
+    w.ingest._process_edge_items(_frame())
     assert [[(rid, [i.uuid for e in edges for i in e.tensor_info]) for rid, edges in c] for c in calls] == [
         [(1, [1, 2]), (2, [6])],
     ]
@@ -142,18 +142,18 @@ def test_a_known_request_with_no_stream_buffer_is_acked_unread(failed, caplog):
         w = _worker()
         w.request_state.per_request_info[1].stream_buffers = {}
         if failed:
-            w.scheduler.failed_rids.add(1)
+            w.lifecycle.failed_rids.add(1)
         return w
 
     frame = _frame()
     batched = worker()
-    with caplog.at_level(logging.WARNING, logger="mstar.worker.worker"):
-        batched._process_edge_items(frame)
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.input_ingest"):
+        batched.ingest._process_edge_items(frame)
     warned = [r for r in caplog.records if "no stream buffer" in r.getMessage()]
     caplog.clear()
     one_by_one = worker()
     for row in rows(frame):
-        one_by_one._process_message_list([WorkerMessage(
+        one_by_one.ingest._dispatch([WorkerMessage(
             message_type=WorkerMessageType.INPUT_SIGNALS, body=row_input_signals(frame, row),
         )])
     assert _state(batched) == _state(one_by_one)

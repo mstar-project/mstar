@@ -490,10 +490,11 @@ The extension carries (see :doc:`environment_variables` for the flags):
   messages on. Each process logs it at startup (``control mesh transport:
   rust <version> from <path>``) and refuses an extension of another version
   than the one its ``mstar`` expects.
-* **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
-  transport; requires the extension, interoperates on the same descriptor
-  wire (and depends on the transport above only in the sense that both ship
-  in the same extension).
+* **SHM tensor arena**: the SHM tensor transport on CUDA and CPU. Each
+  process stages its tensors in ``/dev/shm`` segments sized from its free
+  space (the ``MSTAR_SHM_ARENA_*`` knobs), and a tensor that does not fit
+  spills to a per-tensor file. Other accelerators use the per-tensor files
+  until the arena is measured there.
 * **Message encoding** — ``MSTAR_WIRE_CODEC``: typed msgpack rather than
   pickle, which is what lets one end of an edge be Rust. On by default,
   extension or not. The legacy ``pickle`` codec is no longer supported.
@@ -515,6 +516,12 @@ in ``rust-toolchain.toml``):
 
    uv pip install maturin
    maturin develop --release -m rust/Cargo.toml
+
+Rebuild whenever ``rust/`` changes, pulled or your own: in a checkout, the
+conductor and each worker refuse an extension built from other ``rust/``
+sources (compared by content, ``mstar_rust.BUILD_SOURCE_HASH``), which would
+otherwise import fine and fail mid-request. An installed wheel has no ``rust/``
+beside ``mstar`` and is not checked.
 
 The CPU test suites build a graph runtime too, so contributors need it as well,
 Mac contributors included: install ``cargo`` through rustup and run the same
@@ -569,7 +576,11 @@ frontend, not the model, can be the limit.
 
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
-are listed in :doc:`environment_variables`.
+are listed in :doc:`environment_variables`. From a checkout, a binary built from
+other ``rust/`` or ``rust/server/`` sources is skipped, and if none is left the
+error gives the command that rebuilds it; one named by the flag or the variable
+is used with a warning. ``mstar-server --source-hash`` prints the hashes of the
+sources a build was made from.
 
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
