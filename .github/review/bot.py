@@ -33,9 +33,9 @@ REDACT = [re.compile(p) for p in (
     r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+",
 )]
 WRITE = ("admin", "maintain", "write")
-# The bot's REST logins (render_summary.BOTS and INLINE_BOTS say whose count for what).
+# The bot's REST logins (render_summary.BOTS and POSTING_BOTS say whose count for what).
 BOT_USERS = [f"{b}[bot]" for b in render_summary.BOTS]
-INLINE_BOT_USERS = [f"{b}[bot]" for b in render_summary.INLINE_BOTS]
+POSTING_BOT_USERS = [f"{b}[bot]" for b in render_summary.POSTING_BOTS]
 # The marker of a stopped review's "didn't complete" comment, of one a later run resolved, and of a refused
 # /review continue's.
 INCOMPLETE = "<!-- claude-review-incomplete -->"
@@ -431,7 +431,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
         user = (c.get("user") or {}).get("login")
         comments.append({"id": c["id"], "user": user, "path": c.get("path"), "line": c.get("line"),
                          "side": c.get("side"), "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
-                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in INLINE_BOT_USERS})
+                         **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in POSTING_BOT_USERS})
     write_json("pr-comments.json", comments)
 
     # The conversation tab: replies to the summary, and the author's answers.

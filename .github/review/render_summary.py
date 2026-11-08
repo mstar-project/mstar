@@ -18,12 +18,13 @@ MARKER = "<!-- claude-review-summary -->"
 # What a re-review starts from (head, findings outside the diff, risk), base64 JSON,
 # so model text can't close the HTML comment. Read back only from the bot's own comments.
 STATE = re.compile(r"<!-- claude-review-state ([A-Za-z0-9+/=]+) -->")
-# Who may post the bot's inline comments: the app, and github-actions, as which a team run posts them (its
-# app token wouldn't last) and everything before the app. A forged thread can only add an open finding.
-INLINE_BOTS = ("mstar-review", "github-actions")
+# Every login the bot posts as: the app, and github-actions, the job's own token, for what the app token
+# can't reach (a team run's inline comments outlast its hour) and everything before the app. Enough for
+# something a forged post can only add to, such as an inline finding.
+POSTING_BOTS = ("mstar-review", "github-actions")
 # Whose summaries, state and markers count (GraphQL logins). With the app configured, only the app's: any
 # workflow on any branch posts as github-actions, so its comments could forge them. Forks have no app.
-BOTS = ("mstar-review",) if os.environ.get("REVIEW_APP_CLIENT_ID") else INLINE_BOTS
+BOTS = ("mstar-review",) if os.environ.get("REVIEW_APP_CLIENT_ID") else POSTING_BOTS
 TAG = re.compile(r"\*\*\[(P[0-3])\]\*\*")
 PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
@@ -158,7 +159,7 @@ def open_findings(review, pages, stacked):
         for thread in page["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]:
             first = thread["comments"]["nodes"][0]
             ref = str(first.get("databaseId", ""))
-            if ref in cleared or not (first["author"] and first["author"]["login"] in INLINE_BOTS):
+            if ref in cleared or not (first["author"] and first["author"]["login"] in POSTING_BOTS):
                 continue
             match = TAG.match(first["body"])
             where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
