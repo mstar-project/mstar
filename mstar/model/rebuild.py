@@ -18,12 +18,17 @@ class RebuildPolicy:
     values its copies hold per KV slot, each in the dtype the node runs in.
     ``sample_output`` is the output that carries the one id a row samples, and ``loop`` the loop each of
     whose iterations samples one.
+
+    ``pad_ids`` are the ids a step replaces with the encoders' outputs, one row each in order. A request that
+    samples one is never dropped, since its rebuild row would hold a pad its host copies have no row for, and every
+    row after it in the step would read the wrong encoder rows.
     """
     walks: frozenset[str]
     ids_input: str
     sample_output: str
     loop: str
     copy_width: Mapping[str, int] = field(default_factory=dict)
+    pad_ids: frozenset[int] = frozenset()
 
     def loop_walks(self, node: str, graphs: Mapping[str, GraphSection]) -> frozenset[str]:
         """The walks in which ``loop`` runs ``node``: those a request can be dropped in."""

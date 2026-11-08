@@ -418,8 +418,9 @@ class Rebuilds:
         self, node_batch: ExecutingBatch, cpu_outputs: Mapping[int, Mapping[str, list[torch.Tensor]]],
         host_rows: HostRows | None, skip_rids: Collection[int] = (),
     ) -> None:
-        """Append each kept row's sample, from the stop check's host copy, to its kept ids. ``skip_rids``
-        are rows whose sample is not real, as for `Engine.step_finished`."""
+        """Append each kept row's sample, from the stop check's host copy, to its kept ids, or forget them when the
+        sample is one of the policy's ``pad_ids``. ``skip_rids`` are rows whose sample is not real, as for
+        `Engine.step_finished`."""
         node = node_batch.node_name
         kept_ids = self._kept.get(node)
         if not kept_ids:
@@ -445,11 +446,15 @@ class Rebuilds:
                 if sample.numel() != 1:
                     raise ValueError(self._not_one_id(node, name, sample.numel()))
                 pairs.append((rid, int(sample)))
+        pads = self._policies[node].pad_ids
         for rid, token in pairs:
             kept = kept_ids.get(rid)
             # the host rows are the forward's, which can hold a row the worker has since taken out of the step
             if kept is not None and ctx.is_real_row(rid) and rid not in ctx.rebuild_rids and rid not in skip_rids:
-                kept.sampled.append(token)
+                if token in pads:
+                    self._forget(node, rid)
+                else:
+                    kept.sampled.append(token)
 
     @staticmethod
     def _not_one_id(node: str, name: str, count: int) -> str:

@@ -202,6 +202,7 @@ class MultimodalDecoderModel(Model):
         return {"LLM": RebuildPolicy(
             walks=frozenset({"prefill_text", *media}), ids_input="text_inputs", sample_output="new_token",
             loop="decode_loop", copy_width={walk: self.config.hidden_size for walk in media},
+            pad_ids=frozenset(pad for encoder in self.encoders for pad in encoder.pad_ids),
         )}
 
     # -----------------------------------------------------------------------
