@@ -743,7 +743,6 @@ jobs:
       PR: ${{ github.event.issue.number }}
       HEAD_SHA: ${{ needs.review.outputs.head_sha }}
       TAG: ${{ github.run_id }}-${{ github.run_attempt }}
-      LIVE_PR_STATE: ${{ runner.temp }}/live-pr
       ERAS_API_KEY: ${{ secrets.ERAS_API_KEY }}
       REDACT: |
         s/sk-ant-[A-Za-z0-9_-]+/[REDACTED]/g
@@ -786,7 +785,9 @@ jobs:
           ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
           RESULT: ${{ needs.review.outputs.result }}
         run: |
-          mkdir -p ~/.ssh "$LIVE_PR_STATE"
+          # gpu.py's ledger, for this run only. Set here: a job's env can't read `runner`.
+          echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
+          mkdir -p ~/.ssh "$RUNNER_TEMP/live-pr"
           ssh-keygen -q -t ed25519 -N '' -f ~/.ssh/live_pr   # Eras boxes: this run's key, registered by gpu.py
           slurm='{}'
           if [ -n "$SLURM_KEY" ] && [ -n "$SLURM_HOST" ]; then
