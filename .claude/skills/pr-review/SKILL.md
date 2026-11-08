@@ -167,8 +167,13 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   anyway; otherwise drop the finding. A finding that contradicts a stated reason without engaging it
   isn't ready to report.
 
+**Latent bugs on main.** A bug in code the PR didn't write or worsen is reported apart, as latent:
+where, what, its priority, and the open issue that tracks it, or a title for one when none does. It
+never counts as an open finding or blocks the PR. A dormant bug in the PR's own code, or a
+pre-existing one the PR must fix (above), is a normal finding.
+
 **Don't report:** formatting or import order (ruff owns them; naming is reported only as style
-pattern B1 allows); pre-existing problems the PR doesn't worsen; praise or a restatement of the
+pattern B1 allows); praise or a restatement of the
 diff; how many tests a PR adds, or that it adds too many (ask for a test only where a finding needs
 one to pin it, and never ask to cut tests for count); GPU timing or numerics you can't establish
 from the code, except a static performance finding with its arithmetic (§4.2) or a measurement from
@@ -644,6 +649,7 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
   the PR's distance from it. Every gap named here is also a finding or a question.
 - **Skipped:** files not reviewed, only on a contributor's capped run whose diff is too large for
   its cap.
+- **Latent bugs on main** (§2), each with its open issue or a suggested title.
 - **Risk:** the design-risk rating, its sentence and, above low, the decisions (§6).
 - **Live test** (full mode): `full`, `targeted` or `none`, the kinds of check, the reason, and the fewest
   GPUs the largest config it needs runs on (§7).

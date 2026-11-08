@@ -18,7 +18,7 @@ WORKFLOW = yaml.safe_load((REPO_ROOT / ".github/workflows/claude-review.yml").re
 
 def review(skipped=(), prior=()):
     return {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
-            "skipped": list(skipped), "types": ["bug"], "prior_findings": list(prior), "design": [],
+            "skipped": list(skipped), "types": ["bug"], "prior_findings": list(prior), "design": [], "latent": [],
             "risk": {"level": "low", "reason": "docs only", "look_at": []}}
 
 
@@ -88,6 +88,19 @@ class TestReviewSummary(unittest.TestCase):
         text = render(r, threads(thread("P1", comment_id=7)), "0123456789", "light", [13])
         self.assertIn("🔴 **2 P1**", text, "a fix in a PR whose diff the review never had would stop blocking")
         self.assertEqual(text.count("Said to be fixed in #12, not checked."), 2)
+
+    def test_a_latent_bug_on_main_is_reported_but_doesnt_block(self):
+        r = review()
+        r["latent"] = [{"location": "mstar/engine/a.py:9", "detail": "leaks a slot on abort.", "priority": "P1",
+                        "issue": None, "issue_title": "Engine leaks a slot when a request aborts"},
+                       {"location": "b.py:2", "detail": "off by one.", "priority": "P2", "issue": 77,
+                        "issue_title": ""}]
+        text = render(r, [], "0123456789", "nogpu", [])
+        self.assertIn("🟢 **No open findings**", text, "a bug the PR didn't write would block it")
+        self.assertEqual(open_findings(r, [], []), [])
+        self.assertIn("#### Latent bugs on main (not from this PR)\n- **[P1]** `mstar/engine/a.py:9`: leaks a slot on "
+                      "abort. No issue yet; suggested title: Engine leaks a slot when a request aborts\n"
+                      "- **[P2]** `b.py:2`: off by one. Tracked in #77.", text)
 
     def test_an_earlier_finding_judged_open_counts_once_whatever_its_thread(self):
         # The author resolved thread 8 without fixing it; thread 7 is still open and also judged open.

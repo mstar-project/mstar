@@ -155,6 +155,8 @@ jobs:
       # actions: read lists and downloads the saved handoff for /review continue.
       actions: read
       contents: read
+      # issues: read lists the open issues, for a latent bug that one already tracks.
+      issues: read
       pull-requests: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -524,6 +526,12 @@ jobs:
           }
           stacked_above || rm -f above-*.diff above.json stacked-above.json
           [ ! -f stacked-above.json ] || echo "above=$(jq -c . stacked-above.json)" >> "$GITHUB_OUTPUT"
+
+          # The open issues, [{number, title}], so a latent bug on main can name the one that tracks it.
+          # Titles are user text: the model reads them as untrusted data, and no command line gets them.
+          # A failed fetch leaves no file, and the review says it couldn't check.
+          gh issue list --repo "$REPO" --state open --limit 1000 --json number,title > open-issues.json \
+            || rm -f open-issues.json
 
           echo "lines=$(wc -l < pr.diff)" >> "$GITHUB_OUTPUT"
           # The summary's fields, from main, for --json-schema. Assigned first so

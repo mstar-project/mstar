@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Provision Hopper-or-newer GPUs for live PR tests: a Slurm node, Eras Cloud, RunPod or Lambda.
+"""Provision Hopper-or-newer GPUs for live PR tests: Slurm nodes, Eras Cloud, RunPod or Lambda.
 
 usage:
   gpu.py check                                   keys, persistent storage, budget
@@ -19,15 +19,16 @@ mounts anywhere; a RunPod network volume or a Lambda filesystem pins one region)
 HF cache lives there; --all-regions lists the rest for
 a "no availability" report. Prices are USD/hr for the whole box.
 
-A Slurm node (`slurm` in the config) is offered first when it has the GPUs free now: an
-"instance" there is a batch job that holds them, every command runs inside it with
-`srun --overlap`, and Slurm's `--time` ends it at the deadline. Serve there with `mserve`,
-the node's own wrapper that runs `mstar serve --gpus $CUDA_VISIBLE_DEVICES` inside a Slurm
-job, never with `--gpus`. An Eras instance runs sshd as root in a Pod that Kubernetes stops
-at the deadline (`activeDeadlineSeconds`, `restartPolicy: Never`); a run that ends releases it.
+Each Slurm node (`slurm` in the config, a list of named nodes) is offered first when it has
+the GPUs free now, the one with the most free first: an "instance" there is a batch job that
+holds them, every command runs inside it with `srun --overlap`, and Slurm's `--time` ends it
+at the deadline. Serve there with `mserve`, the node's own wrapper that runs
+`mstar serve --gpus $CUDA_VISIBLE_DEVICES` inside a Slurm job, never with `--gpus`. An Eras
+instance runs sshd as root in a Pod that Kubernetes stops at the deadline
+(`activeDeadlineSeconds`, `restartPolicy: Never`); a run that ends releases it.
 
 `launch --run SCRIPT` makes the script the work itself rather than holding the GPUs for ssh.
-The Slurm job runs Slurm's copy of it, in the job's own directory under slurm.workdir, which
+The Slurm job runs Slurm's copy of it, in the job's own directory under the node's workdir, which
 holds the --input files; terminate (and so the watchdog) deletes that directory, so pull what
 you need first. On Eras it is the Pod's command, with the inputs in /run/live-pr and sshd up
 beside it for copying results back; the instance is released 15 minutes after it exits.
@@ -38,7 +39,7 @@ its deadline (budget.max_hours by default), even if the session that launched it
 
 `launch` exits 4 when budget.max_running refuses it, 1 on any other error.
 
-Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY; the Slurm node is reached by
+Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY; the Slurm nodes are reached by
 ssh. Settings from config.local.json next to the skill (see config.example.json). Stdlib
 only, so it runs from any python3.
 """
@@ -163,23 +164,35 @@ def eras(method, path, body=None, params=None):
     return call(method, f"/v1/org/{_eras_org}{path}", body, params)
 
 
-def slurm_run(cfg: dict, command: str, check: bool = True) -> str:
-    """One shell command on the Slurm login host; stdout."""
-    r = subprocess.run(slurm_ssh(cfg) + [command], capture_output=True, text=True, check=False, timeout=120)
+def slurm_nodes(cfg: dict) -> list[dict]:
+    """The configured Slurm nodes that have a host."""
+    return [n for n in cfg.get("slurm") or [] if n.get("host")]
+
+
+def slurm_node(cfg: dict, name: str) -> dict:
+    """The configured Slurm node called `name`: a Slurm offer's and instance's region."""
+    for sl in slurm_nodes(cfg):
+        if sl["name"] == name:
+            return sl
+    die(f"no Slurm node {name!r} in the config")
+
+
+def slurm_run(sl: dict, command: str, check: bool = True) -> str:
+    """One shell command on the Slurm node `sl`'s login host; stdout."""
+    r = subprocess.run(slurm_ssh(sl) + [command], capture_output=True, text=True, check=False, timeout=120)
     if check and r.returncode != 0:
         raise ApiError(r.returncode, f"slurm: {command.split(maxsplit=1)[0]}: {(r.stderr or r.stdout).strip()[-400:]}")
     return r.stdout
 
 
-def slurm_cancel(cfg: dict, job: str, jobdir: str | None) -> None:
+def slurm_cancel(sl: dict, job: str, jobdir: str | None) -> None:
     """Cancel a job (scancel's arguments) and, once it has gone, remove its directory: on a shared
-    node nothing of a run stays but what was copied back (weights live in slurm.hf_home)."""
+    node nothing of a run stays but what was copied back (weights live in the node's hf_home)."""
     rm = f"sleep 60; rm -rf {shlex.quote(jobdir)}" if jobdir else ":"
-    slurm_run(cfg, f"scancel {job}; (nohup sh -c {shlex.quote(rm)} > /dev/null 2>&1 < /dev/null &)")
+    slurm_run(sl, f"scancel {job}; (nohup sh -c {shlex.quote(rm)} > /dev/null 2>&1 < /dev/null &)")
 
 
-def slurm_ssh(cfg: dict, scp: bool = False) -> list[str]:
-    sl = cfg["slurm"]
+def slurm_ssh(sl: dict, scp: bool = False) -> list[str]:
     known = STATE / f"slurm_{re.sub(r'[^A-Za-z0-9.]', '_', sl['host'])}.known_hosts"
     STATE.mkdir(parents=True, exist_ok=True)
     if sl.get("host_key"):  # pinned: the node's ngrok port is reused across machines
@@ -340,51 +353,58 @@ def gres_gpus(gres: str) -> int:
     return int(m[1]) if m else 0
 
 
-def slurm_offers(cfg, gpus, min_vram, all_regions) -> list[dict]:
-    """A node with `gpus` free now. Never more than slurm.max_gpus: the node is shared."""
-    sl = cfg["slurm"]
+def slurm_offers(sl: dict, gpus: int, all_regions: bool) -> list[dict]:
+    """The node `sl`, when one of its machines has `gpus` free now. Never more than its max_gpus: the
+    node is shared."""
     if gpus > sl.get("max_gpus", 4):
         return []
-    offers = []
     partition = shlex.quote(sl.get("partition", "main"))
-    out = slurm_run(cfg, f"sinfo -h -N -p {partition} -O 'NodeHost:40,Gres:40,GresUsed:60,StateLong:20'")
+    out = slurm_run(sl, f"sinfo -h -N -p {partition} -O 'NodeHost:40,Gres:40,GresUsed:60,StateLong:20'")
+    free = total = 0
     for line in out.splitlines():
         host, gres, used, state = (line.split() + ["", "", "", ""])[:4]
-        total, busy = gres_gpus(gres), gres_gpus(used)
-        free = 0 if any(s in state for s in ("drain", "down", "fail")) else total - busy
-        if free >= gpus or (all_regions and total >= gpus):
-            offers.append({
-                "id": f"slurm:{host}:{gpus}", "provider": "slurm", "gpu": sl.get("gpu", "?"), "count": gpus,
-                "vram_gb": sl.get("vram_gb", "?"), "region": host, "usd_per_hour": 0.0,
-                "availability": f"{free} free" if free >= gpus else f"busy ({free} free)", "storage": True,
-            })
-    return offers
+        total = max(total, gres_gpus(gres))
+        if not any(s in state for s in ("drain", "down", "fail")):
+            free = max(free, gres_gpus(gres) - gres_gpus(used))
+    if free < gpus and not (all_regions and total >= gpus):
+        return []
+    return [{
+        "id": f"slurm:{sl['name']}:{gpus}", "provider": "slurm", "gpu": sl.get("gpu", "?"), "count": gpus,
+        "vram_gb": sl.get("vram_gb", "?"), "region": sl["name"], "usd_per_hour": 0.0, "free": free,
+        "availability": f"{free} free" if free >= gpus else f"busy ({free} free)", "storage": True,
+    }]
 
 
-PROVIDERS = {"slurm": slurm_offers, "eras": eras_offers, "runpod": runpod_offers, "lambda": lambda_offers}
+PROVIDERS = {"eras": eras_offers, "runpod": runpod_offers, "lambda": lambda_offers}
 
 
 def enabled(cfg, provider) -> bool:
-    if provider == "slurm":
-        return bool(cfg.get("slurm", {}).get("host")) and cfg["slurm"].get("enabled", True)
     key = {"runpod": "RUNPOD_API_KEY", "lambda": "LAMBDA_API_KEY", "eras": "ERAS_API_KEY"}[provider]
     return cfg.get(provider, {}).get("enabled", True) and bool(os.environ.get(key))
 
 
 def cmd_offers(args, cfg):
     offers, errors = [], []
+    if not slurm_nodes(cfg):
+        errors.append("slurm: skipped (no node with a host)")
+    for sl in slurm_nodes(cfg):  # a node that can't be reached is skipped, with its reason
+        try:
+            offers += slurm_offers(sl, args.gpus, args.all_regions)
+        except (ApiError, subprocess.TimeoutExpired) as e:
+            errors.append(f"slurm {sl['name']}: {e}")
     for provider, fn in PROVIDERS.items():
         if not enabled(cfg, provider):
-            errors.append(f"{provider}: skipped (disabled, or no API key or host)")
+            errors.append(f"{provider}: skipped (disabled, or no API key)")
             continue
         try:
             offers += fn(cfg, args.gpus, args.min_vram, args.all_regions,
                          **({"allow_arm": args.allow_arm} if provider == "lambda" else {}))
         except (ApiError, subprocess.TimeoutExpired) as e:
             errors.append(f"{provider}: {e}")
-    # What can start now first, then the cheapest (a Slurm node costs nothing extra).
+    # What can start now first, then the cheapest (a Slurm node costs nothing extra), then the Slurm
+    # node with the most GPUs free.
     offers.sort(key=lambda o: (o["availability"] in ("none",) or o["availability"].startswith("busy"),
-                               o["usd_per_hour"], o["count"]))
+                               o["usd_per_hour"], -o.get("free", 0), o["count"]))
     cap = cfg["budget"]["max_usd_per_hour"]
     if args.json:
         print(json.dumps({"offers": offers, "errors": errors, "max_usd_per_hour": cap}, indent=1))
@@ -451,7 +471,8 @@ def find_offer(cfg, offer_id: str) -> dict:
     elif provider == "lambda":
         pool = lambda_offers(cfg, 1, 0, True, allow_arm=True)
     elif provider == "slurm":
-        pool = slurm_offers(cfg, int(offer_id.rsplit(":", 1)[1]), 0, False)
+        _, name, count = offer_id.split(":")
+        pool = slurm_offers(slurm_node(cfg, name), int(count), False)
     elif provider == "eras":
         pool = eras_offers(cfg, 1, 0, False)
     else:
@@ -472,7 +493,8 @@ def cmd_launch(args, cfg):
     if hours > cfg["budget"]["max_hours"] and not args.allow_over_budget:
         die(f"{hours} h is over the {cfg['budget']['max_hours']} h cap; ask before passing --allow-over-budget")
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
-    name = job_name(cfg, o["provider"], args.pr, args.tag or time.strftime('%m%d-%H%M'))
+    sl = slurm_node(cfg, o["region"]) if o["provider"] == "slurm" else None
+    name = job_name(sl, args.pr, args.tag or time.strftime('%m%d-%H%M'))
     max_instances = cfg["budget"].get("max_concurrent_instances", 1)
     max_total = cfg["budget"].get("max_total_usd")
     max_running = cfg["budget"].get("max_running")
@@ -487,8 +509,9 @@ def cmd_launch(args, cfg):
                     f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
             if max_running is not None and not args.allow_over_budget:
                 up, errors = running(cfg)
-                if o["provider"] in errors:
-                    die(f"can't count this tool's {o['provider']} jobs for budget.max_running: {errors[o['provider']]}")
+                where = f"slurm {o['region']}" if sl else o["provider"]
+                if where in errors:
+                    die(f"can't count this tool's {where} jobs for budget.max_running: {errors[where]}")
                 if len(up) >= max_running:
                     die(f"{len(up)} of this tool's jobs are up, from every session; budget.max_running is "
                         f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget", code=4)
@@ -497,13 +520,13 @@ def cmd_launch(args, cfg):
                 die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
                     f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
         if o["provider"] == "slurm":
-            sl, n = cfg["slurm"], o["count"]
-            jobdir = job_dir(cfg, name)
+            n = o["count"]
+            jobdir = job_dir(sl, name)
             body = " ".join(["sbatch", "--parsable", "-p", shlex.quote(sl.get("partition", "main")),
                              f"--gres=gpu:{n}", f"-c {sl.get('cpus_per_gpu', 24) * n}",
                              f"--mem={sl.get('mem_gb_per_gpu', 180) * n}G", f"--time={max(1, int(hours * 60))}",
                              f"--nice={sl.get('nice', 100)}", "--no-requeue", f"-J {shlex.quote(name)}",
-                             shlex.quote(f"--export=ALL,HF_HOME={hf_home(cfg, 'slurm', None)}"),
+                             shlex.quote(f"--export=ALL,HF_HOME={hf_home(cfg, 'slurm', sl['name'])}"),
                              *([f"--chdir={shlex.quote(jobdir)}", f"-o {shlex.quote(jobdir)}/job.log",
                                 shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
                                else ["-o /dev/null", "--wrap 'sleep infinity'"])])
@@ -541,11 +564,11 @@ def cmd_launch(args, cfg):
         try:
             if o["provider"] == "slurm":
                 if args.run:  # the job's directory, script and inputs exist before it can start
-                    slurm_run(cfg, f"umask 077 && mkdir -p {shlex.quote(jobdir)}")
+                    slurm_run(sl, f"umask 077 && mkdir -p {shlex.quote(jobdir)}")
                     for f in [args.run, *args.input]:  # scp keeps the mode, so a 0600 key file stays 0600
-                        subprocess.run(slurm_ssh(cfg, scp=True) + ["-p", f, f"{sl['host']}:{jobdir}/"], check=True,
+                        subprocess.run(slurm_ssh(sl, scp=True) + ["-p", f, f"{sl['host']}:{jobdir}/"], check=True,
                                        capture_output=True, timeout=300)
-                iid = slurm_run(cfg, body).strip().split(";")[0]
+                iid = slurm_run(sl, body).strip().split(";")[0]
             elif o["provider"] == "eras":
                 for i, vid in enumerate(candidates):
                     try:
@@ -583,18 +606,19 @@ def cmd_launch(args, cfg):
     print(key)
 
 
-def job_prefix(cfg: dict, provider: str) -> str:
-    """What the names of this tool's jobs and instances start with: slurm.job_prefix on a shared node."""
-    return (cfg.get("slurm", {}).get("job_prefix", "live-pr") if provider == "slurm" else "live-pr") + "-"
+def job_prefix(sl: dict | None) -> str:
+    """What the names of this tool's jobs and instances start with: on a shared Slurm node `sl`, its
+    job_prefix; elsewhere (None) live-pr."""
+    return (sl or {}).get("job_prefix", "live-pr") + "-"
 
 
-def job_name(cfg: dict, provider: str, pr: int, tag: str) -> str:
-    return f"{job_prefix(cfg, provider)}{pr}-{tag}"
+def job_name(sl: dict | None, pr: int, tag: str) -> str:
+    return f"{job_prefix(sl)}{pr}-{tag}"
 
 
-def job_dir(cfg: dict, name: str) -> str:
+def job_dir(sl: dict, name: str) -> str:
     """A Slurm job's directory: its working directory, holding a --run script and its inputs."""
-    return f"{cfg['slurm'].get('workdir', '/workspace/live-pr')}/{name}"
+    return f"{sl.get('workdir', '/workspace/live-pr')}/{name}"
 
 
 ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Notebook (NVIDIA GPU): sshd as root
@@ -727,7 +751,7 @@ def eras_create(body: dict, pubkey: str) -> str:
 
 def hf_home(cfg, provider, region) -> str:
     if provider == "slurm":
-        return cfg["slurm"].get("hf_home", "/workspace/shared/hf")
+        return slurm_node(cfg, region).get("hf_home", "/workspace/shared/hf")
     if provider == "eras":
         return cfg.get("eras", {}).get("hf_home", "/workspace/hf")
     if provider == "runpod":
@@ -741,8 +765,9 @@ def hf_home(cfg, provider, region) -> str:
 def status(e: dict, cfg: dict | None = None) -> tuple[str, str | None, int]:
     """(status, host, ssh port)."""
     if e["provider"] == "slurm":
+        sl = slurm_node(cfg or load_config(), e["region"])
         try:  # "ended" only on squeue's word: a failed ssh says nothing about the job
-            st = slurm_run(cfg or load_config(), f"squeue -h -j {e['instance_id']} -o %T").strip()
+            st = slurm_run(sl, f"squeue -h -j {e['instance_id']} -o %T").strip()
         except ApiError as err:
             if "Invalid job id" not in str(err):
                 raise
@@ -778,7 +803,8 @@ def remote(e: dict, cfg: dict, command: list[str] | str, tty: bool = False) -> l
     if e["provider"] == "slurm":
         shell = f"bash -lc {shlex.quote(cmd)}" if cmd else "--pty bash -l"
         inner = f"srun --jobid={e['instance_id']} --overlap {shell}"
-        return slurm_ssh(cfg)[:1] + (["-t"] if tty or not cmd else []) + slurm_ssh(cfg)[1:] + [inner]
+        ssh = slurm_ssh(slurm_node(cfg, e["region"]))
+        return ssh[:1] + (["-t"] if tty or not cmd else []) + ssh[1:] + [inner]
     return ssh_base(e, cfg) + [f"{e['user']}@{e['host']}"] + ([cmd] if cmd else [])
 
 
@@ -824,7 +850,8 @@ def cmd_copy(args, cfg):
     e = reachable(args.instance)
     if e["provider"] == "slurm":  # the job's files are the login host's files; relative to its directory
         rel = args.remote if args.remote.startswith(("/", "~")) or not e.get("dir") else f"{e['dir']}/{args.remote}"
-        target, scp = f"{cfg['slurm']['host']}:{rel}", slurm_ssh(cfg, scp=True)
+        sl = slurm_node(cfg, e["region"])
+        target, scp = f"{sl['host']}:{rel}", slurm_ssh(sl, scp=True)
     else:
         target, scp = f"{e['user']}@{e['host']}:{args.remote}", ssh_base(e, cfg, scp=True)
     src, dst = (args.local, target) if args.cmd == "push" else (target, args.local)
@@ -836,7 +863,7 @@ def cmd_copy(args, cfg):
 def terminate(key: str, e: dict) -> None:
     try:
         if e["provider"] == "slurm":
-            slurm_cancel(load_config(), e["instance_id"], e.get("dir"))
+            slurm_cancel(slurm_node(load_config(), e["region"]), e["instance_id"], e.get("dir"))
         elif e["provider"] == "eras":
             eras("POST", f"/instances/{e['instance_id']}/release", {})
         elif e["provider"] == "runpod":
@@ -890,22 +917,23 @@ def cmd_extend(args, cfg):
 
 
 def running(cfg: dict) -> tuple[list[str], dict[str, str]]:
-    """This tool's jobs and instances up now on the Slurm node and Eras, from every session and
-    machine (the ledger has only this machine's), one line each; and why a provider couldn't be listed."""
+    """This tool's jobs and instances up now on the Slurm nodes and Eras, from every session and
+    machine (the ledger has only this machine's), one line each; and why a node or provider couldn't
+    be listed."""
     up, errors = [], {}
-    if enabled(cfg, "slurm"):
+    for sl in slurm_nodes(cfg):
         try:
-            out = slurm_run(cfg, "squeue -h -o '%j %i %T %M/%l'")
-            up += [f"slurm: {ln}" for ln in out.splitlines() if ln.startswith(job_prefix(cfg, "slurm"))]
+            out = slurm_run(sl, "squeue -h -o '%j %i %T %M/%l'")
+            up += [f"slurm {sl['name']}: {ln}" for ln in out.splitlines() if ln.startswith(job_prefix(sl))]
         except (ApiError, subprocess.TimeoutExpired) as err:
-            errors["slurm"] = str(err)
+            errors[f"slurm {sl['name']}"] = str(err)
     if enabled(cfg, "eras"):
         try:
             items = eras("GET", "/instances", params={"page_size": 100}).get("items") or []
         except (ApiError, subprocess.TimeoutExpired) as err:
             errors["eras"], items = str(err), []
         for i in items:
-            if str(i.get("name")).startswith(job_prefix(cfg, "eras")) and i.get("status") not in ("ended", "releasing"):
+            if str(i.get("name")).startswith(job_prefix(None)) and i.get("status") not in ("ended", "releasing"):
                 up.append(f"eras:{i['id']}  {i.get('name')}  {i.get('status')}")
     return up, errors
 
@@ -924,7 +952,7 @@ def cmd_list(args, cfg):
         print(f"{key}  pr {e['pr']}  {e['count']}x {e['gpu']} {e['region']}  {st}  "
               f"{hrs:.2f} h, ~${hrs * e['usd_per_hour']:.2f}  deadline in {left:.0f} min")
     if args.all:
-        print("--- this tool's on Slurm and Eras, from every session; all of RunPod and Lambda ---")
+        print("--- this tool's on the Slurm nodes and Eras, from every session; all of RunPod and Lambda ---")
         if enabled(cfg, "runpod"):
             for p in runpod_list("/pods", "pods"):
                 print(f"runpod:{p['id']}  {p.get('name')}  {p.get('status')}  ${p.get('cost', '?')}/hr")

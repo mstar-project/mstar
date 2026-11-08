@@ -1,6 +1,6 @@
 ---
 name: live-pr-test
-description: Live-test an M* pull request on real GPUs — read the PR, size the cheapest Hopper-or-newer box for it, provision it on the team's Slurm node, Eras Cloud, RunPod or Lambda (or use the persistent cluster), test the PR's claims plus regressions against main, copy media back, tear the box down, and report in markdown. Use when asked to live-test, GPU-test, smoke-test or benchmark a PR, or to "run the PR on a real box".
+description: Live-test an M* pull request on real GPUs — read the PR, size the cheapest Hopper-or-newer box for it, provision it on the team's Slurm nodes, Eras Cloud, RunPod or Lambda (or use the persistent cluster), test the PR's claims plus regressions against main, copy media back, tear the box down, and report in markdown. Use when asked to live-test, GPU-test, smoke-test or benchmark a PR, or to "run the PR on a real box".
 ---
 
 # Live-testing a PR
@@ -27,7 +27,7 @@ Read alongside this:
 - **cloud** (default): provision with `scripts/gpu.py`, work over ssh, copy results back with scp, terminate.
 - **cluster** (`cluster` in the request, or `mode: cluster` in the config): no provisioning, ssh or scp. Run on the cluster directly and write results to `cluster.results_dir/pr-<n>-<timestamp>/`, which the requester opens in VS Code. Everything else is the same.
 
-Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY`, `LAMBDA_API_KEY` and `ERAS_API_KEY` in the environment. Never print them, write them to the box, or put them in a command line that gets logged. The Slurm node is reached over ssh (`slurm` in the config). `offers` lists a Slurm node first when it has the GPUs free: there an instance is a batch job holding them, `gpu.py ssh` runs inside it, and servers start with `mserve` (the node's wrapper, installed there, that runs `mstar serve --gpus $CUDA_VISIBLE_DEVICES` inside a Slurm job), never `--gpus`. `launch --run SCRIPT` makes a script the job itself, with its `--input` files in the job's working directory (on Eras, in `/run/live-pr`); on Slurm, `terminate` and the deadline watchdog delete that directory, so pull results first.
+Settings live in `config.local.json` next to this file (gitignored; copy [config.example.json](config.example.json)). API keys come from `RUNPOD_API_KEY`, `LAMBDA_API_KEY` and `ERAS_API_KEY` in the environment. Never print them, write them to the box, or put them in a command line that gets logged. The Slurm nodes are reached over ssh (`slurm` in the config: a list of named nodes, each with its host, port, pinned host key and partition). `offers` lists every Slurm node that has the GPUs free first, the one with the most free at the top, and says why a node it couldn't reach is missing: there an instance is a batch job holding them, `gpu.py ssh` runs inside it, and servers start with `mserve` (the node's wrapper, installed there, that runs `mstar serve --gpus $CUDA_VISIBLE_DEVICES` inside a Slurm job), never `--gpus`. `launch --run SCRIPT` makes a script the job itself, with its `--input` files in the job's working directory (on Eras, in `/run/live-pr`); on Slurm, `terminate` and the deadline watchdog delete that directory, so pull results first.
 
 ## Several PRs at once
 
@@ -110,6 +110,18 @@ In cluster mode, run the same script on the cluster with `--workdir` and `--hf-h
 Installing packages and making new venvs is fine, and expected when a check needs them: a PR that changes dependencies, an extra the shared environment lacks (a G2P package, an older `setuptools`), a pinned torch build, or a library version the code requires (e.g. FlashInfer). Build them in the work directory, never in the shared environment, and name them in `harness-notes.md`. A `--no-deps` overlay put first on `PYTHONPATH` is often enough for one package.
 
 A venv with a different torch (or FlashInfer/Triton) version gets its own JIT caches: point `FLASHINFER_WORKSPACE_BASE`, `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` at a directory of its own whenever that arm runs. FlashInfer keys its cache by its own version, not torch's, so two torch versions share one directory, rebuild each other's kernels, and hold the build lock while they do. One torch-2.10 arm's first boot (a `gdn_prefill` rebuild) blocked every other Qwen3.5 server on the node until it was stopped. Expect that arm's first boot to recompile everything (20–30 minutes); size its readiness timeout for it.
+
+**Then CI's tests, on the GPUs, before any server starts** (they would compete with it for GPU memory). GitHub's CPU Core job skips every test that needs CUDA; here they run, in the PR arm bootstrap built. The paths are CI's own, from `scripts/ci/select_cpu_tests.py`, plus the CUDA cases in `test/rust/test_arena_transport.py`. ruff, the dynamo smoke and cargo stay with GitHub's CI: a GPU changes nothing for them.
+
+```bash
+source ~/live-pr/env.sh && arm pr && uv pip install -q pytest-xdist && mkdir -p $LIVE_RESULTS/ci
+paths=$(python -c 'import sys; sys.path.insert(0, "scripts/ci"); from pathlib import Path; from select_cpu_tests import expand_paths; print(*expand_paths(Path(".")))')
+HF_HUB_OFFLINE=1 python -m pytest -p xdist -n 4 -ra --junitxml=$LIVE_RESULTS/ci/pytest.xml $paths test/rust/test_arena_transport.py > $LIVE_RESULTS/ci/pytest.log 2>&1
+```
+
+- Keep `-n` small: every worker lands on `cuda:0`.
+- Rerun each failure once, serially (`python -m pytest <node id>`, no xdist), in `arm pr`, so contention flakes drop out. Rerun what still fails in `arm main` (run bootstrap again without `--no-main` if the plan skipped that arm). A test that fails on main too is "also fails on main" and doesn't count against the PR. One that only the PR fails makes the verdict Fail.
+- Tests that need more GPUs than the box has, or a checkpoint the box hasn't cached (`HF_HUB_OFFLINE=1`), skip themselves. The report's Tests block says which, from `-ra`.
 
 ## 3. Run
 

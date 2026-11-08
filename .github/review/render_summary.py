@@ -72,6 +72,19 @@ SCHEMA = {
             "required": ["ref", "priority", "status", "why"],
         }},
         "design": STRINGS,
+        # Bugs in code the PR didn't write or worsen: reported, never counted or blocking.
+        "latent": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "path:line"},
+                "detail": {"type": "string"},
+                "priority": {"type": "string", "enum": list(PRIORITIES)},
+                "issue": {"anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
+                          "description": "the open issue that tracks it (open-issues.json), or null"},
+                "issue_title": {"type": "string", "description": "with no issue: a title for one"},
+            },
+            "required": ["location", "detail", "priority", "issue", "issue_title"],
+        }},
         "risk": {"type": "object", "properties": {
             "level": {"type": "string", "enum": ["low", "medium", "high"]},
             "reason": {"type": "string"},
@@ -92,7 +105,7 @@ SCHEMA = {
         }, "required": ["run", "reason", "confirm", "checks", "gpus"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
-                 "prior_findings", "design", "risk"],
+                 "prior_findings", "design", "latent", "risk"],
 }
 
 
@@ -170,6 +183,12 @@ def above(finding):
     return f"Fixed in #{finding.get('fixed_in', '?')} above; merge together with it."
 
 
+def latent(bug):
+    issue = f"Tracked in #{bug['issue']}." if bug.get("issue") else \
+        f"No issue yet; suggested title: {bug['issue_title']}"
+    return f"**[{bug['priority']}]** `{bug['location']}`: {bug['detail']} {issue}"
+
+
 def render(review, pages, head, mode, stacked, salvaged=False):
     """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above).
     `salvaged`: the review went past its turn limit, so the action failed it and no live test follows."""
@@ -194,6 +213,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
         ("Questions", review["questions"]),
         ("Design", review.get("design", [])),
         ("Where to look", [f"`{p['location']}`: {p['why']}" for p in (review.get("risk") or {}).get("look_at", [])]),
+        ("Latent bugs on main (not from this PR)", [latent(b) for b in review.get("latent", [])]),
     ]
     for title, items in sections:
         if items:
