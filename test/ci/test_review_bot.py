@@ -223,6 +223,10 @@ class TestCollect(unittest.TestCase):
             importlib.reload(bot)
         self.assertIsNone(collect(**routes)[0].get("rereview"),
                           "any workflow on a branch could post the state a re-review starts from")
+        inline = {"id": 7, "user": {"login": "github-actions[bot]"}, "body": "**[P1]** drops a token"}
+        files = collect(**{"GET repos/o/r/pulls/7/comments": [inline]})[1]
+        self.assertTrue(json.loads(files["pr-comments.json"])[0]["mine"],
+                        "a team run's inline finding would stop being re-checked")
         team_run = {"isResolved": False, "isOutdated": False, "comments": {"nodes": [
             {"author": {"login": "github-actions"}, "databaseId": 7, "body": "**[P1]** drops a token"}]}}
         pages = [{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [team_run]}}}}}]
