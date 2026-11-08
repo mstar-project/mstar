@@ -1,7 +1,7 @@
-"""Worker._add_new_request / _remove_request against the real runtime.
+"""A request admitted by ``InputIngest`` and torn down by the worker, against the real runtime.
 
 This path had no coverage at all: every other worker test stubs
-``_add_new_request`` out. That is how eight constructor-keyword breakages
+``InputIngest._add_new_request`` out. That is how eight constructor-keyword breakages
 from the rid refactor stayed invisible behind a green suite.
 
 It also pins the ownership split: the runtime mints the handle and owns the
@@ -20,9 +20,8 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphNode
 from mstar.model.base import WorkerGraph
-from mstar.testing_utils.worker import make_worker
-from mstar.utils.containers import RecentSet
-from mstar.utils.ipc_format import NewRequest, RemoveRequest
+from mstar.testing_utils.worker import deliver, make_worker
+from mstar.utils.ipc_format import NewRequest, RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.stream_buffers import StreamBufferManager
 
@@ -68,9 +67,9 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
     all_loops = {wg_id: set() for wg_id, *_ in graphs}
     node_to_partition = {node: partition for _, node, _, partition in graphs}
 
-    w = make_worker(worker_id=WORKER, tensor_manager=_StubTensorManager())
-    w._graph_runtime = build_runtime(
-        bookkeeping=w.tensor_manager.tensor_store.bookkeeping,
+    tensor_manager = _StubTensorManager()
+    runtime = build_runtime(
+        bookkeeping=tensor_manager.tensor_store.bookkeeping,
         my_worker_id=WORKER,
         my_worker_graphs=worker_graphs,
         all_wg_ids_to_graph_walks=all_walks,
@@ -79,30 +78,30 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
         node_to_partition=node_to_partition,
         sharding_config=_sharding_config(),
     )
-    w.request_state = RequestStateManager(node_to_partition=node_to_partition)
-    w.engine_manager = SimpleNamespace(
-        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfgs, info: None,
-        remove_request=lambda rid: None,
-    )
-    w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid, rid_str: None,
-        clear_wire_rid=lambda rid_str: None,
-        note_arrival=lambda rid: None,
+    request_state = RequestStateManager(node_to_partition=node_to_partition)
+    w = make_worker(
+        worker_id=WORKER, tensor_manager=tensor_manager, _graph_runtime=runtime,
+        request_state=request_state,
+        engine_manager=SimpleNamespace(
+            engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+            add_request=lambda rid, cfgs, info: None,
+            remove_request=lambda rid: None,
+        ),
+        scheduler=SimpleNamespace(clear_rid=lambda rid: None, drop_backlogged=lambda rids: None),
+        communicator=SimpleNamespace(send=lambda *a, **k: None),
+        wakeup_event=SimpleNamespace(register_futures=lambda f: None),
+        streams=StreamBufferManager(request_state, tensor_manager, []),
     )
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w.communicator = SimpleNamespace(send=lambda *a, **k: None)
-    w.wakeup_event = SimpleNamespace(register_futures=lambda f: None)
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
-    w._draining_rids = set()
-    w._pending_drains = set()
-    w._reads_done_sent = set()
-    w._in_flight_rids = set()
-    w._pending_removes = {}
-    w._unprocessed_messages = {}
-    w._removed_rids = RecentSet(16)
-    w.enable_nvtx = False
     return w
+
+
+def _admit(w, body):
+    w.ingest._dispatch([WorkerMessage(WorkerMessageType.NEW_REQUEST, body)])
+
+
+def _remove(w, request_id):
+    deliver(w, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id=request_id)))
 
 
 def _new_request(request_id="r1", graph=(WG_ID, NODE, WALK, "default"), worker_graph_ids=(WG_ID,)):
@@ -123,11 +122,11 @@ def _new_request(request_id="r1", graph=(WG_ID, NODE, WALK, "default"), worker_g
 def test_admit_mints_a_handle_and_sets_up_both_sides():
     w = _worker()
     body = _new_request()
-    w._add_new_request(body)
+    _admit(w, body)
 
-    rid = w._rid("r1")
+    rid = w._graph_runtime.get_rid_handle("r1")
     assert rid is not None, "the handle must be interned"
-    assert w._rid_str(rid) == "r1"
+    assert w._graph_runtime.get_rid_string(rid) == "r1"
     # The handle is stamped onto the fwd_info so submodules can key on it.
     assert body.request_info.rid_handle == rid
 
@@ -144,12 +143,12 @@ def test_admit_mints_a_handle_and_sets_up_both_sides():
 
 def test_remove_tears_down_both_sides_and_frees_the_handle():
     w = _worker()
-    w._add_new_request(_new_request("r1"))
-    rid = w._rid("r1")
+    _admit(w, _new_request("r1"))
+    rid = w._graph_runtime.get_rid_handle("r1")
 
-    w._remove_request(RemoveRequest(request_id="r1"))
+    _remove(w, "r1")
 
-    assert w._rid("r1") is None
+    assert w._graph_runtime.get_rid_handle("r1") is None
     assert w._graph_runtime.get_sharding_config(rid) is None, \
         "the runtime must drop the request's state on removal"
     assert w._graph_runtime.get_sharding_config(rid) is None
@@ -158,19 +157,19 @@ def test_remove_tears_down_both_sides_and_frees_the_handle():
 
     # Freed handles are reused, which is why teardown has to be complete: the
     # next request gets this exact integer back.
-    w._add_new_request(_new_request("r2"))
-    assert w._rid("r2") == rid
-    assert w._rid_str(rid) == "r2"
+    _admit(w, _new_request("r2"))
+    assert w._graph_runtime.get_rid_handle("r2") == rid
+    assert w._graph_runtime.get_rid_string(rid) == "r2"
 
 
 def test_admit_is_refused_after_a_drain():
     """A NEW that arrives after this rank sent READS_DONE for the rid is
     refused: the drain is complete, so nothing may be read for it any more."""
     w = _worker()
-    w._draining_rids.add("r1")
-    w._reads_done_sent.add("r1")
-    w._add_new_request(_new_request("r1"))
-    assert w._rid("r1") is None
+    w.lifecycle.draining.add("r1")
+    w.lifecycle.reads_done("r1")
+    _admit(w, _new_request("r1"))
+    assert w._graph_runtime.get_rid_handle("r1") is None
     assert w.tensor_manager.registered == []
 
 
@@ -187,10 +186,10 @@ def test_a_second_partition_opens_nothing_twice():
     opened = []
     w.engine_manager.add_request = lambda rid, cfgs, info: opened.append((rid, info.partition_name))
 
-    w._add_new_request(_new_request("r1", THINKER, (0, 1)))
-    w._add_new_request(_new_request("r1", TALKER, (0, 1)))
+    _admit(w, _new_request("r1", THINKER, (0, 1)))
+    _admit(w, _new_request("r1", TALKER, (0, 1)))
 
-    rid = w._rid("r1")
+    rid = w._graph_runtime.get_rid_handle("r1")
     assert w.tensor_manager.registered == [rid]
     assert opened == [(rid, "Thinker")]
     # each partition still gets its own forward-pass info and worker graph
@@ -199,8 +198,8 @@ def test_a_second_partition_opens_nothing_twice():
     assert all(w._graph_runtime.is_partition_idle(rid, p) for p in ("Thinker", "Talker"))
 
     # the next request to get the handle opens it again
-    w._remove_request(RemoveRequest(request_id="r1"))
-    w._add_new_request(_new_request("r2", TALKER, (0, 1)))
-    assert w._rid("r2") == rid
+    _remove(w, "r1")
+    _admit(w, _new_request("r2", TALKER, (0, 1)))
+    assert w._graph_runtime.get_rid_handle("r2") == rid
     assert w.tensor_manager.registered == [rid, rid]
     assert opened == [(rid, "Thinker"), (rid, "Talker")]

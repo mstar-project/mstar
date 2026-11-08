@@ -24,6 +24,7 @@ that split once per forward for a ``[B, L, H, D]`` DiT stream.
 """
 from __future__ import annotations
 
+import functools
 from typing import Callable, NamedTuple
 
 import torch
@@ -33,9 +34,10 @@ from mstar.distributed.communication import CommGroup
 
 def sp_seq_split(total: int, world_size: int) -> list[int]:
     """Even per-rank token counts summing to ``total`` (earlier ranks get the
-    remainder). The sequence need not be divisible by ``world_size``."""
-    base, rem = divmod(total, world_size)
-    return [base + (1 if r < rem else 0) for r in range(world_size)]
+    remainder). The sequence need not be divisible by ``world_size``. Arithmetic
+    only, so a compiled caller traces it without a graph break, a dynamic
+    ``total`` staying symbolic."""
+    return [(total + world_size - 1 - r) // world_size for r in range(world_size)]
 
 
 def scatter_sequence(
@@ -63,25 +65,19 @@ def gather_sequence(
 
     Pads each shard to the max per-rank length so the underlying collective is a
     native equal-size all-gather, then trims — robust to sequences not divisible
-    by the group size. For the common even split it is a plain all-gather."""
+    by the group size. Without a branch on the sizes, so a compiled caller keeps
+    them symbolic and compiles once for every sequence length."""
     world_size = sp_group.world_size
     if world_size == 1:
         return x_shard
-    max_sz = max(seq_sizes)
-    local = x_shard
-    if local.size(dim) < max_sz:
-        pad_shape = list(local.shape)
-        pad_shape[dim] = max_sz - local.size(dim)
-        pad = torch.zeros(pad_shape, dtype=local.dtype, device=local.device)
-        local = torch.cat([local, pad], dim=dim)
-    gathered = sp_group.all_gather(local.contiguous(), dim=dim)
-    if all(s == max_sz for s in seq_sizes):
-        return gathered
-    chunks = list(torch.split(gathered, max_sz, dim=dim))
-    return torch.cat(
-        [chunks[r].narrow(dim, 0, seq_sizes[r]) for r in range(world_size)],
-        dim=dim,
-    ).contiguous()
+    dim %= x_shard.dim()  # positive: unflatten below adds a dim, which would shift a negative one
+    max_sz = functools.reduce(torch.sym_max, seq_sizes)
+    shape = list(x_shard.shape)
+    shape[dim] = max_sz
+    local = x_shard.new_empty(shape)
+    local.narrow(dim, 0, x_shard.size(dim)).copy_(x_shard)
+    chunks = sp_group.all_gather(local, dim=dim).unflatten(dim, (world_size, max_sz)).unbind(dim)
+    return torch.cat([chunk.narrow(dim, 0, n) for chunk, n in zip(chunks, seq_sizes, strict=True)], dim=dim)
 
 
 def my_rows(group: CommGroup, batch: int) -> slice:
