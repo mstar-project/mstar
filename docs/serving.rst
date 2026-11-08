@@ -786,8 +786,9 @@ A decode step hands work between a worker's main, GPU and plan threads several
 times, and every step's tokens go from the API server's message thread to the
 frontend. On a host whose idle cores drop into deep C-states each handoff to a
 sleeping core waits for it to wake, and a core that sleeps between handoffs stays
-at a low clock under the ``powersave`` governor, so a small model's step is mostly
-host time spent waking CPUs. Two knobs deal with it:
+at a low clock under a governor that sets the clock from how busy the core looks
+(``schedutil``, or ``intel_pstate``'s ``powersave``), so a small model's step is
+mostly host time spent waking CPUs. Three knobs deal with it:
 
 - ``step_thread_core`` pins those threads. ``always`` gives each worker three cores,
   one hardware thread of each, and the API server a core of its own. ``siblings``
@@ -802,6 +803,12 @@ host time spent waking CPUs. Two knobs deal with it:
 - ``idle_hold: qos`` asks the kernel to keep every CPU out of deep idle states
   through ``/dev/cpu_dma_latency`` for the server's life. It needs a device most
   containers hide, and it logs what it got.
+- ``uclamp_min`` asks the kernel for a minimum clock for the API server's and
+  workers' threads whenever they run (1024 is the top), so threads that take turns
+  don't sit at a low clock. It only helps under a governor that sets the clock from
+  utilization, such as ``schedutil``; under ``performance``, a driver in active
+  mode (``intel_pstate``, ``amd-pstate``) or a VM with no cpufreq it does nothing.
+  0, the default, is off, and it logs whether the kernel took it.
 
 Qwen3.5-0.8B tok/s at c=1 / 8, ``benchmark.runner`` at ``-O2``, the server ``taskset``
 to 8 cores (with their siblings where the CPU has SMT), medians over server sessions:

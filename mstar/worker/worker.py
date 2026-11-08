@@ -534,7 +534,7 @@ class Worker:
     ):
         # before anything below builds a resource or a submodule that reads one
         knobs.configure((model_config or {}).get("knobs"))
-        # before this worker starts any thread
+        # before this worker starts its own threads
         hold_clock_from_knob(f"Worker {worker_id}")
         self.worker_id = worker_id
         self.device = device

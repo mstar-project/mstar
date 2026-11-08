@@ -1687,7 +1687,7 @@ def _util_min() -> int:
 
 
 def _in_a_thread(fn):
-    """A thread of its own, since ``hold_clock`` can't be undone on the test's."""
+    """A thread of its own, so ``hold_clock`` doesn't leave a floor on the test's."""
     out = []
     thread = threads.Thread(target=lambda: out.append(fn()))
     thread.start()
