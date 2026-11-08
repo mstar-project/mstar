@@ -342,21 +342,26 @@ class StepPipeline:
         in_flight = self._held_beside(CHAIN_LANE)
         if self._spec_pending is not None:
             in_flight.update(self._spec_pending.batch.request_to_worker_graph)
+        # drains only: removes wait for the next teardown point
         self._apply_drains(in_flight)
         laps.lap("post_removes")
         self._set_pending(None)
         if self._spec_pending is None and self.is_tp_follower:
-            # N is done and nothing runs. Rank 0 tore down what N held here, and
-            # what it stamped with a step this rank dropped, before it sent the next
-            # step, so this rank does too, before it takes that step.
+            # N is done and nothing runs. Rank 0 stamps each remove with the
+            # last step it sent, so the ones stamped with N, or with a head
+            # this rank dropped, it tore down before sending any later step.
+            # Those have landed here (``removes_ready`` gates on
+            # ``last_consumed_seq``), so this rank tears them down now, before
+            # it takes the next step.
             self._teardown(self.in_flight_rids)
         laps.lap("set_pending")
 
     def _clear_speculation(self) -> None:
         """N's outcome voids what was built on it. A speculation that depended on
         N's outputs (the plan thread already threaded them in) can't run at all. A
-        yield-away is independent of N, but the refusal may have shifted the
-        engine's KV-cache state (paused or offloaded rids), so its pre-plan resets."""
+        yield-away is independent of N and still runs, but its pre-plan resets: on
+        an admit refusal ``_handle_admit_failure`` may shift the engine's KV-cache
+        state (paused or offloaded rids)."""
         speculation = self._speculation
         if speculation is None:
             return
@@ -594,7 +599,8 @@ class StepPipeline:
         room for the retry. Under TP this runs on every rank: page allocation is
         driven by rank 0's scheduler and replicated by the broadcast, so the
         ranks refuse the same batches (``KVCacheManager.post_warmup_validate``
-        fails fast at startup if that ever breaks).
+        checks at startup that they begin with the same free pages). Only rank
+        0 makes room (``Admission.relieve``); a follower re-queues and tears down.
 
         A teardown this rank has been holding releases pages, and spending one
         can mean no eviction is needed at all. After the push-back, so a rid torn

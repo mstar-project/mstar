@@ -11,8 +11,8 @@ unordered with the real compute stream (silent corruption or illegal
 accesses on the eager fallback path, which launches Triton at request
 time).
 
-These tests exercise ``Worker._init_engine_thread`` exactly as
-``Worker.run`` wires it into its executors.
+These tests exercise ``StepExecutor._init_engine_thread`` exactly as
+``StepExecutor.start`` wires it into its executors.
 """
 from concurrent.futures import ThreadPoolExecutor
 

@@ -112,6 +112,8 @@ CORE_FILES = {
     "mstar/model/base.py",
     "mstar/model/submodule_base.py",
     "mstar/worker/admission.py",
+    "mstar/worker/executing_batch.py",
+    "mstar/worker/host_copies.py",
     "mstar/worker/input_ingest.py",
     "mstar/worker/lockstep.py",
     "mstar/worker/micro_scheduler.py",
