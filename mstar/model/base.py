@@ -1229,7 +1229,8 @@ class Model(ABC):
     # model's turns (see "Streams from the client" in docs/adding_models.rst); None: none.
     turn_tokens: tuple[int, int] | None = None
     # A model whose replies may never get their end mark: a reply ends after this many
-    # steps whose text is only padding (no text, no mark); None: only the marks end one.
+    # steps whose text is only padding (no text, no mark), and text outside a reply opens
+    # one; None: only the marks end and open them.
     turn_idle_steps: int | None = None
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
