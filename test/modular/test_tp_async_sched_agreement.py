@@ -2,7 +2,7 @@
 
 The flag is per-rank env. A leader without it never sends a decision the
 async follower waits for; a leader with it sends heads a serial follower
-cannot always build. ``Worker._verify_tp_async_sched_agrees`` votes on the
+cannot always build. ``Lockstep.verify_async_sched_agrees`` votes on the
 per-node verdict at startup and refuses a mismatch.
 """
 
@@ -17,7 +17,7 @@ from torch.distributed import ReduceOp
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 
 
 class _Group:
@@ -50,14 +50,14 @@ def _run_ranks(async_per_rank, axis):
             tp_group=group if axis == "tp" else CommGroup.trivial(),
             sp_group=group if axis == "sp" else CommGroup.trivial(),
         )
-        worker = types.SimpleNamespace(
+        worker = make_worker(
             parallel_nodes={"node"},
             parallel_groups=types.SimpleNamespace(get_joint_group_for_node=lambda n: joint),
-            _tp_async_for=lambda n: async_per_rank[i],
+            tp_async_sched=async_per_rank[i],
         )
         try:
-            Worker._verify_tp_async_sched_agrees(worker)
-        except RuntimeError as exc:
+            worker.lockstep.verify_async_sched_agrees()
+        except Exception as exc:
             errors[i] = exc
 
     threads = [threading.Thread(target=rank, args=(i,)) for i in range(len(async_per_rank))]
