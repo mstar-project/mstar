@@ -51,6 +51,7 @@ from mstar.model.qwen3_5.config import (
     Qwen3_5VisionConfig,
 )
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, NodeInputs
+from mstar.model.utils import warn_retired_ladder_env
 from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.knobs import compile_deterministic, ingraph_decode_rope
 from mstar.utils.profiler import PhaseLaps
@@ -112,11 +113,9 @@ class LLMSubmodule(SampledTokenDecoder):
         encoders: tuple[MediaEncoder, ...] = (),
     ):
         super().__init__(model, config, encoders)
-        if "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS" in os.environ:
-            logger.warning(
-                "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS is no longer read; set the ladder "
-                "with `prefill_token_buckets` in the serving config",
-            )
+        warn_retired_ladder_env(
+            "MSTAR_QWEN35_PREFILL_TOKEN_BUCKETS", "prefill_token_buckets: {LLM: {prefill_text: [...], mixed: [...]}}",
+        )
         # patches per merged token along each axis, for the MRoPE grids
         self._merge_size = vision_config.spatial_merge_size if vision_config is not None else None
 

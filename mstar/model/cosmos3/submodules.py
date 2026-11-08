@@ -97,6 +97,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StepOrder,
 )
+from mstar.model.utils import warn_retired_ladder_env
 from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
@@ -402,6 +403,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
         super().__init__()
+        warn_retired_ladder_env("COSMOS3_PREFILL_CAPTURE_TOKENS", "prefill_token_buckets: {dit: {prefill: [...]}}")
         self.transformer = transformer
         self.config = config
         # The loop-back edges of this deployment's scheduler, beside the latents.

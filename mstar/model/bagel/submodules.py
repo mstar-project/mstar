@@ -58,6 +58,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StackingMethod,
 )
+from mstar.model.utils import warn_retired_ladder_env
 from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
@@ -392,6 +393,10 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self.vae_transform = _VAE_TRANSFORM
 
         self._vit_batching = os.environ.get("MSTAR_VIT_BATCHING", "0") == "1"
+        warn_retired_ladder_env(
+            "MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS",
+            "prefill_token_buckets: {vit_encoder: {vit_block_loop: [...]}}",
+        )
         # CUDA-graph capture of the ViT block loop, over the engine's ragged
         # attention resource. Off by default: capture costs one graph per
         # (bs, token bucket) and the eager flash-attn path is already fast;

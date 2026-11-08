@@ -1,6 +1,7 @@
 
 import json
 import logging
+import os
 import re
 from collections.abc import Container
 from dataclasses import dataclass, field
@@ -624,6 +625,14 @@ def capture_ladder(key: str, value) -> list[int]:
             or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in value)):
         raise ValueError(f"{key} must be a non-empty list of distinct positive integers, got {value!r}")
     return list(value)
+
+
+def warn_retired_ladder_env(name: str, setting: str) -> None:
+    """Warn that the environment variable ``name``, a capture ladder the serving config's
+    ``prefill_token_buckets`` replaced, is set but no longer read; ``setting`` is the
+    serving config entry that sets it."""
+    if name in os.environ:
+        logger.warning("%s is no longer read; set the ladder in the serving config: %s", name, setting)
 
 
 def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:
