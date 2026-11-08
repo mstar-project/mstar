@@ -312,6 +312,8 @@ pub enum Adapter {
     Cosmos3,
     Cosmos3Edge,
     Qwen3TTS,
+    DiffusionImage,
+    TextChat,
 }
 
 impl Adapter {
@@ -326,12 +328,17 @@ impl Adapter {
             "Cosmos3Adapter" => Some(Adapter::Cosmos3),
             "Cosmos3EdgeAdapter" => Some(Adapter::Cosmos3Edge),
             "Qwen3TTSAdapter" => Some(Adapter::Qwen3TTS),
+            "DiffusionImageAdapter" => Some(Adapter::DiffusionImage),
+            "TextChatAdapter" => Some(Adapter::TextChat),
             _ => None,
         }
     }
 
     pub fn supports_chat(&self) -> bool {
-        matches!(self, Adapter::Bagel | Adapter::Qwen3Omni | Adapter::Qwen3_5 | Adapter::Cosmos3Edge)
+        matches!(
+            self,
+            Adapter::Bagel | Adapter::Qwen3Omni | Adapter::Qwen3_5 | Adapter::Cosmos3Edge | Adapter::TextChat
+        )
     }
 
     pub fn supports_speech(&self) -> bool {
@@ -347,7 +354,7 @@ impl Adapter {
     }
 
     pub fn supports_images(&self) -> bool {
-        matches!(self, Adapter::Bagel | Adapter::Cosmos3 | Adapter::Cosmos3Edge)
+        matches!(self, Adapter::Bagel | Adapter::Cosmos3 | Adapter::Cosmos3Edge | Adapter::DiffusionImage)
     }
 
     pub fn supports_videos(&self) -> bool {
@@ -379,6 +386,7 @@ impl Adapter {
             // BAGEL reads temperature / top_p from its model config; only
             // max_output_tokens and seed are honored.
             Adapter::Bagel | Adapter::Qwen3_5 => text_chat(req, upload_dir, allow_remote),
+            Adapter::TextChat => text_only_chat(req, upload_dir),
             Adapter::Cosmos3Edge => {
                 // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
                 // Read before the attachments are saved, since a malformed value
@@ -431,7 +439,7 @@ impl Adapter {
                     parts,
                 })
             }
-            Adapter::Orpheus | Adapter::Cosmos3 | Adapter::Qwen3TTS => {
+            Adapter::Orpheus | Adapter::Cosmos3 | Adapter::Qwen3TTS | Adapter::DiffusionImage => {
                 Err("chat is not supported by this model".to_string())
             }
         }
@@ -504,7 +512,8 @@ impl Adapter {
                     parts: Vec::new(),
                 })
             }
-            Adapter::Bagel | Adapter::Qwen3_5 | Adapter::Cosmos3 | Adapter::Cosmos3Edge => {
+            Adapter::Bagel | Adapter::Qwen3_5 | Adapter::Cosmos3 | Adapter::Cosmos3Edge
+            | Adapter::DiffusionImage | Adapter::TextChat => {
                 Err("audio/speech is not supported by this model".to_string())
             }
         }
@@ -512,7 +521,8 @@ impl Adapter {
 
     pub fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
         match self {
-            Adapter::Bagel => {
+            // `DiffusionImageAdapter`'s translations are `BagelAdapter`'s, line for line.
+            Adapter::Bagel | Adapter::DiffusionImage => {
                 let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
                 size_kwargs(&mut mk, req.size.as_deref())?;
                 if let Some(seed) = req.seed {
@@ -632,7 +642,7 @@ impl Adapter {
         extra_kwargs: Map<String, Value>,
     ) -> Result<SubmitArgs, String> {
         match self {
-            Adapter::Bagel => {
+            Adapter::Bagel | Adapter::DiffusionImage => {
                 let mut extra_kwargs = extra_kwargs;
                 // a form field that parsed as JSON (e.g. "512") is still the size text
                 let size = extra_kwargs
@@ -692,6 +702,123 @@ fn text_chat(
         model_kwargs: mk,
         parts,
     })
+}
+
+/// `TextChatAdapter.chat_to_request`: text-only LLMs, which refuse what they
+/// cannot serve rather than dropping it. Remote media is never fetched.
+fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> Result<SubmitArgs, String> {
+    let (text, file_paths, in_mods, parts) = flatten_messages(&req.messages, upload_dir, false)?;
+    let refuse = |message: String| {
+        // a refused chat is never submitted, so nothing else removes its attachments
+        for path in file_paths.values().flatten() {
+            let _ = std::fs::remove_file(path);
+        }
+        Err(message)
+    };
+    let other: std::collections::BTreeSet<&str> =
+        in_mods.iter().map(String::as_str).filter(|m| *m != "text").collect();
+    if !other.is_empty() {
+        let listed: Vec<String> = other.iter().map(|m| crate::media::py_repr(m)).collect();
+        return refuse(format!("this model takes text only; the messages carry [{}]", listed.join(", ")));
+    }
+    if text.as_deref().is_none_or(str::is_empty) {
+        return refuse("messages carry no text content".to_string());
+    }
+    for (name, value) in [("max_tokens", req.max_tokens), ("max_completion_tokens", req.max_completion_tokens)] {
+        if let Some(v) = value.filter(|v| *v < 1) {
+            return refuse(format!("{name} must be at least 1, got {v}"));
+        }
+    }
+    if let Some(n) = req.n.filter(|n| *n != 1) {
+        return refuse(format!("n={n}: this model returns one choice"));
+    }
+    if req.stop.as_ref().is_some_and(truthy) {
+        return refuse(
+            "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
+        );
+    }
+    let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+    for name in ["logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"] {
+        if let Some(v) = mk.get(name).filter(|v| truthy(v)) {
+            return refuse(format!("{name} is not supported; got {}", py_value_repr(v)));
+        }
+        mk.remove(name);
+    }
+    if mk.remove("best_of").is_some_and(|v| !(v.is_null() || v == 1)) {
+        return refuse("best_of is not supported; this model returns one choice".to_string());
+    }
+    if mk.remove("response_format").is_some_and(|v| !(v.is_null() || v == serde_json::json!({"type": "text"}))) {
+        return refuse("response_format needs constrained decoding; only {'type': 'text'} is served".to_string());
+    }
+    apply_sampling(
+        &mut mk,
+        Sampling {
+            temperature: req.temperature.clone(),
+            top_p: req.top_p.clone(),
+            seed: req.seed,
+            max_tokens: chat_max_tokens(req),
+            temperature_key: "temperature",
+            top_p_key: "top_p",
+            max_tokens_key: Some("max_output_tokens"),
+        },
+    );
+    Ok(SubmitArgs {
+        tokens: None,
+        text,
+        file_paths: BTreeMap::new(),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
+        model_kwargs: mk,
+        parts,
+    })
+}
+
+/// Python's `repr` of a JSON value as `json.loads` gives it, for a refusal
+/// that quotes it as the Python frontend's does. An object's keys come in
+/// serde_json's (sorted) order, not the client's.
+pub(crate) fn py_value_repr(v: &Value) -> String {
+    match v {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Number(n) if n.is_f64() => py_float_repr(n.as_f64().unwrap_or(f64::NAN)),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => crate::media::py_repr(s),
+        Value::Array(items) => format!("[{}]", items.iter().map(py_value_repr).collect::<Vec<_>>().join(", ")),
+        Value::Object(m) => format!(
+            "{{{}}}",
+            m.iter().map(|(k, v)| format!("{}: {}", crate::media::py_repr(k), py_value_repr(v))).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Python's `repr(float)`: the shortest round-trip digits, positional for a
+/// decimal exponent in -4..16 (with at least one fractional digit) and
+/// scientific with a two-digit exponent otherwise.
+fn py_float_repr(x: f64) -> String {
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    let sci = format!("{x:e}"); // shortest round-trip digits, e.g. "-1.25e-5"
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    if !(-4..16).contains(&exp) {
+        let (head, tail) = digits.split_at(1);
+        let frac = if tail.is_empty() { String::new() } else { format!(".{tail}") };
+        let esign = if exp < 0 { '-' } else { '+' };
+        return format!("{sign}{head}{frac}e{esign}{:02}", exp.abs());
+    }
+    if exp < 0 {
+        return format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize));
+    }
+    let point = exp as usize + 1;
+    if digits.len() <= point {
+        format!("{sign}{}{}.0", digits, "0".repeat(point - digits.len()))
+    } else {
+        format!("{sign}{}.{}", &digits[..point], &digits[point..])
+    }
 }
 
 /// `chat_template_kwargs.enable_thinking` read as `Cosmos3EdgeAdapter` does:
@@ -988,6 +1115,19 @@ mod tests {
         ] {
             assert_eq!(chat(fields).unwrap_err(), err, "{fields}");
         }
+    }
+
+    #[test]
+    fn floats_are_quoted_as_python_reprs_them() {
+        for (x, want) in [
+            (0.5, "0.5"), (1.0, "1.0"), (-2.0, "-2.0"), (1e-05, "1e-05"), (0.0001, "0.0001"),
+            (123.456, "123.456"), (1e16, "1e+16"), (1.5e16, "1.5e+16"), (9999999999999998.0, "9999999999999998.0"),
+            (-3.25e-07, "-3.25e-07"), (0.0, "0.0"),
+        ] {
+            assert_eq!(super::py_float_repr(x), want, "{x}");
+        }
+        let v: Value = serde_json::from_str(r#"{"b": [true, null, "it's"], "a": 1}"#).unwrap();
+        assert_eq!(super::py_value_repr(&v), r#"{'a': 1, 'b': [True, None, "it's"]}"#);
     }
 
     fn chat_with(fields: &str) -> ChatCompletionRequest {

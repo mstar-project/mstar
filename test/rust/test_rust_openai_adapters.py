@@ -56,10 +56,8 @@ NOT_PORTED = {
     ("KokoroAdapter", "speech"),
     ("OmniVoiceAdapter", "speech"),
     ("VoxCPM2Adapter", "speech"),
-    ("DiffusionImageAdapter", "images"),
     ("LTX25Adapter", "videos"),
     ("Wan22Adapter", "videos"),
-    ("TextChatAdapter", "chat"),
 }
 
 
@@ -199,11 +197,15 @@ def _chat_classes() -> list[str]:
                   if a.supports_chat and (c, "chat") not in NOT_PORTED)
 
 
-CHAT_CLASSES = _chat_classes()
+# Text-only chat refuses the multimodal CHAT body; its own table is below.
+TEXT_ONLY_CHAT = {"TextChatAdapter"}
+CHAT_CLASSES = [c for c in _chat_classes() if c not in TEXT_ONLY_CHAT]
 
 
 def test_the_chat_classes_are_the_ones_this_pr_ports():
-    assert CHAT_CLASSES == ["BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter"]
+    assert _chat_classes() == [
+        "BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter", "TextChatAdapter",
+    ]
 
 
 class _UnportedChatAdapter(OpenAIAdapter):
@@ -372,3 +374,59 @@ def test_both_frontends_list_the_voices_alike(model, voiced, tmp_path, monkeypat
     assert (status, json.loads(body)) == (py.status_code, py.json())
     if voiced and model == "orpheus":
         assert py.json()["voices"][0] == {"id": "tara", "name": "tara"}
+
+
+# ── text-only chat (TextChatAdapter) ─────────────────────────────────────────
+
+def _text(**fields):
+    return {"model": "glm52", "messages": [{"role": "user", "content": "Bonjour, 世界"}], **fields}
+
+
+TEXT_CHAT_CASES = {
+    "accepted": _text(temperature=0.3, top_p=0.9, max_tokens=16, seed=2, top_k=5),
+    "text-response-format": _text(response_format={"type": "text"}, best_of=1, n=1, logprobs=False),
+    "image": {"model": "glm52", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is it"},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{PNG}"}},
+    ]}]},
+    "no-text": {"model": "glm52", "messages": [{"role": "user", "content": ""}]},
+    "zero-max-tokens": _text(max_tokens=0),
+    "zero-max-completion-tokens": _text(max_completion_tokens=0),
+    "n": _text(n=2),
+    "stop": _text(stop=["\n"]),
+    "logprobs": _text(logprobs=True),
+    "logit-bias": _text(logit_bias={"50256": -100}),
+    "presence-penalty": _text(presence_penalty=0.5),
+    "tiny-penalty": _text(frequency_penalty=1e-05),
+    "stop-token-ids": _text(stop_token_ids=[2, 3]),
+    "best-of": _text(best_of=2),
+    "json-format": _text(response_format={"type": "json_object"}),
+    "tool-call": _text(tool_choice="required"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(TEXT_CHAT_CASES))
+def test_a_text_only_chat_is_refused_or_submitted_as_python_does(case, tmp_path):
+    """The Python adapter's refusal is the Rust 400's message, word for word
+    (values quoted with Python's ``repr``); an accepted chat reaches the backend
+    with the same arguments, once ``submit_request`` normalizes them."""
+    from mstar.utils.generation_kwargs import normalize_generation_kwargs
+
+    body = TEXT_CHAT_CASES[case]
+    try:
+        want, refusal = ADAPTER_REGISTRY["glm52"].chat_to_request(_python_request(body), tmp_path), None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _StubAPIServer()
+    with _model_stack("glm52", stub) as (port, _upload):
+        status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+    if refusal is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+        assert not stub.submitted
+        return
+    assert status == 200, data
+    (sub,) = stub.submitted
+    assert (sub["text"], sub["in"], sub["out"]) == (want.text, want.input_modalities, want.output_modalities)
+    assert normalize_generation_kwargs(sub["mk"]) == want.model_kwargs
+    assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
+    assert not sub["files"]

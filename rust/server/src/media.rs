@@ -760,7 +760,7 @@ pub fn check_audio_format(fmt: &str, stream: bool) -> Result<String, String> {
 
 /// Python's `repr` of a str, for a refusal that quotes the client's value as
 /// the Python frontend's does.
-fn py_repr(s: &str) -> String {
+pub(crate) fn py_repr(s: &str) -> String {
     static UNPRINTABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let unprintable = UNPRINTABLE
         .get_or_init(|| regex::Regex::new(r"[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]").unwrap());
