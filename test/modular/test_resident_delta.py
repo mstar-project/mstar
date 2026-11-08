@@ -1039,6 +1039,35 @@ def test_the_speculation_is_cleared_before_the_recovery_runs():
     )
 
 
+def test_a_leader_with_no_next_step_tears_down_what_waited_behind_the_last():
+    """A remove for a row that only a side step held waits through the preamble.
+    With nothing speculated after N, it lands before the next step is built,
+    whose admit may need its pages; otherwise the admit can be refused and hold
+    a row."""
+    rank = _rank(leader=True)
+    pipeline = rank.pipeline
+    torn: list[str] = []
+    pipeline._tear_down_request = torn.append
+    pipeline._handle_admit_failure = lambda *a, **kw: None
+    rank._graph_runtime.set_in_flight = lambda node, rids, wg_ids, value: None
+    rank.lifecycle.add("side", "side")
+    rank.lifecycle.remove("side", RemoveRequest(request_id="side", source=MessageSource.CONDUCTOR), -1)
+    done = Future()
+    done.set_result({})
+    pipeline.pending = SimpleNamespace(
+        node_name="node", graph_walk="walk", future=done, speculative_new_iter=False,
+        batch=ScheduledBatch(node_name="node", graph_walk="walk", request_to_worker_graph={"r0": "wg"}),
+        node_batch=SimpleNamespace(
+            admit_error=AllocationFailed("out of pages", pages_short=1, label="main", request_id="r0"),
+            failed_requests={},
+        ),
+    )
+
+    pipeline._finish_chain_step(PhaseLaps("test."))
+
+    assert torn == ["side"], "the next step would be admitted with the removed row's pages still held"
+
+
 def _follow_spec(*, replay_refuses: bool) -> Worker:
     """The real ``Speculator.follow`` and ``MicroScheduler``, as far
     as the delta gate, so the gate is driven by a real refusal rather than a
