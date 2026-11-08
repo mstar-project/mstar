@@ -1130,8 +1130,9 @@ TypeError rather than something silently swallowed by a <code class="docutils li
 <dt class="sig sig-object py" id="mstar.engine.resources.base.EngineResourceInfo.head_shards">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">head_shards</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.engine.resources.base.EngineResourceInfo.head_shards" title="Link to this definition">#</a></dt>
 <dd><p>How many ways the node’s ranks split its attention heads, which each
-builder sizes head counts by: all its TP × SP ranks. A ragged resource
-declaring <code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.shard_over_sp=False</span></code> splits over TP only.</p>
+builder sizes head counts by: its TP × SP ranks (CFG ranks run whole
+branches, every head). A ragged resource declaring
+<code class="docutils literal notranslate"><span class="pre">RaggedAttentionConfig.shard_over_sp=False</span></code> splits over TP only.</p>
 </dd></dl>
 
 <dl class="py attribute">

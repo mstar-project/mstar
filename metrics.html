@@ -967,7 +967,7 @@ worker and transport values its message carries are stale.</p>
 <h2>Engine workers<a class="headerlink" href="#engine-workers" title="Link to this heading">#</a></h2>
 <p>From the workers’ numbers, forwarded in the conductor’s status message, so up to two
 seconds old. A node with replicas on several workers shows their sum. The ranks of a
-tensor or sequence parallel instance count once: the instance’s first rank reports.</p>
+TP, SP or CFG instance count once: the instance’s first rank reports.</p>
 <dl class="simple">
 <dt><code class="docutils literal notranslate"><span class="pre">mstar_kv_pages_used{model_name,</span> <span class="pre">component,</span> <span class="pre">resource}</span></code></dt><dd><p>Gauge. Pages of a paged KV cache not on its free list: held by requests, or kept by
 the prefix cache. A node can have several caches (e.g. a decoder’s self and cross

@@ -745,6 +745,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#routing-across-data-parallel-replicas">Routing across data-parallel replicas</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preprocessing-threads">Preprocessing threads</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#guidance-cfg-parallelism">Guidance (CFG) parallelism</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallelism-moe">Expert parallelism (MoE)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tuned-kernel-configs">Tuned kernel configs</a></li>
 </ul>
@@ -921,11 +922,12 @@ the inputs for that walk, and whether the request is finished
 (<code class="docutils literal notranslate"><span class="pre">request_done=True</span></code>). A simple prefill-decode model sets <code class="docutils literal notranslate"><span class="pre">is_prefill</span></code> to false
 once, then repeats the decode walk until EOS.</p>
 </dd>
-<dt><code class="docutils literal notranslate"><span class="pre">get_submodule(self,</span> <span class="pre">node_name,</span> <span class="pre">device=&quot;cpu&quot;,</span> <span class="pre">tp_group=None,</span> <span class="pre">autocast_dtype=None,</span> <span class="pre">sp_group=None,</span> <span class="pre">moe_parallel=None)</span> <span class="pre">-&gt;</span> <span class="pre">NodeSubmodule</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Build and return the <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> for <code class="docutils literal notranslate"><span class="pre">node_name</span></code>, and cache the result. Load
+<dt><code class="docutils literal notranslate"><span class="pre">get_submodule(self,</span> <span class="pre">node_name,</span> <span class="pre">device=&quot;cpu&quot;,</span> <span class="pre">tp_group=None,</span> <span class="pre">autocast_dtype=None,</span> <span class="pre">sp_group=None,</span> <span class="pre">moe_parallel=None,</span> <span class="pre">cfg_group=None)</span> <span class="pre">-&gt;</span> <span class="pre">NodeSubmodule</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Build and return the <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> for <code class="docutils literal notranslate"><span class="pre">node_name</span></code>, and cache the result. Load
 weights here, on <code class="docutils literal notranslate"><span class="pre">device</span></code>. Return <code class="docutils literal notranslate"><span class="pre">None</span></code> for dummy mode.</p>
 <p><code class="docutils literal notranslate"><span class="pre">tp_group</span></code> and <code class="docutils literal notranslate"><span class="pre">sp_group</span></code> are the node’s tensor-parallel and sequence-parallel
 communicators when the node is sharded. Pass <code class="docutils literal notranslate"><span class="pre">tp_group</span></code> to the parallel-linear
-constructors. See <a class="reference internal" href="#tensor-parallelism"><span class="std std-ref">Step 6</span></a>.</p>
+constructors. See <a class="reference internal" href="#tensor-parallelism"><span class="std std-ref">Step 6</span></a>. <code class="docutils literal notranslate"><span class="pre">cfg_group</span></code> is passed only to a
+node whose group sets <code class="docutils literal notranslate"><span class="pre">cfg_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>; see <a class="reference internal" href="#guidance-cfg-parallelism">Guidance (CFG) parallelism</a>.</p>
 <p><code class="docutils literal notranslate"><span class="pre">moe_parallel</span></code> is the node group’s <code class="docutils literal notranslate"><span class="pre">ep_config</span></code>, parsed into a
 <code class="docutils literal notranslate"><span class="pre">MoeParallelConfig</span></code>. It is passed only to an EP-enabled node whose group sets one,
 so a model without MoE layers never receives it. See <a class="reference internal" href="#expert-parallelism-moe">Expert parallelism (MoE)</a>.</p>
@@ -1326,7 +1328,7 @@ none. The engine reads only this hook to order a split walk’s rows, so a spec 
 config carries <code class="docutils literal notranslate"><span class="pre">splits</span></code> must return them here. <code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code> and
 <code class="docutils literal notranslate"><span class="pre">LinearAttnSpec</span></code> return their config’s <code class="docutils literal notranslate"><span class="pre">splits</span></code>.</p></li>
 </ul>
-<p>Two lockstep-parallel nodes on one worker (TP or SP nodes placed on the same ranks) must not
+<p>Two lockstep-parallel nodes on one worker (TP, SP or CFG nodes placed on the same ranks) must not
 share a resource whose state rank 0 decides for the other ranks outside the step that uses it:
 a resource implementing <code class="docutils literal notranslate"><span class="pre">supports_eviction</span></code>, <code class="docutils literal notranslate"><span class="pre">lease_cached_prefix</span></code> or <code class="docutils literal notranslate"><span class="pre">page_trail</span></code>, which
 the paged KV cache does with or without host offload. The other ranks replay each decision
@@ -2589,7 +2591,7 @@ each row with <code class="docutils literal notranslate"><span class="pre">mstar
 <code class="docutils literal notranslate"><span class="pre">fused_sample</span></code> would. After the launch, <code class="docutils literal notranslate"><span class="pre">sampler.advance_offsets(draws)</span></code> moves the offsets
 as that many <code class="docutils literal notranslate"><span class="pre">sample</span></code> calls would. <code class="docutils literal notranslate"><span class="pre">fused_draw_args()</span></code> returns None when <code class="docutils literal notranslate"><span class="pre">sample</span></code> would
 do more than that draw (an eager step, the penalty, min-p, logprobs, a kept last token,
-TP); the model then calls <code class="docutils literal notranslate"><span class="pre">sample</span></code>.</p>
+a TP, SP or CFG node); the model then calls <code class="docutils literal notranslate"><span class="pre">sample</span></code>.</p>
 <div class="admonition warning">
 <p class="admonition-title">Warning</p>
 <p>Where the callable is passed into a traced function, create one <code class="docutils literal notranslate"><span class="pre">AttentionCallable</span></code>
@@ -2698,7 +2700,7 @@ batch into the next one (see <code class="docutils literal notranslate"><span cl
 of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
 walk that nothing on the chain reads, such as a codec. Where the config asks,
 <code class="docutils literal notranslate"><span class="pre">EngineManager.build</span></code> refuses what the lane can’t serve, since a side step is neither
-speculated nor planned ahead and lands between two chain steps: a TP or SP node, a node
+speculated nor planned ahead and lands between two chain steps: a TP, SP or CFG node, a node
 alone on its worker, a device without streams, a node with chain walks or resources, and a
 side walk that is not the node’s alone, sits in a combined walk, or has output spans or a
 stop check. A config without the field keeps the node on the chain, whatever it declares.</p>
@@ -3274,7 +3276,9 @@ which that tensor is split across the group. If a name is absent, or maps to <co
 the tensor is replicated to every rank. You need an entry only for edges where the
 producer and the consumer both keep the data sharded. The common case is replicated
 activations, which needs no entry. You can also set <code class="docutils literal notranslate"><span class="pre">shard_dim</span></code> per run, under a
-<code class="docutils literal notranslate"><span class="pre">sharding_config</span></code> block in the YAML.</p></li>
+<code class="docutils literal notranslate"><span class="pre">sharding_config</span></code> block in the YAML. A sharded signal is split over the node’s whole
+lockstep instance, so placement refuses one on a node group with <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> or
+<code class="docutils literal notranslate"><span class="pre">cfg_size</span></code> above 1.</p></li>
 </ul>
 <p>If a node group has <code class="docutils literal notranslate"><span class="pre">tp_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> and names a node that is not in <code class="docutils literal notranslate"><span class="pre">tp_enabled_nodes</span></code>,
 loading fails. See <code class="docutils literal notranslate"><span class="pre">configs/qwen3omni_thinker_tp2.yaml</span></code> for an example with several node
@@ -3289,8 +3293,33 @@ the module whose <code class="docutils literal notranslate"><span class="pre">fo
 <code class="docutils literal notranslate"><span class="pre">MuseGlimmerTextModel</span></code> do. <code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code> builds the kernel’s workspace for its
 TP node.</p>
 </section>
+<section id="guidance-cfg-parallelism">
+<span id="id6"></span><h3>Guidance (CFG) parallelism<a class="headerlink" href="#guidance-cfg-parallelism" title="Link to this heading">#</a></h3>
+<p>A diffusion node that runs its classifier-free-guidance branches as one batch can split
+them over a node group’s <code class="docutils literal notranslate"><span class="pre">cfg_size</span></code> ranks, a mesh axis of its own beside <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>
+and <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). Declare the node and the most branches it runs in
+<code class="docutils literal notranslate"><span class="pre">cfg_enabled_nodes</span></code>; placement refuses a <code class="docutils literal notranslate"><span class="pre">cfg_size</span></code> that doesn’t divide that count:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_default_sharding_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">ShardingConfig</span><span class="p">(</span>
+        <span class="n">groups</span><span class="o">=</span><span class="p">[],</span> <span class="n">tp_enabled_nodes</span><span class="o">=</span><span class="nb">set</span><span class="p">(),</span> <span class="n">shard_dim</span><span class="o">=</span><span class="p">{},</span>
+        <span class="n">cfg_enabled_nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"dit"</span><span class="p">:</span> <span class="mi">2</span><span class="p">},</span>
+    <span class="p">)</span>
+</pre></div>
+</div>
+<p>The submodule receives <code class="docutils literal notranslate"><span class="pre">cfg_group</span></code> from <code class="docutils literal notranslate"><span class="pre">get_submodule</span></code>, takes its rows of the branch
+batch with <code class="docutils literal notranslate"><span class="pre">my_rows(cfg_group,</span> <span class="pre">branches)</span></code>
+(<code class="docutils literal notranslate"><span class="pre">mstar/model/components/distributed/sequence_parallel.py</span></code>), and after the forward
+reassembles them with <code class="docutils literal notranslate"><span class="pre">cfg_group.all_gather(out,</span> <span class="pre">dim=0)</span></code>. Every rank then runs the same
+guidance combine and solver step on replicated latents. CFG ranks keep every attention
+head; only TP and SP ranks split them. The ranks run in lockstep on the same requests, so
+any per-request resource the node declares must stay the same shape on every rank, and a
+node with <code class="docutils literal notranslate"><span class="pre">cfg_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code> can’t hold a paged KV cache (placement refuses one before
+any worker starts): branches that hold different KV are separate nodes in a graph <code class="docutils literal notranslate"><span class="pre">Parallel</span></code>
+instead, on a node group with <code class="docutils literal notranslate"><span class="pre">cfg_size:</span> <span class="pre">1</span></code>, as BAGEL’s <code class="docutils literal notranslate"><span class="pre">LLM_cfg_text</span></code> and <code class="docutils literal notranslate"><span class="pre">LLM_cfg_img</span></code> are.
+<code class="docutils literal notranslate"><span class="pre">Wan22DitSubmodule</span></code> is the reference.</p>
+</section>
 <section id="expert-parallelism-moe">
-<span id="id6"></span><h3>Expert parallelism (MoE)<a class="headerlink" href="#expert-parallelism-moe" title="Link to this heading">#</a></h3>
+<span id="id7"></span><h3>Expert parallelism (MoE)<a class="headerlink" href="#expert-parallelism-moe" title="Link to this heading">#</a></h3>
 <p>A sharded MoE node can split its routed experts in two ways. Under TP, the default, every
 rank holds a slice of every expert. Under EP, each rank holds whole experts. A deployment
 picks one per node group with an <code class="docutils literal notranslate"><span class="pre">ep_config</span></code> block; see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a> for the keys. The
@@ -4085,6 +4114,7 @@ for a full omni-modal model.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#routing-across-data-parallel-replicas">Routing across data-parallel replicas</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#preprocessing-threads">Preprocessing threads</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensor-parallelism-sharding">Tensor parallelism (sharding)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#guidance-cfg-parallelism">Guidance (CFG) parallelism</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#expert-parallelism-moe">Expert parallelism (MoE)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tuned-kernel-configs">Tuned kernel configs</a></li>
 </ul>

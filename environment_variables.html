@@ -936,7 +936,8 @@ Workers on CUDA set <code class="docutils literal notranslate"><span class="pre"
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GLOO_SOCKET_IFNAME</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">lo</span></code></p></td>
-<td><p>PyTorch’s variable for the Gloo groups next to each TP/SP group.
+<td><p>PyTorch’s variable for the Gloo groups next to each parallel group
+and for each lockstep instance.
 Same rule: the conductor sets <code class="docutils literal notranslate"><span class="pre">lo</span></code> for its workers unless you set
 it, so Gloo does not listen on the address the hostname resolves to.</p></td>
 </tr>
@@ -1301,7 +1302,7 @@ length); over it, the request gets a 400.</p></td>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TP_ASYNC_SCHED</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code>, else <code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
-<td><p>Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+<td><p>Async scheduling for lockstep-parallel (TP / SP / CFG) nodes; overrides the
 deployment config’s <code class="docutils literal notranslate"><span class="pre">tp_async_sched</span></code>. <code class="docutils literal notranslate"><span class="pre">1</span></code> (or <code class="docutils literal notranslate"><span class="pre">true</span></code>): the
 instance leader speculates step N+1 of the parallel node during
 forward N (the existing single-worker speculation machinery, gate
