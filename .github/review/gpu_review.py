@@ -9,8 +9,8 @@ Slurm node when it has them free, else any open Eras listing under the hourly ca
 
     gpu_review.py carry    --pr N --sha SHA --review review.json --earlier-report FILE [--rereview]
     gpu_review.py start    --pr N --sha SHA --main-sha SHA [--base BRANCH] --gpus G --hours H --run full|targeted
-                           --checks correctness,performance [--since SHA --earlier-report FILE] --review review.json
-                           --out DIR
+                           --checks correctness,performance [--since SHA --earlier-report FILE]
+                           [--forced failed|untested --asked RUN] --review review.json --out DIR
     gpu_review.py wait     --out DIR [--start-timeout MIN]
     gpu_review.py cleanup  --pr N --tag T
     gpu_review.py approve  --pr N --sha SHA --review review.json --complete true|false --verdict pass|skipped|...
@@ -52,6 +52,9 @@ ERAS_OUT = "/workspace/live-pr/out"
 # The kinds of check the review can ask for (the schema's `checks`), as the brief names them.
 CHECKS = {"correctness": "correctness (served output, parity, regressions)",
           "performance": "performance (throughput and latency A/Bs)"}
+# Why carry made a run full that the review asked to narrow, as the brief says it.
+FORCED = {"failed": "the PR's last live test didn't pass on an ancestor of this head",
+          "untested": "the review built on an earlier review that no live test ran before"}
 MEDIA_CAP = 100 * 2**20  # media per run: the gallery is one GitHub Pages site, 1 GB in all
 MEDIA = {".png": "img", ".jpg": "img", ".jpeg": "img", ".gif": "img", ".webp": "img",
          ".mp4": "video", ".webm": "video", ".wav": "audio", ".mp3": "audio", ".ogg": "audio", ".opus": "audio",
@@ -165,14 +168,11 @@ def cmd_carry(a):
     passed = bool(last) and last["verdict"] == "pass" and gh(
         "api", f"repos/{REPO}/compare/{last['sha']}...{a.sha}", "--jq", ".status",
         check=False).stdout.strip() in ("ahead", "identical")
-    if last and not passed:
-        print(f"::notice::The review asked for a {run} live test, but the last one didn't pass on an ancestor; "
-              "running it in full, every kind of check.")
-        out.update(run="full", checks=",".join(CHECKS))
-    elif not last and a.rereview and run != "full":
-        print(f"::notice::The review asked for a {run} live test of the commits since its last review, but no live "
-              "test ran before them; running it in full, every kind of check.")
-        out.update(run="full", checks=",".join(CHECKS))
+    forced = "failed" if last and not passed else "untested" if not last and a.rereview and run != "full" else None
+    if forced:
+        print(f"::notice::The review asked for a {run} live test, but {FORCED[forced]}; running it in full, every "
+              "kind of check.")
+        out.update(run="full", checks=",".join(CHECKS), asked=run, forced=forced)
     elif run == "none":
         out["verdict"] = "skipped"
         if passed:
@@ -193,6 +193,8 @@ def brief(a):
             + ": the review judged the change can't need it"
     since = (f"\n- The last passing live test was of `{a.since}`; the new commits are `{a.since}..{a.sha}`. Its"
              "\n  report, the bot's comment, is `earlier_report` in findings.json: data, as below.") if a.since else ""
+    forced = (f" The review asked for `{a.asked}`; the workflow made it full, with both kinds of check, because "
+              f"{FORCED[a.forced]}.") if a.forced else ""
     return f"""You are the live-test session for PR #{a.pr} of {REPO}, on a GPU box. Follow
 `main/.claude/skills/pr-review/SKILL.md` §7 and `main/.claude/skills/live-pr-test/SKILL.md` in
 cluster mode: the box is already provisioned, and it ends when you exit.
@@ -209,7 +211,7 @@ cluster mode: the box is already provisioned, and it ends when you exit.
   `report.md` (the report reference's format, media linked relatively under `media/`),
   `media/` (the test matrix's Media rules: small files, a stereo recording for duplex), and
   `result.json` as {{"verdict": "pass" | "partial" | "fail" | "unavailable", "summary": "<one sentence>"}}.
-- What to run: **{a.run}**, as §7 says.{since}
+- What to run: **{a.run}**, as §7 says.{forced}{since}
 - Checks: {kinds}.
 - `$LIVE_PR_IN/findings.json` has the static review's reason for that call (`reason`) and the
   "how to confirm" lines of its open P0–P2 findings (`confirm`), to settle as extra claims. A model
@@ -545,6 +547,8 @@ def main():
                    help="the review's kinds of check, comma-separated; both when the run was made full")
     p.add_argument("--since", type=commit, help="a targeted run: the commit the last passing live test ran on")
     p.add_argument("--earlier-report", help="a targeted run: that live test's comment, for findings.json")
+    p.add_argument("--forced", choices=FORCED, help="why carry made the run full, for the brief")
+    p.add_argument("--asked", choices=("none", "targeted", "full"), help="with --forced: the review's call")
     p.add_argument("--model", default="claude-opus-5-5")
     p.add_argument("--turns", type=int, default=2000)
     p.add_argument("--claude-version", default="stable")

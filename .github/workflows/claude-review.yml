@@ -843,12 +843,15 @@ jobs:
           RUN: ${{ steps.carry.outputs.run }}
           CHECKS: ${{ steps.carry.outputs.checks }}
           SINCE: ${{ steps.carry.outputs.since }}
+          FORCED: ${{ steps.carry.outputs.forced }}
+          ASKED: ${{ steps.carry.outputs.asked }}
         run: |
           set +e
           python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
             --base "$BASE" \
             --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
             --run "$RUN" --checks "$CHECKS" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
+            ${FORCED:+--forced "$FORCED" --asked "$ASKED"} \
             --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
           code=$?
           [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
