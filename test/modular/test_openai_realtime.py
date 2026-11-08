@@ -1477,6 +1477,23 @@ def test_a_reply_without_an_end_mark_ends_where_the_next_starts(duplex):
     for response, steps in zip(done, ([1, 2], [3, 4, 5]), strict=True):
         assert [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"
                 and e["response_id"] == response["id"]] == [_step_pcm(i) for i in steps]
+    assert not api.aborted, "the call ended on its own: nothing to abort"
+
+
+def test_a_reply_without_an_end_mark_ends_after_its_padding(duplex):
+    """A model whose replies may get no end mark declares turn_idle_steps: its
+    reply ends that many steps into padding, and later padding is between replies."""
+    texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), _text(3), _text(4), _text(5)]
+    client, api = duplex([*texts, *(_audio(i) for i in range(6))], end=True)
+    api.model.turn_idle_steps = 2
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        events = _until_closed(ws)
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert [(r["status"], r["output"][0]["content"][0]["transcript"]) for r in done] == [("completed", "Hi")]
+    assert [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"] == [
+        _step_pcm(i) for i in (1, 2, 3, 4)]
 
 
 def test_a_call_that_ends_mid_reply_finishes_its_response(duplex):
