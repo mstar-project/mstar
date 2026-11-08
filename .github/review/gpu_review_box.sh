@@ -26,6 +26,12 @@ ANTHROPIC_API_KEY=$(cat /run/live-pr-key/value 2> /dev/null || cat "$IN/anthropi
 export ANTHROPIC_API_KEY
 rm -f "$IN/anthropic.key"
 
+# Two runs can share a Slurm node (no job container, network namespace or private /tmp), so each takes a
+# port block, a ZMQ socket prefix and a TMPDIR of its own, from its job id; on Eras the box is its own.
+export LIVE_PR_PORT=$((10000 + ${SLURM_JOB_ID:-0} % 1100 * 20))
+export LIVE_PR_SOCKET_PREFIX=/tmp/mstar_${SLURM_JOB_ID:-pod} TMPDIR=$W/tmp
+mkdir -p "$TMPDIR"
+
 finish() {
   [ -s "$OUT/result.json" ] || printf '{"verdict": "unavailable", "summary": "%s"}\n' "$1" > "$OUT/result.json"
   touch "$OUT/done"
