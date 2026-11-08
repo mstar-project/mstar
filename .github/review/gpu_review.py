@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""The review bot's live test: the steps of claude-review.yml's live-test job, and pr-labels.yml's
-dismissal of the bot's approval, run as `python3 .github/review/gpu_review.py <step>` with bot.py's
-dispatcher (a step's parameters are its env) and seam (every program it runs goes through bot.run).
+"""The review bot's live test: the steps of claude-review.yml's live-test job, run as
+`python3 .github/review/gpu_review.py <step>` with bot.py's dispatcher (a step's parameters are its env)
+and seam (every program it runs goes through bot.run).
 
 Nothing here runs a model or the PR's code: the live-test session runs on the GPU box
 (gpu_review_box.sh), and this script only gets it GPUs, waits for it, collects what it wrote,
@@ -631,47 +631,12 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
         return
     review_pr(pr, head_sha, "APPROVE", f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open "
                                        f"P0–P2 finding, and {tested}. It covers this commit only.")
-    # A push between the check and the approval would leave it on a commit nobody tested; a failed read or a
-    # malformed reply can't rule one out.
-    pull = bot.read(bot.api, f"repos/{REPO}/pulls/{pr}")
-    if ((pull or {}).get("head") or {}).get("sha") != head_sha:
-        said = f"**Not approved:** new commits arrived while approving `{head_sha[:7]}`.\n"
-        try:
-            dismiss_approvals(pr, "new commits arrived while approving")
-        except (SystemExit, RuntimeError, ValueError, KeyError, TypeError):
-            decision.write_text(said + f"The approval on `{head_sha[:7]}` couldn't be withdrawn: a maintainer needs "
-                                "to dismiss it.\n")
-            raise
-        decision.write_text(said)
-        return
     decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")
 
 
 def review_pr(pr, sha, event, body):
     bot.gh("api", "-X", "POST", f"repos/{REPO}/pulls/{pr}/reviews", "--input", "-",
            input=json.dumps({"commit_id": sha, "event": event, "body": body}))
-
-
-def dismiss_approvals(pr, message):
-    """Dismiss every approval of the bot's on the PR; a failed one warns and fails the step, after the rest."""
-    failed = False
-    for r in bot.api_list(f"repos/{REPO}/pulls/{pr}/reviews?per_page=100"):
-        if r.get("state") == "APPROVED" and ((r.get("user") or {}).get("login") or "").removesuffix("[bot]") \
-                in render_summary.BOTS:
-            done = bot.gh("api", "-X", "PUT", f"repos/{REPO}/pulls/{pr}/reviews/{r['id']}/dismissals", "--input", "-",
-                          input=json.dumps({"message": message, "event": "DISMISS"}), check=False)
-            if done.returncode:
-                print(f"::warning::Couldn't dismiss review {r['id']}: {done.stderr}")
-                failed = True
-    if failed:
-        sys.exit(1)
-
-
-def dismiss(out, pr, message="New commits or a new base since the review bot approved; comment /review for a "
-                               "new review."):
-    """pr-labels.yml: dismiss the bot's approval when the PR gets new commits or a new base, since the
-    approval was for the commit it tested."""
-    dismiss_approvals(pr, message)
 
 
 # ---------------------------------------------------------------- what gets posted
@@ -830,7 +795,7 @@ def incomplete(out, pr, run_url):
 
 STEPS = {"configure": configure, "inputs": inputs, "carry": carry, "start": start, "wait": wait, "redact": redact,
          "comment": comment, "publish": publish, "approve": approve, "post": post, "cleanup": cleanup,
-         "incomplete": incomplete, "dismiss": dismiss}
+         "incomplete": incomplete}
 
 if __name__ == "__main__":
     bot.main(STEPS)

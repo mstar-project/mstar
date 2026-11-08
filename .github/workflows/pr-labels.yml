@@ -9,53 +9,20 @@ name: PR labels
 # out only the default branch: the script reads the PR's file list through the
 # API and never runs its code. Run it by hand (workflow_dispatch) to relabel
 # every open PR, e.g. after changing the rules.
-#
-# It also dismisses the review bot's approval (claude-review.yml, `/review`)
-# when the PR gets new commits or a new base, since the approval was for the
-# commit it tested. A second line: branch protection's "dismiss stale approvals"
-# is what doesn't depend on a workflow, and this one needs an Actions event
-# policy that allows pull_request_target (README, setup step 4).
 
 on:
   pull_request_target:
-    types: [opened, reopened, synchronize, ready_for_review, edited]
+    types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
 
 permissions: {}
 
-env:
-  # When set, only the app's login counts as the bot (render_summary.BOTS).
-  REVIEW_APP_CLIENT_ID: ${{ vars.REVIEW_APP_CLIENT_ID }}
+concurrency:
+  group: pr-labels-${{ github.event.pull_request.number || 'all' }}
+  cancel-in-progress: true
 
 jobs:
-  # A job of its own, outside the label job's cancel group, so a later event
-  # (an edit right after a push, say) can't cancel it, and a labelling failure
-  # can't skip it.
-  dismiss:
-    if: github.event.action == 'synchronize' || (github.event.action == 'edited' && github.event.changes.base)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      pull-requests: write
-    steps:
-      - name: Check out the default branch
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
-      # The job's own token, not the app's: dismissing needs only pull-requests: write.
-      - name: Dismiss the review bot's approval
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-        run: python3 .github/review/gpu_review.py dismiss
-
   label:
-    concurrency:
-      group: pr-labels-${{ github.event.pull_request.number || 'all' }}
-      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -68,9 +35,8 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-      # The job's own token, like the dismiss job above: labelling needs only pull-requests: write.
+      # The job's own token: labelling needs only pull-requests: write.
       - name: Label
-        if: github.event.action != 'edited' || github.event.changes.base
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}

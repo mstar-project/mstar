@@ -430,32 +430,6 @@ class TestApprove(unittest.TestCase):
                 self.assertEqual(json.loads(fake.writes()[0][1])["event"], "COMMENT",
                                  "an engine change's approval would count")
 
-    def test_a_push_during_the_approval_withdraws_it_and_says_so(self):
-        text, out, fake = self.approve({"value": "on"}, head_after="fedcba9876", extra={
-            f"GET repos/{R}/pulls/7/reviews?per_page=100": [
-                {"id": 3, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
-            f"PUT repos/{R}/pulls/7/reviews/3/dismissals": {}})
-        self.assertIn(f"PUT repos/{R}/pulls/7/reviews/3/dismissals", [key for key, _ in fake.writes()],
-                      "the approval would stand on a commit nobody tested")
-        self.assertIn("Not approved", text)
-        text, out, _ = self.approve({"value": "on"}, head_after="fedcba9876", extra={
-            f"GET repos/{R}/pulls/7/reviews?per_page=100": [
-                {"id": 3, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
-            f"PUT repos/{R}/pulls/7/reviews/3/dismissals": Fail("HTTP 502")})
-        self.assertEqual(out.get("exit"), 1, "a failed dismissal would pass silently")
-        self.assertIn("couldn't be withdrawn", text, "the comment would say not approved with the approval standing")
-
-    def test_a_failed_read_of_the_head_after_the_approval_withdraws_it_like_a_push(self):
-        for name, after in (("a failed read", Fail("HTTP 502")), ("a malformed reply", {"head": None})):
-            with self.subTest(name):
-                text, out, fake = self.approve({"value": "on"}, head_after=after, extra={
-                    f"GET repos/{R}/pulls/7/reviews?per_page=100": [
-                        {"id": 3, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}],
-                    f"PUT repos/{R}/pulls/7/reviews/3/dismissals": {}})
-                self.assertIn(f"PUT repos/{R}/pulls/7/reviews/3/dismissals", [key for key, _ in fake.writes()],
-                              "the approval would stand on a commit it can't be sure of")
-                self.assertIn("Not approved", text)
-
     def test_a_finding_counts_as_fixed_above_only_while_that_pr_still_holds_the_fix(self):
         finding = {"priority": "P1", "location": "a.py:1", "claim": "c", "detail": "d", "fixed_in": 9}
         above = [{"number": 9, "head_sha": "a" * 40}]
@@ -467,16 +441,6 @@ class TestApprove(unittest.TestCase):
                 _, out, writes = self.approve({"value": "on"}, outside=[finding], above=above,
                                               extra={f"GET repos/{R}/pulls/9": reply})
                 self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], approved, f"a PR above that is {name}")
-
-    def test_dismissal_reads_every_page_and_reports_one_that_failed(self):
-        reviews = [{"id": 3, "state": "APPROVED", "user": None},
-                   {"id": 4, "state": "APPROVED", "user": {"login": "mstar-review[bot]"}}]
-        def listed(argv, stdin):
-            return reviews if "--paginate" in argv else Fail("called without --paginate")
-
-        out, fake = step(gpu_review.dismiss, {f"GET repos/{R}/pulls/7/reviews*": listed,
-                                              f"PUT repos/{R}/pulls/7/reviews/4/dismissals": Fail("HTTP 502")}, pr=7)
-        self.assertEqual(out.get("exit"), 1, "a failed dismissal would leave an approval on a commit nobody tested")
 
     def test_approvals_happen_only_when_the_variable_reads_on(self):
         text, out, writes = self.approve({"value": "on"})
