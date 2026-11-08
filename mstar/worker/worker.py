@@ -3873,11 +3873,12 @@ class Worker:
                     self._apply_drains(in_flight)
                     laps.lap("post_removes")
                     _set_pending(None)
-                    if spec_pending is None and self.is_tp_follower:
-                        # N is done and nothing runs. Rank 0 tore down what N held
-                        # here, and what it stamped with a step this rank dropped,
-                        # before it sent the next step, so this rank does too, before
-                        # it takes that step.
+                    if spec_pending is None:
+                        # N is done and nothing runs, so tear down what waited behind
+                        # N before the next step is built: its admit may need the
+                        # pages. On a follower these include what rank 0 stamped with
+                        # N, or with a head this rank dropped, which rank 0 tore down
+                        # before it sent any later step.
                         self._teardown(self._in_flight_rids)
                     laps.lap("set_pending")
 
