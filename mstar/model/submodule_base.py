@@ -841,7 +841,7 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # stream (``mstar.worker.side_steps``); they do where the node's group in
     # the serving config sets ``side_stream: true``. For a stream-fed walk that
     # no chain step waits on. Where the config asks, ``EngineManager.build``
-    # (``_side_lane_keys``) refuses a TP or SP node, a node alone on its
+    # (``_side_lane_keys``) refuses a TP, SP or CFG node, a node alone on its
     # worker, a device without streams, a node that also has chain walks or
     # holds resources, and a side walk that is not the node's alone, is part
     # of a combined walk, or has output spans or a stop check.

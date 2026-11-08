@@ -162,7 +162,7 @@ class _Serve:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, kv_yaml)
         by_key = resolve_spec_dependencies(specs)
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo(
             my_entity_id="glm52_serve_e2e", my_session_id="glm52_serve_e2e",
             transfer_engine=LocalTransferEngine("localhost"),
