@@ -308,12 +308,6 @@ class TestStart(unittest.TestCase):
         self.assertIn("already has 2 GPU runs going", (out / "unavailable.md").read_text(),
                       "the PR would read that there were no GPUs")
 
-    def test_past_a_spend_cap_no_box_starts_and_the_pr_is_told(self):
-        with unittest.mock.patch.object(bot, "over_cap", lambda repo: "The review bot's weekly spend cap is reached."):
-            out, launched = self.start("sk-test", {"eras": {"run_secret_id": "s"}})
-        self.assertEqual(launched, [], "a live test would start past the cap")
-        self.assertIn("weekly spend cap", (out / "unavailable.md").read_text(), "the PR wouldn't be told why")
-
     def test_a_stacked_pr_is_tested_against_its_base_branch(self):
         self.assertIn("--base joe/cp-stack-1", gpu_review.brief(7, "0123456789", "abcdef", "joe/cp-stack-1", "full",
                                                                 ["correctness"]),
@@ -382,33 +376,6 @@ class TestComment(unittest.TestCase):
         self.assertIn("[c](media/c.wav)", text, "a link to a file the gallery left out would point at nothing")
 
 
-class Done:
-    stdout = ""
-
-
-class TestCost(unittest.TestCase):
-    def test_a_box_costs_what_its_session_reports_up_to_the_limit(self):
-        lt = Path(tempfile.mkdtemp())
-        self.assertEqual(gpu_review.box_cost(lt), 0.0, "a box that wrote nothing would cost something")
-        (lt / "results").mkdir()
-        (lt / "results/claude.json").write_text(json.dumps({"total_cost_usd": 1.5}))
-        self.assertEqual(gpu_review.box_cost(lt), 1.5)
-        for cost in ("1e12", "Infinity", "NaN", "-1e12", "[1]"):  # claude.json is the box's own file
-            (lt / "results/claude.json").write_text('{"total_cost_usd": %s}' % cost)
-            self.assertEqual(gpu_review.box_cost(lt), 0.0, f"a box could claim a cost of {cost}")
-
-    def test_a_cost_that_cant_be_read_still_releases_the_run(self):
-        calls = []
-        state = types.SimpleNamespace(ledger=lambda: {"eras:1": {}}, load_config=dict,
-                                      release_by_name=lambda cfg, pr, tag: None)
-        with unittest.mock.patch.object(gpu_review, "gpu_py", state), \
-                unittest.mock.patch.object(gpu_review, "gpu", side_effect=lambda *a, **k: calls.append(a) or Done()), \
-                unittest.mock.patch.object(gpu_review, "box_cost", side_effect=ValueError("bad claude.json")), \
-                contextlib.redirect_stdout(io.StringIO()):
-            gpu_review.cleanup({}, 7, "1-1", tempfile.mkdtemp())
-        self.assertIn(("terminate", "eras:1"), calls, "a corrupt cost file would leave the box running")
-
-
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
                 outside=(), above=None, extra=None, head_after=None, untestable=""):
@@ -454,10 +421,10 @@ class TestApprove(unittest.TestCase):
                                        {"filename": "docs/x.rst", "changes": 9000}]}, "couldn't read the diff")):
             with self.subTest(name):
                 text, out, writes = self.approve({"value": "on"}, **kwargs)
-                self.assertEqual((writes, out.get("approval")), ([], None), f"{name} would still approve")
+                self.assertEqual(writes, [], f"{name} would still approve")
                 self.assertIn(says, text)
         text, out, writes = self.approve({"value": "On"})
-        self.assertEqual((writes, out.get("approval")), ([], None), "only the exact word `on` turns approvals on")
+        self.assertEqual(writes, [], "only the exact word `on` turns approvals on")
 
     def test_the_fixed_check_finds_hardware_words_and_leaves_ordinary_ones(self):
         for text, hit in (("amdsmi.gpu", True), ("if isAMD():", True), ("MI300A nodes", True), ("hipcc -c x", True),
@@ -472,8 +439,9 @@ class TestApprove(unittest.TestCase):
         for files in ([{"filename": "mstar/engine/engine.py"}],
                       [{"filename": "docs/x.rst", "previous_filename": "mstar/engine/engine.py"}]):
             with self.subTest(files):
-                _, out, _ = self.approve({"value": "on"}, files=files)
-                self.assertEqual(out["approval"], "comment", "an engine change's approval would count")
+                _, _, fake = self.approve({"value": "on"}, files=files, head_after="0123456789")
+                self.assertEqual(json.loads(fake.writes()[0][1])["event"], "COMMENT",
+                                 "an engine change's approval would count")
 
     def test_a_push_during_the_approval_withdraws_it_and_says_so(self):
         text, out, fake = self.approve({"value": "on"}, head_after="fedcba9876", extra={
@@ -482,7 +450,6 @@ class TestApprove(unittest.TestCase):
             f"PUT repos/{R}/pulls/7/reviews/3/dismissals": {}})
         self.assertIn(f"PUT repos/{R}/pulls/7/reviews/3/dismissals", [key for key, _ in fake.writes()],
                       "the approval would stand on a commit nobody tested")
-        self.assertNotIn("approval", out, "the ledger would record an approval that was withdrawn")
         self.assertIn("Not approved", text)
         text, out, _ = self.approve({"value": "on"}, head_after="fedcba9876", extra={
             f"GET repos/{R}/pulls/7/reviews?per_page=100": [
@@ -500,7 +467,6 @@ class TestApprove(unittest.TestCase):
                     f"PUT repos/{R}/pulls/7/reviews/3/dismissals": {}})
                 self.assertIn(f"PUT repos/{R}/pulls/7/reviews/3/dismissals", [key for key, _ in fake.writes()],
                               "the approval would stand on a commit it can't be sure of")
-                self.assertNotIn("approval", out, "the ledger would record an approval that was withdrawn")
                 self.assertIn("Not approved", text)
 
     def test_a_finding_counts_as_fixed_above_only_while_that_pr_still_holds_the_fix(self):
@@ -513,7 +479,7 @@ class TestApprove(unittest.TestCase):
             with self.subTest(name):
                 _, out, writes = self.approve({"value": "on"}, outside=[finding], above=above,
                                               extra={f"GET repos/{R}/pulls/9": reply})
-                self.assertEqual("approval" in out, approved, f"a PR above that is {name}")
+                self.assertEqual(writes == [f"POST repos/{R}/pulls/7/reviews"], approved, f"a PR above that is {name}")
 
     def test_dismissal_reads_every_page_and_reports_one_that_failed(self):
         reviews = [{"id": 3, "state": "APPROVED", "user": None},
@@ -527,19 +493,19 @@ class TestApprove(unittest.TestCase):
 
     def test_approvals_happen_only_when_the_variable_reads_on(self):
         text, out, writes = self.approve({"value": "on"})
-        self.assertEqual((out["approval"], writes), ("approve", [f"POST repos/{R}/pulls/7/reviews"]))
+        self.assertEqual(writes, [f"POST repos/{R}/pulls/7/reviews"])
         self.assertIn("**Approved** on `0123456`", text)
         for variable, what in (({"value": "off"}, "off"), (Fail("HTTP 404"), "unset"),
                                (Fail("HTTP 403"), "unreadable")):
             text, out, writes = self.approve(variable)
-            self.assertEqual((writes, out.get("approval")), ([], None), f"{what} would still approve")
+            self.assertEqual(writes, [], f"{what} would still approve")
             self.assertTrue(text.startswith("Approvals are off (`REVIEW_APPROVALS`). By the rule this would be "
                                             "approved."), text)
             self.assertIn("Nothing left from the review.", text)
 
     def test_not_approved_lists_the_rules_conditions_as_the_checklist(self):
         text, out, writes = self.approve({"value": "on"}, verdict="fail")
-        self.assertEqual((writes, out.get("approval")), ([], None))
+        self.assertEqual(writes, [])
         self.assertIn("- [ ] the live test's verdict is fail", text, "the rule's condition would not reach the human")
         self.assertNotIn("Not approved", text)
         text, _, _ = self.approve({"value": "off"}, verdict="fail")

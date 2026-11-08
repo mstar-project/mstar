@@ -56,25 +56,11 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
       pageInfo { hasNextPage endCursor }
       nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
     } } } }"""
-# A run's record, base64 JSON, in a ledger comment: one comment per attempt of a run, so concurrent runs can't lose
-# updates.
-SPEND = re.compile(r"<!-- review-spend ([A-Za-z0-9+/=]+) -->")
-# USD the bot may spend on Claude per UTC week (Monday 00:00 UTC on): the review's tokens and the box's session, a
-# change to main like the approval rule. Eras GPU time is bounded by the Eras wallet and limits, not here.
-WEEKLY_CAP = 10_000
-ISSUES = {"ledger": ("Review bot spend ledger",
-                     "The review bot's Claude spend, one comment per run attempt. Read by code."),
-          "status": ("Review bot status", "The review bot's status: a daily report in this body, alerts as comments.")}
-EJECTIONS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: String) {
-  repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
-    timelineItems(first: 100, after: $endCursor, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
-      pageInfo { hasNextPage endCursor }
-      nodes { ... on RemovedFromMergeQueueEvent { createdAt reason } }
-    } } } }"""
+# What starts the status issue's body, how the bot finds its own issue.
+STATUS_ISSUE = "<!-- review-bot-status -->"
 # The monitor's state in the status issue's body (signals already reported), base64 JSON.
 MONITOR = re.compile(r"<!-- review-monitor-state ([A-Za-z0-9+/=]+) -->")
 MONITOR_DAYS = 60
-ISSUE_COMMENTS = 2_000  # a bot issue past this rolls over to a new one; GitHub stops an issue at 2,500
 # How a PR's body says it fixes or reverts another, and the subjects `szz` treats as fixes.
 FIXES = re.compile(r"\b(?:fix(?:e[sd])?|revert(?:s|ed)?)\s+#(\d+)\b", re.IGNORECASE)
 # A fix-word, unless what follows is a typo, or all it fixes is a comment, docs or lint: such a word ending the
@@ -205,111 +191,25 @@ def redact(text, exact=()):
     return text
 
 
-def issue_marker(kind):
-    return f"<!-- review-bot-{kind} -->"
-
-
 def utcnow():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def issues(repo, kind):
-    """The bot's own issues of `kind`, lowest number first: those a bot login created whose body starts
-    with the kind's marker. Created in a race, or rolled over when one is full, several can exist; readers
-    take them all, writers the lowest with room (`issue`)."""
-    found = {}
-    for login in POSTING_BOT_USERS:  # the spend ledger and status issue are written with the job's own token
+def status_issue(repo):
+    """The bot's status issue, or None before the monitor, its one writer, has made it: the issue a bot login
+    created whose body starts with STATUS_ISSUE."""
+    for login in POSTING_BOT_USERS:
         creator = login.replace("[", "%5B").replace("]", "%5D")
         for i in api_list(f"repos/{repo}/issues?state=all&creator={creator}&per_page=100"):
             if (i.get("user") or {}).get("login") in POSTING_BOT_USERS \
-                    and (i.get("body") or "").startswith(issue_marker(kind)):
-                found[i["number"]] = i
-    return [found[n] for n in sorted(found)]
-
-
-def issue(repo, kind):
-    """The number of the bot's issue of `kind` to write to: the lowest with room for more comments, created if
-    there is none."""
-    for i in issues(repo, kind):
-        if i.get("comments", 0) < ISSUE_COMMENTS:
-            return i["number"]
-    title, text = ISSUES[kind]
-    body = json.dumps({"title": title, "body": f"{issue_marker(kind)}\n{text}\n"})
-    return json.loads(gh("api", "-X", "POST", f"repos/{repo}/issues", "--input", "-", input=body).stdout)["number"]
+                    and (i.get("body") or "").startswith(STATUS_ISSUE):
+                return i
+    return None
 
 
 def comment_on_issue(repo, number, body):
     """Post `body` as a comment on an issue, from stdin."""
     gh("issue", "comment", str(number), "--repo", repo, "--body-file", "-", input=body)
-
-
-def ledger(repo, since):
-    """[(created_at, record)] of the ledger since `since` (ISO 8601): the bot's own comments from every ledger
-    issue, once per run, attempt of its review and attempt of its live test. Re-running only a run's spend job
-    keeps the attempts its usage and live test came from, so it adds nothing; re-running all its jobs spends again,
-    and re-running only its live test counts its box session on top of the review already counted, even at the
-    same or no cost, and keeps its approval. A record's `usd` comes back as Claude spend alone: an older record
-    held its GPU cost too, in `usd` and `gpu_usd`, and only the latter is taken off. A failed read raises."""
-    records, seen = [], set()
-    for i in issues(repo, "ledger"):
-        for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100"):
-            m = SPEND.search(c.get("body") or "")
-            if not m or (c.get("user") or {}).get("login") not in POSTING_BOT_USERS:
-                continue
-            try:
-                record = json.loads(base64.b64decode(m[1]))
-            except ValueError:
-                continue
-            run_key = record.get("run"), (record.get("usage") or {}).get("run_attempt") or record.get("attempt")
-            live_key = (*run_key, record.get("live_attempt"))
-            if live_key in seen:
-                continue
-            usd = round(max(0, finite_usd(record) - finite_usd(record, "gpu_usd")), 4)
-            if run_key in seen:  # the live test ran again: a new box session, the review's tokens already counted
-                usd = finite_usd(record, "box_usd")
-            seen |= {run_key, live_key}
-            records.append((c["created_at"], {**record, "usd": usd}))
-    return records
-
-
-def spend(repo, now):
-    """Claude USD spent so far in `now`'s UTC week, which starts Monday 00:00 UTC."""
-    monday = (now - datetime.timedelta(days=now.weekday())).strftime("%Y-%m-%dT00:00:00Z")
-    return sum(finite_usd(record) for created, record in ledger(repo, monday) if created >= monday)
-
-
-def finite_usd(record, key="usd"):
-    """A record's USD under `key`, or 0 when it isn't a finite, non-negative number."""
-    usd = record.get(key)
-    return usd if isinstance(usd, (int, float)) and not isinstance(usd, bool) and 0 <= usd < float("inf") else 0
-
-
-def over_cap(repo):
-    """Why nothing new may start, or None: the weekly cap reached, with one alert on the status issue for it
-    per week, or a failed read of the ledger. Checked at every step that starts spending."""
-    now = utcnow()
-    try:
-        used = spend(repo, now)
-    except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
-        print(f"::warning::Couldn't read the spend ledger: {e}")
-        return "The review bot couldn't read its spend ledger, so no new review or GPU run starts; try again later."
-    if used < WEEKLY_CAP:
-        return None
-    why = (f"The review bot's weekly Claude spend cap (${used:,.0f} of ${WEEKLY_CAP:,}) is reached; it resets Monday "
-           "at 00:00 UTC. No new review or GPU run starts until then.")
-    alert(repo, f"week-{now.strftime('%G-W%V')}", why)
-    return why
-
-
-def alert(repo, key, text):
-    """Comment `text` on the status issue, once per `key`, best effort: a failed alert changes no decision."""
-    marker = f"<!-- review-alert {key} -->"
-    try:
-        number = issue(repo, "status")
-        if not marked(api_list(f"repos/{repo}/issues/{number}/comments?per_page=100"), marker):
-            comment_on_issue(repo, number, f"{marker}\n{text}\n")
-    except (RuntimeError, ValueError, KeyError, TypeError) as e:
-        print(f"::warning::Couldn't post the alert: {e}")
 
 
 # ---------------------------------------------------------------- preflight job
@@ -331,16 +231,6 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
         return
     mode = "" if command == "continue" else command  # the stopped review's mode, from its handoff
 
-    def start(**outputs):
-        """The request is allowed: run it, unless the bot is past the spend cap or can't tell."""
-        stop = over_cap(repo)
-        if stop:
-            print(f"::notice::{stop}")
-            out["run"] = "false"
-            reply(repo, pr, stop)
-            return
-        out.update(run="true", **outputs)
-
     perm = permission(repo, actor)
     if perm in WRITE:
         author_perm = permission(repo, author) if command == "full" else ""
@@ -350,12 +240,12 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
             reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes an author with write access; "
                             "comment `/review nogpu` for the review without the live test.")
             return
-        start(mode=mode, turns=team_turns)
+        out.update(run="true", mode=mode, turns=team_turns)
         return
     own = assoc in CONTRIBUTORS and actor != "" and actor == author and skip_label != "true"
     if own and command in ("light", "continue"):
         print(f"::notice::{actor} has '{perm}' access; reviewing their own PR as its author ({assoc}).")
-        start(mode=mode, non_write_user=actor, turns=self_turns)
+        out.update(run="true", mode=mode, non_write_user=actor, turns=self_turns)
         return
     out["run"] = "false"
     if not own:
@@ -753,19 +643,16 @@ def salvage(out, repo, pr, runner_temp):
             result.get("subtype"), "Claude Code ended without a result")
 
 
-def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, github_run_attempt,
-          github_step_summary, prev=""):
+def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_step_summary, prev=""):
     """What the run used, from the execution file or, after a timeout, the session transcript: a table in
-    the job summary, and the record the `spend` job writes to the ledger (`record`). Never posted on the
-    PR, and never fails: a record that couldn't be read says why in its `error` field."""
-    record = {"pr": pr, "head_sha": head_sha, "mode": mode, "continue": prev != "", "run_id": github_run_id,
-              "run_attempt": github_run_attempt, "outcome": outcome}
+    the job summary. Never posted on the PR, and never fails: a run that couldn't be read says why in its
+    `Error` row."""
+    record = {"pr": pr, "head_sha": head_sha, "mode": mode, "continue": prev != "", "outcome": outcome}
     try:
         record.update(session.usage(session.load([Path(runner_temp, EXECUTION), Path(home, ".claude/projects")])))
     except Exception as e:
         record["error"] = f"{type(e).__name__}: {e}"
         print(f"::warning::Couldn't read the review's usage: {record['error']}")
-    out["record"] = json.dumps(record, separators=(",", ":"))
     try:
         with open(github_step_summary, "a") as f:
             f.write(session.usage_table(record))
@@ -936,36 +823,6 @@ def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_conti
         comment(repo, pr, text)
 
 
-# ---------------------------------------------------------------- spend job
-
-def record(out, repo, pr, github_run_id, github_run_attempt, usage="", box_usd="", approval="",
-           live_attempt=""):
-    """Append one record for this run to the ledger issue (`spend` job, after the review and the live test),
-    so the cap and the monitor read what each run cost in Claude: the review's tokens and the live test's box
-    session. Nothing spent, nothing written."""
-    try:
-        review = json.loads(usage) if usage else {}
-    except ValueError:
-        review = {}
-    box = float(box_usd or 0)
-    if not review and not box:
-        return
-    cost = review.get("total_cost_usd")
-    usd = round((cost if isinstance(cost, (int, float)) else 0) + box, 4)
-    entry = {"pr": pr, "head": review.get("head_sha"), "mode": review.get("mode"), "run": github_run_id,
-             "attempt": github_run_attempt, "usage": review, "box_usd": box, "approval": approval,
-             "live_attempt": live_attempt, "usd": usd}
-    b64 = base64.b64encode(json.dumps(entry).encode()).decode()
-    what = f"PR `#{pr}`" if pr else "Weekly improvement run"
-    try:
-        comment_on_issue(repo, issue(repo, "ledger"), f"{what}: ${usd:,.2f}.\n<!-- review-spend {b64} -->\n")
-    except UNREADABLE as e:
-        alert(repo, f"ledger-{github_run_id}-{github_run_attempt}",
-              f"Run {github_run_id}'s spend (${usd:,.2f}) didn't reach the ledger, so the cap doesn't count it: "
-              f"{safe(e)}")
-        raise
-
-
 # ---------------------------------------------------------------- monitor (a daily job; no model)
 
 def main_commits(since):
@@ -1081,7 +938,7 @@ def pr_signals(repo, pull, commits, bug_prs, window=""):
     number, merge = pull["number"], pull.get("merge_commit_sha")
     timeline = api_list(f"repos/{repo}/issues/{number}/timeline?per_page=100")
     signals, mentions = referenced(timeline, number, repo)
-    if pull.get("merged_at") and merge:
+    if merge:
         shas = {merge} | {c["sha"] for c in api_list(f"repos/{repo}/pulls/{number}/commits?per_page=100")}
         signals += [{"key": f"{number}:reverted:{c['sha'][:10]}",
                      "text": f"`#{number}` reverted by `{c['sha'][:10]}` ({safe(c['subject'])})"}
@@ -1091,46 +948,46 @@ def pr_signals(repo, pull, commits, bug_prs, window=""):
         parents = next((c["parents"].split() for c in commits if c["sha"] == merge), [])
         if parents:
             signals += ci_regressions(repo, number, merge, parents[0])
-    else:  # open and approved: did the merge queue throw it out? (only GraphQL says)
-        for page in graphql(EJECTIONS, repo, number):
-            for e in page["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"]:
-                signals.append({"key": f"{number}:ejected:{e['createdAt']}",
-                                "text": f"`#{number}` removed from the merge queue ({safe(e.get('reason'))})"})
     return signals, mentions
 
 
 def monitor(out, repo, approvals=""):
-    """The daily report (review-monitor.yml), with no model: what happened to the PRs the bot approved
-    in the last 60 days, today's spend, the kill switch and new bug reports, written to the status
-    issue's body. Signals not reported before go out as one comment, so subscribers get at most one
-    notification a day. Untrusted titles go through `safe`, text reaches `gh` on stdin."""
+    """The daily report (review-monitor.yml), with no model: what happened to the PRs merged in the last 60
+    days with the bot's approval (GitHub's own record: an APPROVED review of the bot's), the kill switch and
+    new bug reports, written to the status issue's body. Signals not reported before go out as one comment,
+    so subscribers get at most one notification a day. Untrusted titles go through `safe`, text reaches
+    `gh` on stdin."""
     now = utcnow()
     window = (now - datetime.timedelta(days=MONITOR_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    number = issue(repo, "status")
+    existing = status_issue(repo)
+    number = existing["number"] if existing else json.loads(gh(
+        "api", "-X", "POST", f"repos/{repo}/issues", "--input", "-",
+        input=json.dumps({"title": "Review bot status",
+                          "body": f"{STATUS_ISSUE}\nThe review bot's status: a daily report in this body.\n"})
+    ).stdout)["number"]
     body = api(f"repos/{repo}/issues/{number}").get("body") or ""
     try:
         state = json.loads(base64.b64decode(MONITOR.search(body)[1]))
     except (ValueError, TypeError):
         state = {}
     last = state.get("last") or window
-    approved = sorted({int(r["pr"]) for _, r in ledger(repo, window)
-                       if r.get("approval") == "approve" and str(r.get("pr")).isdigit()}, reverse=True)
+    merged = sorted((i["number"] for i in api_list(f"repos/{repo}/issues?state=closed&since={window}&per_page=100")
+                     if ((i.get("pull_request") or {}).get("merged_at") or "") >= window), reverse=True)
     commits = main_commits(window)
     bug_prs = {i["number"] for i in api_list(f"repos/{repo}/issues?state=closed&labels=type%2Fbug&since={window}"
                                              "&per_page=100")
                if (i.get("pull_request") or {}).get("merged_at")}
     rows, signals, linked, unread = [], [], set(), set()
-    for pr in approved:
+    for pr in merged:
         try:
-            pull = api(f"repos/{repo}/pulls/{pr}")
             reviews = api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")
-            stood = any(r.get("state") == "APPROVED" and (r.get("user") or {}).get("login") in BOT_USERS
-                        for r in reviews)
-            if not stood or not (pull.get("merged_at") or pull.get("state") == "open"):
+            if not any(r.get("state") == "APPROVED" and (r.get("user") or {}).get("login") in BOT_USERS
+                       for r in reviews):
                 continue
+            pull = api(f"repos/{repo}/pulls/{pr}")
             found, mentions = pr_signals(repo, {**pull, "number": pr}, commits, bug_prs, window)
         except UNREADABLE as e:
-            rows.append(f"| `#{pr}` | ? | couldn't read: {safe(e).replace('|', '/')} |")
+            rows.append(f"| `#{pr}` | couldn't read: {safe(e).replace('|', '/')} |")
             unread.add(str(pr))
             continue
         signals += found
@@ -1138,20 +995,17 @@ def monitor(out, repo, approvals=""):
         cell = "; ".join(s["text"] for s in found) or "none"
         if mentions:
             cell += " (also mentioned in " + ", ".join(f"`{m}`" for m in mentions) + ")"
-        merged = "merged" if pull.get("merged_at") else "open"
-        rows.append(f"| `#{pr}` {safe(pull.get('title')).replace('|', '/')} | {merged} | {cell.replace('|', '/')} |")
+        rows.append(f"| `#{pr}` {safe(pull.get('title')).replace('|', '/')} | {cell.replace('|', '/')} |")
     bugs = [i for i in api_list(f"repos/{repo}/issues?state=all&labels=bug&since={last}&per_page=100")
             if "pull_request" not in i and (i.get("created_at") or "") >= last and str(i["number"]) not in linked]
     new_prs = [p for p in api(f"repos/{repo}/pulls?state=all&sort=created&direction=desc&per_page=100") or []
                if (p.get("created_at") or "") >= last]
-    used = spend(repo, now)
     reported = set(state.get("signals") or [])
     current = {s["key"]: s for s in signals}
     fresh = [current[k]["text"] for k in sorted(current) if k not in reported]
-    head = [issue_marker("status"), "### Review bot status", f"Updated {now.strftime('%Y-%m-%d %H:%M')} UTC.", "",
-            f"Claude spend this week: ${used:,.0f} of ${WEEKLY_CAP:,}. "
+    head = [STATUS_ISSUE, "### Review bot status", f"Updated {now.strftime('%Y-%m-%d %H:%M')} UTC.", "",
             f"Approvals: **{'on' if approvals == 'on' else 'off'}** (`REVIEW_APPROVALS`).", "",
-            f"#### PRs the bot approved, last {MONITOR_DAYS} days", "| PR | State | Signals |", "| --- | --- | --- |"]
+            f"#### PRs merged with the bot's approval, last {MONITOR_DAYS} days", "| PR | Signals |", "| --- | --- |"]
     tail = ["", f"New PRs since the last report: {len(new_prs)}.",
             "#### New bug reports not linked to an approved PR"]
     tail += [f"- `#{i['number']}` {safe(i.get('title'))}" for i in bugs] or ["None."]
@@ -1159,12 +1013,12 @@ def monitor(out, repo, approvals=""):
     saved = {"last": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "signals": sorted(set(current) | kept)}
     tail.append(f"\n<!-- review-monitor-state {base64.b64encode(json.dumps(saved).encode()).decode()} -->")
     while len("\n".join(head + rows + tail)) > 60_000 and rows:
-        rows.pop()  # the oldest PRs go first: `approved` is newest first
+        rows.pop()  # the oldest PRs go first: `merged` is newest first
     if fresh:  # first: the body below records these as reported, so a failed post goes out tomorrow
         comment_on_issue(repo, number, "**New signals on PRs the bot approved:**\n\n"
                          + "\n".join(f"- {text}" for text in fresh) + "\n")
     gh("api", "-X", "PATCH", f"repos/{repo}/issues/{number}", "--input", "-",
-       input=json.dumps({"body": "\n".join(head + (rows or ["| | | none yet |"]) + tail) + "\n"}))
+       input=json.dumps({"body": "\n".join(head + (rows or ["| | none yet |"]) + tail) + "\n"}))
 
 
 # ---------------------------------------------------------------- improve (a weekly job)
@@ -1182,9 +1036,9 @@ def monday(now):
     return (now - datetime.timedelta(days=now.weekday())).strftime("%Y-%m-%d")
 
 
-def pr_evidence(repo, pr, since, records):
-    """What happened on PR `pr` since `since`, for the improvement run: its runs from the ledger (cost, outcome),
-    the findings a later review judged moot, its reviews, inline comments and conversation. Logins become a role.
+def pr_evidence(repo, pr, since):
+    """What happened on PR `pr` since `since`, for the improvement run: the findings a later review judged moot,
+    its reviews, inline comments and conversation. Logins become a role.
     A finding someone resolved stays however old it is: GitHub doesn't say when a thread was resolved."""
     author = (api(f"repos/{repo}/pulls/{pr}").get("user") or {}).get("login")
     inline, conversation = discussion(repo, pr)
@@ -1206,50 +1060,42 @@ def pr_evidence(repo, pr, since, records):
                              "body": scrub(c["body"])})
         return rows[-IMPROVE_ITEMS:]
 
-    runs = [{"mode": r.get("mode"), "outcome": (r.get("usage") or {}).get("outcome"),
-             "subtype": (r.get("usage") or {}).get("subtype"), "turns": (r.get("usage") or {}).get("num_turns"),
-             "usd": r.get("usd"), "box_usd": r.get("box_usd"),
-             "approval": r.get("approval"), "url": f"https://github.com/{repo}/actions/runs/{r.get('run')}"}
-            for created, r in records if created >= since and str(r.get("pr")) == str(pr)]
     moot = [{"ref": scrub(f.get("ref")), "why": scrub(f.get("why")), "url": c["url"]}
             for c in conversation
             if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)
             and (c.get("created_at") or "") >= since
             for f in (render_summary.saved_state(c["body"]) or {}).get("moot", [])]
-    return {"runs": runs, "moot": moot, "reviews": kept(reviews), "inline": kept(inline),
+    return {"moot": moot, "reviews": kept(reviews), "inline": kept(inline),
             "conversation": kept(conversation)}
 
 
 def improve_inputs(out, repo, key_set):
-    """The evidence for the weekly improvement run (review-improve.yml), in improve-evidence/: one file per PR the
-    bot reviewed in the last three weeks with anything from the last 7 days, and status.json, the status
-    issue's signals and alerts. `run` stays false without an API key, past the spend cap, once this week's run
-    has finished (a failed one can be retried by hand), or with nothing to read."""
+    """The evidence for the weekly improvement run (review-improve.yml), in improve-evidence/: one file per PR
+    with a review summary or a stopped review of the bot's in the last three weeks and anything from the last
+    7 days, and status.json, the status issue's signals. `run` stays false without an API key, or with nothing
+    to read."""
     out["run"] = "false"
     if key_set != "true":
         print("::warning::ANTHROPIC_API_KEY is not set; skipping the improvement run.")
         return
-    stop = over_cap(repo)  # its alert is best effort: this job's token can only read issues
-    if stop:
-        print(f"::notice::{stop}")
-        return
     now = utcnow()
     stamp = "%Y-%m-%dT%H:%M:%SZ"
-    records = ledger(repo, (now - datetime.timedelta(days=21)).strftime(stamp))
-    if any(r.get("mode") == "improve" and (r.get("usage") or {}).get("outcome") == "success"
-           and created >= f"{monday(now)}T00:00:00Z" for created, r in records):
-        print("::notice::This week's improvement run has already finished.")
-        return
     since = (now - datetime.timedelta(days=7)).strftime(stamp)
-    newest_first = dict.fromkeys(int(r["pr"]) for _, r in reversed(records) if str(r.get("pr")).isdigit())
+    newest_first = dict.fromkeys(
+        int(c["issue_url"].rsplit("/", 1)[1])
+        for c in reversed(api_list(f"repos/{repo}/issues/comments"
+                                   f"?since={(now - datetime.timedelta(days=21)).strftime(stamp)}&per_page=100"))
+        if (c.get("user") or {}).get("login") in BOT_USERS
+        and (c.get("body") or "").startswith((render_summary.MARKER, INCOMPLETE)))
     files = {}
     for pr in list(newest_first)[:IMPROVE_ITEMS]:
-        evidence = pr_evidence(repo, pr, since, records)
+        evidence = pr_evidence(repo, pr, since)
         if any(evidence.values()):
             files[f"{pr}.json"] = {"pr": pr, **evidence}
+    found = status_issue(repo)
     status = [{"url": c.get("html_url"), "text": scrub(line)}
-              for i in issues(repo, "status")
-              for c in api_list(f"repos/{repo}/issues/{i['number']}/comments?since={since}&per_page=100")
+              for c in (api_list(f"repos/{repo}/issues/{found['number']}/comments?since={since}&per_page=100")
+                        if found else [])
               if (c.get("user") or {}).get("login") in POSTING_BOT_USERS
               for line in (c.get("body") or "").splitlines() if line.strip()]
     if status:
@@ -1263,12 +1109,11 @@ def improve_inputs(out, repo, key_set):
     out.update(run="true", schema=json.dumps(IMPROVE_SCHEMA, separators=(",", ":")))
 
 
-def improve_post(out, repo, github_run_id, github_run_attempt, output="", usage=""):
-    """Record what the improvement run cost, first, so a failed post can't lose it; then open the week's issue
-    from its structured output, redacted, on stdin. Evidence links stay inside this repository (no `..`, which
-    would climb out of it) and go through redirect.github.com, which keeps them off the PRs' timelines. An empty
-    list opens nothing; a run that returned no list fails. Never touches code, PRs or the bot."""
-    record(out, repo, "", github_run_id, github_run_attempt, usage=usage)
+def improve_post(out, repo, output=""):
+    """Open the week's issue from the improvement run's structured output, redacted, on stdin. Evidence links
+    stay inside this repository (no `..`, which would climb out of it) and go through redirect.github.com, which
+    keeps them off the PRs' timelines. An empty list opens nothing; a run that returned no list fails. Never
+    touches code, PRs or the bot."""
     try:
         items = json.loads(output)["improvements"]
     except (ValueError, KeyError, TypeError):
@@ -1320,7 +1165,7 @@ def main(steps):
 
 STEPS = {"preflight": preflight, "react": react, "resolve": resolve, "collect": collect, "salvage": salvage,
          "usage": usage, "post": post, "hide": hide, "labels": labels, "handoff": handoff, "incomplete": incomplete,
-         "record": record, "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post}
+         "monitor": monitor, "improve_inputs": improve_inputs, "improve_post": improve_post}
 
 if __name__ == "__main__":
     main(STEPS)

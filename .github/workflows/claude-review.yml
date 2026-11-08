@@ -20,10 +20,9 @@ name: Claude Review
 #   3. Rules are read from main's checkout at the root. The prompt tells the
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
-#   4. The job's token can write only to pull requests and, for the spend
-#      ledger and its alerts, to issues (preflight, live-test and spend jobs),
-#      and the review app's token (below) only to pull requests and issues of
-#      this repository, and in full mode to the media repository's contents
+#   4. The job's token can write only to pull requests, and the review app's
+#      token (below) only to pull requests and issues of this repository, and
+#      in full mode to the media repository's contents
 #      (REVIEW_MEDIA_REPO). The job token of the review job, which runs the
 #      model, has no issues: write (the app token it mints does, to post and
 #      react). The job token can't read repository variables.
@@ -104,8 +103,7 @@ name: Claude Review
 # `pull_request` workflow can upload an artifact with any name.
 #
 # Every run that reaches Claude records its API calls, tokens, turns and cost
-# in the job summary and in one comment on the spend ledger issue (bot.py,
-# record), read by the preflight and the live test to enforce the Claude spend cap.
+# in the job summary, never on the PR.
 
 on:
   issue_comment:
@@ -149,8 +147,6 @@ jobs:
       contents: read
       # The one-line reply to a refused request.
       pull-requests: write
-      # The spend check reads the ledger issue and alerts on the status issue.
-      issues: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
@@ -223,8 +219,6 @@ jobs:
       above: ${{ steps.diff.outputs.above }}
       # Finished and returned its summary itself: a salvaged or stopped review never approves.
       complete: ${{ steps.review.outcome == 'success' && steps.post.outcome == 'success' }}
-      # What the run used, for the ledger (the `spend` job below).
-      usage: ${{ steps.usage.outputs.record }}
     permissions:
       # actions: read lists and downloads the saved handoff for /review continue.
       actions: read
@@ -395,11 +389,9 @@ jobs:
         run: python3 .github/review/bot.py salvage
 
       # What the run used, from the execution file or, after a timeout, the
-      # session transcript: a table in the job summary, and the record the
-      # `spend` job appends to the ledger. Never posted on the PR.
+      # session transcript: a table in the job summary. Never posted on the PR.
       - name: Record usage
         if: always() && steps.diff.outcome == 'success'
-        id: usage
         continue-on-error: true
         env:
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -508,17 +500,9 @@ jobs:
       cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    outputs:
-      # What the box's session cost, and what was decided, for the ledger.
-      box_usd: ${{ steps.release.outputs.box_usd }}
-      approval: ${{ steps.approve.outputs.approval }}
-      # A re-run of only the spend job keeps this; a re-run of the live test changes it. The ledger's key.
-      live_attempt: ${{ github.run_attempt }}
     permissions:
       contents: read
       pull-requests: write
-      # The spend check before the GPUs start: reads the ledger, and alerts on the status issue.
-      issues: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REPO: ${{ github.repository }}
@@ -707,7 +691,6 @@ jobs:
       # Whatever this run launched goes, even after a cancel or a failure above.
       - name: Release the GPUs
         if: always() && steps.cfg.outcome == 'success'
-        id: release
         continue-on-error: true
         run: python3 .github/review/gpu_review.py cleanup
 
@@ -722,37 +705,3 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/review/gpu_review.py incomplete
-
-  # The one writer of the spend ledger: one comment per attempt of a run, after the review and the
-  # live test whatever became of them, so the cap sees every run that spent anything.
-  # A job of its own, so the job token's `issues: write` stays out of the job that runs the model.
-  spend:
-    name: Record spend
-    needs: [preflight, review, live-test]
-    if: always() && needs.preflight.outputs.run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      issues: write
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      REPO: ${{ github.repository }}
-      PR: ${{ github.event.issue.number }}
-    steps:
-      - name: Check out main's scripts
-        continue-on-error: true
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          sparse-checkout: .github/review
-          persist-credentials: false
-
-      - name: Append this run to the spend ledger
-        continue-on-error: true
-        env:
-          USAGE: ${{ needs.review.outputs.usage }}
-          BOX_USD: ${{ needs.live-test.outputs.box_usd }}
-          APPROVAL: ${{ needs.live-test.outputs.approval }}
-          LIVE_ATTEMPT: ${{ needs.live-test.outputs.live_attempt }}
-        run: python3 .github/review/bot.py record

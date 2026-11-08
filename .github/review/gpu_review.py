@@ -9,7 +9,7 @@ decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config `configure` writes: the team's
 Slurm node with the most GPUs free, else any open Eras listing under the hourly cap. The live
 test's files are in $RUNNER_TEMP/lt; `start` and `wait` exit 3, with `unavailable` set, when no GPUs
-are free, the bot has REVIEW_GPU_MAX_RUNS runs going or it is past the spend cap, after writing lt/unavailable.md.
+are free or the bot has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md.
 """
 import fnmatch
 import html
@@ -54,7 +54,6 @@ NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
 # Multi-Process Service. `TPU` in capitals only: `tpu` is also an ordinary local variable.
 UNTESTABLE_HARDWARE = re.compile(r"(?<![a-z0-9])(?:(?:is)?amd(?!64)[a-z0-9]*|rocm|hip(?:cc)?|mi\d{3}[ax]?|xpu|gaudi|hpu"
                                  r"|(?-i:TPU)|(?<!bare[- _])metal|apple[ _-]?silicon)(?![a-z0-9])", re.IGNORECASE)
-MAX_BOX_USD = 500  # what a box's own claude.json can claim for one run; a box controls that file
 ERAS_OUT = "/workspace/live-pr/out"
 # The kinds of check the review can ask for (the schema's `checks`), as the brief names them.
 CHECKS = {"correctness": "correctness (served output, parity, regressions)",
@@ -330,8 +329,8 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
           asked_checks="", turns="2000"):
     """Get GPUs and start the live-test session on them: the brief (fixed text, the commits and carry's
     call), the review's notes (findings.json) and the PR's title and description (pr-body.md) as data,
-    and the box's own Anthropic key. Exits 3, with `unavailable` set, when the bot is past the spend cap,
-    no GPUs are free or it has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md."""
+    and the box's own Anthropic key. Exits 3, with `unavailable` set, when no GPUs are free or it has
+    REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md."""
     pr, gpus, hours, turns = int(pr), int(gpus), float(hours), int(turns)
     base, checks = branch(base), check_kinds(checks)
     since = commit(since) if since else ""
@@ -351,9 +350,6 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
     (lt / "pr-body.md").write_text(f"# {pull['title']}\n\n{pull['body'] or ''}\n")
     (lt / "run.json").write_text(json.dumps({"repo": REPO, "pr": pr, "sha": head_sha, "main_sha": main_sha,
                                              "model": MODEL, "turns": turns, "claude": CLAUDE}))
-    stop = bot.over_cap(REPO)  # a review can take hours, so again right before the spend, as at preflight
-    if stop:
-        unavailable(out, lt, stop)
     cfg = gpu_py.load_config()
     free, listing = free_offers(gpus)
     cap = listing["max_usd_per_hour"]
@@ -486,25 +482,9 @@ def wait(out, runner_temp, start_timeout="30"):
     print(f"collected: {sorted(p.name for p in results.iterdir())}")
 
 
-def box_cost(lt):
-    """USD of the box's own Claude Code session, believed only up to MAX_BOX_USD."""
-    try:
-        box_usd = float(json.loads((lt / "results/claude.json").read_text()).get("total_cost_usd") or 0)
-    except (OSError, ValueError, AttributeError, TypeError, OverflowError, RecursionError):
-        box_usd = 0.0
-    if not 0 <= box_usd <= MAX_BOX_USD:  # NaN fails this too
-        box_usd = 0.0
-    return box_usd
-
-
-def cleanup(out, pr, tag, runner_temp):
-    """Release whatever this run launched, from the ledger and by name, for a run cancelled mid-launch;
-    and first what the box's session cost, for the ledger, so a failed release can't lose it."""
+def cleanup(out, pr, tag):
+    """Release whatever this run launched, from the ledger and by name, for a run cancelled mid-launch."""
     pr = int(pr)
-    try:  # nothing here may stop the release below
-        out["box_usd"] = str(box_cost(Path(runner_temp, "lt")))
-    except Exception as e:
-        print(f"::warning::Couldn't read the run's cost: {type(e).__name__}: {e}")
     print(gpu("list", check=False).stdout)
     for key in list(gpu_py.ledger()):
         gpu("terminate", key, check=False)
@@ -708,7 +688,6 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
                 "area/engine or area/resources ("
                 + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else "") + ").")
         review_pr(pr, head_sha, "COMMENT", body)
-        out["approval"] = "comment"
         decision.write_text(f"**Would approve** `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`; "
                             "doesn't count toward required reviews: touches area/engine or area/resources.\n")
         return
@@ -727,7 +706,6 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
             raise
         decision.write_text(said)
         return
-    out["approval"] = "approve"
     decision.write_text(f"**Approved** on `{head_sha[:7]}` by the rule in `.github/review/gpu_review.py`.\n")
 
 
