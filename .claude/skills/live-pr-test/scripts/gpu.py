@@ -473,63 +473,64 @@ def cmd_launch(args, cfg):
     max_total = cfg["budget"].get("max_total_usd")
     max_running = cfg["budget"].get("max_running")
 
-    if o["provider"] == "slurm":
-        sl, n = cfg["slurm"], o["count"]
-        jobdir = job_dir(cfg, name)
-        body = " ".join(["sbatch", "--parsable", "-p", shlex.quote(sl.get("partition", "main")),
-                         f"--gres=gpu:{n}", f"-c {sl.get('cpus_per_gpu', 24) * n}",
-                         f"--mem={sl.get('mem_gb_per_gpu', 180) * n}G", f"--time={max(1, int(hours * 60))}",
-                         f"--nice={sl.get('nice', 100)}", "--no-requeue", f"-J {shlex.quote(name)}",
-                         shlex.quote(f"--export=ALL,HF_HOME={hf_home(cfg, 'slurm', None)}"),
-                         *([f"--chdir={shlex.quote(jobdir)}", f"-o {shlex.quote(jobdir)}/job.log",
-                            shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
-                           else ["-o /dev/null", "--wrap 'sleep infinity'"])])
-    elif o["provider"] == "eras":
-        volume = eras_cache_volume(cfg, args.cache, args.cache_volume)
-        body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input, volume, args.cache == "rw")
-    elif o["provider"] == "runpod":
-        rp = cfg["runpod"]
-        vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
-        kind = "global" if vol["kind"] == "global" else "network"
-        body = {
-            "name": name, "cloud": "SECURE",
-            "gpu": {"id": o["gpu"], "count": o["count"], "minCudaVersion": rp.get("min_cuda", "12.8")},
-            "image": rp["image"], "disk": rp.get("disk_gb", 200),
-            # Both names: the API spec and the SSH docs disagree on which one the image reads.
-            "env": {"PUBLIC_KEY": pubkey, "SSH_PUBLIC_KEY": pubkey, "HF_HOME": rp["hf_home"]},
-            "ports": ["22/tcp"], "startSsh": True,
-            "mounts": {kind: [{"volumeId": vol["id"], "path": "/workspace"}]},
-            "dataCenterIds": [o["region"]],
-        }
-    else:
-        lm = cfg["lambda"]
-        fs = lambda_filesystems(cfg)[o["region"]]
-        body = {
-            "name": name, "region_name": o["region"], "instance_type_name": o["id"].split(":")[1],
-            "ssh_key_names": [lm["ssh_key_name"]], "file_system_names": [fs["name"]],
-            "image": {"family": lm.get("image_family", "lambda-stack-24-04")},
-        }
-    if args.dry_run:
-        print(body if isinstance(body, str) else json.dumps(body, indent=1).replace(pubkey, "<public key>"))
-        return
-
-    # The caps are checked and the launch recorded under one lock, so parallel
-    # sessions can't each pass the check and launch together.
-    with ledger_txn() as d:
-        if len(d) >= max_instances and not args.allow_over_budget:
-            die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
-                f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
-        if max_running is not None and not args.allow_over_budget:
-            up, errors = running(cfg)
-            if o["provider"] in errors:
-                die(f"can't count this tool's {o['provider']} jobs for budget.max_running: {errors[o['provider']]}")
-            if len(up) >= max_running:
-                die(f"{len(up)} of this tool's jobs are up, from every session; budget.max_running is {max_running}. "
-                    "Wait for one to end, or ask before passing --allow-over-budget")
-        committed = sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours
-        if max_total is not None and committed > max_total and not args.allow_over_budget:
-            die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
-                f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
+    # The caps are checked and the launch recorded under one lock, so parallel sessions can't each
+    # pass the check and launch together; and the body is built after the caps, since building an
+    # Eras one registers an ssh key. A dry run checks nothing and records nothing.
+    with contextlib.nullcontext({}) if args.dry_run else ledger_txn() as d:
+        if not args.dry_run:
+            if len(d) >= max_instances and not args.allow_over_budget:
+                die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
+                    f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
+            if max_running is not None and not args.allow_over_budget:
+                up, errors = running(cfg)
+                if o["provider"] in errors:
+                    die(f"can't count this tool's {o['provider']} jobs for budget.max_running: {errors[o['provider']]}")
+                if len(up) >= max_running:
+                    die(f"{len(up)} of this tool's jobs are up, from every session; budget.max_running is "
+                        f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget")
+            committed = sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours
+            if max_total is not None and committed > max_total and not args.allow_over_budget:
+                die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
+                    f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
+        if o["provider"] == "slurm":
+            sl, n = cfg["slurm"], o["count"]
+            jobdir = job_dir(cfg, name)
+            body = " ".join(["sbatch", "--parsable", "-p", shlex.quote(sl.get("partition", "main")),
+                             f"--gres=gpu:{n}", f"-c {sl.get('cpus_per_gpu', 24) * n}",
+                             f"--mem={sl.get('mem_gb_per_gpu', 180) * n}G", f"--time={max(1, int(hours * 60))}",
+                             f"--nice={sl.get('nice', 100)}", "--no-requeue", f"-J {shlex.quote(name)}",
+                             shlex.quote(f"--export=ALL,HF_HOME={hf_home(cfg, 'slurm', None)}"),
+                             *([f"--chdir={shlex.quote(jobdir)}", f"-o {shlex.quote(jobdir)}/job.log",
+                                shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
+                               else ["-o /dev/null", "--wrap 'sleep infinity'"])])
+        elif o["provider"] == "eras":
+            volume = eras_cache_volume(cfg, args.cache, args.cache_volume)
+            body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input, volume, args.cache == "rw")
+        elif o["provider"] == "runpod":
+            rp = cfg["runpod"]
+            vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
+            kind = "global" if vol["kind"] == "global" else "network"
+            body = {
+                "name": name, "cloud": "SECURE",
+                "gpu": {"id": o["gpu"], "count": o["count"], "minCudaVersion": rp.get("min_cuda", "12.8")},
+                "image": rp["image"], "disk": rp.get("disk_gb", 200),
+                # Both names: the API spec and the SSH docs disagree on which one the image reads.
+                "env": {"PUBLIC_KEY": pubkey, "SSH_PUBLIC_KEY": pubkey, "HF_HOME": rp["hf_home"]},
+                "ports": ["22/tcp"], "startSsh": True,
+                "mounts": {kind: [{"volumeId": vol["id"], "path": "/workspace"}]},
+                "dataCenterIds": [o["region"]],
+            }
+        else:
+            lm = cfg["lambda"]
+            fs = lambda_filesystems(cfg)[o["region"]]
+            body = {
+                "name": name, "region_name": o["region"], "instance_type_name": o["id"].split(":")[1],
+                "ssh_key_names": [lm["ssh_key_name"]], "file_system_names": [fs["name"]],
+                "image": {"family": lm.get("image_family", "lambda-stack-24-04")},
+            }
+        if args.dry_run:
+            print(body if isinstance(body, str) else json.dumps(body, indent=1).replace(pubkey, "<public key>"))
+            return
         try:
             if o["provider"] == "slurm":
                 if args.run:  # the job's directory, script and inputs exist before it can start

@@ -308,7 +308,9 @@ class TestEras(unittest.TestCase):
             GPU["terminate"]("eras:i-1", e)
         self.assertEqual(GPU["ledger"](), {}, "the watchdog would retry a released instance forever")
 
-    def test_a_cache_refresh_never_launches_without_its_volume(self):
+    def eras_launch(self, cache, max_running=None):
+        """gpu.py launch on a fake Eras whose one cache volume, v1, looks free but is refused at
+        preview, as when another box took it in between; the calls it made."""
         key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
         key.write_text("ssh-ed25519 AAAA test")
         tpl = {"endpoints": {"ssh": {"port": 22}}, "pod": {"containers": [
@@ -316,7 +318,7 @@ class TestEras(unittest.TestCase):
 
         def eras(method, path, body=None, params=None):
             calls.append((method, path, body))
-            if path == "/instances/preview":  # another box holds the volume
+            if path == "/instances/preview":
                 held = set(body["run"]["bindings"]["volumes"]) != {"workspace"}
                 return {"problems": [{"code": "volume_bound"}] if held else [], "is_available": True,
                         "quote": {"line_items": []}}
@@ -330,24 +332,29 @@ class TestEras(unittest.TestCase):
                 "id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1, "usd_per_hour": 3.0, "region": "x",
                 "storage": True})
         cfg = {"ssh_public_key": str(key), "eras": {"cache_volume_ids": ["v1"]},
-               "budget": {"max_usd_per_hour": 30, "max_hours": 4}}
-
-        def launch(cache):
-            calls.clear()
-            args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=None, input=[], cache=cache,
-                                      cache_volume="v1", allow_over_budget=False, dry_run=False)
-            with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()), \
-                    contextlib.redirect_stderr(io.StringIO()):
+               "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": max_running}}
+        args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=None, input=[], cache=cache,
+                                  cache_volume="v1", allow_over_budget=False, dry_run=False)
+        with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()), \
+                unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}), contextlib.redirect_stderr(io.StringIO()):
+            try:
                 GPU["cmd_launch"](args, cfg)
-            return [c[2] for c in calls if c[1] == "/instances"]
+            except SystemExit as e:
+                calls.append(("exit", e.code, None))
+        return calls
 
-        with self.assertRaises(SystemExit):
-            launch("rw")
-        self.assertEqual([c for c in calls if c[1] == "/instances"], [],
+    def test_a_cache_refresh_never_launches_without_its_volume(self):
+        calls = self.eras_launch("rw")
+        self.assertEqual([c for c in calls if c[1] == "/instances" and c[0] == "POST"], [],
                          "the refresh would fill a box's local disk and report success, writing nothing to the volume")
-        created = launch("ro")
+        created = [c[2] for c in self.eras_launch("ro") if c[1] == "/instances" and c[0] == "POST"]
         self.assertEqual([list(b["run"]["bindings"]["volumes"]) for b in created], [["workspace"]],
                          "a live test would wait for the cache volume instead of starting cold")
+
+    def test_a_launch_past_the_caps_registers_nothing(self):
+        calls = self.eras_launch("ro", max_running=0)
+        self.assertEqual([c[:2] for c in calls if c[0] in ("POST", "exit")], [("exit", 1)],
+                         "a refused launch would leave an ssh key in the organization")
 
 
 if __name__ == "__main__":
