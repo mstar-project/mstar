@@ -340,7 +340,7 @@ def patch_key(lines):
     judged alone, since a type change has two."""
     starts = [i for i, line in enumerate(lines) if line.startswith("diff --git ")] + [len(lines)]
     key = []
-    for start, end in zip(starts, starts[1:]):
+    for start, end in zip(starts, starts[1:], strict=False):
         section = lines[start:end]
         hunks = any(line.startswith("@@") for line in section)
         for line in section:
