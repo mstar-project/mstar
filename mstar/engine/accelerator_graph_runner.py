@@ -40,7 +40,7 @@ from mstar.model.submodule_base import (
     lora_rows,
 )
 from mstar.platforms import current_platform
-from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.compile import deterministic_inductor_options, with_inductor_overrides
 from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
 
@@ -80,27 +80,6 @@ def compile_level() -> int:
         )
         return DEFAULT_COMPILE_LEVEL
     return level
-
-
-@cache
-def _has_deterministic_mode() -> bool:
-    import torch._inductor.config as inductor_config
-
-    if hasattr(inductor_config, "deterministic"):
-        return True
-    logger.warning(
-        "torch %s has no Inductor deterministic mode; compiles that ask for it time "
-        "their kernels instead, so their output can differ between server processes",
-        torch.__version__,
-    )
-    return False
-
-
-def deterministic_inductor_options() -> dict[str, Any]:
-    """Inductor options for its deterministic mode (see
-    ``DETERMINISTIC_COMPILE_MODE``), for a compile that sets its own options;
-    empty, with a warning, on a torch without the mode."""
-    return {"deterministic": True} if _has_deterministic_mode() else {}
 
 
 def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
@@ -263,7 +242,7 @@ def capture_with_static_outputs(
 
 
 def fail_if_graphs_required(missing: list[str]) -> None:
-    """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
+    """MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
     eager path at 10-20x the latency."""
     required = os.environ.get("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")

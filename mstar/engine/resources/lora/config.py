@@ -92,7 +92,8 @@ class LoraTarget:
     ``slice_packs`` names checkpoint modules that pack several slices into one tensor: a
     gated delta-net's ``in_proj_qkv`` is ``[q | k | v]``, three outputs the base shards
     across ranks on their own. Such a module has one A, which each of its slices takes,
-    and a B whose rows are those slices' in order.
+    and a B whose rows are those slices' in order. A pack named None is the module itself
+    as a checkpoint stores it fused, with no stacked-shard id.
 
     ``slice_align`` rounds each slice's rank-local width up to a multiple, for a base
     linear that pads its fused output per rank so the next slice starts aligned. The
@@ -116,7 +117,7 @@ class LoraTarget:
     parallel: Literal["column", "row", "none"] = "column"
     slice_names: tuple[str | int, ...] = ()
     slice_units: tuple[int, ...] | None = None
-    slice_packs: tuple[tuple[str | int, tuple[str | int, ...]], ...] | None = None
+    slice_packs: tuple[tuple[str | int | None, tuple[str | int, ...]], ...] | None = None
     slice_align: tuple[int, ...] | None = None
     layers: tuple[int, ...] | None = None
     kind: Literal["linear", "embedding"] = "linear"
