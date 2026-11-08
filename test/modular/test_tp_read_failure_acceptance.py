@@ -63,7 +63,6 @@ import torch
 
 from mstar.graph.runtime.base import PhasedPostprocess
 from mstar.utils.ipc_format import WorkerMessageType
-from mstar.worker.rebuild import Rebuilds
 
 HERE = Path(__file__).resolve().parent
 
@@ -658,25 +657,18 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     import torch.distributed as dist
 
     from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.testing_utils.worker import make_worker
     from mstar.utils.containers import RecentSet
     from mstar.worker.micro_scheduler import MicroScheduler
     from mstar.worker.stream_buffers import StreamBufferManager
-    from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
+    from mstar.worker.worker import _REMOVED_RIDS_KEEP
 
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w._rebuilds = Rebuilds({}, {})
-    w.worker_id = WORKERS[rank]
-    w.device = torch.device("cpu")
+    w = make_worker(worker_id=WORKERS[rank], device=torch.device("cpu"))
     w.enable_nvtx = w.enable_prof = False
     w._launch_wait_s = 1.0
     w._max_consecutive_spec = 1
     w._device_loopback = {}
     w._host_rows_slot = 0
-    w._phase_period = 0
-    w._phase_buf = {}
-    w._gpu_spans = []
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     w.parallel_groups = SimpleNamespace(
         barrier_all=dist.barrier,
@@ -703,7 +695,7 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._tp_broadcast_seq = 0
     w._tp_nospec = RecentSet(64)
     w._tp_leader_gap_warned = False
-    w.scheduler = MicroScheduler(w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)
+    w.scheduler = MicroScheduler(engine_manager=w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)
     w.scheduler.runtime = graph
     w._unprocessed_messages = {}
     w._removed_rids = RecentSet(_REMOVED_RIDS_KEEP)
@@ -712,12 +704,9 @@ def _worker(rank, scenario, comm, graph, engine, tm, group):
     w._pending_removes = {}
     w._removes_awaiting_step = {}
     w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w.streaming_buffers = {}
     w.partition_topology = None
     w._my_consumer_connections = []
     w._streaming_edge_names = set()
-    w._consumer_node_cache = {}
-    w._stream_partition = {}
     w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._innermost_loop_by_node = {}
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides

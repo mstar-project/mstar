@@ -7,7 +7,6 @@ lane filter, and which configs the startup decision refuses.
 """
 from __future__ import annotations
 
-import contextlib
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -24,6 +23,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import DeviceLoopback, NodeSubmodule, TokenStop
 from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.threads import ThreadPool
 from mstar.worker import side_steps
 from mstar.worker.engine_manager import EngineManager, _side_lane_keys, side_stream_nodes
@@ -81,13 +81,11 @@ def _step(rids, landed=True, done=True, failed=None, lane=SIDE_LANE):
 def _worker():
     """A real ``Worker`` with what the lane calls around it recorded."""
     log: list = []
-    worker = Worker.__new__(Worker)
+    worker = make_worker()
     worker.log = log
     worker.worker_id = "w0"
     worker.device = torch.device("cpu")
     worker._in_flight_rids = set()
-    worker._phase_period = 0
-    worker._span = lambda *a, **k: contextlib.nullcontext()
     worker._wait_for_step = lambda step: log.append("wait for step")
     worker._clear_in_flight_flag = lambda batch: log.append("clear in flight")
     worker._set_in_flight_flag = lambda batch, value: log.append(f"in flight {value}")
@@ -166,9 +164,7 @@ def test_a_step_that_staged_host_rows_fails(monkeypatch):
 
 def test_the_submitted_step_takes_the_lane_body_and_lifts_the_launch_fence(monkeypatch):
     _StreamBackend(monkeypatch)
-    worker = Worker.__new__(Worker)
-    worker.device = torch.device("cpu")
-    worker._execute_on_gpu_thread = lambda *a: _OUTPUTS
+    worker = make_worker(device=torch.device("cpu"), _execute_on_gpu_thread=lambda *a: _OUTPUTS)
     lane = SideStepLane(worker)
     lane._stream = side_steps.torch.Stream(worker.device)
     node_batch = SimpleNamespace(launch_started_event=None)
