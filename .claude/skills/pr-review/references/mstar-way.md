@@ -171,15 +171,15 @@ The design with more free rows and fewer new concepts wins. A design whose patch
 
 Paths are on `main`; grep the symbol if a file has moved.
 
-**Graph structure** (`mstar/graph/base.py`)
+**Graph structure** (`mstar/graph/base.py` declares it; the runtime that runs it is
+`rust/src/graph/state.rs`, AGENTS.md invariant 5)
 - `GraphNode`: one computation implemented by a node submodule; ready when its inputs have arrived.
   `enable_async_scheduling` (default on) lets the worker speculate its next step.
 - `Sequential`, `Parallel`: composition.
 - `Loop`: runs a section repeatedly for one request. `max_iters` is a safety bound; the real stop is
-  a submodule's `check_stop` returning loop names, registered through `register_loop_finish_signal`
-  (`mstar/graph/graph_io.py`), applied one step late (the async worker's one wasted step). External
-  inputs are re-injected each iteration; a streamed input yields the next chunk instead
-  (`Loop.ingest_external_input`). Loop-back edges carry per-iteration values; `outputs` are emitted
+  a submodule's `check_stop` returning loop names, applied one step late in the Rust runtime
+  (`register_loop_finish`, the async worker's one wasted step). External inputs are re-injected each
+  iteration; a streamed input yields the next chunk instead (`ingest`). Loop-back edges carry per-iteration values; `outputs` are emitted
   at the end, `accumulated_outputs` appended and emitted at the end. A step can advance its loop by
   more than one (`loop_strides`, built for chunk loops; `mstar/worker/chunk_loops.py`). The runtime
   knows the loop, so speculation and readiness handle it without special cases.

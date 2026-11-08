@@ -65,10 +65,10 @@ examples, configs, tests (including GPU-gated ones that skip on CPU), docs. A re
 sends a value the PR now refuses, or a harness that sends a key the PR now ignores, is a finding.
 So is a default that moved without a line in the description.
 
-A new message type is a change for every receiver: `Worker._process_message_list` drops an unknown
-type silently, where the conductor raises. A per-request message can reach a worker before its
-NEW_REQUEST or after its REMOVE: it joins `msg_types_needing_active_request` so it is parked or
-dropped, and a dropped one that carries tensors is acked so its producer frees them.
+A new message type is a change for every receiver: `InputIngest._dispatch`
+(`mstar/worker/input_ingest.py`) drops an unknown type silently, where the conductor raises. A
+per-request message can reach a worker before its NEW_REQUEST or after its REMOVE: it joins
+`_NEEDS_ACTIVE_REQUEST` so it is parked or dropped, and a dropped one that carries tensors is acked so its producer frees them.
 
 Coverage line: `behaviour changes → consumers checked: <change> → <files>; …`
 
