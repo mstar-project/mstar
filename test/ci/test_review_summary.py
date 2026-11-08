@@ -14,9 +14,9 @@ render, open_findings, read_state = SUMMARY["render"], SUMMARY["open_findings"],
 WORKFLOW = (REPO_ROOT / ".github/workflows/claude-review.yml").read_text().splitlines()
 
 
-def step_script(step_id):
-    """The `run: |` script of the workflow step with this id, read as text: CI's test/ci job has no YAML parser."""
-    start = WORKFLOW.index(f"        id: {step_id}")
+def step_script(job, step_id):
+    """The `run: |` script of `job`'s step with this id, read as text: CI's test/ci job has no YAML parser."""
+    start = WORKFLOW.index(f"        id: {step_id}", WORKFLOW.index(f"  {job}:"))
     head = next(i for i in range(start, len(WORKFLOW)) if WORKFLOW[i].strip() == "run: |")
     indent = len(WORKFLOW[head + 1]) - len(WORKFLOW[head + 1].lstrip())
     script = []
@@ -38,7 +38,7 @@ def threads(*nodes):
 
 
 def preflight(command, perms, actor="an-author", author="an-author", assoc="CONTRIBUTOR"):
-    """The review job's preflight step run as the workflow runs it, for `command` (the word its COMMAND env
+    """The preflight job's step run as the workflow runs it, for `command` (the word its COMMAND env
     maps the comment to), with `gh` answering each login's permission from `perms`. Returns its outputs."""
     with tempfile.TemporaryDirectory() as d:
         gh = Path(d, "gh")
@@ -50,7 +50,7 @@ def preflight(command, perms, actor="an-author", author="an-author", assoc="CONT
         env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(out), "REPO": "o/r",
                "KEY_SET": "true", "COMMAND": command, "ACTOR": actor, "AUTHOR": author, "ASSOC": assoc,
                "SKIP_LABEL": "false"}
-        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script("pre")], env=env,
+        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script("preflight", "pre")], env=env,
                        check=True, capture_output=True)
         return dict(line.split("=", 1) for line in out.read_text().splitlines())
 
