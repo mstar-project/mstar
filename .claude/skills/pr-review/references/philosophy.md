@@ -3,7 +3,7 @@
 mstar's design principles, each with the questions to ask of a diff. AGENTS.md states the rules
 (invariants 1–14, style rules S1–S4) and [patterns.md](patterns.md) the concrete review checks
 (A1–A10, B1–B13, C1–C16). This file is why those exist, plus the values neither writes down. The
-philosophy pass (SKILL.md §4.11) applies it. Cite a miss as "mstar philosophy §N".
+philosophy pass (SKILL.md §4.10) applies it. Cite a miss as "mstar philosophy §N".
 
 ## 1. Models declare, the engine executes, and shared layers know nothing about any one model
 

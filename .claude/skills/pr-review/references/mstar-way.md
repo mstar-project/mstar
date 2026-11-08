@@ -1,6 +1,6 @@
 # The mstar way: tables and primitives
 
-The derivation the mstar-way pass follows (SKILL.md §3 Phase A and §4.6 Phase B). mstar is a
+The derivation the mstar-way pass follows (SKILL.md §3 Phase A and §4.5 Phase B). mstar is a
 dataflow runtime: a request is a walk through a graph of nodes, and the runtime already schedules,
 batches, speculates, pre-plans, captures, streams, evicts, parallelizes and tears down anything
 expressed as graph structure, edges and declared resources. A feature written that way inherits

@@ -48,7 +48,7 @@ A run that reaches its turn cap stops without posting its summary, and `/review 
 
 ## What to report
 
-The skill's bar (§2), description pass (§4.4), questions and output (§7): report every finding that meets the bar, none that don't, and hold none back.
+The skill's bar (§2), description pass (§4.3), questions and output (§7): report every finding that meets the bar, none that don't, and hold none back.
 
 ## Modes
 
