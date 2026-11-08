@@ -180,7 +180,8 @@ Communication
        Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
-     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+     - PyTorch's variable for the Gloo groups next to each parallel group
+       and for each lockstep instance.
        Same rule: the conductor sets ``lo`` for its workers unless you set
        it, so Gloo does not listen on the address the hostname resolves to.
 
@@ -281,7 +282,9 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        ``Content-Length`` is answered before it is read, so a client that
        writes the whole body before reading the reply can see a connection
        reset instead of the 413; one that sends ``Expect: 100-continue``
-       gets the 413 before it sends the body.
+       gets the 413 before it sends the body. It also caps one
+       message on every WebSocket route unless the config sets
+       ``ws_max_message_mb``; a larger one closes the socket (1009).
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
@@ -477,7 +480,7 @@ Worker scheduling
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
      - config's ``tp_async_sched``, else ``1``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+     - Async scheduling for lockstep-parallel (TP / SP / CFG) nodes; overrides the
        deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
@@ -684,18 +687,6 @@ Worker scheduling
        ``max_seq_len`` (the model's context, or ``resources: <kv>: max_seq_len``;
        not the config's top-level key), at most the pool's pages, plus a few, 8
        bytes each. Read by ``knobs.resident_planning``.
-   * - ``MSTAR_KV_PLAN_CACHE``
-     - config's ``knobs: kv_plan_cache``, else ``0``
-     - The KV manager plans a captured decode step off the previous step's
-       plan when the batch is the same rows in the same order and nothing
-       but that step's commit touched the streams: every length is one
-       more, pages change only where a row crossed a page boundary, and the
-       five FlashInfer index arrays come from numpy instead of a per-row
-       Python pass. The first version measured a loss at c64/c128 on 0.8B
-       (batches change every step or two there, and a hit still rebuilt the
-       views); the reworked path keeps the views lazy and is off by default
-       until measured. ``0`` plans every step from the streams. ``2`` runs
-       both and logs a difference, for checking a run.
    * - ``MSTAR_DEVICE_LOOPBACK``
      - config's ``knobs: device_loopback``, else ``1``
      - Whether a decode node may keep its loop-back token on the device:

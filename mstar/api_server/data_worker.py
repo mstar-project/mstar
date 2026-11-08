@@ -44,6 +44,7 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
+from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
@@ -212,7 +213,7 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     YAML has been applied."""
     specs = serving_resources(model, model_config)
     groups = [
-        (group["ranks"], int(group.get("tp_size", 1)) * int(group.get("sp_size", 1)), group["node_names"])
+        (group["ranks"], math.prod(node_group_axis_sizes(group).values()), group["node_names"])
         for group in model_config.get("node_groups") or []
     ]
     opened = frozenset().union(*prefix_caches_by_rank(specs, groups, names_checkpoint(model)).values())
@@ -322,12 +323,12 @@ class PreprocessWorker:
         # directly once a request is done (no cross-thread queue / race).
         # Sends never block the thread (OutboxCommunicator): the conductor and
         # the workers block on sends to it, so it has to keep reading.
-        self.communicator = OutboxCommunicator(make_communicator(
+        self.communicator = make_communicator(
             my_id="api_server_preprocess_worker",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
             nonblocking_send=True,
-        ))  # only used to send (from the worker thread)
+        )  # only used to send (from the worker thread)
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
             my_entity_id="api_server_preprocess_worker",

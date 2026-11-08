@@ -42,10 +42,10 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
     SubmoduleStep,
 )
+from mstar.testing_utils.worker import make_worker
 from mstar.utils import knobs  # noqa: E402
 from mstar.utils.ipc_format import OffloadDelta  # noqa: E402
-from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.worker.scheduled_batch import ScheduledBatch  # noqa: E402
 
 PAGE = 4
 WALK = "decode"
@@ -314,24 +314,6 @@ def test_a_resident_step_leaves_the_addressing_memo_to_host_steps():
     addressing = pool._current["main"]
     assert addressing.host_slot_indices is memo[1]
     assert addressing.host_slot_indices == [pool._slots[r]["main"].index for r in (1, 2)]
-
-
-def test_a_resident_step_keeps_the_cached_kv_plan_attention_reads():
-    live, ref, planner = _setup({1: 3, 2: 5, 3: 8})
-    for res in (live, ref):
-        res["kv"]._plan_cache_mode = 1
-    rids = [1, 2, 3]
-    pages = set()
-    for t in range(40):
-        a = _captured_step(live, planner, rids, slot=t % 2, bs=4)
-        b = _captured_step(ref, None, rids, slot=t % 2, bs=4)
-        _same(a, b, 3)
-        x, y = (s.ctx.plan_results["kv"]["main"].cpu_indptrs for s in (a, b))
-        for p, q in zip(x[:5], y[:5], strict=True):
-            assert torch.equal(torch.as_tensor(p), torch.as_tensor(q))
-        pages.add(a.pages[0])
-    assert len(pages) > 1
-    assert live["kv"].plan_cache_stats["hit"] > 20
 
 
 def test_a_stage_is_timed_under_the_step_plan_phase(monkeypatch):
@@ -967,11 +949,7 @@ def test_a_stream_wider_than_a_row_raises():
 # ---- what a raise in the plan leaves ----
 
 def _preplan_worker(engine):
-    worker = Worker.__new__(Worker)
-    worker.worker_id = "w"
-    worker.enable_nvtx = False
-    worker._phase_period = 0
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
+    worker = make_worker(worker_id="w", engine_manager=SimpleNamespace(get_engine=lambda node: engine))
     return worker
 
 
@@ -1141,29 +1119,32 @@ def _offload_engine(resources, planner):
 
 
 def _refused_worker(engine, line):
-    """The real handler and the real victim search over a real engine."""
-    worker = Worker.__new__(Worker)
-    worker.parallel_nodes = set()
-    worker.parallel_leader_nodes = set()
-    worker._hold_logged = {}
-    worker.pushed = []
-    worker.held = []
-    worker._apply_removes_whose_step_landed = lambda: None
-    worker._apply_pending_removes_safe_to_drop = lambda rids: None
-    worker._graph_runtime = SimpleNamespace(push_back_node=lambda node, rids, graphs: worker.pushed.append(rids))
-    worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
-    worker.eviction_policy = SimpleNamespace(value="last_in_line")
-    # preemption declines, as it does for a pool with no host memory and no rebuilds, so the offload and the hold run
-    worker._preemption = SimpleNamespace(preempt=lambda node_batch: False)
-    worker.scheduler = SimpleNamespace(
-        arrival=list(line), hold_requests=worker.held.extend, could_refill=lambda *a: False,
-        last_in_line=lambda node, walk, rids: max(rids, key=line.index),
+    """The real handler and the real victim search over a real engine, with
+    ``line`` the requests in the order a step reaches them."""
+    pushed = []
+    worker = make_worker(
+        _graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine),
+        scheduler=SimpleNamespace(
+            could_refill=lambda *a: False,
+            last_in_line=lambda node, walk, rids: max(rids, key=line.index),
+        ),
     )
+    for rid in line:
+        worker.lifecycle.add(rid, str(rid))
+    worker.pushed = pushed
     return worker
 
 
+def _refused(batch, outcome_reason, failed_resource):
+    return SimpleNamespace(
+        node_name=batch.node_name, admit_error=outcome_reason, failed_resource=failed_resource,
+        request_ids=list(batch.request_to_worker_graph), cached_rids=set(),
+    )
+
+
 def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
-    """Through the worker's refusal path: the KV pool refuses, `_handle_allocation_failure`
+    """Through the worker's refusal path: the KV pool refuses, `_handle_admit_failure`
     offloads the row furthest from a step, its slot goes with it, the retry runs, and the
     victim's reload is written whole at its own lengths."""
     from mstar.engine.resources.runner import StepRunner
@@ -1193,10 +1174,8 @@ def test_a_refused_admit_offloads_a_victim_and_its_reload_is_written_whole():
 
     worker = _refused_worker(engine, line=[1, 2, 3])
     batch = ScheduledBatch(node_name="n", graph_walk=WALK, request_to_worker_graph={1: "g", 2: "g"})
-    worker._handle_allocation_failure(batch, SimpleNamespace(
-        node_name="n", admit_error=outcome.reason, failed_resource=outcome.failed_resource,
-    ))
-    assert worker.pushed == [[1, 2]] and worker.held == [3]
+    worker._handle_admit_failure(batch, _refused(batch, outcome.reason, outcome.failed_resource))
+    assert worker.pushed == [[1, 2]] and list(worker.admission.held_until) == [3]
     assert engine.residency("n", 3) is Residency.ON_HOST
     assert planner.slot_of(3) is None and 3 not in planner._stale
 
@@ -1239,11 +1218,9 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
     engine = _offload_engine({k: live[k] for k in ("kv", "pool", "rope")}, planner)
     worker = _refused_worker(engine, line=[1, 2])
     batch = ScheduledBatch(node_name="n", graph_walk="prefill", request_to_worker_graph={2: "g"})
-    worker._handle_allocation_failure(batch, SimpleNamespace(
-        node_name="n", admit_error=outcome.reason, failed_resource="pool",
-    ))
+    worker._handle_admit_failure(batch, _refused(batch, outcome.reason, "pool"))
     assert worker.pushed == [[2]]
-    assert worker.held == [2]
+    assert list(worker.admission.held_until) == [2]
     assert engine.residency("n", 1) is Residency.RESIDENT
 
 

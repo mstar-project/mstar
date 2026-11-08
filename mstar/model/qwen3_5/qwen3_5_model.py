@@ -93,8 +93,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         if self.tokenizer.eos_token_id is not None:
             self.config.extra_stop_token_ids = (self.tokenizer.eos_token_id,)
         # the vision tower, whose output fills images' and videos' pads in
-        # prompt order
-        pad = self._pad_ids()
+        # prompt order. A text-only checkpoint's tokenizer still has the pad
+        # tokens, so the tower decides whether the model takes media.
+        pad = self._pad_ids() if self.vision_config is not None else {}
         tower = vision_encoder(tuple(pad.values())) if pad else None
         self.media = tuple(
             MediaIntake(m, tower, p, self._image_intake) if m == "image"
@@ -405,9 +406,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def kv_layout(self, layout: dict, length: int, advance: int | None = None) -> dict:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        merge = self.vision_config.spatial_merge_size
         advance = length + sum(
-            vision_position_advance(torch.tensor(grid), merge) - tokens
+            vision_position_advance(torch.tensor(grid), self._merge()) - tokens
             for tokens, grid in zip(layout.get("tokens", ()), layout.get("grid", ()), strict=True)
         )
         return super().kv_layout(layout, length, advance)

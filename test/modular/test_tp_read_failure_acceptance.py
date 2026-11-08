@@ -61,9 +61,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.graph.runtime.base import PhasedPostprocess
 from mstar.utils.ipc_format import WorkerMessageType
-from mstar.worker.rebuild import Rebuilds
 
 HERE = Path(__file__).resolve().parent
 
@@ -90,7 +90,7 @@ TRIGGER_S = 2.0
 # past this hung.
 DEADLINE_S = 30.0
 # Per-rank setup a fix adds to Worker.__init__ (see the module docstring).
-_DESIGN_SETUP = ("_setup_read_gate", "_setup_tp_read_check")
+_DESIGN_SETUP = ("_setup_read_gate",)
 
 # What each request reads. A grid prompt is Qwen3.5's prefill_vision row: the
 # whole prompt, text, image and text, its image of grid (t, h, w) expanded to
@@ -644,81 +644,74 @@ class _Reads:
 def _tp_group(rank):
     import torch.distributed as dist
 
-    from mstar.distributed.all_reduce import AllReduce
-    from mstar.distributed.communication import CommGroup
-
     group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
     group.device_group = group.cpu_group = dist.new_group([0, 1], timeout=datetime.timedelta(seconds=COLLECTIVE_S))
     group.initialized = True
-    group._all_reduce = AllReduce(group.device_group)
     return group
 
 
 def _worker(rank, scenario, comm, graph, engine, tm, group):
     import torch.distributed as dist
 
-    from mstar.distributed.communication import CommGroup, JointGroups
-    from mstar.utils.containers import RecentSet
+    from mstar.testing_utils.worker import make_worker
+    from mstar.worker.admission import Admission
+    from mstar.worker.lockstep import Lockstep
     from mstar.worker.micro_scheduler import MicroScheduler
+    from mstar.worker.rebuild import Rebuilds
+    from mstar.worker.request_lifecycle import RequestLifecycle
+    from mstar.worker.services import WorkerLayout, WorkerServices
     from mstar.worker.stream_buffers import StreamBufferManager
-    from mstar.worker.worker import _REMOVED_RIDS_KEEP, Worker
 
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w._rebuilds = Rebuilds({}, {})
-    w.worker_id = WORKERS[rank]
-    w.device = torch.device("cpu")
+    parallel_groups = SimpleNamespace(
+        barrier_all=dist.barrier,
+        restore_default_timeout=lambda: None,
+        get_joint_group_for_node=lambda node: JointGroups(
+            tp_group=group, sp_group=CommGroup.trivial(), instance=group,
+        ),
+        get_instance_rank_for_node=lambda node: rank,
+        get_instance_world_size_for_node=lambda node: 2,
+    )
+    engine_manager = SimpleNamespace(
+        get_engine=lambda node: engine, warmup_all=lambda: None,
+        remove_request=engine.remove_request,
+    )
+    streams = StreamBufferManager(graph, tm, [])
+    services = WorkerServices(
+        worker_id=WORKERS[rank], device=torch.device("cpu"), graph_runtime=graph,
+        engine_manager=engine_manager, tensor_manager=tm, request_state=graph,
+        communicator=comm, parallel_groups=parallel_groups, rebuilds=Rebuilds({}, {}), streams=streams,
+    )
+    layout = WorkerLayout(
+        parallel_nodes=frozenset({NODE}), parallel_leader_nodes=frozenset({NODE} if rank == 0 else ()),
+        is_tp_follower=rank != 0,
+    )
+    admission = Admission(services=services, layout=layout)
+    lockstep = Lockstep(services=services, layout=layout, admission=admission)
+    lifecycle = RequestLifecycle(layout=layout)
+    w = make_worker(
+        worker_id=WORKERS[rank], device=torch.device("cpu"), communicator=comm, tensor_manager=tm,
+        _graph_runtime=graph, engine_manager=engine_manager, request_state=graph,
+        parallel_groups=parallel_groups, layout=layout, admission=admission, lockstep=lockstep,
+        streams=streams, lifecycle=lifecycle,
+        scheduler=MicroScheduler(
+            services=services, layout=layout, lifecycle=lifecycle, lockstep=lockstep, admission=admission,
+        ),
+        wakeup_event=SimpleNamespace(
+            drain=lambda: None, register_future=lambda f: None, register_futures=lambda f: None,
+        ),
+        parallel_nodes={NODE}, parallel_leader_nodes=set(layout.parallel_leader_nodes),
+        is_tp_follower=rank != 0,
+    )
     w.enable_nvtx = w.enable_prof = False
     w._launch_wait_s = 1.0
     w._max_consecutive_spec = 1
     w._device_loopback = {}
     w._host_rows_slot = 0
-    w._phase_period = 0
-    w._phase_buf = {}
-    w._gpu_spans = []
     w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w.parallel_groups = SimpleNamespace(
-        barrier_all=dist.barrier,
-        restore_default_timeout=lambda: None,
-        get_tp_config_for_node=lambda node: group,
-        get_sp_config_for_node=lambda node: SimpleNamespace(world_size=1),
-        get_joint_group_for_node=lambda node: JointGroups(tp_group=group, sp_group=CommGroup.trivial()),
-        get_instance_rank_for_node=lambda node: rank,
-        get_instance_world_size_for_node=lambda node: 2,
-    )
-    w.communicator = comm
-    w.wakeup_event = SimpleNamespace(drain=lambda: None, register_future=lambda f: None)
-    w.tensor_manager = tm
-    w._graph_runtime = graph
-    w.engine_manager = SimpleNamespace(
-        get_engine=lambda node: engine, warmup_all=lambda: None,
-        remove_request=engine.remove_request,
-    )
-    w.request_state = graph
-    w.parallel_nodes = {NODE}
-    w.parallel_leader_nodes = {NODE} if rank == 0 else set()
-    w.is_tp_follower = rank != 0
-    w.tp_async_sched, w.tp_async_nodes = False, None
-    w._tp_broadcast_seq = 0
-    w._tp_nospec = RecentSet(64)
-    w._tp_leader_gap_warned = False
-    w.scheduler = MicroScheduler(w.engine_manager, parallel_leader_nodes=w.parallel_leader_nodes)
-    w.scheduler.runtime = graph
-    w._unprocessed_messages = {}
-    w._removed_rids = RecentSet(_REMOVED_RIDS_KEEP)
-    w._hold_logged = {}
     w._in_flight_rids = set()
-    w._pending_removes = {}
-    w._removes_awaiting_step = {}
-    w._pending_drains, w._draining_rids, w._reads_done_sent = set(), set(), set()
-    w.streaming_buffers = {}
     w.partition_topology = None
     w._my_consumer_connections = []
     w._streaming_edge_names = set()
-    w._consumer_node_cache = {}
-    w._stream_partition = {}
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])
     w._innermost_loop_by_node = {}
     w._stop_token_signal = {}  # no declared stop policies: check_stop decides
     w._metrics = None
@@ -812,6 +805,8 @@ def _rank_main(rank, scenario, inbox, outbox):
         )
         tm.communicator = comm
         w = _worker(rank, scenario, comm, graph, engine, tm, group)
+        for rid in ("r0", "r1"):
+            w.lifecycle.add(rid, rid)
         try:
             w.run()
         except _Stop:

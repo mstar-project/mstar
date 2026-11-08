@@ -240,7 +240,7 @@ def test_the_cached_plan_keeps_its_indptrs_while_the_ring_turns(kv):
 
 def test_a_plan_built_across_a_touch_of_its_rows_is_not_reused(kv, monkeypatch):
     """A pre-plan builds on the plan thread while the main thread can tear a
-    request down: the entry keeps the epochs from before the build."""
+    request down: the entry keeps the epoch from before the build."""
     build = kv._plan_label
 
     def touched(*args, **kwargs):
