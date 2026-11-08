@@ -66,6 +66,51 @@ class TestSlurm(unittest.TestCase):
         self.assertTrue(any("scancel 42" in c and f"rm -rf {jobdir}" in c for c in calls),
                         f"the job's directory (the Anthropic key, venvs, builds) would stay on the node: {calls}")
 
+    def test_the_same_job_id_on_two_nodes_is_two_instances(self):
+        key, state = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp())
+        key.write_text("ssh-ed25519 AAAA test")
+        saved = {k: self.globals[k] for k in ("STATE", "LEDGER")}
+        self.addCleanup(self.globals.update, saved)
+        self.globals.update(slurm_run=fake_slurm({"sinfo": "n gpu:8 gpu:0 idle\n", "sbatch": "42\n"}),
+                            STATE=state, LEDGER=state / "instances.json")
+        nodes = [{**SLURM_CFG["slurm"][0], "name": name} for name in ("node1", "node2")]
+        cfg = {"slurm": nodes, "ssh_public_key": str(key), "budget": {
+            "max_usd_per_hour": 0, "max_hours": 4, "max_concurrent_instances": 9}}
+        for name in ("node1", "node2"):
+            args = argparse.Namespace(offer=f"slurm:{name}:1", pr=7, hours=1, tag=name, run=None, input=[],
+                                      cache="ro", allow_over_budget=False, dry_run=False)
+            with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()):
+                GPU["cmd_launch"](args, cfg)
+        self.assertEqual(sorted(GPU["ledger"]()), ["slurm:node1:42", "slurm:node2:42"],
+                         "the second node's job would overwrite the first's entry, and its deadline watchdog")
+
+    def test_nodes_on_one_host_keep_their_own_known_hosts(self):
+        self.addCleanup(self.globals.update, {"STATE": self.globals["STATE"]})
+        self.globals["STATE"] = Path(tempfile.mkdtemp())
+        files = [next(a for a in GPU["slurm_ssh"]({"name": name, "host": "root@7.tcp.ngrok.io", "port": port,
+                                                  "host_key": f"ssh-ed25519 {name}"}) if "UserKnownHostsFile" in a)
+                 for name, port in (("node1", 21), ("node2", 22))]
+        self.assertNotEqual(*files, "one node's pinned key would overwrite the other's, and ssh would refuse it")
+
+    def test_a_bad_slurm_config_is_refused_with_a_reason(self):
+        for slurm in ({"host": "h", "name": "n"}, [{"host": "h"}], [{"host": "h", "name": "a:b"}],
+                      [{"host": "h", "name": "n", "enabled": False}]):
+            with self.subTest(slurm=slurm), self.assertRaisesRegex(GPU["ApiError"], "slurm"):
+                GPU["slurm_nodes"]({"slurm": slurm})
+
+    def test_the_watchdog_outlives_a_node_gone_from_the_config(self):
+        saved = {k: self.globals[k] for k in ("STATE", "LEDGER", "load_config")}
+        self.addCleanup(self.globals.update, saved)
+        state = Path(tempfile.mkdtemp())
+        self.globals.update(STATE=state, LEDGER=state / "instances.json", load_config=lambda: {"slurm": []})
+        with GPU["ledger_txn"]() as d:
+            d["slurm:gone:42"] = {"provider": "slurm", "instance_id": "42", "region": "gone", "deadline": 0}
+
+        with unittest.mock.patch("time.sleep", side_effect=InterruptedError), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(InterruptedError, msg="the watchdog would exit, and the job would run on"):
+            GPU["cmd_watchdog"](argparse.Namespace(instance="slurm:gone:42"), {})
+
     def test_no_launch_past_max_running_from_any_session(self):
         key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
         key.write_text("ssh-ed25519 AAAA test")

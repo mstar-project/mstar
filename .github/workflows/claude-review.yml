@@ -83,7 +83,9 @@ name: Claude Review
 #
 # Failures never turn the PR's check red: every step after the preflight is
 # continue-on-error and gated on the one before it, and if the review didn't
-# complete, the last step says so in a PR comment with a link to the log.
+# complete, the last step says so in a PR comment with a link to the log. The
+# one exception is the first step, checking out main's scripts: the reporter
+# is one of those scripts, so that failure is only in the run's log.
 #
 # Failing gracefully: a review that finished but went past --max-turns (the
 # action then reports a failure) still has its summary in the action's
@@ -340,7 +342,7 @@ jobs:
             pr.diff is ${{ steps.diff.outputs.lines }} lines.
             Turn cap: ${{ needs.preflight.outputs.turns }}.
             ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
-            ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json is present, with since.diff and since-commits.txt or, after a rebase, interdiff.diff. Follow the prompt''s Re-review section.' || '' }}
+            ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json is present, with since.diff and since-commits.txt or, after a force-push, rebase or merge of main, interdiff.diff. Follow the prompt''s Re-review section.' || '' }}
           # No shell or edits; web reads only from the sites listed here (GitHub, the
           # vLLM and SGLang docs, Hugging Face, PyTorch, arXiv) and Claude Code's
           # built-in documentation sites, so the review can read how other projects do it. The only write tool is the inline-
