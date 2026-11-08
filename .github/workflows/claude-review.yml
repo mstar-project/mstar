@@ -15,7 +15,9 @@ name: Claude Review
 #      or execute anything from it. The PR's tree goes in pr-head/ and is read
 #      only. There is no setup-python, no pip, no cargo, no make.
 #   2. persist-credentials: false on both checkouts, so no token is written into
-#      a working tree the PR controls.
+#      a working tree the PR controls. The action does write this job's token
+#      into the root checkout's .git/config, so the review step's settings deny
+#      the model reads of .git.
 #   3. Rules are read from main's checkout at the root. The prompt tells the
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.

@@ -281,14 +281,6 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
     out.update(dir=str(saved), mode=mode)
 
 
-def file_patch(f):
-    """One file of the files API as a diff. A removed file's new side is /dev/null, as in git's own diff."""
-    old = f["previous_filename"] if f.get("previous_filename") is not None else f["filename"]
-    new = "/dev/null" if f["status"] == "removed" else f"b/{f['filename']}"
-    patch = f["patch"] if f.get("patch") is not None else "(no patch from GitHub: binary, or too large to show)"
-    return f"diff --git a/{old} b/{f['filename']}\n--- a/{old}\n+++ {new}\n{patch}\n"
-
-
 def stacked_above(repo, pull, head_sha):
     """The PRs stacked above this one, for a finding one of them fixes (fixed_above): every open PR based
     on this PR's branch, then on theirs, up to 5, as [{number, head_sha}], with above-<n>.diff the change
@@ -380,16 +372,10 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     if prev:
         shutil.copyfile(Path(prev, "handoff.md"), "handoff.md")
     pull = api(f"repos/{repo}/pulls/{pr}")
-    # The commit `resolve` fixed, not the PR's live head: three dots, as the PR's own diff. GitHub refuses
-    # a diff past 20,000 lines or 300 files. Fall back to the files API (up to 3,000 files; it omits the
-    # patch of a file that is too large on its own).
-    r = gh("api", "-H", "Accept: application/vnd.github.diff",
-           f"repos/{repo}/compare/{pull['base']['sha']}...{head_sha}", check=False)
-    if r.returncode == 0:
-        diff = r.stdout
-    else:
-        print(f"::warning::The diff failed ({r.stderr[:300]}); building pr.diff from the files API.")
-        diff = "".join(map(file_patch, api_list(f"repos/{repo}/pulls/{pr}/files")))
+    # The commit `resolve` fixed, not the PR's live head: three dots, as the PR's own diff. A failure
+    # (GitHub can give up on generating a very large one) fails this step: the review reports it didn't run.
+    diff = gh("api", "-H", "Accept: application/vnd.github.diff",
+              f"repos/{repo}/compare/{pull['base']['sha']}...{head_sha}").stdout
     write("pr.diff", diff)
     write("pr-body.md", (pull["body"] or "") + "\n")
 
