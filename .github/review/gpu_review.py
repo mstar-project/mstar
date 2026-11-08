@@ -110,7 +110,7 @@ def configure(out, runner_temp, pr="0", ssh_key="", slurm_nodes="", slurm_author
             and n.get("host_key") for n in nodes):
         raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]), a host and "
                          "a pinned host_key")
-    for n in nodes:  # the variable isn't secret, but ssh's errors print the host to this public log
+    for n in nodes:  # GitHub masks the secret whole, not a host inside it, and ssh's errors print the host
         for host in {n["host"], n["host"].split("@")[-1]}:
             print(f"::add-mask::{host}")
     slurm = []
@@ -606,6 +606,10 @@ class Decision:
         return [*self.rule, *self.review]
 
 
+# The two rules that come from the file list approval_facts takes against the default branch.
+COUNTED = "files counted against main, including any PR below this one"
+
+
 def decide(f):
     """The approval rule: pure, from ApprovalFacts."""
     rule = []
@@ -622,11 +626,11 @@ def decide(f):
     if f.too_many_files:
         rule.append("the file list is too long to check")
     if f.blocked:
-        rule.append("touches the review's rules or dependencies: " + ", ".join(f.blocked[:8])
+        rule.append(f"touches the review's rules or dependencies ({COUNTED}): " + ", ".join(f.blocked[:8])
                     + (" and more" if len(f.blocked) > 8 else ""))
     # A review's `none` counts on runtime code only after a passing live test.
     if f.verdict == "skipped" and not f.since and f.runtime:
-        rule.append("no GPU run on runtime code")
+        rule.append(f"no GPU run on runtime code ({COUNTED})")
     review = []
     if f.risk_level != "low":
         review.append(f"the review rated the design risk {f.risk_level}: a maintainer owns the decisions its "
@@ -736,7 +740,7 @@ def render_comment(sha, lt, media_url=""):
     rels = {p.relative_to(results).as_posix() for p in files}
 
     def link(m):  # links to the gallery's media point at its copy; images show inline
-        bang, text, rel = m[1], m[2], m[3]
+        bang, text, rel = m[1], m[2], m[3].replace("\u200b", "")  # `inert` splits a name like a@2x.png too
         if rel not in rels or not media_url:
             return m[0]
         url = f"{media_url.rstrip('/')}/{rel}"

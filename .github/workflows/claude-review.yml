@@ -16,7 +16,9 @@ name: Claude Review
 #      or execute anything from it. The PR's tree goes in pr-head/ and is read
 #      only. There is no setup-python, no pip, no cargo, no make.
 #   2. persist-credentials: false on both checkouts, so no token is written into
-#      a working tree the PR controls.
+#      a working tree the PR controls. The action does write this job's token
+#      into the root checkout's .git/config, so the review step's settings deny
+#      the model reads of .git.
 #   3. Rules are read from main's checkout at the root. The prompt tells the
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
@@ -522,13 +524,14 @@ jobs:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
 
-      # gpu.py's settings, from repository variables; the ssh key every box is reached with from a
-      # secret, and each node's host and pinned host key from REVIEW_SLURM_NODES. The key stays on
-      # the runner: it never reaches the box.
+      # gpu.py's settings, from repository variables. From secrets: the ssh key every box is reached
+      # with, and REVIEW_SLURM_NODES, each node's host and pinned host key (a step's env: is printed to
+      # the public log before the step runs, so it can't mask a variable in time). The key stays on the
+      # runner: it never reaches the box.
       - name: Configure the GPUs
         env:
           SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
-          SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
+          SLURM_NODES: ${{ secrets.REVIEW_SLURM_NODES }}
           SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
           COMMENTER: ${{ github.event.comment.user.login }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
@@ -604,7 +607,7 @@ jobs:
           S1: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
-          NODES: ${{ vars.REVIEW_SLURM_NODES }}
+          NODES: ${{ secrets.REVIEW_SLURM_NODES }}
         run: python3 .github/review/gpu_review.py redact
 
       # The media go to the gallery repository (GitHub Pages), never into this

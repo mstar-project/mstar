@@ -833,11 +833,12 @@ class TestImprove(unittest.TestCase):
         for text in ("![x](https&colon;&sol;&sol;evil.example/x.png)", "![w](https:\\/\\/evil.example/x.png)",
                      "[w](/\\/evil.example)", "[z](http:evil.example/x)", "&commat;someone", "&num;99", "@someone",
                      "#99", "<!-- x", "<img src=x>", "GH-5", "gh-5", "_GH-123_", "https://github.com/o/r/issues/5",
-                     "![x](https://evil.example/x.png)", "www.evil.example", "_www.evil.example_"):
+                     "![x](https://evil.example/x.png)", "www.evil.example", "_www.evil.example_",
+                     "[a]: //evil.example/x"):
             for fn in (bot.safe, bot.scrub):
                 with self.subTest(text, fn=fn.__name__):
                     out = fn(text)
-                    self.assertNotRegex(out, r"(?i)\]\(|!\[|://|gh-|www\.", "it would render or mark a timeline")
+                    self.assertNotRegex(out, r"(?i)\][(:]|!\[|://|gh-|www\.", "it would render or mark a timeline")
                     self.assertNotRegex(out, "[@#<&\\\\](?!\u200b)", "it would ping, open markup or spell another")
                     self.assertEqual(bot.safe(bot.safe(text)), bot.safe(text), "a second pass would change it")
 
