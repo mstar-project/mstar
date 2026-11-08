@@ -154,11 +154,11 @@ def marked(comments, marker):
             if (c.get("user") or {}).get("login") in BOT_USERS and (c.get("body") or "").startswith(marker)]
 
 
-def last_state(conversation):
-    """The state of the bot's last summary among the PR's conversation comments, or None (read_state)."""
+def last_summary(conversation):
+    """The bot's last summary among the PR's conversation comments, or None."""
     summaries = [c for c in conversation
                  if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
-    return render_summary.read_state(summaries[-1]["body"]) if summaries else None
+    return summaries[-1]["body"] if summaries else None
 
 
 def oneline(commits):
@@ -605,12 +605,14 @@ def discussion(repo, pr):
         comments.append({"id": c["id"], "user": user, "user_type": (c.get("user") or {}).get("type"),
                          "path": c.get("path"), "line": c.get("line"), "side": c.get("side"),
                          "in_reply_to_id": c.get("in_reply_to_id"), "body": c.get("body"),
+                         "author_association": c.get("author_association"),
                          "created_at": c.get("created_at"), "url": c.get("html_url"),
                          **threads.get(c.get("in_reply_to_id") or c["id"], {}), "mine": user in POSTING_BOT_USERS})
     # The conversation tab: replies to the summary, and the author's answers.
     conversation = [{"id": c["id"], "user": (c.get("user") or {}).get("login"),
                      "user_type": (c.get("user") or {}).get("type"), "created_at": c.get("created_at"),
-                     "url": c.get("html_url"), "body": c.get("body")}
+                     "author_association": c.get("author_association"), "url": c.get("html_url"),
+                     "body": c.get("body")}
                     for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
     return comments, conversation
 
@@ -649,7 +651,8 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
     # (too large, say) means a full review, never an empty since.diff.
     if not prev:
-        state = last_state(conversation)
+        summary = last_summary(conversation)
+        state = summary and render_summary.read_state(summary)
         last = (state or {}).get("head")
         since = f"repos/{repo}/compare/{last}...{head_sha}"
         try:
@@ -729,6 +732,9 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
 
 # ---------------------------------------------------------------- review job: after the review
 
+# Whose comment can answer an earlier review's risk or questions (GitHub's author_association).
+MAINTAINERS = ("OWNER", "MEMBER", "COLLABORATOR")
+
 def salvage(out, repo, pr, runner_temp):
     """The action fails a run that went past --max-turns even when Claude finished and returned its
     summary, and on a real failure it still writes everything Claude said to its execution file. Read
@@ -783,21 +789,21 @@ def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, gi
         print(f"::warning::Couldn't write the job summary: {e}")
 
 
-def earlier_review(repo, pr, prev):
-    """(state, answered): the state of the review this run built on, what render_summary.carried carries over,
-    from last-review.json or on a /review continue (which wasn't shown it) the last summary; and whether a
-    person other than the author has commented since that review. Not knowing reads as not answered."""
+def earlier_review(repo, pr):
+    """(state, answered): the state of the last review, what render_summary.carried carries over: what
+    last-review.json showed this run, or the last summary's when it had no last-review.json (no earlier
+    diff, a partial review, or a /review continue); and whether a person other than the author has
+    commented since that review. Not knowing reads as not answered; not being able to read the state fails.
+    Answering takes a maintainer (MAINTAINERS) who isn't the author, and a comment that isn't a `/review` command."""
     path, state = Path("last-review.json"), None
     if path.exists():
         state = json.loads(path.read_text())
-    elif not prev:
-        return None, False
     try:
         conversation = api_list(f"repos/{repo}/issues/{pr}/comments")
         summaries = [c for c in conversation if (c.get("user") or {}).get("login") in BOT_USERS
                      and (c["body"] or "").startswith(render_summary.MARKER)]
         if state is None and summaries:
-            state = render_summary.read_state(summaries[-1]["body"])
+            state = render_summary.saved_state(summaries[-1]["body"])
         if not state or not summaries:
             return state, False
         since = summaries[-1]["created_at"]
@@ -805,13 +811,17 @@ def earlier_review(repo, pr, prev):
         spoken = [*conversation, *api_list(f"repos/{repo}/pulls/{pr}/comments"),
                   *api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")]
     except (RuntimeError, ValueError, KeyError, TypeError):
+        if state is None:
+            raise
         return state, False
     answered = any((c.get("submitted_at") or c.get("created_at") or "") > since
-                   and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") != author for c in spoken)
+                   and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") != author
+                   and c.get("author_association") in MAINTAINERS
+                   and not (c.get("body") or "").startswith("/review") for c in spoken)
     return state, answered
 
 
-def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
+def post(out, repo, pr, output, head_sha, mode, salvaged, detail=""):
     """Post the summary, rendered from the review's fields by render_summary and redacted: model output from
     untrusted input. Read the PR's threads after the review posted its inline comments, so the status line
     counts them along with earlier ones still open. Each run posts its own summary comment, so a re-review
@@ -819,7 +829,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
     point here, and loses its marker so a later failure starts a fresh one."""
     pages = graphql(THREADS, repo, pr)
     try:
-        review = render_summary.carried(json.loads(output), *earlier_review(repo, pr, prev))
+        review = render_summary.carried(json.loads(output), *earlier_review(repo, pr))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:

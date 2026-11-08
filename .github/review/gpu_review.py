@@ -42,6 +42,9 @@ NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "MANIFEST.in", "pyproject.toml", "setup
 NO_COUNT_AREAS = {"area/engine", "area/resources"}
 # No runtime code: a review's `none` alone approves a change only to these.
 NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
+# Hardware the bot's GPUs aren't, named in a PR (other_hardware). Lookarounds rather than \b, so `rocm_env`
+# and `is_amd` count, and `amd64` and `hipster` don't.
+UNTESTABLE_HARDWARE = re.compile(r"(?<![a-z0-9])(amd|rocm|hip|mi\d{3}x?)(?![a-z0-9])", re.IGNORECASE)
 MAX_BOX_USD = 500  # what a box's own claude.json can claim for one run; a box controls that file
 ERAS_OUT = "/workspace/live-pr/out"
 # The kinds of check the review can ask for (the schema's `checks`), as the brief names them.
@@ -69,17 +72,19 @@ def gpu_py():
 
 # ---------------------------------------------------------------- GPUs
 
-def slurm_allowed(pr, slurm_authors):
-    """Whether this PR's live test may use the Slurm nodes: only when its author is one of `slurm_authors`
-    (REVIEW_SLURM_AUTHORS, the people already on the nodes). Unset means no Slurm; everyone else with write
-    access still gets a live test, on Eras. The nodes have no job containers and the box runs PR code as root."""
-    return bool(slurm_authors.split()) and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in slurm_authors.split()
+def slurm_allowed(pr, slurm_authors, commenter):
+    """Whether this PR's live test may use the Slurm nodes: only when the person who asked for it and the
+    PR's author are both in `slurm_authors` (REVIEW_SLURM_AUTHORS, the people already on the nodes). Unset
+    means no Slurm; everyone else with write access still gets a live test, on Eras. The nodes have no job
+    containers and the box runs PR code as root."""
+    listed = slurm_authors.split()
+    return commenter in listed and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in listed
 
 
-def configure(out, runner_temp, pr: int = 0, slurm_key="", slurm_nodes="", slurm_authors="", max_gpus="4", hours="4",
-              max_usd="30", max_runs="2", eras_secret="", eras_cache_volumes=""):
+def configure(out, runner_temp, pr: int = 0, slurm_key="", slurm_nodes="", slurm_authors="", commenter="",
+              max_gpus="4", hours="4", max_usd="30", max_runs="2", eras_secret="", eras_cache_volumes=""):
     """gpu.py's config.local.json from the workflow's variables and secrets, and the ssh keys. The Slurm
-    nodes only with their key (one for all of them) and for an author `slurm_allowed` lets use them; Eras
+    nodes only with their key (one for all of them) and for a run `slurm_allowed` lets use them; Eras
     only with ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of nodes, each with its name, host,
     port and pinned host key, and optionally any other field of gpu.py's node. ERAS_CACHE_VOLUMES: the Eras
     cache volumes' ids, space-separated. Nothing here reaches the box."""
@@ -94,7 +99,7 @@ def configure(out, runner_temp, pr: int = 0, slurm_key="", slurm_nodes="", slurm
             for n in nodes):
         raise ValueError("REVIEW_SLURM_NODES: a JSON list of nodes, each with a name ([A-Za-z0-9._-]) and a host")
     slurm = []
-    if slurm_key and nodes and slurm_allowed(pr, slurm_authors):
+    if slurm_key and nodes and slurm_allowed(pr, slurm_authors, commenter):
         key = ssh / "review_slurm"
         key.touch(mode=0o600)
         key.write_text(slurm_key.strip() + "\n")
@@ -165,19 +170,22 @@ def last_live_test(pr):
     return last
 
 
-def pr_files(base_sha, sha):
-    """The files changed from BASE_SHA to SHA, a rename's old name too, or None when GitHub's list is too
-    long to check (300 max)."""
+def changed_files(base_sha, sha):
+    """GitHub's entries for the files changed from BASE_SHA to SHA, or None when its list is too long to
+    check (300 max)."""
     files = bot.api(f"repos/{REPO}/compare/{base_sha}...{sha}").get("files")
-    if files is None or len(files) >= 300:
-        return None
+    return None if files is None or len(files) >= 300 else files
+
+
+def file_names(files):
+    """The names in changed_files' entries, a rename's old name too."""
     return [name for f in files for name in (f["filename"], f.get("previous_filename")) if name]
 
 
 def touches_runtime(pr, sha):
     """Whether the PR at SHA changes runtime code, by file_gate; a file list too long to check does."""
-    files = pr_files(bot.api(f"repos/{REPO}/pulls/{pr}")["base"]["sha"], sha)
-    return files is None or bool(file_gate(files, ROOT)[2])
+    files = changed_files(bot.api(f"repos/{REPO}/pulls/{pr}")["base"]["sha"], sha)
+    return files is None or bool(file_gate(file_names(files), ROOT)[2])
 
 
 def carry(out, pr, head_sha, runner_temp, rereview=""):
@@ -254,7 +262,8 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 - GPUs: the ones in CUDA_VISIBLE_DEVICES. On a Slurm node (SLURM_JOB_ID is set) start servers with
   `mserve`, never `--gpus`. Don't start tmux or detached processes outside this session's job.
   Another run can share the node: every server's `--port` comes from the 20 ports starting at
-  `$LIVE_PR_PORT`, and its `--socket-path-prefix` is `$LIVE_PR_SOCKET_PREFIX`. `$TMPDIR` is this run's own.
+  `$LIVE_PR_PORT`. Don't pass `--socket-path-prefix`: the default comes from the port. `$TMPDIR` is this
+  run's own.
 - You have no GitHub token and post nothing. Write everything to `$LIVE_PR_OUT`:
   `report.md` (the report reference's format, media linked relatively under `media/`),
   `media/` (the test matrix's Media rules: small files, a stereo recording for duplex), and
@@ -499,6 +508,20 @@ def to_fix_first(review, pr, above):
     return why
 
 
+def other_hardware(pull, changes, review):
+    """Why the bot's GPUs passing doesn't cover this PR, as reasons not to approve (none when they do): what
+    the review's `untestable` field says and what UNTESTABLE_HARDWARE finds in the PR's title, file names and
+    changed lines. A diff GitHub won't give is a reason too."""
+    text = [pull["title"], *file_names(changes)]
+    for f in changes:
+        text += [line[1:] for line in (f.get("patch") or "").splitlines() if line[:1] in ("+", "-")]
+    named = sorted({m.lower() for line in text for m in UNTESTABLE_HARDWARE.findall(line)})
+    needs = [x for x in ((review.get("live_test") or {}).get("untestable"), ", ".join(named)) if x]
+    unread = [f["filename"] for f in changes if f.get("changes") and not f.get("patch")]
+    return [*([f"needs a test on {'; '.join(needs)}: the bot's GPUs can't run it"] if needs else []),
+            *([f"couldn't read the diff of `{unread[0]}` to check what hardware it needs"] if unread else [])]
+
+
 def reasons_not_to_approve(pr, sha, verdict, since, review):
     """(why not, engine files, the conditions only this rule knows): the rule's failed conditions, the files
     that make an approval one that doesn't count, and what the checklist has no field for, its `extra`."""
@@ -514,11 +537,12 @@ def reasons_not_to_approve(pr, sha, verdict, since, review):
     # runtime code). On runtime code it counts only after that passing live test (below).
     if not (verdict == "pass" or (verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none")):
         why.append(f"the live test's verdict is {verdict}" + ("; judge its 👂 rows" if verdict == "partial" else ""))
-    files = pr_files(pull["base"]["sha"], sha)
-    if files is None:
+    changes = changed_files(pull["base"]["sha"], sha)
+    why += other_hardware(pull, changes or [], review)
+    if changes is None:
         why.append("the file list is too long to check")
     else:
-        blocked, engine, runtime = file_gate(files, ROOT)
+        blocked, engine, runtime = file_gate(file_names(changes), ROOT)
         if blocked:
             why.append("touches the review's rules or dependencies: " + ", ".join(blocked[:8])
                        + (" and more" if len(blocked) > 8 else ""))
@@ -601,7 +625,7 @@ def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
                             "doesn't count toward required reviews: touches area/engine or area/resources.\n")
         return
     review_pr(pr, head_sha, "APPROVE", f"Approved by the review bot on `{head_sha[:7]}`: low design risk, no open "
-                                       f"P0–P2 finding, and {tested}. A push dismisses it.")
+                                       f"P0–P2 finding, and {tested}. It covers this commit only.")
     # A push between the check and the approval would leave it on a commit nobody tested; a failed read can't
     # rule one out.
     try:

@@ -532,6 +532,10 @@ class TestCollect(unittest.TestCase):
         configure_review_app(self)
         self.assertIsNone(collect(**routes)[0].get("rereview"),
                           "any workflow on a branch could post the state a re-review starts from")
+        inline = {"id": 7, "user": {"login": "github-actions[bot]"}, "body": "**[P1]** drops a token"}
+        files = collect(**{"GET repos/o/r/pulls/7/comments": [inline]})[1]
+        self.assertTrue(json.loads(files["pr-comments.json"])[0]["mine"],
+                        "a team run's inline finding would stop being re-checked")
         team_run = {"isResolved": False, "isOutdated": False, "comments": {"nodes": [
             {"author": {"login": "github-actions"}, "databaseId": 7, "body": "**[P1]** drops a token"}]}}
         pages = [{"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [team_run]}}}}}]
@@ -716,6 +720,50 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertTrue(json.loads(resolved)["body"].startswith(bot.RESOLVED + "\n"))
         self.assertTrue(all(posted not in arg for argv, _ in fake.calls for arg in argv),
                         "posted text would reach gh's command line")
+
+    def test_the_summary_keeps_the_last_reviews_findings_a_re_review_wasnt_shown(self):
+        item = {"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"}
+        question = {"location": "a.py:1", "text": "Should this be a resource?"}
+        state = {"head": LAST, "mode": "nogpu", "skipped": ["big.py"], "latent": [], "outside_diff": [item],
+                 "questions": [question], "risk": {"level": "medium", "reason": "r", "look_at": []}}
+        partial = f"{render_summary.MARKER}\n<!-- claude-review-state " \
+                  f"{base64.b64encode(json.dumps(state).encode()).decode()} -->"
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []}}
+        with workspace():
+            _, fake = step(bot.post, {
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
+                "GET repos/o/r/issues/7/comments": [{"id": 5, "user": {"login": "mstar-review[bot]"},
+                                                     "created_at": "t", "body": partial}],
+                "GET repos/o/r/pulls/7": {"user": {"login": "an-author"}},
+                "GET repos/o/r/pulls/7/comments": [],
+                "GET repos/o/r/pulls/7/reviews*": [],
+            }, repo="o/r", pr="7", output=json.dumps(review), head_sha=HEAD, mode="light", salvaged="false")
+        (_, posted), = fake.writes()
+        saved = render_summary.saved_state(posted)
+        self.assertEqual(saved["outside_diff"], [item],
+                         "a run with no last-review.json, or a /review continue, would drop the finding for good")
+        self.assertEqual((saved["questions"], saved["risk"]["level"]), ([question], "medium"),
+                         "post would approve past a question and a risk nobody answered")
+
+    def test_only_a_maintainer_other_than_the_author_answers_an_earlier_review(self):
+        for name, comment, answered in (
+                ("a member", {"user": {"login": "m", "type": "User"}, "author_association": "MEMBER",
+                              "body": "keep it"}, True),
+                ("the author", {"user": {"login": "an-author", "type": "User"}, "author_association": "OWNER",
+                                "body": "it's fine"}, False),
+                ("an outsider", {"user": {"login": "o", "type": "User"}, "author_association": "NONE",
+                                 "body": "it's fine"}, False),
+                ("a /review command", {"user": {"login": "m", "type": "User"}, "author_association": "MEMBER",
+                                       "body": "/review nogpu"}, False)):
+            with self.subTest(name), workspace(), mock.patch.object(bot, "run", FakeGh({
+                    "GET repos/o/r/issues/7/comments": [summary(LAST), {**comment, "created_at": "u"}],
+                    "GET repos/o/r/pulls/7": {"user": {"login": "an-author"}},
+                    "GET repos/o/r/pulls/7/comments": [],
+                    "GET repos/o/r/pulls/7/reviews*": []})):
+                self.assertEqual(bot.earlier_review("o/r", "7")[1], answered)
 
     def test_only_the_fixed_type_labels_reach_the_api(self):
         out, fake = step(bot.labels, {"GET repos/o/r/issues/7/labels": [{"name": "type/docs"}, {"name": "area/x"}],

@@ -75,6 +75,16 @@ class TestReviewSummary(unittest.TestCase):
         self.assertEqual(len(state["outside_diff"]), 2, "the finding would be gone at the next re-review")
         judged = [{"ref": "a.py:1", "priority": "P1", "status": "fixed", "why": "guard added"}]
         self.assertEqual(carried(review(prior=judged), {"outside_diff": earlier}, False)["outside_diff"], [earlier[1]])
+        reopened = carried(review(prior=[{"ref": "a.py:1", "priority": "P1", "status": "open", "why": "no fix"}]),
+                           {"outside_diff": [{**earlier[0], "fixed_in": 12}]}, False)
+        self.assertEqual([f[:2] for f in open_findings(reopened, [], [12])], [("outside the diff, a.py:1", "P1")],
+                         "a stale fixed_in would hide a finding this run judged still open, and the status go green")
+        above = carried(review(prior=[{"ref": "a.py:1", "priority": "P1", "status": "fixed_above", "fixed_in": 12,
+                                       "why": "guard added"}]), {"outside_diff": [earlier[0]]}, False)
+        self.assertEqual(read_state(render(above, [], "0123456789", "nogpu", []))["outside_diff"][0]["location"],
+                         "a.py:1", "a finding fixed in a PR that isn't stacked would be gone from the next re-review")
+        self.assertEqual(render(above, [], "0123456789", "nogpu", [12]).count("Fixed in #12 above"), 2,
+                         "kept in both lists, it would be said twice in the section and twice on the checklist")
 
     def test_a_re_review_cant_lower_the_risk_or_lose_an_unanswered_question(self):
         carried = SUMMARY["carried"]
@@ -85,6 +95,12 @@ class TestReviewSummary(unittest.TestCase):
         self.assertEqual(r["questions"], earlier["questions"], "a re-review could drop a question nobody answered")
         self.assertEqual(read_state(render(r, [], "0123456789", "full", []))["questions"], earlier["questions"])
         self.assertEqual(carried(review(), earlier, True)["questions"], [], "a person's answer would change nothing")
+        self.assertEqual(carried(review(), earlier, True)["risk"]["level"], "low",
+                         "a maintainer's answer would leave the earlier risk standing")
+        decision = {"location": "a.py:1", "why": "new lifecycle state"}
+        floored = carried(review(), {"risk": {**earlier["risk"], "look_at": [decision]}}, False)
+        self.assertEqual(floored["risk"]["look_at"], [decision], "the checklist wouldn't name the decision kept")
+        self.assertEqual(read_state(render(floored, [], "0123456789", "full", []))["risk"]["look_at"], [decision])
 
     def test_a_finding_a_pr_above_fixes_is_reported_but_doesnt_block(self):
         above = [{"ref": "7", "priority": "P1", "status": "fixed_above", "fixed_in": 12, "why": "guard added"}]

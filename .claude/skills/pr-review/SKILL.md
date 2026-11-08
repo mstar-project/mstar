@@ -171,7 +171,8 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   that lands second folds into the first.
 - **The author's stated reason.** For every finding, P0–P3, read the description, replies, commit
   messages and code comments for a reason the author gave for that code. When there is one and it
-  holds, drop the finding. When there is one and it doesn't, the finding states it in one clause
+  holds, drop a new finding; an earlier one follows the re-review prompt, where a P0–P2 the author
+  argues against with no code change is `disputed`, not dropped. When there is one and it doesn't, the finding states it in one clause
   and says why it doesn't hold or why the finding stands anyway. A finding that contradicts a stated reason without engaging it
   isn't ready to report.
 
@@ -339,8 +340,9 @@ the bar's priority. A judgement call on direction is a question.
 ### 4.5 Abstraction fit and Phase B (all modes)
 
 Set Phase A beside the code: one row per design area with what the derivation gives, what the PR
-does, which is better and why, and the cost to converge. Every row where the derivation is better is
-a finding or folds into one; note where the PR beats it. Run the disguise, altitude and seam checks
+does, which is better and why, and the cost to converge. A row where the derivation is better goes in
+`questions` or the risk's `look_at` as §4.4 says, and is a finding only when an `AGENTS.md` invariant is
+actually broken, at the bar's priority; note where the PR beats it. Run the disguise, altitude and seam checks
 in [mstar-way.md](references/mstar-way.md) on the code; each hit is a finding naming the primitive,
 the altitude or the type it should be, and a disguise-check hit in a shared layer is at most P1 (§2).
 
@@ -377,11 +379,10 @@ the PR adds, name the mstar abstraction that owns it and check the PR uses it:
   general level now, keyed by declarations, correct for the general case; generality means the shape
   and placement, not unused knobs. Where the PR chose the narrow version, it must say why.
 
-A misfit is a finding even if it works and is tested. **Priority:** P1 in a shared layer or public
-surface (the cap for a disguise-check hit there), when it hits invariant 1's "nothing under
-`mstar/model/` should" list, when it blocks a known optimization, or for a loop or stop decision in
-`forward` that blocks streaming or continuous batching for the model's family; inside one model
-otherwise, P2 when an `AGENTS.md` invariant is broken and a question when it isn't. When the right abstraction doesn't exist yet, the finding names the missing engine piece
+A misfit that actually breaks an `AGENTS.md` invariant (invariant 1's "nothing under `mstar/model/`
+should" list, say) is a finding at the bar's priority, even if it works and is tested. One that breaks
+none goes in `questions` or the risk's `look_at` (§6), naming what it blocks: a known optimization,
+or streaming or continuous batching for the model's family. When the right abstraction doesn't exist yet, the finding names the missing engine piece
 (mstar philosophy §2) and, with a shell, any open PR providing it, and says whether to block on that
 PR or stack this one on it.
 
@@ -434,11 +435,10 @@ API field, registry entry):
 Each design finding names the concrete pain (the realistic next change it makes hard, shown as the
 lines that change would copy or special-case), sketches the better shape, and says what converging
 costs now versus after merge. **Priority:** P0 when the design breaks a contract other code on `main`
-relies on, or makes correct behaviour impossible to express (rare); P1 for an `AGENTS.md` invariant
-violation, a model-specific concept in a shared layer or public surface, or a blocker for a known
-high-value optimization there; P2 only when an `AGENTS.md` invariant is actually broken, and
-otherwise a design that works goes in `questions` or the risk's `look_at` (§6); P3 for a cleaner
-shape that is cheap to leave.
+relies on, or makes correct behaviour impossible to express (rare); an `AGENTS.md` invariant actually
+broken, at the bar's priority (a model-specific concept in a shared layer or public surface usually
+is one). Otherwise a design that works goes in `questions` or the risk's `look_at` (§6), with any
+high-value optimization it blocks; P3 for a cleaner shape that is cheap to leave.
 
 ### 4.8 Minimality (all modes)
 
@@ -459,7 +459,8 @@ the wrong layer.
   picked the one needing the fewest new concepts. (Duplex built on persistent sessions brings in
   session lifecycle, persistence and reconnect; a streaming edge from the client reuses existing
   `StreamBuffer` and partition machinery.) A PR built on the heavier foundation that doesn't say why
-  is a finding (P1 in a shared layer).
+  goes in `questions` or the risk's `look_at` (§4.4), and is a finding only when an `AGENTS.md`
+  invariant is actually broken, at the bar's priority.
 - **Per-model adoption cost.** A cross-cutting feature (LoRA, quantization, a cache kind, a sampler
   variant) should cost each model declarations only: a config field, a resource declaration, a list
   of module names. Methods every model must implement are a finding when the engine could derive the
@@ -593,6 +594,12 @@ the last review.
   `what` (an input, a claim to measure, or a config or path the change only shows on) and `why`
   (one line): the input your trace found, the config that takes the changed branch. Short strings,
   no commands. Empty when you have none. The live test folds them into its risk map.
+- `untestable`: what in this PR the bot's GPUs can't exercise, as a short string; empty when there is
+  nothing. Set it for code or configs whose path runs only on hardware the live test doesn't have
+  (AMD/ROCm, XPU, Apple, anything else). When nothing the bot's GPUs can run is reached, `run` is
+  `none`, even for a change to what a model does on that hardware; when shared code changes too, the
+  live test still runs for what it can reach. It doesn't gate the GPU run. It stops the bot's approval:
+  such a PR gets the normal review and checklist, and a person approves it.
 
 The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
 counts them) and no skipped file. Otherwise no box starts, and the comment lists what to fix first

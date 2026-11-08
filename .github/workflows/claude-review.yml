@@ -425,7 +425,6 @@ jobs:
           MODE: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}
           DETAIL: ${{ steps.salvage.outputs.detail }}
-          PREV: ${{ steps.prev.outputs.dir }}
         run: python3 .github/review/bot.py post
 
       # Hide the earlier summaries as outdated, so the PR shows only the latest
@@ -543,6 +542,7 @@ jobs:
           SLURM_KEY: ${{ secrets.REVIEW_SLURM_SSH_KEY }}
           SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
           SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
+          COMMENTER: ${{ github.event.comment.user.login }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}

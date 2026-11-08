@@ -54,12 +54,23 @@ class TestApproval(unittest.TestCase):
         for expected in ("inline 1", "inline 3", "inline 5", "engine.py:10"):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")
 
-    def test_only_a_listed_author_can_use_the_slurm_nodes(self):
-        with unittest.mock.patch.object(bot, "api", return_value={"user": {"login": "someone"}}):
-            self.assertFalse(gpu_review.slurm_allowed(7, ""), "with the variable unset, nobody may use Slurm")
-            self.assertFalse(gpu_review.slurm_allowed(7, "alice bob"),
-                             "any write-access author would run code as root on the shared nodes")
-            self.assertTrue(gpu_review.slurm_allowed(7, "alice someone"))
+    def test_only_a_listed_author_and_commenter_can_use_the_slurm_nodes(self):
+        def slurm(authors, commenter):
+            fake = FakeGh({f"GET repos/{R}/pulls/7": {"user": {"login": "someone"}}, "ssh-keygen*": ""})
+            with tempfile.TemporaryDirectory() as d, \
+                    unittest.mock.patch.object(gpu_review, "GPU", Path(d, "s/gpu.py")), \
+                    unittest.mock.patch.object(Path, "home", return_value=Path(d)), \
+                    unittest.mock.patch.object(bot, "run", fake):
+                gpu_review.configure({}, d, pr=7, slurm_key="k", slurm_nodes='[{"name": "n", "host": "h"}]',
+                                     slurm_authors=authors, commenter=commenter)
+                return json.loads(Path(d, "config.local.json").read_text())["slurm"]
+
+        self.assertEqual(slurm("", "someone"), [], "with the variable unset, nobody may use Slurm")
+        self.assertEqual(slurm("alice bob", "alice"), [],
+                         "any write-access author would run code as root on the shared nodes")
+        self.assertEqual(slurm("alice someone", "bob"), [],
+                         "someone not on the nodes could send a listed author's PR there")
+        self.assertEqual(len(slurm("alice someone", "alice")), 1)
 
     def test_rules_and_dependencies_never_approve_and_engine_approvals_dont_count(self):
         for path in (".github/review/review-prompt.md", ".claude/skills/pr-review/SKILL.md", "AGENTS.md",
@@ -76,7 +87,7 @@ class TestApproval(unittest.TestCase):
                          "a low-risk worker or model change couldn't get a counting approval")
 
     def test_a_none_run_counts_as_a_pass_only_when_the_review_chose_none(self):
-        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}}
+        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}, "title": "T"}
 
         def why(verdict, run, files=("docs/models.rst",), since="", skipped=(), questions=()):
             fake = FakeGh({f"GET repos/{R}/pulls/7": pr, f"GET repos/{R}/collaborators/an-author/permission":
@@ -374,11 +385,11 @@ class TestCost(unittest.TestCase):
 
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
-                outside=(), above=None, extra=None, head_after=None):
+                outside=(), above=None, extra=None, head_after=None, untestable=""):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
         `verdict` or the other arguments fail it; its decision text, the outputs and the writes, as a
         list unless `head_after` (the head on the read after the POST) asks for the fake and its calls."""
-        pr = {"head": {"sha": head}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}}
+        pr = {"head": {"sha": head}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}, "title": "T"}
         heads = iter(() if head_after is None else (pr,))
         after = head_after if isinstance(head_after, Fail) else {**pr, "head": {"sha": head_after}}
         routes = {f"GET repos/{R}/pulls/7": (lambda a, i: next(heads, after))
@@ -392,7 +403,8 @@ class TestApprove(unittest.TestCase):
             (ws / "review.json").write_text(json.dumps({
                 "outside_diff": list(outside), "prior_findings": [], "questions": [], "skipped": [],
                 "risk": {"level": risk, "reason": "docs only", "look_at": []},
-                "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1}}))
+                "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1,
+                              "untestable": untestable}}))
             if above is not None:
                 (ws / "stacked-above.json").write_text(json.dumps(above))
             out, fake = step(gpu_review.approve, routes, pr=7, head_sha="0123456789", runner_temp=temp, verdict=verdict)
@@ -405,7 +417,15 @@ class TestApprove(unittest.TestCase):
                                    ("the author can't write", {"perm": "read"}, "read"),
                                    ("design risk", {"risk": "medium"}, ""),
                                    ("a blocked file", {"files": [{"filename": ".github/workflows/ci.yml"}]}, "rules"),
-                                   ("a blocked file renamed away", {"files": [blocked]}, "rules")):
+                                   ("a blocked file renamed away", {"files": [blocked]}, "rules"),
+                                   ("the review says the GPUs can't run it", {"untestable": "AMD kernels"},
+                                    "needs a test on AMD kernels: the bot's GPUs can't run it"),
+                                   ("a changed line names AMD hardware", {"files": [
+                                       {"filename": "docs/x.rst", "changes": 1,
+                                        "patch": "@@ -1 +1 @@\n+runs on ROCm"}]},
+                                    "needs a test on rocm"),
+                                   ("a diff that can't be read", {"files": [
+                                       {"filename": "docs/x.rst", "changes": 9000}]}, "couldn't read the diff")):
             with self.subTest(name):
                 text, out, writes = self.approve({"value": "on"}, **kwargs)
                 self.assertEqual((writes, out.get("approval")), ([], None), f"{name} would still approve")

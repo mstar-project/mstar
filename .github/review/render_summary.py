@@ -33,6 +33,8 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
 # disputed: a P0-P2 the author argues against with no code change. It stays open, for a person to decide.
 STILL_OPEN = ("open", "disputed")
+# What takes an earlier finding outside the diff out of the state (`carried`).
+CLEARS = ("fixed", "moot")
 # Summaries and handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu", "gpu": "full"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
@@ -115,7 +117,10 @@ SCHEMA = {
                                                           "the change only shows on"},
                 "why": {"type": "string", "description": "one line"},
             }, "required": ["what", "why"]}},
-        }, "required": ["run", "reason", "checks", "gpus", "focus"]},
+            # What the bot's GPUs can't run in this PR; it stops the bot's approval, not the GPU run.
+            "untestable": {"type": "string", "description": "the hardware or path the live test can not exercise, "
+                                                            "short; empty when there is nothing"},
+        }, "required": ["run", "reason", "checks", "gpus", "focus", "untestable"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "latent", "risk"],
@@ -148,18 +153,31 @@ RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 def carried(review, earlier, answered):
     """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
-    outside the diff this one hasn't cleared ("a finding left out stays open"), its risk level as a floor,
-    and its questions, unless a person other than the author has commented since (`answered`), when this
-    review's judgement stands. Everything here is carried into the next state too."""
+    outside the diff this one hasn't cleared ("a finding left out stays open"; only `fixed` and `moot` clear
+    one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
+    still open loses any `fixed_in` from before); and its risk level as a floor, with the `look_at` that names
+    the decision, and its questions, unless a maintainer other than the author has commented since
+    (`answered`), when this review's judgement stands. Everything here is carried into the next state too."""
     earlier = earlier or {}
-    cleared = {f["ref"] for f in review["prior_findings"] if f["status"] not in STILL_OPEN}
+    verdicts = {f["ref"]: f for f in review["prior_findings"]}
     locations = {f["location"] for f in review["outside_diff"]}
+
+    def with_verdict(f):
+        verdict = verdicts.get(f["location"])
+        if verdict is None:
+            return f
+        kept = {k: v for k, v in f.items() if k != "fixed_in"}
+        fixed_in = verdict["status"] == "fixed_above" and verdict.get("fixed_in")
+        return {**kept, "fixed_in": fixed_in} if fixed_in else kept
+
     review = {**review, "outside_diff": [*review["outside_diff"], *[
-        f for f in earlier.get("outside_diff", []) if f["location"] not in cleared and f["location"] not in locations]]}
-    old, new = earlier.get("risk"), review.get("risk")
-    if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
-        review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}"}
+        with_verdict(f) for f in earlier.get("outside_diff", []) if f["location"] not in locations
+        and verdicts.get(f["location"], {}).get("status") not in CLEARS]]}
     if not answered:
+        old, new = earlier.get("risk"), review.get("risk")
+        if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
+            review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}",
+                              "look_at": [*new.get("look_at", []), *old.get("look_at", [])]}
         asked = {q["text"] for q in review["questions"]}
         review["questions"] = [*review["questions"], *[q for q in earlier.get("questions", [])
                                                        if q["text"] not in asked]]
@@ -212,14 +230,20 @@ def status(review, pages, head, mode, stacked):
         icon = "🟡"
     else:
         icon = "🟢"
-    fixed_above = sum(f["status"] == "fixed_above" for f in review["prior_findings"]) \
-        + sum(bool(f.get("fixed_in")) for f in review["outside_diff"])
+    fixed_above = len(prior_above(review)) + sum(bool(f.get("fixed_in")) for f in review["outside_diff"])
     text = ", ".join(f"{n} {p}" for p, n in counts.items() if n) or "No open findings" + (
         f"; {fixed_above} fixed above" if fixed_above else "")
     line = f"{icon} **{text}** on `{head[:7]}`, {mode} review"
     if review.get("risk"):
         line += f" · design risk **{review['risk']['level']}**: {review['risk']['reason']}"
     return line
+
+
+def prior_above(review):
+    """The earlier findings judged fixed above, but not one `carried` also kept in outside_diff (its row there
+    counts)."""
+    outside = {f["location"] for f in review["outside_diff"]}
+    return [f for f in review["prior_findings"] if f["status"] == "fixed_above" and f["ref"] not in outside]
 
 
 def above(finding):
@@ -248,8 +272,7 @@ def checklist(review, pages, stacked, extra=()):
         return [f"**[{p}]** `{w}`: {what}" for wanted in priorities for w, p, what in found if p == wanted]
 
     items = [*findings("P0", "P1"),
-             *[f"**[{f['priority']}]** {f['ref']}: {above(f)}" for f in review["prior_findings"]
-               if f["status"] == "fixed_above"],
+             *[f"**[{f['priority']}]** {f['ref']}: {above(f)}" for f in prior_above(review)],
              *[f"**[{f['priority']}]** `{f['location']}`: {above(f)}" for f in review["outside_diff"]
                if f.get("fixed_in")],
              *extra,
@@ -288,7 +311,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
         ("Outside the diff", [f"**[{f['priority']}]** `{f['location']}`: {f['claim']}\n\n  {f['detail']}"
                               for f in review["outside_diff"] if not f.get("fixed_in")]),
         ("Fixed in a PR above", [f"**[{f['priority']}]** {f['ref']}: {f['why']} {above(f)}"
-                                 for f in prior if f["status"] == "fixed_above"]
+                                 for f in prior_above(review)]
          + [f"**[{f['priority']}]** `{f['location']}`: {f['claim']} {above(f)}\n\n  {f['detail']}"
             for f in review["outside_diff"] if f.get("fixed_in")]),
         ("Description", review["description_problems"]),
@@ -315,9 +338,10 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
             else "Advisory: this review doesn't approve or block.")
     parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
-    risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
+    risk = review.get("risk")
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
-             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": review.get("latent", []),
+             "risk": risk and {k: risk[k] for k in ("level", "reason", "look_at") if k in risk},
+             "latent": review.get("latent", []),
              "questions": review["questions"],
              "live_test": live, "moot": [f for f in prior if f["status"] == "moot"]}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
@@ -337,19 +361,19 @@ def saved_state(body):
         state = json.loads(base64.b64decode(found[-1])) if found else None
     except ValueError:
         return None
-    return state if isinstance(state, dict) else None
+    if not isinstance(state, dict):
+        return None
+    state["mode"] = current_mode(state.get("mode"))
+    return state
 
 
 def read_state(body):
-    """The state a summary comment carries, for a re-review to start from; else None, and that run
-    reviews the whole PR. None too when it doesn't decode and when the earlier review skipped files.
-    Any mode can build on any other, since every mode runs every pass."""
+    """The saved state, when a re-review can build on it; else None, and that run reviews the whole PR. Not
+    when it doesn't decode or the earlier review skipped files. Any mode can build on any other, since every
+    mode runs every pass."""
     state = saved_state(body)
-    if state is None:
-        return None
-    state["mode"] = current_mode(state.get("mode"))
     # A state without `latent` is from before light mode ran every pass, so it counts as a partial review;
     # one without `skipped` is older still.
-    if state.get("skipped", [None]) or "latent" not in state:
+    if state is None or state.get("skipped", [None]) or "latent" not in state:
         return None
     return state
