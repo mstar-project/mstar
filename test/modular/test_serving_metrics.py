@@ -1376,6 +1376,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
                         lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
     monkeypatch.setattr(entrypoint, "_run_warmup_requests", lambda server, specs, replicas: events.append("warmup"))
     monkeypatch.setattr(entrypoint.uvicorn, "Server", _Uvicorn)
+    monkeypatch.setattr(entrypoint.ws_frames, "start", lambda: None)
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
 
     entrypoint.main(["--config", cfg, "--enable-metrics"])

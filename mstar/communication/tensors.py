@@ -1646,7 +1646,8 @@ class TensorCommunicationManager(ABC):
             )
 
     def ack_unread_tensors(self, graph_edges: list[GraphEdge]):
-        """Ack tensors for an already-removed request without reading them.
+        """Ack tensors without reading them, for edges nothing here will consume: a
+        removed request, one with a remove pending, or a stream with no buffer here.
 
         The producer holds these buffers until it gets the TENSOR_RECEIVED ack;
         emit it here so it can reclaim them.
