@@ -574,9 +574,11 @@ def refresh_above():
 
 
 def approvals_on():
-    """The kill switch, the repository variable REVIEW_APPROVALS, read now rather than from the job's
-    start, so a live test that began hours ago still obeys it. Unset, any other value or a failed read
-    (the job's own token can't read variables) means off."""
+    """The kill switch, the repository variable REVIEW_APPROVALS, read through the app's token right before
+    approving; unset, any other value or a failed read means off. Two facts measured on Actions keep this read:
+    `vars.X` is fixed when a run starts, even for a later job started after the variable changed, so `vars`
+    can't obey a flip to off during a multi-hour run; and the job's own GITHUB_TOKEN, even with `actions: read`,
+    gets 403 on the variables API."""
     return (bot.read(bot.api, f"repos/{REPO}/actions/variables/REVIEW_APPROVALS") or {}).get("value") == "on"
 
 

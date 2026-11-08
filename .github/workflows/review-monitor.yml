@@ -1,9 +1,9 @@
 name: Review bot monitor
 
 # A daily report on the PRs merged with the review bot's approval. Reviews nothing and runs no
-# model: every step reads GitHub and git and writes the status issue (bot.py, monitor). Run it
-# by hand once as setup: it creates the status issue. The status issue has one writer: this
-# job, serialized by its concurrency group.
+# model: every step reads GitHub and git and writes the status issue (bot.py, monitor). Its
+# first scheduled run creates that issue and the skip-ai-review label. The status issue has one
+# writer: this job, serialized by its concurrency group.
 
 on:
   schedule:
@@ -26,7 +26,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      # The status issue: its body and its comments.
+      # The status issue (its body and its comments) and the skip-ai-review label.
       issues: write
       pull-requests: read
       # A failed check on a merge commit whose parent passed.
