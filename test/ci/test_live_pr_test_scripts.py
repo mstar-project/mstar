@@ -137,8 +137,8 @@ class TestGpu(unittest.TestCase):
         entry = GPU["ledger"]()[key]
         for end in ("by hand", "at the deadline"):
             GPU["save_ledger"]({key: {**entry, "deadline": time.time() - 1}})
-            deleted = []  # the first pod appears after its launch gave up
-            self.g.update(runpod_list=lambda path, field, params=None: made,
+            deleted, polls = [], iter([[]])  # the first pod appears after its launch gave up, and a poll late
+            self.g.update(runpod_list=lambda path, field, params=None, polls=polls: next(polls, made),
                           runpod=lambda method, path, *a, deleted=deleted, **k: deleted.append((method, path)) or {})
             with contextlib.redirect_stdout(io.StringIO()):
                 if end == "by hand":
@@ -147,6 +147,43 @@ class TestGpu(unittest.TestCase):
                     GPU["cmd_watchdog"](argparse.Namespace(instance=key), CFG)
             self.assertEqual(deleted, [("DELETE", "/pods/p1")], f"ending the pending entry {end} left its pod up")
             self.assertEqual(GPU["ledger"](), {})
+
+    def test_an_extend_or_terminate_while_adopt_looks_is_kept(self):
+        """The pending entry is changed from another shell while launch is still looking for its pod."""
+        for change, want in (("extend", 0), ("terminate", 60)):
+            GPU["save_ledger"]({})
+            state = {"polls": 0}
+
+            def runpod(method, path, body=None, params=None, retry=True, state=state):
+                if method == "POST":
+                    state["name"] = body["name"]
+                    raise GPU["ApiError"](502, "bad gateway")
+                return {}
+
+            def runpod_list(path, field, params=None, state=state, change=change):
+                state["polls"] += 1
+                if state["polls"] == 1:  # another shell acts before the pod is listed
+                    pending = f"pending:{state['name']}"
+                    if change == "extend":
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            GPU["cmd_extend"](argparse.Namespace(instance=pending, hours=0, allow_over_budget=False),
+                                              CFG)
+                    else:
+                        with GPU["ledger_txn"]() as d:
+                            d.pop(pending)
+                    return []
+                return [{"id": "p1", "name": state["name"]}]
+            self.g.update(runpod=runpod, runpod_list=runpod_list, find_offer=lambda cfg, oid: OFFER,
+                          runpod_volumes=lambda cfg: {"US-1": {"id": "v", "kind": "network"}})
+            args = argparse.Namespace(offer=OFFER["id"], pr=7, hours=1, allow_over_budget=False, dry_run=False)
+            with unittest.mock.patch("subprocess.Popen") as popen, contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                GPU["cmd_launch"](args, CFG)
+            entry = GPU["ledger"]().get("runpod:p1")
+            self.assertIsNotNone(entry, f"the pod found after a {change} meanwhile went unrecorded")
+            self.assertIn("runpod:p1", [c.args[0][-1] for c in popen.call_args_list])
+            self.assertAlmostEqual((entry["deadline"] - time.time()) / 60, want, delta=1,
+                                   msg=f"the {change} made while launch looked was lost")
 
     def test_a_create_refused_with_a_429_makes_nothing_to_look_for(self):
         made, listed, deleted, exited = self.launch(GPU["ApiError"](429, "slow down"))
@@ -172,6 +209,7 @@ class TestGpu(unittest.TestCase):
         GPU["save_ledger"]({"runpod:p1": {**one, "launched_at": now - 5 * 3600, "deadline": now - 30}})
         with contextlib.redirect_stdout(io.StringIO()):
             GPU["cmd_extend"](argparse.Namespace(instance="runpod:p1", hours=0, allow_over_budget=False), CFG)
+        self.assertLess(GPU["ledger"]()["runpod:p1"]["deadline"], time.time() + 1)
 
     def test_offers_with_a_provider_not_answering_is_not_no_availability(self):
         def erroring(*a, **k):

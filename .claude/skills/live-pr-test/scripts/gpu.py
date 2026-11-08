@@ -445,18 +445,20 @@ def cmd_launch(args, cfg):
     arm_watchdog(key)  # a pending entry's watchdog terminates by name at the deadline
     if lost:
         try:
-            iid = adopt(o["provider"], name, lost)
+            iid = adopt(o["provider"], name)
         except ApiError as err:
             die(f"the create's answer was lost ({lost}), and looking for {name} failed ({err}): "
                 f"`gpu.py terminate {pending}` terminates it by name once the API answers")
         if iid is None:
             die(f"the create failed ({lost}), and no instance named {name} showed up in 2 min. Its watchdog "
                 f"still terminates one by name at the deadline; `gpu.py terminate {pending}` does it now")
+        print(f"the create's answer was lost ({lost}); {o['provider']}:{iid} is the instance named {name}",
+              file=sys.stderr)
         with ledger_txn() as d:
             key = f"{o['provider']}:{iid}"
             # recorded even if pending was terminated meanwhile: the pod was just found, so it gets a watchdog
-            d[key] = {**fields, "instance_id": iid}
-            d.pop(pending, None)  # pending's watchdog sees it gone and exits
+            # the entry as it is now (an extend meanwhile), or as it was if it was terminated meanwhile
+            d[key] = {**(d.pop(pending, None) or fields), "instance_id": iid}  # pending's watchdog then exits
         arm_watchdog(key)
     print(f"launched {key} ({o['count']}x {o['gpu']}, {o['region']}, ${o['usd_per_hour']}/hr); "
           f"watchdog terminates it at {time.strftime('%H:%M', time.localtime(now + hours * 3600))} ({hours} h)")
@@ -477,11 +479,10 @@ def named(provider: str, name: str) -> list[str]:
     return [i["id"] for i in lambda_("GET", "/instances") or [] if i.get("name") == name]
 
 
-def adopt(provider: str, name: str, err: Exception) -> str | None:
+def adopt(provider: str, name: str) -> str | None:
     """The instance a create whose answer was lost made, found by its name, or None after 2 min."""
     for _ in range(12):  # a new instance can take a while to show in the listing
         if ids := named(provider, name):
-            print(f"{provider}:{ids[0]} is the instance named {name} ({err})", file=sys.stderr)
             return ids[0]
         time.sleep(10)
     return None
@@ -563,7 +564,7 @@ def cmd_copy(args, cfg):
 def terminate(key: str, e: dict) -> None:
     # A lost create's entry (instance_id None) terminates whatever has its name, waiting as long as
     # launch would for it to be listed.
-    ids = [e["instance_id"]] if e["instance_id"] else [i for i in [adopt(e["provider"], e["name"], key)] if i]
+    ids = [e["instance_id"]] if e["instance_id"] else [i for i in [adopt(e["provider"], e["name"])] if i]
     if not ids and not e["instance_id"]:
         print(f"no instance named {e['name']} was listed in 2 min; nothing to terminate", file=sys.stderr)
     for iid in ids:
