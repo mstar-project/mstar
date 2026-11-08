@@ -3596,7 +3596,7 @@ class Worker:
         clear_loop_stops: bool = True,
     ):
         # Stage stopwatch named like the NVTX ranges below; a clock stamp, not
-        # a nested `_span`, because of the two early returns.
+        # a nested `timer.span`, because of the two early returns.
         _pp_t = _time.perf_counter() if self.timer.period else 0.0
         def _pp_stage(name: str) -> None:
             nonlocal _pp_t

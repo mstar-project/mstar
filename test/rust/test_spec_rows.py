@@ -1,7 +1,7 @@
 """The columnar speculation (``prep_spec_rows`` + ``SpeculationBuilder.assemble_rows``)
 must build exactly the speculative step the per-row path builds.
 
-A real worker (``Worker.__new__`` plus the attributes these methods read) over
+A real worker (``make_worker`` plus the collaborators these methods read) over
 the real graph runtime is driven through a decode loop. Each
 step the next one is speculated twice from the same state, once per path --
 prepping is side-effect free when nothing streams -- and everything the engine,

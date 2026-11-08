@@ -26,7 +26,8 @@ _COLLABORATORS = frozenset({
 def make_worker(**overrides) -> Worker:
     """A ``Worker`` with no threads, sockets or engines. ``overrides`` replace
     fields and methods by name; a name ``Worker`` does not have raises
-    ``TypeError``, so a test cannot go on setting a field that has moved."""
+    ``TypeError``. Only names passed here are checked: a field a test sets on
+    the returned worker is not."""
     worker = Worker.__new__(Worker)
     worker._init_step_state()
     worker.worker_id = "w0"

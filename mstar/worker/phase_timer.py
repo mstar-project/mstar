@@ -1,7 +1,7 @@
 """Per-phase timing of the worker's threads, and the NVTX range that goes with
 each phase. ``benchmark/worker_phases`` reads what this writes out.
 
-Off unless ``MSTAR_PHASE_TIMING`` is a positive period (in passes); see
+Set ``MSTAR_PHASE_TIMING`` to a positive period (in passes) to turn it on; see
 ``docs/environment_variables.rst``.
 """
 import gc

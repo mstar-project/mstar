@@ -1,7 +1,7 @@
 """Preparing and building the worker's speculative step.
 
-While step N runs, the worker speculates step N+1.
-``Worker._try_speculate_next`` decides what to speculate and merges in
+While step N runs, the worker speculates step N+1 (see the async-worker
+skill). ``Worker._try_speculate_next`` decides what to speculate and merges in
 fresh rows from the scheduler; the stages on either side of that live here:
 
 * ``SpeculationPreparer`` asks the graph runtime which of N's rows continue
