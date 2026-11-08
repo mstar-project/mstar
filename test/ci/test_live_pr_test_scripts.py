@@ -46,8 +46,7 @@ class Reply:
 class TestGpu(unittest.TestCase):
     def setUp(self):
         self.g = GPU["http"].__globals__
-        saved = {k: self.g[k] for k in ("STATE", "LEDGER", "runpod", "runpod_list", "runpod_volumes", "find_offer",
-                                        "runpod_offers", "lambda_offers")}
+        saved = {k: self.g[k] for k in ("STATE", "LEDGER", "runpod", "runpod_list", "runpod_volumes", "find_offer")}
         self.addCleanup(self.g.update, saved)
         state = Path(tempfile.mkdtemp())
         self.g.update(STATE=state, LEDGER=state / "instances.json")
@@ -217,8 +216,9 @@ class TestGpu(unittest.TestCase):
         def erroring(*a, **k):
             raise GPU["ApiError"](503, "unavailable")
         args = argparse.Namespace(gpus=1, min_vram=80, all_regions=False, allow_arm=False, json=False)
-        self.g["runpod_offers"] = erroring
-        self.g["lambda_offers"] = lambda *a, **k: []
+        unittest.mock.patch.object(GPU["RunPod"], "offers", erroring).start()
+        unittest.mock.patch.object(GPU["Lambda"], "offers", lambda *a, **k: []).start()
+        self.addCleanup(unittest.mock.patch.stopall)
         # no key anywhere; RunPod erroring with no Lambda key; RunPod erroring and Lambda answering with nothing
         for env in ({}, {"RUNPOD_API_KEY": "k"}, {"RUNPOD_API_KEY": "k", "LAMBDA_API_KEY": "k"}):
             out = io.StringIO()
