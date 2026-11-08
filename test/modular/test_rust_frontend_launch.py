@@ -35,3 +35,13 @@ def test_unset_settings_leave_the_frontends_defaults(launched, monkeypatch):
     rust_frontend.launch_rust_server("bin", "qwen3_5_0.8b", 8000, "/b", "/u")
     assert "MSTAR_REQUEST_TIMEOUT_S" not in launched["env"]
     assert "MSTAR_SAMPLE_RATE" not in launched["env"]
+
+
+def test_the_voice_list_is_the_models_and_never_an_inherited_one(launched, monkeypatch):
+    monkeypatch.setenv("MSTAR_VOICES", '{"voices": [{"id": "stale", "name": "stale"}]}')
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
+    assert "MSTAR_VOICES" not in launched["env"]
+    voices = {"object": "list", "voices": [{"id": "af", "name": "af"}], "default_voice": "af"}
+    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u", voices=voices)
+    import json
+    assert json.loads(launched["env"]["MSTAR_VOICES"]) == voices

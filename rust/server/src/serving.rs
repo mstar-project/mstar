@@ -50,6 +50,9 @@ pub struct AppState {
     pub bridge: Option<Arc<Bridge>>,
     /// Requests refused before submission; sent with each `/metrics` request.
     pub refusals: Arc<Refusals>,
+    /// `GET /v1/audio/voices`' body, from the model (`MSTAR_VOICES`, set by the
+    /// launcher); `None` when the model publishes no fixed voice list.
+    pub voices: Option<Arc<serde_json::Value>>,
 }
 
 /// One item of a request's result stream.

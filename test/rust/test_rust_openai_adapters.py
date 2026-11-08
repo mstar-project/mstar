@@ -328,3 +328,47 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
     with _model_stack(model, _StubAPIServer()) as (port, _upload):
         rust = _post(port, "/v1/chat/completions", body, timeout=30)
     assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
+
+
+# ── GET /v1/audio/voices ─────────────────────────────────────────────────────
+
+class _VoicedModel:
+    def get_voices(self):
+        return ["tara", "leo"]
+
+    def get_default_voice(self):
+        return "tara"
+
+
+def _get(port, path, timeout=15):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+@pytest.mark.parametrize("model,voiced", [("orpheus", True), ("orpheus", False), ("qwen3_5_0.8b", True)],
+                         ids=["voices", "no-voice-list", "not-a-speech-model"])
+def test_both_frontends_list_the_voices_alike(model, voiced, tmp_path, monkeypatch):
+    """The launcher hands the model's list over as the Python route builds it
+    (``serving_speech.list_voices``); a model with none, or no speech surface,
+    gets the same 404."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+    from mstar.api_server.openai.serving_speech import list_voices
+    from mstar.api_server.rust_frontend import VOICES_ENV
+
+    server = _PythonServer(model, tmp_path)
+    server.model = _VoicedModel() if voiced else None
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    py = TestClient(entrypoint.app).get("/v1/audio/voices")
+    voices = list_voices(server)
+    env = {VOICES_ENV: json.dumps(voices.model_dump())} if voices is not None else {}
+    with _model_stack(model, _StubAPIServer(), env=env) as (port, _upload):
+        status, body = _get(port, "/v1/audio/voices")
+    assert (status, json.loads(body)) == (py.status_code, py.json())
+    if voiced and model == "orpheus":
+        assert py.json()["voices"][0] == {"id": "tara", "name": "tara"}

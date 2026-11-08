@@ -148,6 +148,11 @@ async fn main() {
         );
     }
 
+    let voices = std::env::var("MSTAR_VOICES")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| Arc::new(serde_json::from_str::<Value>(&s).expect("MSTAR_VOICES is a JSON voice list")));
+
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
         model_name: model_name.clone(),
@@ -160,6 +165,7 @@ async fn main() {
         tok,
         bridge,
         refusals: refusals.clone(),
+        voices,
     };
 
     // Allow-all CORS, matching mstar's CORSMiddleware configuration.
@@ -201,6 +207,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
+        .route("/v1/audio/voices", get(audio_voices))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
@@ -563,6 +570,20 @@ async fn metrics(State(st): State<AppState>) -> Response {
 
 async fn list_models(State(st): State<AppState>) -> Json<ModelList> {
     Json(ModelList::new(vec![ModelCard::new(st.model_name, now())]))
+}
+
+/// `GET /v1/audio/voices`, as router.py's `audio_voices`.
+async fn audio_voices(State(st): State<AppState>) -> Response {
+    if let Err(r) = resolve(&st, Surface::Speech) {
+        return r;
+    }
+    match &st.voices {
+        Some(list) => Json(list.as_ref().clone()).into_response(),
+        None => {
+            let message = format!("Model '{}' does not publish a voice list", st.model_name);
+            error(404, &message, error_type(404))
+        }
+    }
 }
 
 // ---- POST /v1/chat/completions -------------------------------------------

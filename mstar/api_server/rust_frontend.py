@@ -57,6 +57,7 @@ bridge socket is private to the pair.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -167,14 +168,18 @@ def _stale_server(binary: str, rust_dir: Path) -> str | None:
 #: launcher's resolved values win over inherited ones, as the API key's does.
 REQUEST_TIMEOUT_ENV = "MSTAR_REQUEST_TIMEOUT_S"
 SAMPLE_RATE_ENV = "MSTAR_SAMPLE_RATE"
+#: ``GET /v1/audio/voices``' body as JSON (``serving_speech.list_voices``).
+VOICES_ENV = "MSTAR_VOICES"
 
 
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
                        api_key: str | None = None, timeout_s: float | None = None,
-                       sample_rate: int | None = None) -> subprocess.Popen:
+                       sample_rate: int | None = None, voices: dict | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
-    (``get_output_sample_rate``); ``None`` leaves the frontend's own default."""
+    (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
+    ``voices`` is the model's voice list as ``GET /v1/audio/voices`` returns it;
+    ``None`` answers that route 404, whatever the environment holds."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -185,6 +190,9 @@ def launch_rust_server(binary: str, model_name: str, port: int,
         env[REQUEST_TIMEOUT_ENV] = repr(float(timeout_s))
     if sample_rate is not None:
         env[SAMPLE_RATE_ENV] = str(int(sample_rate))
+    env.pop(VOICES_ENV, None)
+    if voices is not None:
+        env[VOICES_ENV] = json.dumps(voices)
     env[OPENAI_ADAPTER_ENV] = openai_adapter_class(model_name)
     proc = subprocess.Popen([binary, model_name, str(port), bridge_dir,
                              upload_dir], env=env)

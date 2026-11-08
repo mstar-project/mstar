@@ -367,6 +367,12 @@ Read by the ``mstar-server`` binary and its bridge
      - Sample rate stamped on the Rust frontend's WAV output.
        ``mstar serve --rust-frontend`` sets it to the model's
        ``get_output_sample_rate("audio")``, as the Python frontend reads it.
+   * - ``MSTAR_VOICES``
+     - unset
+     - The Rust frontend's ``GET /v1/audio/voices`` body, as JSON; unset
+       answers 404, as for a model with no fixed voice list. Not for
+       deployments to set: ``launch_rust_server`` sets it from the model
+       (``serving_speech.list_voices``) and drops an inherited value.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
