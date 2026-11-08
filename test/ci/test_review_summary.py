@@ -31,6 +31,12 @@ class TestReviewSummary(unittest.TestCase):
         text = render(review(), threads(thread("P1"), thread("P2")), "0123456789", "light")
         self.assertIn("\n🔴 **1 P1, 1 P2** on `0123456`, light review", text)
 
+    def test_an_untagged_bot_thread_counts_as_a_p2(self):
+        untagged = thread("P1")
+        untagged["comments"]["nodes"][0]["body"] = "`step` drops the last token"
+        text = render(review(), threads(untagged), "0123456789", "light")
+        self.assertIn("\n🟡 **1 P2** on", text, "the status line wouldn't count a finding that blocks approval")
+
     def test_threads_from_before_the_review_app_still_count(self):
         found = open_findings(review(), threads(thread("P1", login="github-actions"),
                                                 thread("P2", login="Gaurav-Shah05")))

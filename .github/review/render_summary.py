@@ -86,8 +86,8 @@ def open_findings(review, pages):
     """(where, priority) of every open finding: the bot's inline threads, this run's findings outside
     the diff, and the earlier findings a later review judged still open. A thread someone resolved stays
     open: only a later review that judged it fixed or moot, or a commit that outdated it, clears it. An
-    untagged bot thread counts as "untagged", since its priority is unknown. `pages` are the PR's
-    review threads, from `gh api graphql --paginate --slurp`."""
+    untagged bot thread counts as a P2, since its priority is unknown and it should still block
+    approval. `pages` are the PR's review threads, from `gh api graphql --paginate --slurp`."""
     prior = review.get("prior_findings", [])
     cleared = {f["ref"] for f in prior if f["status"] in ("fixed", "moot")}
     found, counted = [], set()
@@ -98,7 +98,7 @@ def open_findings(review, pages):
             if thread["isOutdated"] or ref in cleared or not (first["author"] and first["author"]["login"] in BOTS):
                 continue
             match = TAG.match(first["body"])
-            found.append((f"inline {ref}", match[1] if match else "untagged"))
+            found.append((f"inline {ref}", match[1] if match else "P2"))
             counted.add(ref)
     found += [(f"outside the diff, {f['location']}", f["priority"]) for f in review["outside_diff"]]
     # Judged still open, though its thread went outdated or it was outside the diff.
