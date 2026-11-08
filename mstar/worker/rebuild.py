@@ -44,9 +44,9 @@ DEFAULT_REBUILD_MEDIA_HOST_MB = 960
 @dataclass(slots=True)
 class HostCopies:
     """Host copies of what a request's prefill walk read besides its ids, for the request's rebuild row, which fill
-    ``slots`` of its KV. Empty until the row's step has run. ``queued`` counts the tensors whose copy hasn't
-    started, and ``landed`` is recorded after the last copy that has started, None where the copies run in
-    place."""
+    ``slots`` of its KV besides those its ids fill, none when the walk read a pad id at each. Empty until the row's
+    step has run. ``queued`` counts the tensors whose copy hasn't started, and ``landed`` is recorded after the last
+    copy that has started, None where the copies run in place."""
     slots: int = 0
     inputs: NameToTensorList | None = None
     queued: int = 0
@@ -72,9 +72,9 @@ class KeptIds:
 
 class LogRoom(NamedTuple):
     """What a request's log takes on a node: the slice of the pool its ids and host copies go to, and how many slots
-    its spans other than ids hold, which its rebuild writes from the host copies."""
+    its spans hold."""
     piece: HostSlice
-    copied_slots: int
+    slots: int
 
 
 class QueuedCopy(NamedTuple):
@@ -223,21 +223,21 @@ class Rebuilds:
         )
 
     def _log_room(self, node: str, layouts: Iterable[StreamLayout]) -> LogRoom | None:
-        """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids and the host
-        copies for its spans other than ids. None when the pool can't hold it, or when the request has spans other
-        than ids and the node's dtype is unknown.
+        """The room ``node``'s log takes for a request of ``layouts``, its slice holding the prompt's ids, at most one
+        a slot, and the host copies for its spans other than ids. None when the pool can't hold it, or when the
+        request has spans other than ids and the node's dtype is unknown.
 
         The ids' dtype isn't known until a step reads them, so each takes 8 B, enough for int64, the widest dtype a
-        step reads ids in. When the walk reads the ids in fewer bytes, the unused room goes back to the pool once the
-        prompt is kept."""
+        step reads ids in. When the walk reads fewer ids, or reads them in fewer bytes, the unused room goes back to
+        the pool once the prompt is kept."""
         spans = [span for layout in layouts for span in layout.spans]
-        ids = sum(span.length for span in spans if span.kind == SpanKind.IDS)
+        slots = sum(span.length for span in spans)
         others = [span for span in spans if span.kind != SpanKind.IDS]
         dtype, width = self._node_dtypes.get(node), self._policies[node].copy_width
         if others and dtype is None:
             return None
         copies = sum(span.length * width[span.walk] for span in others) * (dtype.itemsize if others else 0)
-        nbytes = aligned(ids * torch.long.itemsize) + copies
+        nbytes = aligned(slots * torch.long.itemsize) + copies
         piece = self._pool.take(nbytes)
         if piece is None and node not in self._logged_full:
             self._logged_full.add(node)
@@ -247,7 +247,7 @@ class Rebuilds:
                 "and the serving config's rebuild_host_mb and rebuild_media_host_mb size the pool.",
                 node, nbytes, self._pool.nbytes_used(), self._pool.nbytes,
             )
-        return None if piece is None else LogRoom(piece, sum(span.length for span in others))
+        return None if piece is None else LogRoom(piece, slots)
 
     def ingest_request(
         self, rid: int, writes: Mapping[str, Mapping[str, NodeWrites]],
@@ -327,7 +327,7 @@ class Rebuilds:
                 HostCopy(prompt, copy.landed), row_walk, array("i"),
                 dict(node_batch.per_request_info[rid].step_metadata),
                 tuple(map(len, tensors)) if len(tensors) > 1 else None,
-                HostCopies(droppable[rid].copied_slots) if copies else None,
+                HostCopies(droppable[rid].slots - prompt.numel()) if copies else None,
             )
             if not copies:
                 self._trim(node, rid, aligned(prompt.nbytes))

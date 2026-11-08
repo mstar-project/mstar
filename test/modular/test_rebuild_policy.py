@@ -367,13 +367,12 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     total, so a failed pinned allocation failed every request in its step. The log takes one slice of the startup
     pool when a request arrives, sized by the policy's bytes per slot, so a request the pool can't hold is known
     before it is admitted and stays out of the drops."""
-    pool = HostPool(176, torch.device("cpu"))
+    pool = HostPool(256, torch.device("cpu"))
     rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), pool, node_dtypes=DTYPES)
 
-    # five ids at 8 B, and the image's six slots at two float32 values each
-    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == (HostSlice(0, 40 + 48), 6)
-    assert _ingest(rebuilds, A, IMAGE_CHAT)
-    assert not _ingest(rebuilds, B, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
+    # an id at 8 B for each of the eleven slots, and the image's six slots at two float32 values each
+    assert _ingest(rebuilds, R, IMAGE_CHAT) and rebuilds._droppable[NODE][R] == (HostSlice(0, 88 + 48), 11)
+    assert not _ingest(rebuilds, A, IMAGE_CHAT), "a request the full pool can't hold would be admitted as droppable"
     step = _vision_step((R,), {}, completion_event=None)
     # the image's four rows, without its two sentinels
     step.per_request_input_tensors[R] = {
@@ -384,7 +383,7 @@ def test_a_request_with_images_takes_room_for_its_copies_when_it_arrives_and_giv
     rebuilds.flush()
 
     assert rebuilds._droppable[NODE][R].piece.nbytes == 40 + 32, (
-        "the sentinels' room would stay taken for the request's life"
+        "the image's room for ids and its sentinels' room would stay taken for the request's life"
     )
     assert rebuilds._kept[NODE][R].copies.inputs["embeds"][0].tolist() == [[1.0, 1.0]] * 4
 
