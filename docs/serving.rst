@@ -362,8 +362,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        modes need a declared stop policy or an actual graph Loop, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, a capture of kernels and
        copies alone. A graph Loop without a row stop policy cannot use ``past_cap``:
-       its run must fit every row's remaining iterations. Declared iteration inputs can run on the device when the walk is
-       resident, has one stop policy for its Loop, and keeps loop-back rows. These walks
+       its run must fit every row's remaining iterations. Declared iteration inputs can
+       run on the device when the walk is resident, has an actual Loop, and keeps loop-back
+       rows; any declared stop policy must belong to that Loop. These walks
        use actual per-row Loop progress and suppress stopped rows even with ``skip``;
        prefix chains and ``past_cap`` are refused. Streamed iteration inputs additionally
        need retained windows whose ordinary chunk policy supplies complete per-iteration
