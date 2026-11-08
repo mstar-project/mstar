@@ -20,48 +20,65 @@ from triton.language.extra import libdevice
 
 
 @triton.jit
-def _qk_norm_rope_kernel(QKV, W, COS, SIN, OUT, HEAD_OFFSET, HEAD_INDEX, num_heads, eps, row_stride, table_stride,
-                         out_row_stride, H: tl.constexpr, D: tl.constexpr, HALF: tl.constexpr, ROT: tl.constexpr,
-                         HB: tl.constexpr, SCATTER: tl.constexpr, SUBSET: tl.constexpr):
+def _qk_norm_rope_kernel(QKV, W, COS, SIN, OUT, HEAD_OFFSET, eps, row_stride, table_stride, out_row_stride,
+                         H: tl.constexpr, D: tl.constexpr, HALF: tl.constexpr, ROT: tl.constexpr,
+                         HB: tl.constexpr, SCATTER: tl.constexpr):
     row = tl.program_id(0)
     block = tl.program_id(1)
+    heads = block * HB + tl.arange(0, HB)  # q heads 0..H-1, then k heads; q and k lie that way in QKV
+    which = (block * HB) // H  # 0 q, 1 k: HB divides H
     d = tl.arange(0, D)
     partner = tl.where(d < HALF, d + HALF, tl.where(d < ROT, d - HALF, d))
-    if SUBSET:  # the heads HEAD_INDEX lists (q's 0..H-1, k's H..2H-1), in any mix
-        slot = block * HB + tl.arange(0, HB)
-        valid = slot < num_heads
-        heads = tl.load(HEAD_INDEX + slot, mask=valid, other=0)
-        base = QKV + row * row_stride + heads[:, None] * D
-        x = tl.load(base + d[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
-        xp = tl.load(base + partner[None, :], mask=valid[:, None], other=0.0).to(tl.float32)
-        which = (heads // H)[:, None] * D
-        w = tl.load(W + which + d[None, :]).to(tl.float32)
-        wp = tl.load(W + which + partner[None, :]).to(tl.float32)
-    else:
-        heads = block * HB + tl.arange(0, HB)  # q heads 0..H-1, then k heads; q and k lie that way in QKV
-        which = (block * HB) // H  # 0 q, 1 k: HB divides H
-        base = QKV + row * row_stride + heads[:, None] * D
-        x = tl.load(base + d[None, :]).to(tl.float32)
-        xp = tl.load(base + partner[None, :]).to(tl.float32)
-        w = tl.load(W + which * D + d).to(tl.float32)[None, :]
-        wp = tl.load(W + which * D + partner).to(tl.float32)[None, :]
+    base = QKV + row * row_stride + heads[:, None] * D
+    x = tl.load(base + d[None, :]).to(tl.float32)
+    xp = tl.load(base + partner[None, :]).to(tl.float32)
+    w = tl.load(W + which * D + d).to(tl.float32)
+    wp = tl.load(W + which * D + partner).to(tl.float32)
     rstd = libdevice.rsqrt(tl.sum(x * x, axis=1) / D + eps)
-    n = (x * rstd[:, None] * w).to(tl.bfloat16).to(tl.float32)
-    n_partner = (xp * rstd[:, None] * wp).to(tl.bfloat16).to(tl.float32)
+    n = (x * rstd[:, None] * w[None, :]).to(tl.bfloat16).to(tl.float32)
+    n_partner = (xp * rstd[:, None] * wp[None, :]).to(tl.bfloat16).to(tl.float32)
     cos = tl.load(COS + row * table_stride + d).to(tl.float32)
     sin = tl.load(SIN + row * table_stride + d).to(tl.float32)
     a = (n * cos[None, :]).to(tl.bfloat16).to(tl.float32)
     b = (n_partner * sin[None, :]).to(tl.bfloat16).to(tl.float32)
-    out = (a + b).to(tl.bfloat16)
-    if SUBSET:  # the i-th listed head's row r at OUT + HEAD_OFFSET[i] + r * out_row_stride
-        offset = tl.load(HEAD_OFFSET + slot, mask=valid, other=0)
-        tl.store(OUT + row.to(tl.int64) * out_row_stride + offset[:, None] + d[None, :], out, mask=valid[:, None])
-    else:
-        if SCATTER:  # head h's row r at OUT + HEAD_OFFSET[h] + r * out_row_stride
-            offset = tl.load(HEAD_OFFSET + heads)
-        else:  # [S, 2 * H, D]
-            offset = heads.to(tl.int64) * D
-        tl.store(OUT + row.to(tl.int64) * out_row_stride + offset[:, None] + d[None, :], out)
+    if SCATTER:  # head h's row r at OUT + HEAD_OFFSET[h] + r * out_row_stride
+        offset = tl.load(HEAD_OFFSET + heads)
+    else:  # [S, 2 * H, D]
+        offset = heads.to(tl.int64) * D
+    tl.store(OUT + row.to(tl.int64) * out_row_stride + offset[:, None] + d[None, :], (a + b).to(tl.bfloat16))
+
+
+@triton.jit
+def _qk_norm_rope_heads_kernel(QKV, W, COS, SIN, OUT, HEAD_OFFSET, HEAD_INDEX, num_heads, num_rows, eps, row_stride,
+                               table_stride, out_row_stride, H: tl.constexpr, D: tl.constexpr, HALF: tl.constexpr,
+                               ROT: tl.constexpr, HB: tl.constexpr, R: tl.constexpr):
+    """The kernel above over the heads HEAD_INDEX lists (q's 0..H-1, k's H..2H-1, in any mix), the i-th's row r to
+    OUT + HEAD_OFFSET[i] + r * out_row_stride; R rows a program, each row's arithmetic as above."""
+    d = tl.arange(0, D)
+    partner = tl.where(d < HALF, d + HALF, tl.where(d < ROT, d - HALF, d))
+    slot = tl.program_id(1) * HB + tl.arange(0, HB)
+    valid = slot < num_heads
+    heads = tl.load(HEAD_INDEX + slot, mask=valid, other=0)
+    which = (heads // H)[:, None] * D
+    w = tl.load(W + which + d[None, :]).to(tl.float32)
+    wp = tl.load(W + which + partner[None, :]).to(tl.float32)
+    offset = tl.load(HEAD_OFFSET + slot, mask=valid, other=0)
+    for i in tl.static_range(R):
+        row = tl.program_id(0) * R + i
+        live = valid & (row < num_rows)
+        base = QKV + row * row_stride + heads[:, None] * D
+        x = tl.load(base + d[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+        xp = tl.load(base + partner[None, :], mask=live[:, None], other=0.0).to(tl.float32)
+        rstd = libdevice.rsqrt(tl.sum(x * x, axis=1) / D + eps)
+        n = (x * rstd[:, None] * w).to(tl.bfloat16).to(tl.float32)
+        n_partner = (xp * rstd[:, None] * wp).to(tl.bfloat16).to(tl.float32)
+        in_rows = d < D * (row < num_rows)
+        cos = tl.load(COS + row * table_stride + d, mask=in_rows, other=0.0).to(tl.float32)
+        sin = tl.load(SIN + row * table_stride + d, mask=in_rows, other=0.0).to(tl.float32)
+        a = (n * cos[None, :]).to(tl.bfloat16).to(tl.float32)
+        b = (n_partner * sin[None, :]).to(tl.bfloat16).to(tl.float32)
+        tl.store(OUT + row.to(tl.int64) * out_row_stride + offset[:, None] + d[None, :], (a + b).to(tl.bfloat16),
+                 mask=live[:, None])
 
 
 @torch.library.custom_op("mstar::h3_qk_norm_rope", mutates_args=())
@@ -79,13 +96,23 @@ def qk_norm_rope(qkv: torch.Tensor, weights: torch.Tensor, cos: torch.Tensor, si
 _BLOCK = 8
 
 
+_ROWS = 4  # rows a program over a head list: ~10% faster than 1 on B300, bit-identical (8 warps is not)
+
+
 def _launch(qkv, weights, cos, sin, eps, heads, rotary_dim, out, head_offset, head_index, out_row_stride):
-    listed = 2 * heads if head_index is None else head_index.numel()
-    _qk_norm_rope_kernel[(qkv.shape[0], triton.cdiv(listed, _BLOCK))](
-        qkv, weights, cos, sin, out, out if head_offset is None else head_offset,
-        out if head_index is None else head_index, listed, eps, qkv.stride(0), cos.stride(0), out_row_stride,
-        H=heads, D=weights.shape[1], HALF=rotary_dim // 2, ROT=rotary_dim, HB=_BLOCK,
-        SCATTER=head_offset is not None, SUBSET=head_index is not None, num_warps=4, enable_fp_fusion=False,
+    rows, d = qkv.shape[0], weights.shape[1]
+    if head_index is not None:
+        listed = head_index.numel()
+        _qk_norm_rope_heads_kernel[(triton.cdiv(rows, _ROWS), triton.cdiv(listed, _BLOCK))](
+            qkv, weights, cos, sin, out, head_offset, head_index, listed, rows, eps, qkv.stride(0), cos.stride(0),
+            out_row_stride, H=heads, D=d, HALF=rotary_dim // 2, ROT=rotary_dim, HB=_BLOCK, R=_ROWS, num_warps=4,
+            enable_fp_fusion=False,
+        )
+        return
+    _qk_norm_rope_kernel[(rows, 2 * heads // _BLOCK)](
+        qkv, weights, cos, sin, out, out if head_offset is None else head_offset, eps, qkv.stride(0), cos.stride(0),
+        out_row_stride, H=heads, D=d, HALF=rotary_dim // 2, ROT=rotary_dim, HB=_BLOCK,
+        SCATTER=head_offset is not None, num_warps=4, enable_fp_fusion=False,
     )
 
 

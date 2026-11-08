@@ -321,11 +321,14 @@ class UlyssesPipeline:
                                    t.storage_offset() + head0(r, 0) * head_dim))
         filled = []
         if fill is not None:
-            # q and k a head group at a time: group g's are written, and sent, while group g - 1 attends
+            # q and k of the first head group, then of all the others in one launch (smaller launches cost more
+            # in total): only the first group's are written before its copies, the rest beside its attention
             index, offset = self._fill_tables(rows, heads, head_dim)
-            for g in range(groups):
-                fill.into(own, offset[g], width, index[g])
-                filled.append(main.record_event())
+            fill.into(own, offset[0], width, index[0])
+            filled.append(main.record_event())
+            if groups > 1:
+                fill.into(own, offset[1:].reshape(-1), width, index[1:].reshape(-1))
+                filled += [main.record_event()] * (groups - 1)
         else:
             placed = main.record_event()
         self._copy_in.wait_event(ready)
