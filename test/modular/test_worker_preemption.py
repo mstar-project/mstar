@@ -587,7 +587,7 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
 
     w._set_rebuildable(1, configs)
 
-    assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
+    assert (1 in w._rebuilds._keeps_ids[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
 
 
 @pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])

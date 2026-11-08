@@ -122,8 +122,8 @@ class Rebuilds:
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
-        # node -> the handles whose pages a drop there can free. Only these keep their ids.
-        self._droppable: dict[str, set[int]] = {node: set() for node in policies}
+        # node -> the handles that keep their ids, those whose pages a drop there can free
+        self._keeps_ids: dict[str, set[int]] = {node: set() for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
         # nodes that have logged a prompt the pool couldn't hold
@@ -177,7 +177,7 @@ class Rebuilds:
         if not unpausable:
             for node in written.keys() - refused:
                 if all(rebuildable[key] for key, nodes in writers.items() if node in nodes):
-                    self._droppable[node].add(rid)
+                    self._keeps_ids[node].add(rid)
         return rebuildable
 
     def keep_prompts(self, node_batch: ExecutingBatch) -> None:
@@ -190,10 +190,10 @@ class Rebuilds:
         walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
         if walk != policy.walk and policy.walk not in walks.values():
             return
-        kept, droppable = self._kept[node_batch.node_name], self._droppable[node_batch.node_name]
+        kept, keeps_ids = self._kept[node_batch.node_name], self._keeps_ids[node_batch.node_name]
         for rid, row in node_batch.per_request_input_tensors.items():
             # a TP follower's unread row has no inputs, and the step fails it
-            if not row or rid in kept or rid not in droppable or walks.get(rid, walk) != policy.walk:
+            if not row or rid in kept or rid not in keeps_ids or walks.get(rid, walk) != policy.walk:
                 continue
             prompt = row[policy.ids_input][0]
             copy = self._pool.copy_out(prompt, node_batch.completion_event)
@@ -332,7 +332,7 @@ class Rebuilds:
 
     def remove_request(self, rid: int) -> None:
         for node, kept in self._kept.items():
-            self._droppable[node].discard(rid)
+            self._keeps_ids[node].discard(rid)
             ids = kept.pop(rid, None)
             if ids is not None:
                 self._pool.give(ids.prompt.slice)
