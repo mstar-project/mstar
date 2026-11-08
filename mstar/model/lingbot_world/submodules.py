@@ -17,18 +17,18 @@
                     chunk's I2V condition and Plucker rays, the DiT, the decode)
 
 The rolling self-attention K/V, the text K/V (computed once per request) and
-the VAE encoder's causal-conv cache live in each request's region of the
-engine's request pool (``DIT_POOL``), declared when the request opens
+the VAE encoder's and decoder's causal-conv caches live in each request's region
+of the engine's request pool (``DIT_POOL``), declared when the request opens
 (``rollout_state_buffers``) so it waits in line for room. The rolling KV window
 (``DIT_KV``) keeps the K/V's sink plus latest window compacted in their buffer,
 so a chunk's keys are one contiguous range; the attention over them is a ragged
 cross-attention (``DIT_ATTN``) whose step pairs the chunk's queries with that
-range and with the text. The encoder writes its cache straight into the pool
-(``wan_vae.PoolFeatCache``, ``wan_vae.encoder_saves_uncopied``). The VAE
-decoder's causal-conv cache stays in the request's ``PerRequestState``, outside
-the pool. Nothing in the engine counts it, and at small output sizes the pool
-admits many rollouts, so the model refuses a config that runs more than one at
-a time (``LingBotWorldModel.validate_config_yaml``).
+range and with the text. The encoder and decoder write their caches straight
+into the pool (``wan_vae.PoolFeatCache``, ``wan_vae.encoder_saves_uncopied``,
+``wan_vae.decoder_saves_uncopied``). Only the noise drawn for the whole rollout
+and small host-side bookkeeping stay in the request's ``PerRequestState``; the
+noise isn't counted by the engine, so the model still refuses a config that
+runs more than one rollout at a time (``LingBotWorldModel.validate_config_yaml``).
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 returns None, the DiT enters the reference's bf16 autocast itself, and the VAE
@@ -71,8 +71,8 @@ ROLLOUT_WALK = "rollout"
 DIT_ATTN = "dit_attn"
 DIT_KV = "dit_kv"
 # the request pool whose regions hold each rollout's state: its rolling K/V (the
-# DIT_KV buffer), its text K/V, and the VAE encoder's causal-conv cache (its slots,
-# then the one output it keeps once it settles)
+# DIT_KV buffer), its text K/V, the VAE encoder's causal-conv cache (its slots, then
+# the one output it keeps once it settles), and the VAE decoder's
 DIT_POOL = "dit_pool"
 TEXT_KV = "text_kv"
 ENCODER_OUT = "enc.out"
@@ -162,13 +162,40 @@ def encoder_slot_name(i: int) -> str:
     return f"enc.{i}"
 
 
+@functools.cache
+def decoder_cache_layout() -> tuple[CacheSlot | None, ...]:
+    """The Wan2.1 VAE decoder's cache slots, found as ``encoder_cache_layout``'s are:
+    the stock-config VAE run on the meta device at a 2x2 latent. A slot no call
+    fills is None."""
+    from diffusers import AutoencoderKLWan
+
+    with torch.device("meta"):
+        vae = AutoencoderKLWan()
+    with torch.inference_mode():
+        cache = wan_vae.new_feat_cache(vae)
+        z = torch.empty(1, 16, 1, 2, 2, device="meta")
+        vae.decoder(z, feat_cache=cache, feat_idx=[0], first_chunk=True)
+        vae.decoder(z, feat_cache=cache, feat_idx=[0])
+    return tuple(CacheSlot(*t.shape[1:]) if torch.is_tensor(t) else None for t in cache)
+
+
+def decoder_cache_dtype(cfg: LingBotWorldConfig) -> torch.dtype:
+    """The dtype the dit's VAE decode runs, and keeps its cache, in."""
+    return torch.float32 if cfg.reference_numerics else wan_vae.decode_dtype()
+
+
+def decoder_slot_name(i: int) -> str:
+    return f"dec.{i}"
+
+
 def rollout_state_buffers(
     cfg: LingBotWorldConfig, lat_hw: tuple[int, int], kv_tokens: int,
 ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """What a rollout at a ``lat_hw`` latent keeps in the pool between chunks: its
     rolling K/V (``kv_tokens`` a layer), its text K/V (every block's, keys then
-    values), and each slot of its VAE encoder's cache plus the output it keeps
-    once settled, in fp32 as the encode runs."""
+    values), each slot of its VAE encoder's cache plus the output it keeps once
+    settled (fp32, as the encode runs), and each slot of its VAE decoder's cache
+    (in the decode's dtype)."""
     buffers = {
         DIT_KV: rolling_config(cfg).buffer(kv_tokens),
         TEXT_KV: ((cfg.num_layers, 2, 1, cfg.text_len, cfg.num_heads, cfg.head_dim), torch.bfloat16),
@@ -178,6 +205,10 @@ def rollout_state_buffers(
         if slot is not None:
             buffers[encoder_slot_name(i)] = (slot.shape(*lat_hw), torch.float32)
     buffers[ENCODER_OUT] = (layout.out.shape(*lat_hw), torch.float32)
+    dtype = decoder_cache_dtype(cfg)
+    for i, slot in enumerate(decoder_cache_layout()):
+        if slot is not None:
+            buffers[decoder_slot_name(i)] = (slot.shape(*lat_hw), dtype)
     return buffers
 
 
@@ -334,6 +365,10 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             else:
                 logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)",
                             torch.backends.cudnn.version())
+        if vae is not None:
+            # each call writes its cache straight into the request's pool region (same math);
+            # before FastDecoder, whose step binds the decoder's forward
+            wan_vae.decoder_saves_uncopied(vae)
         self._decoder = wan_vae.FastDecoder(vae, channels_last=fast, compile=fast) if vae is not None else None
         if vae is not None:
             # the de-normalize's constants, fp32 on the decoder's device
@@ -478,7 +513,9 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             # the encode stream (its cache, slots in the pool) and where in the pool its views were taken
             encoder_stream=None,
             encoder_stream_at=None,
-            feat_cache=wan_vae.new_feat_cache(self.vae) if self.vae is not None else None,
+            # the decoder cache (its slots in the pool) and where in the pool its views were taken
+            decoder_cache=None,
+            decoder_cache_at=None,
         )
 
     def forward(
@@ -538,7 +575,7 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
             commit_t = torch.stack([steps[-1] * 0.0]).to(device)
             self.dit(x0, commit_t, text_kv, y, conditioning, store, attention)
             del conditioning
-            pixels = self._decode(x0, state, clip_start=chunk == 0)
+            pixels = self._decode(x0, self._decoder_cache(state), clip_start=chunk == 0)
 
         state.add("chunk", chunk + 1)
         if self.keep_chunk_outputs:
@@ -580,17 +617,38 @@ class LingBotDitSubmodule(_SingleRequestMixin, NodeSubmodule):
         before a request at that size."""
         cfg = self.config
         device = next(self.vae.parameters()).device
-        state = {"feat_cache": wan_vae.new_feat_cache(self.vae)}
         with torch.inference_mode():
+            # laid out as a request's cache in the pool, so the served call signatures compile here
+            shapes = [None if slot is None else slot.shape(*lat_hw) for slot in decoder_cache_layout()]
+            cache = wan_vae.PoolFeatCache.fresh(shapes, self._decode_dtype, device)
             for k in range(2):
-                self._decode(torch.zeros(cfg.out_dim, cfg.chunk_size, *lat_hw, device=device), state, clip_start=k == 0)
+                self._decode(torch.zeros(cfg.out_dim, cfg.chunk_size, *lat_hw, device=device), cache, clip_start=k == 0)
 
-    def _decode(self, latents: torch.Tensor, state, clip_start: bool) -> torch.Tensor:
+    def _decode(self, latents: torch.Tensor, cache: list, clip_start: bool) -> torch.Tensor:
         """``[1, 3, frames, H, W]`` in [-1, 1]: the chunk decoded as the
-        continuation of the request's stream."""
+        continuation of the stream whose decoder cache is ``cache``."""
         # the de-normalize in fp32 whatever the decode's dtype
         z = (latents[None].float() / self._latents_inv_std + self._latents_mean).to(self._decode_dtype)
-        return self._decoder.decode_stream(z, state["feat_cache"], clip_start=clip_start)
+        return self._decoder.decode_stream(z, cache, clip_start=clip_start)
+
+    def _decoder_cache(self, state) -> wan_vae.PoolFeatCache:
+        """The rollout's decoder cache, its slots views of the request's pool buffers.
+        Kept between chunks, and taken again when the pool has moved the region (a
+        rearrange copies it elsewhere, so the old views no longer point at it)."""
+        pool = self.state_pool()
+        slots = decoder_cache_layout()
+        cache = state["decoder_cache"]
+        with torch.inference_mode():
+            first = pool.view(decoder_slot_name(next(i for i, s in enumerate(slots) if s is not None)))
+            if cache is not None and state["decoder_cache_at"] == first.data_ptr():
+                return cache
+            buffers = [None if slot is None else pool.view(decoder_slot_name(i)) for i, slot in enumerate(slots)]
+            # a filled slot sits at the start of its buffer (PoolFeatCache)
+            items = [b.as_strided(t.shape, t.stride()) if torch.is_tensor(t) else t
+                     for b, t in zip(buffers, cache if cache is not None else [None] * len(slots), strict=True)]
+        cache = wan_vae.PoolFeatCache(items, buffers)
+        state.add_all(decoder_cache=cache, decoder_cache_at=first.data_ptr())
+        return cache
 
     def _encoder_stream(self, state) -> EncoderStream:
         """The rollout's encode stream, its cache's slots views of the request's pool

@@ -108,13 +108,13 @@ class LingBotWorldModel(Model):
     # ------------------------------------------------------------------
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The request pool that holds each rollout's rolling K/V, text K/V and encoder
-        cache, the rolling K/V window over the first, and the ragged attention over the
+        """The request pool that holds each rollout's rolling K/V, text K/V and VAE
+        caches, the rolling K/V window over the first, and the ragged attention over the
         K/V unless ``reference_numerics`` attends with the reference's FA2 instead."""
         cfg = self.config
         specs: list[NodeResourceSpec] = [
             # inference tensors: the dit's forward runs in inference mode, and its compiled
-            # blocks take views of the pool (the text K/V) as they are
+            # blocks and decode take views of the pool (text K/V, decoder cache) as they are
             RequestPoolSpec(resource_key=DIT_POOL, nodes={"dit"},
                             config=RequestPoolConfig(pool_bytes=self.default_pool_bytes(), inference_tensors=True)),
             RollingKVSpec(resource_key=DIT_KV, nodes={"dit"}, config=rolling_config(cfg)),
@@ -156,20 +156,22 @@ class LingBotWorldModel(Model):
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse to serve more than one rollout at a time.
 
-        The pool bounds each rollout's K/V and encoder cache, not how many
-        rollouts run: at small output sizes it admits many. Each one's VAE decoder
-        cache is allocated by the dit outside the engine's resources, so until it
-        is a resource, the conductor's admit queue, which exists only when
-        ``max_concurrent_requests`` is set, has to hold it to one rollout.
+        The pool bounds each rollout's K/V and VAE caches, not how many rollouts
+        run: at small output sizes it admits many. Each one's noise for the whole
+        rollout (at most 4.4% of its region: 0.4 GiB for the longest at 464x832) is
+        still allocated by the dit outside the engine's resources, so the
+        conductor's admit queue, which exists only when
+        ``max_concurrent_requests`` is set, holds it to one rollout until the
+        limit is lifted with the served checks for several rollouts at once.
         """
         limit = config.get("max_concurrent_requests")
         if type(limit) is int and limit == 1:
             return
         raise ValueError(
             f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
-            "The request pool bounds each rollout's K/V and encoder cache, not how many run, and each "
-            "rollout's VAE decoder cache is allocated by the dit outside the engine's resources, so the "
-            "admit queue that this key enables is the only bound on it."
+            "The request pool bounds each rollout's K/V and VAE caches, not how many run, and each "
+            "rollout's noise is allocated by the dit outside the engine's resources, so the admit queue "
+            "that this key enables is the only bound on it."
         )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:

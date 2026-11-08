@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
     CACHE_T,
     WanCausalConv3d,
+    WanDecoder3d,
     WanEncoder3d,
     WanResample,
     WanResidualBlock,
@@ -158,9 +159,9 @@ class PoolFeatCache(FeatCache):
     or None for a slot no call fills. A value with the shape of the one it
     replaces is written into it, which is every call once a stream has settled;
     a value of another shape (a stream's first calls) is written at the start of
-    its buffer with ``_compact_strides``. Meant for an eager stream (the encoder,
-    with ``encoder_saves_uncopied``): handed to a compiled decode, it changes how
-    the decoder's graphs are split, which measured slower.
+    its buffer with ``_compact_strides``. With ``encoder_saves_uncopied`` /
+    ``decoder_saves_uncopied`` each slot is written once a call, the one copy
+    diffusers' clone made.
     """
 
     def __init__(self, items, buffers):
@@ -188,7 +189,9 @@ class PoolFeatCache(FeatCache):
         return bool(same) if torch.is_tensor(same) else same
 
     def __setitem__(self, index, value):
-        old = list.__getitem__(self, index)
+        # ``self[index]``: torch.compile cannot trace ``list.__getitem__(self, index)`` on a
+        # list subclass, and runs the whole calling block uncompiled instead
+        old = self[index]
         if self._watch is not None:
             written, same = self._watch
             written.add(index)
@@ -228,6 +231,19 @@ class PoolFeatCache(FeatCache):
         return cls([None] * len(shapes), buffers)
 
 
+def _scratch(feat_cache: list) -> list:
+    """A copy of ``feat_cache`` for a throwaway call, whose writes must not reach it."""
+    if isinstance(feat_cache, PoolFeatCache):
+        dtype = next(b.dtype for b in feat_cache.buffers if b is not None)
+        device = next(b.device for b in feat_cache.buffers if b is not None)
+        copy = PoolFeatCache.fresh([None if b is None else tuple(b.shape) for b in feat_cache.buffers], dtype, device)
+        for i, t in enumerate(feat_cache):
+            list.__setitem__(copy, i, copy.buffers[i].as_strided(t.shape, t.stride()).copy_(t)
+                             if torch.is_tensor(t) else t)
+        return copy
+    return type(feat_cache)(t.clone() if torch.is_tensor(t) else t for t in feat_cache)
+
+
 def _keep(feat_cache: list, idx: int, value: torch.Tensor) -> None:
     """Save ``value``, a slice of a conv's input, as cache slot ``idx``: written where
     a ``PoolFeatCache`` keeps it, which copies it there; else a copy of its own, as
@@ -251,10 +267,37 @@ class _UncopiedResidualBlock(WanResidualBlock):
         return x + h
 
 
+def _conv_on_cached_input(conv: nn.Module, xin: torch.Tensor) -> torch.Tensor:
+    """``conv`` on an input that already starts with its ``CACHE_T`` cached frames:
+    what its forward runs once it has prepended them."""
+    if isinstance(conv, ChannelsLastCausalConv3d):
+        pad_w, _, pad_h, _, _, _ = conv._padding
+        return F.conv3d(xin, conv.weight, conv.bias, conv.stride, (0, pad_h, pad_w), conv.dilation, conv.groups)
+    padding = list(conv._padding)
+    padding[4] -= CACHE_T
+    return nn.Conv3d.forward(conv, F.pad(xin, padding))
+
+
 def _cached_conv(conv: nn.Module, x: torch.Tensor, feat_cache: list, feat_idx: list) -> torch.Tensor:
     """diffusers' cached causal conv step: the conv continues from slot ``feat_idx[0]``,
-    which then keeps the input's last ``CACHE_T`` frames."""
+    which then keeps the input's last ``CACHE_T`` frames.
+
+    Into a ``PoolFeatCache`` that already holds ``CACHE_T`` frames, the frames kept are
+    the last of the conv's input, ``[cached | x]``, once it is built (the same values
+    diffusers keeps). Taken from ``x`` before the conv, as diffusers takes them, they
+    are still an unstored activation when a compiled call builds the write, which then
+    recomputes that activation (the norm and SiLU before the conv) instead of copying
+    it: measured 3 ms a chunk slower on LingBot's decoder, and not bit-identical."""
     idx = feat_idx[0]
+    old = feat_cache[idx]
+    if (isinstance(feat_cache, PoolFeatCache) and torch.is_tensor(old) and old.shape[2] == CACHE_T
+            and conv._padding[4] == CACHE_T):
+        xin = torch.cat([old.to(x.device), x], dim=2)
+        if isinstance(conv, ChannelsLastCausalConv3d):
+            xin = xin.contiguous(memory_format=torch.channels_last_3d)
+        feat_cache[idx] = xin[:, :, -CACHE_T:, :, :]
+        feat_idx[0] += 1
+        return _conv_on_cached_input(conv, xin)
     cache_x = x[:, :, -CACHE_T:, :, :]
     if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
         # cache last frame of last two chunk
@@ -302,6 +345,33 @@ class _UncopiedEncoder3d(WanEncoder3d):
         return _cached_conv(self.conv_out, x, feat_cache, feat_idx)
 
 
+class _UncopiedDecoder3d(WanDecoder3d):
+    """``WanDecoder3d.forward`` with its in and out convs' cache steps through
+    ``_cached_conv``. Same math."""
+
+    def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):  # noqa: B006 (diffusers' signature)
+        if feat_cache is None:
+            return super().forward(x, first_chunk=first_chunk)
+        x = _cached_conv(self.conv_in, x, feat_cache, feat_idx)
+        x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        for up_block in self.up_blocks:
+            x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+        x = self.nonlinearity(self.norm_out(x))
+        return _cached_conv(self.conv_out, x, feat_cache, feat_idx)
+
+
+def decoder_saves_uncopied(vae: nn.Module) -> None:
+    """Switch ``vae``'s decoder residual blocks and top, in place, to the cache steps of
+    ``_cached_conv``: into a ``PoolFeatCache``, a compiled steady-state call copies each
+    slot's frames straight into it, as fast as ``FeatCache``'s copy into fresh memory
+    and bit-identical. With any other cache they run as diffusers'. Call it before the
+    decoder's step is compiled (``FastDecoder``), which binds the forward; idempotent.
+    The temporal upsamples keep diffusers' code (their two slots copy in place too)."""
+    for module in vae.decoder.modules():
+        module.__class__ = {WanResidualBlock: _UncopiedResidualBlock, WanDecoder3d: _UncopiedDecoder3d}.get(
+            type(module), type(module))
+
+
 _UNCOPIED = {WanResidualBlock: _UncopiedResidualBlock, WanResample: _UncopiedResample,
              WanEncoder3d: _UncopiedEncoder3d}
 
@@ -342,6 +412,8 @@ def _compact(t: torch.Tensor) -> torch.Tensor:
 def compact_feat_cache(feat_cache: list) -> None:
     """Give every slot compact storage with ``_compact_strides``, in place,
     so the cache holds only ``feat_cache_bytes``."""
+    if isinstance(feat_cache, PoolFeatCache):
+        return
     for i, t in enumerate(feat_cache):
         if torch.is_tensor(t):
             list.__setitem__(feat_cache, i, _compact(t))
@@ -435,7 +507,7 @@ class DecoderStep:
         if x.dtype == torch.bfloat16:
             key = (tuple(x.shape), x.stride(), _cache_signature(feat_cache))
             if key not in self._warmed:
-                scratch = type(feat_cache)(t.clone() if torch.is_tensor(t) else t for t in feat_cache)
+                scratch = _scratch(feat_cache)
                 self._fn(x, feat_cache=scratch, feat_idx=[0])
                 self._warmed.add(key)
         out = self._fn(x, feat_cache=feat_cache, feat_idx=[0])

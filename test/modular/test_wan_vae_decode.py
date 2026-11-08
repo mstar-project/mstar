@@ -336,3 +336,54 @@ def test_encoder_blocks_that_save_uncopied_encode_and_cache_as_diffusers(kind) -
         assert all((torch.equal(a, b) if torch.is_tensor(a) else a == b)
                    for a, b in zip(ref_cache, got_cache, strict=True))
     assert all(t.data_ptr() == b.data_ptr() for t, b in zip(pool, pool.buffers, strict=True) if torch.is_tensor(t))
+
+
+@pytest.mark.parametrize("compile", [False, True])
+@pytest.mark.parametrize("kind", KINDS)
+def test_decoder_blocks_that_save_uncopied_decode_the_feat_cache_stream_into_a_pool_feat_cache(kind, compile) -> None:
+    """``decoder_saves_uncopied`` with a ``PoolFeatCache``: the same frames and cache as
+    diffusers' blocks with a ``FeatCache``, every slot kept in its own buffer (taken
+    from the conv's input once built). With a plain cache the blocks run as diffusers'."""
+    import copy
+
+    vae = tiny_wan_vae(kind)
+    z = _latents(vae, 8)
+    wan_vae.to_channels_last(vae)
+    swapped = copy.deepcopy(vae)
+    wan_vae.decoder_saves_uncopied(swapped)
+    assert type(swapped.decoder).__name__ == "_UncopiedDecoder3d"
+    calls = ((0, 2), (2, 5), (5, 8))
+
+    def stream(model, cache):
+        step = wan_vae.DecoderStep(model, compile=compile)
+        with torch.no_grad():
+            return torch.cat([wan_vae.decode_causal(model, z[:, :, a:b], cache, step, clip_start=a == 0)
+                              for a, b in calls], 2)
+
+    ref_cache = wan_vae.new_feat_cache(vae)
+    ref = stream(vae, ref_cache)
+    plain_cache = wan_vae.new_feat_cache(swapped)
+    torch.testing.assert_close(stream(swapped, plain_cache), ref, rtol=0, atol=0)
+    shapes = [tuple(t.shape) if torch.is_tensor(t) else None for t in ref_cache]
+    pool = wan_vae.PoolFeatCache.fresh(shapes, torch.float32, "cpu")
+    torch.testing.assert_close(stream(swapped, pool), ref, rtol=0, atol=0)
+    assert all(torch.equal(a, b) for a, b in zip(ref_cache, pool, strict=True) if torch.is_tensor(a))
+    assert all(t.data_ptr() == b.data_ptr() for t, b in zip(pool, pool.buffers, strict=True) if torch.is_tensor(t))
+
+
+def test_a_pool_feat_cache_warm_up_copy_is_laid_out_as_it_is_in_memory_of_its_own() -> None:
+    """``DecoderStep`` warms a new call signature on a copy: for a ``PoolFeatCache``, one
+    laid out as it is (pieces of one block), so the warm-up runs the served graph."""
+    cache = wan_vae.PoolFeatCache.fresh([(1, 4, 2, 3, 5), None, (1, 2, 2, 3, 5)], torch.float32, "cpu")
+    cache[0] = torch.randn(1, 4, 2, 3, 5).contiguous(memory_format=torch.channels_last_3d)
+    cache[1] = "Rep"
+    cache[2] = torch.randn(1, 2, 1, 3, 5)
+    copy = wan_vae._scratch(cache)
+    assert isinstance(copy, wan_vae.PoolFeatCache) and copy[1] == "Rep"
+    for i in (0, 2):
+        assert torch.equal(copy[i], cache[i]) and copy[i].stride() == cache[i].stride()
+        assert copy[i].data_ptr() == copy.buffers[i].data_ptr() != cache[i].data_ptr()
+    gap = cache.buffers[2].data_ptr() - cache.buffers[0].data_ptr()
+    assert copy.buffers[2].data_ptr() - copy.buffers[0].data_ptr() == gap
+    wan_vae.compact_feat_cache(cache)  # the caller's memory: left where it is
+    assert cache[0].data_ptr() == cache.buffers[0].data_ptr()

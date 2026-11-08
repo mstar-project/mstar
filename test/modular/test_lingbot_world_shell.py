@@ -8,6 +8,7 @@ reference are the oracle-gated parity harness's job
 
 import math
 import sys
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -573,9 +574,9 @@ def test_the_dit_declares_a_request_pool_the_rolling_kv_over_it_and_a_ragged_cro
 
 def test_the_default_pool_holds_one_rollout_at_the_largest_area_or_two_at_the_default(model):
     """A rollout keeps its rolling K/V (18 latent frames of at most max_area / 256 tokens,
-    whatever the aspect), its text K/V and its encoder cache in the pool. The default
-    pool, 16.0 GiB, holds one at 720x1280 (11.1 GiB of K/V, 4.8 GiB of encoder cache)
-    or two at the default 464x832."""
+    whatever the aspect), its text K/V and its VAE caches in the pool. With a bf16 decode
+    the default pool, 20.1 GiB, holds one at 720x1280 (11.1 GiB of K/V, 4.8 GiB of
+    encoder cache, 4.1 GiB of decoder cache) or two at the default 464x832."""
     cfg = model.config
     assert model.max_window_tokens() == 18 * (720 * 1280 // 256)
     sub = _bare_dit_submodule(model, {})
@@ -585,23 +586,69 @@ def test_the_default_pool_holds_one_rollout_at_the_largest_area_or_two_at_the_de
         last = sub.chunk_spans(cfg.max_chunks - 1, (lat[0] * 8, lat[1] * 8)).position
         assert last.sink + last.window <= model.max_window_tokens(), image_hw
         assert lat[0] * lat[1] <= largest[0] * largest[1] == 90 * 160, image_hw  # the cache scales with pixels
-    assert round(model.default_pool_bytes() / 2**30, 1) == 16.0
-    first = sub.chunk_spans(0, (464, 832)).position
-    default = RequestPoolReqConfig.of(rollout_state_buffers(cfg, (58, 104), first.sink + first.window)).nbytes()
-    assert model.default_pool_bytes() // default == 2
+    with mock.patch.object(submodules.wan_vae, "decode_dtype", return_value=torch.bfloat16):
+        assert round(model.default_pool_bytes() / 2**30, 1) == 20.1
+        first = sub.chunk_spans(0, (464, 832)).position
+        default = RequestPoolReqConfig.of(rollout_state_buffers(cfg, (58, 104), first.sink + first.window)).nbytes()
+        assert model.default_pool_bytes() // default == 2
 
 
-def test_a_rollouts_state_is_its_kv_text_kv_and_every_encoder_cache_slot(model):
-    """At 464x832 (a 58x104 latent): 4.7 GiB of rolling K/V, 90 MiB of text K/V and
-    2.0 GiB of encoder cache (fp32), as measured on an H100."""
+def test_a_rollouts_state_is_its_kv_text_kv_and_every_vae_cache_slot(model):
+    """At 464x832 (a 58x104 latent): 4.7 GiB of rolling K/V, 90 MiB of text K/V, 2.0 GiB
+    of encoder cache (fp32) and 1.7 GiB of decoder cache (bf16), as measured on an H100."""
     layout = submodules.encoder_cache_layout()
     assert len(layout.slots) == 26 and sum(s is not None for s in layout.slots) == 24
-    buffers = rollout_state_buffers(model.config, (58, 104), 27144)
+    decoder = submodules.decoder_cache_layout()
+    assert len(decoder) == 33 and sum(s is not None for s in decoder) == 32
+    with mock.patch.object(submodules.wan_vae, "decode_dtype", return_value=torch.bfloat16):
+        buffers = rollout_state_buffers(model.config, (58, 104), 27144)
     gib = {prefix: sum(math.prod(shape) * dtype.itemsize for name, (shape, dtype) in buffers.items()
-                       if name.startswith(prefix)) / 2**30 for prefix in (DIT_KV, TEXT_KV, "enc.")}
-    assert {k: round(v, 2) for k, v in gib.items()} == {DIT_KV: 4.66, TEXT_KV: 0.09, "enc.": 2.02}
+                       if name.startswith(prefix)) / 2**30 for prefix in (DIT_KV, TEXT_KV, "enc.", "dec.")}
+    assert {k: round(v, 2) for k, v in gib.items()} == {DIT_KV: 4.66, TEXT_KV: 0.09, "enc.": 2.02, "dec.": 1.7}
+    assert buffers["dec.32" if decoder[32] else "dec.31"][0][-2:] == (464, 832)
     assert buffers[ENCODER_OUT] == ((1, 32, 1, 58, 104), torch.float32)
     assert all(dtype == torch.float32 for name, (_, dtype) in buffers.items() if name.startswith("enc."))
+
+
+def test_the_decoder_cache_follows_its_region_when_the_pool_moves_it(model):
+    """Kept between chunks as views of the pool, and taken again, with what it holds,
+    after a rearrange has slid the region to another place."""
+    buffers = {name: (shape, torch.float32) for name, (shape, _) in
+               rollout_state_buffers(model.config, (2, 2), 1).items() if name.startswith("dec.")}
+    wants = RequestPoolReqConfig.of(buffers)
+    pool = RequestPool(RequestPoolConfig(pool_bytes=3 * wants.nbytes(), inference_tensors=True),
+                       torch.device("cpu"), name=DIT_POOL)
+    sub = _bare_dit_submodule(model, {DIT_POOL: pool})
+
+    def step(*rids):
+        segs = tuple(Segment(request_id=rid, label="chunk", span=1) for rid in rids)
+        ctx = StepContext(request_ids=rids, graph_walk=ROLLOUT_WALK, slot=0, capture=False)
+        assert pool.admit(RequestPoolStep(segments=segs), ctx).ok
+        pool.plan(RequestPoolStep(segments=segs), ctx)
+
+    for rid in (1, 2):
+        pool.ingest_request(rid, wants)
+        assert pool.reserve(rid, "dit", ROLLOUT_WALK, None) is None
+    step(1, 2)
+    step(2)  # the cache is request 2's
+    state = PerRequestState()
+    state.add_all(decoder_cache=None, decoder_cache_at=None)
+    cache = sub._decoder_cache(state)
+    filled = [i for i, b in enumerate(cache.buffers) if b is not None]
+    with torch.inference_mode():  # as the dit decodes
+        for i in filled:
+            cache[i] = torch.full(cache.buffers[i].shape, float(i))
+    assert sub._decoder_cache(state) is cache  # nothing moved
+    pool.remove_request(1)
+    pool.ingest_request(3, RequestPoolReqConfig.of({"big": ((2 * wants.nbytes() // 4,), torch.float32)}))
+    assert pool.reserve(3, "dit", ROLLOUT_WALK, None) is None
+    step(3)  # only fits once request 2 slides to the start
+    step(2)
+    moved = sub._decoder_cache(state)
+    assert moved is not cache and state["decoder_cache"] is moved
+    for i in filled:
+        assert moved[i].data_ptr() == pool.view(f"dec.{i}").data_ptr() != cache[i].data_ptr()
+        assert torch.equal(moved[i], torch.full(cache.buffers[i].shape, float(i)))
 
 
 def test_the_encode_stream_follows_its_region_when_the_pool_moves_it(model):
@@ -784,14 +831,14 @@ def test_the_fast_config_only_adds_the_autotuned_compile():
 
 
 def test_a_config_must_run_one_rollout_at_a_time(model):
-    """The pool doesn't bound the rollouts' VAE decoder caches, so until they are
-    engine resources the conductor runs one rollout at a time."""
+    """The pool doesn't bound the rollouts' noise, so until the limit is lifted the
+    conductor runs one rollout at a time."""
     model.validate_config_yaml({"max_concurrent_requests": 1}, "lingbot.yaml")
     for limit in (None, 0, 2, 16, True, "1", 1.0):
         config = {"max_concurrent_requests": limit} if limit is not None else {}
         with pytest.raises(ValueError, match="requires `max_concurrent_requests: 1`") as err:
             model.validate_config_yaml(config, "lingbot.yaml")
-    assert "VAE decoder cache is allocated by the dit outside" in str(err.value)
+    assert "noise is allocated by the dit outside" in str(err.value)
 
 
 def test_the_shipped_config_runs_one_rollout_at_a_time_over_the_default_pool(model):

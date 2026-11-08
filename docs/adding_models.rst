@@ -1183,9 +1183,10 @@ runs in inference mode declares ``RequestPoolConfig(inference_tensors=True)``: t
 allocated, viewed and written in inference mode (writes go through ``writing()``), so its
 views are inference tensors and pass to the model's compiled graphs as they are, since
 those guard on their inputs' dispatch keys. LingBot-World keeps each rollout's rolling K/V,
-text K/V and VAE encoder cache in one (``DIT_POOL``); the encoder writes its cache straight
-into it (``wan_vae.PoolFeatCache`` with ``wan_vae.encoder_saves_uncopied``). Its VAE decoder
-cache is still the model's, so it requires ``max_concurrent_requests: 1``.
+text K/V and VAE encoder and decoder caches in one (``DIT_POOL``); both write their caches
+straight into it (``wan_vae.PoolFeatCache`` with ``wan_vae.encoder_saves_uncopied`` and
+``wan_vae.decoder_saves_uncopied``). Its noise for the whole rollout is still the model's,
+so it requires ``max_concurrent_requests: 1`` for now.
 
 Rolling (compacted) caches
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
