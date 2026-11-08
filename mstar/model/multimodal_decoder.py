@@ -241,6 +241,8 @@ class MultimodalDecoderModel(Model):
             spans.append(Span("ids", walk, length - end, length - end, "text_inputs"))
         # one row writes the whole prompt
         spans[1:] = [span._replace(opens_step=False) for span in spans[1:]]
+        # Key no span. The default keys the leading text span, and `rebuild_refusal` refuses a keyed prompt of more
+        # than one span.
         return {KV_CACHE: {"main": LabelLayout(spans=tuple(spans), growth=(("decode_loop", 1),), keyed_spans=0)}}
 
     def media_advance(self, tokens: int, grid: list[int]) -> int:
