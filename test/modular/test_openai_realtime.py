@@ -30,7 +30,6 @@ from fastapi.testclient import TestClient  # noqa: E402
 from mstar.api_server import media_io  # noqa: E402
 from mstar.api_server.openai import adapters, serving_realtime  # noqa: E402
 from mstar.api_server.openai.adapters import SubmitArgs, Transcript  # noqa: E402
-from mstar.model.base import Model  # noqa: E402
 from mstar.testing_utils.model import StubModel
 
 
@@ -1119,17 +1118,12 @@ def test_a_character_split_across_token_chunks_survives_a_step():
 # -- conversation intent (full duplex) ---------------------------------------
 
 
-class _DuplexModel:
+class _DuplexModel(StubModel):
     turn_tokens = (1, 2)
-    turn_idle_steps = Model.turn_idle_steps
-    turn_silence_rms = Model.turn_silence_rms
     channels = 1
 
     def get_output_audio_channels(self, modality="audio"):
         return self.channels
-
-    def get_output_sample_rate(self, modality="audio"):
-        return 24000
 
     def get_default_voice(self):
         return "Aria"
