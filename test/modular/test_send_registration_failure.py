@@ -271,7 +271,7 @@ def _postprocess_worker(refuse, follower=False):
 
 def _decode_step(rids, final_stream=()):
     node_batch = SimpleNamespace(
-        request_ids=list(rids), per_request_info=dict.fromkeys(rids),
+        node_name="llm", request_ids=list(rids), per_request_info=dict.fromkeys(rids),
         failed_requests={}, completion_event=None,
         final_stream_rids=set(final_stream), resource_publish_info={},
         partition_done_rids=set(), cached_rids=set(), withheld_outputs={},

@@ -118,6 +118,7 @@ def _worker(rids=("r1",)):
     w.scheduler.held_until = {}
     w.scheduler.admit_errors = {}
     w.scheduler.backlog = {}
+    w._in_flight_rids = set()
     w._hold_rows(CHAIN_LANE, rids)
     return w
 

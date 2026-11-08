@@ -35,7 +35,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine import apply_dynamo_config
 from mstar.engine.chunking import ChunkRange
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AdmitFailedReason, AllocationFailed
+from mstar.engine.resources import AdmitFailedReason, AllocationFailed, Residency
 from mstar.engine.resources.kv.config import without_layouts
 from mstar.engine.resources.kv.transfer import (
     TransferEngineInfo,
@@ -107,6 +107,7 @@ from mstar.worker.batch_builder import BatchBuilderType
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.engine_manager import EngineManager, refuse_combined_walks_across_tp_groups
 from mstar.worker.executing_batch import input_metadata_and_fwd_info, make_executing_batch
+from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import (
     CHAIN_LANE,
     MicroScheduler,
@@ -116,6 +117,7 @@ from mstar.worker.micro_scheduler import (
 )
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.phase_timer import PhaseTimer, step_key
+from mstar.worker.rebuild import DEFAULT_REBUILD_HOST_MB, Rebuilds
 from mstar.worker.side_steps import SIDE_LANE, SideStepLane
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import (
@@ -193,6 +195,23 @@ def _make_graph_runtime(
         bookkeeping=bookkeeping,
         communicator=communicator,
         **kwargs,
+    )
+
+
+def _make_rebuilds(
+    model: Model | None, model_config: dict | None, node_names: set[str], lockstep_nodes: set[str],
+    device: torch.device,
+) -> Rebuilds:
+    """What a dropped request is rebuilt from, on each node here whose model declares how."""
+    policies = model.rebuild_policies() if model is not None else {}
+    # A lockstep node's KV refuses every drop, so its requests keep no ids.
+    policies = {node: policy for node, policy in policies.items() if node not in lockstep_nodes}
+    host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
+    if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
+        raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
+    return Rebuilds(
+        policies, model.get_graph_walk_graphs() if model is not None else {},
+        HostPool(host_mb << 20, device) if host_mb and policies.keys() & node_names else None,
     )
 
 
@@ -720,9 +739,13 @@ class Worker:
         self.scheduler.get_tensor = self.tensor_manager.get_tensor
         self.tensor_manager.rid_to_str = self._rid_str
 
+        self._rebuilds = _make_rebuilds(model, model_config, node_names, self.parallel_nodes, self.device)
+
         # Let the scheduler see deferred removes so it stops initiating new work
         # for those rids (shared by reference — mutations are visible to both).
         self.scheduler.pending_removes = self._pending_removes
+        self.scheduler.in_flight_rids = self._in_flight_rids
+        self.scheduler.rebuilds = self._rebuilds
 
         # PartitionTopology + StreamBuffer on consumer worker
         self.partition_topology = topology
@@ -862,7 +885,7 @@ class Worker:
         leads and the tensors every rank reads."""
         return WorkerMetrics(
             self.worker_id, interval_s, frozenset(self.parallel_leader_nodes),
-            self.engine_manager.engine, self.scheduler,
+            self.engine_manager.engine, self.scheduler, self._rebuilds,
             send=lambda status: self.communicator.send("conductor", ConductorMessage(
                 message_type=ConductorMessageType.WORKER_STATUS, body=status,
             )),
@@ -1174,6 +1197,7 @@ class Worker:
         self.scheduler.clear_rid(request_id, body.request_id)
         self._pending_removes.pop(request_id, None)
 
+        self._rebuilds.remove_request(request_id)
         laps.lap("misc")
         # DEBUG: once per request on the main thread, it cost as much as the
         # engine's own removal (test/waypoint/serve_rollout.py, which waits on
@@ -1184,6 +1208,27 @@ class Worker:
         # Last: frees the handle for reuse, so nothing above may run after it.
         self._graph_runtime.remove_request(request_id)
         laps.lap("runtime")
+
+    def _drop(self, request_id: int, node_name: str) -> int:
+        """Drop the request's KV on ``node_name``, which its kept ids can rebuild, and return
+        the pages freed."""
+        info = self.request_state.get_fwd_info(request_id, self.request_state.get_partition_for_node(node_name))
+        why = self._rebuilds.refusal(request_id, node_name, info.graph_walk, info.dynamic_loop_iter_counts)
+        if why is not None:
+            raise RuntimeError(
+                f"Worker {self.worker_id}: {self._rid_str(request_id)} can't be dropped on {node_name}, since {why}"
+            )
+        backlogged = any(
+            request_id in batch.request_to_worker_graph
+            for (node, _), batch in self.scheduler.backlog.items() if node == node_name
+        )
+        if request_id in self._in_flight_rids or backlogged:
+            raise RuntimeError(
+                f"Worker {self.worker_id}: {self._rid_str(request_id)} is in a step or a backlog on {node_name}"
+            )
+        return self.engine_manager.get_engine(node_name).drop_request(
+            node_name, request_id, self._rebuilds.tokens(request_id, node_name),
+        )
 
     def _drain_request(self, body: DrainRequest) -> None:
         """Phase-1 teardown (abort/fail): stop scheduling this rid, then ACK
@@ -1807,7 +1852,7 @@ class Worker:
 
         active = [
             rid for rid in self.scheduler.arrival
-            if not engine.is_offloaded(node_name, rid)
+            if engine.residency(node_name, rid) is Residency.RESIDENT
             and (not inside_only or rid in batch_ids)
         ]
 
@@ -1914,6 +1959,7 @@ class Worker:
             request_walks=batch.request_walks,
             chunk_ranges=batch.chunk_ranges,
             engine=self.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
+            rebuild_rids=batch.rebuild_rids, rebuilds=self._rebuilds,
         )
         node_batch.read_check_rids = batch.read_check_rids
         for rid in unresolved:
@@ -2037,11 +2083,8 @@ class Worker:
 
     def _push_back_batch(self, batch: ScheduledBatch) -> None:
         """Return a whole batch's nodes to the ready set (admit refusal, OOM)."""
-        rids = list(batch.request_to_worker_graph)
-        self._graph_runtime.push_back_node(
-            batch.node_name, rids,
-            [batch.request_to_worker_graph[rid] for rid in rids],
-        )
+        rows = batch.graph_rows()
+        self._graph_runtime.push_back_node(batch.node_name, list(rows), list(rows.values()))
 
     @staticmethod
     def _edge_block(
@@ -2534,7 +2577,9 @@ class Worker:
         defers for every lane's (``_in_flight_rids``); a main-loop error fails
         the chain's."""
         rows = self._rows_by_lane = {**self._rows_by_lane, lane: frozenset(rids)}
-        self._in_flight_rids = set().union(*rows.values())
+        # in place: the scheduler holds the set too, and starts no rebuild for a row in it
+        self._in_flight_rids.clear()
+        self._in_flight_rids.update(*rows.values())
 
     def _held_beside(self, lane: int) -> set[int]:
         """The rows the other lanes' steps in flight hold."""
@@ -2639,10 +2684,11 @@ class Worker:
         doomed = {rid for rid in rids if rid in named} or set(rids)
         if self._is_tp_follower_node(batch.node_name):
             doomed = set()
-        survivors = [rid for rid in rids if rid not in doomed]
+        rows = batch.graph_rows()
+        survivors = [rid for rid in rows if rid not in doomed]
         if survivors:
             self._graph_runtime.push_back_node(
-                batch.node_name, survivors, [rids[rid] for rid in survivors],
+                batch.node_name, survivors, [rows[rid] for rid in survivors],
             )
         if doomed:
             logger.error(
@@ -2781,11 +2827,14 @@ class Worker:
 
         REMOVE_REQUEST is deferred while a GPU step is in flight. The
         publication on that step's completion must still exclude the rid.
+        A rebuild row publishes nothing: its request keeps the publication
+        from before its drop.
         """
         return [
             rid for rid in batch.request_ids
             if (info := batch.per_request_info.get(rid)) is not None
             if rid not in self._pending_removes
+            and rid not in batch.step_context.rebuild_rids
             and rid not in self.scheduler.failed_rids
             and info.request_id not in self._pending_drains
             and info.request_id not in self._draining_rids
@@ -2907,7 +2956,7 @@ class Worker:
         (``_clear_in_flight_flag``), on paths with no stage to settle.
         """
         batch = speculation.scheduled_batch
-        rid_to_wg = batch.request_to_worker_graph if success else {}
+        rid_to_wg = batch.graph_rows() if success else {}
         self._graph_runtime.commit_speculation(
             speculation.spec_id, success, list(dropped_rids),
             # Keeps these nodes off the ready queue while the step is in flight.
@@ -2963,6 +3012,11 @@ class Worker:
         # walk and drops a loop-back no row can take; prep_spec_rids the loop
         # completion per rid.
         groups = batch.rids_by_walk()
+        if batch.rebuild_rids:
+            rebuild = batch.rebuild_rids
+            groups = {walk: kept for walk, rids in groups.items() if (kept := [r for r in rids if r not in rebuild])}
+            if not groups:
+                return None
         if len(groups) == 1:
             rows = next(iter(groups.values()))
             counts = None if len(rows) == 1 else [len(rows)]
@@ -3139,6 +3193,7 @@ class Worker:
             pending, spec_target_info, prep, other_walks, fresh_final_edges,
             chunk_ranges=None if fresh_batch is None else fresh_batch.chunk_ranges,
             incomplete_node_rids=None if fresh_batch is None else fresh_batch.incomplete_node_rids,
+            rebuild_rids=frozenset() if fresh_batch is None else fresh_batch.rebuild_rids,
         )
         # N's rows, not fresh ones: a cleared speculation must not ready their
         # nodes while N's chunk is in flight; N's settle does that
@@ -3563,14 +3618,14 @@ class Worker:
     def _wg_ids_of(batch: ScheduledBatch) -> list[int]:
         """``set_in_flight``'s worker graphs: one id for a step of one walk
         (a node in a walk lives in one worker graph), else one per rid."""
-        rid_to_wg = batch.request_to_worker_graph
+        rid_to_wg = batch.graph_rows()
         if batch.request_walks or not rid_to_wg:
             return list(rid_to_wg.values())
         return [next(iter(rid_to_wg.values()))]
 
     def _set_in_flight_flag(self, batch: ScheduledBatch, value: bool) -> None:
         self._graph_runtime.set_in_flight(
-            batch.node_name, list(batch.request_to_worker_graph),
+            batch.node_name, list(batch.graph_rows()),
             Worker._wg_ids_of(batch), value,
         )
 
@@ -3606,6 +3661,7 @@ class Worker:
             self.timer.buf[f"worker.postprocess.{name}"].append(now - _pp_t)
             _pp_t = now
 
+        self._finish_rebuild_rows(batch_N, outputs)
         if self.enable_nvtx:
             range_push("worker.postprocess.cleanup_inputs", synchronize=False)
 
@@ -3726,11 +3782,15 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
+        self._rebuilds.keep_prompts(batch_N.node_batch)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
             skip_rids=batch_N.batch.incomplete_node_rids,
+        )
+        self._rebuilds.keep_samples(
+            batch_N.node_batch, cpu_outputs, host_rows, skip_rids=batch_N.batch.incomplete_node_rids,
         )
         _pp_stage("prematerialize")
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
@@ -3815,6 +3875,42 @@ class Worker:
         _pp_stage("tail")
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
+
+    def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
+        """Take the step's rebuild rows off it and advance their rebuilds. A rebuild's last chunk lands it and
+        lets its request's decode row run."""
+        batch, node_batch = batch_N.batch, batch_N.node_batch
+        rebuild = batch.rebuild_rids
+        if not rebuild:
+            return
+        node = batch_N.node_name
+        # the engine also skips a row the prefix cache served whole, whose rebuild is done (below)
+        skipped = (rebuild & node_batch.skipped_rids) - node_batch.cached_rids
+        if skipped:
+            self._fail_requests({
+                rid: f"Error in worker: {node} skipped the rebuild row of {self._rid_str(rid)}, whose inputs come "
+                "from its kept ids" for rid in skipped
+            })
+        # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
+        ran = set(node_batch.request_ids) | node_batch.cached_rids
+        landed = [
+            rid for rid in rebuild if rid in ran and self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid))
+        ]
+        if landed:
+            # the step's kernels read the prepared input released here
+            self._wait_for_step(batch_N)
+            engine = self.engine_manager.get_engine(node)
+            for rid in landed:
+                engine.release_chunk_inputs(rid, node)
+                engine.land_rebuild(node, rid)
+        for rid in rebuild:
+            outputs.pop(rid, None)
+            batch.discard_rid(rid)
+            batch.chunk_ranges.pop(rid, None)
+            node_batch.per_request_info.pop(rid, None)
+        batch.incomplete_node_rids -= rebuild
+        node_batch.cached_rids -= rebuild
+        node_batch.request_ids = [rid for rid in node_batch.request_ids if rid not in rebuild]
 
     def _runtime_stop_column(
         self, batch_N: PendingBatch, host_rows: "HostRows | None",
@@ -4750,7 +4846,7 @@ class Worker:
             self._clear_in_flight_flag(sb)
             fresh = {
                 rid: wg_id
-                for rid, wg_id in sb.request_to_worker_graph.items()
+                for rid, wg_id in sb.graph_rows().items()
                 if rid not in speculation.continuing_rids
                 and rid not in failed_rids
             }
@@ -5213,15 +5309,14 @@ class Worker:
                                 self._settle_speculation(speculation, success=False)
                                 # Fresh rids are not re-readied by N's routing
                                 # the way continuing rids are: give them back.
+                                rows = sb.graph_rows()
                                 fresh = [
-                                    rid for rid in sb.request_to_worker_graph
+                                    rid for rid in rows
                                     if rid not in speculation.continuing_rids
-                                    and sb.request_to_worker_graph.get(rid)
-                                    is not None
+                                    and rows.get(rid) is not None
                                 ]
                                 self._graph_runtime.push_back_node(
-                                    sb.node_name, fresh,
-                                    [sb.request_to_worker_graph[r] for r in fresh],
+                                    sb.node_name, fresh, [rows[r] for r in fresh],
                                 )
                                 speculation = None
 

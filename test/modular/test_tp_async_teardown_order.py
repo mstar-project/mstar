@@ -36,6 +36,7 @@ from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import RecentSet  # noqa: E402
 from mstar.utils.ipc_format import MessageSource, RemoveRequest, WorkerMessageType  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 
 NODE, WALK = "LLM", "decode"
@@ -53,11 +54,8 @@ class _Stop(BaseException):
 
 def _batch(seq: int, rids: list[int]):
     """A step's scheduled and executing halves."""
-    scheduled = SimpleNamespace(
-        node_name=NODE, graph_walk=WALK, tp_seq=seq,
-        request_to_worker_graph={rid: 0 for rid in rids},
-        chunk_ranges={}, incomplete_node_rids=set(),
-        rids_by_walk=lambda: {WALK: list(rids)},
+    scheduled = ScheduledBatch(
+        node_name=NODE, graph_walk=WALK, tp_seq=seq, request_to_worker_graph={rid: 0 for rid in rids},
     )
     executing = SimpleNamespace(
         node_name=NODE, request_ids=list(rids), admit_error=None, failed_requests={},

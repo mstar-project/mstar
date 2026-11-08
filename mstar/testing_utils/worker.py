@@ -13,6 +13,7 @@ import torch
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.phase_timer import PhaseTimer
+from mstar.worker.rebuild import Rebuilds
 from mstar.worker.worker import Worker
 
 # Built by ``__init__`` from the deployment; no default stands in for them.
@@ -37,6 +38,8 @@ def make_worker(**overrides) -> Worker:
     worker.profile_info = WorkerProfileInfo()
     worker.timer = PhaseTimer(worker_id="w0", period=0)
     worker.chunk_loops = ChunkLoops()
+    # no node declares a rebuild policy
+    worker._rebuilds = Rebuilds({}, {})
     worker._launch_wait_s = 0.0
     worker._max_consecutive_spec = 1024
     # a worker that leads and follows nothing

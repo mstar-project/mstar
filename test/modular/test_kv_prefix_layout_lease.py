@@ -351,7 +351,7 @@ def test_a_step_that_changes_walk_fails_where_its_layout_is_built():
         layout(TEXT_WALK).row()
     with pytest.raises(ValueError, match="span 0 .* no span comes before it"):
         layout(IMAGE_WALK, opens_step=False).row()
-    assert [row[-1] for row in layout(IMAGE_WALK).row()[0]] == [True, False]
+    assert [row[6] for row in layout(IMAGE_WALK).row()[0]] == [True, False]
 
 
 _DISAGREEING = {
