@@ -864,6 +864,52 @@ def test_a_name_that_is_no_walk_sets_the_piecewise_region_it_labels():
         regions({"backbone_layer": [256]})
 
 
+def _tower_with_ladder(tower: str, ladder: list[int]):
+    """A vision block-loop or AuT encoder node, its region captured on the serving
+    config's ``ladder`` and its attention resource sized from the class's own top
+    bucket, as the models declare it: the node and its region's runner."""
+    from mstar.model.components.aut_encoder import AuTEncoderConfig
+    from mstar.model.components.aut_submodule import AuTEncoderSubmodule
+    from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP, PackedBlockLoopEncoder
+    from mstar.model.keys import VISION_ATTN
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    if tower == "vision":
+        tower_class = type("Tower", (PackedBlockLoopEncoder,), {"prepare_inputs": None})
+        node = tower_class(torch.nn.Module(), SimpleNamespace(hidden_size=8, head_dim=4), "out")
+        node.node_resources = {VISION_ATTN: SimpleNamespace(max_segments_per_step=8)}
+        label = VISION_BLOCK_LOOP
+    else:
+        config = AuTEncoderConfig()
+        node = type("Encoder", (AuTEncoderSubmodule,), {"prepare_inputs": None})(
+            SimpleNamespace(config=config), "audio_attn")
+        node.node_resources = {"audio_attn": SimpleNamespace(
+            max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(config))}
+        label = "aut_encode"
+    mgmt = make_mgmt(node, joint_comm_group=SimpleNamespace(world_size=1), region_ladders={label: ladder})
+    (runner,) = make_engine(_submodules={"node": mgmt})._build_piecewise_runners("node", mgmt).values()
+    return node, runner
+
+
+def test_a_vision_ladder_past_the_class_top_replays_and_batches_to_its_own_top():
+    node, runner = _tower_with_ladder("vision", [256, 32768])
+    rows = [SimpleNamespace(input_seq_len=10000, resource_step_info={"main": [10000]}) for _ in range(2)]
+    assert runner.can_lease(rows, ["a", "b"]) and node.can_batch(None, rows)
+
+
+def test_an_audio_clip_past_the_window_ceiling_runs_eagerly_however_long_the_ladder():
+    """The resource's windows per row are sized from the class's top bucket; a clip
+    with more than a replay's plan holds takes no lease, so its stack runs eagerly
+    rather than overflowing the plan."""
+    node, runner = _tower_with_ladder("audio", [64, 16384])
+    windows = node.node_resources["audio_attn"].max_segments_per_request
+    rows = [SimpleNamespace(input_seq_len=104 * n) for n in (windows, windows + 1)]
+    assert runner.can_lease(rows[:1], ["a"])
+    assert not runner.can_lease(rows[1:], ["b"])
+    # a batch the longer ladder holds packs, past the class's top bucket
+    assert node.can_batch(None, [SimpleNamespace(input_seq_len=3000)] * 2)
+
+
 @pytest.mark.parametrize("regions_off", [True, False])
 def test_a_name_on_a_node_with_no_region_here_is_skipped_only_if_it_declares_some(regions_off, caplog):
     """OmniVoice's backbone declares its region but captures none with ``backbone_graphs``

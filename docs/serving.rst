@@ -350,10 +350,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        the steps its capture replays (``max_batch_tokens``; a walk inside a
        combined walk runs under the combined walk's), and the rungs past it, which
        no step would reach, are dropped and logged; a region takes its ladder
-       whole. A region whose attention resource is sized from the model's top
-       rung (a vision tower's ``max_segments_per_step``) needs that raised under
-       ``resources`` with a longer ladder, or its captures past it fail. Each
-       rung adds captures, graph memory and startup time. Loading
+       whole, and its node packs a step up to the ladder's top. A tower's
+       attention resource is sized from the model's own top rung, and a step
+       with more attention segments than it holds runs eagerly, so a ladder
+       past that rung replays its longer steps only with the resource raised
+       under ``resources``: ``vision_attn: {max_segments_per_step: N}`` for a
+       vision tower's ``vision_block_loop`` (Qwen3.5, Qwen3-Omni, Muse Glimmer;
+       N frames or windows a step), and ``audio_attn: {max_segments_per_request:
+       N}`` for Qwen3-Omni's ``aut_encode`` (N 8 s windows a clip). Each rung
+       adds captures, graph memory and startup time. Loading
        fails, before any weights load, if the setting is not a mapping of node ->
        name -> ladder, names a node in no node group or a walk of the model that
        does not run the node (a node runs the walks it is in and its combined
