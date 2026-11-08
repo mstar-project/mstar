@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 # ``accelerator_graph_runner.compile_kwargs``.
 DETERMINISTIC_COMPILE_MODE = "deterministic"
 
+# The batch sizes a capture takes when its config names none.
+DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
+
 
 def check_compile_mode(mode: str | None) -> str | None:
     """A capture config's ``compile_mode``, refused at build rather than at capture,
@@ -289,7 +292,7 @@ def _trim(ladder: list[int], tokens: int | None, at_least: int = 0) -> list[int]
 
 def apply_token_ladders(
     node: str, configs: list[AcceleratorGraphConfig], ladders: Mapping[str, Any],
-    step_tokens: Callable[[PackedAcceleratorGraphConfig, str], int | None],
+    step_tokens: Callable[[str, int], int | None],
 ) -> None:
     """Take a serving config's ``prefill_token_buckets`` for ``node`` (capture
     walk -> ladder or ``{min batch size: ladder}``, which `EngineManager`
@@ -297,9 +300,10 @@ def apply_token_ladders(
     that walk.
 
     A ladder runs to the first rung that holds the most tokens the scheduler
-    gives a step its capture replays (``step_tokens`` of the capture and each
-    replay walk: its token budget, or a little past it beside decode rows;
-    none where any walk has no budget): a rung beyond would never replay. A
+    gives a step its capture replays (``step_tokens`` of each replay walk and
+    the capture's widest batch: its token budget, or a little past it beside
+    decode rows; none where any walk has no budget): a rung beyond would never
+    replay. A
     larger batch size's ladder also runs at least as far as a smaller one's,
     which share its static buffers.
 
@@ -330,7 +334,8 @@ def apply_token_ladders(
             )
             continue
         for config in targets:
-            bounds = [step_tokens(config, w) for w in config.replay_graph_walks]
+            rows = max(config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES)
+            bounds = [step_tokens(w, rows) for w in config.replay_graph_walks]
             bound = None if None in bounds else max(bounds)
             trimmed, top, dropped = {}, 0, []
             for k, rungs in sorted(ladders_by_batch_size(ladder).items()):

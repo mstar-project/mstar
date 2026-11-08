@@ -18,6 +18,7 @@ from mstar.engine.accelerator_graph_backend import (
     CapturedGraph,
 )
 from mstar.engine.accelerator_graph_config import (
+    DEFAULT_CAPTURE_BATCH_SIZES,
     DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
@@ -46,9 +47,6 @@ from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
-
-
-DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
 # torch.compile arguments per compile level (``mstar serve -O``), for a captured
@@ -721,10 +719,7 @@ class AcceleratorGraphRunner:
             )
         )
         if token_ladders:
-            apply_token_ladders(
-                submodule_name, self._capture_configs, token_ladders,
-                lambda config, walk: step_tokens(walk, max(self._batch_sizes(config))),
-            )
+            apply_token_ladders(submodule_name, self._capture_configs, token_ladders, step_tokens)
         self._resources = resources
         self._step_runner = step_runner
         self._device = device

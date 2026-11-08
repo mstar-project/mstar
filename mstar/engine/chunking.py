@@ -15,6 +15,7 @@ from mstar.model.submodule_base import (
     ChunkingPolicy,
     NodeInputs,
 )
+from mstar.worker.batch_builder import most_step_tokens
 
 if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch, SubmoduleManagement
@@ -114,14 +115,13 @@ class ChunkingManagement:
         it runs in, if any (a combined batch whose rows share one real walk
         runs relabelled to it, `ScheduledBatch.relabel_if_uniform`, and still
         ran under the combined walk's budget). Or more, by what the step's
-        speculated rows, one-token decode rows, take of ``min_chunk_tokens``:
-        where they leave a prompt less than that, the prompt still runs that
-        many (`batch_builder._run_head`) beside them."""
+        speculated rows, one-token decode rows, take of ``min_chunk_tokens``
+        (`batch_builder.most_step_tokens`)."""
         walk = self._combined_walk_of.get((node_name, graph_walk), graph_walk)
         budget = self.max_batch_tokens(node_name, walk)
         if budget is None:
             return None
-        return max(budget, max_rows - 1 + self.min_chunk_tokens(budget))
+        return most_step_tokens(budget, self.min_chunk_tokens(budget), max_rows - 1)
 
     def set_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],
