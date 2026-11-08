@@ -181,7 +181,7 @@ class Rebuilds:
         # node -> the dtype it runs in, which its host copies take. A node missing here copies nothing.
         self._node_dtypes = node_dtypes
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
-        # without one no request keeps ids, so none is dropped
+        assert pool is not None or not policies, "a node that rebuilds requests keeps their ids in the host pool"
         self._pool = pool
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
@@ -273,7 +273,7 @@ class Rebuilds:
         taken = {}
         if not unpausable:
             for node in written.keys() - refused:
-                room = None if self._pool is None else self._log_room(node, written[node])
+                room = self._log_room(node, written[node])
                 if room is None:
                     refused.add(node)
                 else:
@@ -297,7 +297,7 @@ class Rebuilds:
         dropped."""
         node = node_batch.node_name
         policy = self._policies.get(node)
-        if self._pool is None or policy is None:
+        if policy is None:
             return
         walk, walks = node_batch.step_context.graph_walk, node_batch.step_context.request_walks
         if walk not in policy.walks and policy.walks.isdisjoint(walks.values()):

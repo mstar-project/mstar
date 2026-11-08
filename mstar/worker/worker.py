@@ -192,8 +192,10 @@ def _make_rebuilds(
     host_mb = _serving_mb(
         model_config, "rebuild_host_mb", DEFAULT_REBUILD_MEDIA_HOST_MB if copies else DEFAULT_REBUILD_HOST_MB,
     )
+    if not host_mb:
+        policies = {}
     return Rebuilds(
-        policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None, engine.host_allowance,
+        policies, graphs, HostPool(host_mb << 20, device) if policies else None, engine.host_allowance,
         {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None},
     )
 

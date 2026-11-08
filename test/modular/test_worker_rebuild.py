@@ -265,9 +265,9 @@ def test_a_lockstep_node_keeps_no_ids_and_sets_no_pool_aside():
     )
 
 
-def test_rebuild_host_mb_0_sets_no_pool_aside_on_a_node_that_copies_media():
-    """``rebuild_host_mb: 0`` turned off the ids' room alone, so a worker whose node copies media still pinned
-    ``rebuild_media_host_mb`` at startup and kept every request's ids and copies there."""
+def test_rebuild_host_mb_0_rebuilds_no_request_there():
+    """``rebuild_host_mb: 0`` set no pool aside but left the node among the ones whose requests rebuild here, so
+    preemption still treated the node as one that drops requests."""
     from test_rebuild_policy import MEDIA, VISION
     from test_rebuild_policy import _graphs as media_graphs
 
@@ -276,7 +276,7 @@ def test_rebuild_host_mb_0_sets_no_pool_aside_on_a_node_that_copies_media():
     engine = SimpleNamespace(host_allowance=None, node_dtype=lambda node: torch.float32)
     rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 0}, my_walks, set(), torch.device("cpu"), engine)
 
-    assert NODE in rebuilds.nodes and rebuilds.pool is None, "the worker pinned the media pool with rebuilds off"
+    assert rebuilds.pool is None and not rebuilds.nodes, "a node with no pool would still count as one that drops"
 
 
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():

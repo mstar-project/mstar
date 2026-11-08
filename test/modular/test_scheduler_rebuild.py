@@ -30,7 +30,7 @@ from mstar.engine.resources.step import FULL_ADMIT_OK, FULL_ADMIT_REBUILD
 from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.testing_utils.worker import make_scheduler
 from mstar.worker.chunk_loops import ChunkLoops
-from mstar.worker.host_pool import HostCopy
+from mstar.worker.host_pool import HostCopy, HostPool
 from mstar.worker.micro_scheduler import MidPrefillRow
 from mstar.worker.rebuild import KeptIds, RebuildCursor, Rebuilds
 
@@ -98,7 +98,8 @@ def _scheduler(walks, combined=False, runtime_type=None, chunk_loops=None, **eng
     sched = make_scheduler(
         SimpleNamespace(get_engine=lambda name: engine), parallel_leader_nodes={NODE},
         combined_walk_of={(NODE, PREFILL): MIXED, (NODE, DECODE): MIXED} if combined else None,
-        graph_runtime=runtime, request_state=state, rebuilds=Rebuilds({NODE: POLICY}, _graphs()),
+        graph_runtime=runtime, request_state=state,
+        rebuilds=Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu"))),
         chunk_loops=chunk_loops,
     )
     return sched, runtime, state, engine
