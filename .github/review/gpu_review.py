@@ -279,6 +279,15 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 """
 
 
+def unavailable(out, lt, text):
+    """Say why the live test can't run, in lt/unavailable.md, and stop the step, exit 3 with `unavailable`
+    set."""
+    (lt / "unavailable.md").write_text(text + "\n")
+    print(text.split("\n")[0])
+    out["unavailable"] = "true"
+    sys.exit(3)
+
+
 def pending_ahead(cfg, offer):
     """How many jobs are pending in a Slurm offer's partition (0 when its queue can't be read: the offer stands)."""
     state = gpu_py()
@@ -317,10 +326,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
                                              "model": MODEL, "turns": turns, "claude": CLAUDE}))
     stop = bot.over_cap(REPO)  # a review can take hours, so again right before the spend, as at preflight
     if stop:
-        (lt / "unavailable.md").write_text(stop + "\n")
-        print(stop)
-        out["unavailable"] = "true"
-        sys.exit(3)
+        unavailable(out, lt, stop)
     cfg = gpu_py()["load_config"]()
     # check=False: offers exits 1 with its JSON when something errored and nothing has an offer. That
     # is "no GPUs" here too, with the errors listed.
@@ -351,10 +357,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
         if r.returncode == 4:  # budget.max_running, which holds on every provider
             msg = (f"The bot already has {cfg['budget']['max_running']} GPU runs going (REVIEW_GPU_MAX_RUNS); "
                    "comment `/review` again when one finishes.")
-            (lt / "unavailable.md").write_text(msg + "\n")
-            print(msg)
-            out["unavailable"] = "true"
-            sys.exit(3)
+            unavailable(out, lt, msg)
         if r.returncode == 0:
             (lt / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (lt / "offer.json").write_text(json.dumps(o))
@@ -369,10 +372,7 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, s
     lines += [f"- `{o['id']}`: {o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr, {o['availability']}"
               for o in everything["offers"]] or ["- no listing has that many Hopper-class GPUs"]
     lines += [f"- {e}" for e in everything["errors"]]
-    (lt / "unavailable.md").write_text("\n".join(lines) + "\n")
-    print(lines[0])
-    out["unavailable"] = "true"
-    sys.exit(3)
+    unavailable(out, lt, "\n".join(lines))
 
 
 def instance(lt):
@@ -400,10 +400,8 @@ def wait(out, runner_temp, start_timeout="30"):
         if e["provider"] == "slurm":
             if st == "pending" and not started and time.time() - t0 > start_timeout * 60:
                 gpu("terminate", key, check=False)
-                (lt / "unavailable.md").write_text(
-                    f"No GPUs for the live test: the Slurm job waited {start_timeout} minutes without starting.\n")
-                out["unavailable"] = "true"
-                sys.exit(3)
+                unavailable(out, lt, f"No GPUs for the live test: the Slurm job waited {start_timeout} minutes "
+                                     "without starting.")
             started = started or st == "running"
             if st == "ended":
                 break
