@@ -3,7 +3,8 @@
 # reviewed commit. gpu_review.py launches it with `gpu.py launch --run`, so the box (a Slurm job or
 # an Eras Pod) is this script, and its GPUs go when it ends.
 #
-# Its inputs are run.json (repo, PR, commits, model), brief.md (what to do), and on Slurm
+# Its inputs are run.json (repo, PR, commits, model), brief.md (what to do), findings.json (the
+# review's notes for the run: model text, which the brief calls untrusted data), and on Slurm
 # anthropic.key (mode 0600, removed once read). On Slurm they are in the job's directory, where
 # the job runs (--chdir; $0 is Slurm's spool copy of this script), and gpu.py removes that
 # directory when the job ends. On Eras they are in /run/live-pr, and the key is an Eras secret at
@@ -19,7 +20,7 @@ REPO=$(field repo); MAIN_SHA=$(field main_sha)
 # A fresh home and Claude config: on a shared node /root/.claude holds other people's settings,
 # hooks and credentials. tmux gets its own socket directory, so nothing joins a shared server.
 export HOME=$W/home CLAUDE_CONFIG_DIR=$W/home/.claude TMUX_TMPDIR=$W/tmux XDG_CACHE_HOME=$W/cache
-export LIVE_PR_DIR=$W/live-pr LIVE_PR_OUT=$OUT HF_HOME=${HF_HOME:-$W/hf}
+export LIVE_PR_DIR=$W/live-pr LIVE_PR_IN=$IN LIVE_PR_OUT=$OUT HF_HOME=${HF_HOME:-$W/hf}
 ANTHROPIC_API_KEY=$(cat /run/live-pr-key/value 2> /dev/null || cat "$IN/anthropic.key")
 export ANTHROPIC_API_KEY
 rm -f "$IN/anthropic.key"

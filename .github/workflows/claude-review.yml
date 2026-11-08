@@ -23,8 +23,11 @@ name: Claude Review
 #      token (below) only to pull requests and issues of this repository. The
 #      model has no shell and no mutation tools: it posts inline comments
 #      through the action's tool (which redacts secrets) and returns the summary
-#      as fields, which a workflow step renders, redacts and posts. The worst
-#      case for a prompt injection is a bad comment.
+#      as fields, which a workflow step renders, redacts and posts. In light
+#      and thorough mode the worst case for a prompt injection is a bad
+#      comment. In gpu mode the live test runs the PR's code with a shell on
+#      the GPU box, as root on the shared Slurm node; see the README's threat
+#      model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
 #
@@ -32,8 +35,9 @@ name: Claude Review
 # here either: it rents GPUs (the team's Slurm node, else an open Eras listing),
 # starts the live-test session on that box (gpu_review_box.sh), waits for it,
 # collects its report and media, posts them, and approves the PR when the rule
-# in gpu_review.py holds. The box gets the PR's public code, a brief and an
-# Anthropic key, never a GitHub token or a cloud key; the GPUs go when the
+# in gpu_review.py holds. The box gets the PR's public code, a fixed brief, the
+# review's notes as data, and its own Anthropic key (LIVE_TEST_ANTHROPIC_KEY),
+# never a GitHub token or a cloud key; the GPUs go when the
 # box's session ends (Slurm's --time, Eras's Pod deadline), whether or not this
 # job is still running.
 
@@ -847,7 +851,8 @@ jobs:
         id: start
         continue-on-error: true
         env:
-          LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY || secrets.ANTHROPIC_API_KEY }}
+          # The box's own key, never the review's: the box runs PR code with a shell.
+          LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
         run: |
           set +e
           python3 .github/review/gpu_review.py start --pr "$PR" --sha "$HEAD_SHA" --main-sha "$(git rev-parse HEAD)" \
