@@ -10,7 +10,7 @@ changes its lines. Run by claude-review.yml with the default branch checked out:
     python3 .github/review/render_summary.py --schema     # for --json-schema
     python3 .github/review/render_summary.py --head <sha> --mode light --threads threads.json \
         --above stacked-above.json < output.json
-    python3 .github/review/render_summary.py --state --mode thorough < summary-comment-body   # what a re-review reads
+    python3 .github/review/render_summary.py --state --mode nogpu < summary-comment-body   # what a re-review reads
 """
 import argparse
 import base64
@@ -31,6 +31,8 @@ PRIORITIES = ("P0", "P1", "P2", "P3")
 # fixed_above: a PR stacked above fixes it, so the two merge together; reported, but not open when that
 # PR is one the review was given the diff of (stacked-above.json).
 STATUSES = ("fixed", "fixed_above", "open", "moot")
+# Summaries posted before the modes were renamed carry the old names in their state.
+RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
@@ -201,8 +203,8 @@ def render(review, pages, head, mode, stacked):
 
 def read_state(body, mode):
     """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
-    None, and that run reviews the whole PR. None too when it doesn't decode, and for a thorough
-    review unless the earlier one was thorough and skipped nothing."""
+    None, and that run reviews the whole PR. None too when it doesn't decode, and for a nogpu
+    review unless the earlier one was nogpu and skipped nothing."""
     found = STATE.findall(body)
     try:
         state = json.loads(base64.b64decode(found[-1])) if found else None
@@ -210,8 +212,9 @@ def read_state(body, mode):
         return None
     if not isinstance(state, dict):
         return None
+    state["mode"] = RENAMED_MODES.get(state.get("mode"), state.get("mode"))
     # A state from before `skipped` was kept counts as having skipped files.
-    if mode == "thorough" and (state.get("mode") != "thorough" or state.get("skipped", [None])):
+    if mode == "nogpu" and (state.get("mode") != "nogpu" or state.get("skipped", [None])):
         return None
     return state
 

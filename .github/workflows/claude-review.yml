@@ -7,7 +7,7 @@ name: Claude Review
 # PRs, so the reviewer could never review a fork's code. issue_comment runs with
 # secrets, and always uses the default branch's copy of this workflow file, never
 # the PR's version, whatever the PR's base. The comment body is only matched by
-# the `if` below, never passed to a shell.
+# the `if` and the preflight's COMMAND below, never passed to a shell.
 #
 # The safety rules that come with that, and that must hold for any edit here:
 #
@@ -30,12 +30,14 @@ name: Claude Review
 
 # When it runs, and who can cause it. Only on request; opening or pushing to
 # a PR never starts a review.
-#   - light, when someone with write access comments `/review` on a PR, or
-#     when a contributor comments `/review` on their own PR, unless it has the
-#     `skip-ai-review` label. "Contributor" is the commenter's
+#   - light, when someone with write access comments `/review light` on a PR,
+#     or when a contributor comments `/review light` on their own PR, unless it
+#     has the `skip-ai-review` label. "Contributor" is the commenter's
 #     author_association: OWNER, MEMBER, COLLABORATOR or CONTRIBUTOR, i.e. the
 #     team plus anyone who has had a PR merged here, from a fork or not;
-#   - thorough, when someone with write access comments `/review thorough`.
+#   - nogpu, when someone with write access comments `/review` or `/review nogpu`.
+#     A contributor without write access who comments `/review` on their own PR
+#     gets a one-line reply pointing to `/review light`, and nothing runs.
 # A run someone with write access starts has a turn cap high enough only to stop
 # a loop (CLAUDE_REVIEW_MAX_TURNS_TEAM, 2000); a contributor's own light review
 # keeps CLAUDE_REVIEW_MAX_TURNS (40).
@@ -47,7 +49,7 @@ name: Claude Review
 # actor is listed in allowed_non_write_users. Most contributors' PRs come from
 # forks without write access, so the preflight lists exactly one login there,
 # and only when the actor is the PR's author, is a contributor, and the run is
-# their own light `/review`. Never '*'. Such a run reads the same untrusted PR
+# their own `/review light`. Never '*'. Such a run reads the same untrusted PR
 # content as a maintainer's /review of that PR, with the same tools and token;
 # only who can start it changes.
 #
@@ -101,10 +103,11 @@ jobs:
     if: >-
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
-       (((github.event.comment.body == '/review' || github.event.comment.body == '/review thorough' ||
-          github.event.comment.body == '/review continue') &&
+       (((github.event.comment.body == '/review' || github.event.comment.body == '/review nogpu' ||
+          github.event.comment.body == '/review light' || github.event.comment.body == '/review continue') &&
          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
-        ((github.event.comment.body == '/review' || github.event.comment.body == '/review continue') &&
+        ((github.event.comment.body == '/review' || github.event.comment.body == '/review light' ||
+          github.event.comment.body == '/review continue') &&
          github.event.comment.user.login == github.event.issue.user.login &&
          !contains(github.event.issue.labels.*.name, 'skip-ai-review') &&
          contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.comment.author_association))))
@@ -128,8 +131,9 @@ jobs:
       # Secrets can't be tested in a job-level `if`, so short-circuit here
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
-      # be the PR's author, a contributor, on a light `/review` (see the
-      # header). Anyone else exits green with a notice.
+      # be the PR's author, a contributor, on `/review light` or `/review
+      # continue` (see the header). A contributor's `/review` on their own PR
+      # gets a one-line reply (`refuse`); anyone else exits green with a notice.
       # non_write_user is set only for that author, and only when they lack
       # write access, so a maintainer's run is unchanged.
       - name: Preflight
@@ -138,25 +142,33 @@ jobs:
           KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
           ACTOR: ${{ github.actor }}
           AUTHOR: ${{ github.event.issue.user.login }}
-          # The commenter's association; SELF_SERVE also requires commenter == author.
+          # The commenter's association; a self-serve run also requires commenter == author.
           ASSOC: ${{ github.event.comment.author_association }}
+          SKIP_LABEL: ${{ contains(github.event.issue.labels.*.name, 'skip-ai-review') }}
           TEAM_TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM }}
           SELF_TURNS: ${{ vars.CLAUDE_REVIEW_MAX_TURNS }}
-          SELF_SERVE: >-
-            ${{ github.event_name == 'issue_comment' &&
-                (github.event.comment.body == '/review' || github.event.comment.body == '/review continue') &&
-                !contains(github.event.issue.labels.*.name, 'skip-ai-review') }}
+          # The command, as one of these fixed words; the comment's text itself never reaches the shell.
+          COMMAND: >-
+            ${{ (github.event.comment.body == '/review light' && 'light') ||
+                ((github.event.comment.body == '/review' || github.event.comment.body == '/review nogpu') && 'nogpu') ||
+                (github.event.comment.body == '/review continue' && 'continue') || '' }}
         run: |
           if [ "$KEY_SET" != "true" ]; then
             echo "::warning::ANTHROPIC_API_KEY is not set; skipping the review."
             echo "run=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          case "$COMMAND" in
+            light|nogpu) mode=$COMMAND ;;
+            continue) mode="" ;;  # the stopped review's mode, from its handoff
+            *) echo "run=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
           perm=$(gh api "repos/$REPO/collaborators/$ACTOR/permission" --jq .permission 2> /dev/null || echo none)
           case "$perm" in
             admin|maintain|write)
               {
                 echo "run=true"
+                echo "mode=$mode"
                 echo "turns=${TEAM_TURNS:-2000}"
               } >> "$GITHUB_OUTPUT"
               exit 0 ;;
@@ -165,17 +177,34 @@ jobs:
             OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR) contributor=true ;;
             *) contributor=false ;;
           esac
-          if [ "$SELF_SERVE" = "true" ] && [ "$contributor" = "true" ] && [ -n "$ACTOR" ] && [ "$ACTOR" = "$AUTHOR" ]; then
+          own=false
+          [ "$contributor" = "true" ] && [ -n "$ACTOR" ] && [ "$ACTOR" = "$AUTHOR" ] && [ "$SKIP_LABEL" != "true" ] && own=true
+          if [ "$own" = "true" ] && [ "$COMMAND" != "nogpu" ]; then
             echo "::notice::$ACTOR has '$perm' access; reviewing their own PR as its author ($ASSOC)."
             {
               echo "run=true"
+              echo "mode=$mode"
               echo "non_write_user=$ACTOR"
               echo "turns=${SELF_TURNS:-40}"
             } >> "$GITHUB_OUTPUT"
+          elif [ "$own" = "true" ]; then
+            echo "::notice::$ACTOR has '$perm' access, not write; \`/review\` takes write access."
+            {
+              echo "run=false"
+              echo "refuse=\`/review\` takes write access to this repository; on your own PR, comment \`/review light\`."
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::$ACTOR has '$perm' access, not write; only people with write access, or a contributor on their own PR, can request a review."
+            echo "::notice::$ACTOR has '$perm' access, not write; only people with write access, or a contributor on their own PR with \`/review light\`, can request a review."
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
+
+      # A request the preflight turned down with a reason the commenter can act on.
+      - name: Reply to a refused request
+        if: steps.pre.outputs.refuse != ''
+        continue-on-error: true
+        env:
+          REFUSE: ${{ steps.pre.outputs.refuse }}
+        run: gh pr comment "$PR" --repo "$REPO" --body "$REFUSE" > /dev/null
 
       # The bot posts as the mstar-review GitHub App, with the M* logo, rather
       # than as github-actions. Until the app's client ID and key are set
@@ -210,8 +239,8 @@ jobs:
         id: pr
         continue-on-error: true
         env:
-          THOROUGH: ${{ github.event.comment.body == '/review thorough' && 'true' || 'false' }}
-          CONTINUE: ${{ github.event.comment.body == '/review continue' && 'true' || 'false' }}
+          MODE: ${{ steps.pre.outputs.mode }}
+          CONTINUE: ${{ steps.pre.outputs.mode == '' }}
           # Someone with write access: a timeout that only stops a runaway, like the turn cap.
           TEAM: ${{ steps.pre.outputs.non_write_user == '' }}
         run: |
@@ -227,11 +256,11 @@ jobs:
             echo "head_repo=$(jq -r .head.repo.full_name pr.json)"
             # Mode sets the prompt's reporting bar and the reasoning effort.
             # Without --effort, Claude Code uses its default for Opus (medium).
-            if [ "$THOROUGH" = "true" ]; then
-              echo "mode=thorough"; echo "effort=xhigh"; timeout=45
-            else
-              echo "mode=light"; echo "effort=high"; timeout=25
-            fi
+            # A /review continue takes the mode, effort and timeout of the review it continues.
+            case "$MODE" in
+              nogpu) echo "mode=nogpu"; echo "effort=xhigh"; timeout=45 ;;
+              *) echo "mode=light"; echo "effort=high"; timeout=25 ;;
+            esac
             [ "$TEAM" = "true" ] && timeout=300
             echo "timeout=$timeout"
             delim="TITLE_$(openssl rand -hex 8)"
@@ -243,8 +272,8 @@ jobs:
       # workspace, so it waits in $RUNNER_TEMP until the diff step. The newest
       # unexpired artifact for this PR wins, and only from this workflow on a
       # trigger that runs the base repository's copy of it. The handoff's mode
-      # is kept; a thorough one needs write access to continue, like `/review
-      # thorough`. Values from handoff.json are checked before use. A stopped
+      # is kept; a nogpu one needs write access to continue, like `/review
+      # nogpu`. Values from handoff.json are checked before use. A stopped
       # review can be continued only while its "didn't complete" comment is
       # still open: any later run that finishes rewrites that comment as
       # resolved, so a handoff it superseded is never used.
@@ -262,7 +291,7 @@ jobs:
               select((.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") and
                 (.body | startswith("<!-- claude-review-incomplete -->"))) | .id') \
             || fail "the PR's comments couldn't be read; try \`/review continue\` again"
-          [ -n "$open_ids" ] || fail "there is no stopped review of this PR to continue: none stopped part-way, or a later run already finished (handoffs are kept for 7 days); comment \`/review\` for a new one"
+          [ -n "$open_ids" ] || fail "there is no stopped review of this PR to continue: none stopped part-way, or a later run already finished (handoffs are kept for 7 days); ask for a new review with \`/review light\` or \`/review\`"
           found=""
           for run_id in $(gh api "repos/$REPO/actions/artifacts?name=$name&per_page=30" --jq '
               [.artifacts[] | select(.expired | not)] | sort_by(.created_at) | reverse | .[].workflow_run.id'); do
@@ -272,7 +301,7 @@ jobs:
                 found=$run_id; break ;;
             esac
           done
-          [ -n "$found" ] || fail "there is no stopped review of this PR to continue (handoffs are kept for 7 days); comment \`/review\` for a new one"
+          [ -n "$found" ] || fail "there is no stopped review of this PR to continue (handoffs are kept for 7 days); ask for a new review with \`/review light\` or \`/review\`"
           dir="$RUNNER_TEMP/prev"
           gh run download "$found" --repo "$REPO" -n "$name" -D "$dir" \
             || fail "the saved handoff couldn't be downloaded; try \`/review continue\` again"
@@ -281,11 +310,11 @@ jobs:
           [ -s "$dir/handoff.md" ] || fail "the saved handoff is malformed"
           [ "$(jq -r '.pr' "$meta")" = "$PR" ] || fail "the saved handoff is for another PR"
           [ "$(jq -r '.head_sha' "$meta")" = "$HEAD_SHA" ] \
-            || fail "the PR has new commits since that review stopped; comment \`/review\` for a review of the current head"
+            || fail "the PR has new commits since that review stopped; ask for a new review of the current head with \`/review light\` or \`/review\`"
           case "$mode" in
             light) effort=high; timeout=25 ;;
-            thorough)
-              [ -z "$NON_WRITE" ] || fail "continuing a thorough review takes write access, like \`/review thorough\`"
+            nogpu)
+              [ -z "$NON_WRITE" ] || fail "continuing a nogpu review takes write access, like \`/review nogpu\`"
               effort=xhigh; timeout=45 ;;
             *) fail "the saved handoff is malformed" ;;
           esac
@@ -370,7 +399,7 @@ jobs:
           # A re-review starts from this bot's last summary, when its commit is still an ancestor
           # of the head: the review re-checks those findings and reads only what changed since
           # (review-prompt.md, "Re-review"). After a force-push it reviews the whole PR again, and
-          # a thorough review does too unless the last one was thorough and skipped nothing.
+          # a nogpu review does too unless the last one was nogpu and skipped nothing.
           # The state is read only from the bot's own summaries: comments that start with the
           # summary's marker, in which model text can't open an HTML comment.
           if [ -z "$PREV" ]; then
@@ -745,9 +774,9 @@ jobs:
             marker='<!-- claude-review-continue-refused -->'
             printf '%s\n`/review continue` didn'"'"'t run: %s. [Log](%s).\n' "$marker" "$WHY" "$RUN_URL" > failed.md
           elif [ "$CAN_CONTINUE" = "true" ]; then
-            next='Comment `/review continue` to continue from its notes in a fresh session (kept for 7 days), or `/review` to start over.'
+            next='Comment `/review continue` to continue from its notes in a fresh session (kept for 7 days), or the same `/review` command to start over.'
           else
-            next='Comment `/review` to retry.'
+            next='Comment the same `/review` command to retry.'
           fi
           if [ "$REFUSED" != "true" ]; then
             marker='<!-- claude-review-incomplete -->'

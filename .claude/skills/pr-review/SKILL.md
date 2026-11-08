@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a design-risk rating (whether a human must make a design or direction call). One session runs every pass itself (a big PR's slices go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (every pass, P0–P2) and thorough (all passes, P0–P3 and design questions). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
+description: Review an M* pull request and report P0–P3 findings with evidence, description problems, questions and a design-risk rating (whether a human must make a design or direction call). One session runs every pass itself (a big PR's slices go to subagents) — an mstar-way derivation written before the diff is read, behaviour lenses, performance, big picture, abstraction fit, factoring, design, minimality, style and philosophy — and ranks findings by the bar in this file. Modes are light (every pass, P0–P2) and nogpu (all passes, P0–P3 and design questions). Use when reviewing a PR or a branch before merge; the review bot in .github/review/ follows it in every mode.
 ---
 
 # Reviewing an M* pull request
@@ -27,7 +27,7 @@ never runs PR code.
 | Mode | Reports | Passes | Tools |
 | --- | --- | --- | --- |
 | `light` | P0–P2, description problems, questions that could become P0 or P1 | all | read only, no shell; 40 turns on a contributor's own PR, else a cap that only stops a loop |
-| `thorough` | everything, P0–P3, and design questions | all | read only, no shell |
+| `nogpu` | everything, P0–P3, and design questions | all | read only, no shell |
 
 Every pass in §3–§4 runs in every mode; the modes differ in what they report. One session runs the
 review and owns every finding: no orchestrator, parallel finders or cross-check round trips. The one
@@ -61,7 +61,7 @@ turn re-reads everything read so far.
   review what crosses slices (a caller in one and a callee in another, state one writes and another
   reads): those are the defects no slice sees. Phase A and the big picture stay yours. A run
   someone with write access starts never skips a file: it slices.
-- **Nothing runs in light or thorough mode.** No tests, scripts, servers or reproductions: findings
+- **Nothing runs in light or nogpu mode.** No tests, scripts, servers or reproductions: findings
   are traced (§5).
 
 ## 1. Inputs and rules
@@ -111,7 +111,7 @@ description doesn't say it is deliberate.
 - **P2**: should be fixed but needn't block: a gap `AGENTS.md` requires to be filled (docs row, test
   registration), an error path that leaks or misreports, a comment that says something the code
   doesn't do.
-- **P3**: an improvement a careful reviewer would suggest. Thorough mode only.
+- **P3**: an improvement a careful reviewer would suggest. `nogpu` mode only.
 
 There is no quota and no cap: report every finding that meets the bar, however many, and none that
 doesn't. Don't pad, and don't hold one back. One finding per root cause, not per occurrence.
@@ -572,7 +572,7 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
   and abstraction fit's per-piece map, one line per piece:
   `<state, computation or path> -> <abstraction>: fits | misfit (<finding id>) | missing system piece (<open PR or "none">)`,
   with each mechanism's state, per-step planning and kernel call on lines of their own.
-- **Design verdict** (thorough), always present, even when the approach is right; at most six lines:
+- **Design verdict** (nogpu), always present, even when the approach is right; at most six lines:
   the Phase A ideal, the rows where the code differs and which side is better, the north star and
   the PR's distance from it. Every gap named here is also a finding or a question.
 - **Skipped:** files not reviewed, only on a contributor's capped run whose diff is too large for
