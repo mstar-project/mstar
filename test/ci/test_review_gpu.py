@@ -120,7 +120,7 @@ class TestApproval(unittest.TestCase):
         self.assertEqual(why("skipped", "targeted"), ["the live test's verdict is skipped"],
                          "a skipped run the review didn't choose would count as a pass")
         runtime = ("docs/models.rst", "mstar/worker/worker.py")
-        self.assertEqual(why("skipped", "none", runtime), ["no GPU run on runtime code"],
+        self.assertEqual(why("skipped", "none", runtime), [f"no GPU run on runtime code ({gpu_review.COUNTED})"],
                          "a model's `none` alone would approve runtime code no GPU ran")
         self.assertEqual(why("skipped", "none", runtime, since="f" * 40), [],
                          "a change since a passing live test could never be approved without a GPU")
@@ -377,12 +377,14 @@ class TestComment(unittest.TestCase):
         self.assertEqual(text.count("<!--"), 1, "the box's report could carry a passing verdict")
 
     def test_the_report_cant_ping_or_load_an_image_but_the_gallery_still_links(self):
-        report = "## Results\n@org/team ![x](https://evil.example/x.png) `List<int>`\n![a](media/a.png)\n"
-        _, text = self.comment(report, [("a.png", 10)], media_url="https://o.github.io/m/pr-7/1")
+        report = ("## Results\n@org/team ![x](https://evil.example/x.png) `List<int>`\n![a](media/a.png)\n"
+                  "![b](media/a@2x.png)\n")
+        _, text = self.comment(report, [("a.png", 10), ("a@2x.png", 10)], media_url="https://o.github.io/m/pr-7/1")
         self.assertNotIn("@org/team", text, "the report could ping a team")
         self.assertNotIn("![x]", text, "the report could load an image from anywhere")
         self.assertIn("## Results\n", text, "headings would break")
         self.assertIn("![a](https://o.github.io/m/pr-7/1/media/a.png)", text, "the gallery's image would stop showing")
+        self.assertIn("![b](https://o.github.io/m/pr-7/1/media/a@2x.png)", text, "a file named with `@` wouldn't link")
         self.assertIn("`List<\u200bint>`", text, "a code span should still read right")
 
     def test_the_gallery_serves_only_media_within_the_cap_and_is_linked_once_published(self):

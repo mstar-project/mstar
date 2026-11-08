@@ -40,7 +40,7 @@ RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 # The first character of anything that can start markup, a link, or a reference to a person, issue or commit.
 # `#` not before a space or another `#`: those are a Markdown heading, which links nothing.
-MARKUP = re.compile(r"(?i)(?:[@<&\\]|#(?![\s#]|$)|\](?=\()|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))"
+MARKUP = re.compile(r"(?i)(?:[@<&\\]|#(?![\s#]|$)|\](?=[(:])|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))"
                     r"(?!\u200b)")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
@@ -135,9 +135,11 @@ SCHEMA = {
 
 def inert(value):
     """Untrusted text, or the strings in a list or dict of it, with a zero-width space after the first character of
-    every `@`, `#`, `<`, `&`, `\\`, `](`, `![`, `://`, `GH-` and `www.`, in any case. So it can't ping anyone, mark
-    another issue's timeline, link, load an image, open HTML or a comment, or spell any of those as an entity or a
-    backslash escape. Nothing is escaped, so text in a code span still reads right and a second pass changes nothing."""
+    every `@`, `#`, `<`, `&`, `\\`, `](`, `]:`, `![`, `://`, `GH-` and `www.`, in any case. (`#` before whitespace,
+    another `#` or the end of the text is left alone: that's a heading or plain, and can't reference anything.) So it
+    can't ping anyone, mark another issue's timeline, link (inline or by a reference definition), load an image, open
+    HTML or a comment, or spell any of those as an entity or a backslash escape. Nothing is escaped, so text in a code
+    span still reads right and a second pass changes nothing."""
     if isinstance(value, str):
         return MARKUP.sub("\\g<0>\u200b", value)
     if isinstance(value, list):
