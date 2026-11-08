@@ -4382,9 +4382,10 @@ class KVManager(AttentionResource):
             victims = self._choose(pages_short, newer, droppable)
             if victims is None:
                 # Any move of ``rid`` from here on returns it with what its grant needed. Back with a page alone, it
-                # would run short again at once.
+                # would run short again at once. A return counts every page its streams hold, lent ones included.
                 allotment = self._allotments[rid]
-                allotment.prompt = max(allotment.prompt, max(allotment.pages, self._held(rid)) + short.pages)
+                lent = sum(len(stream.lent) for stream in self._streams[rid].values())
+                allotment.prompt = max(allotment.prompt, max(allotment.pages, self._held(rid)) + lent + short.pages)
                 self._asks[rid] = short.pages
                 self._parked.add(rid)
                 pages = self._host_pages(rid)
