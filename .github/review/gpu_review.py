@@ -163,15 +163,10 @@ def check_kinds(text):
 
 
 def last_live_test(pr):
-    """The bot's last live-test comment on the PR, {"sha", "verdict", "body"}, or None. Only its first
-    line, the marker, is read: the report below it is the box's text. A failed fetch raises: it never
-    reads as "no earlier live test"."""
-    last = None
-    for c in bot.api_list(f"repos/{REPO}/issues/{pr}/comments"):
-        m = bot.LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
-        if m and c["user"]["login"] in bot.BOT_USERS:
-            last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
-    return last
+    """bot.last_live_test on the PR's comments. A failed fetch raises: it never reads as "no earlier live
+    test"."""
+    return bot.last_live_test({"user": (c.get("user") or {}).get("login"), "body": c["body"]}
+                              for c in bot.api_list(f"repos/{REPO}/issues/{pr}/comments"))
 
 
 def changed_files(base_sha, sha):
@@ -216,11 +211,7 @@ def carry(out, pr, head_sha, runner_temp, rereview=""):
     run = live.get("run") if live.get("run") in ("none", "targeted", "full") else "full"
     asked = live.get("checks") if isinstance(live.get("checks"), list) else []
     out.update(run=run, checks=",".join([k for k in CHECKS if k in asked] or CHECKS))
-    try:
-        passed = bool(last) and last["verdict"] == "pass" and \
-            bot.api(f"repos/{REPO}/compare/{last['sha']}...{head_sha}")["status"] in ("ahead", "identical")
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        passed = False
+    passed = bot.passed_on_ancestor(REPO, last, head_sha)
     untested = not last and rereview and (run == "targeted" or run == "none" and touches_runtime(pr, head_sha))
     forced = None if rereview and live.get("untestable") \
         else "failed" if last and not passed else "untested" if untested else None
@@ -583,11 +574,8 @@ def refresh_above():
         return
     kept = []
     for p in json.loads(path.read_text()):
-        try:
-            pull = bot.api(f"repos/{REPO}/pulls/{p['number']}")
-        except (RuntimeError, ValueError, KeyError, TypeError):
-            continue
-        if pull.get("state") == "open" and (pull.get("head") or {}).get("sha") == p["head_sha"]:
+        pull = bot.read(bot.api, f"repos/{REPO}/pulls/{p['number']}")
+        if pull and pull.get("state") == "open" and (pull.get("head") or {}).get("sha") == p["head_sha"]:
             kept.append(p)
     path.write_text(json.dumps(kept))
 
@@ -596,10 +584,7 @@ def approvals_on():
     """The kill switch, the repository variable REVIEW_APPROVALS, read now rather than from the job's
     start, so a live test that began hours ago still obeys it. Unset, any other value or a failed read
     (the job's own token can't read variables) means off."""
-    try:
-        return bot.api(f"repos/{REPO}/actions/variables/REVIEW_APPROVALS").get("value") == "on"
-    except (RuntimeError, ValueError, AttributeError):
-        return False
+    return (bot.read(bot.api, f"repos/{REPO}/actions/variables/REVIEW_APPROVALS") or {}).get("value") == "on"
 
 
 def left_for_you(pr, review, extra):
@@ -641,11 +626,8 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
                                        f"P0–P2 finding, and {tested}. It covers this commit only.")
     # A push between the check and the approval would leave it on a commit nobody tested; a failed read can't
     # rule one out.
-    try:
-        moved = bot.api(f"repos/{REPO}/pulls/{pr}")["head"]["sha"] != head_sha
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        moved = True
-    if moved:
+    pull = bot.read(bot.api, f"repos/{REPO}/pulls/{pr}")
+    if pull is None or pull["head"]["sha"] != head_sha:
         said = f"**Not approved:** new commits arrived while approving `{head_sha[:7]}`.\n"
         try:
             dismiss_approvals(pr, "new commits arrived while approving")

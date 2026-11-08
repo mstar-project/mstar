@@ -641,30 +641,42 @@ def rereview_inputs(out, repo, pull, head_sha, diff, conversation):
         out["rereview"] = "true"
 
 
-def since_live_test(repo, head_sha, conversation):
-    """Full mode: since-live-test.diff and since-live-test-commits.txt, the diff and commits since the PR's
-    last live test, when it passed on an ancestor of the head, for the review's live-test call
-    (review-prompt.md, Re-review step 4). Read as gpu_review.py carry reads it: the bot's own live-test
-    comments, by their first line, the marker, alone. Without both files (GitHub refused either) the
-    review judges the whole PR."""
-    live = None
-    for c in conversation:
+def last_live_test(comments):
+    """The bot's last live-test comment among `comments` ({"user": login, "body": text}), {"sha", "verdict",
+    "body"}, or None. Only its first line, the marker, is read: the report below it is the box's text."""
+    last = None
+    for c in comments:
         m = LIVE_TEST.fullmatch((c["body"] or "").split("\n")[0])
         if m and c["user"] in BOT_USERS:
-            live = m
-    tested = f"repos/{repo}/compare/{live[1] if live else ''}...{head_sha}"
+            last = {"sha": m[1], "verdict": m[2], "body": c["body"]}
+    return last
+
+
+def passed_on_ancestor(repo, live, head_sha):
+    """Whether the live test `live` (last_live_test, or None) passed on an ancestor of `head_sha`. A compare
+    that can't be read counts as no."""
+    if not live or live["verdict"] != "pass":
+        return False
+    status = (read(api, f"repos/{repo}/compare/{live['sha']}...{head_sha}") or {}).get("status")
+    return status in ("ahead", "identical")
+
+
+def since_live_test(repo, head_sha, conversation):
+    """Full mode: since-live-test.diff and since-live-test-commits.txt, the diff and commits since the PR's
+    last live test, when it passed on an ancestor of the head (last_live_test, passed_on_ancestor), for the
+    review's live-test call (review-prompt.md, Re-review step 4). Without both files (GitHub refused
+    either) the review judges the whole PR."""
+    live = last_live_test(conversation)
+    if not passed_on_ancestor(repo, live, head_sha):
+        return
+    tested = f"repos/{repo}/compare/{live['sha']}...{head_sha}"
     try:
-        ancestor = bool(live) and live[2] == "pass" and api(tested)["status"] in ("ahead", "identical")
-    except (RuntimeError, ValueError, KeyError, TypeError):
-        ancestor = False
-    if ancestor:
-        try:
-            live_diff = gh("api", "-H", "Accept: application/vnd.github.diff", tested).stdout
-            commits = oneline(c for page in api(tested, "--paginate", "--slurp") for c in page["commits"])
-            write("since-live-test.diff", live_diff)
-            write("since-live-test-commits.txt", commits)
-        except (RuntimeError, ValueError, KeyError):
-            pass
+        live_diff = gh("api", "-H", "Accept: application/vnd.github.diff", tested).stdout
+        commits = oneline(c for page in api(tested, "--paginate", "--slurp") for c in page["commits"])
+    except UNREADABLE:
+        return
+    write("since-live-test.diff", live_diff)
+    write("since-live-test-commits.txt", commits)
 
 
 def write_stacked_above(out, repo, pull, head_sha):
@@ -767,7 +779,7 @@ def earlier_review(repo, pr):
         author = api(f"repos/{repo}/pulls/{pr}")["user"]["login"]
         spoken = [*conversation, *api_list(f"repos/{repo}/pulls/{pr}/comments"),
                   *api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")]
-    except (RuntimeError, ValueError, KeyError, TypeError):
+    except UNREADABLE:
         if state is None:
             raise
         return state, False
@@ -931,7 +943,7 @@ def record(out, repo, pr, github_run_id, github_run_attempt, usage="", gpu_usd="
     what = f"PR `#{pr}`" if pr else "Weekly improvement run"
     try:
         comment_on_issue(repo, issue(repo, "ledger"), f"{what}: ${usd:,.2f}.\n<!-- review-spend {b64} -->\n")
-    except (RuntimeError, ValueError, KeyError, TypeError) as e:
+    except UNREADABLE as e:
         alert(repo, f"ledger-{github_run_id}-{github_run_attempt}",
               f"Run {github_run_id}'s spend (${usd:,.2f}) didn't reach the ledger, so the cap doesn't count it: "
               f"{safe(e)}")
@@ -1040,7 +1052,7 @@ def ci_regressions(repo, number, merge, parent):
 
     try:
         before, after = conclusions(parent), conclusions(merge)
-    except (RuntimeError, ValueError, KeyError, TypeError):
+    except UNREADABLE:
         return []
     return [{"key": f"{number}:ci:{name}",
              "text": f"`#{number}`: check `{safe(name)}` failed on `{merge[:10]}`, its parent passed"}
@@ -1101,7 +1113,7 @@ def monitor(out, repo, approvals=""):
             if not stood or not (pull.get("merged_at") or pull.get("state") == "open"):
                 continue
             found, mentions = pr_signals(repo, {**pull, "number": pr}, commits, bug_prs, window)
-        except (RuntimeError, ValueError, KeyError, TypeError, AttributeError) as e:
+        except UNREADABLE as e:
             rows.append(f"| `#{pr}` | ? | couldn't read: {safe(e).replace('|', '/')} |")
             unread.add(str(pr))
             continue
