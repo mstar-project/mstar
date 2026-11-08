@@ -55,6 +55,11 @@ def gpu(*args, check=True, timeout=900):
     return run(sys.executable, str(GPU), *args, check=check, timeout=timeout)
 
 
+def gpu_py():
+    """gpu.py's functions, for what its command line doesn't do."""
+    return runpy.run_path(str(GPU))
+
+
 def gh(*args, check=True):
     return run("gh", *args, check=check)
 
@@ -133,7 +138,7 @@ def cmd_start(a):
 
 def instance(out):
     key = (out / "instance").read_text().strip()
-    state = runpy.run_path(str(GPU))
+    state = gpu_py()
     return key, state["entry"](key), state
 
 
@@ -145,7 +150,7 @@ def cmd_wait(a):
     started, t0 = False, time.time()
     while True:
         try:
-            st, host, _ = g["status"](e, cfg)
+            st, host, port = g["status"](e, cfg)
         except Exception as err:  # a flaky ssh or API call is not an outcome
             print(f"status: {err}", flush=True)
             time.sleep(60)
@@ -162,6 +167,10 @@ def cmd_wait(a):
                 break
         else:
             started = started or bool(host)
+            if host and (e.get("host"), e.get("port")) != (host, port):  # where gpu.py ssh and pull connect
+                with g["ledger_txn"]() as d:
+                    d[key].update(host=host, port=port)
+                e.update(host=host, port=port)
             if st.startswith("run ") or st in ("ended", "releasing"):
                 break  # the Pod is gone, and its results with it
             if host and gpu("ssh", key, f"test -f {ERAS_OUT}/done", check=False, timeout=120).returncode == 0:
@@ -179,7 +188,7 @@ def cmd_wait(a):
 def cmd_cleanup(a):
     """Release whatever this run launched, from the ledger and by name, for a run cancelled mid-launch."""
     print(gpu("list", check=False).stdout)
-    state = runpy.run_path(str(GPU))
+    state = gpu_py()
     for key in list(state["ledger"]()):
         gpu("terminate", key, check=False)
     cfg = state["load_config"]()

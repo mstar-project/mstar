@@ -2,6 +2,7 @@
   "mode": "cloud",
   "results_dir": "~/live-pr-results",
   "ssh_public_key": "~/.ssh/id_ed25519.pub",
+  "identity_file": "",
   "budget": {
     "max_usd_per_hour": 20,
     "max_hours": 6,

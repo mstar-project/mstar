@@ -663,11 +663,13 @@ def status(e: dict, cfg: dict | None = None) -> tuple[str, str | None, int]:
     return i.get("status", "?"), i.get("ip"), 22
 
 
-def ssh_base(e: dict, scp: bool = False) -> list[str]:
+def ssh_base(e: dict, cfg: dict, scp: bool = False) -> list[str]:
     known = STATE / f"{e['provider']}_{e['instance_id']}.known_hosts"
     return ["scp" if scp else "ssh", "-P" if scp else "-p", str(e["port"]),
             "-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={known}",
-            "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=15"]
+            "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=15",
+            # the private half of ssh_public_key, when ssh wouldn't try it by default
+            *(["-i", str(Path(cfg["identity_file"]).expanduser())] if cfg.get("identity_file") else [])]
 
 
 def remote(e: dict, cfg: dict, command: list[str] | str, tty: bool = False) -> list[str]:
@@ -677,7 +679,7 @@ def remote(e: dict, cfg: dict, command: list[str] | str, tty: bool = False) -> l
         shell = f"bash -lc {shlex.quote(cmd)}" if cmd else "--pty bash -l"
         inner = f"srun --jobid={e['instance_id']} --overlap {shell}"
         return slurm_ssh(cfg)[:1] + (["-t"] if tty or not cmd else []) + slurm_ssh(cfg)[1:] + [inner]
-    return ssh_base(e) + [f"{e['user']}@{e['host']}"] + ([cmd] if cmd else [])
+    return ssh_base(e, cfg) + [f"{e['user']}@{e['host']}"] + ([cmd] if cmd else [])
 
 
 def cmd_wait(args, cfg):
@@ -724,7 +726,7 @@ def cmd_copy(args, cfg):
         rel = args.remote if args.remote.startswith(("/", "~")) or not e.get("dir") else f"{e['dir']}/{args.remote}"
         target, scp = f"{cfg['slurm']['host']}:{rel}", slurm_ssh(cfg, scp=True)
     else:
-        target, scp = f"{e['user']}@{e['host']}:{args.remote}", ssh_base(e, scp=True)
+        target, scp = f"{e['user']}@{e['host']}:{args.remote}", ssh_base(e, cfg, scp=True)
     src, dst = (args.local, target) if args.cmd == "push" else (target, args.local)
     sys.exit(subprocess.run(scp + ["-r", src, dst], check=False).returncode)
 

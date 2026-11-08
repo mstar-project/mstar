@@ -111,5 +111,36 @@ class TestSlurm(unittest.TestCase):
                       "each run would download the weights again into its own directory")
 
 
+
+class TestEras(unittest.TestCase):
+    def test_wait_records_the_host_and_ssh_uses_the_runs_key(self):
+        out = Path(tempfile.mkdtemp())
+        (out / "instance").write_text("eras:i-1\n")
+        e = {"provider": "eras", "instance_id": "i-1", "run": True, "user": "root"}
+        led = {"eras:i-1": e}
+
+        @contextlib.contextmanager
+        def ledger_txn():
+            yield led
+
+        g = {"entry": lambda key: dict(led[key]), "load_config": dict, "ledger_txn": ledger_txn,
+             "status": lambda e, cfg: ("active", "box.example", 2222)}
+        calls = []
+
+        def gpu(*args, check=True, timeout=900):
+            calls.append(args)
+            return argparse.Namespace(returncode=0, stdout="", stderr="")
+
+        globs = GPU_REVIEW["cmd_wait"].__globals__
+        saved = {k: globs[k] for k in ("gpu", "gpu_py")}
+        self.addCleanup(globs.update, saved)
+        globs.update(gpu=gpu, gpu_py=lambda: g)
+        GPU_REVIEW["cmd_wait"](argparse.Namespace(out=str(out), start_timeout=30))
+        self.assertEqual((led["eras:i-1"].get("host"), led["eras:i-1"].get("port")), ("box.example", 2222),
+                         "gpu.py ssh and pull would die with 'run gpu.py wait first'")
+        ssh = GPU["ssh_base"]({**e, "host": "box.example", "port": 2222}, {"identity_file": "~/.ssh/live_pr"})
+        self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
+
+
 if __name__ == "__main__":
     unittest.main()

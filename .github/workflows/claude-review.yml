@@ -799,7 +799,7 @@ jobs:
               job_prefix: "review-bot", workdir: "/workspace/review-bot", gpu: "H200", vram_gb: 141}')
           fi
           jq -n --argjson s "$slurm" --argjson usd "$MAX_USD" --argjson h "$HOURS" --arg sec "$ERAS_SECRET" '{
-            mode: "cloud", results_dir: "results", ssh_public_key: "~/.ssh/live_pr.pub",
+            mode: "cloud", results_dir: "results", ssh_public_key: "~/.ssh/live_pr.pub", identity_file: "~/.ssh/live_pr",
             budget: {max_usd_per_hour: $usd, max_hours: $h, max_concurrent_instances: 1, max_total_usd: ($usd * $h)},
             slurm: $s, eras: ({} + (if $sec != "" then {run_secret_id: $sec} else {} end)),
             runpod: {enabled: false}, lambda: {enabled: false}}' > .claude/skills/live-pr-test/config.local.json
