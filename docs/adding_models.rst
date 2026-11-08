@@ -1285,7 +1285,8 @@ placed exactly as weights are.
   YAML's ``targets:`` serves them by naming them. The align op groups fewer than 1024 ids
   once padded to its warp of 32, so a spec serves at most ``992 // E`` slots (7 at 128
   experts) and refuses more where the YAML sizes it. Experts split by expert parallelism
-  are refused at deployment validation and at bind (``expert_split``); serve them under TP.
+  are refused at deployment validation and at bind (``expert_split``); serve them under TP
+  (on the serial protocol until #1082).
 - **Target kinds and rows.** ``kind="embedding"`` is a token embedding: ``in_features``
   is the vocabulary, the layer passes token ids as ``x``, and the shrink is a gather of
   A's column per token (``mstar::lora_gather_shrink``), PEFT's ``lora_embedding_A`` /

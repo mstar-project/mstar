@@ -103,7 +103,8 @@ def _expert_lora_split_by_ep(specs: Sequence[NodeResourceSpec], config: Mapping[
             yield (
                 f"resources.{spec.resource_key}: targets {split_targets} are LoRA on MoE experts, which "
                 f"{sorted(split & spec.nodes)} split by expert parallelism (`ep_config: parallel: ep`); serve them "
-                "with `parallel: tp`, or leave the experts targets out of `targets:`"
+                "with `parallel: tp` (and `tp_async_sched: false` until the async TP scheduler is fenced), "
+                "or leave the experts targets out of `targets:`"
             )
 
 

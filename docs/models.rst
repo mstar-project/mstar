@@ -287,7 +287,8 @@ merge's.
        ``targets:`` names them
      - Expert targets are opt-in: each slot holds every expert's A and B (about 1.7 GB per
        slot at rank 16, and as much pinned on the host per adapter held there), and with
-       128 experts a pool serves at most 7 slots. Under TP only: an ``ep_config`` with
+       128 experts a pool serves at most 7 slots. Under TP only (on the serial protocol,
+       ``tp_async_sched: false``, until #1082; see the Qwen3.5 notes): an ``ep_config`` with
        ``parallel: ep`` over several ranks refuses them at startup. Per-expert adapters
        only (``experts.<N>.<proj>``), not PEFT's fused 3-D form. The router takes none.
        Talker, code predictor and encoders take none. Not validated: this MoE model's
