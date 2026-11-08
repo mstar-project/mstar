@@ -24,8 +24,9 @@ def _guard(cfg: Glm52ModelConfig) -> int:
     return cfg.max_seq_len if cfg.dsa_long_context else cfg.index_topk
 
 
-def test_request_budget_above_the_default_is_honored():
-    m = _model()
+@pytest.mark.parametrize("k", [0, 2])
+def test_request_budget_above_the_default_is_honored(k):
+    m = _model(mtp_num_draft_tokens=k)
     # a request that names none may run to the end of the window
     assert m.config.max_output_tokens is None
     assert m.get_max_output_tokens() == _guard(m.config)
@@ -33,8 +34,8 @@ def test_request_budget_above_the_default_is_honored():
     assert budget == 2000
     decode = m.get_graph_walk_graphs()["decode"]
     assert isinstance(decode, Loop)
-    # Loop ends after max_iters iterations; each emits one token on top of
-    # the prefill's, so reaching the budget takes budget-1 of them
+    # Loop ends after max_iters iterations; each emits at least one token on
+    # top of the prefill's, so reaching the budget takes budget-1 of them
     assert decode.max_iters >= budget - 1
     # byte mode was honored: nothing lazily built a tokenizer
     assert m.process_prompt("Hi", ["text"], ["text"]).new_input_tensors["text_inputs"][0].tolist() == [72, 105]
@@ -54,8 +55,9 @@ def test_the_largest_budget_is_the_context_window():
     assert m.get_max_output_tokens(max_output_tokens=7) == 7
 
 
-def test_loop_cap_covers_every_reachable_budget_and_stays_below_the_guard():
-    m = _model()
+@pytest.mark.parametrize("k", [0, 2])
+def test_loop_cap_covers_every_reachable_budget_and_stays_below_the_guard(k):
+    m = _model(mtp_num_draft_tokens=k)
     guard = _guard(m.config)
     decode = m.get_graph_walk_graphs()["decode"]
     # the largest budget check_stop can honor needs guard-1 iterations
@@ -100,6 +102,8 @@ def test_a_long_context_prompt_is_held_to_index_topk():
     cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=8192)
     assert cfg.max_prompt_tokens == cfg.index_topk == 2048
     assert Glm52ModelConfig().max_prompt_tokens == 2046
+    # an MTP step writes its whole verify block: two of them for k = 3
+    assert Glm52ModelConfig(mtp_num_draft_tokens=3).max_prompt_tokens == 2048 - 8
 
 
 def test_postprocess_emits_raw_token_bytes():

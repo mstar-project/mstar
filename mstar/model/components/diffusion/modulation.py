@@ -78,7 +78,7 @@ if triton is not None:
     @triton.jit
     def _ada_layer_norm_kernel(
         x_ptr, res_ptr, gate_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, x_out_ptr, out_ptr,
-        seq, tokens_per_group, groups, mod_batch_stride, mod_group_stride, dim, eps,
+        seq, tokens_per_group, groups, mod_batch_stride, mod_group_stride, dim, eps: tl.constexpr,
         HAS_RES: tl.constexpr, HAS_GATE: tl.constexpr, HAS_SHIFT: tl.constexpr, HAS_SCALE: tl.constexpr,
         HAS_W: tl.constexpr, HAS_B: tl.constexpr, BLOCK_D: tl.constexpr,
     ):
@@ -101,8 +101,7 @@ if triton is not None:
         mean = tl.sum(xf, axis=0) / dim
         diff = tl.where(mask, xf - mean, 0.0)
         var = tl.sum(diff * diff, axis=0) / dim
-        # eps arrives as fp64 from a compiled caller; keep the row in fp32
-        out = diff * tl.math.rsqrt(var + eps.to(tl.float32))
+        out = diff * tl.math.rsqrt(var + eps)
         if HAS_W:
             out = out * tl.load(w_ptr + cols, mask=mask, other=0.0)
         if HAS_B:

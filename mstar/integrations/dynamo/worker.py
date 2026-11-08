@@ -96,6 +96,7 @@ def build_server(args) -> tuple[APIServer, mp.process.BaseProcess, str]:
         tensor_comm_protocol=CommProtocol(args.tensor_comm_protocol),
         model=model,
         model_name=model_name,
+        model_config=config,
     )
 
     ctx = mp.get_context("spawn")
