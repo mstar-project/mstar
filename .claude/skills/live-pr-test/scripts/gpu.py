@@ -818,7 +818,11 @@ def running(cfg: dict) -> tuple[list[str], dict[str, str]]:
         except (ApiError, subprocess.TimeoutExpired) as err:
             errors["slurm"] = str(err)
     if enabled(cfg, "eras"):
-        for i in eras("GET", "/instances", params={"page_size": 100}).get("items") or []:
+        try:
+            items = eras("GET", "/instances", params={"page_size": 100}).get("items") or []
+        except (ApiError, subprocess.TimeoutExpired) as err:
+            errors["eras"], items = str(err), []
+        for i in items:
             if str(i.get("name")).startswith(job_prefix(cfg, "eras")) and i.get("status") not in ("ended", "releasing"):
                 up.append(f"eras:{i['id']}  {i.get('name')}  {i.get('status')}")
     return up, errors

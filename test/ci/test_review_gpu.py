@@ -228,6 +228,11 @@ class TestSlurm(unittest.TestCase):
             launch(2)
         self.assertEqual(len(launch(3)), 1)
 
+        def eras_down(*a, **k):
+            raise GPU["ApiError"](-1, "GET /instances: gave up after retries")
+        self.globals["eras"] = eras_down
+        self.assertEqual(len(launch(2)), 2, "an Eras outage would stop launches on the Slurm node too")
+
     def test_the_job_uses_the_shared_hf_cache(self):
         key = Path(tempfile.mkdtemp()) / "key.pub"
         key.write_text("ssh-ed25519 AAAA test")
