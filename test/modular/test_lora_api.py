@@ -60,7 +60,7 @@ from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
 from mstar.testing_utils.engine import make_engine  # noqa: E402
 from mstar.testing_utils.model import make_model  # noqa: E402
-from mstar.testing_utils.worker import make_worker  # noqa: E402
+from mstar.testing_utils.worker import deliver, make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -455,9 +455,10 @@ def test_a_load_a_worker_never_answers_times_out_and_is_undone(paths):
 
 
 def _finish_when_read(worker):
-    if worker._lora_loads:
-        wait([f for load in worker._lora_loads._loads for _, f in load.reads], timeout=30)
-        worker._finish_lora_loads()
+    loads = worker.ingest.lora_loads
+    if loads:
+        wait([f for load in loads._loads for _, f in load.reads], timeout=30)
+        worker.ingest.process_messages()  # the main loop's pass, which acks what was read
 
 
 class _Deployment:
@@ -465,7 +466,8 @@ class _Deployment:
 
     def __init__(self, paths, fail_on: str | None = None):
         self.served = ServedModels(base=("base",), lora=True)
-        self.admin = LoraAdmin(make_spec({}, runtime_updates=True), self.served, self._to_conductor)
+        # a lost ack fails the load in 5 s, not the default 300
+        self.admin = LoraAdmin(make_spec({}, runtime_updates=True), self.served, self._to_conductor, timeout_s=5.0)
         self.ops = LoraAdapterOps(make_spec({}, runtime_updates=True), ["worker_0", "worker_1"], self._from_conductor)
         self.pools, self.workers, self.unload_seen = {}, {}, []
         for rank in range(2):
@@ -478,7 +480,7 @@ class _Deployment:
             self.workers[worker_id] = make_worker(
                 worker_id=worker_id,
                 engine_manager=SimpleNamespace(engine=make_engine(_resources={LORA_RESOURCE_KEY: pool})),
-                communicator=SimpleNamespace(send=self._from_worker),
+                communicator=SimpleNamespace(send=self._from_worker, get_all_new_messages=list),
             )
 
     def _to_conductor(self, message: ConductorMessage):
@@ -496,7 +498,7 @@ class _Deployment:
         if message.message_type == WorkerMessageType.UNLOAD_LORA_ADAPTER:
             name = message.body.lora_name
             self.unload_seen.append((peer, name in self.served.adapters))
-        self.workers[peer]._process_message_list([message])
+        deliver(self.workers[peer], message)
         _finish_when_read(self.workers[peer])
 
     def _from_worker(self, peer, message):
@@ -550,7 +552,7 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
         if peer == "api_server":
             answers.append(message.body)
         else:
-            d.workers[peer]._process_message_list([message])
+            deliver(d.workers[peer], message)
 
     d.ops = LoraAdapterOps(
         make_spec({}, runtime_updates=True, runtime_update_timeout_s=10.0),
@@ -568,8 +570,9 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
     d.ops.load(LoadLoraAdapter(op_id="op2", lora_name="a1", lora_path=paths["a1"], lora_digest=digest))
     _finish_when_read(d.workers["worker_0"])
     gate.set()
-    while d.workers["worker_1"]._lora_loads:
+    for _ in range(2):  # the first load (which applies the rollback behind it), then the retry
         _finish_when_read(d.workers["worker_1"])
+    assert not d.workers["worker_1"].ingest.lora_loads
     assert answers[-1] == LoraAdapterResult(op_id="op2", status=200)
     assert all(pool.serves("a1") for pool in d.pools.values())
 

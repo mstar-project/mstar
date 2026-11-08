@@ -251,7 +251,7 @@ Engine workers
 
 From the workers' numbers, forwarded in the conductor's status message, so up to two
 seconds old. A node with replicas on several workers shows their sum. The ranks of a
-tensor or sequence parallel instance count once: the instance's first rank reports.
+TP, SP or CFG instance count once: the instance's first rank reports.
 
 ``mstar_kv_pages_used{model_name, component, resource}``
    Gauge. Pages of a paged KV cache not on its free list: held by requests, or kept by
