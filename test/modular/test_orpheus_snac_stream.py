@@ -293,7 +293,7 @@ def test_no_window_size_falls_back_to_eager(overrides):
 def test_model_kwargs_override_the_window(monkeypatch):
     from mstar.model.orpheus import orpheus_model
 
-    monkeypatch.setattr(orpheus_model, "_resolve_local_hf_snapshot", lambda repo_id, cache_dir=None: repo_id)
+    monkeypatch.setattr(orpheus_model, "_resolve_local_hf_snapshot", lambda repo_id, **kw: repo_id)
     monkeypatch.setattr(orpheus_model.AutoTokenizer, "from_pretrained", lambda *args, **kwargs: None)
     model = OrpheusModel(
         "unused", snac_chunk_schedule=[2], snac_chunk_frames=8,
