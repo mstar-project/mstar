@@ -16,6 +16,7 @@ from typing import NamedTuple
 
 import torch
 
+from mstar.api_server.media_io import remove_uploads
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 
@@ -283,9 +284,11 @@ class PreprocessWorker:
         enable_nvtx: bool=False,
         adapter_digests: dict[str, bytes] | None = None,
         is_pending: Callable[[str], bool] | None = None,
+        upload_dir: str | os.PathLike | None = None,
     ):
         """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
-        server's startup check read them."""
+        server's startup check read them. ``upload_dir`` is where the API server saves
+        uploads: a request refused in preprocessing has its files there removed at once."""
         check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -364,6 +367,7 @@ class PreprocessWorker:
                 adapter_roots=self.adapter_prefix_roots,
                 conductor_outbox=self.conductor_outbox,
                 is_pending=is_pending,
+                upload_dir=upload_dir,
             )
         )
         self.thread.start()
@@ -693,6 +697,9 @@ class PreprocessWorkerThread:
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
     MAX_APPENDS_PER_PASS = 32
+    # None (a thread built without __init__) leaves a refused request's uploads to the
+    # HTTP layer's deferred cleanup
+    upload_dir: str | os.PathLike | None = None
 
     def __init__(
         self,
@@ -718,9 +725,11 @@ class PreprocessWorkerThread:
         adapter_roots: AdapterPrefixRoots | None = None,
         conductor_outbox: queue.Queue | None = None,
         is_pending: Callable[[str], bool] | None = None,
+        upload_dir: str | os.PathLike | None = None,
     ):
         self._adapter_roots = adapter_roots
         self.conductor_outbox = conductor_outbox
+        self.upload_dir = upload_dir
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -2027,6 +2036,10 @@ class PreprocessWorkerThread:
         if profile is not None:
             profile.failed = True
             self.profile_queue.put(profile)
+        # Nothing reads a refused request's files again, so they go now rather than with
+        # the HTTP layer's deferred cleanup, and before the client hears of the refusal.
+        if self.upload_dir is not None:
+            remove_uploads(pre_input.file_paths, self.upload_dir)
         # A request whose media load or prompt processing fails never
         # reaches the conductor, so nothing downstream would ever complete
         # it; surface the failure as an error chunk instead of leaving the

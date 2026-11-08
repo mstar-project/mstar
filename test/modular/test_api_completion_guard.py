@@ -48,7 +48,7 @@ def test_output_chunk_counts_wait_for_registration_then_complete():
     assert worker.received_final_chunks("r1", {"video_output": 1}) is True
 
 
-def _preprocess_failure(model, file_paths=None):
+def _preprocess_failure(model, file_paths=None, upload_dir=None):
     """Run one request through the preprocess loop and return its error chunk
     and the rids force-cleaned."""
     wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
@@ -82,6 +82,7 @@ def _preprocess_failure(model, file_paths=None):
     wt._live_requests = {}
     wt._preparing = deque()
     wt._keyed_labels = {}
+    wt.upload_dir = upload_dir
 
     wt.in_queue.put(PreprocessInput(
         request_id="r1", text="x", file_paths=file_paths,
@@ -112,6 +113,33 @@ def test_preprocess_failure_emits_error_chunk():
     assert b"bad knob" in chunk.data
     assert chunk.metadata["status"] == 400
     assert cleaned == ["r1"]
+
+
+def test_a_refused_request_s_uploads_are_gone_before_its_error(tmp_path):
+    """Nothing reads a refused request's files again: the ones under the upload dir are
+    removed before the client hears of the refusal, not by the HTTP layer's cleanup a
+    minute later. A file elsewhere is left alone."""
+
+    class _Model(StubModel):
+        def max_input_files(self):
+            return {"image": 2}
+
+        def load_image(self, path, device):
+            return SimpleNamespace(data=torch.zeros(3, 2, 2, dtype=torch.uint8), metadata={})
+
+        def process_prompt(self, *args, **kwargs):
+            raise ValueError("bad keyframe")
+
+    uploads, elsewhere = tmp_path / "uploads", tmp_path / "elsewhere"
+    uploads.mkdir()
+    elsewhere.mkdir()
+    saved, outside = uploads / "a.png", elsewhere / "b.png"
+    for path in (saved, outside):
+        path.write_bytes(b"x")
+    chunk, _ = _preprocess_failure(_Model(), {"image": [str(saved), str(outside)]}, upload_dir=uploads)
+
+    assert b"bad keyframe" in chunk.data
+    assert not saved.exists() and outside.exists()
 
 
 class _BaseLoaders(StubModel):
