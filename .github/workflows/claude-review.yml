@@ -823,7 +823,7 @@ jobs:
               select(.user.login == "mstar-review[bot]" or .user.login == "github-actions[bot]") | .body' \
             | grep -o '<!-- claude-live-test sha=[0-9a-f]* verdict=[a-z]* -->' | tail -n 1)
           sha=$(sed -E 's/.*sha=([0-9a-f]*).*/\1/' <<< "$marker"); verdict=$(sed -E 's/.*verdict=([a-z]*).*/\1/' <<< "$marker")
-          status=$( [ -n "$sha" ] && gh api "repos/$REPO/compare/$sha...$HEAD_SHA" --jq .status 2> /dev/null )
+          status=$( [ -n "$sha" ] && gh api "repos/$REPO/compare/$sha...$HEAD_SHA" --jq .status 2> /dev/null || true )
           if [ "$verdict" = "pass" ] && { [ "$status" = "ahead" ] || [ "$status" = "identical" ]; }; then
             echo "verdict=pass" >> "$GITHUB_OUTPUT"
             echo "note=No GPU run: nothing since the passing live test of \`${sha:0:7}\` reaches code it exercised." >> "$GITHUB_OUTPUT"
