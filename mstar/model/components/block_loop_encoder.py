@@ -89,6 +89,17 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         order, off the walk's ``MEDIA_LAYOUT``."""
         return media_grids(fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}, self.output)
 
+    def bind_node_resources(self, resources: dict[str, Any]) -> None:
+        super().bind_node_resources(resources)
+        # a resource whose step is the segments (a LoRA pool) reads them as the rows the
+        # tower's linears see, in order; a second label would count every patch again
+        if self.segment_keys and len(self.SEGMENT_LABELS) > 1:
+            raise ValueError(
+                f"{type(self).__name__}: {list(self.segment_keys)} take one row per segment, but "
+                f"this tower declares each patch under {len(self.SEGMENT_LABELS)} labels "
+                f"{list(self.SEGMENT_LABELS)}"
+            )
+
     def _declare(
         self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
     ) -> SubmoduleStep:
