@@ -94,7 +94,7 @@ def cmd_configure(a):
                  "max_gpus": int(env("MAX_GPUS") or 4), "job_prefix": "review-bot", "workdir": "/workspace/review-bot",
                  "gpu": "H200", "vram_gb": 141, "hf_home": "/workspace/shared/hf"}
     usd, hours = float(env("MAX_USD") or 30), float(env("HOURS") or 4)
-    eras = {}
+    eras = {"cache_volume_ids": (env("ERAS_CACHE_VOLUMES") or "").split()}
     if env("ERAS_SECRET"):
         eras["run_secret_id"] = env("ERAS_SECRET")
     cfg = {"mode": "cloud", "results_dir": "results", "ssh_public_key": str(ssh / "live_pr.pub"),

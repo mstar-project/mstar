@@ -795,6 +795,7 @@ jobs:
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
           MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS || '2' }}
           ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
+          ERAS_CACHE_VOLUMES: ${{ vars.ERAS_CACHE_VOLUMES }}
           RESULT: ${{ needs.review.outputs.result }}
         run: |
           # gpu.py's ledger, for this run only. Set here: a job's env can't read `runner`.

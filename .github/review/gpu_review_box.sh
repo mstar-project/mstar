@@ -21,6 +21,14 @@ REPO=$(field repo); MAIN_SHA=$(field main_sha)
 # hooks and credentials. tmux gets its own socket directory, so nothing joins a shared server.
 export HOME=$W/home CLAUDE_CONFIG_DIR=$W/home/.claude TMUX_TMPDIR=$W/tmux XDG_CACHE_HOME=$W/cache
 export LIVE_PR_DIR=$W/live-pr LIVE_PR_IN=$IN LIVE_PR_OUT=$OUT HF_HOME=${HF_HOME:-$W/hf}
+# The bot's cache volume (Eras, read-only at /cache, when a free one was bound): the compile caches
+# where bootstrap.sh looks for them (beside the HF home), and any models on it in this run's HF cache
+# as local directories of links (the Hub client writes refs/ inside a model's directory).
+[ ! -d /cache/live-pr-compile-cache ] || ln -sfn /cache/live-pr-compile-cache "$(dirname "$HF_HOME")/live-pr-compile-cache"
+if [ -d /cache/hf/hub ]; then
+  mkdir -p "$HF_HOME/hub"
+  for m in /cache/hf/hub/models--*; do [ -e "$HF_HOME/hub/${m##*/}" ] || cp -rs "$m" "$HF_HOME/hub/"; done
+fi
 ANTHROPIC_API_KEY=$(cat /run/live-pr-key/value 2> /dev/null || cat "$IN/anthropic.key")
 export ANTHROPIC_API_KEY
 rm -f "$IN/anthropic.key"
