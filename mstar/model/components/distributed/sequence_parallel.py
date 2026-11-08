@@ -73,7 +73,8 @@ def gather_sequence(
     max_sz = max(seq_sizes)
     # a pad, not a copy into a slice: compiled, the slice's layout would guard on the sizes
     local = torch.nn.functional.pad(x_shard, [0, 0] * (x_shard.dim() - dim - 1) + [0, max_sz - x_shard.size(dim)])
-    chunks = sp_group.all_gather(local, dim=dim).unflatten(dim, (world_size, max_sz)).unbind(dim)
+    # contiguous: pad keeps a channels-last shard's layout, and the gather moves raw bytes
+    chunks = sp_group.all_gather(local.contiguous(), dim=dim).unflatten(dim, (world_size, max_sz)).unbind(dim)
     return torch.cat([chunk.narrow(dim, 0, n) for chunk, n in zip(chunks, seq_sizes, strict=True)], dim=dim)
 
 

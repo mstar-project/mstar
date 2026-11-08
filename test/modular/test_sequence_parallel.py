@@ -183,8 +183,9 @@ def _compiled_packs(rank, world, dynamic, batched):
     assert breaks and all("_all_to_all_single" in reason for reason in breaks), list(breaks)
 
 
-@pytest.mark.parametrize("batched", [False, True], ids=["SHD", "BSHD"])
-@pytest.mark.parametrize("dynamic", [True, False], ids=["dynamic", "static"])
+# Cosmos3's packed stack is [T, H, D] and compiled dynamic, LTX's and Wan's are [B, L, H, D] and static
+@pytest.mark.parametrize("dynamic,batched", [(True, False), (False, True), (True, True)],
+                         ids=["dynamic-SHD", "static-BSHD", "dynamic-BSHD"])
 @pytest.mark.parametrize("world", [2, 3])
 def test_compiled_sequence_parallel_stack_breaks_only_at_the_collectives(tmp_path, world, dynamic, batched):
     _run(_compiled_packs, world, tmp_path / "store", dynamic, batched)

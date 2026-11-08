@@ -58,7 +58,6 @@ def _all_to_all_single(
     return recv
 
 
-
 # torch 2.13 renamed the into-tensor collectives to the *_single scheme.
 # Import-time selection keeps the fallback out of compiled call paths.
 _all_gather_single = getattr(dist, "all_gather_single", None)
