@@ -10,7 +10,7 @@ usage:
   gpu.py ssh <instance> [command ...]            run a command (or a shell) on it
   gpu.py push <instance> <local> <remote>        scp -r to the box
   gpu.py pull <instance> <remote> <local>        scp -r from the box
-  gpu.py list [--all]                            instances launched by this tool (--all: whole accounts)
+  gpu.py list [--all]                            instances launched here (--all: by any session; all RunPod, Lambda)
   gpu.py extend <instance> --hours H             move the watchdog deadline to now + H
   gpu.py terminate <instance>
 
@@ -465,14 +465,14 @@ def cmd_launch(args, cfg):
     if hours > cfg["budget"]["max_hours"] and not args.allow_over_budget:
         die(f"{hours} h is over the {cfg['budget']['max_hours']} h cap; ask before passing --allow-over-budget")
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
-    prefix = cfg.get("slurm", {}).get("job_prefix", "live-pr") if o["provider"] == "slurm" else "live-pr"
-    name = f"{prefix}-{args.pr}-{args.tag or time.strftime('%m%d-%H%M')}"
+    name = job_name(cfg, o["provider"], args.pr, args.tag or time.strftime('%m%d-%H%M'))
     max_instances = cfg["budget"].get("max_concurrent_instances", 1)
     max_total = cfg["budget"].get("max_total_usd")
+    max_running = cfg["budget"].get("max_running")
 
     if o["provider"] == "slurm":
         sl, n = cfg["slurm"], o["count"]
-        jobdir = f"{sl.get('workdir', '/workspace/live-pr')}/{name}"
+        jobdir = job_dir(cfg, name)
         body = " ".join(["sbatch", "--parsable", "-p", shlex.quote(sl.get("partition", "main")),
                          f"--gres=gpu:{n}", f"-c {sl.get('cpus_per_gpu', 24) * n}",
                          f"--mem={sl.get('mem_gb_per_gpu', 180) * n}G", f"--time={max(1, int(hours * 60))}",
@@ -515,6 +515,13 @@ def cmd_launch(args, cfg):
         if len(d) >= max_instances and not args.allow_over_budget:
             die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
                 f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
+        if max_running is not None and not args.allow_over_budget:
+            up, errors = running(cfg)
+            if o["provider"] in errors:
+                die(f"can't count this tool's {o['provider']} jobs for budget.max_running: {errors[o['provider']]}")
+            if len(up) >= max_running:
+                die(f"{len(up)} of this tool's jobs are up, from every session; budget.max_running is {max_running}. "
+                    "Wait for one to end, or ask before passing --allow-over-budget")
         committed = sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours
         if max_total is not None and committed > max_total and not args.allow_over_budget:
             die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
@@ -559,6 +566,20 @@ def cmd_launch(args, cfg):
     print(f"launched {key} ({o['count']}x {o['gpu']}, {o['region']}, ${o['usd_per_hour']}/hr); "
           f"watchdog terminates it at {time.strftime('%H:%M', time.localtime(now + hours * 3600))} ({hours} h)")
     print(key)
+
+
+def job_prefix(cfg: dict, provider: str) -> str:
+    """What the names of this tool's jobs and instances start with: slurm.job_prefix on a shared node."""
+    return (cfg.get("slurm", {}).get("job_prefix", "live-pr") if provider == "slurm" else "live-pr") + "-"
+
+
+def job_name(cfg: dict, provider: str, pr: int, tag: str) -> str:
+    return f"{job_prefix(cfg, provider)}{pr}-{tag}"
+
+
+def job_dir(cfg: dict, name: str) -> str:
+    """A Slurm job's directory: its working directory, holding a --run script and its inputs."""
+    return f"{cfg['slurm'].get('workdir', '/workspace/live-pr')}/{name}"
 
 
 ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Notebook (NVIDIA GPU): sshd as root
@@ -786,6 +807,23 @@ def cmd_extend(args, cfg):
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
 
+def running(cfg: dict) -> tuple[list[str], dict[str, str]]:
+    """This tool's jobs and instances up now on the Slurm node and Eras, from every session and
+    machine (the ledger has only this machine's), one line each; and why a provider couldn't be listed."""
+    up, errors = [], {}
+    if enabled(cfg, "slurm"):
+        try:
+            out = slurm_run(cfg, "squeue -h -o '%j %i %T %M/%l'")
+            up += [f"slurm: {ln}" for ln in out.splitlines() if ln.startswith(job_prefix(cfg, "slurm"))]
+        except (ApiError, subprocess.TimeoutExpired) as err:
+            errors["slurm"] = str(err)
+    if enabled(cfg, "eras"):
+        for i in eras("GET", "/instances", params={"page_size": 100}).get("items") or []:
+            if str(i.get("name")).startswith(job_prefix(cfg, "eras")) and i.get("status") not in ("ended", "releasing"):
+                up.append(f"eras:{i['id']}  {i.get('name')}  {i.get('status')}")
+    return up, errors
+
+
 def cmd_list(args, cfg):
     d = ledger()
     if not d:
@@ -800,18 +838,13 @@ def cmd_list(args, cfg):
         print(f"{key}  pr {e['pr']}  {e['count']}x {e['gpu']} {e['region']}  {st}  "
               f"{hrs:.2f} h, ~${hrs * e['usd_per_hour']:.2f}  deadline in {left:.0f} min")
     if args.all:
-        print("--- every instance on the accounts ---")
+        print("--- this tool's on Slurm and Eras, from every session; all of RunPod and Lambda ---")
         if enabled(cfg, "runpod"):
             for p in runpod_list("/pods", "pods"):
                 print(f"runpod:{p['id']}  {p.get('name')}  {p.get('status')}  ${p.get('cost', '?')}/hr")
-        if enabled(cfg, "slurm"):
-            out = slurm_run(cfg, "squeue -h -o '%j %i %T %M/%l'", check=False)
-            mine = [ln for ln in out.splitlines() if ln.startswith(cfg["slurm"].get("job_prefix", "live-pr") + "-")]
-            print("\n".join(f"slurm: {ln}" for ln in mine) or "slurm: no jobs")
-        if enabled(cfg, "eras"):
-            for i in eras("GET", "/instances", params={"page_size": 100}).get("items") or []:
-                if i.get("status") not in ("ended",):
-                    print(f"eras:{i['id']}  {i.get('name')}  {i.get('status')}")
+        up, errors = running(cfg)
+        for line in up + [f"{p}: {err}" for p, err in errors.items()]:
+            print(line)
         if enabled(cfg, "lambda"):
             for i in lambda_("GET", "/instances") or []:
                 print(f"lambda:{i['id']}  {i.get('name')}  {i.get('status')}  {i['instance_type']['name']}")

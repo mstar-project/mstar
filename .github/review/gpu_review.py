@@ -99,7 +99,7 @@ def cmd_configure(a):
     cfg = {"mode": "cloud", "results_dir": "results", "ssh_public_key": str(ssh / "live_pr.pub"),
            "identity_file": str(ssh / "live_pr"),
            "budget": {"max_usd_per_hour": usd, "max_hours": hours, "max_concurrent_instances": 1,
-                      "max_total_usd": usd * hours},
+                      "max_total_usd": usd * hours, "max_running": int(env("MAX_RUNS") or 2)},
            "slurm": slurm, "eras": eras, "runpod": {"enabled": False}, "lambda": {"enabled": False}}
     (GPU.parent.parent / "config.local.json").write_text(json.dumps(cfg, indent=1))
 
@@ -161,14 +161,7 @@ def cmd_start(a):
     (out / "findings.json").write_text(json.dumps(findings, indent=1))
     (out / "run.json").write_text(json.dumps({"repo": REPO, "pr": a.pr, "sha": a.sha, "main_sha": a.main_sha,
                                               "model": a.model, "turns": a.turns, "claude": a.claude_version}))
-    g = gpu_py()
-    cfg = g["load_config"]()
-    running = live_runs(g, cfg)
-    if running >= a.max_runs:
-        (out / "unavailable.md").write_text(f"No GPUs for the live test: the bot has {running} live tests running, "
-                                            f"its limit (REVIEW_GPU_MAX_RUNS). Comment `/review gpu` later.\n")
-        print(f"{running} live tests running")
-        sys.exit(3)
+    cfg = gpu_py()["load_config"]()
     listing = json.loads(gpu("offers", "--gpus", str(a.gpus), "--json").stdout)
     cap = listing["max_usd_per_hour"]
     free = [o for o in listing["offers"] if o["usd_per_hour"] <= cap
@@ -204,22 +197,6 @@ def cmd_start(a):
     (out / "unavailable.md").write_text("\n".join(lines) + "\n")
     print(lines[0])
     sys.exit(3)
-
-
-def live_runs(g, cfg):
-    """The bot's live tests running now, on any PR: its Slurm jobs (by job_prefix) and its Eras
-    instances (Eras is the bot's own organization; see the README)."""
-    n = 0
-    if g["enabled"](cfg, "slurm"):
-        prefix = cfg["slurm"].get("job_prefix", "live-pr") + "-"
-        try:
-            n += sum(j.startswith(prefix) for j in g["slurm_run"](cfg, "squeue -h -o %j").splitlines())
-        except (g["ApiError"], subprocess.TimeoutExpired) as err:  # then offers can't use the node either
-            print(f"slurm: {err}")
-    if g["enabled"](cfg, "eras"):
-        n += sum(str(i.get("name")).startswith("live-pr-") and i.get("status") not in ("ended", "releasing")
-                 for i in g["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or [])
-    return n
 
 
 def instance(out):
@@ -279,15 +256,15 @@ def cmd_cleanup(a):
         gpu("terminate", key, check=False)
     cfg = state["load_config"]()
     if state["enabled"](cfg, "slurm"):
-        name = f"{cfg['slurm'].get('job_prefix', 'live-pr')}-{a.pr}-{a.tag}"
+        name = state["job_name"](cfg, "slurm", a.pr, a.tag)
         try:
-            state["slurm_cancel"](cfg, f"--name={shlex.quote(name)}",
-                                  f"{cfg['slurm'].get('workdir', '/workspace/live-pr')}/{name}")
+            state["slurm_cancel"](cfg, f"--name={shlex.quote(name)}", state["job_dir"](cfg, name))
         except (state["ApiError"], subprocess.TimeoutExpired) as err:  # still release what Eras holds
             print(f"slurm: {err}")
     if state["enabled"](cfg, "eras"):
+        name = state["job_name"](cfg, "eras", a.pr, a.tag)
         for i in state["eras"]("GET", "/instances", params={"page_size": 100}).get("items") or []:
-            if i.get("name") == f"live-pr-{a.pr}-{a.tag}" and i.get("status") not in ("ended", "releasing"):
+            if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
 
 
@@ -370,7 +347,7 @@ def cmd_approve(a):
                 + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else "") + ").")
         gh("api", "-X", "POST", f"repos/{REPO}/pulls/{a.pr}/reviews", "-f", f"commit_id={a.sha}",
            "-f", "event=COMMENT", "-f", f"body={body}")
-        print("would approve")
+        print("approval=comment")
         return
     body = (f"Approved by the review bot on `{a.sha[:7]}`: low risk, no open P0–P2 finding, and the live test "
             "passed. A push dismisses it.")
@@ -379,7 +356,7 @@ def cmd_approve(a):
     # A push between the check and the approval would leave it on a commit nobody tested.
     if gh_json(f"repos/{REPO}/pulls/{a.pr}")["head"]["sha"] != a.sha:
         dismiss(a.pr, "new commits arrived while approving")
-    print("approved")
+    print("approval=approve")
 
 
 def dismiss(pr, message):
@@ -475,7 +452,6 @@ def main():
     p.add_argument("--model", default="claude-opus-5-5")
     p.add_argument("--turns", type=int, default=2000)
     p.add_argument("--claude-version", default="stable")
-    p.add_argument("--max-runs", type=int, default=2, help="the most live tests the bot runs at once, on all PRs")
     p = sub.add_parser("wait")
     p.add_argument("--out", required=True)
     p.add_argument("--start-timeout", type=int, default=30, help="minutes a Slurm job may wait to start")

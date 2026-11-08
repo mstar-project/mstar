@@ -793,6 +793,7 @@ jobs:
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS || '4' }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS || '4' }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
+          MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS || '2' }}
           ERAS_SECRET: ${{ vars.ERAS_RUN_SECRET_ID }}
           ERAS_CACHE_VOLUMES: ${{ vars.ERAS_CACHE_VOLUMES }}
           RESULT: ${{ needs.review.outputs.result }}
@@ -863,7 +864,6 @@ jobs:
             --base "$BASE" \
             --gpus "${{ steps.cfg.outputs.gpus }}" --hours "${{ steps.cfg.outputs.hours }}" --review review.json \
             --run "$RUN" ${SINCE:+--since "$SINCE" --earlier-report earlier-live-test.md} \
-            --max-runs "${{ vars.REVIEW_GPU_MAX_RUNS || '2' }}" \
             --out "$RUNNER_TEMP/lt" --tag "$TAG" --turns "${{ vars.CLAUDE_REVIEW_MAX_TURNS_TEAM || '2000' }}"
           code=$?
           [ "$code" = 3 ] && echo "unavailable=true" >> "$GITHUB_OUTPUT"
@@ -979,8 +979,7 @@ jobs:
           set -o pipefail  # an error in the rule fails this step, rather than tee's exit 0 hiding it
           python3 .github/review/gpu_review.py approve --pr "$PR" --sha "$HEAD_SHA" --review review.json \
             --complete true --verdict "$VERDICT" --why "$RUNNER_TEMP/why.txt" | tee approve.log
-          grep -q '^approved' approve.log && echo "approved=true" >> "$GITHUB_OUTPUT" || true
-          grep -q '^would approve' approve.log && echo "approved=engine" >> "$GITHUB_OUTPUT" || true
+          grep '^approval=' approve.log >> "$GITHUB_OUTPUT" || true
 
       # Model output from untrusted input, posted only from the redacted copies.
       - name: Post the live test
@@ -992,7 +991,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           NOTE: ${{ steps.carry.outputs.note }}
-          APPROVED: ${{ steps.approve.outputs.approved }}
+          APPROVAL: ${{ steps.approve.outputs.approval }}
           APPROVE_OUTCOME: ${{ steps.approve.outcome }}
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -1004,9 +1003,9 @@ jobs:
           elif [ -s "$lt/unavailable.md" ]; then { echo "<!-- claude-live-test sha=$HEAD_SHA verdict=unavailable -->"; cat "$lt/unavailable.md"; } > post.md
           else printf '<!-- claude-live-test-carried -->\n%s\n' "$NOTE" > post.md
           fi
-          if [ "$APPROVED" = "true" ]; then
+          if [ "$APPROVAL" = "approve" ]; then
             printf '\n**Approved** on `%s` by the rule in `.github/review/gpu_review.py`.\n' "${HEAD_SHA:0:7}" >> post.md
-          elif [ "$APPROVED" = "engine" ]; then
+          elif [ "$APPROVAL" = "comment" ]; then
             printf '\n**Would approve** `%s` by the rule in `.github/review/gpu_review.py`; doesn'"'"'t count toward required reviews: touches area/engine or area/resources.\n' "${HEAD_SHA:0:7}" >> post.md
           elif [ -s "$RUNNER_TEMP/why.txt" ]; then
             printf '\nNot approved: %s.\n' "$(cat "$RUNNER_TEMP/why.txt")" >> post.md
