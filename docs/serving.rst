@@ -359,9 +359,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        writes to the trash slot until the run ends, so its KV and recurrent state stay where
        its stop left them; it needs a resident walk. Counted loops need no token output:
        their admitted iteration bound and the worker yield end the same device run. Both
-       modes need a declared stop policy, one rank, CUDA
+       modes need a declared stop policy or an actual graph Loop, one rank, CUDA
        12.4 and up, ``libcudadevrt.a`` under ``CUDA_HOME``, a capture of kernels and
-       copies alone. Declared iteration inputs can run on the device when the walk is
+       copies alone. A graph Loop without a row stop policy cannot use ``past_cap``:
+       its run must fit every row's remaining iterations. Declared iteration inputs can run on the device when the walk is
        resident, has one stop policy for its Loop, and keeps loop-back rows. These walks
        use actual per-row Loop progress and suppress stopped rows even with ``skip``;
        prefix chains and ``past_cap`` are refused. Streamed iteration inputs additionally
