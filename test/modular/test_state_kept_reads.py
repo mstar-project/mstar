@@ -487,38 +487,6 @@ def test_the_handle_path_adds_the_projected_context_and_reads_through_the_handle
     assert handle.read_at == [3], "the layer id reaches the handle"
 
 
-def test_the_handle_path_needs_nothing_from_the_resources():
-    """A model on the contract names no resource of its own, and the engine binds resources on every node at load."""
-    layer = _cross_attention(context_kv_key="context", layer=0)
-    layer.bind_resources({})
-    assert layer.cross is None and layer.context_kv is None, "layer id 0 still selects the handle path"
-
-
-@torch.no_grad()
-def test_a_layer_with_no_handle_key_fails_at_its_first_call():
-    layer = _cross_attention(layer=0)
-    layer.bind_state({"context": _StubContext()})
-    with pytest.raises(AttributeError):
-        layer(torch.randn(2, 8))
-
-
-@torch.no_grad()
-def test_the_resource_path_is_unchanged_with_nothing_bound():
-    class _Cross:
-        context_cache_key = "cache"
-
-        def run(self, q, kv_cache_layer=None):
-            self.view = kv_cache_layer
-            return q
-
-    cross = _Cross()
-    layer = _cross_attention(cross_key="cross", source="default")
-    layer.bind_resources({"cross": cross, "cache": SimpleNamespace(layer_view=lambda: "cursor")})
-    assert layer.context is None and layer.layer is None
-    assert layer(torch.randn(2, 8)).shape == (2, 8)
-    assert cross.view == "cursor"
-
-
 # Through real resources
 
 

@@ -21,7 +21,7 @@ PORTED = (
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/pi05",
     "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
-    "mstar/model/qwen3_tts", "mstar/model/bagel", "mstar/model/chatterbox",
+    "mstar/model/qwen3_tts", "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states",

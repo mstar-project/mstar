@@ -218,10 +218,8 @@ class ParallelCrossAttention(nn.Module):
         k_bias: bool = False,
         v_bias: bool = True,
         o_bias: bool = True,
-        source: str = "default",
-        cross_key: str | None = None,
-        context_kv_key: str | None = None,
-        layer: int | None = None,
+        context_kv_key: str,
+        layer: int,
     ):
         super().__init__()
 
@@ -286,12 +284,8 @@ class ParallelCrossAttention(nn.Module):
             reduce_results=True,
         )
 
-        self.source = source
-        self._cross_key = cross_key or source
         self._context_kv_key = context_kv_key
-        self.cross = None
-        self.context_kv = None
-        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.layer = torch.tensor(layer, device="cpu")
         self.context = None
 
     def compute_kv(
@@ -307,19 +301,6 @@ class ParallelCrossAttention(nn.Module):
         v = self.v_proj(encoder_states).view(enc_len, self.num_kv_heads, self.head_dim)
         return k, v
 
-    def bind_resources(self, resources: dict) -> None:
-        """Resolve this source's cross-attention resource and the cache
-        holding its context. See ``NodeSubmodule.bind_node_resources``."""
-        # a layer id selects the handle path, which binds through `bind_state`
-        if self.layer is not None:
-            return
-        self.cross = resources[self._cross_key]
-        key = self._context_kv_key
-        if key is None:
-            # the resource already names the cache it attends
-            key = self.cross.context_cache_key
-        self.context_kv = resources[key]
-
     def bind_state(self, handles: dict) -> None:
         """The context array's handle, on a node that declares it."""
         self.context = handles.get(self._context_kv_key)
@@ -329,24 +310,9 @@ class ParallelCrossAttention(nn.Module):
         k, v = self.compute_kv(encoder_states)
         self.context.add(self.layer, k=k, v=v)
 
-    # Same cursor API as AttentionCallable, so a layer loop drives self- and
-    # cross-attention the same way. Not an AttentionCallable itself: nothing is
-    # written here, and the context cache is a different resource.
-    def bind_step(self, label: str) -> None:
-        self.cross.set_default_label(label)
-
-    def set_layer_idx(self, layer_idx: int) -> None:
-        self.context_kv.set_default_layer_idx(layer_idx)
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """On the resource path, label and layer index come off the resources'
-        cursors; see ``Attention.forward``."""
         num_tokens = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
-        if self.context is not None:
-            attn = self.context.read(self.layer, q)
-        else:
-            # nothing is written here: the context was written once at encode time
-            attn = self.cross.run(q, kv_cache_layer=self.context_kv.layer_view())
+        attn = self.context.read(self.layer, q)
         attn = attn.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.out_proj(attn)

@@ -8,9 +8,25 @@ from types import SimpleNamespace
 import torch
 from torch import nn
 
-from mstar.model.submodule_base import HostRows
-from mstar.model.whisper.config import PREFILL_WALK, WhisperModelConfig
+from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.step import StepContext
+from mstar.engine.state.adapters import node_handles, node_resources
+from mstar.model.submodule_base import HostRows, ModelInputsFromEngine, engine_step
+from mstar.model.whisper.components.decoder import WhisperDecoderModel
+from mstar.model.whisper.config import (
+    ATTN,
+    CROSS_ATTN,
+    CROSS_KV_CACHE,
+    DECODER_NODE,
+    DECODER_STATE,
+    KV_CACHE,
+    PREFILL_WALK,
+    SAMPLER,
+    WhisperModelConfig,
+)
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
+from mstar.model.whisper.whisper_model import WhisperModel
 from mstar.worker.worker import _LazyHostOutputs
 
 
@@ -19,43 +35,133 @@ def _node():
     return WhisperDecoderSubmodule(nn.Identity(), config)
 
 
-class _Decoder(nn.Module):
-    """Zero logits over 8 tokens, whatever the input."""
+class _StubPages:
+    """A KV pool or the cross read: every label open, nothing kept, and a read returns its queries."""
 
-    def embed(self, input_ids, position_ids):
-        return torch.zeros(input_ids.shape[0], 4)
+    requires_kv_write = True
 
-    def forward(self, input_embeds, *, label):
-        return input_embeds
+    def layer_view(self, i):
+        return torch.empty(0)
 
-    def lm_head(self, hidden):
-        return torch.zeros(hidden.shape[0], 8)
+    def opens_label(self, request_id, label):
+        return True
+
+    def write_kv(self, k, v, layer_idx, label):
+        pass
+
+    def run(self, q, **kwargs):
+        return q
 
 
-class _Sampler:
+class _StubPlan(_StubPages):
+    """The self-attention's plan and the position counter: each row's next position, advanced at commit."""
+
     def __init__(self):
-        self.logits = []
+        self.next: dict[int, int] = {}
+        self.segments = ()
 
-    def sample(self, request_ids, logits):
+    def position(self, request_id, label):
+        return self.next.get(request_id, 0)
+
+    def pos_ids(self, label):
+        return torch.tensor([p for s in self.segments for p in range(self.next.get(s.request_id, 0),
+                                                                     self.next.get(s.request_id, 0) + s.span)])
+
+    def select_last_hidden(self, x, label):
+        return x[torch.tensor([s.span for s in self.segments]).cumsum(0) - 1]
+
+    def commit(self):
+        for s in self.segments:
+            self.next[s.request_id] = self.position(s.request_id, "main") + s.span
+
+
+class _StubSampler:
+    """Draws the next of ``tokens`` for each row as ``dtype``, and records the logits it was given. An eager draw
+    returns int32 tokens, and a captured one int64."""
+
+    def __init__(self):
+        self.tokens: list[int] = []
+        self.logits: list[torch.Tensor] = []
+        self.dtype = torch.int32
+
+    def sample(self, rows, logits):
         self.logits.append(logits.clone())
-        return logits.argmax(-1)
+        return torch.tensor([self.tokens.pop(0) for _ in rows], dtype=self.dtype)
+
+
+class _Driver:
+    """A tiny decoder node with random weights, over stub resources and a real decoder state pool, stepped as the
+    engine steps it: declare, admit and plan the pool, open the handles, prepare, preprocess, forward, check and
+    commit."""
+
+    def __init__(self, config: WhisperModelConfig):
+        model = object.__new__(WhisperModel)
+        model.config = config
+        torch.manual_seed(0)
+        decoder = WhisperDecoderModel(config)
+        for param in decoder.parameters():  # fused projections start from torch.empty
+            nn.init.normal_(param, std=0.05)
+        self.node = WhisperDecoderSubmodule(decoder.eval(), config)
+        self.plan, self.sampler = _StubPlan(), _StubSampler()
+        (spec,) = [spec for spec in node_resources(model) if spec.resource_key == DECODER_STATE]
+        self.pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+        pages = _StubPages()
+        self.node.bind_node_state(node_handles(model, DECODER_NODE, {
+            KV_CACHE: pages, CROSS_KV_CACHE: pages, CROSS_ATTN: pages, ATTN: self.plan, "rope": self.plan,
+            DECODER_STATE: self.pool, SAMPLER: self.sampler,
+        }))
+        self.ingested: set[int] = set()
+
+    def step(self, walk: str, rows: dict) -> dict:
+        """One step over ``rows``, request handle to its forward-pass info and routed inputs."""
+        rids = list(rows)
+        inputs = [self.node.prepare_inputs(walk, info, signals) for info, signals in rows.values()]
+        for rid in set(rids) - self.ingested:
+            self.pool.ingest_request(rid)
+            self.ingested.add(rid)
+        step = engine_step(self.node, graph_walk=walk, request_ids=rids, inputs=inputs)
+        ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False)
+        step.set_ctx(ctx)
+        self.plan.segments = step.segments
+        state = step.steps[DECODER_STATE]
+        assert self.pool.admit(state, ctx).ok, "the pool holds a slot for every row"
+        self.pool.plan(state, ctx)
+        engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={}, step=step)
+        step.begin_calls()
+        try:
+            with torch.no_grad():
+                self.batch = self.node.preprocess(walk, engine_inputs, inputs)
+                out = self.node.forward_batched(walk, engine_inputs, **self.batch)
+            step.check_calls()
+            self.pool.commit(state, ctx)
+            step.commit_calls()
+        finally:
+            step.end_calls()
+        if KV_CACHE in step.state:
+            self.plan.commit()
+        return out
+
+
+def _tiny_config(**overrides) -> WhisperModelConfig:
+    return WhisperModelConfig(**{
+        "d_model": 64, "decoder_layers": 2, "decoder_attention_heads": 4, "decoder_ffn_dim": 128,
+        "max_source_positions": 8, **overrides,
+    })
 
 
 def test_forward_suppresses_before_sampling():
     """A prefill and a decode step through ``forward``: the sampler sees the
     begin-suppressed tokens masked only for the first token. (The context is
-    written in ``preprocess``, outside the captured prefill.)"""
-    node, sampler = _node(), _Sampler()
-    node.decoder = _Decoder()
-    engine_inputs = SimpleNamespace(request_ids=["a"], resources={
-        "attn": SimpleNamespace(select_last_hidden=lambda hidden: hidden[-1:]),
-        "positions": SimpleNamespace(pos_ids=lambda label: None),
-        "sampler": sampler,
-    })
-    node.forward("prefill", engine_inputs, input_ids=torch.tensor([9, 9, 9, 9]))
-    node.forward("decode", engine_inputs, input_ids=torch.tensor([9]))
-    first, later = sampler.logits
-    assert first.shape == later.shape == (1, 8)
+    added in ``preprocess``, outside the captured prefill.)"""
+    driver = _Driver(_tiny_config(suppress_tokens=[1, 5], begin_suppress_tokens=[2, 3]))
+    info = SimpleNamespace(step_metadata={"timestamps": False})
+    driver.sampler.tokens = [9, 9]
+    driver.step(PREFILL_WALK, {0: (info, {
+        "text_inputs": [torch.tensor([9, 9, 9, 9])], "encoder_states": [torch.zeros(8, 64)],
+    })})
+    driver.step("decode", {0: (info, {"text_inputs": [torch.tensor([9])]})})
+    first, later = driver.sampler.logits
+    assert first.shape == later.shape == (1, driver.node.config.vocab_size)
     assert torch.isinf(first[0, [1, 2, 3, 5]]).all() and not torch.isinf(first[0, [0, 4, 6, 7]]).any()
     assert torch.isinf(later[0, [1, 5]]).all() and not torch.isinf(later[0, [0, 2, 3, 4, 6, 7]]).any()
 

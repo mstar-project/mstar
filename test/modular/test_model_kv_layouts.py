@@ -641,7 +641,7 @@ def test_whisper_lays_out_the_forced_prompt_and_the_encoders_whole_window(second
 
     output = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [clip]}, **kwargs)
 
-    layout, tensors = output.metadata["kv_layout"], output.new_input_tensors
+    layout, tensors = output.metadata["state_layout"], output.new_input_tensors
     prompt = len(tensors["text_inputs"][0])
     spans = [(span.walk, span.length) for span in layout[KV_CACHE]["main"].spans]
     if language is None:

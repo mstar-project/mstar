@@ -715,7 +715,9 @@ def _cross_attention(parallel: bool) -> nn.Module:
     from mstar.model.components.attention import CrossAttention
     from mstar.model.components.distributed.attention import ParallelCrossAttention
 
-    return (ParallelCrossAttention if parallel else CrossAttention)(hidden_size=HIDDEN, num_heads=2, head_dim=4)
+    if parallel:
+        return ParallelCrossAttention(hidden_size=HIDDEN, num_heads=2, head_dim=4, context_kv_key="context", layer=0)
+    return CrossAttention(hidden_size=HIDDEN, num_heads=2, head_dim=4)
 
 
 # a module that runs these children other than through their forward over the step's

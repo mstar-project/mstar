@@ -29,6 +29,7 @@ from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.state.adapters import node_resources
 from mstar.model.whisper.config import CONTEXT_LABEL, CROSS_KV_CACHE, KV_CACHE, WhisperModelConfig
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
 from mstar.model.whisper.whisper_model import WhisperModel
@@ -72,7 +73,7 @@ def _make_model() -> WhisperModel:
 
 
 def _kv_specs(model: WhisperModel) -> dict[str, KVSpec]:
-    return {s.resource_key: s for s in model.get_node_resources() if isinstance(s, KVSpec)}
+    return {s.resource_key: s for s in node_resources(model) if isinstance(s, KVSpec)}
 
 
 def _manager(config: PagedKVConfig, name: str) -> KVManager:
@@ -175,7 +176,7 @@ def test_shipped_yaml_caps_requests_at_what_the_caches_hold(name):
     assert cfg["max_concurrent_requests"] == WhisperModel.MAX_CONCURRENT_REQUESTS
     model.validate_config_yaml(cfg, str(path))
     # the YAML tunes host offload only; the pools validated are the pools built
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     apply_yaml_overrides(specs, cfg)
     pages = {s.resource_key: s.config.max_num_pages for s in specs if isinstance(s, KVSpec)}
     assert pages == {

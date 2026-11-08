@@ -17,8 +17,8 @@ Whisper's decoding is constrained the way openai-whisper / HF's
 Which rule applies depends on the tokens generated so far. The worker
 launches the next decode step before it has read the previous step's token
 on the host, so that history cannot live in Python: the four integers that
-summarize it (``[active, phase, last_ts, ceil]``) are a tensor row that is
-routed along with the sampled token, updated by :meth:`TimestampRules.advance`
+summarize it (``[active, phase, last_ts, ceil]``) are a tensor row kept in
+each request's decoder state, updated by :meth:`TimestampRules.advance`
 inside the (captured) forward, and turned into masks on the ``(bs, vocab)``
 logits by :meth:`TimestampRules.apply` with no data-dependent control flow.
 :func:`rule_state` builds the same row from a token history on the host —
