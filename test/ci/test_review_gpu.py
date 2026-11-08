@@ -204,7 +204,7 @@ class TestStart(unittest.TestCase):
         out = Path(tempfile.mkdtemp())
         (out / "review.json").write_text(json.dumps({"live_test": {
             "run": "full", "reason": self.INJECTED, "confirm": [self.INJECTED], "checks": ["correctness"],
-            "gpus": 1}}))
+            "gpus": 1, "focus": [{"what": self.INJECTED, "why": "the PR's own path"}]}}))
         offers = [{"id": "slurm:node1:1", "provider": "slurm", "gpu": "H200", "count": 1, "usd_per_hour": 0.0,
                    "availability": "8 free"},
                   {"id": "eras:l1", "provider": "eras", "gpu": "H200", "count": 1, "usd_per_hour": 3.0,
@@ -245,7 +245,9 @@ class TestStart(unittest.TestCase):
         self.assertEqual([x[1] for x in launched], ["slurm:node1:1"])
         self.assertNotIn(self.INJECTED, (out / "brief.md").read_text(),
                          "model text from an untrusted PR would be instructions to a root shell")
-        self.assertIn(self.INJECTED, (out / "findings.json").read_text())
+        self.assertEqual(json.loads((out / "findings.json").read_text())["focus"],
+                         [{"what": self.INJECTED, "why": "the PR's own path"}],
+                         "the live test would plan without the review's suggestions")
         self.assertIn("`$LIVE_PR_IN/pr-body.md`", (out / "brief.md").read_text(),
                       "the session would look for the PR's description with gh, which the box doesn't have")
         self.assertIn(str(out / "pr-body.md"), launched[0])

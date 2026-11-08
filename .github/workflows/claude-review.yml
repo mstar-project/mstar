@@ -28,13 +28,13 @@ name: Claude Review
 #      as fields, which a workflow step renders, redacts and posts. In light
 #      and nogpu mode the worst case for a prompt injection is a bad
 #      comment. In full mode the live test runs the PR's code with a shell on
-#      the GPU box, as root on the shared Slurm node; see the README's threat
+#      the GPU box, as root on a shared Slurm node; see the README's threat
 #      model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
 #
 # `/review` (full mode) adds a second job, live-test, that runs no model and no PR code
-# here either: it rents GPUs (the team's Slurm node, else an open Eras listing),
+# here either: it rents GPUs (the team's Slurm nodes, else an open Eras listing),
 # starts the live-test session on that box (gpu_review_box.sh), waits for it,
 # collects its report and media, posts them, and approves the PR when the rule
 # in gpu_review.py holds. The box gets the PR's public code, a fixed brief, the
@@ -155,6 +155,8 @@ jobs:
       # actions: read lists and downloads the saved handoff for /review continue.
       actions: read
       contents: read
+      # issues: read lists the open issues, for a latent bug that one already tracks.
+      issues: read
       pull-requests: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -524,6 +526,12 @@ jobs:
           }
           stacked_above || rm -f above-*.diff above.json stacked-above.json
           [ ! -f stacked-above.json ] || echo "above=$(jq -c . stacked-above.json)" >> "$GITHUB_OUTPUT"
+
+          # The open issues, [{number, title}], so a latent bug on main can name the one that tracks it.
+          # Titles are user text: the model reads them as untrusted data, and no command line gets them.
+          # A failed fetch leaves no file, and the review says it couldn't check.
+          gh issue list --repo "$REPO" --state open --limit 1000 --json number,title > open-issues.json \
+            || rm -f open-issues.json
 
           echo "lines=$(wc -l < pr.diff)" >> "$GITHUB_OUTPUT"
           # The summary's fields, from main, for --json-schema. Assigned first so
@@ -895,16 +903,13 @@ jobs:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
 
-      # gpu.py's settings, from repository variables; the Slurm node's key and
-      # pinned host key from secrets and variables. Nothing here reaches the box.
+      # gpu.py's settings, from repository variables; the Slurm nodes' key from a secret, and
+      # each node's host and pinned host key from REVIEW_SLURM_NODES. Nothing here reaches the box.
       - name: Configure the GPUs
         id: cfg
         env:
           SLURM_KEY: ${{ secrets.REVIEW_SLURM_SSH_KEY }}
-          SLURM_HOST: ${{ vars.REVIEW_SLURM_HOST }}
-          SLURM_PORT: ${{ vars.REVIEW_SLURM_PORT || '22' }}
-          SLURM_HOST_KEY: ${{ vars.REVIEW_SLURM_HOST_KEY }}
-          SLURM_PARTITION: ${{ vars.REVIEW_SLURM_PARTITION || 'background' }}
+          SLURM_NODES: ${{ vars.REVIEW_SLURM_NODES }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS || '4' }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS || '4' }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
@@ -1001,11 +1006,13 @@ jobs:
           S1: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
-          S4: ${{ vars.REVIEW_SLURM_HOST }}
+          NODES: ${{ vars.REVIEW_SLURM_NODES }}
         run: |
+          # Each node's host, as configured (user@host) and bare, as ssh's errors print it.
+          mapfile -t hosts < <(jq -r '.[].host // empty | ., (split("@") | last)' <<< "${NODES:-[]}")
           for f in "$RUNNER_TEMP/lt/results/report.md" "$RUNNER_TEMP/lt/results/result.json" "$RUNNER_TEMP/lt/unavailable.md"; do
             [ -f "$f" ] || continue
-            for v in "$S1" "$S2" "$S3" "$S4"; do
+            for v in "$S1" "$S2" "$S3" "${hosts[@]}"; do
               [ -z "$v" ] || python3 -c 'import sys; p, v = sys.argv[1:]; s = open(p).read().replace(v, "[REDACTED]"); open(p, "w").write(s)' "$f" "$v"
             done
             sed -E -i "$REDACT" "$f"

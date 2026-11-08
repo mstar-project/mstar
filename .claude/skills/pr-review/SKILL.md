@@ -167,8 +167,13 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   anyway; otherwise drop the finding. A finding that contradicts a stated reason without engaging it
   isn't ready to report.
 
+**Latent bugs on main.** A bug in code the PR didn't write or worsen is reported apart, as latent:
+where, what, its priority, and the open issue that tracks it, or a title for one when none does. It
+never counts as an open finding or blocks the PR. A dormant bug in the PR's own code, or a
+pre-existing one the PR must fix (above), is a normal finding.
+
 **Don't report:** formatting or import order (ruff owns them; naming is reported only as style
-pattern B1 allows); pre-existing problems the PR doesn't worsen; praise or a restatement of the
+pattern B1 allows); praise or a restatement of the
 diff; how many tests a PR adds, or that it adds too many (ask for a test only where a finding needs
 one to pin it, and never ask to cut tests for count); GPU timing or numerics you can't establish
 from the code, except a static performance finding with its arithmetic (§4.2) or a measurement from
@@ -555,7 +560,8 @@ The live test is a second session that runs after the review, on the GPU box, wi
 nothing else: no GitHub token and no cloud keys. It follows `.claude/skills/live-pr-test/SKILL.md`
 (cluster mode: the box is already provisioned) end to end: its plan, risk map, reach before results,
 reference parity, both frontends where they apply. It gets the PR, the head commit to test, the
-review's reason for its call and the "how to confirm" lines of open P0–P2 findings.
+review's reason for its call, the "how to confirm" lines of open P0–P2 findings and the review's
+focus.
 
 **The review decides whether and what the live test runs**, on every review and re-review, from
 what the change can affect, and says why. "The change" is what changed since the PR's last passing
@@ -569,11 +575,17 @@ the last review.
   - `none`: nothing in the change needs a GPU run to settle it (docs, comments, tests, benchmarks,
     or code no served request runs); never a change to what a model or the server does, however
     small. On a `none` with no passing live test before it, only docs, tests and benchmarks can be
-    approved. The reason says why in one sentence.
+    approved. The reason says why in one sentence. A change to tests that skip without CUDA gets at
+    least `targeted`: the live test runs CI's tests on the box's GPUs, and GitHub's CPU job never
+    does.
 - `checks`, the kinds of check: `correctness` (served output, parity, regressions) and/or
   `performance` (throughput and latency A/Bs). Leave `performance` out when the change can't
   plausibly move speed; leave `correctness` out only for a pure performance change whose outputs you
   proved unchanged by reading the code. Give it with `none` too; it is ignored there.
+- `focus`: up to eight things the live test should try that the diff alone wouldn't show it, each
+  `what` (an input, a claim to measure, or a config or path the change only shows on) and `why`
+  (one line): the input your trace found, the config that takes the changed branch. Short strings,
+  no commands. Empty when you have none. The live test folds them into its risk map.
 
 The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
 counts them), no open question and no skipped file. Otherwise no box starts, and the comment lists
@@ -644,9 +656,10 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
   the PR's distance from it. Every gap named here is also a finding or a question.
 - **Skipped:** files not reviewed, only on a contributor's capped run whose diff is too large for
   its cap.
+- **Latent bugs on main** (§2), each with its open issue or a suggested title.
 - **Risk:** the design-risk rating, its sentence and, above low, the decisions (§6).
-- **Live test** (full mode): `full`, `targeted` or `none`, the kinds of check, the reason, and the fewest
-  GPUs the largest config it needs runs on (§7).
+- **Live test** (full mode): `full`, `targeted` or `none`, the kinds of check, the reason, the fewest
+  GPUs the largest config it needs runs on, and the focus (§7).
 
 **Before reporting, check:** every cited `path:line` says what the finding claims at the head; every
 gap in the design verdict is a finding or a question; the eight coverage lines are
