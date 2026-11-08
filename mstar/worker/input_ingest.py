@@ -195,39 +195,34 @@ class InputIngest:
         if first:
             self._tensors.register_request(rid, runtime.get_sharding_config(rid))
         laps.lap("worker_state")
-        if first:
-            try:
+        try:
+            if first:
                 self._engines.add_request(
                     rid, body.request_info.resource_configs, body.request_info,
                 )
                 laps.lap("engine_add")
                 self._skip_unshared_publish(rid, body.worker_graph_to_workers)
                 laps.lap("skip_publish")
-            except Exception as err:
-                # the engine rolled the ingest back; the conductor's REMOVE tears down the rest
-                text, _ = client_error_text(
-                    err, f"Worker {self._worker_id}: ingest of request {wire_rid} failed",
-                    log=logger,
-                )
-                lifecycle.fail({rid: f"Error in worker: {text}"})
-                self._dispatch(lifecycle.take_parked(wire_rid))
-                return
-        body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
+            body.request_info.resource_configs = without_layouts(body.request_info.resource_configs)
 
-        self._streams.add_request(rid, body.request_info)
-        laps.lap("stream_buffers")
+            self._streams.add_request(rid, body.request_info)
+            laps.lap("stream_buffers")
 
-        # Start RDMA reads for tensors that have tensor_info
-        self._wakeup_event.register_futures(self._tensors.start_read_tensors(
-            rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
-        ))
-        laps.lap("start_reads")
+            # Start RDMA reads for tensors that have tensor_info
+            self._wakeup_event.register_futures(self._tensors.start_read_tensors(
+                rid, body.initial_inputs, graph_walk=body.request_info.graph_walk,
+            ))
+            laps.lap("start_reads")
 
-        # Signal-only edges (tensor_info is None) can be processed immediately
-        signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
-        if signal_only:
-            runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
-        laps.lap("ingest_signals")
+            # Signal-only edges (tensor_info is None) can be processed immediately
+            signal_only = [edge for edge in body.initial_inputs if len(edge.tensor_info) == 0]
+            if signal_only:
+                runtime.ingest_inputs_batch(_one_rids_edges(rid, signal_only), can_buffer=True)
+            laps.lap("ingest_signals")
+        except Exception as err:
+            # a failed engine ingest rolled itself back; the conductor's REMOVE
+            # tears down what else the request has here
+            self._fail_intake([rid], err, f"ingest of request {wire_rid} failed")
         self._dispatch(lifecycle.take_parked(wire_rid))
 
     def _remove_request(self, body: RemoveRequest) -> None:
@@ -346,25 +341,31 @@ class InputIngest:
         # Start RDMA reads for non-streaming edges with tensor_info; a
         # streamed row of an EDGE_ITEMS replayed from the park has none, and
         # no forward-pass info either
-        if non_streaming:
-            self._wakeup_event.register_futures(self._tensors.start_read_tensors(
-                rid, non_streaming, graph_walk=body.request_info.graph_walk,
-            ))
-        # Start RDMA reads for streaming edges with tensor_info (will be routed
-        # to a buffer in check_ready_tensors)
-        if streaming_with_tensors:
-            self._wakeup_event.register_futures(
-                self._tensors.start_read_tensors(rid, streaming_with_tensors),
-            )
-            # no forward-pass info comes with a client stream's chunks, nor with
-            # a stream whose walk the producer does not decide (see
-            # `walk_driven_signals`)
-            walks = body.request_info.stream_consumer_walks if body.request_info is not None else {}
-            walk_driven = self._streams.walk_driven_edges
-            for edge in streaming_with_tensors:
-                req_info.stream_buffers[edge.name].pre_read_register_joined(
-                    [info.uuid for info in edge.tensor_info], walks.get(walk_driven.get(edge.name)),
+        try:
+            if non_streaming:
+                self._wakeup_event.register_futures(self._tensors.start_read_tensors(
+                    rid, non_streaming, graph_walk=body.request_info.graph_walk,
+                ))
+            # Start RDMA reads for streaming edges with tensor_info (will be routed
+            # to a buffer in check_ready_tensors)
+            if streaming_with_tensors:
+                self._wakeup_event.register_futures(
+                    self._tensors.start_read_tensors(rid, streaming_with_tensors),
                 )
+                # no forward-pass info comes with a client stream's chunks, nor with
+                # a stream whose walk the producer does not decide (see
+                # `walk_driven_signals`)
+                walks = body.request_info.stream_consumer_walks if body.request_info is not None else {}
+                walk_driven = self._streams.walk_driven_edges
+                for edge in streaming_with_tensors:
+                    req_info.stream_buffers[edge.name].pre_read_register_joined(
+                        [info.uuid for info in edge.tensor_info], walks.get(walk_driven.get(edge.name)),
+                    )
+        except Exception as err:
+            if enable_nvtx:
+                range_pop(synchronize=False)
+            self._fail_intake([rid], err, f"input read of request {body.request_id} failed")
+            return
         if enable_nvtx:
             range_pop(synchronize=False)
             range_push("process_new_inputs.process_inputs")
@@ -410,7 +411,27 @@ class InputIngest:
             stream_buf.pre_read_register_joined(frame.uuids[row.start:row.start + row.count])
             reads.append((rid, [edge]))
         if reads:
-            self._wakeup_event.register_futures(self._tensors.start_read_tensors_multi(reads))
+            try:
+                futures = self._tensors.start_read_tensors_multi(reads)
+            except Exception as err:
+                self._fail_intake([rid for rid, _ in reads], err, "streamed input read failed")
+                return
+            self._wakeup_event.register_futures(futures)
+
+    def _fail_intake(self, rids: list[int], err: Exception, what: str) -> None:
+        """Fail ``rids`` for an error taking in their inputs (a CUDA OOM in
+        the H2D read, say), rather than letting it escape the message loop:
+        nothing else would fail them, and the rest of the drained messages
+        would be lost. Recorded for a TP step's read check, as a failed read
+        is (see ``check_ready_tensors``), and reported once per request."""
+        self._lockstep.record_read_failures(
+            r for r in rids if r in self._request_state.per_request_info
+        )
+        rids = [r for r in rids if r not in self._lifecycle.failed_rids]
+        if not rids:
+            return
+        text, _ = client_error_text(err, f"Worker {self._worker_id}: {what}", log=logger)
+        self._lifecycle.fail({rid: f"Error in worker: {text}" for rid in rids})
 
     def _ack_unbuffered(self, rid: int, request_id: str, edges: list[GraphEdge]) -> None:
         """Streamed edges of a known request with no stream buffer here:
