@@ -5,10 +5,10 @@ and beside a full-occupancy attention it slows that attention by about what it m
 compute. Here a rank's heads for each destination split into ``groups`` head groups. Group g's q/k/v rows go by
 pitched copy-engine copies (``cuMemcpy2DAsync``) straight into each peer's receive slot, a CUDA IPC mapping, and a
 ``cuStreamWriteValue32`` queued behind them bumps the peer's flag. The peer's attention of group g waits on that
-flag with ``cuStreamWaitValue32``, which holds no SM, while group g+1 is still on the copy engines; each group's
-output rows go back the same way. A head attends as it does in the full call, so the result is the serving
-exchange's bit for bit: the first call of each shape checks that on every rank and keeps the serving exchange
-for that shape otherwise.
+flag with ``cuStreamWaitValue32``, which holds no SM, while group g+1 is still on the copy engines. Each group's
+output rows go back the same way, straight into the owner's output tensor at the group's heads, so nothing merges
+them afterwards. A head attends as it does in the full call, so the result is the serving exchange's bit for bit:
+the first call of each shape checks that on every rank and keeps the serving exchange for that shape otherwise.
 
 Adapted from SGLang's ``ipc_a2a_multi.py`` (Apache-2.0), cut to what a DiT's Ulysses attention needs: one
 sequence, equal shares, q, k and v with one head count.
@@ -107,12 +107,12 @@ class _Shape(NamedTuple):
 
 
 class _Pool:
-    """Every rank's receive slots, output blocks and flags, each peer's opened in this rank's context; one pool for
-    every call, grown to the largest (a pool per shape would grow with every new row bucket). For a call of
-    ``rows``: per head group, q, k and v slots as attention reads them, ``[world * rows, group_heads, head_dim]``
-    each, rank r's rows at ``r * rows``; per (source rank, group), an output block of that rank's output rows of
-    this rank's queries, ``[rows, group_heads, head_dim]``. ``fin[p]`` counts the head groups peer p has delivered,
-    ``fout[g * world + p]`` the calls whose group g it has."""
+    """Every rank's receive slots, output and flags, each peer's opened in this rank's context; one pool for every
+    call, grown to the largest (a pool per shape would grow with every new row bucket). For a call of ``rows``: per
+    head group, q, k and v slots as attention reads them, ``[world * rows, group_heads, head_dim]`` each, rank r's
+    rows at ``r * rows``; the call's output, ``[rows, heads, head_dim]``, which every rank writes its heads of
+    directly. ``fin[p]`` counts the head groups peer p has delivered to this rank's slots, ``fout[p]`` those it has
+    written into this rank's output."""
 
     def __init__(self, group: CommGroup, shape: _Shape, groups: int):
         world = group.world_size
@@ -120,11 +120,10 @@ class _Pool:
         self.group_heads = shape.heads // (world * groups)
         per_row = self.group_heads * shape.head_dim
         self.inb = _share(group, _shareable_zeros(groups * 3 * world * shape.rows * per_row, shape.dtype))
-        self.outb = _share(group, _shareable_zeros(world * groups * shape.rows * per_row, shape.dtype))
+        self.out = _share(group, _shareable_zeros(shape.rows * shape.heads * shape.head_dim, shape.dtype))
         self.fin = _share(group, _shareable_zeros(world, torch.int32))
-        self.fout = _share(group, _shareable_zeros(groups * world, torch.int32))
+        self.fout = _share(group, _shareable_zeros(world, torch.int32))
         self.groups_sent = 0
-        self.calls = 0
 
     def serves(self, shape: _Shape) -> bool:
         return shape._replace(rows=0) == self.shape._replace(rows=0) and shape.rows <= self.shape.rows
@@ -156,7 +155,8 @@ def _share(group: CommGroup, t: torch.Tensor) -> list[torch.Tensor]:
 class UlyssesPipeline:
     """One SP group's pipelined Ulysses exchange. ``__call__`` returns None, on every rank alike, when it can't
     serve a call (no stream memory operations, a shape it hasn't verified bit-identical, a capture), and the
-    caller then runs the serving exchange."""
+    caller then runs the serving exchange. What it returns is the pool's output buffer, valid until the next call
+    on the current stream: the peers' next writes into it are ordered after everything queued before that call."""
 
     def __init__(self, group: CommGroup, groups: int, group_streams: bool = False):
         self.group = group
@@ -225,13 +225,13 @@ class UlyssesPipeline:
         some rank can't spare it twice over, and the shape keeps the serving exchange. Every rank reaches the same
         call with the same shape, in lockstep; each waits out its queued copies into the old pool before it goes."""
         world = self.group.world_size
-        need = (self.groups * 3 * world + world * self.groups) * shape.rows * self.group_heads(shape.heads) \
+        need = (self.groups * 3 * world * self.group_heads(shape.heads) + shape.heads) * shape.rows \
             * shape.head_dim * torch.empty((), dtype=shape.dtype).element_size()
         held = 0
         if self._pool is not None:
             torch.cuda.synchronize()
             held = sum(t.numel() * t.element_size() for t in (self._pool.inb[self.group.rank],
-                                                              self._pool.outb[self.group.rank]))
+                                                              self._pool.out[self.group.rank]))
         free, _ = torch.cuda.mem_get_info()
         spare = free + torch.cuda.memory_reserved() - torch.cuda.memory_allocated() + held
         if not self.group.agree([int(spare >= 2 * need)])[0]:
@@ -248,21 +248,21 @@ class UlyssesPipeline:
         rows, heads, head_dim = q.shape
         hg, esz = buf.group_heads, q.element_size()
         slot_numel = world * rows * hg * head_dim
-        out_numel = rows * hg * head_dim
         main = torch.cuda.current_stream()
         base, buf.groups_sent = buf.groups_sent, buf.groups_sent + groups
-        buf.calls += 1
-        call = buf.calls
         parts = (q, k, v)
         peers = [(r + i) % world for i in range(1, world)]
-        row_bytes, out_pitch = hg * head_dim * esz, heads * head_dim * esz
+        row_bytes, head_bytes = hg * head_dim * esz, head_dim * esz
+        out_pitch = heads * head_bytes
+        # addresses, not views: a tensor view per copy costs more host time than queueing the copy
+        inb, outs = [t.data_ptr() for t in buf.inb], [t.data_ptr() for t in buf.out]
+        fin, fout = buf.fin[r].data_ptr(), buf.fout[r].data_ptr()
 
         def head0(p: int, g: int) -> int:  # first head of destination p's group g
             return (p * groups + g) * hg
 
-        def slot(member: int, g: int, part: int) -> torch.Tensor:
-            start = (g * 3 + part) * slot_numel
-            return buf.inb[member].narrow(0, start, slot_numel).view(world * rows, hg, head_dim)
+        def slot(g: int, part: int) -> torch.Tensor:  # this rank's
+            return buf.inb[r].narrow(0, (g * 3 + part) * slot_numel, slot_numel).view(world * rows, hg, head_dim)
 
         ready = main.record_event()
         # this rank's own rows on the SMs, before the first attention: a same-device copy queued behind a
@@ -270,17 +270,21 @@ class UlyssesPipeline:
         for g in range(groups):
             h0 = head0(r, g)
             for part, t in enumerate(parts):
-                slot(r, g, part)[r * rows:(r + 1) * rows].copy_(t[:, h0:h0 + hg])
+                slot(g, part)[r * rows:(r + 1) * rows].copy_(t[:, h0:h0 + hg])
         self._copy_in.wait_event(ready)
         for g in range(groups):
             for p in peers:
                 h0 = head0(p, g)
                 for part, t in enumerate(parts):
-                    ops.copy2d(self._copy_in, slot(p, g, part)[r * rows:].data_ptr(), row_bytes,
-                               t.data_ptr() + h0 * head_dim * esz, t.stride(0) * esz, row_bytes, rows)
+                    dst = inb[p] + ((g * 3 + part) * slot_numel) * esz + r * rows * row_bytes
+                    ops.copy2d(self._copy_in, dst, row_bytes, t.data_ptr() + h0 * head_bytes, t.stride(0) * esz,
+                               row_bytes, rows)
             for p in peers:
                 ops.write(self._copy_in, buf.fin[p].data_ptr() + 4 * r, base + g + 1)
-        merged = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+        # Every rank writes its heads of this rank's rows straight in, and the caller reads it on `main` until the
+        # next call. A peer's writes for that call come after its attention, which waits for this rank's q/k/v of
+        # that call, sent after everything queued on `main` before the call: so after the caller has read this one.
+        merged = buf.out[r].narrow(0, 0, rows * heads * head_dim).view(rows, heads, head_dim)
         if self.group_streams:
             while len(self._streams) < groups:
                 self._streams.append(torch.cuda.Stream())
@@ -291,27 +295,24 @@ class UlyssesPipeline:
                 stream.wait_event(placed)
             with torch.cuda.stream(stream):
                 for p in peers:
-                    ops.wait(stream, buf.fin[r].data_ptr() + 4 * p, base + g + 1)
-                out = attend_group(slot(r, g, 0), slot(r, g, 1), slot(r, g, 2)).contiguous()
+                    ops.wait(stream, fin + 4 * p, base + g + 1)
+                out = attend_group(slot(g, 0), slot(g, 1), slot(g, 2)).contiguous()
                 # the copy stream reads it after the next group's attention may have reused its memory
                 out.record_stream(self._copy_out)
                 self._copy_out.wait_event(stream.record_event())
-                for p in peers:
-                    block = buf.outb[p].narrow(0, (r * groups + g) * out_numel, out_numel)
-                    ops.copy2d(self._copy_out, block.data_ptr(), row_bytes, out[p * rows:].data_ptr(), row_bytes,
-                               row_bytes, rows)
-                for p in peers:
-                    ops.write(self._copy_out, buf.fout[p].data_ptr() + 4 * (g * world + r), call)
                 h0 = head0(r, g)
+                for p in peers:
+                    ops.copy2d(self._copy_out, outs[p] + h0 * head_bytes, out_pitch,
+                               out.data_ptr() + p * rows * row_bytes, row_bytes, row_bytes, rows)
+                for p in peers:
+                    ops.write(self._copy_out, buf.fout[p].data_ptr() + 4 * r, base + g + 1)
                 merged[:, h0:h0 + hg].copy_(out[r * rows:(r + 1) * rows])
-        for g in range(groups):
-            for p in peers:
-                ops.wait(self._copy_out, buf.fout[r].data_ptr() + 4 * (g * world + p), call)
-                block = buf.outb[r].narrow(0, (p * groups + g) * out_numel, out_numel)
-                ops.copy2d(self._copy_out, merged.data_ptr() + head0(p, g) * head_dim * esz, out_pitch,
-                           block.data_ptr(), row_bytes, row_bytes, rows)
-        # the next call rewrites the slots and the caller may free q / k / v, which the copy streams read
-        main.wait_stream(self._copy_out)
+        # A peer writes its groups from one stream, in order, so its count covers every group before it. Once
+        # every peer has written, every peer has also attended over its slots, which the next call rewrites.
+        for p in peers:
+            ops.wait(main, fout + 4 * p, base + groups)
+        # the caller may free q / k / v, which the copy-in stream reads; `main` needn't wait out this rank's own
+        # sends, whose sources record_stream keeps alive
         main.wait_stream(self._copy_in)
         if self.group_streams:
             for stream in self._streams[:groups]:
