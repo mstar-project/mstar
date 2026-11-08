@@ -670,7 +670,8 @@ def incomplete(out, repo, pr, run_url, why="a step failed", detail="", can_conti
 
 def main(steps):
     """Run the step `sys.argv[1]` names, with its parameters from the environment, and write what it put
-    in `out` to $GITHUB_OUTPUT, even when it fails. An empty variable takes the parameter's default."""
+    in `out` to $GITHUB_OUTPUT, even when it fails. An empty variable takes the parameter's default. Each
+    step gets its parameters as strings and validates them itself."""
     step = steps[sys.argv[1]]
     kwargs = {}
     for name, p in list(inspect.signature(step).parameters.items())[1:]:
@@ -679,7 +680,7 @@ def main(steps):
             continue
         if name.upper() not in os.environ:
             raise ValueError(f"{sys.argv[1]}: ${name.upper()} is not set")
-        kwargs[name] = value if p.annotation is p.empty or value == "" else p.annotation(value)
+        kwargs[name] = value
     out = {}
     try:
         step(out, **kwargs)
