@@ -162,7 +162,7 @@ Qwen3.8-27B (`qwen3_8_27b`) is the Qwen3.5 architecture and runs on the same cod
 mstar serve qwen3_8_27b --gpus 0,1,2,3
 ```
 
-Its `output_gate_type: swish` names the gated DeltaNet norm's activation, which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores the key and hard-codes SiLU. Video is still refused and the MTP head is skipped. The chat template's new `reasoning_effort` and `preserve_thinking` are not forwarded: every request gets the template's defaults (`xhigh` and preserved), whatever the client sends.
+Its `output_gate_type: swish` names the gated DeltaNet norm's activation, which is the SiLU every Qwen3.5 checkpoint already uses. transformers ignores the key and hard-codes SiLU. Video is still refused and the MTP head is skipped. The chat template's new `reasoning_effort` and `preserve_thinking` are not forwarded: every request gets the template's defaults (`xhigh` and preserved), whatever the client sends, and a request that sends one is logged as ignoring it.
 
 ## Command A+ (`command_a_plus`) {#command-a-command-a-plus}
 

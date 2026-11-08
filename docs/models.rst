@@ -582,7 +582,7 @@ the key and hard-codes SiLU. Video is still
 refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
-client sends.
+client sends, and a request that sends one is logged as ignoring it.
 
 Command A+ (``command_a_plus``)
 -------------------------------
