@@ -4,6 +4,7 @@ stubbed — proves the HTTP surface, the msgpack bridge protocol, and the
 error path end to end without GPUs. Skipped unless the ``mstar_rust``
 extension is installed and the server binary is built
 (``cargo build --release`` in ``rust/server/``)."""
+import base64
 import contextlib
 import dataclasses
 import json
@@ -998,7 +999,12 @@ def test_streaming_generate_carries_a_late_errors_status_in_band():
         code, lines = _generate_stream(port)
     assert code == 200
     assert lines[0]["modality"] == "text"
-    assert lines[-1] == {"error": "Error in worker: boom", "status": 503}
+    # Python's in-band error chunk (`errors_in_band`), status and all
+    assert lines[-1] == {
+        "modality": "error",
+        "data": base64.b64encode(b"Error in worker: boom").decode(),
+        "metadata": {"status": 503},
+    }
 
 
 def test_bagel_images_map_size_onto_width_and_height():
@@ -1373,3 +1379,53 @@ def test_generate_refuses_a_body_that_is_not_a_form_as_python_does(ctype, body, 
     with _model_stack("qwen3_omni", _StubAPIServer()) as (port, _upload):
         status, got = _post_raw(port, "/generate", body, content_type=ctype)
     assert (status, got) == (py.status_code, py.json()) and status == 400
+
+
+class _FailsAfterTwoChunksStub(_StubAPIServer):
+    """Two chunks, then a backend failure after the 200 has gone out."""
+
+    async def iter_result_chunks(self, request_id):
+        yield _Chunk("text", b"Hel", {"token_ids": [1]})
+        yield _Chunk("audio", bytes(range(256)) * 4, {"sample_rate": 24000})
+        yield _Chunk("error", b"Error in worker: boom", {"status": 500})
+
+
+@pytest.mark.parametrize("binary", [False, True], ids=["ndjson", "frames"])
+def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
+    """The bytes each frontend writes for the same chunks parse to the same
+    items: NDJSON lines, or ``Accept: application/vnd.mstar.frames`` frames,
+    and a failure after the 200 as Python's in-band ``error`` chunk."""
+    import io
+    import urllib.parse
+
+    from mstar.api_server.entrypoint import _chunk_to_binary_frame, _chunk_to_ndjson_payload
+    from mstar.client.media import BINARY_STREAM_MEDIA_TYPE, iter_binary_frames
+
+    stub = _FailsAfterTwoChunksStub()
+    sent = [
+        _Chunk("text", b"Hel", {"token_ids": [1]}),
+        _Chunk("audio", bytes(range(256)) * 4, {"sample_rate": 24000}),
+        _Chunk("error", b"Error in worker: boom", {"status": 500}),
+    ]
+    if binary:
+        python_body = b"".join(b"".join(_chunk_to_binary_frame(c)) for c in sent)
+    else:
+        python_body = "".join(_chunk_to_ndjson_payload(c) for c in sent).encode()
+
+    def items(body: bytes):
+        if binary:
+            return [(f["modality"], f["bytes"], f["metadata"])
+                    for f in iter_binary_frames(io.BytesIO(body))]
+        return [(m["modality"], m["data"], m["metadata"]) for m in map(json.loads, body.splitlines())]
+
+    data = urllib.parse.urlencode({"text": "hi", "output_modalities": "text,audio"}).encode()
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if binary:
+        headers["Accept"] = BINARY_STREAM_MEDIA_TYPE
+    with _model_stack("qwen3_omni", stub) as (port, _up):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/generate", data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            ctype, vary, rust_body = r.headers["Content-Type"], r.headers["Vary"], r.read()
+    assert ctype == (BINARY_STREAM_MEDIA_TYPE if binary else "application/x-ndjson")
+    assert vary == "Accept"
+    assert items(rust_body) == items(python_body)

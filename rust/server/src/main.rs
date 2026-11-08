@@ -1184,6 +1184,12 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // A substring match, as Python's: the vendor type is in no other range.
+    let binary = req
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains(BINARY_STREAM_MEDIA_TYPE));
 
     // Every field is a form field, as in Python: another body (JSON, say) would
     // parse as an empty form and be submitted as an empty request.
@@ -1228,7 +1234,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         }
         return generate_finish(
             st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
-            request_id, uploads, Vec::new(),
+            request_id, uploads, Vec::new(), binary,
         )
         .await;
     }
@@ -1322,7 +1328,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
 
     generate_finish(
         st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
-        request_id, uploads, parts,
+        request_id, uploads, parts, binary,
     )
     .await
 }
@@ -1366,6 +1372,7 @@ async fn generate_finish(
     request_id: Option<String>,
     uploads: SavedUploads,
     mut parts: Vec<Part>,
+    binary: bool,
 ) -> Response {
     // An empty field means none, as the Python /generate's form parsing reads
     // its optional fields.
@@ -1462,20 +1469,30 @@ async fn generate_finish(
             Ok(base) => base,
             Err((status, message)) => return detail_error(status, &message),
         };
-        let body = base.map(|item| {
-            Ok::<Bytes, Infallible>(Bytes::from(match item {
-                Out::Chunk(c) => ndjson_line(&c),
-                // after the 200 is committed the status travels in-band
-                Out::Error { status, message } => {
-                    let mut s = json!({"error": message, "status": status}).to_string();
-                    s.push('\n');
-                    s.into_bytes()
-                }
-            }))
+        let body = base.flat_map(move |item| {
+            let chunk = match item {
+                Out::Chunk(c) => c,
+                // After the 200 the status travels in-band, as the error chunk
+                // Python's `errors_in_band` ends the stream with.
+                Out::Error { status, message } => ResultChunk {
+                    modality: "error".to_string(),
+                    data: message.into_bytes(),
+                    metadata: json!({"status": status}),
+                },
+            };
+            let pieces = if binary {
+                let (header, payload) = binary_frame(chunk);
+                vec![header, payload]
+            } else {
+                vec![Bytes::from(ndjson_line(&chunk))]
+            };
+            futures::stream::iter(pieces.into_iter().map(Ok::<Bytes, Infallible>))
         });
+        let media_type = if binary { BINARY_STREAM_MEDIA_TYPE } else { "application/x-ndjson" };
         return Response::builder()
-            .header("content-type", "application/x-ndjson")
+            .header("content-type", media_type)
             .header("cache-control", "no-cache")
+            .header("vary", "Accept")
             .body(Body::from_stream(body))
             .unwrap();
     }
@@ -1517,6 +1534,25 @@ fn remove_uploads(upload_dir: &std::path::Path, file_paths: &BTreeMap<String, Ve
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// `Accept`ed on `/generate` for length-framed chunks (Python's
+/// `BINARY_STREAM_MEDIA_TYPE`).
+const BINARY_STREAM_MEDIA_TYPE: &str = "application/vnd.mstar.frames";
+
+/// One chunk as Python's `_chunk_to_binary_frame` writes it: a JSON header
+/// line naming the payload's length, then the payload as is, which spares a
+/// video frame the base64 and JSON passes of the NDJSON form.
+fn binary_frame(c: ResultChunk) -> (Bytes, Bytes) {
+    let mut header = json!({
+        "modality": c.modality,
+        "nbytes": c.data.len(),
+        "metadata": c.metadata,
+    })
+    .to_string()
+    .into_bytes();
+    header.push(b'\n');
+    (Bytes::from(header), Bytes::from(c.data))
 }
 
 fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
@@ -1736,7 +1772,7 @@ mod tests {
         uploads.paths = file_paths;
         let resp = generate_finish(
             st, Some("hi".into()), input.map(str::to_string), output.into(), streaming,
-            false, None, None, uploads, Vec::new(),
+            false, None, None, uploads, Vec::new(), false,
         )
         .await;
         let (status, _, data) = body(resp).await;
