@@ -998,11 +998,17 @@ def referenced(timeline, number, repo):
     return signals, mentions
 
 
+# The first character of anything that can start markup, a link, or a reference to a person, issue or commit.
+MARKUP = re.compile(r"(?i)(?:[@#<&\\]|\](?=\()|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))(?!\u200b)")
+
+
 def safe(text):
-    """Untrusted text for the status issue: redacted, on one line, unable to ping anyone, open a comment or
-    mark another issue's timeline, in plain characters or in entity or backslash spellings of them."""
-    return (redact(" ".join(str(text or "").split())).replace("\\", "\\\\").replace("&", "&amp;")
-            .replace("@", "@\u200b").replace("<!--", "&lt;!--").replace("#", "#\u200b"))
+    """Untrusted text for an issue or comment: redacted, on one line, and with a zero-width space after the first
+    character of every `@`, `#`, `<`, `&`, `\\`, `](`, `![`, `://`, `GH-` and `www.`, in any case. So it can't ping
+    anyone, mark another issue's timeline, link, load an image, open HTML or a comment, or spell any of those as an
+    entity or a backslash escape. Nothing is escaped, so text in a code span still reads right and a second pass
+    changes nothing."""
+    return MARKUP.sub("\\g<0>\u200b", redact(" ".join(str(text or "").split())))
 
 
 def szz(commits, shas, number, files, bug_prs=(), since=""):
@@ -1145,12 +1151,11 @@ def monitor(out, repo, approvals=""):
 # ---------------------------------------------------------------- improve (a weekly job)
 
 def scrub(text):
-    """Comment or model text for the weekly improvement run: `safe`, clipped, and without names, links,
-    markup or references, so it can't name anyone, load an image or mark a PR's timeline."""
-    text = re.sub(r"(?i)[a-z][a-z0-9+.-]*://[^\s`]+|(?<![\w./-])//[^\s`]+|\bwww\.[^\s`]+", "[link]",
+    """Comment or model text for the weekly improvement run: `safe` and clipped, with names and links taken out,
+    which `safe` only makes inert."""
+    text = re.sub(r"(?i)[a-z][a-z0-9+.-]*://[^\s`]+|(?<![a-z0-9])www\.[^\s`]+", "[link]",
                   re.sub(r"@[\w-]+", "@someone", str(text or "")))
-    return (safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "<\u200b")
-            .replace("](", "]\u200b("))[:IMPROVE_TEXT]
+    return safe(text)[:IMPROVE_TEXT]
 
 
 def monday(now):

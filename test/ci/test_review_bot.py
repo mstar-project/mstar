@@ -784,7 +784,7 @@ class TestImprove(unittest.TestCase):
     def test_a_post_is_redacted_on_stdin_with_links_kept_in_the_repository(self):
         secret = "sk-ant-" + "a1b2c3d4" * 3
         change = ("ask @a-person about #7, see https://evil.example/x.png HTTPS://evil.example/x www.evil.example/a "
-                  '![x](HTTP://evil.example/x.png) <img src="//evil.example/x.png"> [y](//evil.example) GH-123')
+                  '![x](HTTP://evil.example/x.png) <img src="//cdn.example/x.png"> [y](//cdn.example) GH-123')
         item = {"title": f"leak {secret}", "change": change, "where": "bot.py",
                 "evidence": ["https://github.com/o/r/pull/5#discussion_r1", "https://evil.example/y",
                              "https://github.com/o/r/../../evil/phish", "https://github.com/o/r/%2e%2e/%2e%2e/evil/phish"]}
@@ -798,22 +798,28 @@ class TestImprove(unittest.TestCase):
         self.assertIn("[REDACTED]", issue["body"])
         self.assertFalse(any(secret in " ".join(argv) for argv, _ in fake.calls), "text reached the command line")
         self.assertIn("https://redirect.github.com/o/r/pull/5#discussion_r1", issue["body"])
-        for text in ("evil.example", "a-person", "<img", "GH-123", "phish"):
+        for text in ("evil.example", "a-person", "<img", "](//", "GH-123", "phish"):
             self.assertNotIn(text, issue["body"])
 
-    def test_scrub_leaves_no_link_image_mention_or_reference_in_any_spelling(self):
+    def test_safe_and_scrub_leave_no_link_image_mention_or_reference_in_any_spelling(self):
         for text in ("![x](https&colon;&sol;&sol;evil.example/x.png)", "![w](https:\\/\\/evil.example/x.png)",
-                     "[w](/\\/evil.example)", "[z](http:evil.example/x)", "&commat;someone", "&num;99"):
-            with self.subTest(text):
-                scrubbed = bot.scrub(text)
-                self.assertNotIn("](", scrubbed, "it would render as a link or load an image")
-                self.assertNotRegex(scrubbed, r"&(?!amp;)", "an entity would render as the character it spells")
-                self.assertNotRegex(scrubbed, r"(?<!\\)\\(?!\\)", "a backslash would hide a link from the pattern")
+                     "[w](/\\/evil.example)", "[z](http:evil.example/x)", "&commat;someone", "&num;99", "@someone",
+                     "#99", "<!-- x", "<img src=x>", "GH-5", "gh-5", "_GH-123_", "https://github.com/o/r/issues/5",
+                     "![x](https://evil.example/x.png)", "www.evil.example", "_www.evil.example_"):
+            for fn in (bot.safe, bot.scrub):
+                with self.subTest(text, fn=fn.__name__):
+                    out = fn(text)
+                    self.assertNotRegex(out, r"(?i)\]\(|!\[|://|gh-|www\.", "it would render or mark a timeline")
+                    self.assertNotRegex(out, "[@#<&\\\\](?!\u200b)", "it would ping, open markup or spell another")
+                    self.assertEqual(bot.safe(bot.safe(text)), bot.safe(text), "a second pass would change it")
 
-    def test_scrub_keeps_ordinary_text_readable(self):
-        for text in ("a//b", "use n//2 here", "path/to//file.py", "`a//b`", "`List<int>`"):
-            with self.subTest(text):
-                self.assertEqual(bot.scrub(text).replace("\u200b", ""), text, "ordinary text would read as a link")
+    def test_safe_and_scrub_keep_ordinary_text_readable(self):
+        for text in ("a//b", "use n//2 here", "path/to//file.py", "//TODO", "`a//b`", "`List<int>`", "`a && b`",
+                     "`&self`", "`\\n`"):
+            for fn in (bot.safe, bot.scrub):
+                with self.subTest(text, fn=fn.__name__):
+                    self.assertEqual(fn(text).replace("\u200b", ""), text, "it would read as a link or escape")
+                    self.assertEqual(bot.safe(bot.safe(text)), bot.safe(text), "a second pass would change it")
 
 
 if __name__ == "__main__":
