@@ -50,8 +50,8 @@ def preflight(command, perms, actor="an-author", author="an-author", assoc="CONT
         env = {**os.environ, "PATH": f"{d}:{os.environ['PATH']}", "GITHUB_OUTPUT": str(out), "REPO": "o/r",
                "KEY_SET": "true", "COMMAND": command, "ACTOR": actor, "AUTHOR": author, "ASSOC": assoc,
                "SKIP_LABEL": "false"}
-        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script("preflight", "pre")], env=env,
-                       check=True, capture_output=True)
+        subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", step_script("preflight", "pre")],
+                       env=env, check=True, capture_output=True)
         return dict(line.split("=", 1) for line in out.read_text().splitlines())
 
 
