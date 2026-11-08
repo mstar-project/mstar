@@ -87,7 +87,6 @@ SCHEMA = {
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "risk"],
 }
-FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.</sub>"
 
 
 def open_findings(review, pages):
@@ -171,7 +170,10 @@ def render(review, pages, head, mode):
     if live and mode == "gpu":
         checks = f" ({', '.join(live.get('checks') or [])})" if live["run"] != "none" and live.get("checks") else ""
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}")
-    parts.append(FOOTER)
+    # Only gpu mode can lead to an approval, by gpu_review.py's rule.
+    role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "gpu"
+            else "Advisory: this review doesn't approve or block.")
+    parts.append(f"<sub>{role} Rules: `AGENTS.md`. Reply to discuss.</sub>")
     risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
              "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "live_test": live}

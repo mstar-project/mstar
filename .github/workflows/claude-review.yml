@@ -1,7 +1,8 @@
 name: Claude Review
 
-# Advisory LLM review of PRs. Not a merge gate. Rules live in AGENTS.md;
-# the reviewer's operating instructions are in .github/review/review-prompt.md.
+# LLM review of PRs: advisory in light and thorough mode; `/review gpu` can approve by
+# the rule in gpu_review.py. Rules live in AGENTS.md; the reviewer's operating
+# instructions are in .github/review/review-prompt.md.
 #
 # Why issue_comment: a plain `pull_request` trigger withholds secrets from fork
 # PRs, so the reviewer could never review a fork's code. issue_comment runs with
@@ -447,7 +448,7 @@ jobs:
       - name: Review
         if: steps.diff.outcome == 'success'
         id: review
-        # Advisory: an API or action failure (bad key, outage, out of turns,
+        # Never red: an API or action failure (bad key, outage, out of turns,
         # timeout) never turns the PR's check red; the last step reports it.
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.prev.outputs.timeout || steps.pr.outputs.timeout || '25') }}
