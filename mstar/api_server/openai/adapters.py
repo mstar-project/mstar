@@ -226,7 +226,9 @@ def _flatten_template_kwargs(mk: dict) -> None:
     """Each ``chat_template_kwargs`` key onto a flat one, which wins. vLLM-style
     clients send template variables this way (``enable_thinking``, Muse
     Glimmer's ``reasoning_strength``); the model reads them flat, and logs a
-    key it does not read as ignored."""
+    key it does not read as ignored. A flat key the chat refusal dropped as off
+    (``logprobs: false``) counts as not sent, so a template key of that name
+    still reaches the model, and is logged as ignored."""
     template_kwargs = mk.pop("chat_template_kwargs", None) or {}
     if not isinstance(template_kwargs, dict):
         raise ValueError("chat_template_kwargs must be an object")

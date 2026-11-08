@@ -383,7 +383,8 @@ impl Adapter {
             // max_output_tokens and seed are honored.
             Adapter::Bagel => text_chat(req, mk, upload_dir, allow_remote),
             Adapter::Qwen3_5 | Adapter::Cosmos3Edge => {
-                // How vLLM-style clients send template variables; a flat key wins.
+                // How vLLM-style clients send template variables; a flat key wins,
+                // except one the refusal dropped as off (as `_flatten_template_kwargs`).
                 // Read before the attachments are saved, since a malformed value
                 // refuses the request.
                 let template_kwargs = template_kwargs(mk.remove("chat_template_kwargs").as_ref())?;
@@ -1094,6 +1095,11 @@ mod tests {
             for adapter in CHAT_ADAPTERS {
                 let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
                 assert!(args.is_ok(), "{fields} refused a plain chat on {adapter:?}");
+                let mk = args.unwrap().model_kwargs;
+                let sent: serde_json::Value = serde_json::from_str(&format!("{{{fields}}}")).unwrap();
+                for key in sent.as_object().unwrap().keys() {
+                    assert!(!mk.contains_key(key), "{key} reached the backend from {fields} on {adapter:?}");
+                }
             }
         }
     }
