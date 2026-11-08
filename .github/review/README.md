@@ -47,13 +47,13 @@ Procedural knowledge — how to run a benchmark, how to debug a hang — belongs
 
 ## One-time setup
 
-**Before merge.** Only what code can't do; the workflows make the rest themselves (the status issue, the `skip-ai-review` and `type/*` labels, the ssh key's registration with Eras) and every limit has a default.
+**Before merge.** Only what the workflows don't do themselves; they make the rest (the status issue, the `skip-ai-review` and `type/*` labels, the ssh key's registration with Eras) and every limit has a default.
 
 1. **The `mstar-review` GitHub App**, owned by `mstar-project` and installed on this repository, with repository permissions Contents: read, Issues: write, Pull requests: write and Variables: read. Put its client ID in the repository variable `REVIEW_APP_CLIENT_ID`.
 2. **The `review-bot` environment** (Settings → Environments), with deployment branches limited to the default branch so a workflow pushed on any branch can't read it (`issue_comment` runs on the default branch, so the jobs that hold the keys pass the rule). Its secrets: `REVIEW_APP_PRIVATE_KEY`, the app's private key; `REVIEW_SSH_KEY`, the one private key the live test reaches boxes with, kept on the runner and never sent to a box; `ERAS_API_KEY`, from an organization or wallet used only by CI with automatic top-up off; and `LIVE_TEST_ANTHROPIC_KEY`, the box's Anthropic key, a key of its own since the box runs PR code with a shell.
-3. **`ANTHROPIC_API_KEY`**, an organization secret on `mstar-project` scoped to this repository (Settings → Secrets and variables → Actions), billed to a project account so usage is attributable.
+3. **`ANTHROPIC_API_KEY`**, a secret available to this repository (Settings → Secrets and variables → Actions), from the workspace in item 7. A repository secret wins over an organization one of the same name, so replace any older one.
 4. **`REVIEW_SSH_KEY`'s public key on each Slurm node**, in its `extra_authorized_keys`.
-5. **`REVIEW_SLURM_NODES`**, a JSON list with one entry per node: `name`, `host` (`root@<host>`), `port` and `host_key` (the node's `ssh-ed25519 …` line, so a reused ngrok port can't impersonate it), and optionally `partition` (default `background`). **`REVIEW_SLURM_AUTHORS`**, the space-separated GitHub logins of the people already on the nodes: a live test can use Slurm only when both the PR's author and the person who commented `/review` are listed, and unset means no Slurm. Everyone else with write access still gets a live test, on Eras.
+5. Two repository variables. **`REVIEW_SLURM_NODES`**, a JSON list with one entry per node: `name`, `host` (`root@<host>`), `port` and `host_key` (the node's `ssh-ed25519 …` line, so a reused ngrok port can't impersonate it), and optionally `partition` (default `background`). **`REVIEW_SLURM_AUTHORS`**, the space-separated GitHub logins of the people already on the nodes: a live test can use Slurm only when both the PR's author and the person who commented `/review` are listed, and unset means no Slurm. Everyone else with write access still gets a live test, on Eras.
 6. **`ERAS_RUN_SECRET_ID`**: save the box's Anthropic key (`LIVE_TEST_ANTHROPIC_KEY`'s value) as an Eras secret and put its id in this repository variable.
 7. **Both Anthropic keys in one Anthropic workspace with a spend limit.** The bot has no cap of its own.
 
