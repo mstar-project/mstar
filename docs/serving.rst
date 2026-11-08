@@ -519,7 +519,9 @@ A deployment can override them per node, either with one budget for every walk
 the model budgets or with a budget per walk; null turns a walk's chunking off. A prompt
 that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
 budget if that is smaller. When less than that is left of a step's budget, the prompt waits
-for the next step rather than running the step over its budget.
+for the next step rather than running the step over its budget. Under ``fifo`` the first
+prompt in line, started or not, keeps that much of each step from the other prompts, so a
+stream of short ones cannot hold it off.
 
 A node whose resources keep state only on a grid of tokens counted from where a chunk starts
 (``Resource.chunk_alignment``) cuts its prompts to whole multiples of that grid, so each

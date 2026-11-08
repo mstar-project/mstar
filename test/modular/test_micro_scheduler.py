@@ -13,6 +13,8 @@ backlog. Three things have to hold across that split:
 
 from __future__ import annotations
 
+import collections
+import itertools
 import sys
 from types import SimpleNamespace
 
@@ -2568,6 +2570,38 @@ def test_short_prompts_cannot_starve_a_prompt_mid_prefill_under_an_alignment():
     queue.update(shorts)
     second = _next_batch(sched, manager)
     assert second.chunk_ranges.get("old") == (8, 12, 40, 4)
+
+
+def test_short_prompts_arriving_every_step_cannot_starve_a_prompt_that_has_not_started():
+    """Short prompts that each fit leave less than the floor, rounded up to the node's
+    alignment, in every step, as a KV page_size of 256 does at a 512-token budget. The first
+    prompt in line keeps the floor whether it has started or not: queued behind them, the
+    long prompt never got its first chunk."""
+    lengths = collections.defaultdict(lambda: 3, old=40)
+    sched = _chunking_scheduler(_AlignedEngine(align=4, floor=2, lengths=lengths, max_bs=64, budget=8))
+    manager = _Manager([])
+    queue = manager.queues["wg0"]._ready
+    shorts = (f"s{i}" for i in itertools.count())
+
+    def arrive(rid):
+        manager.per_request_info[rid] = object()
+        manager.walks[rid] = "prefill"
+        queue[rid] = {NODE}
+
+    arrive(next(shorts))
+    arrive("old")
+    ran = []
+    for _ in range(20):
+        for _ in range(3):
+            arrive(next(shorts))
+        batch = _next_batch(sched, manager)
+        manager.land(batch)
+        chunk = batch.chunk_ranges.get("old")
+        if chunk is not None:
+            ran.append(chunk.stride)
+            if not chunk.is_final:
+                queue["old"] = {NODE}
+    assert sum(ran) == 40, f"the long prompt ran {sum(ran)} of its 40 tokens in 20 steps"
 
 
 def test_a_walk_cap_under_the_floor_cuts_its_rows_to_the_alignment():
