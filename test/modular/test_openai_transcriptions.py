@@ -4,6 +4,7 @@ The router is mounted on a FastAPI app with a stubbed APIServer, like
 ``test_openai_router.py``; the adapters are exercised directly as well.
 """
 
+import asyncio
 import functools
 import json
 import re
@@ -843,6 +844,74 @@ def test_streamed_upload_files_are_deleted(client_and_stub):
 
 
 @requires_audio_duration
+@requires_audio_duration
+def test_a_finished_tail_frees_its_place_in_the_share(client_and_stub, monkeypatch):
+    """Tails are read as they land, so an upload whose windows all stop inside a
+    segment keeps its share instead of falling back to one window at a time."""
+    client, stub = client_and_stub
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 4)
+    tails, windows_out, seen = set(), [], []
+    real_tail, real_submit, collect = serving_transcriptions._tail, serving_transcriptions._submit, stub.collect_results
+
+    async def tail(*args):
+        window = await real_tail(*args)
+        if window is not None:
+            tails.add(id(window))
+        return window
+
+    def submit(api, adapter, req, window, streaming, inflight):
+        if id(window) not in tails:
+            windows_out.append(window)
+        return real_submit(api, adapter, req, window, streaming, inflight)
+
+    async def collect_window(request_id, raw_request=None):
+        # a tail comes back at once; a window lets the loop run first, as the engine would
+        if not any(w.request_id == request_id for w in windows_out):
+            return await collect(request_id, raw_request)
+        seen.append(len(windows_out))
+        await asyncio.sleep(0)
+        return await collect(request_id, raw_request)
+
+    monkeypatch.setattr(serving_transcriptions, "_tail", tail)
+    monkeypatch.setattr(serving_transcriptions, "_submit", submit)
+    stub.collect_results = collect_window
+    stub.next_chunks = _text("<|0.00|>", " Done.", "<|20.00|>", "<|20.40|>", " cut off")
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(8 * 30 + 25))
+    assert r.status_code == 200, r.text
+    assert len(tails) >= 7
+    # a window's tail holds a place until the next window is awaited, so the
+    # lookahead runs one behind 4; counted until read, it would stay at 4
+    assert seen[:6] == [4, 4, 5, 6, 7, 8]
+
+
+@requires_audio_duration
+def test_a_window_failing_while_a_tail_is_out_releases_the_tail(client_and_stub):
+    client, stub = client_and_stub
+    cut = _text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off")
+    stub.queued_chunks = [cut, [_Chunk("error", b"bad window", {"status": 400})], _text(" three")]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(85))
+    assert r.status_code == 400
+    # the tail went out after window 0 came back, and its read was cancelled with the request
+    assert len(stub.submits) == 4
+    assert stub.submits[3]["request_id"] in stub.released
+    assert not list(stub.upload_dir.iterdir())
+
+
+@requires_audio_duration
+def test_a_failed_tail_fails_the_upload(client_and_stub):
+    client, stub = client_and_stub
+    cut = _text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off")
+    stub.queued_chunks = [cut, _text("<|0.00|>", " Two.", "<|29.00|>"), _text("<|0.00|>", " Three.", "<|1.00|>"),
+                          [_Chunk("error", b"bad tail", {"status": 400})]]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 400
+    assert "bad tail" in r.text
+    assert not list(stub.upload_dir.iterdir())
+
+
 def test_parallel_bounds_windows_in_flight(client_and_stub, monkeypatch):
     client, stub = client_and_stub
     monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 2)

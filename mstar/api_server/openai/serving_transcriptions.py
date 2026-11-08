@@ -639,11 +639,13 @@ async def create_transcription(
 
     inflight: set[str] = set()
     share = window_share(api).join()
+    tail_reads: dict[int, asyncio.Task] = {}
     try:
         if mode == "parallel" or planner.single:
             windows = planner.fixed() if planner.single else await asyncio.to_thread(planner.fixed)
             # each tail goes to the engine as soon as its window is in, beside
             # the windows still decoding, and counts against the upload's share
+            # until its text is read, which happens as it lands
             tails: dict[int, Window] = {}
             collected = 0
             async for window in _parallel(api, adapter, req, windows, inflight, share, raw_request):
@@ -651,11 +653,12 @@ async def create_transcription(
                 if tail is not None:
                     _submit(api, adapter, req, tail, streaming=False, inflight=inflight)
                     tails[collected] = tail
+                    tail_reads[collected] = asyncio.create_task(_collect(api, tail, inflight, raw_request))
                 collected += 1
             # fewer than all means the client is gone: the tails in flight are released below
             if collected == len(windows) and tails:
-                for tail in tails.values():
-                    text = await _collect(api, tail, inflight, raw_request)
+                for index, tail in tails.items():
+                    text = await tail_reads[index]
                     if text is None:
                         break
                     tail.raw_text = text
@@ -667,6 +670,10 @@ async def create_transcription(
             windows = [w async for w in _sequential(api, adapter, req, planner, inflight, raw_request)]
         duration = planner.duration
     finally:
+        # a read cancelled before its tail finished leaves the tail in inflight for _release
+        for read in tail_reads.values():
+            read.cancel()
+        await asyncio.gather(*tail_reads.values(), return_exceptions=True)
         share.leave()
         _release(api, inflight)
         planner.cleanup()
