@@ -411,7 +411,7 @@ def review_threads(pr):
 
 def blocking(review, pages, stacked):
     """The open P0–P2 findings, by the summary's own rule (render_summary.open_findings)."""
-    return [f"{where} ({p})" for where, p in render_summary.open_findings(review, pages, stacked) if p != "P3"]
+    return [f"{where} ({p})" for where, p, _ in render_summary.open_findings(review, pages, stacked) if p != "P3"]
 
 
 def file_gate(files, repo_root):
@@ -463,7 +463,7 @@ def reasons_not_to_approve(pr, sha, verdict, since, review):
     if (review.get("risk") or {}).get("level") != "low":
         level = (review.get("risk") or {}).get("level", "unrated")
         why.append(f"the review rated the design risk {level}: a maintainer owns the decisions its summary's "
-                   "\"Where to look\" lists")
+                   "\"What's left for you\" lists")
     if review.get("questions"):
         why.append(f"{len(review['questions'])} open question(s)")
     why += to_fix_first(review, pr, "stacked-above.json")

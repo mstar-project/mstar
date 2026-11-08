@@ -80,7 +80,7 @@ turn re-reads everything read so far.
   new hunks, and load nothing else: never the whole PR's diff or a file no new hunk touches, and a
   caller only where a new hunk changes its contract, by line range. What merges of `main` brought in
   isn't the author's change; skip it. Review the whole PR again only when the earlier review skipped
-  files or reported less than this mode does (light, for a nogpu or full review). With a shell, `git
+  files. With a shell, `git
   range-diff` gives the interdiff. The bot's prompt names its files.
 - **The stack.** For a stacked PR, diff against the base PR. With a shell, find the open PRs built
   on this one (`gh pr list --base <headRefName>`, recursively) and read their code. A finding that a

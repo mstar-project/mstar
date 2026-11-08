@@ -51,7 +51,7 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
   repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
     reviewThreads(first: 100, after: $endCursor) {
       pageInfo { hasNextPage endCursor }
-      nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body } } }
+      nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
     } } } }"""
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")
@@ -434,7 +434,7 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
     if not prev:
         summaries = [c for c in conversation
                      if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
-        state = render_summary.read_state(summaries[-1]["body"], mode) if summaries else None
+        state = render_summary.read_state(summaries[-1]["body"]) if summaries else None
         last = (state or {}).get("head")
         since = f"repos/{repo}/compare/{last}...{head_sha}"
         try:

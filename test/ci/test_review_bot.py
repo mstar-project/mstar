@@ -173,7 +173,7 @@ class TestRestore(unittest.TestCase):
 
 def summary(head, mode="light"):
     state = base64.b64encode(json.dumps({"head": head, "mode": mode, "skipped": [], "outside_diff": [],
-                                         "risk": None}).encode()).decode()
+                                         "risk": None, "latent": []}).encode()).decode()
     return {"id": 3, "user": {"login": "mstar-review[bot]"}, "created_at": "t",
             "body": f"<!-- claude-review-summary -->\nx\n<!-- claude-review-state {state} -->"}
 
