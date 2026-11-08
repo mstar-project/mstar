@@ -6,6 +6,11 @@ on:
   # break main when they land together.
   push:
     branches: [main]
+  # The merge queue tests each PR merged with main and with every PR queued
+  # ahead of it, before it lands, so that break shows up here instead of on
+  # main. A check the queue requires must run on this event, or the queue
+  # waits for it forever. Each queued commit is its own concurrency group.
+  merge_group:
 jobs:
   build:
     runs-on: ubuntu-latest
