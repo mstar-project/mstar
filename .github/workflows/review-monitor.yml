@@ -35,7 +35,7 @@ jobs:
       - name: Check out main
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          # No ref: a scheduled run's event has no repository, and it checks out the default branch.
           fetch-depth: 0
           filter: blob:none
           persist-credentials: false

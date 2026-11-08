@@ -9,7 +9,7 @@ decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config `configure` writes: the team's
 Slurm node with the most GPUs free, else any open Eras listing under the hourly cap. The live
 test's files are in $RUNNER_TEMP/lt; `start` and `wait` exit 3, with `unavailable` set, when no GPUs
-are free or the bot has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md.
+are free, the bot has REVIEW_GPU_MAX_RUNS runs going or it is past a spend cap, after writing lt/unavailable.md.
 """
 import fnmatch
 import html
@@ -263,8 +263,8 @@ def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hou
           since: commit = "", forced="", asked="", asked_checks: check_kinds = (), turns: int = 2000):
     """Get GPUs and start the live-test session on them: the brief (fixed text, the commits and carry's
     call), the review's notes (findings.json) and the PR's title and description (pr-body.md) as data,
-    and the box's own Anthropic key. Exits 3, with `unavailable` set, when no GPUs are free or the bot
-    has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md."""
+    and the box's own Anthropic key. Exits 3, with `unavailable` set, when the bot is past a spend cap,
+    no GPUs are free or it has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md."""
     if run not in ("full", "targeted") or forced not in ("", *FORCED) or asked not in ("", "none", "targeted", "full"):
         raise ValueError(f"unexpected run {run!r}, forced {forced!r} or asked {asked!r}")
     lt = Path(runner_temp, "lt")
@@ -401,7 +401,9 @@ def run_cost(lt, now):
 
 def cleanup(out, pr: int, tag, runner_temp):
     """Release whatever this run launched, and delete the ssh key it registered, from the ledger and by
-    name, for a run cancelled mid-launch; then what the run's GPUs and box session cost, for the ledger."""
+    name, for a run cancelled mid-launch; and first what the run's GPUs and box session cost, for the
+    ledger, so a failed release can't lose it."""
+    out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
     print(gpu("list", check=False).stdout)
     state = gpu_py()
     for key in list(state["ledger"]()):
@@ -419,7 +421,6 @@ def cleanup(out, pr: int, tag, runner_temp):
             if i.get("name") == name and i.get("status") not in ("ended", "releasing"):
                 state["eras"]("POST", f"/instances/{i['id']}/release", {})
         state["eras_delete_key"](name)
-    out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
 
 
 # ---------------------------------------------------------------- approval
