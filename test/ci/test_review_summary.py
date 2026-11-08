@@ -155,6 +155,11 @@ class TestReviewSummary(unittest.TestCase):
         self.assertIn("<summary>and 3 more</summary>", text)
         self.assertEqual(text.count("- [ ]"), 13, "a question past the first ten would be lost")
 
+    def test_a_full_review_says_the_live_test_adds_its_own_items(self):
+        self.assertIn("The live-test comment adds its own items.", render(review(), [], "0123456789", "full", []))
+        self.assertNotIn("The live-test comment", render(review(), [], "0123456789", "full", [], salvaged=True),
+                         "a run past its turn limit gets no live test to add anything")
+
     def test_a_review_that_skipped_files_is_not_green(self):
         text = render(review(skipped=["mstar/worker/worker.py"]), [], "0123456789", "light", [])
         self.assertIn("\n🟡 **No open findings**", text, "a partial review would read as a clean one")

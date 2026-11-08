@@ -263,7 +263,8 @@ def render(review, pages, head, mode, stacked, salvaged=False):
         after = (" No live test runs: the review went past its turn limit." if salvaged
                  else " The live-test job posts its outcome in a separate comment.")
         parts.append(f"Live test: **{live['run']}**{checks}. {live['reason']}{after}")
-    parts.append(checklist(review, pages, stacked))
+    left = checklist(review, pages, stacked)
+    parts.append(f"{left} The live-test comment adds its own items." if mode == "full" and not salvaged else left)
     # Only full mode can lead to an approval, by gpu_review.py's rule.
     role = ("Any approval is posted by the live-test job, by the rule in `gpu_review.py`." if mode == "full"
             else "Advisory: this review doesn't approve or block.")

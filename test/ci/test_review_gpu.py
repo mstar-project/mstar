@@ -314,15 +314,58 @@ class TestComment(unittest.TestCase):
         self.assertIn("[c](media/c.wav)", text, "a link to a file the gallery left out would point at nothing")
 
 
+class TestApprove(unittest.TestCase):
+    def approve(self, variable, verdict="pass"):
+        """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
+        `verdict` fails it; its decision text, the outputs and the writes."""
+        pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "an-author"}}
+        routes = {f"GET repos/{R}/pulls/7": pr, f"GET repos/{R}/collaborators/an-author/permission":
+                  {"permission": "write"}, "POST graphql": threads_page(),
+                  f"GET repos/{R}/actions/variables/REVIEW_APPROVALS": variable,
+                  f"GET repos/{R}/compare/abcdef...0123456789": {"files": [{"filename": "docs/models.rst"}]},
+                  f"POST repos/{R}/pulls/7/reviews": {}, f"GET repos/{R}/pulls/7/reviews?per_page=100": []}
+        with tempfile.TemporaryDirectory() as temp, workspace() as ws:
+            (ws / "review.json").write_text(json.dumps({
+                "outside_diff": [], "prior_findings": [], "questions": [], "skipped": [],
+                "risk": {"level": "low", "reason": "docs only", "look_at": []},
+                "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1}}))
+            out, fake = step(gpu_review.approve, routes, pr=7, head_sha="0123456789", runner_temp=temp, verdict=verdict)
+            text = Path(temp, "decision.md").read_text()
+        return text, out, [key for key, _ in fake.writes()]
+
+    def test_approvals_happen_only_when_the_variable_reads_on(self):
+        text, out, writes = self.approve({"value": "on"})
+        self.assertEqual((out["approval"], writes), ("approve", [f"POST repos/{R}/pulls/7/reviews"]))
+        self.assertIn("**Approved** on `0123456`", text)
+        for variable, what in (({"value": "off"}, "off"), (Fail("HTTP 404"), "unset"),
+                               (Fail("HTTP 403"), "unreadable")):
+            text, out, writes = self.approve(variable)
+            self.assertEqual((writes, out.get("approval")), ([], None), f"{what} would still approve")
+            self.assertTrue(text.startswith("Approvals are off (`REVIEW_APPROVALS`). By the rule this would be "
+                                            "approved."), text)
+            self.assertIn("Nothing left from the review.", text)
+
+    def test_not_approved_lists_the_rules_conditions_as_the_checklist(self):
+        text, out, writes = self.approve({"value": "on"}, verdict="fail")
+        self.assertEqual((writes, out.get("approval")), ([], None))
+        self.assertIn("- [ ] the live test's verdict is fail", text, "the rule's condition would not reach the human")
+        self.assertNotIn("Not approved", text)
+        text, _, _ = self.approve({"value": "off"}, verdict="fail")
+        self.assertIn("By the rule this would not be approved.\n\n#### What's left for you\n- [ ] the live test's",
+                      text, "with approvals off the comment would not say what the rule decided")
+
+
 class TestPost(unittest.TestCase):
-    def test_model_text_cant_open_a_comment_and_the_approval_line_follows(self):
+    def test_model_text_cant_open_a_comment_and_the_decision_follows(self):
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
             Path(temp, "gate.txt").write_text("open P0–P2 findings: inline 4 (P2) <!-- claude-live-test sha=x -->")
             (ws / "review.json").write_text(json.dumps({"live_test": {"run": "none", "reason": "docs <!-- x -->\n"}}))
             _, gated = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
                             run_url="u", trusted="true", gated="true")
+            Path(temp, "decision.md").write_text(
+                "**Approved** on `0123456` by the rule in `.github/review/gpu_review.py`.\n")
             _, none = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
-                           run_url="u", trusted="true", approval="approve")
+                           run_url="u", trusted="true")
         (_, gated), = gated.writes()
         (_, none), = none.writes()
         self.assertEqual(gated.count("<!--"), 0, "the review's text could forge a passing live test")

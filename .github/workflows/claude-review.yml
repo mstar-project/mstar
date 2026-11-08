@@ -631,7 +631,8 @@ jobs:
         run: python3 .github/review/gpu_review.py publish
 
       # Minted here, after the live test, since the app's token lasts an hour:
-      # everything below that posts or approves uses it.
+      # everything below that posts or approves uses it. Reading REVIEW_APPROVALS
+      # takes the app's token (the job's own can't read variables), right before approving.
       - name: Mint the review app's token
         if: always() && vars.REVIEW_APP_CLIENT_ID != ''
         id: app
@@ -643,6 +644,7 @@ jobs:
           permission-contents: read
           permission-issues: write
           permission-pull-requests: write
+          permission-actions-variables: read
 
       - name: Decide approval
         if: always() && (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '')
@@ -664,7 +666,6 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
-          APPROVAL: ${{ steps.approve.outputs.approval }}
           APPROVE_OUTCOME: ${{ steps.approve.outcome }}
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
           GATED: ${{ steps.carry.outputs.gated }}
