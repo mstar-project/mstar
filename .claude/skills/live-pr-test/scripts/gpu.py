@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import fcntl
 import json
 import os
@@ -840,7 +841,8 @@ def terminate(key: str, e: dict) -> None:
 def eras_sweep_keys() -> None:
     """Best effort: delete the ssh keys launches registered (each named after its instance) whose
     instance has ended or is gone. A key can't go while its instance releases, so each terminate
-    deletes those earlier ones left."""
+    deletes those earlier ones left. One under 15 minutes old may be a launch's in progress, its
+    instance not created yet."""
     try:
         live = {i.get("name") for i in eras("GET", "/instances", params={"page_size": 100}).get("items") or []
                 if i.get("status") != "ended"}
@@ -848,8 +850,10 @@ def eras_sweep_keys() -> None:
     except ApiError as err:
         print(f"gpu.py: ssh keys not swept: {err}", file=sys.stderr)
         return
+    recent = time.time() - 900
     for k in keys:
-        if str(k.get("name")).startswith(job_prefix({}, "eras")) and k["name"] not in live:
+        created = datetime.datetime.fromisoformat(k["created_at"].replace("Z", "+00:00")).timestamp()
+        if str(k.get("name")).startswith(job_prefix({}, "eras")) and k["name"] not in live and created < recent:
             try:  # one a later launch reuses (same public key) stays while that instance holds it
                 eras("DELETE", f"/ssh-keys/{k['id']}")
             except ApiError as err:

@@ -8,6 +8,7 @@ import os
 import runpy
 import subprocess
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -295,8 +296,13 @@ class TestEras(unittest.TestCase):
             if path == "/instances":  # this one is releasing, an earlier one ended, another is gone
                 return {"items": [{"name": "live-pr-7-1-1", "status": "releasing"},
                                   {"name": "live-pr-6-1-1", "status": "ended"}]}
-            return {"items": [{"id": "k1", "name": "live-pr-7-1-1"}, {"id": "k2", "name": "someone's laptop"},
-                              {"id": "k3", "name": "live-pr-6-1-1"}, {"id": "k4", "name": "live-pr-5-1-1"}]}
+            # k5 is a launch's in progress: registered just now, its instance not created yet.
+            old, now = "2026-01-01T00:00:00Z", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            return {"items": [{"id": "k1", "name": "live-pr-7-1-1", "created_at": old},
+                              {"id": "k2", "name": "someone's laptop", "created_at": old},
+                              {"id": "k3", "name": "live-pr-6-1-1", "created_at": old},
+                              {"id": "k4", "name": "live-pr-5-1-1", "created_at": old},
+                              {"id": "k5", "name": "live-pr-8-1-1", "created_at": now}]}
 
         globs = GPU["terminate"].__globals__
         saved = {k: globs[k] for k in ("eras", "STATE", "LEDGER")}
@@ -307,7 +313,8 @@ class TestEras(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             GPU["terminate"]("eras:i-1", e)
         self.assertEqual([c[1] for c in calls if c[0] == "DELETE"], ["/ssh-keys/k3", "/ssh-keys/k4"],
-                         "a key Eras wouldn't delete while its instance released would stay forever")
+                         "a key Eras wouldn't delete while its instance released would stay forever, or a launch "
+                         "in progress would lose its key")
         # A key Eras won't delete yet: the release stands, and the watchdog stops.
         in_use = True
         GPU["save_ledger"]({"eras:i-1": e})
