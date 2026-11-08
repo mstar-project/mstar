@@ -322,11 +322,11 @@ def test_a_values_read_and_write_captured_address_the_rows_each_replay_plans():
     for rid in "abcd":
         pool.ingest_request(rid)
     handle = ArrayHandle(array, {"state": pool}, None)
-    start = {"h": torch.full(SHAPE, 100.0, device="cuda")}
+    handle.set_start({"h": torch.full(SHAPE, 100.0, device="cuda")})
     inc = torch.zeros(4, *SHAPE, device="cuda")
 
     def forward():
-        fields = handle.read(0, start=start).fields
+        fields = handle.read(0).fields
         handle.write(0, h=fields["h"] + inc, n=fields["n"] + 1)
 
     def declared(step, ctx) -> SubmoduleStep:
