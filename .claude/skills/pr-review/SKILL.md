@@ -76,8 +76,8 @@ turn re-reads everything read so far.
   An agent with a shell gets them with `gh pr view <n> --json title,body,baseRefName,headRefName,files`,
   `git fetch origin pull/<n>/head:pr<n>` and `git diff origin/main...pr<n>`.
 - **A re-review** of a PR reviewed before covers only what changed since: the commits since that
-  review, or after a force-push, a rebase or a merge of `main` the interdiff (the PR's own hunks whose
-  changes differ from its diff then, and what it dropped). Re-check every earlier finding by reading
+  review, or after a force-push, a rebase or a merge of `main` the interdiff (each file whose patch
+  differs from its patch then, line numbers aside, new and old). Re-check every earlier finding by reading
   the lines it cites, review only the new and dropped hunks, and load nothing else: never the whole
   PR's diff or a file no new or dropped hunk touches, and a caller only where a new hunk changes its
   contract, by line range. Review the whole PR again only when the earlier review skipped files. With a shell, `git

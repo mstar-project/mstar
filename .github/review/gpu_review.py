@@ -811,7 +811,7 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
         body = f"<!-- claude-live-test sha={head_sha} verdict=unavailable -->\n" + text(lt / "unavailable.md")
     else:  # the review chose `none` and it stood
         reason = (json.loads(Path("review.json").read_text()).get("live_test") or {}).get("reason")
-        reason = bot.jq_text("" if reason is None else reason).replace("<!--", "&lt;!--").rstrip("\n")
+        reason = str("" if reason is None else reason).replace("<!--", "&lt;!--").rstrip("\n")
         body = f"<!-- claude-live-test-none -->\nNo GPU run: {reason}\n"
     decision = text(Path(runner_temp, "decision.md"))  # what approve decided: one approval line, or the checklist
     if decision:
