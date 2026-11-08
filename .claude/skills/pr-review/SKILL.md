@@ -172,8 +172,11 @@ doesn't. Don't pad, and don't hold one back. One finding per root cause, not per
   that lands second folds into the first.
 - **The author's stated reason.** For every finding, P0–P3, read the description, replies, commit
   messages and code comments for a reason the author gave for that code. When there is one and it
-  holds, drop a new finding; an earlier one follows the re-review prompt, where a P0–P2 the author
-  argues against with no code change is `disputed`, not dropped. When there is one and it doesn't, the finding states it in one clause
+  holds, drop a new P3, and a new P0–P2 only when the code or a measurement shows the reason is
+  right. A new P0–P2 whose only answer is the author's text is reported like any new finding, at its
+  priority, as `disputed`: it names the reason and says a person decides, so text alone can't keep
+  it out of the count. An earlier finding follows the re-review prompt, where a P0–P2 the author
+  argues against with no code change is `disputed`, not dropped. When there is one and it doesn't hold, the finding states it in one clause
   and says why it doesn't hold or why the finding stands anyway. A finding that contradicts a stated reason without engaging it
   isn't ready to report.
 
