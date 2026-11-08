@@ -3,8 +3,7 @@ name: Review bot improvements
 # Once a week, one issue listing what the review bot could improve about itself, from the past
 # week's evidence (bot.py, improve_inputs). It never edits code, opens a PR or changes the bot.
 # The model has the review's restrictions and no web; everything it reads is untrusted data
-# (improve-prompt.md). Its job can't write issues: the issue and the ledger comment come
-# from a job of their own, as in claude-review.yml.
+# (improve-prompt.md). Its job can't write issues: the issue comes from a job of its own.
 
 on:
   schedule:
@@ -28,7 +27,6 @@ jobs:
     outputs:
       run: ${{ steps.inputs.outputs.run }}
       result: ${{ steps.improve.outputs.structured_output }}
-      usage: ${{ steps.usage.outputs.record }}
     permissions:
       contents: read
       issues: read
@@ -74,7 +72,6 @@ jobs:
 
       - name: Record usage
         if: always() && steps.inputs.outputs.run == 'true'
-        id: usage
         continue-on-error: true
         env:
           PR: ""
@@ -91,7 +88,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      # The week's issue and the ledger comment.
+      # The week's issue.
       issues: write
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,8 +100,7 @@ jobs:
           sparse-checkout: .github/review
           persist-credentials: false
 
-      - name: Record the cost and open the issue
+      - name: Open the issue
         env:
           OUTPUT: ${{ needs.improve.outputs.result }}
-          USAGE: ${{ needs.improve.outputs.usage }}
         run: python3 .github/review/bot.py improve_post
