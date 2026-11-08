@@ -31,7 +31,7 @@ Probes that found bugs our earlier runs missed, from human reviews of the same P
 | --- | --- |
 | `mstar/model/<family>/` only | that family's functional suite and its perf suite at its usual concurrency, PR vs main |
 | new model (new `mstar/model/<family>/`, new `DEFAULT_CONFIGS` entry) | functional suite with media for every request type it serves; competitor benchmark per the benchmarking skill ("Profiling a gap against another engine") |
-| `mstar/worker/`, `mstar/engine/engine.py`, `mstar/engine/cuda_graph_runner.py`, `mstar/graph/`, `mstar/conductor/` | **worker A/B set** below |
+| `mstar/worker/`, `mstar/engine/engine.py`, `mstar/engine/accelerator_graph_runner.py`, `mstar/graph/`, `mstar/conductor/` | **worker A/B set** below |
 | `mstar/engine/resources/<kind>` | the worker A/B rows whose models declare that resource (grep `get_node_resources` for the class), plus the PR's own model |
 | `mstar/distributed/`, `mstar/model/components/distributed/`, anything TP/SP | the TP rows of the worker A/B set |
 | `mstar/communication/`, `rust/`, `mstar/graph/` runtime | worker A/B set. Every functional and risk check runs on both the Rust and the Python runtime (`MSTAR_RUST_ZMQ=0 MSTAR_RUST_GRAPH=0`), plus a functional smoke over `--tensor-comm-protocol TCP` (untimed) (AGENTS.md invariant 5) |

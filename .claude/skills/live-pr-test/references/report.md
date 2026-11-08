@@ -81,6 +81,8 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 - Before writing "Not tested" or calling a row indirect, read the description's own evidence table and check the route can reach the case at all (`/v1/images/edits` drops `n`). Cite the description's direct measurement where it exists.
 - Say on the row when a served probe never reached the changed code (it died upstream, or the conductor dropped it before ingest); count hits at the changed code, as a probe on the receive cache did for #623.
 - A gap against the description's number (TTFA, throughput) is only "worth a look on the author's side" after running the description's own client and inputs too. When your absolute speed is several times the author's, find the stack difference (compile, config) before comparing anything else.
+- A result that rests on a hook, patch or injected fault outside the repo attaches its source (a collapsed block is fine), so the author can replay the same fault.
+- Quote an error as its whole log line, with the process that logged it and how many times it appeared, so the author can match it to a known failure.
 - No suggested fixes built on a mechanism you haven't checked; check a timing claim ("the window re-arms on each refusal") against log timestamps before writing it.
 - Report what was run, including what failed or was skipped. A suite that could not run is a "Not tested" line, never silently dropped.
 - Length-sensitive metrics (req/s, audio-sec/s, RTF tails) only compare when output volume matches; check `Output bytes` first (benchmarking skill, trap 3).
