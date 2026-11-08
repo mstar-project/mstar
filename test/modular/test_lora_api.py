@@ -63,7 +63,7 @@ from mstar.engine.resources.step import AdmitRuntimeError  # noqa: E402
 from mstar.model.base import KVLabel, PrefixKeys  # noqa: E402
 from mstar.testing_utils.engine import make_engine  # noqa: E402
 from mstar.testing_utils.model import make_model  # noqa: E402
-from mstar.testing_utils.worker import make_worker  # noqa: E402
+from mstar.testing_utils.worker import deliver, make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -444,9 +444,10 @@ def test_the_conductors_ops_update_each_workers_copy_of_the_spec(paths):
 
 
 def _finish_when_read(worker):
-    if worker._lora_loads:
-        wait([f for load in worker._lora_loads._loads for _, f in load.reads], timeout=30)
-        worker._finish_lora_loads()
+    loads = worker.ingest.lora_loads
+    if loads:
+        wait([f for load in loads._loads for _, f in load.reads], timeout=30)
+        loads.finish()
 
 
 class _Deployment:
@@ -486,7 +487,7 @@ class _Deployment:
         if message.message_type == WorkerMessageType.UNLOAD_LORA_ADAPTER:
             name = message.body.lora_name
             self.unload_seen.append((peer, name in self.served.adapters, self.roots.root(name)))
-        self.workers[peer]._process_message_list([message])
+        deliver(self.workers[peer], message)
         _finish_when_read(self.workers[peer])
 
     def _from_worker(self, peer, message):
@@ -540,7 +541,7 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
         if peer == "api_server":
             answers.append(message.body)
         else:
-            d.workers[peer]._process_message_list([message])
+            deliver(d.workers[peer], message)
 
     d.ops = LoraAdapterOps(
         make_spec({}, runtime_updates=True, runtime_update_timeout_s=10.0),
@@ -557,7 +558,7 @@ def test_a_retry_after_a_timeout_runs_behind_the_slow_workers_rollback(paths):
     d.ops.load(LoadLoraAdapter(op_id="op2", lora_name="a1", lora_path=paths["a1"]))
     _finish_when_read(d.workers["worker_0"])
     gate.set()
-    while d.workers["worker_1"]._lora_loads:
+    while d.workers["worker_1"].ingest.lora_loads:
         _finish_when_read(d.workers["worker_1"])
     assert answers[-1] == LoraAdapterResult(op_id="op2", status=200, served=True)
     assert all(pool.serves("a1") for pool in d.pools.values())

@@ -395,6 +395,10 @@ class Qwen3OmniModel(Model):
                     num_kv_heads=audio.encoder_attention_heads,
                     head_dim=audio.head_dim,
                     max_segments_per_request=AuTEncoderSubmodule.max_windows_per_replay(audio),
+                    # The 512 MB default costs 2 GB across both encoders and slots.
+                    # FA3 plans take none of it; FA2's captured plans split KV at
+                    # the bucket's segment ceiling, ~230 MB here at bs=8.
+                    workspace_mb=256,
                 ),
             ),
             RaggedAttentionSpec(
@@ -407,6 +411,8 @@ class Qwen3OmniModel(Model):
                     # bucket at this many; a step with more frames runs the
                     # block loop eagerly (`PackedBlockLoopEncoder._fits_capture`).
                     max_segments_per_step=VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // 256,
+                    # FA2's split-KV partials at the 8192-patch bucket: ~95 MB.
+                    workspace_mb=128,
                 ),
             ),
         ]

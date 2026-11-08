@@ -3000,7 +3000,7 @@ impl GraphRuntime {
             // EmitToClient does not carry it, and neither does any other
             // streamed edge: the receiver reads the info only alongside a
             // non-streamed one, or for a walk-driven one's consumer walk
-            // (`Worker._process_new_inputs`).
+            // (`InputIngest._process_new_inputs`).
             //
             // `is_local` is the whole point. A node in a SIBLING worker graph
             // on this worker compiles to External (Orpheus streams new_token

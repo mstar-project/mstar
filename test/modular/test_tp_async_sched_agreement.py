@@ -2,7 +2,7 @@
 
 The flag is per-rank env. A leader without it never sends a decision the
 async follower waits for; a leader with it sends heads a serial follower
-cannot always build. ``Worker._verify_tp_async_sched_agrees`` votes on the
+cannot always build. ``Lockstep.verify_async_sched_agrees`` votes on the
 per-node verdict at startup and refuses a mismatch.
 """
 
@@ -17,7 +17,7 @@ from torch.distributed import ReduceOp
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 
 
 class _Group:
@@ -37,27 +37,24 @@ class _Group:
         return out
 
 
-def _run_ranks(async_per_rank, axis):
-    """Run the check on one worker per rank of a ``node`` parallel over ``axis``;
-    return each rank's exception, or None."""
+def _run_ranks(async_per_rank):
+    """Run the check on one worker per rank of ``node``'s lockstep instance, the
+    only group it reads; return each rank's exception, or None."""
     posted = [None] * len(async_per_rank)
     barrier = threading.Barrier(len(async_per_rank), timeout=10)
     errors = [None] * len(async_per_rank)
 
     def rank(i):
         group = _Group(posted, barrier, i)
-        joint = JointGroups(
-            tp_group=group if axis == "tp" else CommGroup.trivial(),
-            sp_group=group if axis == "sp" else CommGroup.trivial(),
-        )
-        worker = types.SimpleNamespace(
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=group)
+        worker = make_worker(
             parallel_nodes={"node"},
             parallel_groups=types.SimpleNamespace(get_joint_group_for_node=lambda n: joint),
-            _tp_async_for=lambda n: async_per_rank[i],
+            tp_async_sched=async_per_rank[i],
         )
         try:
-            Worker._verify_tp_async_sched_agrees(worker)
-        except RuntimeError as exc:
+            worker.lockstep.verify_async_sched_agrees()
+        except Exception as exc:
             errors[i] = exc
 
     threads = [threading.Thread(target=rank, args=(i,)) for i in range(len(async_per_rank))]
@@ -68,13 +65,11 @@ def _run_ranks(async_per_rank, axis):
     return errors
 
 
-@pytest.mark.parametrize("axis", ["tp", "sp"])
 @pytest.mark.parametrize("flag", [True, False])
-def test_agreeing_ranks_pass(axis, flag):
-    assert _run_ranks([flag, flag], axis) == [None, None]
+def test_agreeing_ranks_pass(flag):
+    assert _run_ranks([flag, flag]) == [None, None]
 
 
-@pytest.mark.parametrize("axis", ["tp", "sp"])
-def test_mismatch_is_refused_on_every_rank(axis):
-    errors = _run_ranks([True, False], axis)
+def test_mismatch_is_refused_on_every_rank():
+    errors = _run_ranks([True, False])
     assert all(exc is not None and "disagrees" in str(exc) for exc in errors)
