@@ -346,13 +346,13 @@ class StepPipeline:
         self._apply_drains(in_flight)
         laps.lap("post_removes")
         self._set_pending(None)
-        if self._spec_pending is None and self.is_tp_follower:
-            # N is done and nothing runs. Rank 0 stamps each remove with the
-            # last step it sent, so the ones stamped with N, or with a head
-            # this rank dropped, it tore down before sending any later step.
-            # Those have landed here (``removes_ready`` gates on
-            # ``last_consumed_seq``), so this rank tears them down now, before
-            # it takes the next step.
+        if self._spec_pending is None:
+            # N is done and nothing runs, so tear down what waited behind N
+            # before the next step is built: its admit may need the pages. On a
+            # follower these include the removes rank 0 stamped with N, or with
+            # a head this rank dropped, which it tore down before sending any
+            # later step; they have landed here (``removes_ready`` gates on
+            # ``last_consumed_seq``).
             self._teardown(self.in_flight_rids)
         laps.lap("set_pending")
 
