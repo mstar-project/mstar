@@ -8,11 +8,12 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 sys.path.insert(0, ".")
 
 from mstar.engine.resources.draft.config import DRAFT_METHODS, DraftConfig, DraftMethod, DraftMode  # noqa: E402
-from mstar.engine.resources.draft.drafter import ChunkBoundary, DrafterNeeds, VerifyNode  # noqa: E402
+from mstar.engine.resources.draft.drafter import CarrySpec, ChunkBoundary, DrafterNeeds, VerifyNode  # noqa: E402
 from mstar.engine.resources.draft.startup import (  # noqa: E402
     check_deployment,
     resolve_mode,
@@ -21,6 +22,7 @@ from mstar.engine.resources.draft.startup import (  # noqa: E402
 )
 from mstar.engine.resources.kv.config import KVLayerSet, KVSpec, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PosScheme  # noqa: E402
+from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig  # noqa: E402
 from mstar.engine.resources.spec import NodeResourceSpec  # noqa: E402
 from mstar.model.submodule_base import DeviceLoopback, TokenStop  # noqa: E402
@@ -116,6 +118,7 @@ def test_a_well_shaped_node_has_no_problems():
     (_stop(walk="other"), DrafterNeeds(), "doesn't stop the decode loop"),
     (_stop(sampler="nope"), DrafterNeeds(), "no engine sampler 'nope'"),
     (_stop(sampler="plain"), DrafterNeeds(), "SamplerSpec.verifies"),
+    (_stop(), DrafterNeeds(carry=CarrySpec(8, torch.float32)), "loop-back state 'draft_carry'; it declares None"),
     (_stop(), DrafterNeeds(kv_overhang=1), "past the verify block"),
     (_stop(), DrafterNeeds(input_kinds=frozenset({"image"})), r"takes no \['text'\]"),
 ])
@@ -127,11 +130,19 @@ def test_a_node_of_the_wrong_shape_is_refused(stop, needs, pattern):
 
 
 def test_resources_that_cant_verify_are_named_and_the_base_refuses():
+    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
+
     specs = _specs(
+        state=RecurrentStateSpec("state", {NODE}, RecurrentStateConfig(
+            num_layers=1, max_slots=4, blocks={"s": RecurrentBlockConfig(shape=(2,), dtype=None)},
+            disable_sink_slot=True,
+        )),
         rope=PositionSpec("rope", {NODE}, PositionConfig(kv_cache="kv_cache", scheme=PosScheme.BLOCK)),
     )
     specs["bare"] = _Unchecked("bare", {NODE})
     problems = resource_problems(_decl(), specs)
+    # a recurrent pool verifies only with a sink for its padding rows; one nobody checked never does
+    assert any("'state'" in p and "disable_sink_slot" in p for p in problems), problems
     assert any("'bare'" in p and "declares no speculative decoding support" in p for p in problems), problems
     assert any("'rope'" in p and "doesn't follow the KV length" in p for p in problems), problems
 
@@ -419,3 +430,21 @@ def test_a_model_drafting_other_than_the_block_says_is_refused():
     assert len(drift) == 1 and "other than model_kwargs.draft" in drift[0]
     missing = check_draft(model, groups, specs)
     assert len(missing) == 1 and "without a model_kwargs.draft block" in missing[0]
+
+
+def test_a_carry_the_sampler_keeps_as_declared_passes():
+    """A drafter's carry lives in the sampler's loop-back state ``draft_carry``,
+    which the model declares at the drafter's width and dtype."""
+    from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+    from mstar.engine.resources.sampler.config import LoopbackState
+
+    needs = DrafterNeeds(carry=CarrySpec(8, torch.float32), chunk_boundary=ChunkBoundary.NONE)
+    decl = _decl(needs=needs)
+
+    def sampler(width, dtype):
+        state = {DRAFT_CARRY: LoopbackState(width, dtype, (0.0,) * width)}
+        return SamplerSpec("sampler", {NODE}, vocab_size=32, verifies=True, loopback_state=state)
+
+    assert shape_problems(decl, decl.token_stop, _specs(sampler=sampler(8, torch.float32))) == []
+    wrong = shape_problems(decl, decl.token_stop, _specs(sampler=sampler(4, torch.float32)))
+    assert any("declares (4, torch.float32)" in p for p in wrong), wrong
