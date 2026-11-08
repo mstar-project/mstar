@@ -60,13 +60,13 @@ def test_a_null_size_is_the_default_size():
     """An explicit null width/height, as a client's extra_body can send, is the
     default 1024x1024 a generation gets when it names no size."""
     output = _model().process_prompt(None, [], ["image"], tensors={}, width=None, height=None)
-    assert output.metadata["kv_layout"]["kv"]["main"].scratch == (1024 // 16) ** 2 + IMAGE_SENTINELS
+    assert output.metadata["state_layout"]["kv"]["main"].scratch == (1024 // 16) ** 2 + IMAGE_SENTINELS
 
 
 def test_a_null_sampling_knob_is_the_default():
     """An explicit null top_k, as a client's extra_body can send, samples with the config's top_k."""
     model = _model()
-    assert model.get_sampling_config("LLM", {"top_k": None}).top_k == model.config.top_k
+    assert model._sample_settings({"top_k": None}).top_k == model.config.top_k
 
 
 def test_an_edit_input_is_downsized_as_pil_does():

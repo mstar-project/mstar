@@ -22,11 +22,13 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from test_bagel_guidance_sink import _handles
 
 from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, StepRunner
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.state.adapters import state_steps
 from mstar.model.bagel.submodules import MIXED_TEXT, LLMSubmodule, active_labels
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -66,20 +68,21 @@ class _Harness:
         self.runner = StepRunner({"kv": self.kv, "rope": self.rope})
         self.runner.ingest_request(RID)
 
-        # declare_step reads only these off the submodule
+        # declare_step reads only this off the submodule
         self.submodule = types.SimpleNamespace(
             node_name="LLM",
-            CFG_BATCHED_LABEL=LLMSubmodule.CFG_BATCHED_LABEL,
             _get_active_labels=lambda walk, cfg: active_labels(walk, cfg, "LLM"),
         )
+        self.handles = _handles()
 
     def run(self, graph_walk: str, span: int, pos_ids=None) -> None:
         inputs = ARNodeInputs(input_seq_len=span)
         inputs.resource_step_info = True  # requires_cfg
         if pos_ids is not None:
             inputs.custom_pos_ids = pos_ids
-        step = LLMSubmodule.declare_step(
-            self.submodule, graph_walk, [RID], [inputs]
+        step = state_steps(
+            LLMSubmodule.declare_step(self.submodule, graph_walk, [RID], [inputs]), self.handles,
+            graph_walk=graph_walk,
         )
         # attention and the sampler are out of scope here
         step.steps.pop("attn", None)
@@ -219,7 +222,6 @@ def _llm_stub():
     """Everything `declare_step` and `preprocess` read off the submodule."""
     return types.SimpleNamespace(
         node_name="LLM",
-        CFG_BATCHED_LABEL=LLMSubmodule.CFG_BATCHED_LABEL,
         _get_active_labels=lambda walk, cfg: active_labels(walk, cfg, "LLM"),
         _batch_get_requires_cfg=LLMSubmodule._batch_get_requires_cfg.__get__(
             object()
@@ -229,7 +231,7 @@ def _llm_stub():
 
 def _segments_by_label(step):
     out: dict[str, set[str]] = {}
-    for segment in step.steps["kv"].segments:
+    for segment in step.segments:
         out.setdefault(segment.label, set()).add(segment.request_id)
     return out
 
@@ -249,7 +251,7 @@ def test_a_mixed_step_forks_only_its_prompt_rows():
         submodule, MIXED_TEXT, ["guided", "decoding"], [guided, decoding],
     )
 
-    kv = step.steps["kv"]
+    kv = state_steps(step, _handles(), graph_walk=MIXED_TEXT).steps["kv"]
     assert kv.pre_forks == (("main", "cfg_text"),)
     assert kv.fork_rids == {"guided"}
 

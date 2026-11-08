@@ -21,7 +21,7 @@ PORTED = (
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/pi05",
     "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
-    "mstar/model/qwen3_tts",
+    "mstar/model/qwen3_tts", "mstar/model/bagel",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states",
@@ -35,19 +35,27 @@ ALLOWED = {
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
         "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
-        "PiecewiseCallInputs", "PiecewiseCaptureShape", "decode_rows_then_prompt", "geometric_batch_sizes",
+        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
+        "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
 }
 # Exceptions for one file, by file, module and name, which a later port of the same kind mustn't inherit.
-ALLOWED_IN: dict[tuple[str, str, str], str] = {}
+ALLOWED_IN: dict[tuple[str, str, str], str] = {
+    ("mstar/model/bagel/bagel_model.py", "mstar.engine.resources", "KVReqConfig"):
+        "per-node and publish labels under CFG parallel and P/D, until P/D labels",
+}
 # Graph breaks a ported package keeps, by file and function, since no state call sits behind them.
 ALLOWED_BREAKS = {
     ("mstar/model/qwen3_omni/components/code2wav.py", "forward"): "the vocoder's transformer, which keeps no state",
     ("mstar/model/qwen3_tts/components/depth_frame/frame.py", "run"):
         "the depth kernel's Gluon launch, which a compiled decode can't trace; no state call sits behind it",
+    ("mstar/model/bagel/components/vit_encoder.py", "attend"):
+        "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
+    ("mstar/model/bagel/submodules.py", "_replay_block_loop"):
+        "the ViT region's replay, which runs its captured graph; no state call sits behind it",
 }
 
 

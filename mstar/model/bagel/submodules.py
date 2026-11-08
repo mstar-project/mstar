@@ -24,14 +24,16 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
+from mstar.engine.state import (
+    ArrayStep,
+    Fork,
+    SampleStep,
     Segment,
     SlotLease,
     SubmoduleStep,
+    at_last_token,
+    position,
+    sample,
 )
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import (
@@ -44,9 +46,7 @@ from mstar.model.bagel.components.modeling_utils import (
     vllm_vae_size,
     vllm_vit_resize,
 )
-from mstar.model.bagel.components.vit_encoder import VIT_ATTN
-from mstar.model.bagel.config import MIXED_TEXT, BagelModelConfig
-from mstar.model.higgs_audio.config import SAMPLER
+from mstar.model.bagel.config import MIXED_TEXT, SAMPLER, VIT_TOKENS, BagelModelConfig
 from mstar.model.submodule_base import (
     END_PARTITION,
     ARNodeInputs,
@@ -523,7 +523,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
                 make_static_inputs=make_static_inputs,
                 # one segment per row: `_max_images_per_request` is 1, so a
                 # request's tokens are one independently-attending image
-                attn_key=VIT_ATTN,
+                array=VIT_TOKENS,
                 total_tokens=sorted(self._accelerator_graph_token_buckets),
                 capture_batch_sizes=sorted(self._accelerator_graph_batch_sizes),
             )
@@ -903,40 +903,23 @@ class LLMSubmodule(ARNodeSubmodule):
       - prefill_vit/vae: forward [main], fork main->cfg_text at commit
       - decode: forward [main, cfg_img]
       - image_gen: the step's branches, with renormalization
-    The runner drives the declaration (forks, plans, commits); every
-    forward call names its label.
+    The runner drives the declaration (forks, plans, commits), and a forward
+    runs once over every label its step lays out, the rows label-major.
     """
 
-    # Plan label the three CFG branches share when they run as one
-    # combined plan; see declare_step.
-    CFG_BATCHED_LABEL = "_cfg_batched"
-
-    def _sample_tokens(
-        self, request_ids: list[str], logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """One token per row of this step's ``[rows, vocab]`` logits.
-
-        ``request_ids`` is the batch the forward ran on, so under capture it is
-        the slot's padding ids and ``logits`` has the padded row count — which
-        is what the graph sampler's per-row params were gathered for. The
-        engine maps the entries back onto the real ids.
-        """
-        tokens = self.node_resources["sampler"].sample(request_ids, logits)
+    def _sample_tokens(self, logits: torch.Tensor) -> torch.Tensor:
+        """One token per row of this step's ``[rows, vocab]`` logits."""
         # FlashInfer reuses its sampling output buffer across calls, so a view
         # held past the next step aliases that step's token.
-        return tokens.clone()
+        return sample(self.sampler, logits).clone()
 
-    def _sample_one(
-        self, request_ids: list[str], logits: torch.Tensor,
-    ) -> NameToTensorList:
+    def _sample_one(self, logits: torch.Tensor) -> NameToTensorList:
         """The single-request forward's output shape: one flat name -> tensors."""
-        return {"new_token": [self._sample_tokens(request_ids, logits)]}
+        return {"new_token": [self._sample_tokens(logits)]}
 
-    def _sample_per_request(
-        self, request_ids: list[str], logits: torch.Tensor,
-    ) -> BatchedModelOutput:
+    def _sample_per_request(self, logits: torch.Tensor) -> BatchedModelOutput:
         """The batched forward's output: row i of ``new_token`` is request i."""
-        return BatchedModelOutput(row_outputs={"new_token": self._sample_tokens(request_ids, logits)})
+        return BatchedModelOutput(row_outputs={"new_token": self._sample_tokens(logits)})
 
     def __init__(
         self,
@@ -971,22 +954,21 @@ class LLMSubmodule(ARNodeSubmodule):
         # (device, dtype) -> the <|vision_start|> and <|vision_end|> embeddings
         self._sentinel_embeds: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles["kv"]
+        self.sampler = handles[SAMPLER]
+
     def _get_image_pos_ids(
         self, labels: list[str],
         request_id: str,
         device: str,
         seq_len: int,
     ):
-        """Every token of an image block shares the stream's current position.
-
-        The starts come from the position resource, which owns the counters
-        (the old cache handle handed them in as a ``pos_info`` dict).
-        """
-        positions = self.node_resources["rope"]
+        """Every token of an image block shares the stream's current position."""
         return {
             label: torch.zeros(
                 seq_len, dtype=torch.int32, device=device,
-            ) + positions.position(request_id, label)
+            ) + position(self.kv, request_id, label)
             for label in labels
         }
 
@@ -1054,6 +1036,8 @@ class LLMSubmodule(ARNodeSubmodule):
                     input_seq_len=1,
                     resource_step_info=True, # requires cfg
                 ),
+                # each row's token is planned on main and cfg_img, as one plan
+                total_tokens_multiplier=2,
             ),
             PackedAcceleratorGraphConfig(
                 # max-autotune until the default compile level (mstar serve -O) is measured on this model
@@ -1233,8 +1217,7 @@ class LLMSubmodule(ARNodeSubmodule):
         labels = self._get_active_labels(graph_walk, requires_cfg)
         if graph_walk in SINGLE_NODE_DENOISE_WALKS:
             # Only the branches the walk runs: labels are ordered main,
-            # cfg_text, cfg_img, so the first n. One branch is the plain
-            # "main" step below.
+            # cfg_text, cfg_img, so the first n.
             labels = labels[:DENOISE_WALKS[graph_walk].branches]
         spans = tuple(inp.input_seq_len for inp in inputs)
 
@@ -1245,38 +1228,18 @@ class LLMSubmodule(ARNodeSubmodule):
             for label in labels
             for rid, span in zip(request_ids, spans, strict=True)
         )
-        per_label_pos_ids = {
-            label: [
-                inp.custom_pos_ids[label] for inp in inputs
-                if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
-            ] for label in labels
-        }
+        pos_ids = [
+            inp.custom_pos_ids[label] for label in labels for inp in inputs
+            if isinstance(inp.custom_pos_ids, dict) and label in inp.custom_pos_ids
+        ]
+        position_ids = torch.cat(pos_ids) if pos_ids else None
 
-        if graph_walk in SINGLE_NODE_DENOISE_WALKS and len(labels) > 1:
-            # Batched CFG: one combined plan across the active branch labels
-            # so the step runs one forward instead of n. The frozen caches
-            # never grow during flow matching, so nothing commits.
-            pos_ids = [
-                tensor for label in labels for tensor in per_label_pos_ids[label]
-            ]
-            return SubmoduleStep(cg_key_info=requires_cfg, steps={
-                "kv": KVStep(
-                    segments=segments,
-                    commit=False,
-                    combined_labels={tuple(labels): self.CFG_BATCHED_LABEL},
-                ),
-                "attn": AttentionStep(segments=segments, causal=False),
-                "rope": PositionStep(
-                    segments=segments,
-                    # keyed by plan label: the combined plan is one label, and
-                    # its ids are concatenated in the same label-major order
-                    pos_ids={
-                        self.CFG_BATCHED_LABEL: torch.cat(pos_ids)
-                    } if pos_ids else None,
-                    # the latents sit at the stream's current position every
-                    # iteration; nothing here is kept, so nothing advances
-                    advance=(0,) * len(segments),
-                ),
+        if graph_walk in DENOISE_WALKS:
+            # Flow matching: the caches are frozen and every iteration puts the
+            # latents at the same position, so nothing is kept and the counters
+            # don't move.
+            return SubmoduleStep(segments=segments, cg_key_info=requires_cfg, state={
+                "kv": ArrayStep(keep=False, position_ids=position_ids),
             })
 
         info = per_request_info or {}
@@ -1291,23 +1254,8 @@ class LLMSubmodule(ARNodeSubmodule):
             sink = frozenset(
                 (rid, label) for label in labels if label != "main" for rid in request_ids if rid not in guided_rids
             )
-        writes = graph_walk not in DENOISE_WALKS
-        if graph_walk in ("prefill_vit", "prefill_vae"):
-            pos_advance = (IMAGE_ADVANCE,) * len(segments)
-        elif not writes:
-            # Flow matching: the caches are frozen and every iteration puts the
-            # latents at the same position, so the counters must not move.
-            pos_advance = (0,) * len(segments)
-        else:
-            pos_advance = None
-        pos_ids = {
-            label: torch.cat(tensors)
-            for label, tensors in per_label_pos_ids.items() if tensors
-        }
 
-        pre_forks: tuple = ()
-        post_forks: tuple = ()
-        fork_rids = None
+        forks: tuple[Fork, ...] = ()
         row_walks = [inp.graph_walk or graph_walk for inp in inputs]
         if requires_cfg:
             if "prefill_text" in row_walks:
@@ -1319,16 +1267,20 @@ class LLMSubmodule(ARNodeSubmodule):
                     rid for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
                     if walk == "prefill_text" and rid in guided_rids and inp.chunk_start == 0
                 )
-                pre_forks = (("main", "cfg_text"),) if fork_rids else ()
+                if fork_rids:
+                    forks = (Fork(src="main", dst="cfg_text", at="start", rows=fork_rids),)
             elif graph_walk in ("prefill_vit", "prefill_vae"):
                 # cfg_text tracks the context including this image, so it
                 # forks at commit, after the step's writes have landed.
-                fork_rids = guided_rids
-                post_forks = (("main", "cfg_text"),)
+                forks = (Fork(src="main", dst="cfg_text", at="end", rows=guided_rids),)
 
         # `cg_key_info` picks among the walk's capture buckets; it must match
         # the `additional_key_info` on the configs in get_cuda_graph_configs.
-        steps: dict = {}
+        image = graph_walk in ("prefill_vit", "prefill_vae")
+        state: dict = {"kv": ArrayStep(
+            forks=forks, placeholders=sink, position_ids=position_ids,
+            advance=(IMAGE_ADVANCE,) * len(segments) if image else None,
+        )}
         # the rows whose token `postprocess` keeps
         kept_rids = frozenset(
             rid for rid, walk in zip(request_ids, row_walks, strict=True)
@@ -1341,41 +1293,21 @@ class LLMSubmodule(ARNodeSubmodule):
             # The prompt's tokens enter the repetition-penalty mask here; the
             # sampler resource adds them at plan time. Only prefill carries
             # them — a sampled token is tracked by the sampler itself.
-            steps["sampler"] = SamplerStep(
-                prefill_tracked_tokens={
+            state[SAMPLER] = SampleStep(
+                prompt_tokens={
                     rid: inp.input_ids
                     for rid, inp, walk in zip(request_ids, inputs, row_walks, strict=True)
                     if inp.input_ids is not None and walk == "prefill_text"
                 },
-                kept_rids=kept_rids,
+                kept_rows=kept_rids,
             )
         elif graph_walk == "prefill_vit":
             # prefill_vit is the last walk before decode for an image prompt,
             # so it samples the first token too (prefill_vae never does).
-            steps["sampler"] = SamplerStep(kept_rids=kept_rids)
+            state[SAMPLER] = SampleStep(kept_rows=kept_rids)
         elif graph_walk == "decode":
-            steps["sampler"] = SamplerStep()
-
-        steps.update({
-            "kv": KVStep(
-                segments=segments,
-                commit=writes,
-                pre_forks=pre_forks,
-                post_forks=post_forks,
-                fork_rids=fork_rids,
-                sink=sink,
-            ),
-            "attn": AttentionStep(
-                segments=segments,
-                causal=graph_walk in ("prefill_text", "decode", MIXED_TEXT),
-            ),
-            "rope": PositionStep(
-                segments=segments,
-                pos_ids=pos_ids or None,
-                advance=pos_advance,
-            ),
-        })
-        return SubmoduleStep(cg_key_info=requires_cfg, steps=steps)
+            state[SAMPLER] = SampleStep()
+        return SubmoduleStep(segments=segments, cg_key_info=requires_cfg, state=state)
 
     def preprocess(
         self,
@@ -1433,7 +1365,7 @@ class LLMSubmodule(ARNodeSubmodule):
         # A prefill hands back logits only when it is meant to sample this step
         # (`sample_prefill_token`); decode always does.
         if _LOGITS in out:
-            return self._sample_one(engine_inputs.request_ids, out.pop(_LOGITS)[0])
+            return self._sample_one(out.pop(_LOGITS)[0])
         return out
 
     def _forward_prefill_text(
@@ -1443,8 +1375,9 @@ class LLMSubmodule(ARNodeSubmodule):
         """embed_tokens -> LLM forward (causal, mode='und') -> KV cache update.
 
         When requires_cfg is True (image generation mode), the declared
-        step forks main -> cfg_text before anything plans, and the forward
-        runs for main and cfg_img (both see the text tokens).
+        step forks main -> cfg_text before anything plans, and one forward
+        runs over main's rows and then cfg_img's, as the step lays them out
+        (both see the text tokens).
         """
         emb = self.embed_tokens(input_ids)
         requires_cfg = kwargs.pop("requires_cfg", False)
@@ -1453,22 +1386,11 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("is_prefill", None)
         sample_token = kwargs.pop("sample_prefill_token", True)
 
-        if requires_cfg:
-            for label in ["main", "cfg_img"]:
-                out = self.language_model(
-                    emb, mode="und",
-                    label=label, **kwargs
-                )
-                if label == "main":
-                    hidden = out
-        else:
-            hidden = self.language_model(
-                emb, mode="und",
-                label="main", **kwargs
-            )
+        hidden = self.language_model(
+            torch.cat([emb, emb]) if requires_cfg else emb, mode="und", **kwargs
+        )
         if sample_token:
-            last_hidden = self.node_resources["attn"].select_last_hidden(hidden, "main")
-            logits = self.lm_head(last_hidden)
+            logits = self.lm_head(at_last_token(self.kv, hidden, label="main"))
             # `_LOGITS` is the private handoff to whichever dispatcher called:
             # the shape of a sampled token is `forward` vs `forward_batched`'s
             # to decide, and this one runs under both.
@@ -1490,14 +1412,10 @@ class LLMSubmodule(ARNodeSubmodule):
         kwargs.pop("is_prefill", None)
         sample_token = kwargs.pop("sample_prefill_token", True)
 
-        hidden = self.language_model(
-            input_embeds, mode="und",
-            label="main", **kwargs
-        )
+        hidden = self.language_model(input_embeds, mode="und", **kwargs)
 
         if sample_token:
-            last_hidden = self.node_resources["attn"].select_last_hidden(hidden, "main")
-            logits = self.lm_head(last_hidden)
+            logits = self.lm_head(at_last_token(self.kv, hidden))
             return {_LOGITS: [logits]}
         return {}
 
@@ -1520,7 +1438,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
         self.language_model(
             input_embeds, mode="gen",
-            label="main",
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
             text_mask=text_mask,
@@ -1540,8 +1457,9 @@ class LLMSubmodule(ARNodeSubmodule):
         Returns logits; token sampling is done by the engine post-forward
         (outside CUDA graph capture).
 
-        When requires_cfg is True: also forward for cfg_img to keep its
-        KV cache in sync (cfg_img tracks all text, no images).
+        When requires_cfg is True, cfg_img's row runs in the same forward,
+        after main's, to keep its KV cache in sync (cfg_img tracks all text,
+        no images).
         """
         requires_cfg = kwargs.pop("requires_cfg", False)
         kwargs.pop("cache_labels", None)
@@ -1553,17 +1471,10 @@ class LLMSubmodule(ARNodeSubmodule):
         emb = self.embed_tokens(input_ids)
 
         hidden = self.language_model(
-            emb, mode="und",
-            label="main", **kwargs
+            torch.cat([emb, emb]) if requires_cfg else emb, mode="und", **kwargs
         )
 
-        if requires_cfg:
-            self.language_model(
-                emb, mode="und",
-                label="cfg_img", **kwargs
-            )
-
-        logits = self.lm_head(hidden[-1:])
+        logits = self.lm_head(hidden[:1])
         return {_LOGITS: [logits]}
 
     def _forward_image_gen(
@@ -1651,7 +1562,6 @@ class LLMSubmodule(ARNodeSubmodule):
             # declared "main" plan.
             hidden = self.language_model(
                 empty_combined_emb, mode="gen",
-                label="main",
                 vae_token_indexes=vae_token_indexes,
                 text_indexes=text_indexes,
                 text_mask=text_mask,
@@ -1696,7 +1606,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
         hidden = self.language_model(
             batched_emb, mode="gen",
-            label=self.CFG_BATCHED_LABEL,
             vae_token_indexes=batched_vae_indexes,
             text_indexes=batched_text_indexes,
             text_mask=batched_text_mask,
@@ -1758,7 +1667,6 @@ class LLMSubmodule(ARNodeSubmodule):
 
         hidden = self.language_model(
             empty_combined_emb, mode="gen",
-            label=label,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,
             text_mask=text_mask,
@@ -1800,8 +1708,6 @@ class LLMSubmodule(ARNodeSubmodule):
         Concatenates inputs across requests, runs a single LLM forward with
         one batched attention plan, then splits outputs back per-request.
         """
-        request_ids = engine_inputs.request_ids
-
         if graph_walk == "decode":
             out = self._forward_decode_batched(
                 input_ids=input_ids,
@@ -1829,7 +1735,7 @@ class LLMSubmodule(ARNodeSubmodule):
         # `sample_prefill_token` off, which hands back no logits.
         if _LOGITS in out:
             # one `[bs, vocab]` sample for the whole batch, split per request
-            return self._sample_per_request(request_ids, out.pop(_LOGITS)[0])
+            return self._sample_per_request(out.pop(_LOGITS)[0])
         return out
 
     def _forward_decode_batched(
@@ -1840,29 +1746,21 @@ class LLMSubmodule(ARNodeSubmodule):
         """Batched decode: all requests generate 1 token each.
 
         1. Concatenate embeddings: [N, hidden] where N = num_requests
-        2. Single LLM forward over the batch (batched attention)
-        3. If any request requires CFG, run a second pass for cfg_img
-        4. lm_head -> one [N, vocab] logits tensor, sampled by the caller
+        2. Single LLM forward over the batch (batched attention); if any
+           request requires CFG, cfg_img's N rows follow main's in it
+        3. lm_head -> one [N, vocab] logits tensor, sampled by the caller
         """
         # 1. Embed and concatenate
         embs = self.embed_tokens(input_ids)
 
-        # 2. Single LLM forward (main cache, already planned)
+        # 2. Single LLM forward, as the step planned it
         hidden = self.language_model(
-            embs, mode="und",
-            label="main",
+            torch.cat([embs, embs]) if requires_cfg else embs, mode="und",
         )
 
-        # 3. CFG sync pass for cfg_img if needed (already planned)
-        if requires_cfg:
-            self.language_model(
-                embs, mode="und",
-                label="cfg_img",
-            )
-
-        # 4. lm_head over the whole batch: one [N, vocab] tensor, so the batch
+        # 3. lm_head over main's rows: one [N, vocab] tensor, so the batch
         # samples in one call rather than per-rid slice by slice.
-        return {_LOGITS: [self.lm_head(hidden)]}
+        return {_LOGITS: [self.lm_head(hidden[:embs.shape[0]])]}
 
 
     def _sentinels(self, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:

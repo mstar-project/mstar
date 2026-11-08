@@ -696,7 +696,7 @@ def test_bagel_lays_each_image_out_in_schedule_order_by_its_own_file_over_its_vi
     bagel, modalities, image_preprocess,
 ):
     output, images = _laid_out(bagel, modalities, image_preprocess=image_preprocess)
-    layout = output.metadata["kv_layout"]["kv"]["main"].spans
+    layout = output.metadata["state_layout"]["kv"]["main"].spans
     schedule = bagel._build_prefill_schedule(
         input_modalities=modalities, is_understanding=True, role_turns=output.metadata["role_turns"],
         input_signals={"text_inputs": output.new_input_tensors["text_inputs"], "image_inputs": images},
@@ -727,7 +727,7 @@ def test_bagel_keys_an_understood_image_and_otherwise_only_a_leading_text_span(b
     }
 
     keyed = {
-        name: _laid_out(bagel, *case)[0].metadata["kv_layout"]["kv"]["main"].keyed_spans
+        name: _laid_out(bagel, *case)[0].metadata.get("keyed_spans", {}).get("kv", {}).get("main")
         for name, case in cases.items()
     }
 
@@ -798,6 +798,7 @@ def test_a_chat_ending_on_images_prefills_what_upstream_interleave_inference_doe
     for walk, tensor in schedule:
         prefilled += tensor.tolist() if walk == "prefill_text" else [("image", tensor)]
     assert prefilled == reference, "a chat ending on images prefills another prompt than upstream BAGEL's"
-    assert [span.walk for span in output.metadata["kv_layout"]["kv"]["main"].spans] == [walk for walk, _ in schedule], (
+    walks = [span.walk for span in output.metadata["state_layout"]["kv"]["main"].spans]
+    assert walks == [walk for walk, _ in schedule], (
         "the layout names its writes in another order than the walks make them"
     )

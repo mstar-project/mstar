@@ -50,22 +50,21 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardConductorMetadata
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVReqConfig,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.resources import KVReqConfig
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Bidirectional,
+    Block,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
 )
-from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -80,8 +79,16 @@ from mstar.model.bagel.components.autoencoder import BagelAutoEncoder
 from mstar.model.bagel.components.language_model import BagelForCausalLM
 from mstar.model.bagel.components.modeling_utils import BagelMLPconnector, PositionEmbedding, TimestepEmbedder
 from mstar.model.bagel.components.tokenization import BagelTokenizer, add_special_tokens
-from mstar.model.bagel.components.vit_encoder import VIT_ATTN, BagelVisionModel
-from mstar.model.bagel.config import MIXED_TEXT, load_bagel_config
+from mstar.model.bagel.components.vit_encoder import BagelVisionModel
+from mstar.model.bagel.config import (
+    ATTN,
+    ATTN_IMAGE,
+    MIXED_TEXT,
+    SAMPLER,
+    VIT_ATTN,
+    VIT_TOKENS,
+    load_bagel_config,
+)
 from mstar.model.bagel.submodules import (
     CFG_WALKS,
     DENOISE_WALKS,
@@ -110,7 +117,6 @@ from mstar.model.base import (
     DECODE,
     ForwardPassArgs,
     KVLabel,
-    LabelLayout,
     Model,
     PrefixKeys,
     ProcessPromptOutput,
@@ -679,7 +685,7 @@ class BagelModel(Model):
         attachments gets its own span and no seam is re-tokenized. The schedule
         builder walks the same :func:`prefill_plan`.
 
-        Given the tensors, it also returns a ``kv_layout`` for each label the request may open.
+        Given the tensors, it also returns a ``state_layout`` for each label the request may open.
         """
         params = self._request_params(input_modalities, output_modalities, kwargs)
         if "image" in output_modalities:
@@ -776,16 +782,18 @@ class BagelModel(Model):
                 params["cfg_text_scale"], params["cfg_img_scale"],
             )
             metadata[CFG_WINDOW] = tuple(window)
-        metadata["kv_layout"] = {
-            "kv": self._kv_layout(parts, segments, images, output_modalities, params, window, role_turns),
-        }
+        layouts, keyed = self._kv_layout(parts, segments, images, output_modalities, params, window, role_turns)
+        metadata["state_layout"] = {"kv": layouts}
+        if keyed is not None:
+            metadata["keyed_spans"] = {"kv": {"main": keyed}}
         return ProcessPromptOutput(result, metadata)
 
     def _kv_layout(
         self, parts: list[PromptPart], segments: list[torch.Tensor], images: list[torch.Tensor],
         output_modalities: list[str], params: dict, window: CFGWindow | None, role_turns: bool,
-    ) -> dict[str, LabelLayout]:
-        """Each label's writes, in the order `_build_prefill_schedule` runs them.
+    ) -> tuple[dict[str, Layout], int | None]:
+        """Each label's writes, in the order `_build_prefill_schedule` runs them, and how many of ``main``'s spans
+        its keys cover, or None for every span up to the first rows span.
 
         ``main`` holds every span. A generation keys only its first span, if that is
         text: its images are resized before their walks see them, and a file's digest
@@ -822,27 +830,24 @@ class BagelModel(Model):
         spans += prompt_spans(plan, texts, "prefill_text", image)
         keyed = int(bool(spans) and spans[0].kind == "ids")
         if understanding:
-            main = LabelLayout(
-                spans=tuple(spans), growth=(("decode_loop", 1),),
-                keyed_spans=None if "image" not in output_modalities else keyed,
-            )
-            return {"main": main}
+            main = Layout(spans=tuple(spans), growth=(("decode_loop", 1),))
+            return {"main": main}, None if "image" not in output_modalities else keyed
         height, width = images[0].shape[-2:] if images else (params["height"], params["width"])
         scratch = (height // cfg.latent_downsample) * (width // cfg.latent_downsample) + IMAGE_SENTINELS
         growth = (("decode_loop", 1),) if think_mode else ()
-        main = LabelLayout(spans=tuple(spans), growth=growth, scratch=scratch, keyed_spans=keyed)
+        main = Layout(spans=tuple(spans), growth=growth, scratch=scratch)
         if not guided(window):
-            return {"main": main, "cfg_text": LabelLayout(), "cfg_img": LabelLayout()}
+            return {"main": main, "cfg_text": Layout(), "cfg_img": Layout()}, keyed
         return {
             "main": main,
-            "cfg_text": LabelLayout(
+            "cfg_text": Layout(
                 spans=tuple(spans[:-1] if spans and spans[-1].walk == "prefill_text" else spans), scratch=scratch,
             ),
-            "cfg_img": LabelLayout(
+            "cfg_img": Layout(
                 spans=tuple(span for span in spans if span.walk == "prefill_text"), growth=growth,
                 scratch=scratch if window.branches == 3 else 0,
             ),
-        }
+        }, keyed
 
     @staticmethod
     def _resize_to_fit(
@@ -895,14 +900,37 @@ class BagelModel(Model):
     # on absent, ungrouped nodes.
     _LLM_NODES = frozenset({"LLM", "LLM_cfg_text", "LLM_cfg_img"})
 
-    def _kv_config(self) -> PagedKVConfig:
-        return PagedKVConfig(
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.hidden_size // self.config.num_attention_heads,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_attention_heads,
-        )
+    def declare_state(self) -> list[Array | Sampler]:
+        """Follows the deployment: `get_worker_graphs` reads whether the CFG branches run on nodes of their own, which
+        sets the LLM's nodes and the walks its image read covers."""
+        c, vit = self.config, self.config.vit_config
+        cfg_parallel = self._has_cfg_parallel
+        llm = self._LLM_NODES if cfg_parallel else frozenset({"LLM"})
+        attend = Attend(q_heads=c.num_attention_heads)
+        text = frozenset({"prefill_text", DECODE})
+        image = frozenset(LLM_GRAPH_WALKS[cfg_parallel]) - text
+        return [
+            Array(
+                VIT_TOKENS, nodes={"vit_encoder"}, layers=frozenset(range(vit.num_hidden_layers)), max_len=0,
+                entry=KVEntry(heads=vit.num_attention_heads, head_dim=vit.hidden_size // vit.num_attention_heads),
+                reads={VIT_ATTN: Read(mask=Block(), op=Attend(q_heads=vit.num_attention_heads))},
+            ),
+            Array(
+                "kv", nodes=llm, layers=frozenset(range(c.num_hidden_layers)), max_len=c.max_position_embeddings,
+                entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.hidden_size // c.num_attention_heads),
+                labels=frozenset(NODE_TO_CFG_LABEL.values()), positions=Positions(rope=Rope(theta=c.rope_theta)),
+                # text reads causally; image tokens and denoise latents see their whole step and the prefix
+                reads={
+                    ATTN: Read(mask=Causal(), op=attend, walks=text),
+                    ATTN_IMAGE: Read(mask=Bidirectional(), op=attend, walks=image),
+                },
+            ),
+            Sampler(SAMPLER, nodes=llm, vocab_size=c.vocab_size, penalty=True),
+        ]
+
+    def kernel_settings(self) -> dict[str, dict[str, int]]:
+        # one image, hence one attending segment, per request
+        return {VIT_ATTN: {"max_segments_per_request": 1}}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         """The text walk's prompt is its token ids, and so is every step it takes.
@@ -937,54 +965,10 @@ class BagelModel(Model):
             repo_id=self.model_path_hf, cache_dir=self.cache_dir,
         )
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The KV cache, the attention over it, positions, and the sampler,
-        plus the ViT's own cacheless attention.
-
-        The labels here are the names the layers bind against
-        (``Attention(attn_key=..., kv_key=..., pos_key=...)``) and the names
-        ``declare_step`` keys its resource steps by, so they are one
-        declaration read from three places.
-        """
-        kv_config = self._kv_config()
-        nodes = set(self._LLM_NODES if self._has_cfg_parallel else {"LLM"})
-        vit = self.config.vit_config
-        return [
-            # The ViT tower attends within one packed forward and caches
-            # nothing, so this stands alone: no KV resource behind it, and only
-            # the captured block loop plans it (eager runs flash-attn — see
-            # `BagelViTAttention.attend`).
-            RaggedAttentionSpec(
-                resource_key=VIT_ATTN, nodes={"vit_encoder"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=vit.num_attention_heads,
-                    num_kv_heads=vit.num_attention_heads,
-                    head_dim=vit.hidden_size // vit.num_attention_heads,
-                    # one image, hence one attending segment, per request
-                    max_segments_per_request=1,
-                ),
-            ),
-            KVSpec(resource_key="kv", nodes=nodes, config=kv_config, leader="LLM"),
-            AttentionSpec(
-                resource_key="attn", nodes=nodes,
-                config=AttentionConfig(kv_cache="kv"),
-            ),
-            PositionSpec(
-                resource_key="rope", nodes=nodes,
-                config=PositionConfig(
-                    kv_cache="kv", rope_theta=self.config.rope_theta,
-                ),
-            ),
-            SamplerSpec(
-                resource_key="sampler", nodes=nodes,
-                vocab_size=self.config.vocab_size,
-            ),
-        ]
-
     def get_request_resource_configs(
         self, partition_fwd_args: dict[str, ForwardPassArgs],
         model_kwargs: dict | None = None,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, KVReqConfig | SampleSettings]:
         """Per-resource knobs a new request is opened with.
 
         Two things are per-request rather than per-deployment: which cache
@@ -1000,7 +984,6 @@ class BagelModel(Model):
         cfg = request["requires_cfg"]
         # only a generation's CFG walks run the CFG nodes
         nodes = self._LLM_NODES if self._has_cfg_parallel and request["target_output"] == "image" else {"LLM"}
-        sampling = self.get_sampling_config("LLM", model_kwargs)
         publish_labels: dict[tuple[str, str], list[str]] = {}
         final_publish_labels: dict[tuple[str, str], list[str]] = {}
         if cfg:
@@ -1054,13 +1037,7 @@ class BagelModel(Model):
                 publish_labels_per_node_walk=publish_labels,
                 final_publish_labels_per_node_walk=final_publish_labels,
             ),
-            "sampler": SamplingReqConfig(
-                temperature=sampling.temperature,
-                top_k=sampling.top_k,
-                top_p=sampling.top_p,
-                ignore_eos=sampling.ignore_eos,
-                repetition_penalty=sampling.repetition_penalty,
-            ),
+            SAMPLER: self._sample_settings(model_kwargs),
         }
 
     def get_submodule(
@@ -1635,10 +1612,7 @@ class BagelModel(Model):
             request_done=request_done
         )
 
-    def get_sampling_config(
-        self, node_name: str,
-        model_kwargs: dict | None = None,
-    )  -> SamplingConfig | None:
+    def _sample_settings(self, model_kwargs: dict | None = None) -> SampleSettings:
         keys = [
             "temperature", "top_k", "top_p", "repetition_penalty",
             "ignore_eos"
@@ -1648,7 +1622,4 @@ class BagelModel(Model):
             for key in keys:
                 if model_kwargs.get(key) is not None:  # an explicit null is the default
                     params[key] = model_kwargs[key]
-        return SamplingConfig(
-            vocab_size=self.config.vocab_size,
-            **params
-        )
+        return SampleSettings(**params)

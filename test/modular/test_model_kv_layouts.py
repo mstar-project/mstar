@@ -90,7 +90,10 @@ def _pointer(tensor: torch.Tensor):
 
 
 def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
+    from test_bagel_guidance_sink import _model
+
     from mstar.conductor.request_info import DEFAULT_PARTITION
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.bagel.submodules import (
         DENOISE_WALKS,
         IMAGE_SENTINELS,
@@ -106,7 +109,7 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
                "image_inputs": out.new_input_tensors.get("image_inputs", images)}
     signals = {name: [_pointer(t) for t in by_name] for name, by_name in tensors.items()}
     # what the data worker folds into model_kwargs from process_prompt
-    stamped = {key: value for key, value in out.metadata.items() if key != "kv_layout"}
+    stamped = {key: value for key, value in out.metadata.items() if key not in ("state_layout", "keyed_spans")}
     fwd = model.get_initial_forward_pass_args(
         DEFAULT_PARTITION, input_modalities, output_modalities, signals, {**kwargs, **stamped},
     )
@@ -120,8 +123,10 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
                 break
     config = model.get_request_resource_configs({DEFAULT_PARTITION: fwd}, kwargs)["kv"]
     cap = model.get_loop_caps(max_output_tokens=6)["decode_loop"]
+    # as the data worker converts them
+    layouts = kv_layouts(_model().declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
     config.apply_conductor_config(
-        kv_layout={label: layout.row() for label, layout in out.metadata["kv_layout"]["kv"].items()},
+        kv_layout={label: layout.row() for label, layout in layouts["kv"].items()},
         loop_caps={"decode_loop": cap},
     )
     vae = VAEEncoderSubmodule(
@@ -172,6 +177,8 @@ class _BagelPool:
         self.llm = _llm()
 
     def step(self, walk: str, rows: dict, guided: dict) -> None:
+        from test_bagel_guidance_sink import _kv_step
+
         from mstar.engine.resources import StepContext
         from mstar.engine.resources.step import SubmoduleStep
         from mstar.model.submodule_base import ARNodeInputs
@@ -182,7 +189,7 @@ class _BagelPool:
             if walk not in {"prefill_text", "decode"}:
                 positions = torch.zeros(count, dtype=torch.int32)
                 inputs[-1].custom_pos_ids = dict.fromkeys(("main", "cfg_text", "cfg_img"), positions)
-        kv_step = self.llm.declare_step(walk, list(rows), inputs, per_request_info={}).steps["kv"]
+        kv_step = _kv_step(self.llm, walk, list(rows), inputs, per_request_info={})
         submodule_step = SubmoduleStep(steps={"kv": kv_step}, segments=list(kv_step.segments))
         submodule_step.set_ctx(StepContext(request_ids=tuple(rows), graph_walk=walk, slot=0, capture=False))
         assert self.runner.admit(submodule_step).outcome.ok
