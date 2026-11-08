@@ -256,9 +256,9 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
     mode = render_summary.current_mode(mode if isinstance(mode, str) else "")
     if not (saved / "handoff.md").is_file() or not (saved / "handoff.md").stat().st_size:
         fail("the saved handoff is malformed")
-    if jq_text(meta.get("pr")) != pr:
+    if str(meta.get("pr")) != pr:
         fail("the saved handoff is for another PR")
-    if jq_text(meta.get("head_sha")) != head_sha:
+    if str(meta.get("head_sha")) != head_sha:
         fail("the PR has new commits since that review stopped; ask for a new review of the current head with "
              "`/review light` or `/review`")
     if mode not in ("light", "nogpu"):
@@ -266,11 +266,6 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
     if mode == "nogpu" and non_write:
         fail("continuing a nogpu review takes write access, like `/review nogpu`")
     out.update(dir=str(saved), mode=mode, timeout=25 if non_write else 300)
-
-
-def jq_text(value):
-    """`value` as text, as `jq -r` prints it."""
-    return value if isinstance(value, str) else json.dumps(value)
 
 
 def file_patch(f):
@@ -516,8 +511,7 @@ def salvage(out, repo, pr, runner_temp):
         comment(repo, pr, "The review didn't run: the API account for the review bot is out of credit.")
         return
     result = ([m for m in messages if m.get("type") == "result"] or [{}])[-1]
-    turns = result.get("num_turns")
-    out["detail"] = f"{'?' if turns is None or turns is False else jq_text(turns)} turns"
+    out["detail"] = f"{result.get('num_turns', '?')} turns"
     output = result.get("structured_output")
     if result.get("subtype") == "success" and result.get("is_error") in (None, False) and isinstance(output, dict):
         out["structured_output"] = json.dumps(output, separators=(",", ":"), ensure_ascii=False)
