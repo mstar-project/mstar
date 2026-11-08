@@ -787,19 +787,20 @@ def earlier_review(repo, pr, prev):
     """(state, answered): the state of the review this run built on, what render_summary.carried carries over,
     from last-review.json or on a /review continue (which wasn't shown it) the last summary; and whether a
     person other than the author has commented since that review. Not knowing reads as not answered."""
-    conversation = api_list(f"repos/{repo}/issues/{pr}/comments")
-    summaries = [c for c in conversation if (c.get("user") or {}).get("login") in BOT_USERS
-                 and (c["body"] or "").startswith(render_summary.MARKER)]
-    if Path("last-review.json").exists():
-        state = json.loads(Path("last-review.json").read_text())
-    elif prev and summaries:
-        state = render_summary.read_state(summaries[-1]["body"])
-    else:
-        state = None
-    if not state or not summaries:
-        return state, False
-    since = summaries[-1]["created_at"]
+    path, state = Path("last-review.json"), None
+    if path.exists():
+        state = json.loads(path.read_text())
+    elif not prev:
+        return None, False
     try:
+        conversation = api_list(f"repos/{repo}/issues/{pr}/comments")
+        summaries = [c for c in conversation if (c.get("user") or {}).get("login") in BOT_USERS
+                     and (c["body"] or "").startswith(render_summary.MARKER)]
+        if state is None and summaries:
+            state = render_summary.read_state(summaries[-1]["body"])
+        if not state or not summaries:
+            return state, False
+        since = summaries[-1]["created_at"]
         author = api(f"repos/{repo}/pulls/{pr}")["user"]["login"]
         spoken = [*conversation, *api_list(f"repos/{repo}/pulls/{pr}/comments"),
                   *api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")]
