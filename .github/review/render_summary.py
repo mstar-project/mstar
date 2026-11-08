@@ -5,7 +5,7 @@ The review returns the fields in SCHEMA rather than Markdown, so every summary
 has the same shape: a status line, then only the sections that have something
 in them. The status line counts the open findings (`open_findings`, which the
 approval rule in gpu_review.py uses too), so a finding from an earlier run counts
-until a re-review judges it fixed or moot or a commit changes its lines. Run by
+until a later review judges it fixed or moot or a commit changes its lines. Run by
 claude-review.yml with the default branch checked out:
 
     python3 .github/review/render_summary.py --schema     # for --json-schema
@@ -84,8 +84,8 @@ FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.
 
 def open_findings(review, pages):
     """(where, priority) of every open finding: the bot's inline threads, this run's findings outside
-    the diff, and the earlier findings a re-review judged still open. A thread someone resolved stays
-    open: only a re-review that judged it fixed or moot, or a commit that outdated it, clears it. An
+    the diff, and the earlier findings a later review judged still open. A thread someone resolved stays
+    open: only a later review that judged it fixed or moot, or a commit that outdated it, clears it. An
     untagged bot thread counts as "untagged", since its priority is unknown. `pages` are the PR's
     review threads, from `gh api graphql --paginate --slurp`."""
     prior = review.get("prior_findings", [])

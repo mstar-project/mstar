@@ -373,7 +373,7 @@ jobs:
           gh pr view "$PR" --repo "$REPO" --json body --jq .body > pr-body.md
 
           # Inline review comments, each marked with its thread's resolved and
-          # outdated state (only GraphQL has those).
+          # outdated state (only GraphQL has those), and `mine` when this bot posted it.
           gh api --paginate "repos/$REPO/pulls/$PR/comments" \
             --jq '.[] | {id, user: .user.login, path, line, side, in_reply_to_id, body}' | jq -s . > review-comments.json
           gh api graphql --paginate -F owner="${REPO%/*}" -F name="${REPO#*/}" -F pr="$PR" -f query='
@@ -385,9 +385,11 @@ jobs:
                 } } } }' \
             --jq '.data.repository.pullRequest.reviewThreads.nodes[] |
               {id: .comments.nodes[0].databaseId, resolved: .isResolved, outdated: .isOutdated}' | jq -s . > threads.json
-          jq --slurpfile t threads.json '
+          bots=$(python3 -c 'import json, runpy; print(json.dumps(runpy.run_path(".github/review/render_summary.py")["BOTS"]))')
+          jq --slurpfile t threads.json --argjson bots "$bots" '
             ($t[0] | map({key: (.id | tostring), value: {resolved, outdated}}) | from_entries) as $m
-            | map(. + ($m[(.in_reply_to_id // .id) | tostring] // {}))' review-comments.json > pr-comments.json
+            | map(. + ($m[(.in_reply_to_id // .id) | tostring] // {})
+                  + {mine: (.user as $u | any($bots[]; . + "[bot]" == $u))})' review-comments.json > pr-comments.json
 
           # The conversation tab: replies to the summary, and the author's answers.
           gh api --paginate "repos/$REPO/issues/$PR/comments" \
