@@ -5,7 +5,7 @@ usage:
   gpu.py check                                   keys, persistent storage, budget
   gpu.py offers --gpus N [--min-vram GB] [--all-regions] [--allow-arm] [--json]
   gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]]
-               [--cache ro|none] [--cache-write ID] [--allow-over-budget] [--dry-run]
+               [--cache ro|none | --cache-write ID] [--allow-over-budget] [--dry-run]
   gpu.py wait <instance>                         until ssh answers; prints how to reach it
   gpu.py ssh <instance> [command ...]            run a command (or a shell) on it
   gpu.py push <instance> <local> <remote>        scp -r to the box
@@ -47,6 +47,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import functools
 import json
 import os
 import re
@@ -506,10 +507,12 @@ def cmd_launch(args, cfg):
                              *([f"--chdir={shlex.quote(jobdir)}", f"-o {shlex.quote(jobdir)}/job.log",
                                 shlex.quote(f"{jobdir}/{Path(args.run).name}")] if args.run
                                else ["-o /dev/null", "--wrap 'sleep infinity'"])])
-        elif o["provider"] == "eras":
-            volumes = eras_cache_volumes(cfg, args.cache, args.cache_write)
-            body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input, volumes[0] if volumes else None,
-                                    bool(args.cache_write))
+        elif o["provider"] == "eras":  # tried in turn: each free cache volume, then none (cold); a refresh only its own
+            free = eras_cache_volumes(cfg, args.cache, args.cache_write)
+            candidates = free if args.cache_write else [*free, None]
+            eras_body = functools.partial(eras_launch_body, cfg, o, name, pubkey, hours, args.run, args.input,
+                                          rw=bool(args.cache_write))
+            body = eras_body(candidates[0])
         elif o["provider"] == "runpod":
             rp = cfg["runpod"]
             vol = runpod_volume_for(runpod_volumes(cfg), o["region"])
@@ -544,20 +547,17 @@ def cmd_launch(args, cfg):
                                        capture_output=True, timeout=300)
                 iid = slurm_run(cfg, body).strip().split(";")[0]
             elif o["provider"] == "eras":
-                for held, nxt in zip(volumes, [*volumes[1:], None], strict=True):
+                for i, vid in enumerate(candidates):
                     try:
-                        iid = eras_create(body)
+                        iid = eras_create(eras_body(vid) if i else body)
                         break
                     except ApiError as err:  # another box took the cache volume since: the next free one, then cold
-                        if not volume_refused(err):
+                        if not volume_refused(err) or vid is None:
                             raise
                         if args.cache_write:  # a refresh without its volume would write nothing that lasts
-                            die(f"cache volume {held} is held: {err}")
-                        print(f"gpu.py: cache volume {held} is held ({str(err)[:200]}); launching "
-                              f"{f'with {nxt}' if nxt else 'cold'}", file=sys.stderr)
-                        body = eras_launch_body(cfg, o, name, pubkey, hours, args.run, args.input, nxt)
-                else:
-                    iid = eras_create(body)
+                            die(f"cache volume {vid} is held or being deleted: {err}")
+                        print(f"gpu.py: cache volume {vid} is held or being deleted ({str(err)[:200]}); "
+                              "trying the next free one, else cold", file=sys.stderr)
             elif o["provider"] == "runpod":
                 iid = runpod("POST", "/pods", body)["id"]
             else:
@@ -681,7 +681,7 @@ def eras_cache_volumes(cfg: dict, cache: str, write: str | None) -> list[str]:
     return free
 
 
-# The error codes of a launch refused over a volume another instance holds.
+# The error codes of a launch refused over a volume another instance holds, or one being deleted.
 VOLUME_HELD = ("volume_bound", "volume_deleting", "volume_binding_conflict", "volume_binding_deleting",
                "resource_in_use")
 
@@ -699,7 +699,7 @@ def eras_create(body: dict) -> str:
         raise ApiError(409, {"code": problems[0].get("code"), "problems": problems})
     if not preview.get("is_available"):
         reason, detail = preview.get("unavailable_reason"), preview.get("unavailable_detail")
-        if reason in VOLUME_HELD:  # another box binds the cache volume (or it is being deleted)
+        if reason in VOLUME_HELD:  # another box binds the cache volume, or it is being deleted
             raise ApiError(409, {"code": reason, "message": detail})
         raise ApiError(409, f"capacity: {detail or reason}")
     for w in (preview.get("run") or {}).get("warnings") or []:
@@ -987,10 +987,11 @@ def main():
     p.add_argument("--run", help="a script that is the work itself; the GPUs go when it ends")
     p.add_argument("--input", action="append", default=[],
                    help="a file for the --run script: in its working directory on Slurm, in /run/live-pr on Eras")
-    p.add_argument("--cache", choices=("ro", "none"), default="ro",
-                   help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
-    p.add_argument("--cache-write", metavar="ID",
-                   help="Eras: mount this cache volume read-write at /cache instead, to fill it; dies if it is held")
+    cache = p.add_mutually_exclusive_group()
+    cache.add_argument("--cache", choices=("ro", "none"), default="ro",
+                       help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
+    cache.add_argument("--cache-write", metavar="ID",
+                       help="Eras: mount this cache volume read-write at /cache instead, to fill it; dies if it is held")
     p.add_argument("--allow-over-budget", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("wait")
