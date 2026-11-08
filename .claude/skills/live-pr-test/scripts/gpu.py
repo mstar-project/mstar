@@ -165,8 +165,19 @@ def eras(method, path, body=None, params=None):
 
 
 def slurm_nodes(cfg: dict) -> list[dict]:
-    """The configured Slurm nodes that have a host."""
-    return [n for n in cfg.get("slurm") or [] if n.get("host")]
+    """The configured Slurm nodes that have a host. Raises ApiError on a bad entry, like a node
+    that is gone, so a running watchdog logs it and keeps trying."""
+    nodes = cfg.get("slurm") or []
+    if not isinstance(nodes, list) or not all(isinstance(n, dict) for n in nodes):
+        raise ApiError(0, "config: `slurm` must be a list of nodes; see config.example.json")
+    nodes = [n for n in nodes if n.get("host")]
+    for n in nodes:
+        name = n.get("name")
+        if not isinstance(name, str) or not name or ":" in name:
+            raise ApiError(0, f"config: slurm node {name!r} needs a name without ':'")
+        if "enabled" in n:
+            raise ApiError(0, f"config: slurm node {name!r}: `enabled` isn't read; empty `host` turns a node off")
+    return nodes
 
 
 def slurm_node(cfg: dict, name: str) -> dict:
@@ -174,7 +185,7 @@ def slurm_node(cfg: dict, name: str) -> dict:
     for sl in slurm_nodes(cfg):
         if sl["name"] == name:
             return sl
-    die(f"no Slurm node {name!r} in the config")
+    raise ApiError(0, f"no Slurm node {name!r} in the config")
 
 
 def slurm_run(sl: dict, command: str, check: bool = True) -> str:
@@ -193,7 +204,7 @@ def slurm_cancel(sl: dict, job: str, jobdir: str | None) -> None:
 
 
 def slurm_ssh(sl: dict, scp: bool = False) -> list[str]:
-    known = STATE / f"slurm_{re.sub(r'[^A-Za-z0-9.]', '_', sl['host'])}.known_hosts"
+    known = STATE / f"slurm_{re.sub(r'[^A-Za-z0-9.]', '_', sl['name'])}.known_hosts"  # nodes can share a host
     STATE.mkdir(parents=True, exist_ok=True)
     if sl.get("host_key"):  # pinned: the node's ngrok port is reused across machines
         host = sl["host"].split("@")[-1]
@@ -589,7 +600,8 @@ def cmd_launch(args, cfg):
             if e.status in (400, 409) or "capacity" in e.code():
                 die(f"no availability: {o['id']} was taken before launch ({e}); rerun offers")
             raise
-        key = f"{o['provider']}:{iid}"
+        # A Slurm job id is unique only on its node.
+        key = f"slurm:{o['region']}:{iid}" if o["provider"] == "slurm" else f"{o['provider']}:{iid}"
         now = time.time()
         d[key] = {"provider": o["provider"], "instance_id": iid, "name": name, "offer": o["id"], "pr": args.pr,
               "run": bool(args.run), "dir": jobdir if o["provider"] == "slurm" and args.run else None,
