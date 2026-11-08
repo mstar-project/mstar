@@ -926,9 +926,11 @@ jobs:
           gpus=$(jq -r --argjson cap "$MAX_GPUS" '[.live_test.gpus // 1, $cap] | min' review.json)
           { echo "gpus=$gpus"; echo "hours=$HOURS"; echo "base=$(jq -r .base.ref pr.json)"; } >> "$GITHUB_OUTPUT"
 
-      # The review's call stands unless the PR's last live test didn't pass on an ancestor of this
-      # head, or a re-review's `targeted`, or its `none` on runtime code, has no live test before it
-      # (gpu_review.py carry):
+      # Nothing runs while the review left an open P0–P2 finding (counted as the approval rule counts
+      # them), an open question or a skipped file (`gated`; the reasons go to gate.txt, as they hold
+      # model text): the comment says what to fix first. Otherwise the review's call stands unless the
+      # PR's last live test didn't pass on an ancestor of this head, or a re-review's `targeted`, or
+      # its `none` on runtime code, has no live test before it (gpu_review.py carry):
       # then the live test runs in full, every kind of check, so a failure is never hidden. After a
       # pass on an ancestor, a `targeted` run is told that commit and given that report. A `none`
       # that stands runs nothing (verdict `skipped`), and counts as a pass for approval after that
@@ -943,7 +945,8 @@ jobs:
         run: |
           set -o pipefail  # an error in the decision fails this step, rather than tee's exit 0 hiding it
           python3 .github/review/gpu_review.py carry --pr "$PR" --sha "$HEAD_SHA" --review review.json \
-            --earlier-report earlier-live-test.md ${REREVIEW:+--rereview} | tee carry.log
+            --earlier-report earlier-live-test.md --above stacked-above.json --gate "$RUNNER_TEMP/gate.txt" \
+            ${REREVIEW:+--rereview} | tee carry.log
           grep '^[a-z_]*=' carry.log >> "$GITHUB_OUTPUT"
 
       - name: Get GPUs and start the live test
@@ -1090,7 +1093,8 @@ jobs:
       - name: Post the live test
         if: >-
           always() && steps.cfg.outcome == 'success' && steps.redact.outcome == 'success' &&
-          (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '' || steps.cfg.outputs.trusted != 'true' ||
+          (steps.render.outcome == 'success' || steps.carry.outputs.verdict != '' || steps.carry.outputs.gated == 'true' ||
+           steps.cfg.outputs.trusted != 'true' ||
            steps.start.outputs.unavailable == 'true' || steps.wait.outputs.unavailable == 'true')
         continue-on-error: true
         env:
@@ -1098,11 +1102,15 @@ jobs:
           APPROVAL: ${{ steps.approve.outputs.approval }}
           APPROVE_OUTCOME: ${{ steps.approve.outcome }}
           TRUSTED: ${{ steps.cfg.outputs.trusted }}
+          GATED: ${{ steps.carry.outputs.gated }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           lt="$RUNNER_TEMP/lt"
           if [ "$TRUSTED" != "true" ]; then
             echo "The live test runs only on a PR whose author has write access; this review stands without it." > post.md
+          elif [ "$GATED" = "true" ]; then   # the reasons hold model text, so they can't open a comment
+            printf 'No live test yet: fix what the review left open first (%s), then comment `/review` again.\n' \
+              "$(sed 's/<!--/\&lt;!--/g' "$RUNNER_TEMP/gate.txt")" > post.md
           elif [ -s "$lt/comment.md" ]; then cp "$lt/comment.md" post.md
           elif [ -s "$lt/unavailable.md" ]; then { echo "<!-- claude-live-test sha=$HEAD_SHA verdict=unavailable -->"; cat "$lt/unavailable.md"; } > post.md
           else   # the review chose `none` and it stood: its reason is model text, so it can't open a comment

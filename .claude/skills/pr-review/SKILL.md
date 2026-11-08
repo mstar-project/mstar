@@ -575,6 +575,10 @@ the last review.
   plausibly move speed; leave `correctness` out only for a pure performance change whose outputs you
   proved unchanged by reading the code. Give it with `none` too; it is ignored there.
 
+The live test starts only when the review left no open P0–P2 finding (counted as the approval rule
+counts them), no open question and no skipped file. Otherwise no box starts, and the comment lists
+what to fix first and asks for `/review` again; the design risk doesn't hold it back.
+
 The bot overrides the review's call in two cases: when the PR's last live test didn't pass on an
 ancestor of the head (it failed, was partial or unavailable, or ran on a commit since rebased away),
 the live test runs in full, with both kinds of check, whatever the review asked for, so a failure is
