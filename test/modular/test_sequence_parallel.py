@@ -183,7 +183,8 @@ def _compiled_packs(rank, world, dynamic, batched):
     assert breaks and all("_all_to_all_single" in reason for reason in breaks), list(breaks)
 
 
-# Cosmos3's packed stack is [T, H, D] and compiled dynamic, LTX's and Wan's are [B, L, H, D] and static
+# Cosmos3's packed stack is [T, H, D] compiled dynamic; its single-request steps (static, [T, H, D]) and
+# LTX's and Wan's DiTs ([B, L, H, D], static) take the same static path as the static case
 @pytest.mark.parametrize("dynamic,batched", [(True, False), (False, True), (True, True)],
                          ids=["dynamic-SHD", "static-BSHD", "dynamic-BSHD"])
 @pytest.mark.parametrize("world", [2, 3])
