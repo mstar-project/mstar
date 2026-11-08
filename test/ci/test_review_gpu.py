@@ -13,7 +13,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 GPU_REVIEW = runpy.run_path(str(REPO_ROOT / ".github/review/gpu_review.py"))
-blocking, risky_files = GPU_REVIEW["blocking"], GPU_REVIEW["risky_files"]
+blocking, file_gate = GPU_REVIEW["blocking"], GPU_REVIEW["file_gate"]
 GPU = runpy.run_path(str(REPO_ROOT / ".claude/skills/live-pr-test/scripts/gpu.py"))
 SLURM_CFG = {"slurm": {"host": "root@node", "job_prefix": "review-bot", "workdir": "/workspace/review-bot"}}
 
@@ -60,14 +60,15 @@ class TestApproval(unittest.TestCase):
         for expected in ("inline 1", "inline 5", "engine.py:10", "earlier 3"):
             self.assertTrue(any(expected in f for f in found), f"{expected} would not block approval: {found}")
 
-    def test_only_one_models_code_and_its_tests_can_be_low_risk(self):
-        self.assertEqual(risky_files(["mstar/model/kokoro/model.py", "mstar/model/kokoro/tests/test_x.py",
-                                      "docs/models.rst"], REPO_ROOT), [])
+    def test_rules_and_dependencies_never_approve_and_engine_approvals_dont_count(self):
         for path in (".github/review/review-prompt.md", ".claude/skills/pr-review/SKILL.md", "AGENTS.md",
-                     "mstar/worker/worker.py", "mstar/engine/resources/kv.py", "uv.lock", "pyproject.toml"):
-            self.assertTrue(risky_files([path], REPO_ROOT), f"{path} could be approved as low risk")
-        self.assertTrue(risky_files(["mstar/model/kokoro/model.py", "mstar/model/orpheus/model.py"], REPO_ROOT),
-                        "a change to two models could be approved as low risk")
+                     "CLAUDE.md", "uv.lock", "rust/server/Cargo.lock", "pyproject.toml", "setup.py"):
+            self.assertTrue(file_gate([path], REPO_ROOT)[0], f"a change to {path} could be approved")
+        self.assertEqual(file_gate(["mstar/engine/engine.py"], REPO_ROOT), ([], ["mstar/engine/engine.py"]),
+                         "an engine change's approval would count toward required reviews")
+        self.assertEqual(file_gate(["mstar/worker/worker.py", "mstar/model/kokoro/model.py",
+                                    "mstar/model/orpheus/model.py", "docs/models.rst"], REPO_ROOT), ([], []),
+                         "a low-risk worker or model change couldn't get a counting approval")
 
 
 

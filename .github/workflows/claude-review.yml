@@ -978,6 +978,7 @@ jobs:
           python3 .github/review/gpu_review.py approve --pr "$PR" --sha "$HEAD_SHA" --review review.json \
             --complete true --verdict "$VERDICT" --why "$RUNNER_TEMP/why.txt" | tee approve.log
           grep -q '^approved' approve.log && echo "approved=true" >> "$GITHUB_OUTPUT" || true
+          grep -q '^would approve' approve.log && echo "approved=engine" >> "$GITHUB_OUTPUT" || true
 
       # Model output from untrusted input, posted only from the redacted copies.
       - name: Post the live test
@@ -1003,6 +1004,8 @@ jobs:
           fi
           if [ "$APPROVED" = "true" ]; then
             printf '\n**Approved** on `%s` by the rule in `.github/review/gpu_review.py`.\n' "${HEAD_SHA:0:7}" >> post.md
+          elif [ "$APPROVED" = "engine" ]; then
+            printf '\n**Would approve** `%s` by the rule in `.github/review/gpu_review.py`; doesn'"'"'t count toward required reviews: touches area/engine.\n' "${HEAD_SHA:0:7}" >> post.md
           elif [ -s "$RUNNER_TEMP/why.txt" ]; then
             printf '\nNot approved: %s.\n' "$(cat "$RUNNER_TEMP/why.txt")" >> post.md
           elif [ "$APPROVE_OUTCOME" = "failure" ]; then

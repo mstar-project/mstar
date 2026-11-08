@@ -35,10 +35,9 @@ SUMMARY = runpy.run_path(str(Path(__file__).with_name("render_summary.py")))
 BOX = Path(__file__).with_name("gpu_review_box.sh")
 REPO = os.environ.get("REPO", "mstar-project/mstar")
 WRITE = ("admin", "maintain", "write")
-# What an approvable change may touch: tests, docs, benchmarks, and one model's own code and
-# configs. Anything else (a shared layer, the review's own rules, dependencies) is not low risk.
-LOW_AREAS = {"area/tests", "area/docs", "area/benchmark"}
-NEVER_LOW = (".github/", ".claude/", "AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py", "uv.lock")
+# Never approved, whatever the review says: the bot's own rules and the dependencies.
+NEVER_DIRS = (".github/", ".claude/")
+NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py")
 ERAS_OUT = "/workspace/live-pr/out"
 MEDIA_CAP = 100 * 2**20  # media per run: the gallery is one GitHub Pages site, 1 GB in all
 MEDIA = {".png": "img", ".jpg": "img", ".jpeg": "img", ".gif": "img", ".webp": "img",
@@ -265,27 +264,22 @@ def blocking(review, pages):
     return [f"{where} ({p})" for where, p in SUMMARY["open_findings"](review, pages) if p != "P3"]
 
 
-def risky_files(files, repo_root):
-    """Files that make the change more than low risk, whatever the review rated it."""
+def file_gate(files, repo_root):
+    """(blocked, engine): the files that rule out any approval (the bot's rules, dependencies and
+    lockfiles), and those in area/engine, whose approval the bot posts as a comment that doesn't
+    count toward required reviews."""
     labels = runpy.run_path(str(ROOT / ".github/labels/label_prs.py"))
     aliases = labels["model_aliases"](str(repo_root), [{"filename": f} for f in files])
-    models, risky = set(), []
-    for f in files:
-        if f.startswith(NEVER_LOW) or f in NEVER_LOW or f.endswith(".lock"):
-            risky.append(f)
-            continue
-        areas = set(labels["areas_of"](f, aliases))
-        models |= {x for x in areas if x.startswith("model/")}
-        if areas - LOW_AREAS and not all(x.startswith("model/") for x in areas - LOW_AREAS):
-            risky.append(f)
-    if len(models) > 1:
-        risky.append(f"{len(models)} models ({', '.join(sorted(models))})")
-    return risky
+    blocked = [f for f in files if f.startswith(NEVER_DIRS) or Path(f).name in NEVER_FILES or f.endswith(".lock")]
+    engine = [f for f in files if f not in blocked and "area/engine" in labels["areas_of"](f, aliases)]
+    return blocked, engine
 
 
 def reasons_not_to_approve(a, review):
+    """(why not, engine files): the rule's failed conditions, and the files that make an approval
+    one that doesn't count."""
     pr = gh_json(f"repos/{REPO}/pulls/{a.pr}")
-    why = []
+    why, engine = [], []
     if a.complete != "true":
         why.append("the review didn't finish cleanly")
     if pr["head"]["sha"] != a.sha:
@@ -309,19 +303,28 @@ def reasons_not_to_approve(a, review):
     if cmp.get("files") is None or len(cmp["files"]) >= 300:
         why.append("the file list is too long to check")
     else:
-        risky = risky_files([f["filename"] for f in cmp["files"]], ROOT)
-        if risky:
-            why.append("touches " + ", ".join(risky[:8]) + (" and more" if len(risky) > 8 else ""))
-    return why
+        blocked, engine = file_gate([f["filename"] for f in cmp["files"]], ROOT)
+        if blocked:
+            why.append("touches the review's rules or dependencies: " + ", ".join(blocked[:8])
+                       + (" and more" if len(blocked) > 8 else ""))
+    return why, engine
 
 
 def cmd_approve(a):
     review = json.loads(Path(a.review).read_text())
-    why = reasons_not_to_approve(a, review)
+    why, engine = reasons_not_to_approve(a, review)
     if why:
         print("not approved: " + "; ".join(why))
         if a.why:
             Path(a.why).write_text("; ".join(why))
+        return
+    if engine:  # a comment, not an approval, so it can't count toward required reviews
+        body = (f"The review bot would approve `{a.sha[:7]}`: low risk, no open P0–P2 finding, and the live test "
+                "passed on it. This doesn't count toward required reviews, because the change touches area/engine ("
+                + ", ".join(f"`{f}`" for f in engine[:8]) + (" and more" if len(engine) > 8 else "") + ").")
+        gh("api", "-X", "POST", f"repos/{REPO}/pulls/{a.pr}/reviews", "-f", f"commit_id={a.sha}",
+           "-f", "event=COMMENT", "-f", f"body={body}")
+        print("would approve")
         return
     body = (f"Approved by the review bot on `{a.sha[:7]}`: low risk, no open P0–P2 finding, and the live test "
             "passed. A push dismisses it.")
