@@ -150,6 +150,14 @@ REFUSALS = {
         lambda: _array(reads={"r": Read(mask=Bidirectional(), queries="video")}),
         "Array 'kv'.reads['r'].queries: a read with no op",
     ),
+    "queries naming the read's own array": (
+        lambda: _array(reads={"r": _read(mask=Bidirectional(), queries="kv")}),
+        "Array 'kv'.reads['r'].queries names this array",
+    ),
+    "queries naming the read's own array, within the step": (
+        lambda: _array(max_len=0, reads={"r": _read(mask=Block(), queries="kv")}),
+        "Array 'kv'.reads['r'].queries names this array",
+    ),
     "update on one entry that isn't rewritable": (
         lambda: _array(entry=_GDN, max_len=1, updates={"u": CausalConv()}),
         "Array 'kv'.updates['u']: only a Value",

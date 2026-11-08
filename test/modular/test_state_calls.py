@@ -734,6 +734,30 @@ def test_a_step_that_adds_on_no_layer_only_reads_and_passes():
     h.check_step(_begin(h, segments=[Segment(1, "main", 0)]))
 
 
+def test_a_step_that_keeps_rows_at_span_above_0_and_adds_nothing_is_refused():
+    """The pages keep a step's span whether or not an add wrote it, and later reads would see those entries."""
+    h = _kv_handle()
+    step = _begin(h)
+    _refused(r"Array 'kv': a step that keeps lists rows at span above 0 and adds nothing",
+             lambda: h.check_step(step))
+
+
+def test_a_placeholder_row_needs_no_add():
+    h = _kv_handle()
+    h.check_step(_begin(h, kv=ArrayStep(placeholders=frozenset({(1, "main")}))))
+
+
+def test_a_captured_step_with_eager_adds_needs_no_add_in_its_forward():
+    h = _kv_handle()
+    h.check_step(_begin(h, ctx=_ctx(capture=True, leased=True), kv=ArrayStep(eager_add=True)))
+
+
+def test_an_eager_step_with_eager_adds_still_needs_its_adds():
+    h = _kv_handle()
+    step = _begin(h, kv=ArrayStep(eager_add=True))
+    _refused(r"Array 'kv': a step that keeps lists rows at span above 0 and adds nothing", lambda: h.check_step(step))
+
+
 def test_a_layer_ending_on_a_scratch_add_in_a_step_that_keeps_is_refused():
     h = _kv_handle()
     step = _begin(h)
