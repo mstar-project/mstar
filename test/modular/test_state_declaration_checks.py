@@ -48,10 +48,11 @@ _ATTEND = Attend(q_heads=8)
 class _StubModel:
     """Serves declarations and walks without building anything."""
 
-    def __init__(self, *arrays, combined=None, kv_labels=None):
+    def __init__(self, *arrays, combined=None, kv_labels=None, rebuild=None):
         self.arrays = list(arrays)
         self.combined = combined or {}
         self.labels = kv_labels or {}
+        self.rebuild = rebuild or {}
 
     def kv_labels(self):
         return self.labels
@@ -61,6 +62,9 @@ class _StubModel:
 
     def get_chunking_policies(self):
         return {}
+
+    def rebuild_policies(self):
+        return self.rebuild
 
     def get_graph_walk_graphs(self):
         return {
@@ -255,7 +259,7 @@ def test_an_array_may_not_carry_two_updates_of_one_type():
 
 
 def test_kv_labels_may_name_only_declared_labels():
-    problem = _one_problem(_array(), kv_labels={"kv": {"main": None, "cfg": None}})
+    problem = _one_problem(_array(), kv_labels={"kv": {"main": KVLabel(), "cfg": KVLabel()}})
     assert problem.startswith("kv_labels()['kv']['cfg']") and "Array 'kv'.labels" in problem
 
 
@@ -340,7 +344,7 @@ def test_a_chunked_walk_cant_read_this_steps_adds_as_a_whole(array, mask):
     problems = state_declaration_problems(_chunked(array))
     assert len(problems) == 1
     assert problems[0].startswith(f"Array {array.name!r}.reads['r']: {mask} on walk 'prefill'")
-    assert "splitting a row's adds across steps changes what its tokens see" in problems[0]
+    assert "which a chunking policy splits across steps" in problems[0]
 
 
 @pytest.mark.parametrize("array", [

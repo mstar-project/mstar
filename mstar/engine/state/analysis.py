@@ -38,7 +38,7 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
-    problems += _chunking_problems(model, arrays)
+    problems += _regrouping_problems(model, arrays)
     problems += _host_problems(arrays, model.kv_labels())
     for sampler in samplers:
         problems += _sampler_problems(sampler, nodes)
@@ -139,14 +139,24 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
     return problems
 
 
-def _chunking_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
+def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
+    regrouped = [
+        *((node, walk, "a chunking policy splits across steps", "leave it out of the policy")
+          for node, policies in model.get_chunking_policies().items() for policy in policies if policy.chunkable
+          for walk in policy.walks),
+        *((node, walk, f"kv_labels()[{array.name!r}][{label!r}] keys for prefix reuse, and a hit can end inside a "
+                       "step", "leave it out of the label's keys")
+          for array in arrays for label, kv_label in model.kv_labels().get(array.name, {}).items()
+          if kv_label.keys is not None for node in array.nodes
+          for walk in (*kv_label.keys.walks, *(grown for grown, _ in kv_label.growth if kv_label.keys.growth))),
+        *((node, policy.walk, f"{node}'s rebuild policy runs again in one step with the ids sampled after it",
+           "drop the rebuild policy")
+          for node, policy in model.rebuild_policies().items()),
+    ]
     return [
-        f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which a chunking policy "
-        "splits across steps; a Block or Bidirectional read sees the step's adds as a whole, so splitting a row's adds "
-        "across steps changes what its tokens see"
-        for node, policies in model.get_chunking_policies().items()
-        for policy in policies if policy.chunkable
-        for walk in policy.walks
+        f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. A Block or "
+        f"Bidirectional read sees each step's adds as a whole, so {fix}"
+        for node, walk, cause, fix in regrouped
         for array in arrays if node in array.nodes
         for key, read in array.reads.items()
         if isinstance(read.mask, Block | Bidirectional) and (read.walks is None or walk in read.walks)

@@ -596,9 +596,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   the one read declared for its layer and walk, and loading refuses two reads over one
   layer and walk. ``Causal()`` sees every entry up to the query's own, ``Window(size)`` the
   last ``size`` of them, its own included, and ``Bidirectional()`` every entry the row keeps and
-  every entry this step adds for it. A walk a chunking policy splits can't read through
-  ``Bidirectional()`` or ``Block()``, since splitting a row's adds across steps would change what
-  its tokens see. ``Attend(q_heads=)`` is attention with the model's query heads, a multiple of
+  every entry this step adds for it. A walk can't read through ``Bidirectional()`` or ``Block()``
+  on a node where a chunking policy splits it, a label's ``PrefixKeys`` key it, or a rebuild
+  policy runs it again, since each regroups a row's adds across steps and would change what its
+  tokens see. ``Attend(q_heads=)`` is attention with the model's query heads, a multiple of
   the entry's heads.
 - ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
   as a recurrent state. ``updates`` names the kernels that read and write one of its fields
