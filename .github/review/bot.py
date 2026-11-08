@@ -49,7 +49,7 @@ THREADS = """query($owner: String!, $name: String!, $pr: Int!, $endCursor: Strin
   repository(owner: $owner, name: $name) { pullRequest(number: $pr) {
     reviewThreads(first: 100, after: $endCursor) {
       pageInfo { hasNextPage endCursor }
-      nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body } } }
+      nodes { isResolved isOutdated comments(first: 1) { nodes { databaseId author { login } body path line } } }
     } } } }"""
 # A commenter's author_association that makes them a contributor (see the workflow's header).
 CONTRIBUTORS = ("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")

@@ -79,7 +79,7 @@ Keep the body to one short paragraph that names the triggering inputs or state; 
 - `prior_findings`: every earlier finding, in every run, a review of the whole PR included: each inline comment marked `mine` that starts a thread (no `in_reply_to_id`) and, on a re-review, the `outside_diff` items in `last-review.json`, each judged as Re-review step 1 says: `ref` (the inline comment's id, or the `outside_diff` item's location), `priority`, `status` (with `fixed_in` for `fixed_above`, under the same rule as `outside_diff`) and one sentence of why. Empty only when there are none. A finding left out stays open.
 - `since_last`: on a re-review, one sentence on what changed since your previous summary in `pr-conversation.json`: findings fixed, still open or new. Empty on a first review.
 - `description_problems`: inaccuracies first, including anything the code does that the description doesn't say, then what's missing.
-- `questions`: each question with what its answer would change. A second sentence is fine for that.
+- `questions`: each question as `location` (the `path:line` it applies to, or empty for the whole PR) and `text`, with what its answer would change. A second sentence is fine for that.
 - `checked`: the paths and claims you traced and found sound, one line each, so a review with few or no findings shows its evidence. The comment shows them collapsed.
 - `skipped`: the files you didn't review, only with a small turn cap (a contributor's own review) on a diff too large for it. Empty otherwise: a run with a large cap reviews every file, in slices.
 - `design`: nogpu, the skill's design verdict, a few lines. Empty in light mode.
