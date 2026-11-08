@@ -4,8 +4,8 @@
 # --cache-write ID` on an Eras box, where that volume is /cache, read-write. Only main's code runs
 # here, never a PR's; live tests mount the volumes read-only.
 #
-# Weights download straight onto the volume (HF_HOME=/cache/hf), so a deadline keeps every model
-# that finished, and the next refresh resumes a partial one. The compile caches are saved to it
+# Weights download straight onto the volume (HF_HOME=/cache/hf), so a deadline keeps every file that
+# finished, and the next refresh downloads what is missing. The compile caches are saved to it
 # every 5 models and at the end. No new model starts once the volume has under 100 GB free.
 #
 # Inputs in /run/live-pr: run.json (repo, main_sha, models: "all" or names, skip: names).
@@ -22,6 +22,9 @@ finish() {  # the Pod is the only copy of the log: stay up until the runner has 
   exit 0
 }
 mountpoint -q /cache || finish "cache volume not mounted"
+# huggingface_hub never resumes a partial download (each attempt writes its own
+# <etag>.<random>.incomplete), so those a deadline cut short would only take up room.
+[ ! -d /cache/hf/hub ] || find /cache/hf/hub -name '*.incomplete' -delete
 
 MAIN_SHA=$(field main_sha)
 git clone -q "https://github.com/$(field repo).git" "$W/main" && git -C "$W/main" checkout -q "$MAIN_SHA" \
