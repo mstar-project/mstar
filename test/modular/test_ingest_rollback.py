@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("torch")
 
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.testing_utils.worker import make_worker
 
 
 class _Res:
@@ -42,36 +42,34 @@ def test_a_raising_ingest_rolls_back_every_resource_it_reached():
 
 
 def test_the_worker_fails_only_the_request_whose_ingest_raised():
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w._draining_rids = set()
-    w._reads_done_sent = set()
-    w._unprocessed_messages = {"wire": ["parked"]}
-    processed, failed, registered = [], [], []
-    w._graph_runtime = SimpleNamespace(
-        add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
-        register_stop_limits=lambda rid, info: None,
+    registered, processed = [], []
+    parked = SimpleNamespace(body=SimpleNamespace(request_id="wire"))
+    w = make_worker(
+        _graph_runtime=SimpleNamespace(
+            add_request=lambda **kw: 5, get_sharding_config=lambda rid: None,
+            register_stop_limits=lambda rid, info: None,
+        ),
+        engine_manager=SimpleNamespace(
+            engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
+            add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
+        ),
+        request_state=SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None),
+        tensor_manager=SimpleNamespace(
+            register_request=lambda rid, sharding: registered.append(rid),
+            start_read_tensors=lambda *a, **kw: pytest.fail("no reads for a failed request"),
+        ),
     )
-    w.engine_manager = SimpleNamespace(
-        engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
-        add_request=lambda rid, cfg, info: (_ for _ in ()).throw(RuntimeError("over capacity")),
-    )
-    w.request_state = SimpleNamespace(per_request_info={}, add_request=lambda rid, info: None)
-    w.scheduler = SimpleNamespace(note_arrival=lambda rid: None)
-    w.tensor_manager = SimpleNamespace(
-        register_request=lambda rid, sharding: registered.append(rid),
-        start_read_tensors=lambda *a, **kw: pytest.fail("no reads for a failed request"),
-    )
-    w._fail_requests = failed.append
-    w._process_message_list = processed.extend
+    assert w.lifecycle.park(parked)
+    w.ingest._dispatch = processed.extend
     body = SimpleNamespace(
         request_id="wire", partition_worker_graph_ids=None, worker_graph_to_workers={}, loop_caps={},
         request_info=SimpleNamespace(
             partition_name="p", graph_walk="g", resource_configs=None, rid_handle=None,
         ),
     )
-    Worker._add_new_request(w, body)
-    assert registered == [5] and len(failed) == 1 and list(failed[0]) == [5]
-    assert failed[0][5].startswith("Error in worker: internal error (error id ")
+    w.ingest._add_new_request(body)
+    failed = w.lifecycle.take_failures()
+    assert registered == [5] and list(failed) == [5]
+    assert failed[5].startswith("Error in worker: internal error (error id ")
     # messages parked before the NEW still go through (a parked REMOVE among them)
-    assert processed == ["parked"] and "wire" not in w._unprocessed_messages
+    assert processed == [parked] and "wire" not in w.lifecycle._parked

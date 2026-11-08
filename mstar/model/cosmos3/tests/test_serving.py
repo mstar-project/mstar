@@ -109,9 +109,14 @@ def test_gen_params_and_step_metadata() -> None:
         "num_inference_steps"
     ] == model.config.num_inference_steps_video
 
-    # i2v conditioning is inferred from the input modalities.
-    p = model._resolve_gen_params({}, ["image", "text"], ["image"])
+    # i2v conditioning is inferred from the input modalities; a single latent
+    # frame would leave nothing to denoise but the pinned image.
+    p = model._resolve_gen_params({}, ["image", "text"], ["video"])
     assert p["has_image_condition"] is True
+    with pytest.raises(ValueError, match="image conditioning requires a video"):
+        model._resolve_gen_params({}, ["image", "text"], ["image"])
+    with pytest.raises(ValueError, match="image conditioning requires a video"):
+        model._resolve_gen_params({"num_frames": 4}, ["image", "text"], ["video"])
 
     fpa = model.get_initial_forward_pass_args(
         "p0", ["text"], ["image"], {"text_inputs": []},
@@ -690,6 +695,7 @@ def test_postprocess_finishes_captured_step() -> None:
     dit.request_state("r").add_all(
         gs=2.0, scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
         cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]},
+        uncond={},
     )
     info = types.SimpleNamespace(graph_walk="image_gen", dynamic_loop_iter_counts={IMAGE_GEN_LOOP: 1})
     lat = torch.ones(1, 1, 2, 2)
@@ -709,6 +715,52 @@ def test_postprocess_finishes_captured_step() -> None:
     dit.postprocess("r", types.SimpleNamespace(graph_walk="prefill"), pre, inputs=inp)
     assert pre == {"cond_v": [lat]}
     dit.cleanup_request("r")
+
+
+@pytest.mark.parametrize("path", ["captured", "batched", "sound"])
+def test_a_step_outside_the_guidance_interval_keeps_the_conditional_branch(path) -> None:
+    """A captured or cross-request batched step runs both branches, but only a
+    step inside the guidance_interval combines them, as the single eager path
+    does, so the same seed gives the same image under any load."""
+    import types
+
+    from mstar.model.cosmos3.constants import VIDEO_SOUND_GEN_WALK
+    from mstar.model.cosmos3.submodules import IMAGE_GEN_LOOP, VIDEO_SOUND_GEN_LOOP, Cosmos3DiTSubmodule
+    from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
+
+    cond_v, uncond_v = torch.full((1, 1, 2, 2), 2.0), torch.ones(1, 1, 2, 2)
+    branches = (cond_v, uncond_v) if path != "sound" else ((cond_v, cond_v[0, 0]), (uncond_v, uncond_v[0, 0]))
+    dit = Cosmos3DiTSubmodule(transformer=None, config=Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True).config, scheduler=None)
+    dit.transformer = types.SimpleNamespace(
+        denoise_step_row=lambda *args, **kwargs: None,
+        denoise_step_batched=lambda reqs, label, attn: [branches] * len(reqs),
+    )
+    dit._solver_state = ()
+    dit.node_resources = {"attn": None}
+    # the step at t=100 is outside the t2i default interval [400, 1000]
+    dit.request_state("r").add_all(
+        gs=2.0, guidance_interval=(400.0, 1000.0),
+        scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
+        cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])],
+              "num_noisy_vision_tokens": 1, "rotary": None},
+        uncond={"rotary": None}, num_sound=1,
+    )
+    walk, loop = ("image_gen", IMAGE_GEN_LOOP) if path != "sound" else (VIDEO_SOUND_GEN_WALK, VIDEO_SOUND_GEN_LOOP)
+    info = types.SimpleNamespace(graph_walk=walk, dynamic_loop_iter_counts={loop: 2})
+    lat = torch.ones(1, 1, 2, 2)
+    if path == "captured":
+        out = {"cond_v": [cond_v], "uncond_v": [uncond_v]}
+        dit.postprocess("r", info, out, inputs=ARNodeInputs(tensor_inputs={"latents": lat}))
+    else:
+        out = dit.forward_batched(
+            walk, ModelInputsFromEngine(request_ids=["r"], per_request_info={"r": info}), latents={"r": lat},
+            sound_latents={"r": lat[0, 0]},
+        )["r"]
+    # 1 + cond (2), not 1 + the combine uncond + gs * (cond - uncond) (3)
+    assert torch.equal(out["latents"][0], torch.full((1, 1, 2, 2), 3.0))
+    if path == "sound":
+        assert torch.equal(out["sound_latents"][0], torch.full((2, 2), 3.0))
 
 
 def test_video_postprocess_uses_request_fps(tmp_path) -> None:

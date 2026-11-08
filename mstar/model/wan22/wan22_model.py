@@ -26,11 +26,9 @@ request's ``num_inference_steps`` stops it via ``Wan22DitSubmodule.check_stop``.
 """
 
 import html
-import io
 import logging
 import os
 import re
-from fractions import Fraction
 
 import torch
 
@@ -39,6 +37,7 @@ from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
     StreamingConnectionState,
 )
+from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
@@ -51,6 +50,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, Model
+from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
@@ -152,13 +152,22 @@ class Wan22Model(Model):
                     num_kv_heads=cfg.num_attention_heads,
                     head_dim=cfg.attention_head_dim,
                     # one segment per guidance branch
-                    max_segments_per_request=2,
+                    max_segments_per_request=Wan22DitSubmodule.CFG_BRANCHES,
                     # the DiT is compiled, not captured: keep attention in its graph
                     compile_op=True,
                     dtype=torch.bfloat16,
                 ),
             ),
         ]
+
+    def get_default_sharding_config(self) -> ShardingConfig:
+        # CFG-parallel: the dit's two guidance branches split over cfg_size
+        # ranks, which all-gather the noise predictions (see Wan22DitSubmodule).
+        # Signals stay replicated: no shard_dim entries.
+        return ShardingConfig(
+            groups=[], tp_enabled_nodes=set(), shard_dim={},
+            cfg_enabled_nodes={"dit": Wan22DitSubmodule.CFG_BRANCHES},
+        )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # -- encode_text: UMT5 forward; both CFG embeddings persist at the
@@ -479,7 +488,6 @@ class Wan22Model(Model):
         """
         if modality != "video":
             raise ValueError(f"Unsupported modality for Wan2.2: {modality!r}")
-        import av
 
         # An explicit ``fps: null`` means "unset", same as an absent key.
         raw_fps = (request_kwargs or {}).get("fps")
@@ -492,22 +500,7 @@ class Wan22Model(Model):
         if fps <= 0:
             raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}")
 
-        frames = output.cpu().numpy()
-        buffer = io.BytesIO()
-        container = av.open(buffer, mode="w", format="mp4")
-        # PyAV rejects float rates, so the rate is handed over as an exact
-        # Fraction: integer rates stay integral (24 -> 24) and fractional ones
-        # become a rational the container can carry (23.976 -> 2997/125).
-        stream = container.add_stream("libx264", rate=Fraction(fps).limit_denominator(1001))
-        stream.height, stream.width = frames.shape[1], frames.shape[2]
-        stream.pix_fmt = "yuv420p"
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():  # flush encoder delay
-            container.mux(packet)
-        container.close()
-        return buffer.getvalue()
+        return encode_mp4(output.cpu().numpy(), fps)
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration
@@ -705,20 +698,19 @@ class Wan22Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None, cfg_group=None,
     ) -> torch.nn.Module | None:
-        # ``autocast_dtype`` and ``sp_group`` exist for interface parity only.
-        # Weights load in the checkpoint's own dtypes, and wan22 declares no
-        # sp-enabled nodes.
+        # ``autocast_dtype`` exists for interface parity only: weights load in the
+        # checkpoint's own dtypes. ``cfg_group`` reaches the dit only.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device)
+        submodule = self._create_submodule(node_name, device, cfg_group=cfg_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str = "cpu") -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device: str = "cpu", cfg_group=None) -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
@@ -755,7 +747,7 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config)
+            return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 

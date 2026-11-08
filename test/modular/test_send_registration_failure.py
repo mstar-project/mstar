@@ -31,8 +31,9 @@ from mstar.graph.base import GraphEdge, GraphNode, TensorPointerInfo
 from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.worker import deliver, make_worker
 from mstar.utils.containers import ParallelList
-from mstar.utils.ipc_format import ConductorMessageType, RemoveRequest
+from mstar.utils.ipc_format import ConductorMessageType, RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -130,13 +131,12 @@ def test_the_worker_fails_only_the_refused_request():
     try:
         r7 = _store(mgr, 7, mine, bad)
         r8 = _store(mgr, 8, theirs)
-        worker = Worker.__new__(Worker)
-        worker._walk_drivers = {}
-        worker._walk_driven_edges = {}
-        worker._stop_token_signal = {}  # no declared stop policies: check_stop decides
-        worker.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
-        worker.tensor_manager = mgr
-        worker.scheduler = SimpleNamespace(failed_rids=set())
+        worker = make_worker(
+            streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
+            tensor_manager=mgr,
+        )
+        worker.lifecycle.add(7, "r7")
+        worker.lifecycle.add(8, "r8")
         reported = []
         worker._fail_requests = reported.append
         route_output = type("RouteOutput", (), {
@@ -182,21 +182,18 @@ def _postprocess_worker(refuse, follower=False):
     """A worker whose ``_postprocess_batch`` runs for real, with the engine,
     graph runtime and transfer engine faked around it. The transfer engine
     refuses every tensor of the rids in ``refuse``, step after step."""
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
-    w._phase_period = 0
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
+        parallel_nodes={"llm"} if follower else set(),
+        scheduler=SimpleNamespace(drop_backlogged=lambda rids: None),
+    )
     w.enable_nvtx = w.enable_prof = False
     w.device = torch.device("cpu")
     w.worker_id = "w0"
-    w.parallel_nodes = {"llm"} if follower else set()
-    w.parallel_leader_nodes = set()
     w._innermost_loop_by_node = {}
     w.log = SimpleNamespace(stop_checked=[], routed=[], registered=[], sent=[], conductor=[])
-    w.scheduler = SimpleNamespace(failed_rids=set())
-    w.scheduler.fail_rids = w.scheduler.failed_rids.update
+    w.lifecycle.add(0, "r0")
+    w.lifecycle.add(1, "r1")
     w.communicator = SimpleNamespace(send=lambda e, m: w.log.conductor.append(m))
     w.request_state = SimpleNamespace(
         per_request_info={0: object(), 1: object()},
@@ -209,7 +206,6 @@ def _postprocess_worker(refuse, follower=False):
     )
     w._inline_emit_values = lambda *a: (None, None)
     w._count_new_tokens = lambda *a: {}
-    w._stream_consumption_batch = lambda rids: []
 
     def check_stop(node_batch, cpu_outputs, host_rows=None):
         w.log.stop_checked.append(list(node_batch.request_ids))
@@ -277,7 +273,7 @@ def _postprocess_worker(refuse, follower=False):
 
 def _decode_step(rids, final_stream=()):
     node_batch = SimpleNamespace(
-        request_ids=list(rids), per_request_info=dict.fromkeys(rids),
+        node_name="llm", request_ids=list(rids), per_request_info=dict.fromkeys(rids),
         failed_requests={}, completion_event=None,
         final_stream_rids=set(final_stream), resource_publish_info={},
         partition_done_rids=set(), cached_rids=set(), withheld_outputs={},
@@ -314,7 +310,7 @@ def test_the_speculated_next_step_sends_nothing_of_a_refused_request():
 
     Worker._postprocess_batch(w, *step_n)
     assert w.log.sent == [[1]]
-    assert w.scheduler.failed_rids == {0}
+    assert w.lifecycle.failed_rids == {0}
 
     Worker._postprocess_batch(w, *step_n1)
 
@@ -327,7 +323,7 @@ def test_the_speculated_next_step_sends_nothing_of_a_refused_request():
 
 def test_a_step_of_only_failed_rids_routes_nothing():
     w = _postprocess_worker(refuse=set())
-    w.scheduler.failed_rids.add(0)
+    w.lifecycle.failed_rids.add(0)
     pending, outputs = _decode_step([0])
 
     Worker._postprocess_batch(w, pending, outputs)
@@ -342,7 +338,7 @@ def test_a_failed_rid_leaves_the_batch_walk_grouping():
     taken out of an in-flight step must leave it too, or routing reaches the
     rid's row after it is gone."""
     w = _postprocess_worker(refuse=set())
-    w.scheduler.failed_rids.add(0)
+    w.lifecycle.failed_rids.add(0)
     pending, outputs = _decode_step([0, 1])
     assert pending.batch.rids_by_walk() == {"decode": [0, 1]}
 
@@ -358,7 +354,7 @@ def test_a_step_of_only_failed_rids_still_waits_for_its_gpu_work(monkeypatch, ha
     while its kernels may still run, so postprocess waits for them anyway."""
     w = _postprocess_worker(refuse=set())
     w.device = SimpleNamespace(type="cuda")
-    w.scheduler.failed_rids.add(0)
+    w.lifecycle.failed_rids.add(0)
     pending, outputs = _decode_step([0])
     waits = []
     if has_event:
@@ -403,7 +399,8 @@ def test_a_follower_still_routes_a_failed_rid_and_reports_it_once():
 def test_an_overlapping_view_fails_only_its_request_on_real_mooncake():
     """The issue's repro on Mooncake over TCP: a tensor and a view inside it
     overlap, which Mooncake refuses (-7)."""
-    pytest.importorskip("mooncake.engine")
+    # Without libibverbs the import raises ImportError, and the default skips only ModuleNotFoundError.
+    pytest.importorskip("mooncake.engine", exc_type=ImportError)
     from mstar.communication.tensors import create_tensor_communication_manager
 
     mgr = create_tensor_communication_manager(
@@ -425,7 +422,7 @@ def test_an_overlapping_view_fails_only_its_request_on_real_mooncake():
 def _real_manager(monkeypatch, rust):
     """Mooncake over TCP, with the given bookkeeper: the Rust one a worker
     uses, or the Python one a data worker falls back to."""
-    pytest.importorskip("mooncake.engine")
+    pytest.importorskip("mooncake.engine", exc_type=ImportError)
     if rust:
         pytest.importorskip("mstar_rust")
     else:
@@ -474,32 +471,24 @@ def test_remove_request_finishes_when_an_unregister_fails(monkeypatch, rust):
     assert mgr.register_for_send_uuids(ParallelList([3], [uuids])) is None
     assert mgr.transfer_engine.unregister_memory(t.data_ptr()) == 0
     released = []
-    w = Worker.__new__(Worker)
-    w._walk_drivers = {}
-    w._walk_driven_edges = {}
-    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    w.streams = StreamBufferManager(SimpleNamespace(per_request_info={}), None, [])  # no streams
-    w.is_tp_follower = False
-    w._rid = lambda wire: 3
-    w._in_flight_rids = set()
-    w._draining_rids, w._pending_drains, w._reads_done_sent = set(), set(), set()
-    w._pending_removes = set()
-    w.streaming_buffers = {}
-    w.tensor_manager = mgr
-    w.engine_manager = SimpleNamespace(
-        remove_request=lambda rid: None,
+    w = make_worker(
+        streams=StreamBufferManager(SimpleNamespace(per_request_info={}), None, []),
+        tensor_manager=mgr,
+        engine_manager=SimpleNamespace(remove_request=lambda rid: None),
+        request_state=SimpleNamespace(remove_request=lambda rid: None),
+        profile_info=SimpleNamespace(pop_request=lambda rid: None),
+        scheduler=SimpleNamespace(clear_rid=lambda rid: released.append(("scheduler", rid))),
+        _graph_runtime=SimpleNamespace(
+            get_sharding_config=lambda rid: None,
+            get_rid_handle=lambda wire: 3,
+            remove_request=lambda rid: released.append(("runtime", rid)),
+        ),
     )
-    w.request_state = SimpleNamespace(remove_request=lambda rid: None)
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w.scheduler = SimpleNamespace(
-        clear_rid=lambda rid, wire: released.append(("scheduler", rid)),
-    )
-    w._graph_runtime = SimpleNamespace(
-        get_sharding_config=lambda rid: None,
-        remove_request=lambda rid: released.append(("runtime", rid)),
-    )
+    w.lifecycle.add(3, "r")
 
-    Worker._remove_request(w, RemoveRequest(request_id="r"))
+    deliver(w, WorkerMessage(
+        message_type=WorkerMessageType.REMOVE_REQUEST, body=RemoveRequest(request_id="r"),
+    ))
 
     assert released == [("scheduler", 3), ("runtime", 3)]
     assert mgr.tensor_store.get_all_uuids(3) == []
@@ -623,7 +612,7 @@ def test_a_leader_drops_a_failed_row_its_follower_keeps():
     leader = _postprocess_worker(refuse=set())
     follower = _postprocess_worker(refuse=set(), follower=True)
     for w in (leader, follower):
-        w.scheduler.failed_rids.add(0)
+        w.lifecycle.failed_rids.add(0)
 
         Worker._postprocess_batch(w, *_decode_step([0, 1]))
 

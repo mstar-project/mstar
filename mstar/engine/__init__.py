@@ -59,6 +59,35 @@ def apply_dynamo_config() -> None:
     torch._dynamo.config.specialize_int = False
 
 
+def with_recompile_limit(fn, submodule):
+    """Wrap ``fn``, one of ``submodule``'s torch.compile'd callables, so dynamo compiles it under
+    the submodule's ``dynamo_recompile_limit()`` where that is above the current limit, for
+    the call's duration. A submodule that doesn't override the hook gets ``fn`` back as is.
+
+    From torch 2.12 dynamo's config is per thread. Before it the patch is process-wide while
+    the call runs, so other nodes keep the engine's limit only because a worker runs one
+    compiled call at a time (capture before its loop, then its one GPU thread), and its GPU and
+    plan threads set the engine's config before the loop (``Worker._engine_thread_pool``)."""
+    from mstar.model.submodule_base import NodeSubmodule
+
+    hook = getattr(type(submodule), "dynamo_recompile_limit", None)
+    if hook is None or hook is NodeSubmodule.dynamo_recompile_limit:
+        return fn
+
+    def forward(*args, **kwargs):
+        need = submodule.dynamo_recompile_limit()
+        config = torch._dynamo.config
+        if need is None or need <= config.recompile_limit:
+            return fn(*args, **kwargs)
+        # and dynamo's cap on a code object's entries in all, which past 256 would hold the
+        # captures over it uncompiled just the same
+        with config.patch(recompile_limit=need,
+                          accumulated_recompile_limit=max(need, config.accumulated_recompile_limit)):
+            return fn(*args, **kwargs)
+
+    return forward
+
+
 def apply_torch_config() -> None:
     apply_dynamo_config()
     # Process-wide, so set once here and never from a thread initializer: a

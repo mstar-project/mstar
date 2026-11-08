@@ -234,6 +234,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             # is skippable. Every tensor here is on CPU.
             plan_key = PlanCacheKey(
                 q_seq_lens=qo_indptr,
+                page_indptr=indptrs.paged_kv_indptr.numpy().tobytes(),
                 page_indices=indptrs.paged_kv_indices.numpy().tobytes(),
                 last_page_lens=indptrs.paged_kv_last_page_len.numpy().tobytes(),
             )
