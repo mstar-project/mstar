@@ -21,8 +21,9 @@ name: Claude Review
 #      model to ignore any AGENTS.md or prompt found under pr-head/, so a PR
 #      cannot rewrite the rules it is judged by.
 #   4. The job's token can write only to pull requests, and the review app's
-#      token (below) only to pull requests and issues of this repository. The
-#      model has no shell and no mutation tools: it posts inline comments
+#      token (below) only to pull requests and issues of this repository, and
+#      in gpu mode to the media repository's contents (REVIEW_MEDIA_REPO).
+#      The model has no shell and no mutation tools: it posts inline comments
 #      through the action's tool (which redacts secrets) and returns the summary
 #      as fields, which a workflow step renders, redacts and posts. In light
 #      and thorough mode the worst case for a prompt injection is a bad

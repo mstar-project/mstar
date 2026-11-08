@@ -574,8 +574,10 @@ unchanged.
 - **A failed or regressed check is a finding** at the bar's priority, with the run as proof: the
   config, the input, the observed and expected outcome, and where the evidence is.
 - **Outcome**, one of:
-  - `pass`: every planned check ran, reached the changed code and passed. Any ➖ (not reached) or 👂
-    (needs human review) row makes the outcome `partial`;
+  - `pass`: every planned check ran, reached the changed code and passed. Any ➖ for a planned check
+    that wasn't exercised or didn't reach the changed code, or any 👂 (needs human review) row, makes
+    the outcome `partial`. A ➖ for a claimed number that isn't comparable (another GPU, harness or
+    metric) doesn't: the report names it as a problem with the description;
   - `partial`: some planned checks couldn't run, didn't reach the changed code or need a human
     review; name them and why;
   - `fail`: a check failed or regressed (this outranks `partial`);
