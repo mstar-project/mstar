@@ -153,8 +153,9 @@ def render(review, pages, head, mode):
     if live and mode == "gpu":
         parts.append(f"Live test: **{live['run']}**. {live['reason']}")
     parts.append(FOOTER)
+    risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
-             "risk": review.get("risk"), "live_test": live}
+             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "live_test": live}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
     text = "\n\n".join(parts).replace("<!--", "&lt;!--")
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
