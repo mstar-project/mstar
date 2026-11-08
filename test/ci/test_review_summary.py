@@ -62,6 +62,7 @@ class TestReviewSummary(unittest.TestCase):
         self.assertIn("- [ ] **[P1]** `inline 7`: disputed, you decide:", text, "no person would be told to decide it")
 
     def test_a_gpu_ask_above_the_cap_stays_untestable_after_a_smaller_re_review(self):
+        carried, over_gpu_cap = SUMMARY["carried"], SUMMARY["over_gpu_cap"]
         for gpus, named, expected in ((8, "", "needs 8 GPUs, runs get 4"), (8, "AMD", "AMD; needs 8 GPUs, runs get 4"),
                                       (4, "AMD", "AMD")):
             with self.subTest(gpus=gpus, named=named):
