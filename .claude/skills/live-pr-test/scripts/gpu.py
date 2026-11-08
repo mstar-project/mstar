@@ -11,7 +11,7 @@ usage:
   gpu.py push <instance> <local> <remote>        scp -r to the box
   gpu.py pull <instance> <remote> <local>        scp -r from the box
   gpu.py list [--all]                            instances launched here (--all: by any session; all RunPod, Lambda)
-  gpu.py extend <instance> --hours H             move the watchdog deadline to now + H
+  gpu.py extend <instance> --hours H             move the watchdog deadline to now + H (Slurm, Eras: earlier only)
   gpu.py terminate <instance>
 
 Offers only cover regions where the team has persistent storage (a RunPod global volume
@@ -924,7 +924,11 @@ def cmd_extend(args, cfg):
     entry(args.instance)
     with ledger_txn() as d:
         e = d[args.instance]
-        e["deadline"] = time.time() + args.hours * 3600
+        deadline = time.time() + args.hours * 3600
+        if e["provider"] in ("slurm", "eras") and deadline > e["deadline"]:
+            die(f"{args.instance} can't run later than its current deadline: Slurm's --time and the Eras Pod's "
+                "deadline were fixed at launch, so it would still end then. Launch a new one for more time")
+        e["deadline"] = deadline
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
 

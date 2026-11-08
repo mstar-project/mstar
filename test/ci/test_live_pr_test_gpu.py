@@ -10,6 +10,7 @@ import os
 import runpy
 import subprocess
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -110,6 +111,23 @@ class TestSlurm(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()), \
                 self.assertRaises(InterruptedError, msg="the watchdog would exit, and the job would run on"):
             GPU["cmd_watchdog"](argparse.Namespace(instance="slurm:gone:42"), {})
+
+    def test_extend_cant_outrun_a_deadline_fixed_at_launch(self):
+        saved = {k: self.globals[k] for k in ("STATE", "LEDGER")}
+        self.addCleanup(self.globals.update, saved)
+        state = Path(tempfile.mkdtemp())
+        self.globals.update(STATE=state, LEDGER=state / "instances.json")
+        soon = time.time() + 600
+        with GPU["ledger_txn"]() as d:
+            d.update({f"{p}:i": {"provider": p, "deadline": soon} for p in ("eras", "runpod")})
+        with self.assertRaises(SystemExit, msg="the watchdog would move but the Pod would still end at its old time"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            GPU["cmd_extend"](argparse.Namespace(instance="eras:i", hours=1), {})
+        with contextlib.redirect_stdout(io.StringIO()):
+            GPU["cmd_extend"](argparse.Namespace(instance="runpod:i", hours=1), {})
+            GPU["cmd_extend"](argparse.Namespace(instance="eras:i", hours=0), {})  # how a lost API key still terminates
+        self.assertLess(GPU["ledger"]()["eras:i"]["deadline"], soon)
+        self.assertGreater(GPU["ledger"]()["runpod:i"]["deadline"], soon)
 
     def test_no_launch_past_max_running_from_any_session(self):
         key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
