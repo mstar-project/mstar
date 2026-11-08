@@ -341,6 +341,14 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional, default 128)* The fewest tokens a prompt cut by chunked prefill runs
        in a step, or the whole budget if that is smaller; with less left, it waits a step. A positive int, for every
        chunked walk. See *Chunked prefill budgets* below.
+   * - ``eager_yield_nodes``
+     - *(optional)* Nodes whose speculation chains look for other ready work from their
+       first step instead of their second. A chain otherwise speculates one step after
+       each yield, so a burst of prompts alternates with decode steps of a few rows; on,
+       the burst prefills first and decode takes its rows together. Throughput at high
+       concurrency, at the cost of decode waiting while prompts run. MI325X, Qwen3.5
+       0.8B, c=64: +0.6 to +2 % tok/s on chat prompts, +4 % on 1k-token prompts. Naming a
+       node of a lockstep instance fails loading.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
        binds, so no client pays a shape's first-request cost (torch.compile of a step,
@@ -502,6 +510,19 @@ the model budgets or with a budget per walk; null turns a walk's chunking off. A
 that is cut runs at least ``min_chunk_tokens`` tokens a step (default 128), or the whole
 budget if that is smaller. When less than that is left of a step's budget, the prompt waits
 for the next step rather than running the step over its budget.
+
+On AMD GPUs the shipped Qwen3.5 configs turn the LLM's budget off (``max_batch_tokens:
+{LLM: null}`` under ``platform_overrides.rocm``; CUDA reads the same files with the
+default). AITER's chunked GDN prefill is captured only to 512 tokens, so there every
+prefill or mixed step past that runs eagerly at a near-flat cost (about 25 ms on MI325X
+for Qwen3.5 0.8B, whatever its length), and the budget turns one eager step per burst of
+whole prompts into one per prompt or two. With no budget prompts run whole, up to the
+prefill capture's row cap a step, and decode takes its rows afterwards. MI325X, 1k-token
+prompts, c=64, output tok/s with the budget and without: 0.8B 4.1k and 8.4k, 2B 3.8k and
+5.8k, 9B TP2 1.56k and 1.80k; chat prompts within 2 %.
+What it costs there is time to first token under load (9B TP2 at c=64: p50 280 ms with
+the budget, 970 without, p95 level) and chunked prefill itself: a long prompt runs whole
+in one step and decode waits for it.
 
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
