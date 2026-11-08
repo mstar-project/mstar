@@ -149,9 +149,10 @@ The GPU model families depend on:
 - **FlashInfer** (`flashinfer-python`) — paged attention and continuous batching for the autoregressive backbones (every model with a `KV_CACHE` node runs attention through it). Pinned to the version the attention wrappers' direct planner calls were checked against (`DIRECT_PLAN_FLASHINFER_VERSIONS` in `mstar/engine/resources/attn/wrappers.py`); on any other version they fall back to FlashInfer's own `plan()`.
 - **flash-attn** — used by LingBot-World's `reference_numerics` mode. **Not installed by any extra**; install it separately (see [flash-attn (LingBot-World)](/installation#flash-attn-lingbot-world)).
 - **flash-attn-4** — Waypoint's flex-attention `FLASH` backend. **Not installed by any extra**; install it separately (see [flash-attn-4 (Waypoint, FA3 sm90 kernel)](/installation#flash-attn-4-waypoint-fa3-sm90-kernel)).
+- **flash_attn_3** — FlashAttention-3's paged kernel for speculative decoding's verify steps in asynchronous mode, on Hopper. **Not installed by any extra**; install it separately (see [flash_attn_3 (speculative decoding, sm90)](/installation#flash-attn-3-speculative-decoding-sm90)).
 - **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory (`SHM`) or `TCP` transport instead (see [Serving](/serving), which also covers the network it needs). The extras install Mooncake's CUDA 12 wheel; next to a CUDA 13 torch (`+cu130`) swap in its CUDA 13 build, as the Docker images do (see [libcudart.so.12: cannot open shared object file](/installation#mooncake-cuda13)).
 
-Apart from `flash-attn` and `flash-attn-4`, these are installed by the extras above. Your installed `torch` must match your system CUDA toolkit — `--torch-backend=auto` handles that for you (next section).
+Apart from `flash-attn`, `flash-attn-4` and `flash_attn_3`, these are installed by the extras above. Your installed `torch` must match your system CUDA toolkit — `--torch-backend=auto` handles that for you (next section).
 
 ## omnivoice (OmniVoice) {#omnivoice-omnivoice}
 
@@ -240,6 +241,19 @@ uv pip install --torch-backend=auto ./flash-attention/flash_attn/cute
 This is pure Python plus `nvidia-cutlass-dsl` — there is no CUDA extension to build. Its kernels are JIT-compiled on first use, which adds roughly a minute to the first server startup.
 
 If `flash-attn-4` isn't importable or torch is older than 2.11, the server logs a warning and falls back to the previous Triton flex kernel. It is correct but slower — about 1.8x per attention call at 720p. Set `MSTAR_FLEX_BACKEND=TRITON` to choose it explicitly, or `MSTAR_FLEX_BACKEND=FLASH` to fail at startup instead of falling back.
+
+## flash_attn_3 (speculative decoding, sm90) {#flash-attn-3-speculative-decoding-sm90}
+
+A node that drafts and verifies tokens runs its verify steps in asynchronous mode only on FlashAttention-3's paged kernel, which reads each request's KV length on the device. Without it (or off SM90) the node runs in synchronous mode on FlashInfer, which is correct and plans each verify step after the one before it was post-processed. `fa3-fwd`, which `.[cosmos3]` and `.[all]` install, is built without paged KV, so it can't serve them.
+
+PyTorch's index hosts the official wheel, one per CUDA build, built against torch's stable ABI. Install the one matching your torch's CUDA (the command below is `cu129`'s):
+
+```bash
+uv pip install --no-deps flash_attn_3==3.0.1 --index-url https://download.pytorch.org/whl/cu129
+python -c "from flash_attn_3.flash_attn_interface import flash_attn_with_kvcache"
+```
+
+It is a wheel of prebuilt kernels (about 400 MB); nothing compiles. The attention resource's `verify_backend` pins a kernel: `fa3` refuses to load where the wheel or the GPU can't run it, `flashinfer` keeps the node synchronous.
 
 ## Matching your CUDA toolkit {#matching-your-cuda-toolkit}
 
