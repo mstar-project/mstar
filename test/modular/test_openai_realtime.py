@@ -1496,6 +1496,24 @@ def test_a_reply_without_an_end_mark_ends_after_its_padding(duplex):
         _step_pcm(i) for i in (1, 2, 3, 4)]
 
 
+def test_text_after_a_reply_ended_for_its_padding_is_a_reply_of_its_own(duplex):
+    """A pause longer than turn_idle_steps inside the model's speech, or a next
+    reply whose start mark is missing: the text after it opens a reply, not lost."""
+    texts = [_text(0), _text(1, mark="start"), _text(2, b"Hi"), _text(3), _text(4), _text(5, b" again"),
+             _text(6, mark="end"), _text(7)]
+    client, api = duplex([*texts, *(_audio(i) for i in range(8))], end=True)
+    api.model.turn_idle_steps = 2
+    with client.websocket_connect("/v1/realtime") as ws:
+        ws.receive_text()
+        _send(ws, "input_audio_buffer.append", audio=base64.b64encode(b"\0\0" * 480).decode())
+        events = _until_closed(ws)
+    done = [e["response"] for e in events if e["type"] == "response.done"]
+    assert [r["output"][0]["content"][0]["transcript"] for r in done] == ["Hi", " again"]
+    for response, steps in zip(done, ([1, 2, 3, 4], [5, 6]), strict=True):
+        assert [base64.b64decode(e["delta"]) for e in events if e["type"] == "response.output_audio.delta"
+                and e["response_id"] == response["id"]] == [_step_pcm(i) for i in steps]
+
+
 def test_a_call_that_ends_mid_reply_finishes_its_response(duplex):
     outputs = [_text(0, mark="start"), _text(1, b"Hel"), _audio(0),
                _Chunk("error", b"the call passed its length", {"status": 400})]
