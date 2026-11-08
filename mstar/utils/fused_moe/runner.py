@@ -106,7 +106,7 @@ def fused_experts(
         ``(tokens, top_k)``, routing probabilities (possibly
         renormalized).  Dtype matches ``hidden_states``.
     topk_ids : torch.Tensor
-        ``(tokens, top_k)`` int; will be cast to int32 if not already.
+        ``(tokens, top_k)`` int32 or int64, read as they are; any other integer type is cast to int32.
     activation : str
         ``"silu"`` (default) or ``"gelu"``.  Qwen3-Omni always uses silu.
     reduce_results : bool

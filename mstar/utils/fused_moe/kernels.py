@@ -296,7 +296,7 @@ def invoke_fused_moe_kernel(
         Output buffer, shape ``(M*topk, N)`` for GEMM-1 or reshape-viewed
         ``(M*topk, hidden)`` for GEMM-2.
     topk_weights, topk_ids : torch.Tensor
-        Router output, shapes ``(M, top_k)``.  ``topk_ids`` must be int32.
+        Router output, shapes ``(M, top_k)``.  ``topk_ids`` int32 or int64.
     sorted_token_ids, expert_ids, num_tokens_post_padded : torch.Tensor
         Outputs of :func:`moe_align_block_size`.
     mul_routed_weight : bool
