@@ -1,5 +1,6 @@
 import functools
 import itertools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -16,7 +17,13 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.distributed.base import (
+    PARALLEL_AXES,
+    ShardingConfig,
+    ShardingGroup,
+    mesh_groups,
+    node_group_axis_sizes,
+)
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
@@ -144,6 +151,16 @@ MAX_OUTPUT_TOKENS = 2048
 class TensorAndMetadata:
     data: torch.Tensor
     metadata: dict = field(default_factory=dict)
+
+
+class RobotIO(NamedTuple):
+    """What a robot policy's requests and outputs look like, for the API
+    server's robot protocols (the openpi WebSocket)."""
+    # the model_kwargs key a request's robot state goes under
+    state_kwarg: str
+    # the shape of the float32 actions ``postprocess`` returns for "action"
+    action_horizon: int
+    action_dim: int
 
 
 class ProcessPromptOutput(NamedTuple):
@@ -323,23 +340,18 @@ class WorkerGraph:
     ranks: list[int] = field(default_factory=list)
     tp_size: int = 1
     sp_size: int = 1
+    cfg_size: int = 1
 
-    # ``ranks`` form a 2D [sp_size, tp_size] mesh per instance (instances tile
-    # for data parallelism). ``_tp_ranks`` are the mesh rows (tensor-parallel
-    # comm groups: sharded heads/weights, all-reduce); ``_sp_ranks`` are the
-    # columns (sequence-parallel comm groups: Ulysses all-to-all);
-    # ``_instance_ranks`` are the whole instances (every rank of an instance runs
-    # a request together; empty without TP/SP, so the data-parallel replicas the
-    # conductor routes to are ``replica_ranks``). With
-    # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
-    # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
-    # __post_init__ to the instance size (tp*sp) so the conductor — which models
-    # a parallel group as its lockstep unit — routes to the whole instance; the
-    # original per-axis degrees live in ``_tp_comm_size`` and ``sp_size``.
-    _tp_ranks: list[list[int]] = field(default_factory=list)
-    _sp_ranks: list[list[int]] = field(default_factory=list)
+    # ``ranks`` tile into lockstep instances (instances tile for data
+    # parallelism), each a row-major mesh over ``PARALLEL_AXES``.
+    # ``_axis_ranks`` holds each axis's comm groups (tp: sharded heads and
+    # weights, all-reduce; sp: Ulysses all-to-all; cfg: one share of the
+    # guidance branches each); ``_instance_ranks`` are the whole instances
+    # (every rank of an instance runs a request together; empty without a
+    # parallel axis, so the data-parallel replicas the conductor routes to are
+    # ``replica_ranks``).
+    _axis_ranks: dict[str, list[list[int]]] = field(default_factory=dict)
     _instance_ranks: list[list[int]] = field(default_factory=list)
-    _tp_comm_size: int = 1
     _group_id: int = field(default=-1)  # original index into config's node_groups
 
     # Dense index over the deployment's worker graphs, reassigned by the
@@ -350,37 +362,31 @@ class WorkerGraph:
     worker_graph_id: int = field(default_factory=lambda: next(_wg_id_counter))
 
     def __post_init__(self):
-        if (self.tp_size > 1 or self.sp_size > 1) and not self._tp_ranks:
-            tp = self.tp_size  # tensor-parallel (row / all-reduce) degree
-            sp = self.sp_size  # sequence-parallel (all-to-all) degree
-            inst = tp * sp
+        inst = self.instance_size
+        if inst > 1:
             assert len(self.ranks) % inst == 0, (
                 f"WorkerGraph {self.worker_graph_id} has {len(self.ranks)} ranks; "
-                f"not divisible by tp_size*sp_size ({tp}*{sp}={inst})."
+                f"not divisible by its instance size ({self.axis_sizes}: {inst})."
             )
-            tp_ranks: list[list[int]] = []
-            sp_ranks: list[list[int]] = []
-            instance_ranks: list[list[int]] = []
-            for base in range(0, len(self.ranks), inst):
-                block = self.ranks[base:base + inst]
-                instance_ranks.append(block)
-                # row-major [sp][tp] grid over this instance's ranks
-                grid = [block[s * tp:(s + 1) * tp] for s in range(sp)]
-                tp_ranks += grid  # rows: vary tp within fixed sp
-                sp_ranks += [
-                    [grid[s][t] for s in range(sp)] for t in range(tp)
-                ]  # columns: vary sp within fixed tp
-            self._tp_ranks = tp_ranks
-            self._sp_ranks = sp_ranks
-            self._instance_ranks = instance_ranks
-            self._tp_comm_size = tp
-            # Conductor routes to the lockstep unit (the whole instance).
-            self.tp_size = inst
+            self._instance_ranks = [self.ranks[base:base + inst] for base in range(0, len(self.ranks), inst)]
+            self._axis_ranks = {axis: [] for axis in PARALLEL_AXES}
+            for block in self._instance_ranks:
+                for axis, groups in mesh_groups(block, self.axis_sizes).items():
+                    self._axis_ranks[axis] += groups
+
+    @property
+    def axis_sizes(self) -> dict[str, int]:
+        return {axis: getattr(self, f"{axis}_size") for axis in PARALLEL_AXES}
+
+    @property
+    def instance_size(self) -> int:
+        """Ranks in one lockstep instance: the conductor's routing unit."""
+        return math.prod(self.axis_sizes.values())
 
     @property
     def replica_ranks(self) -> list[list[int]]:
         """The ranks of each data-parallel replica: the lockstep instances, or
-        one rank apiece without TP/SP. The conductor routes a request to one."""
+        one rank apiece without a parallel axis. The conductor routes a request to one."""
         return self._instance_ranks or [[r] for r in self.ranks]
 
 
@@ -423,8 +429,7 @@ def _divide_into_worker_graphs(
                 consumes_stream=graph.consumes_stream,
                 _group_id=group_idx,
                 ranks=ng["ranks"],
-                tp_size=ng.get("tp_size", 1),
-                sp_size=ng.get("sp_size", 1),
+                **{f"{axis}_size": size for axis, size in node_group_axis_sizes(ng).items()},
             )
         ]
 
@@ -735,16 +740,13 @@ class Model(ABC):
                     f"Node group with ep_config contains nodes not in "
                     f"ep_enabled_nodes {sharding_config.ep_enabled_nodes}: {ng['node_names']}"
                 )
-            tp = ng.get("tp_size", 1)
-            sp = ng.get("sp_size", 1)
-            instance_size = tp * sp
+            instance_size = math.prod(node_group_axis_sizes(ng).values())
             if instance_size <= 1:
                 continue
-            # The sharding group is the lockstep unit — tp*sp workers routed
-            # together. TP shards weights via shard_dim-driven fanout; SP is
-            # in-module (replicated signals, no shard_dim) but its ranks must
-            # still run each request together, so the group spans the whole
-            # instance.
+            # The sharding group is the lockstep unit — the whole instance's
+            # workers, routed together. TP shards weights via shard_dim-driven
+            # fanout; SP and CFG are in-module (replicated signals, no
+            # shard_dim) but their ranks must still run each request together.
             groups.append(ShardingGroup(
                 nodes=set(ng["node_names"]),
                 tp_size=instance_size,
@@ -1043,6 +1045,19 @@ class Model(ABC):
 
         return TensorAndMetadata(img)
 
+    def load_decoded_image(self, image: torch.Tensor, device: str) -> TensorAndMetadata:
+        """What :meth:`load_image` returns, for an image that reached the API
+        server already decoded: RGB uint8 ``[3, H, W]``, as ``read_image(path,
+        rgb=True)`` decodes a file. A model that takes such images (e.g. from
+        the openpi endpoint) overrides this so the two paths agree; the rest
+        take images only as files."""
+        raise NotImplementedError(f"{type(self).__name__} takes images only as files")
+
+    def robot_io(self) -> RobotIO | None:
+        """A robot policy's request and output shapes, which the openpi
+        WebSocket serves it by; None for a model that is not one."""
+        return None
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
@@ -1134,7 +1149,7 @@ class Model(ABC):
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
-        moe_parallel: "MoeParallelConfig | None" = None,
+        moe_parallel: "MoeParallelConfig | None" = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
 
@@ -1149,6 +1164,12 @@ class Model(ABC):
         participates in a non-trivial SP group, so models without SP support
         never receive it. Models that support SP forward it to their
         attention so it can all-to-all the sequence around the kernel.
+
+        ``cfg_group`` is the node's classifier-free-guidance comm group, for
+        a node in ``cfg_enabled_nodes`` whose group sets ``cfg_size > 1``
+        (passed only then): each rank runs its ``my_rows(cfg_group,
+        branches)`` share of the branches and ``cfg_group.all_gather``
+        reassembles them. Nothing else about the node changes.
 
         ``moe_parallel`` is the node group's ``ep_config``: TP or EP for the
         node's routed experts. Passed only for a node in ``ep_enabled_nodes``

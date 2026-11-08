@@ -8,7 +8,7 @@ import logging
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import now, rid
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,9 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
         chunks = await api.collect_results(request_id, raw_request)
     finally:
         media_io.schedule_upload_cleanup(args.file_paths, api.upload_dir)
-    # Each video chunk is an mp4 (H.264); return it base64-encoded, mirroring the
-    # image endpoint's b64_json shape. A sound request additionally emits a raw
+    # Each video chunk is an mp4 (H.264); return it base64-encoded (bytes, which
+    # MediaJSONResponse writes as they are), mirroring the image endpoint's
+    # b64_json response. A sound request additionally emits a raw
     # 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one
     # playable file with sound); if the mux fails the plain video is returned.
     # The mux also rescales the video timestamps to the request frame rate: the
@@ -66,13 +67,13 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
                 )
             except Exception:  # noqa: BLE001 — degrade to video-only, keep serving
                 logger.exception("Muxing generated audio into the mp4 failed; returning video only")
-        data.append({"b64_json": base64.b64encode(video).decode("ascii"), "url": None})
+        data.append({"b64_json": base64.b64encode(video), "url": None})
     return {"created": now(), "data": data}
 
 
 def _stream_ndjson(api, request_id):
     # Bound to the submission now: the body is iterated later, by Starlette.
-    return _ndjson_lines(api.iter_result_chunks(request_id))
+    return _ndjson_lines(errors_in_band(request_id, api.iter_result_chunks(request_id)))
 
 
 async def _ndjson_lines(chunks):

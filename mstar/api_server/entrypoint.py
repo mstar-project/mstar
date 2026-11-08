@@ -23,15 +23,16 @@ from pathlib import Path
 from typing import Any, NamedTuple, Optional, Protocol
 
 import msgpack
+import torch
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 
-from mstar.api_server import media_io
+from mstar.api_server import media_io, ws_frames
 from mstar.api_server.auth import (
     API_KEY_ENV,
     APIKeyGuard,
@@ -40,8 +41,9 @@ from mstar.api_server.auth import (
     resolve_api_key,
     warn_if_no_api_key,
 )
-from mstar.api_server.body_limit import BodyLimitMiddleware
+from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
     APIServerMessage,
     ClientAppend,
@@ -49,13 +51,14 @@ from mstar.api_server.request_types import (
     ResultChunk,
 )
 from mstar.api_server.served_models import ServedModels
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
 from mstar.communication.communicator import CommProtocol, make_communicator
 from mstar.communication.tensors import ensure_deployment_token
 from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.engine.resources.lora.config import lora_enabled
 from mstar.engine.resources.lora.serving import lora_specs
 from mstar.engine.resources.lora.store import check_adapters
+from mstar.model.media_limits import RAW_INPUT_CHARGES
 from mstar.model.multimodal import SUPPORTED_MODALITIES, PromptPart
 from mstar.model.registry import model_init_kwargs
 from mstar.observability.catalog import STATUS_INTERVAL_S
@@ -409,6 +412,24 @@ def _file_bytes(file_paths: dict[str, list[str]] | None) -> int:
     return sum(os.path.getsize(path) for paths in (file_paths or {}).values() for path in paths)
 
 
+def _check_raw_inputs(
+    raw_inputs: dict[str, list[torch.Tensor]], file_paths: dict[str, list[str]] | None,
+) -> None:
+    """Refuse a modality that can't arrive decoded, one sent both decoded and as
+    files (whose order among each other nothing would say), and an image that
+    isn't RGB uint8 ``[3, H, W]``."""
+    for modality, items in raw_inputs.items():
+        if modality not in RAW_INPUT_CHARGES:
+            raise ValueError(f"{modality} inputs arrive only as files; raw_inputs takes {sorted(RAW_INPUT_CHARGES)}")
+        if modality in (file_paths or {}):
+            raise ValueError(f"a request sends its {modality} inputs either decoded or as files, not both")
+        if modality == "image" and not all(
+            isinstance(item, torch.Tensor) and item.dtype == torch.uint8 and item.ndim == 3 and item.shape[0] == 3
+            for item in items
+        ):
+            raise ValueError("a decoded image is an RGB uint8 tensor of shape [3, H, W]")
+
+
 class DeadConductorError(RuntimeError):
     """The conductor process exited before the workers finished setup (it
     exits when a worker dies during init), so the server must not bind."""
@@ -463,6 +484,11 @@ class APIServer:
         self.model_name = model_name
         # what an OpenAI request's `model` field may name: the base model, or an adapter
         self.served_models = ServedModels.of(model_name, model_config)
+        # The openpi WebSocket at `/`, when the config maps robot observations to this model.
+        openpi_block = (model_config or {}).get("openpi")
+        self.openpi_policy = (
+            None if openpi_block is None else OpenpiPolicy.from_config(openpi_block, model)
+        )
         specs = lora_specs(model, model_config)
         lora_spec = specs[0] if specs else None
         # Every adapter the serving config names, checked against every LoRA spec and
@@ -485,6 +511,13 @@ class APIServer:
 
         # Before any tensor manager; the conductor and workers inherit it.
         ensure_deployment_token()
+        if tensor_comm_protocol == CommProtocol.SHM:
+            # Likewise before any arena: every one is sized from the same
+            # measurement, so none depends on how many started before it.
+            from mstar.communication.arena import export_arena_plan
+
+            export_arena_plan(None if model_config is None else deployment_workers(
+                model_config, accelerator_type()).devices)
         self.preprocess_worker = PreprocessWorker(
             model=model,
             model_config=model_config,
@@ -700,6 +733,7 @@ class APIServer:
         model: str | None = None,
         end_input: bool | Collection[str] = True,
         file_streams: dict[str, list[str | None]] | None = None,
+        raw_inputs: dict[str, list[torch.Tensor]] | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -729,7 +763,14 @@ class APIServer:
         in :meth:`stream_input`: one the model lacks is refused with a 400.
         ``process_prompt`` routes the opening's files, so a name is only
         checked.
+
+        ``raw_inputs`` are inputs already decoded, by modality and in order,
+        in place of that modality's files (images, as RGB uint8 ``[3, H, W]``):
+        the model loads them with ``Model.load_decoded_<modality>``, so nothing
+        is written or decoded.
         """
+        if raw_inputs is not None:
+            _check_raw_inputs(raw_inputs, file_paths)
         if request_id is None:
             request_id = str(uuid.uuid4())
         check_request_id(request_id)
@@ -803,6 +844,7 @@ class APIServer:
             prompt_parts=prompt_parts,
             ends=ending,
             streaming=streaming,
+            raw_inputs=raw_inputs,
         ))
 
         logger.info(
@@ -1536,7 +1578,9 @@ class APIServer:
         ``chunks`` is the request's ``ResultChunk`` iterator when the caller has
         already read from it (``open_result_stream``); None opens a fresh one.
         """
-        chunks = chunks if chunks is not None else self.iter_result_chunks(request_id)
+        chunks = errors_in_band(
+            request_id, chunks if chunks is not None else self.iter_result_chunks(request_id),
+        )
         if binary:
             return self._stream_binary(chunks)
         return self._stream_ndjson(chunks)
@@ -2025,7 +2069,9 @@ app.add_middleware(BodyLimitMiddleware)
 # answers browser preflights (which carry no credentials) and still stamps its
 # headers on a 401, and an unauthenticated request is refused before its body
 # is read.
-api_key_guard = APIKeyGuard(resolve_api_key())
+api_key_guard = APIKeyGuard(
+    resolve_api_key(), serves_openpi=lambda: getattr(api_server, "openpi_policy", None) is not None,
+)
 app.add_middleware(APIKeyMiddleware, guard=api_key_guard)
 # Outside the key check and the body limit, which refuse before routing, and
 # inside CORS, so a browser preflight is not counted. ``routes`` must list
@@ -2071,10 +2117,11 @@ def _decode_ws_files(
     files: list | None, upload_dir: Path,
 ) -> tuple[dict[str, list[str]], list[PromptPart]]:
     """Persist a websocket message's media (``{"name", "data"}`` entries;
-    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame) under
-    the upload dir, grouped by the modality of each file name, the way the
-    multipart ``/generate`` route does. A message rejected halfway leaves no
-    files behind."""
+    ``data`` raw bytes in a msgpack frame, base64 text in a JSON frame, or a
+    ``SavedUpload`` a large frame's parse already saved) under the upload dir,
+    grouped by the modality of each file name, the way the multipart
+    ``/generate`` route does. A message rejected halfway leaves no files
+    behind."""
     if files is not None and not isinstance(files, list):
         raise ValueError("files must be a list of {name, data} objects")
     file_paths: dict[str, list[str]] = {}
@@ -2089,15 +2136,10 @@ def _decode_ws_files(
             if modality == "unknown":
                 raise ValueError(f"Cannot determine modality for file: {name}")
             data = entry.get("data")
-            if isinstance(data, str):
-                # the decoder the data-URL paths use: unpadded or wrapped
-                # base64 is fine, a bad alphabet is the client's error
-                data = media_io._decode_base64_payload(data)
-            if not isinstance(data, (bytes, bytearray)):
-                raise ValueError(f"file {name!r} carries no data")
-            base = os.path.basename(name) or "upload"
-            save_path = upload_dir / f"{uuid.uuid4()}_{base}"
-            save_path.write_bytes(bytes(data))
+            save_path = (
+                Path(data.claim()) if isinstance(data, ws_frames.SavedUpload)
+                else ws_frames.save_entry(name, data, upload_dir)
+            )
             saved.append(save_path)
             paths = file_paths.setdefault(modality, [])
             parts.append(PromptPart(modality=modality, index=len(paths)))
@@ -2105,6 +2147,9 @@ def _decode_ws_files(
     except Exception:
         for path in saved:
             path.unlink(missing_ok=True)
+        for entry in files or []:  # the ones not reached
+            if isinstance(entry, dict) and isinstance(entry.get("data"), ws_frames.SavedUpload):
+                Path(entry["data"].claim()).unlink(missing_ok=True)
         raise
     return file_paths, parts
 
@@ -2501,17 +2546,22 @@ async def generate_ws(websocket: WebSocket):
     previous_turn: asyncio.Future | None = None
     try:
         while True:
+            # not kept while the socket idles: a refused message's saved files go with it
+            frame = message = None
             frame = await websocket.receive()
             if frame.get("type") == "websocket.disconnect":
                 break
             binary = frame.get("bytes") is not None
             try:
-                if binary:
-                    message = msgpack.unpackb(frame["bytes"], raw=False)
-                else:
-                    message = json.loads(frame.get("text") or "")
+                message = await ws_frames.parse_frame(
+                    frame["bytes"] if binary else frame.get("text") or "", api_server.upload_dir,
+                )
+            except OSError as exc:  # the server's side of a large frame, not the frame
+                text, _ = client_error_text(exc, "generate/ws frame hand-off failed", log=logger, type_name=False)
+                reply({"request_id": None, "error": text, "status": 500}, binary)
+                continue
             except Exception as exc:  # noqa: BLE001 — a bad frame is reported, not fatal
-                reply({"request_id": None, "error": f"undecodable frame: {exc}"}, binary)
+                reply({"request_id": None, "error": f"undecodable frame: {scrub_paths(str(exc))}"}, binary)
                 continue
             if not isinstance(message, dict):
                 reply({"request_id": None, "error": "message must be an object"}, binary)
@@ -2610,6 +2660,17 @@ async def generate(
         check_request_id(request_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
+
+    # Every field is a form field: any other body (JSON, say) parses as an
+    # empty form, and would be submitted as an empty request.
+    content_type = request.headers.get("content-type", "")
+    if content_type and content_type.split(";", 1)[0].strip().lower() not in (
+        "multipart/form-data", "application/x-www-form-urlencoded",
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"/generate takes multipart/form-data or urlencoded fields, not {content_type}",
+        )
 
     # FastAPI 0.147+ reads an omitted bool form field as False (an unchecked
     # HTML checkbox) instead of its declared default, for Optional[bool] too.
@@ -2762,6 +2823,27 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/healthz", include_in_schema=False)
+async def healthz():
+    """``/health`` as openpi's policy server answers its probe, on a server that
+    serves the openpi socket; elsewhere there is no such route."""
+    if getattr(api_server, "openpi_policy", None) is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    await health_check()
+    return PlainTextResponse("OK\n")
+
+
+@app.websocket("/")
+async def openpi_ws(websocket: WebSocket):
+    """openpi's policy protocol (see :mod:`mstar.api_server.openpi`), where
+    ``openpi_client`` connects: the server's root. Refused unless the config
+    has an ``openpi:`` block."""
+    if api_server is None:
+        await websocket.close(code=1013, reason="Server not ready")
+        return
+    await serve_connection(websocket, api_server)
+
+
 @app.get("/metrics", include_in_schema=False)
 async def metrics():
     """Prometheus metrics, when the server runs with ``--enable-metrics``."""
@@ -2816,6 +2898,19 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
 
 
+def _ws_max_size(config: dict) -> int:
+    """The config's ``ws_max_message_mb``, in bytes: the largest WebSocket
+    message the server reads (by default what an HTTP body may be, since one
+    /generate/ws message carries what a body would). A larger one closes its
+    socket with 1009."""
+    mb = config.get("ws_max_message_mb")
+    if mb is None:
+        return max_body_bytes()
+    if isinstance(mb, bool) or not isinstance(mb, (int, float)) or not 0 < mb < math.inf:
+        raise ValueError(f"ws_max_message_mb must be a positive number of MiB, not {mb!r}")
+    return int(mb * (1 << 20))
+
+
 def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
@@ -2824,6 +2919,7 @@ def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     return uvicorn.Config(
         app, host=host, port=port, access_log=False, log_config=None,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
+        ws_max_size=_ws_max_size(config),
     )
 
 
@@ -2841,8 +2937,6 @@ def _set_preprocess_threads(model, config: dict) -> None:
             return
     else:
         threads = model.PREPROCESS_TORCH_THREADS or cpus.plan().preprocess_threads
-    import torch
-
     torch.set_num_threads(int(threads))
 
 
@@ -2951,11 +3045,18 @@ def main(argv: list[str] | None = None):
             "LoRA adapters (`resources: lora:` in the serving config) are served by the "
             "Python frontend only; drop --rust-frontend"
         )
+    try:
+        _ws_max_size(config)  # here, not at the bind after the workers' compile
+    except ValueError as e:
+        raise SystemExit(f"mstar: {e}") from None
     if args.rust_frontend:
         from mstar.api_server.rust_frontend import find_server_binary
 
         # Before anything loads, so a missing or stale binary fails fast.
         rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
+        if config.get("openpi") is not None:
+            logger.warning("The openpi WebSocket (`openpi:` in the config) is served by the Python frontend only; "
+                           "--rust-frontend serves without it")
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -3078,6 +3179,7 @@ def main(argv: list[str] | None = None):
                 server.should_exit = True
 
             api_server.set_on_fatal(_stop_server)
+            ws_frames.start()
             server.run()
             if not server.started:
                 exit_code = 3  # uvicorn.run()'s own code for a server that never came up
@@ -3094,6 +3196,7 @@ def main(argv: list[str] | None = None):
             shutil.rmtree(bridge_dir, ignore_errors=True)
         if api_server is not None:
             api_server.cleanup()
+        ws_frames.stop()
         _shutdown_conductor_process(conductor_proc)
     # A worker or conductor death is a failed run. A SIGINT stop still exits 0.
     if api_server.fatal_error is not None:

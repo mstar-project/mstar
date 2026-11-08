@@ -15,6 +15,7 @@ import torch
 
 from mstar.engine.chunking import ChunkRange
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
+from mstar.testing_utils.model import make_model
 from mstar.worker.batch_builder import fill_token_budget, fill_token_budget_in_start_order
 
 # ── the token budget ────────────────────────────────────────────────────
@@ -200,17 +201,10 @@ def test_in_start_order_the_head_runs_over_budget_rather_than_nothing():
 
 def _engine_with(submodule, policies=None):
     """``policies`` is the model's ``chunking_policy_of()``: (node, walk) -> policy."""
-    from types import SimpleNamespace
 
-    from mstar.engine.chunking import ChunkingManagement
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = Engine.__new__(Engine)
-    engine._tp_follower_nodes = set()
-    engine._submodules = {"LLM": SimpleNamespace(submodule=submodule, resources={}, resident=None)}
-    engine._keyed_walks = {}
-    engine._resources = {}
-    engine._chunking = ChunkingManagement(engine._submodules)
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule)})
     engine._chunking.set_policies(policies or {})
     return engine
 
@@ -496,8 +490,6 @@ def test_the_mismatched_row_fails_and_the_rest_of_the_step_runs():
             return super().prepare_inputs(**kwargs)
 
     engine = _engine_with(_Sub(10))
-    engine._enable_nvtx = False
-    engine._loopback_steps = {}
     batch = ExecutingBatch(
         node_name="LLM",
         per_request_info={1: 1, 2: 2},
@@ -516,8 +508,9 @@ def test_a_step_over_its_token_budget_is_reported(caplog):
 
     from mstar.engine.chunking import ChunkingManagement
     from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.testing_utils.engine import make_mgmt
 
-    chunking = ChunkingManagement({"LLM": SimpleNamespace(submodule=SimpleNamespace())})
+    chunking = ChunkingManagement({"LLM": make_mgmt(submodule=SimpleNamespace())})
     chunking.set_policies(
         {("LLM", "mixed"): ChunkingPolicy(walks=("mixed",), max_batch_tokens=4)},
     )
@@ -564,13 +557,10 @@ def test_a_continuing_decode_row_is_estimated_at_one_token():
 def _budgeted_engine():
     from types import SimpleNamespace
 
-    from mstar.engine.chunking import ChunkingManagement
-    from mstar.engine.engine import Engine
     from mstar.model.submodule_base import ChunkingPolicy
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
-    engine = Engine.__new__(Engine)
-    engine._submodules = {"LLM": SimpleNamespace(submodule=SimpleNamespace())}
-    engine._chunking = ChunkingManagement(engine._submodules)
+    engine = make_engine(_submodules={"LLM": make_mgmt(submodule=SimpleNamespace())})
     engine.set_chunking_policies({
         ("LLM", "prefill"): ChunkingPolicy(walks=("prefill",), max_batch_tokens=512),
         ("LLM", "vision"): ChunkingPolicy(walks=("vision",), max_batch_tokens=2048),
@@ -766,14 +756,22 @@ class _Unmeasured(_Chunker):
 
 
 def _chunking_model():
-    return SimpleNamespace(chunking_policy_of=lambda: {
+    return make_model(chunking_policy_of=lambda: {
         ("LLM", "prefill"): ChunkingPolicy(
             walks=("prefill",), chunkable=True, max_batch_tokens=512),
     })
 
 
 def _groups(sp=1):
-    return SimpleNamespace(get_sp_config_for_node=lambda node: SimpleNamespace(world_size=sp))
+    """The worker's real groups, so the call site can't drift from their API."""
+    from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+
+    groups = WorkerParallelGroups(num_workers=sp, global_rank=0)
+    if sp > 1:
+        sp_group = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(sp)))
+        groups.add("LLM", sp_group, "sp")
+        groups.node_to_instance_comm["LLM"] = sp_group
+    return groups
 
 
 def test_a_node_under_sp_has_its_chunking_turned_off(caplog):

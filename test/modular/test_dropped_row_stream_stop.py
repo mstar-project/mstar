@@ -26,16 +26,18 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.communication.tensors import StoredOutputs  # noqa: E402
-from mstar.engine.chunking import ChunkingManagement  # noqa: E402
-from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
+from mstar.engine.engine import ExecutingBatch  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess, RouteOutput  # noqa: E402
 from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, chunk_loop_name  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.chunk_loops import ChunkLoops  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.rebuild import Rebuilds  # noqa: E402
-from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
+from mstar.worker.worker import (  # noqa: E402
+    PendingBatch,  # noqa: E402
+    )
 
 NODE, WALK, LOOP = "vocoder", "w", "stream_loop"
 
@@ -116,12 +118,7 @@ class _Runtime(PhasedPostprocess):
 
 
 def _engine(sub):
-    eng = Engine.__new__(Engine)
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub, resources={})}
-    eng._enable_nvtx = False
-    eng._loopback_steps = {}
-    eng._chunking = ChunkingManagement(eng._submodules)
-    eng._runner = StepRunner({})
+    eng = make_engine(_submodules={NODE: make_mgmt(sub)}, _runner=StepRunner({}))
     return eng
 
 
@@ -146,29 +143,20 @@ def _worker(eng, runtime, in_loop=True, through_send=False, loop=LOOP):
             raise _ReachedRoutingError
         return StoredOutputs([], [], [], [0] * (len(rids) * len(signals)))
 
-    w = Worker.__new__(Worker)
-    w._phase_period = 0
-    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    w._walk_drivers = {}  # no producer-driven walk transitions here
-    w._walk_driven_edges = {}
-    w.enable_nvtx = False
-    w.enable_prof = False
-    w.device = torch.device("cpu")
-    w._rebuilds = Rebuilds({}, {})
-    w._preemption = SimpleNamespace(
-        preempt=lambda node_batch: False, rebuilt=lambda rid, node, tokens: None, remove_request=lambda rid: None,
-    )
-    w._graph_runtime = runtime
-    w.scheduler = SimpleNamespace(failed_rids=set())
-    w.tensor_manager = SimpleNamespace(
+    w = make_worker(
+        device=torch.device("cpu"),
+        _graph_runtime=runtime,
+        scheduler=SimpleNamespace(),
+        tensor_manager=SimpleNamespace(
         cleanup_collectable=lambda *a: None,
         store_and_return_tensor_info_batch=_store,
         drop_host_copies=lambda: None,
         dereference_batch_uniform=lambda uuids: None,
+    ),
+        streams=SimpleNamespace(consumption_batch=lambda rids: [], assign_consumer_walks=lambda batch: None),
+        engine_manager=SimpleNamespace(get_engine=lambda n: eng),
+        _innermost_loop_by_node={(WALK, NODE): loop} if in_loop else {},
     )
-    w.streams = SimpleNamespace(consumption_batch=lambda rids: [])
-    w.engine_manager = SimpleNamespace(get_engine=lambda n: eng)
-    w._innermost_loop_by_node = {(WALK, NODE): loop} if in_loop else {}
     w.reported: dict[int, str] = {}
     w._fail_requests = w.reported.update
     w.request_state = SimpleNamespace(

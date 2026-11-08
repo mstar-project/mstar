@@ -529,7 +529,7 @@ class Conductor:
         }
 
         # Set up worker graph TP ranks; validate_deployment checked each worker
-        # graph belongs to one sharding group of its tp_size.
+        # graph belongs to one sharding group of its instance size.
         self.streaming_consumers = set()
         self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
 
@@ -591,7 +591,7 @@ class Conductor:
                         continue
                     wg = self.node_walk_to_wg[(node, walk)]
                     # The instance rank is the worker's index within the
-                    # lockstep instance (0..tp*sp-1), used by the
+                    # lockstep instance (0..instance size - 1), used by the
                     # replicated-signal fanout (so exactly one rank — index 0
                     # — forwards a replicated tensor to a downstream node).
                     for ranks in wg._instance_ranks:
@@ -628,10 +628,14 @@ class Conductor:
         self._derive_worker_info()
         self._launch_workers()
 
+        # Sends never block the run loop (OutboxCommunicator): a worker blocked
+        # sending to the conductor stops reading, and a conductor blocked on
+        # that worker would stop reading too, so neither would ever drain.
         self.communicator = make_communicator(
             my_id="conductor",
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
+            nonblocking_send=True,
         )
 
     def _max_output_tokens(self, model_kwargs: dict) -> int:
@@ -989,6 +993,12 @@ class Conductor:
             f"worker {worker_id} (pid {p.pid}) exited with "
             f"{describe_exitcode(p.exitcode)}, so the server is shutting down"
         )
+        # The failures go out before the process does: what a full API server
+        # could not take yet is queued in the outbox. Bounded, so a peer that
+        # never reads again cannot hold the shutdown.
+        deadline = time.monotonic() + 1.0
+        while self.communicator.flush() and time.monotonic() < deadline:
+            time.sleep(0.001)
         raise DeadWorkerError(worker_id, p.pid, p.exitcode)
 
     def _fail_all_requests(self, error_message: str, status: int = 503) -> None:
@@ -1029,10 +1039,10 @@ class Conductor:
         """
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            # Route to a whole instance (the lockstep unit): every rank of a
-            # tp*sp instance runs the request together, so its TP all-reduce
-            # and SP all-to-all collectives stay in sync. Picking a single TP
-            # row here would desync the SP all-to-all across rows.
+            # Route to a whole instance (the lockstep unit): every rank of an
+            # instance runs the request together, so the collectives of each
+            # of its axes stay in sync. Picking a single TP row here would
+            # desync the SP all-to-all across rows.
             result[wg_id] = [f"worker_{r}" for r in wg.replica_ranks[replicas[wg._group_id]]]
         return result
 
@@ -1610,8 +1620,8 @@ class Conductor:
     def _send_for_teardown(self, request_id: str, entity: str, message):
         """Send one teardown message; a send that raises is logged so it can't
         skip the sends, drain record or free that follow it. A dead peer does
-        not raise (the send queues, then blocks at the high-water mark), so
-        this is only a backstop."""
+        not raise (the send queues in the outbox), so this is only a
+        backstop."""
         try:
             self.communicator.send(entity, message)
         except Exception:
@@ -2402,5 +2412,9 @@ class Conductor:
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
             # No wakeup event is registered: nothing in this process makes work
-            # outside a message, and what isn't a message is a timed check.
-            self.communicator.poll_for_messages(timeout_ms=self._ms_to_next_timed_check())
+            # outside a message, and what isn't a message is a timed check, or
+            # a queued send to a full peer, retried soon.
+            sends_pending = self.communicator.flush()
+            self.communicator.poll_for_messages(
+                timeout_ms=1 if sends_pending else self._ms_to_next_timed_check(),
+            )

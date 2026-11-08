@@ -9,7 +9,6 @@ API server's message thread (``test_serving_metrics``).
 """
 from __future__ import annotations
 
-import contextlib
 import queue
 import threading
 from types import SimpleNamespace
@@ -40,7 +39,9 @@ from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs  # noqa: E402
 from mstar.observability import catalog  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers, MetricSnapshot  # noqa: E402
-from mstar.streaming.topology import PartitionTopology  # noqa: E402
+from mstar.testing_utils.engine import make_engine, make_mgmt  # noqa: E402
+from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ConductorMessage,
     ConductorMessageType,
@@ -51,7 +52,6 @@ from mstar.utils.ipc_format import (  # noqa: E402
 )
 from mstar.worker import worker_metrics  # noqa: E402
 from mstar.worker.rebuild import Rebuilds  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
 from mstar.worker.worker_metrics import WorkerMetrics  # noqa: E402
 
 NODE, PREFILL, DECODE = "LLM", "prefill", "decode"
@@ -106,12 +106,11 @@ def _hold(kv: KVManager, rid: str, tokens: int) -> None:
 def _engine(resources=(), sub=None, keyed=False) -> Engine:
     """The real ``Engine`` attributes its prefix probe and
     ``paged_kv_caches`` read; every resource here sits on ``NODE``."""
-    eng = Engine.__new__(Engine)
-    eng._resources = {r.name: r for r in resources}
-    eng._resource_nodes = {r.name: frozenset({NODE}) for r in resources}
-    eng._submodules = {NODE: SimpleNamespace(submodule=sub or _Sub(), resources={})}
-    eng._enable_nvtx = False
-    eng._loopback_steps = {}
+    eng = make_engine(
+        _resources={r.name: r for r in resources},
+        _resource_nodes={r.name: frozenset({NODE}) for r in resources},
+        _submodules={NODE: make_mgmt(sub or _Sub())},
+    )
     eng._runner = StepRunner(eng._resources, node_resources={NODE: list(eng._resources)})
     eng._keyed_walks = {NODE: {PREFILL}} if keyed else {}
     eng._prefix_model = "Toy"
@@ -312,7 +311,7 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
                                      graph_walk=batch.graph_walk, slot=0, capture=False),
         )
 
-    def next_batch(request_state, exclude_target=None):
+    def next_batch(exclude_target=None):
         if not schedule:
             raise _StopLoopError
         step = schedule.pop(0)
@@ -341,33 +340,22 @@ def _looping_worker(monkeypatch, schedule, speculate, refuse):
     def stub(*a, **k):
         return None
 
-    w = Worker.__new__(Worker)
-    w.worker_id = "worker_0"
-    w.enable_nvtx = False
-    w._phase_period, w._phase_buf = 0, {}
-    w._max_consecutive_spec, w._launch_wait_s = 1024, 0.0
-    w.tp_async_sched, w.is_tp_follower = False, False
-    w.parallel_nodes, w.parallel_leader_nodes = set(), set()
-    w._in_flight_rids = set()
-    w._preemption = SimpleNamespace(
-        preempt=lambda node_batch: False, remove_request=lambda rid: None, make_room=lambda: None,
+    w = make_worker(
+        worker_id="worker_0",
+        parallel_groups=SimpleNamespace(barrier_all=stub, restore_default_timeout=stub),
+        engine_manager=SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng),
+        communicator=SimpleNamespace(send=stub, wait_for_work=stub),
+        wakeup_event=SimpleNamespace(register_future=stub),
+        request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
+        scheduler=SimpleNamespace(next_batch=next_batch, note_ran=stub),
     )
-    w.parallel_groups = SimpleNamespace(barrier_all=stub, restore_default_timeout=stub)
-    w.engine_manager = SimpleNamespace(warmup_all=stub, get_engine=lambda node: eng)
-    w.communicator = SimpleNamespace(send=stub, wait_for_work=stub)
-    w.wakeup_event = SimpleNamespace(register_future=stub)
-    w.request_state = SimpleNamespace(get_partition_for_node=lambda node: "p")
-    w.scheduler = SimpleNamespace(
-        take_admit_errors=dict, get_next_batch=next_batch, clear_batch_limit=stub, note_ran=stub,
-        remember_ready=contextlib.nullcontext,
-    )
-    for name in ("_verify_tp_async_sched_agrees", "_init_engine_thread", "_await_admit_settled",
-                 "_apply_pending_removes_safe_to_drop", "_fail_requests", "_apply_pending_drains",
-                 "_process_messages", "_apply_removes_whose_step_landed", "_check_ready_tensors",
-                 "_poll_stream_buffers", "_set_in_flight_flag", "_clear_in_flight_flag",
+    for name in ("_init_engine_thread", "_await_admit_settled",
+                 "_apply_removes", "_fail_requests", "_apply_drains", "_report_failures", "_teardown",
+                 "_set_in_flight_flag", "_clear_in_flight_flag",
                  "_settle_speculation", "_drop_rows_whose_loop_stopped", "_handle_admit_failure"):
         setattr(w, name, stub)
-    w.maybe_send_zmq_to_tp_followers = lambda node_batch: -1
+    for name in ("process_messages", "check_ready_tensors", "poll_stream_buffers"):
+        setattr(w.ingest, name, stub)
     w._build_executing_batch = executing
     w._build_speculation = build_speculation
     w._execute_on_gpu_thread = gpu
@@ -508,10 +496,9 @@ def test_prefix_lookups_before_start_counting_are_not_counted():
 
 
 def test_the_worker_starts_counting_on_enable_metrics(clock):
-    w = Worker.__new__(Worker)
-    w._metrics = _metrics(counting=False)
+    w = make_worker(_metrics=_metrics(counting=False))
     clock.now = 1.0
-    w._process_message_list([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
+    w.ingest._dispatch([WorkerMessage(WorkerMessageType.ENABLE_METRICS, EnableMetrics())])
     clock.now = 1.25
     w._metrics.step_done(NODE, DECODE, _prepare(_engine(), DECODE, r1=1).inputs, submitted_at=1.0)
     assert _hist(w._metrics.snapshot(), "mstar_step_seconds")[(NODE, DECODE)][1] == pytest.approx(0.25)
@@ -556,12 +543,9 @@ def test_the_data_worker_sends_enable_metrics_before_any_later_request(tmp_path)
     from mstar.api_server.request_types import PreprocessInput
     from mstar.communication.event import EventWakeup
 
-    class _Model:
+    class _Model(StubModel):
         def process_prompt(self, *args, **kwargs):
             return None
-
-        def get_partition_topology(self):
-            return PartitionTopology(partitions=["default"])
 
     sent = []
     facade = PreprocessWorker.__new__(PreprocessWorker)
@@ -624,8 +608,9 @@ def test_pending_rows_are_the_backlog_and_the_ready_rows_not_in_a_step():
     queue["r6"] = {"talker"}  # ready for a node this rank does not schedule
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 4
 
-    sched.fail_rids({"r2"})
-    sched.pending_removes["r5"] = None
+    sched.lifecycle.failed_rids.add("r2")
+    sched.drop_backlogged({"r2"})
+    sched.lifecycle.pending_removes["r5"] = -1
     assert _values(m.snapshot(), "mstar_component_pending_steps")[(NODE,)] == 2
 
 
@@ -677,7 +662,7 @@ def test_the_worker_status_crosses_the_wire_typed():
 
 
 def test_metrics_are_off_on_a_worker_built_without_an_interval():
-    assert Worker.__new__(Worker)._metrics is None
+    assert make_worker()._metrics is None
 
 
 def test_every_worker_process_gets_the_status_interval(tmp_path, monkeypatch):

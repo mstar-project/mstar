@@ -1085,12 +1085,12 @@ class Cosmos3OmniTransformer(nn.Module):
         return gather_sequence(sp, gen_seq, seq_sizes)
 
     def gen_layers_batched(self, gen_seq, cos, sin):
-        """The generation layer stack and final norm over ``denoise_step_batched``'s
-        cross-request pack, against the attention it bound. Apart from that
-        method, so the submodule can compile it alone: only the pack's length
-        depends on the batch, so with that length dynamic one compile serves
-        every batch size and mix of resolutions, while the per-request parts
-        around it run eager."""
+        """The generation layer stack and final norm over the cross-request pack
+        of ``denoise_step_batched`` or ``denoise_step_action_batched``, against
+        the attention the step bound. Apart from those methods, so the submodule
+        can compile it alone: only the pack's length depends on the batch, so
+        with that length dynamic one compile serves every batch size and mix of
+        resolutions, while the per-request parts around it run eager."""
         attend = self._gen_attend
         sp = self.sp_group
         if sp.world_size == 1:
@@ -1483,8 +1483,8 @@ class Cosmos3OmniTransformer(nn.Module):
             cos = torch.cat(cos_cond, dim=0)
             sin = torch.cat(sin_cond, dim=0)
 
-        all_gen = self._sp_run_gen_layers(all_gen, cos, sin, label, attn)
-        gen_out = self.norm_moe_gen(all_gen)
+        self._gen_attend.bind_step(attn=attn, label=label)
+        gen_out = self.gen_layers_batched(all_gen, cos, sin)
 
         sizes = [g.shape[0] for g in gen_seqs]
         total = sum(sizes)
