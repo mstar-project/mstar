@@ -796,6 +796,15 @@ class TestImprove(unittest.TestCase):
         for text in ("evil.example", "a-person", "<img", "GH-123", "phish"):
             self.assertNotIn(text, issue["body"])
 
+    def test_scrub_leaves_no_link_image_mention_or_reference_in_any_spelling(self):
+        for text in ("![x](https&colon;&sol;&sol;evil.example/x.png)", "![w](https:\\/\\/evil.example/x.png)",
+                     "[w](/\\/evil.example)", "[z](http:evil.example/x)", "&commat;someone", "&num;99"):
+            with self.subTest(text):
+                scrubbed = bot.scrub(text)
+                self.assertNotIn("](", scrubbed, "it would render as a link or load an image")
+                self.assertNotRegex(scrubbed, r"&(?!amp;)", "an entity would render as the character it spells")
+                self.assertNotRegex(scrubbed, r"(?<!\\)\\(?!\\)", "a backslash would hide a link from the pattern")
+
 
 if __name__ == "__main__":
     unittest.main()

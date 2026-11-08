@@ -991,9 +991,9 @@ def referenced(timeline, number, repo):
 
 def safe(text):
     """Untrusted text for the status issue: redacted, on one line, unable to ping anyone, open a comment or
-    mark another issue's timeline."""
-    return (redact(" ".join(str(text or "").split())).replace("@", "@\u200b").replace("<!--", "&lt;!--")
-            .replace("#", "#\u200b"))
+    mark another issue's timeline, in plain characters or in entity or backslash spellings of them."""
+    return (redact(" ".join(str(text or "").split())).replace("\\", "\\\\").replace("&", "&amp;")
+            .replace("@", "@\u200b").replace("<!--", "&lt;!--").replace("#", "#\u200b"))
 
 
 def szz(commits, shas, number, files, bug_prs=(), since=""):
@@ -1140,7 +1140,8 @@ def scrub(text):
     markup or references, so it can't name anyone, load an image or mark a PR's timeline."""
     text = re.sub(r"(?i)(?:[a-z][a-z0-9+.-]*:)?//\S+|\bwww\.\S+", "[link]",
                   re.sub(r"@[\w-]+", "@someone", str(text or "")))
-    return safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "&lt;")[:IMPROVE_TEXT]
+    return (safe(re.sub(r"(?i)\b(GH-)(?=\d)", "\\1\u200b", text)).replace("<", "&lt;")
+            .replace("](", "]\u200b("))[:IMPROVE_TEXT]
 
 
 def monday(now):
