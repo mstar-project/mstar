@@ -708,7 +708,8 @@ class TestAfterTheReview(unittest.TestCase):
                 "PATCH repos/o/r/issues/comments/5": {},
             }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="light", salvaged="true", detail="41 turns")
         (_, posted), (_, resolved) = fake.writes()
-        self.assertEqual(out, {"id": "99"})
+        self.assertEqual(out["id"], "99")
+        self.assertNotIn(token, out["result"], "the raw summary would reach the live-test job unredacted")
         self.assertNotIn(token, posted)
         self.assertIn("leaked [REDACTED]", posted)
         self.assertIn("went past the workflow's turn limit (41 turns)", posted)

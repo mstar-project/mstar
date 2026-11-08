@@ -783,16 +783,31 @@ def usage(out, pr, head_sha, mode, outcome, runner_temp, home, github_run_id, gi
         print(f"::warning::Couldn't write the job summary: {e}")
 
 
-def earlier_outside_diff(repo, pr, prev):
-    """The findings outside the diff of the review this run built on, which stay open until it judges them:
-    what last-review.json showed it, or the last summary's on a /review continue, which wasn't shown them."""
-    state = None
+def earlier_review(repo, pr, prev):
+    """(state, answered): the state of the review this run built on, what render_summary.carried carries over,
+    from last-review.json or on a /review continue (which wasn't shown it) the last summary; and whether a
+    person other than the author has commented since that review. Not knowing reads as not answered."""
+    conversation = api_list(f"repos/{repo}/issues/{pr}/comments")
+    summaries = [c for c in conversation if (c.get("user") or {}).get("login") in BOT_USERS
+                 and (c["body"] or "").startswith(render_summary.MARKER)]
     if Path("last-review.json").exists():
         state = json.loads(Path("last-review.json").read_text())
-    elif prev:
-        state = last_state([{"user": (c.get("user") or {}).get("login"), "body": c.get("body")}
-                            for c in api_list(f"repos/{repo}/issues/{pr}/comments")])
-    return (state or {}).get("outside_diff") or []
+    elif prev and summaries:
+        state = render_summary.read_state(summaries[-1]["body"])
+    else:
+        state = None
+    if not state or not summaries:
+        return state, False
+    since = summaries[-1]["created_at"]
+    try:
+        author = api(f"repos/{repo}/pulls/{pr}")["user"]["login"]
+        spoken = [*conversation, *api_list(f"repos/{repo}/pulls/{pr}/comments"),
+                  *api_list(f"repos/{repo}/pulls/{pr}/reviews?per_page=100")]
+    except (RuntimeError, ValueError, KeyError, TypeError):
+        return state, False
+    answered = any((c.get("submitted_at") or c.get("created_at") or "") > since
+                   and (u := c.get("user") or {}).get("type") != "Bot" and u.get("login") != author for c in spoken)
+    return state, answered
 
 
 def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
@@ -803,7 +818,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
     point here, and loses its marker so a later failure starts a fresh one."""
     pages = graphql(THREADS, repo, pr)
     try:
-        review = render_summary.carried(json.loads(output), earlier_outside_diff(repo, pr, prev))
+        review = render_summary.carried(json.loads(output), *earlier_review(repo, pr, prev))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:
@@ -813,6 +828,7 @@ def post(out, repo, pr, output, head_sha, mode, salvaged, detail="", prev=""):
     if not text.strip():
         print("::warning::The review returned no summary to render.")
         sys.exit(1)
+    out["result"] = redact(json.dumps(review))  # what the approval rule reads, with what it carried over
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")

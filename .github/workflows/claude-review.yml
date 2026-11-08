@@ -215,7 +215,8 @@ jobs:
       mode: ${{ steps.prev.outputs.mode || steps.pr.outputs.mode }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       main_sha: ${{ steps.base.outputs.commit }}
-      result: ${{ steps.review.outputs.structured_output }}
+      # The summary's fields as `post` rendered them, with what it carried over from the earlier review.
+      result: ${{ steps.post.outputs.result }}
       # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
       rereview: ${{ steps.diff.outputs.rereview }}
       # stacked-above.json, for the approval rule's count of findings fixed above.

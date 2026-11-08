@@ -66,14 +66,25 @@ class TestReviewSummary(unittest.TestCase):
         earlier = [{"priority": "P1", "claim": "leak", "location": "a.py:1", "detail": "d"},
                    {"priority": "P2", "claim": "typo", "location": "b.py:2", "detail": "d"}]
         pages = threads(thread("P1", outdated=True, comment_id=8))
-        r = carried(review(prior=[{"ref": "b.py:2", "priority": "P2", "status": "open", "why": "unchanged"}]), earlier)
+        r = carried(review(prior=[{"ref": "b.py:2", "priority": "P2", "status": "open", "why": "unchanged"}]),
+                    {"outside_diff": earlier}, False)
         self.assertEqual([f[:2] for f in open_findings(r, pages, [])],
                          [("inline 8", "P1"), ("outside the diff, a.py:1", "P1"), ("outside the diff, b.py:2", "P2")],
                          "a rebase, or a re-review leaving a finding out, would clear it unjudged")
         state = read_state(render(r, pages, "0123456789", "nogpu", []))
         self.assertEqual(len(state["outside_diff"]), 2, "the finding would be gone at the next re-review")
         judged = [{"ref": "a.py:1", "priority": "P1", "status": "fixed", "why": "guard added"}]
-        self.assertEqual(carried(review(prior=judged), earlier)["outside_diff"], [earlier[1]])
+        self.assertEqual(carried(review(prior=judged), {"outside_diff": earlier}, False)["outside_diff"], [earlier[1]])
+
+    def test_a_re_review_cant_lower_the_risk_or_lose_an_unanswered_question(self):
+        carried = SUMMARY["carried"]
+        earlier = {"outside_diff": [], "risk": {"level": "medium", "reason": "new lifecycle state"},
+                   "questions": [{"location": "a.py:1", "text": "Should this be a resource?"}]}
+        r = carried(review(), earlier, False)
+        self.assertEqual(r["risk"]["level"], "medium", "a small fix commit could rate a medium PR low and approve it")
+        self.assertEqual(r["questions"], earlier["questions"], "a re-review could drop a question nobody answered")
+        self.assertEqual(read_state(render(r, [], "0123456789", "full", []))["questions"], earlier["questions"])
+        self.assertEqual(carried(review(), earlier, True)["questions"], [], "a person's answer would change nothing")
 
     def test_a_finding_a_pr_above_fixes_is_reported_but_doesnt_block(self):
         above = [{"ref": "7", "priority": "P1", "status": "fixed_above", "fixed_in": 12, "why": "guard added"}]

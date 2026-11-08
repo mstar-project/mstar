@@ -143,14 +143,27 @@ def judged(review, stacked):
                                for f in review.get("prior_findings", [])]}
 
 
-def carried(review, earlier):
-    """`review` with the earlier findings outside the diff it hasn't cleared added to its own: `earlier` is
-    the last review's outside_diff. "A finding left out stays open", and stays in the state for the next
-    re-review to judge."""
+RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
+def carried(review, earlier, answered):
+    """`review` with what the earlier review's state (`earlier`, last-review.json) still holds: its findings
+    outside the diff this one hasn't cleared ("a finding left out stays open"), its risk level as a floor,
+    and its questions, unless a person other than the author has commented since (`answered`), when this
+    review's judgement stands. Everything here is carried into the next state too."""
+    earlier = earlier or {}
     cleared = {f["ref"] for f in review["prior_findings"] if f["status"] not in STILL_OPEN}
     locations = {f["location"] for f in review["outside_diff"]}
-    return {**review, "outside_diff": [*review["outside_diff"], *[
-        f for f in earlier if f["location"] not in cleared and f["location"] not in locations]]}
+    review = {**review, "outside_diff": [*review["outside_diff"], *[
+        f for f in earlier.get("outside_diff", []) if f["location"] not in cleared and f["location"] not in locations]]}
+    old, new = earlier.get("risk"), review.get("risk")
+    if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
+        review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}"}
+    if not answered:
+        asked = {q["text"] for q in review["questions"]}
+        review["questions"] = [*review["questions"], *[q for q in earlier.get("questions", [])
+                                                       if q["text"] not in asked]]
+    return review
 
 
 def open_findings(review, pages, stacked):
@@ -299,6 +312,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
     state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
              "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": review.get("latent", []),
+             "questions": review["questions"],
              "live_test": live, "moot": [f for f in prior if f["status"] == "moot"]}
     # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
     text = "\n\n".join(parts).replace("<!--", "&lt;!--")
