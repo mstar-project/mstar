@@ -1,7 +1,7 @@
 """The columnar speculation (``prep_spec_rows`` + ``SpeculationBuilder.assemble_rows``)
 must build exactly the speculative step the per-row path builds.
 
-A real worker (``Worker.__new__`` plus the attributes these methods read) over
+A real worker (``make_worker`` plus the collaborators these methods read) over
 the real graph runtime is driven through a decode loop. Each
 step the next one is speculated twice from the same state, once per path --
 prepping is side-effect free when nothing streams -- and everything the engine,
@@ -27,6 +27,7 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput
 from mstar.graph.special_destinations import EMPTY_DESTINATION
 from mstar.model.base import WorkerGraph
 from mstar.model.submodule_base import BatchedModelOutput
+from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import StepPick
 from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
@@ -150,14 +151,12 @@ def _runtime(max_iters: int, pair: bool = False, mixed: bool = False):
 
 def _worker(max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False) -> Worker:
     rt, tm = _runtime(max_iters, pair, mixed)
-    w = Worker.__new__(Worker)
-    w._graph_runtime = rt
-    w.tensor_manager = tm
-    w.request_state = RequestStateManager(node_to_partition={NODE: PART, NODE_B: PART})
-    w.scheduler = _Scheduler()
-    w._phase_period = 0
-    w.enable_prof = False
-    w.enable_nvtx = False
+    w = make_worker(
+        _graph_runtime=rt,
+        tensor_manager=tm,
+        request_state=RequestStateManager(node_to_partition={NODE: PART, NODE_B: PART}),
+        scheduler=_Scheduler(),
+    )
     w.streams = StreamBufferManager(w.request_state, tm, [])
     # no resource splits a walk here, so a mixed step keeps its rows' order
     w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
@@ -169,7 +168,6 @@ def _worker(max_iters: int = 1 << 20, pair: bool = False, mixed: bool = False) -
     w.parallel_nodes = set()
     w.worker_id = ME
     w._rid_str = rt.get_rid_string
-    w._rebuilds = Rebuilds({}, {})
     return w
 
 
