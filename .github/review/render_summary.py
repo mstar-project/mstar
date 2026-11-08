@@ -34,7 +34,7 @@ STATUSES = ("fixed", "fixed_above", "open", "disputed", "moot")
 STILL_OPEN = ("open", "disputed")
 # What takes an earlier finding outside the diff out of the state (`carried`).
 CLEARS = ("fixed", "moot")
-# Summaries and handoffs saved before the modes were renamed carry the old names (current_mode).
+# Handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
 STRINGS = {"type": "array", "items": {"type": "string"}}
@@ -294,7 +294,7 @@ def render(review, pages, head, mode, stacked):
 
 
 def current_mode(mode):
-    """`mode` by its current name: summaries and handoffs saved before the modes were renamed carry the old one."""
+    """`mode` by its current name: handoffs saved before the modes were renamed carry the old one."""
     return RENAMED_MODES.get(mode, mode)
 
 
@@ -307,7 +307,6 @@ def saved_state(body):
         return None
     if not isinstance(state, dict):
         return None
-    state["mode"] = current_mode(state.get("mode"))
     return state
 
 
@@ -316,8 +315,6 @@ def read_state(body):
     when it doesn't decode or the earlier review skipped files. Any mode can build on any other, since every
     mode runs every pass."""
     state = saved_state(body)
-    # A state without `latent` is from before light mode ran every pass, so it counts as a partial review;
-    # one without `skipped` is older still.
-    if state is None or state.get("skipped", [None]) or "latent" not in state:
+    if state is None or state.get("skipped"):
         return None
     return state
