@@ -9,6 +9,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import sys
 import tempfile
 import threading
@@ -156,9 +157,10 @@ def test_chat_extra_numeric_knob_is_coerced(client_and_stub, top_k):
     assert got == 5 and type(got) is int
 
 
-def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
+def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub, caplog):
     client, stub = client_and_stub
     stub.model_name = "bagel"
+    caplog.set_level(logging.INFO, logger="mstar.api_server.openai.router")
     r = client.post(
         "/v1/chat/completions",
         json={
@@ -172,6 +174,9 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
     assert r.status_code == 400
     # a refused input is the client's error, on every route
     assert r.json()["error"]["type"] == "invalid_request_error"
+    # and logs one INFO line: a client that sends a refused field on every call logged a traceback each
+    [record] = [rec for rec in caplog.records if rec.name == "mstar.api_server.openai.router"]
+    assert (record.levelno, record.exc_info) == (logging.INFO, None)
 
 
 def test_chat_refuses_server_paths_uniformly(client_and_stub, tmp_path):
