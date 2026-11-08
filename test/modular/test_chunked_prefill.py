@@ -804,6 +804,8 @@ def _graph_model():
 @pytest.mark.parametrize("model_config, match", [
     # the key's place before it moved, which every model's `**kwargs` would swallow
     ({"model_kwargs": {"prefill_token_buckets": [32, 64]}}, "moved to the top level"),
+    ({"model_kwargs": {"prefill_batched_token_buckets": [256]}}, "moved to the top level"),
+    ({"model_kwargs": {"backbone_token_buckets": [256]}}, "moved to the top level"),
     ({"prefill_token_buckets": [32, 64]}, "node -> capture walk -> ladder"),
     ({"prefill_token_buckets": {"LLM": []}}, "node -> capture walk -> ladder"),
     ({"prefill_token_buckets": {"LLM": {"prefill": []}}}, "distinct positive"),

@@ -26,10 +26,15 @@ logger = logging.getLogger(__name__)
 def _prefill_token_buckets(model_config: dict) -> Mapping:
     """The serving config's ``prefill_token_buckets``: node -> capture walk or
     piecewise region -> ladder (`_split_token_ladders`)."""
-    if "prefill_token_buckets" in (model_config.get("model_kwargs") or {}):
+    # the model_kwargs ladders this key replaced; a model now drops them in **kwargs unread
+    moved = sorted(
+        {"prefill_token_buckets", "prefill_batched_token_buckets", "backbone_token_buckets"}
+        & set(model_config.get("model_kwargs") or {})
+    )
+    if moved:
         raise ValueError(
-            "model_kwargs.prefill_token_buckets moved to the top level of the serving config, "
-            "per node and capture walk: prefill_token_buckets: {<node>: {<capture walk>: [...]}}"
+            f"model_kwargs {moved} moved to the top level of the serving config, per node and "
+            "capture walk or region: prefill_token_buckets: {<node>: {<walk or region>: [...]}}"
         )
     ladders = model_config.get("prefill_token_buckets")
     if ladders is None:
