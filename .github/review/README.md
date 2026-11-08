@@ -13,7 +13,7 @@ An advisory LLM reviewer runs on a PR when someone asks for it with `/review`, i
 
 The method in every mode is the [`pr-review`](../../.claude/skills/pr-review/SKILL.md) skill; [`review-prompt.md`](review-prompt.md) adds the bot's inputs, re-review scope and output. A run someone with write access starts has a turn cap meant only to stop a loop (`CLAUDE_REVIEW_MAX_TURNS_TEAM`, 2000, and a 5-hour timeout); a contributor's own light review keeps `CLAUDE_REVIEW_MAX_TURNS` (40).
 
-**Re-reviews.** When the bot's last summary is on a commit that is still an ancestor of the head, the next run re-checks each earlier finding at the head (fixed, still open, or moot), reviews only the commits since, plus whatever they reach elsewhere, and checks what merges of `main` changed under the PR. After a force-push it reviews the whole PR again, and a `thorough` run does too unless the last review was `thorough` and skipped no file. An earlier finding counts as open until a later review judges it fixed or moot or a commit outdates its thread, whether or not someone resolved the thread.
+**Re-reviews.** When the bot's last summary is on a commit that is still an ancestor of the head, the next run re-checks each earlier finding at the head (fixed, still open, or moot), reviews only the commits since, plus whatever they reach elsewhere, and checks what merges of `main` changed under the PR. After a force-push it reviews the whole PR again, and a `thorough` run does too unless the last review was `thorough` and skipped no file. An earlier finding counts as open until a later review judges it fixed, fixed in a PR stacked above (which merges with it), or moot, or a commit outdates its thread, whether or not someone resolved the thread.
 
 To re-review after pushes, comment `/review` again. The `skip-ai-review` label turns off the author's own `/review`; a `/review` or `/review thorough` from someone with write access still runs.
 
@@ -30,7 +30,7 @@ Running out of turns is handled in two ways. A review that finished but went pas
 | File | Role |
 | --- | --- |
 | [`../../AGENTS.md`](../../AGENTS.md) | **The substance.** Numbered invariants the reviewer checks and cites. Also read by contributors' own coding agents. |
-| [`review-prompt.md`](review-prompt.md) | How the reviewer behaves: trust boundary, path routing, reporting bar, output format. |
+| [`review-prompt.md`](review-prompt.md) | The bot's inputs, trust boundary, re-review scope and output. The method and bar are in `pr-review`. |
 | [`../workflows/claude-review.yml`](../workflows/claude-review.yml) | The workflow, and the safety rules that come with running on `issue_comment`. |
 | [`render_summary.py`](render_summary.py) | The summary's fields (its `--schema`), and the comment they render to. |
 | [`session.py`](session.py) | Reads a run's execution file and transcripts: the usage record, and the handoff for `/review continue`. |
@@ -64,8 +64,8 @@ Do this before anyone comes to rely on it. The failure mode for a review bot is 
 Pick ten or so merged PRs: a few where a human reviewer caught a genuine defect, a few that were clean, and a couple of big refactors. Then:
 
 - **Missed a real defect** → the invariant it should have cited is missing or too vague in `AGENTS.md`. Add it with the concrete failure mode, not as a principle.
-- **Reported something nobody would ask for a change on** → tighten the "Don't report" list in `review-prompt.md`. Being specific about the *category* works better than lowering a severity dial.
-- **Rambled or padded to look useful** → the Findings criteria in `review-prompt.md` are the lever. Zero findings must read as a success.
+- **Reported something nobody would ask for a change on** → tighten the "Don't report" list in `pr-review` §2. Being specific about the *category* works better than lowering a severity dial.
+- **Rambled or padded to look useful** → the bar in `pr-review` §2 is the lever: every finding that meets it, and none that don't.
 
 Track hit rate across the sample as you change things; it is easy to fix one case and regress two.
 
