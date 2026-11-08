@@ -77,7 +77,7 @@ def test_an_unbatched_step_clears_rows_only(rids):
         step_context=SimpleNamespace(slot_lease=None, graph_walk="decode", rebuild_rids=frozenset()),
         exec_timings=SimpleNamespace(start=None), admit_error=None,
         outputs_ready=threading.Event(), release_waiters=lambda: None,
-        preplanned_rids=None, preplan_event=None,
+        preplanned_rids=None, preplan_event=None, lease_spans=None,
     )
     eng.exec(batch)
     assert seen["rows_only"] is False and batch.rows_only is False

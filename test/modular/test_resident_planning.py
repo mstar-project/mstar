@@ -995,6 +995,7 @@ def _preplan_batch(planner, rids, bs):
     return SimpleNamespace(
         node_name="n", inputs=[SimpleNamespace() for _ in rids], request_ids=list(rids), per_request_info={},
         step_context=ctx, preplan_event=None, preplanned_rids=None, step=None, uniform_inputs=None,
+        lease_spans=None,
     )
 
 

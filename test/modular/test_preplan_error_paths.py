@@ -187,7 +187,7 @@ def _batch(preplanned) -> SimpleNamespace:
     return SimpleNamespace(
         request_ids=["a"], node_name="dit", running_batched=True,
         step_context=SimpleNamespace(graph_walk="decode", slot_lease=None),
-        preplanned_rids=preplanned, preplan_event=object(),
+        preplanned_rids=preplanned, preplan_event=object(), lease_spans=None,
         outputs_ready=SimpleNamespace(set=lambda: None),
         release_waiters=lambda: None,
         exec_timings=SimpleNamespace(start=None),
@@ -228,7 +228,7 @@ def test_reset_drops_the_kept_step_of_a_partly_dropped_batch() -> None:
     )
     batch = SimpleNamespace(
         request_ids=["a"], node_name="dit", inputs=[object()], step=object(),
-        preplanned_rids=("a", "b"), preplan_event=object(),
+        preplanned_rids=("a", "b"), preplan_event=object(), lease_spans=None,
         step_context=SimpleNamespace(slot_lease=None),
     )
     assert fake.preplan_is_stale(batch)
@@ -264,7 +264,7 @@ def test_a_pre_plan_records_its_event_even_when_it_raises(monkeypatch) -> None:
     )
     batch = SimpleNamespace(
         node_name="dit", inputs=None, request_ids=["a"], per_request_info={},
-        step=None, preplan_event=None, preplanned_rids=None,
+        step=None, preplan_event=None, preplanned_rids=None, lease_spans=None,
         step_context=SimpleNamespace(
             graph_walk="decode", padded_request_ids=["a"], is_preplan=False,
             set_padded_rids=lambda rids: None, resident=None,
