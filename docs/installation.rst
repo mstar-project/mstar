@@ -261,7 +261,10 @@ The GPU model families depend on:
   (``+cu130``) swap in its CUDA 13 build, as the Docker images do (see
   :ref:`mooncake-cuda13`).
 
-Apart from ``flash-attn`` and ``flash-attn-4``, these are installed by the extras above. Your
+- **DeepGEMM** (optional) — a faster block-fp8 GEMM for FP8 checkpoints' dense linears on H200.
+  **Not installed by any extra**; see `DeepGEMM (block-fp8 linears on H200)`_.
+
+Apart from ``flash-attn``, ``flash-attn-4`` and DeepGEMM, these are installed by the extras above. Your
 installed ``torch`` must match your system CUDA toolkit — ``--torch-backend=auto`` handles
 that for you (next section).
 
@@ -420,6 +423,35 @@ logs a warning and falls back to the previous Triton flex kernel. It is correct
 but slower — about 1.8x per attention call at 720p. Set
 ``MSTAR_FLEX_BACKEND=TRITON`` to choose it explicitly, or
 ``MSTAR_FLEX_BACKEND=FLASH`` to fail at startup instead of falling back.
+
+DeepGEMM (block-fp8 linears on H200)
+------------------------------------
+
+The dense linears of a block-fp8 checkpoint (128 x 128 weight scales, e.g.
+``Qwen/Qwen3.5-397B-A17B-FP8``) run the GEMM the ``fp8_linear`` kernel table names for the
+GPU and token count. On H200 the table names DeepGEMM's SM90 block-scaled GEMM, the one vLLM
+runs, for most of the Qwen3.5 FP8 shapes' larger counts (big decode batches, prefill). In the
+table's measurements that takes 4-38% less GEMM time than the next-best kernel at 24-1024
+tokens, and about the same below. It is an optional import that no extra installs. Without
+it, those rows run FlashInfer's block-scaled GEMM (up to 512 tokens) or cuBLAS's, which
+compute the same thing up to rounding.
+
+It builds against the installed torch and JIT-compiles its kernels on first use, so it needs
+a CUDA toolkit matching torch's (``nvcc`` on ``PATH`` or ``CUDA_HOME``) and the elfutils
+headers. Pinned to the revision it was tested at (DeepGEMM 2.8.2, with torch 2.11 cu129 and
+CUDA 12.9):
+
+.. code-block:: bash
+
+   sudo apt-get install -y libdw-dev libelf-dev
+   git clone https://github.com/deepseek-ai/DeepGEMM.git
+   cd DeepGEMM
+   git checkout 5081f8513af57e61696de4f4f04b0e707ffb503e
+   git submodule update --init --recursive
+   ./install.sh
+
+Compiled kernels are cached under ``DG_JIT_CACHE_DIR`` (DeepGEMM's own setting). A
+DeepGEMM that imports but cannot run (no ``nvcc``, say) is skipped with a warning at startup.
 
 Matching your CUDA toolkit
 --------------------------

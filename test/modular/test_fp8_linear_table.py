@@ -56,18 +56,27 @@ def test_the_h200_table_covers_the_qwen3_5_fp8_checkpoints():
         assert entry is not None and "sweep" in entry.provenance["harness"], (n, k, glu)
 
 
-def test_a_deepgemm_row_runs_flashinfer_where_deepgemm_does_not(monkeypatch):
+def test_without_deepgemm_its_rows_run_the_builtin_w8a8_gemm(monkeypatch):
+    """DeepGEMM is optional: where it doesn't import, the probe says so (without touching the GPU) and a table row
+    naming it runs the built-in rule's W8A8 GEMM for the count, flashinfer's or cuBLAS's."""
     pytest.importorskip("triton")
+    import sys
+
     import torch
 
     from mstar.kernels import Choice
     from mstar.utils import dense_fp8
 
     dev = torch.device("cuda", 0)
+    monkeypatch.setattr(dense_fp8.current_platform, "cuda_capability", lambda device: (9, 0))
+    monkeypatch.setitem(sys.modules, "deep_gemm", None)  # not installed: the import raises
+    probed = dense_fp8._probe_dg(dev)
+    assert probed is False
+
     monkeypatch.setattr(dense_fp8, "_table_rows", lambda *a: ((16,), (Choice("triton8"), Choice("deepgemm"))))
     monkeypatch.setitem(dense_fp8._FI_OK, dev, True)
     monkeypatch.setitem(dense_fp8._W8A8_OK, dev, True)
-    monkeypatch.setitem(dense_fp8._DG_OK, dev, False)
+    monkeypatch.setitem(dense_fp8._DG_OK, dev, probed)
     assert [dense_fp8._choose(dev, 5120, 17408, False, m)[0] for m in (8, 32, 4096)] == ["triton8", "flashinfer",
                                                                                        "cublas"]
     monkeypatch.setitem(dense_fp8._DG_OK, dev, True)
