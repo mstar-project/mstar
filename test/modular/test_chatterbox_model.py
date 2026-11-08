@@ -37,6 +37,7 @@ from mstar.model.chatterbox.components.s3gen import ReferenceConditioning
 from mstar.model.chatterbox.components.s3gen_graphs import EncoderGraphs, SolveGraphs, VocoderGraphs
 from mstar.model.chatterbox.config import (
     COND_LABEL,
+    S3GEN_STREAM,
     T3_ATTN,
     T3_KV,
     T3_POS,
@@ -579,6 +580,21 @@ def test_shipped_yaml_fits_its_request_cap_in_the_kv_pool(name, caplog):
     # without a cap nothing bounds the pool: started, with a warning
     model.validate_config_yaml({k: v for k, v in cfg.items() if k != "max_concurrent_requests"}, str(path))
     assert "sets no max_concurrent_requests" in caplog.text
+
+
+def test_a_cap_past_the_s3gen_streams_slots_is_refused():
+    """A request holds its S3Gen stream's slot until it is torn down. Past the pool's slots, a chunk step's admit
+    waits for a slot where the conductor would have queued the request."""
+    path = Path(__file__).parents[2] / "configs" / "chatterbox.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    model = _make_model()
+    model.config.max_new_tokens_limit = cfg["model_kwargs"]["max_new_tokens_limit"]
+    cap = cfg["max_concurrent_requests"]
+    cfg["resources"][S3GEN_STREAM] = {"max_slots": cap}
+    with pytest.raises(ValueError, match=rf"need {cap} slots of resources\.{S3GEN_STREAM} .* leaves {cap - 1} of its"):
+        model.validate_config_yaml(cfg, str(path))
+    cfg["resources"][S3GEN_STREAM] = {"max_slots": cap + 1}
+    model.validate_config_yaml(cfg, str(path))
 
 
 def _fits(model, cap: int, max_num_pages: int) -> bool:
@@ -1701,6 +1717,13 @@ def test_chunk_policy_growth_knobs_reach_the_ramp():
     default = _make_model()
     assert default.config.stream_context_tokens == 25
     assert _new_tokens_per_chunk(default._chunk_policy(), 585) == [35, 50, 100, 200, 200]
+
+
+def test_a_chunk_growth_below_one_is_refused():
+    model = _make_model()
+    model.config.stream_chunk_growth = 0.5
+    with pytest.raises(ValueError, match=r"growth must be >= 1, got 0\.5"):
+        model._chunk_policy()
 
 
 def test_s3gen_keeps_the_reference_for_chunks_without_the_clip():
