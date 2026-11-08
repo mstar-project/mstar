@@ -293,6 +293,7 @@ def _trim(ladder: list[int], tokens: int | None, at_least: int = 0) -> list[int]
 def apply_token_ladders(
     node: str, configs: list[AcceleratorGraphConfig], ladders: Mapping[str, Any],
     step_tokens: Callable[[str, int], int | None],
+    batch_sizes: Callable[[AcceleratorGraphConfig], list[int]],
 ) -> None:
     """Take a serving config's ``prefill_token_buckets`` for ``node`` (capture
     walk -> ladder or ``{min batch size: ladder}``, which `EngineManager`
@@ -301,7 +302,8 @@ def apply_token_ladders(
 
     A ladder runs to the first rung that holds the most tokens the scheduler
     gives a step its capture replays (``step_tokens`` of each replay walk and
-    the capture's widest batch: its token budget, or a little past it beside
+    the capture's widest batch, of the ``batch_sizes`` the runner captures it
+    at: its token budget, or a little past it beside
     decode rows; none where any walk's steps have no bound): a rung beyond
     would never replay. A larger batch size's ladder also runs at least as far
     as a smaller one's, which share its static buffers.
@@ -333,7 +335,7 @@ def apply_token_ladders(
             )
             continue
         for config in targets:
-            rows = max(config.capture_batch_sizes or DEFAULT_CAPTURE_BATCH_SIZES)
+            rows = max(batch_sizes(config))
             bounds = [step_tokens(w, rows) for w in config.replay_graph_walks]
             bound = None if None in bounds else max(bounds)
             trimmed, top, dropped = {}, 0, []

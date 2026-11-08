@@ -351,8 +351,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        inside a combined walk runs under the combined walk's), or, for a combined
        walk's steps, past it where the capture's widest batch of one-token decode
        rows leaves a prompt less than ``min_chunk_tokens``, which then still runs
-       that many. The rungs past it,
-       which no step would reach, are dropped and logged. A ladder is kept whole
+       that many. The rungs past it, which no step would reach, are dropped and
+       logged. A ladder is kept whole
        where its steps run under no budget or may hold a prompt of a walk whose
        chunking ``max_batch_tokens`` turned off, which runs whole, as is a
        region's. A vision tower's ``vision_block_loop`` and an AuT encoder's

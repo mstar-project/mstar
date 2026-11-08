@@ -719,7 +719,9 @@ class AcceleratorGraphRunner:
             )
         )
         if token_ladders:
-            apply_token_ladders(submodule_name, self._capture_configs, token_ladders, step_tokens)
+            apply_token_ladders(
+                submodule_name, self._capture_configs, token_ladders, step_tokens, self._batch_sizes,
+            )
         self._resources = resources
         self._step_runner = step_runner
         self._device = device

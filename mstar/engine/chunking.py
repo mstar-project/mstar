@@ -15,7 +15,6 @@ from mstar.model.submodule_base import (
     ChunkingPolicy,
     NodeInputs,
 )
-from mstar.worker.batch_builder import most_step_tokens
 
 if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch, SubmoduleManagement
@@ -116,10 +115,10 @@ class ChunkingManagement:
         runs relabelled to it, `ScheduledBatch.relabel_if_uniform`, and still
         ran under the combined walk's budget). For a combined walk's step, or
         more, by what a speculation chain's rows, one-token decode rows, take
-        of ``min_chunk_tokens`` (`batch_builder.most_step_tokens`). A real
-        walk's step carries no chain rows: decode rows beside a prompt make the
-        step the combined walk's (`MicroScheduler.label_for`), and a chain on a
-        prompt walk continues no row, its rows mid-prefill being the step's own.
+        of ``min_chunk_tokens``. A real walk's step carries no chain rows of
+        its own node: decode rows beside a prompt make the step the combined
+        walk's (`MicroScheduler.label_for`), and a same-node chain on a prompt
+        walk continues no row, its rows mid-prefill being the step's own.
 
         None too where the step may hold a prompt of a walk whose chunking
         the serving config turned off: it runs whole, however long."""
@@ -136,7 +135,10 @@ class ChunkingManagement:
         budget = self.max_batch_tokens(node_name, walk)
         if budget is None or not members:
             return budget
-        return most_step_tokens(budget, self.min_chunk_tokens(budget), max_rows - 1)
+        # the chain's rows come off the budget first (`MicroScheduler._build_step`),
+        # and `batch_builder._run_head` still runs a prompt `min_chunk_tokens` where
+        # they leave it less
+        return max(budget, max_rows - 1 + self.min_chunk_tokens(budget))
 
     def set_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],

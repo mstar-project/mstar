@@ -390,15 +390,6 @@ def _run_head(
     dropped.discard(head)
 
 
-def most_step_tokens(budget: int, min_chunk: int, chain_rows: int) -> int:
-    """The most tokens a step under ``budget`` runs with ``chain_rows``
-    one-token rows of a speculation chain beside its cut prompt: the chain's
-    rows come off the budget first (``MicroScheduler._build_step``), and
-    `_run_head` still runs the prompt ``min_chunk`` tokens where they leave
-    less."""
-    return max(budget, chain_rows + min_chunk)
-
-
 def fill_token_budget_in_start_order(
     rids: list[int], tokens: dict[int, int], chunkable: set[int], budget: int,
     min_chunk: int = 1, start_order: dict[int, int] | None = None,
