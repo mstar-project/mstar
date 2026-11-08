@@ -560,9 +560,10 @@ def _lora_spec():
 _A_TP_THEN_B = [{"node_names": ["a"], "ranks": [0, 1], "tp_size": 2}, {"node_names": ["b"], "ranks": [2]}]
 
 
-def test_a_lora_deployment_passes(tmp_path):
+def test_a_lora_deployment_passes(tmp_path, monkeypatch):
     """The pass checks the specs the YAML turns on, as the workers build them: the opt-in
     LoRA spec, for the `lora:` block to override, split into a pool per node."""
+    monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)
     # the serial TP protocol, which LoRA at TP 2 takes
     cfg = _cfg(tmp_path, _A_TP_THEN_B, resources={"lora": {"max_slots": 2}}, tp_async_sched=False)
     _validate(_Model(_a_then_b, specs=[_lora_spec()], tp_enabled_nodes=["a"]), cfg)
@@ -584,15 +585,20 @@ def test_a_bad_lora_value_is_reported_once_with_the_other_problems(tmp_path, mon
     assert problems[1] == "Resource spec kv nodes ['a', 'b'] must use the same TP x SP shape across replicas"
 
 
-@pytest.mark.parametrize("tp_async_sched, refused", [(None, True), (False, False), (["b"], False)],
-                         ids=["async_default", "serial", "async_elsewhere"])
-def test_lora_on_a_node_the_async_tp_scheduler_runs_is_refused(tmp_path, monkeypatch, tp_async_sched, refused):
+@pytest.mark.parametrize("tp_async_sched, targets, refused", [
+    (None, None, True), (False, None, False), (["b"], None, False), (None, ["o"], False),
+], ids=["async_default", "serial", "async_elsewhere", "no_pool_on_the_tp_node"])
+def test_lora_on_a_node_the_async_tp_scheduler_runs_is_refused(
+    tmp_path, monkeypatch, tp_async_sched, targets, refused,
+):
     """Each rank picks its own LoRA slots, and the async TP scheduler can tear a request
     down on one rank between a step's broadcast and its admit; the serial protocol
-    cannot, so a TP LoRA node outside the async scheduler passes."""
+    cannot, so a TP LoRA node outside the async scheduler passes, as does a TP node
+    whose `targets:` leave it no pool."""
     monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)
     extra = {} if tp_async_sched is None else {"tp_async_sched": tp_async_sched}
-    cfg = _cfg(tmp_path, _A_TP_THEN_B, resources={"lora": {"max_slots": 2}}, **extra)
+    block = {"max_slots": 2, **({} if targets is None else {"targets": targets})}
+    cfg = _cfg(tmp_path, _A_TP_THEN_B, resources={"lora": block}, **extra)
     model = _Model(_a_then_b, specs=[_lora_spec()], tp_enabled_nodes=["a"])
     if refused:
         _refused(model, cfg, r"LoRA node\(s\) \['a'\] at tp_size 2 under the async TP scheduler")

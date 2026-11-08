@@ -158,9 +158,6 @@ def validate_deployment(
         )
     except _UNREADABLE as e:
         problems.append(_unreadable("get_node_resources", e))
-    lora = [spec for spec in specs or () if isinstance(spec, LoraSpec)]
-    if lora and not malformed:  # reads node_groups, which the placement checks found readable
-        problems += _checked("checking LoRA under tensor parallelism", _lora_tp_problems, config, lora)
     if specs is not None:
         problems += _checked("checking the node resources", check_resources, model, specs, config)
         # the placement checks see what the workers build of them
@@ -169,6 +166,10 @@ def validate_deployment(
         except (ValueError, OSError) as e:
             problems.append(f"building the node resources failed: {type(e).__name__}: {e}")
             specs = None
+    # the pools the workers build, one per node that the `targets:` leave a target on
+    lora = [spec for spec in specs or () if isinstance(spec, LoraSpec)]
+    if lora and not malformed:  # reads node_groups, which the placement checks found readable
+        problems += _checked("checking LoRA under tensor parallelism", _lora_tp_problems, config, lora)
     # after get_worker_graphs too: a model may shape its walks from the deployment (BAGEL)
     problems += _checked(
         "checking the client streams", check_client_streams,
