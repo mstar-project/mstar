@@ -858,12 +858,12 @@ def hf_home(cfg, provider, region) -> str:
 
 # ---------------------------------------------------------------- status / ssh
 
-def status(e: dict, cfg: dict | None = None) -> tuple[str, str | None, int]:
+def status(e: dict, cfg: dict) -> tuple[str, str | None, int]:
     """(status, host, ssh port)."""
     if not e["instance_id"]:
         return f"create's answer lost; terminate it to end {e['name']}", None, 0
     if e["provider"] == "slurm":
-        sl = slurm_node(cfg or load_config(), e["region"])
+        sl = slurm_node(cfg, e["region"])
         try:  # "ended" only on squeue's word: a failed ssh says nothing about the job
             st = slurm_run(sl, f"squeue -h -j {e['instance_id']} -o %T").strip()
         except ApiError as err:
