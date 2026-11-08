@@ -21,11 +21,11 @@ from mstar.engine.state.calls import ArrayHandle
 from mstar.engine.state.within_step import WithinStepHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"FusedDrawArgs", "PagedNHDTarget", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "at_last_token", "causal_conv", "drew", "fused_draw_args", "gated_delta_net", "host", "last_sampled", "position",
-    "positions", "rope", "sample",
+    "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "position", "positions", "rope",
+    "sample",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -181,20 +181,6 @@ SNAPSHOT = {
     ],
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],
-    ],
-    "FusedDrawArgs": [
-        ["temperature", "POSITIONAL_OR_KEYWORD", None],
-        ["top_k", "POSITIONAL_OR_KEYWORD", None],
-        ["top_p", "POSITIONAL_OR_KEYWORD", None],
-        ["seed", "POSITIONAL_OR_KEYWORD", None],
-        ["offset", "POSITIONAL_OR_KEYWORD", None],
-    ],
-    "drew": [
-        ["s", "POSITIONAL_OR_KEYWORD", None],
-        ["n", "POSITIONAL_OR_KEYWORD", None],
-    ],
-    "fused_draw_args": [
-        ["s", "POSITIONAL_OR_KEYWORD", None],
     ],
     "at_last_token": [
         ["h", "POSITIONAL_OR_KEYWORD", None],

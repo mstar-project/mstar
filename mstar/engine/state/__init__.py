@@ -9,8 +9,8 @@ from mstar.engine.resources.step import (
 from mstar.engine.state.calls import (
     at_last_token,
     causal_conv,
-    drew,
-    fused_draw_args,
+    drew,  # noqa: F401
+    fused_draw_args,  # noqa: F401
     gated_delta_net,
     host,
     kernel_setting,  # noqa: F401
@@ -29,7 +29,7 @@ from mstar.engine.state.contract import (
     CausalConv,
     Entry,
     Fork,
-    FusedDrawArgs,
+    FusedDrawArgs,  # noqa: F401
     GatedDeltaNet,
     KVEntry,
     Layout,
@@ -48,9 +48,11 @@ from mstar.engine.state.contract import (
 )
 from mstar.engine.state.state_op import state_op
 
-# `kernel_setting`, `SubmoduleStep`, `draw_row` and `draw_row_layout` stay out of `__all__`, whose names can't be
-# removed after release. `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild
-# after release replaces its `steps`, `cg_key_info` and `_ctx`. `draw_row` is the reference for what a fused draw picks.
+# `kernel_setting`, `SubmoduleStep` and the fused draw stay out of `__all__`, whose names can't be removed after
+# release. `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild after release
+# replaces its `steps`, `cg_key_info` and `_ctx`. One model uses the fused draw: `FusedDrawArgs`, `fused_draw_args`,
+# `drew`, `draw_row` and `draw_row_layout`. They're frozen together once a second model draws in place, or a state op
+# on a sampler replaces `drew`.
 __all__ = [
     "Array",
     "ArrayStep",
@@ -60,7 +62,6 @@ __all__ = [
     "CausalConv",
     "Entry",
     "Fork",
-    "FusedDrawArgs",
     "GatedDeltaNet",
     "KVEntry",
     "Layout",
@@ -81,8 +82,6 @@ __all__ = [
     "Window",
     "at_last_token",
     "causal_conv",
-    "drew",
-    "fused_draw_args",
     "gated_delta_net",
     "host",
     "last_sampled",

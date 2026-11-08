@@ -310,7 +310,7 @@ class Sampler:
     penalty: bool = True
     min_p: bool = False
     eos_ids: tuple[int, ...] = ()    # the ids min_tokens bars
-    draws: int = 1                   # draws in each step that lists it, by sample or drew
+    draws: int = 1                   # draws in each step that lists it
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -401,9 +401,9 @@ FUSED_DRAW_MAX_VOCAB = 2048
 
 
 class FusedDrawArgs(NamedTuple):
-    """Each row's sampling parameters, for a kernel in the forward that draws its own tokens. Row r's i-th draw is
-    ``draw_row(..., seed[r], offset[r] + i, ...)``, which consumes one draw from the row's random stream, exactly as one
-    `sample` call does."""
+    """Not frozen yet, like the rest of the fused draw. Each row's sampling parameters, for a kernel in the forward
+    that draws its own tokens. Row r's i-th draw is ``draw_row(..., seed[r], offset[r] + i, ...)``, which consumes one
+    draw from the row's random stream, exactly as one `sample` call does."""
 
     temperature: torch.Tensor    # [rows] float32
     top_k: torch.Tensor          # [rows] int32, 0 is off

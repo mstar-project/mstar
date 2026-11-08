@@ -28,11 +28,14 @@ def _argmax_tie_break_left(value1, index1, value2, index2):
 
 
 def layout():
+    """Not frozen yet, like the rest of the fused draw. The layout `draw_row` takes as ``LAY``."""
     return gl.BlockedLayout([8], [32], [4], [0])
 
 
 @gluon.jit
 def draw_row(lptr, temp, k, top_p, seed, offset, V, BLOCK: gl.constexpr, LAY: gl.constexpr):
+    """Not frozen yet, like the rest of the fused draw. The token `sample` would draw from the ``V`` logits at
+    ``lptr``."""
     offs = gl.arange(0, BLOCK, layout=LAY)
     valid = offs < V
     x = gl.load(lptr + offs, mask=valid, other=-float("inf")).to(gl.float32)

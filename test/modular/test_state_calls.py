@@ -1269,7 +1269,8 @@ def test_a_forgotten_drew_fails_the_step():
     s = _drawing()
     step = _begin(s)
     fused_draw_args(s)
-    _refused(r"Sampler 'draws': a step listing it sampled 0 times, and draws is 15", lambda: s.check_step(step))
+    _refused(r"Sampler 'draws': a step listing it counted 0 draws by sample and drew, and draws is 15",
+             lambda: s.check_step(step))
 
 
 @pytest.mark.parametrize("n", [0, -1, 16, 1.0, True])
@@ -1313,9 +1314,10 @@ def test_importing_the_contract_leaves_gluon_unimported():
     assert subprocess.run([sys.executable, "-c", script], check=False).returncode == 0, "the contract imported Gluon"
 
 
-def test_the_contract_exports_the_draw_a_kernel_calls_outside_its_surface():
+def test_the_contract_exports_the_fused_draw_outside_its_surface():
     from mstar.engine.resources.sampler import fused_draw
     from mstar.engine.state import draw_row, draw_row_layout
 
     assert draw_row is fused_draw.draw_row and draw_row_layout is fused_draw.layout
-    assert {"draw_row", "draw_row_layout"}.isdisjoint(state.__all__), "they can change with the kernel"
+    names = {"FusedDrawArgs", "fused_draw_args", "drew", "draw_row", "draw_row_layout"}
+    assert names.isdisjoint(state.__all__), "the fused draw can change until a second model draws in place"

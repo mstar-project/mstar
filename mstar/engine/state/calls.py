@@ -397,7 +397,9 @@ class SamplerHandle(StepHandle):
         if step.ctx.replays or (not self._drawn and step.state[self.name].kept_rows == frozenset()):
             return
         if self._drawn != self.sampler.draws:
-            raise self._refusal(f"a step listing it sampled {self._drawn} times, and draws is {self.sampler.draws}")
+            counted = (f"counted {self._drawn} draws by sample and drew" if self._fused
+                       else f"sampled {self._drawn} times")
+            raise self._refusal(f"a step listing it {counted}, and draws is {self.sampler.draws}")
 
     def commit_step(self, step) -> None:
         """Nothing: the resource holds a sampler's state."""
@@ -471,9 +473,9 @@ def sample(s: SamplerHandle, logits: torch.Tensor) -> torch.Tensor:
 
 @torch.compiler.disable
 def fused_draw_args(s: SamplerHandle) -> FusedDrawArgs | None:
-    """Each row's sampling parameters, padding rows included, for a kernel in the forward that draws as `sample` would.
-    None when `sample` would draw any other way this step, or the declared vocabulary is past what `draw_row`
-    reproduces, and the model then calls `sample`."""
+    """Not frozen yet, like the rest of the fused draw. Each row's sampling parameters, padding rows included, for a
+    kernel in the forward that draws as `sample` would. None when `sample` would draw any other way this step, or the
+    declared vocabulary is past what `draw_row` reproduces, and the model then calls `sample`."""
     if not s._open:
         raise s._refusal("fused_draw_args in a step that doesn't list the sampler")
     args = None if s.sampler.vocab_size > FUSED_DRAW_MAX_VOCAB else s.resource.fused_draw_args()
@@ -483,8 +485,9 @@ def fused_draw_args(s: SamplerHandle) -> FusedDrawArgs | None:
 
 @torch.compiler.disable
 def drew(s: SamplerHandle, n: int) -> None:
-    """Count ``n`` draws a kernel made from `fused_draw_args`, and advance each row's sampling state as ``n`` `sample`
-    calls would. Called after the launch, so the advance is ordered after the kernel's reads."""
+    """Not frozen yet, like the rest of the fused draw. Count ``n`` draws a kernel made from `fused_draw_args`, and
+    advance each row's sampling state as ``n`` `sample` calls would. Called after the launch, so the advance is ordered
+    after the kernel's reads."""
     if not s._fused:
         raise s._refusal("drew, and no fused_draw_args this step returned arguments")
     if not (type(n) is int and n >= 1 and s._drawn + n <= s.sampler.draws):

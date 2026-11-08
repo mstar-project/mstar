@@ -2129,7 +2129,9 @@ from the row's random stream, as one ``sample`` call does. After the launch, ``d
 ``n`` draws toward the sampler's ``draws`` and moves the offsets. ``fused_draw_args`` returns None
 when ``sample`` would do more than that draw (an eager step, the penalty, min-p, logprobs, a kept
 last token, TP) or the declared vocabulary is above 2048, where ``fused_sample`` leaves the layout
-``draw_row`` assumes; the model then calls ``sample``.
+``draw_row`` assumes; the model then calls ``sample``. These calls and ``FusedDrawArgs``, the
+tuple ``fused_draw_args`` returns, stay out of ``mstar.engine.state.__all__``, so they can change
+until a second model draws in place.
 
 .. warning::
 
