@@ -87,8 +87,8 @@ FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.
 
 def stacked_above(path):
     """The numbers of the PRs stacked above whose diffs the review was given: stacked-above.json, which
-    the workflow leaves out when a fetch failed. None without it."""
-    return [int(pr["number"]) for pr in json.loads(Path(path).read_text())] if Path(path).exists() else []
+    the workflow leaves out when a fetch failed. [] without it."""
+    return [int(pr["number"]) for pr in json.loads(Path(path).read_text())] if path and Path(path).exists() else []
 
 
 def judged(review, stacked):

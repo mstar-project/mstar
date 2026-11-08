@@ -395,9 +395,11 @@ jobs:
           # based on this PR's branch, then on theirs, up to 5. above-<n>.diff is the change from this
           # head to PR n's head, and stacked-above.json lists them as [{number, head_sha}]; the summary
           # counts a finding as fixed above only in one of them. Only a branch of this repository can
-          # have PRs based on it, and a PR counts only when its head descends from this head. Branch names
-          # and commits reach a command line only after jq has checked them. A failed fetch leaves none
-          # of these files, so a finding said to be fixed above stays open, and the review still runs.
+          # have PRs based on it, so only PRs from this repository count and have their branches walked
+          # (a fork's branch name can match a branch here), and a PR counts only when its head descends
+          # from this head. Branch names and commits reach a command line only after jq has checked them.
+          # A failed fetch leaves none of these files, so a finding said to be fixed above stays open, and
+          # the review still runs.
           stacked_above() {
             local branches=() ref list n sha next status
             ref=$(gh api "repos/$REPO/pulls/$PR" --jq 'select(.head.repo.full_name == .base.repo.full_name)
@@ -405,8 +407,9 @@ jobs:
             [ -z "$ref" ] || branches=("$ref")
             echo '[]' > stacked-above.json
             while [ ${#branches[@]} -gt 0 ] && [ "$(jq length stacked-above.json)" -lt 5 ]; do
-              list=$(gh pr list --repo "$REPO" --base "${branches[0]}" --state open --json number,headRefName,headRefOid \
-                --jq '.[] | select((.number | type == "number") and (.headRefOid | test("^[0-9a-f]{40}$"))
+              list=$(gh pr list --repo "$REPO" --base "${branches[0]}" --state open \
+                --json number,headRefName,headRefOid,isCrossRepository \
+                --jq '.[] | select((.isCrossRepository | not) and (.number | type == "number") and (.headRefOid | test("^[0-9a-f]{40}$"))
                   and (.headRefName | test("^[A-Za-z0-9._/][A-Za-z0-9._/-]*$"))) | "\(.number) \(.headRefOid) \(.headRefName)"') \
                 || return 1
               branches=("${branches[@]:1}")
