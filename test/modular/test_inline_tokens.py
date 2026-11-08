@@ -16,8 +16,9 @@ from mstar.communication import wire
 from mstar.communication.event import EventWakeup
 from mstar.engine.resources.sampler.config import SAMPLED_LOGPROB
 from mstar.graph.loop_indices import NestedLoopIndices
-from mstar.model.base import Model
 from mstar.model.submodule_base import HostRows
+from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.worker import make_worker
 from mstar.worker.worker import Worker
 
 # -- wire --------------------------------------------------------------------
@@ -53,14 +54,7 @@ def test_result_tokens_round_trips_through_the_codec():
 # -- api server --------------------------------------------------------------
 
 
-class _Model:
-    def get_partition_topology(self):
-        from mstar.streaming.topology import PartitionTopology
-        return PartitionTopology(partitions=["default"])
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
-
+class _Model(StubModel):
     def postprocess(self, output, modality, request_kwargs=None):
         assert modality == "text"
         return f"<{int(output[0])}>".encode()
@@ -260,8 +254,7 @@ class _Batch:
 
 
 def _worker(runtime=_Runtime()):
-    w = Worker.__new__(Worker)
-    w._graph_runtime = runtime
+    w = make_worker(_graph_runtime=runtime)
     return w
 
 

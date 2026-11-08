@@ -540,7 +540,7 @@ class CodecSubmodule(ARNodeSubmodule):
         wav, new = self.incremental(codec_tokens, state, lengths)
         for name, value in new.items():
             pool.scatter_(name, value)
-        return (wav.clamp(-1, 1) * 32767).to(torch.int16)
+        return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
 
     def forward(
         self,

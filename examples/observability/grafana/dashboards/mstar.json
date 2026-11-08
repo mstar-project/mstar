@@ -2113,8 +2113,8 @@
     },
     {
       "type": "timeseries",
-      "title": "KV cache pages used",
-      "description": "Share of each paged KV cache's pages off the free list, per graph node and cache; dashed: share the prefix cache names (it frees the ones no request holds on demand).",
+      "title": "KV cache pages and rebuild host pool used",
+      "description": "Share of each paged KV cache's pages off the free list, per graph node and cache; dashed: share the prefix cache names (it frees the ones no request holds on demand); dotted: share of the rebuild host pool holding kept prompt ids (a prompt that doesn't fit is never dropped).",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -2161,6 +2161,24 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    0,
+                    10
+                  ]
+                }
+              }
+            ]
           }
         ]
       },
@@ -2194,6 +2212,16 @@
           },
           "expr": "sum by (component, resource) (mstar_kv_pages_cached{model_name=~\"$model\"}) / sum by (component, resource) (mstar_kv_pages_total{model_name=~\"$model\"})",
           "legendFormat": "{{component}}/{{resource}} cached",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (mstar_rebuild_host_bytes_used{model_name=~\"$model\"}) / sum by (component) (mstar_rebuild_host_bytes_total{model_name=~\"$model\"})",
+          "legendFormat": "{{component}} rebuild host pool",
           "range": true
         }
       ],

@@ -310,12 +310,8 @@ class CommandAPlusLanguageModel(nn.Module):
             # A replicated table makes the lookup a plain gather. The sharded
             # lookup all-reduces rows that are zero on every other rank, so the
             # result is bit-identical.
-            shard = self.embed_tokens.weight.data
-            self._replicated_embedding = torch.empty(
-                (shard.shape[0] * group.world_size, shard.shape[1]), dtype=shard.dtype, device=shard.device,
-            )
-            torch.distributed.all_gather_into_tensor(
-                self._replicated_embedding, shard.contiguous(), group=group.device_group,
+            self._replicated_embedding = group.all_gather(
+                self.embed_tokens.weight.data.contiguous(), dim=0,
             )
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:

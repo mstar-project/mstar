@@ -392,7 +392,10 @@ def test_shipped_tables_are_well_formed(path):
                 assert set(gate_up) == ({"bj", "bk", "bjs", "bks", "warps"} if fp8 else {"bj", "bk", "warps"})
                 assert set(down) == {"bn", "bc", "warps"}
             assert set(tuning.router or ()) == ({"bk", "splits", "warps"} if fp8 else set())
-
+        if op.name == "fp8_linear":
+            for _, choice in entry.rows:
+                if choice.impl == "w8a16" and choice.config is not None:
+                    assert {"DOT", "BN", "BK", "SPLIT", "STAGES", "num_warps"} <= set(choice.config)
 
 
 def test_the_moe_decode_sweep_refuses_bf16_experts_and_a_bf16_miss_names_no_sweep(fake_moe_decode_sweep, on_gpu):

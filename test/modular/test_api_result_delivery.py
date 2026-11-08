@@ -28,6 +28,7 @@ from mstar.communication.event import EventWakeup
 from mstar.graph.base import GraphEdge
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.profile.format import OutputInfo, RequestProfile
+from mstar.testing_utils.model import StubModel
 
 
 class _RecordingTensorManager:
@@ -73,16 +74,12 @@ class _RecordingCommunicator:
         pass
 
 
-class _BlockingModel:
+class _BlockingModel(StubModel):
     """process_prompt blocks until released, like a long video preprocess."""
 
     def __init__(self):
         self.release = threading.Event()
         self.entered = threading.Event()
-
-    def get_partition_topology(self):
-        from mstar.streaming.topology import PartitionTopology
-        return PartitionTopology(partitions=["default"])
 
     def process_prompt(self, *args, **kwargs):
         self.entered.set()

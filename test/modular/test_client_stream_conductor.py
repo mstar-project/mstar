@@ -42,6 +42,8 @@ from mstar.streaming.topology import (  # noqa: E402
     client_stream_limits,
     find_client_streams,
 )
+from mstar.testing_utils.model import StubModel  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.utils.ipc_format import (  # noqa: E402
     ClientStreamRoute,
     ConductorMessage,
@@ -55,7 +57,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     WorkerMessageType,
 )
 from mstar.validation.client_streams import check_client_streams  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
+from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
 
 PREPROCESS = "api_server_preprocess_worker"
 
@@ -79,16 +81,13 @@ class _ScriptDoneError(Exception):
     pass
 
 
-class _DuplexToy(Model):
+class _DuplexToy(StubModel):
     """One partition whose loop consumes a stream the client feeds."""
 
     consumer = "ear"
 
     def __init__(self, consumer_input="audio_in"):
         self._consumer_input = consumer_input
-
-    def get_node_resources(self):
-        return []
 
     def get_graph_walk_graphs(self):
         return {"listen": Loop(name="listen_loop", max_iters=1000, outputs=[], section=GraphNode(
@@ -113,17 +112,8 @@ class _DuplexToy(Model):
                                         incoming_connections=None):
         return _fwd()
 
-    def process_prompt(self, *a, **k):
-        return {}
-
     def process_stream_chunk(self, chunk):
         return {"audio_in": chunk.tensors["audio_inputs"]}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
 
 
 def _fwd():
@@ -316,14 +306,15 @@ def test_the_route_encodes_without_pickle():
 
 
 def _stub_worker(sbuf):
-    """What ``Worker._process_new_inputs`` touches for a streaming-only signal."""
+    """What ``InputIngest._process_new_inputs`` touches for a streaming-only signal."""
     reads = []
     req_info = SimpleNamespace(stream_buffers={"audio_in": sbuf})
-    stub = Worker.__new__(Worker)
-    vars(stub).update(
-        _reads_done_sent=set(), worker_id="worker_0", enable_nvtx=False, _walk_driven_edges={},
-        _rid=lambda rid: 7 if rid == "r" else None,
-        request_state=SimpleNamespace(per_request_info={7: req_info}),
+    request_state = SimpleNamespace(per_request_info={7: req_info})
+    stub = make_worker(
+        worker_id="worker_0",
+        _graph_runtime=SimpleNamespace(get_rid_handle=lambda rid: 7 if rid == "r" else None),
+        request_state=request_state,
+        streams=StreamBufferManager(request_state, None, []),
         tensor_manager=SimpleNamespace(
             start_read_tensors=lambda rid, edges, graph_walk=None: edges and reads.append(
                 [info.uuid for edge in edges for info in edge.tensor_info]
@@ -331,8 +322,7 @@ def _stub_worker(sbuf):
         ),
         wakeup_event=SimpleNamespace(register_futures=lambda futures: None),
     )
-    # the real one, not a copy: it reads the stub's scheduler and tensor manager
-    stub._ack_unbuffered = Worker._ack_unbuffered.__get__(stub)
+    stub.lifecycle.add(7, "r")
     return stub, reads
 
 
@@ -345,13 +335,13 @@ def test_the_worker_buffers_client_chunks_and_closes_on_producer_done():
 
     # as the data worker sends them: no forward-pass info, which only a
     # non-streaming input carries
-    Worker._process_new_inputs(stub, InputSignals(
+    stub.ingest._process_new_inputs(InputSignals(
         request_id="r", inputs=[chunk], request_info=None, partition_name="Ear",
     ))
     assert reads == [[1, 2]] and [tid for tid, _walk in sbuf._tensor_ids_in_order] == [1, 2]
     assert not sbuf.producer_done
 
-    Worker._process_new_inputs(stub, InputSignals(
+    stub.ingest._process_new_inputs(InputSignals(
         request_id="r", inputs=[], request_info=None, partition_name="Ear",
         producer_done={CLIENT}, producer_done_items={"audio_in": 2},
     ))
@@ -458,14 +448,15 @@ def test_the_worker_acks_a_stream_it_has_no_buffer_for_unread(caplog, failed_her
                         policy=FixedChunkPolicy(chunk_size=1))
     stub, reads = _stub_worker(sbuf)
     stub.request_state.per_request_info[7].stream_buffers = {}
-    stub.scheduler = SimpleNamespace(failed_rids={7} if failed_here else set())
+    if failed_here:
+        stub.lifecycle.failed_rids.add(7)
     acked = []
     stub.tensor_manager.ack_unread_tensors = acked.append
     info = CurrentForwardPassInfo(request_id="r", graph_walk="listen", fwd_index=0, random_seed=0,
                                   max_tokens=8, partition_name="Ear")
     chunk = GraphEdge(next_node="ear", name="audio_in", tensor_info=[_info(1)], is_streaming=True)
     with caplog.at_level(logging.WARNING):
-        Worker._process_new_inputs(stub, InputSignals(request_id="r", inputs=[chunk], request_info=info,
+        stub.ingest._process_new_inputs(InputSignals(request_id="r", inputs=[chunk], request_info=info,
                                                       partition_name="Ear"))
     assert reads == []
     assert acked == [[chunk]]
@@ -481,7 +472,7 @@ def test_a_client_end_closes_only_the_streams_it_counts():
     info = CurrentForwardPassInfo(request_id="r", graph_walk="listen", fwd_index=0, random_seed=0,
                                   max_tokens=8, partition_name="Ear")
 
-    Worker._process_new_inputs(stub, InputSignals(
+    stub.ingest._process_new_inputs(InputSignals(
         request_id="r", inputs=[], request_info=info, partition_name="Ear",
         producer_done={CLIENT}, producer_done_items={"video_in": 2},
     ))
@@ -500,7 +491,7 @@ def test_a_producer_partitions_end_leaves_a_colocated_consumers_stream_open():
     info = CurrentForwardPassInfo(request_id="r", graph_walk="listen", fwd_index=0, random_seed=0,
                                   max_tokens=8, partition_name="A")
 
-    Worker._process_new_inputs(stub, InputSignals(
+    stub.ingest._process_new_inputs(InputSignals(
         request_id="r", inputs=[], request_info=info, partition_name="A",
         producer_done={"P"}, producer_done_items={"to_a": 4},
     ))

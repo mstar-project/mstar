@@ -18,9 +18,9 @@ from test_output_failure_teardown import _Model, _TensorManager, _thread
 from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.engine.engine import ExecutingBatch
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ConductorMessageType
-from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler
-from mstar.worker.worker import Worker
+from mstar.worker.micro_scheduler import CHAIN_LANE
 
 USER = getpass.getuser()
 ERROR_ID = re.compile(r"error id ([0-9a-f]{12})\)")
@@ -106,19 +106,18 @@ def test_an_arena_io_error_reaches_the_client_as_an_error_id(caplog):
 
 
 def _worker(rids=("r1",)):
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w.sent = []
-    w.communicator = SimpleNamespace(send=lambda entity, msg: w.sent.append(msg))
-    w.request_state = SimpleNamespace(per_request_info={rid: object() for rid in rids})
-    w._graph_runtime = SimpleNamespace(
-        get_rid_string=lambda h: h, set_in_flight=lambda *args: None,
+    sent = []
+    request_state = SimpleNamespace(per_request_info={rid: object() for rid in rids})
+    runtime = SimpleNamespace(get_rid_string=lambda h: h, set_in_flight=lambda *args: None)
+    scheduler = make_scheduler(request_state=request_state, graph_runtime=runtime)
+    w = make_worker(
+        communicator=SimpleNamespace(send=lambda entity, msg: sent.append(msg)),
+        request_state=request_state, _graph_runtime=runtime,
+        scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
-    w.scheduler = MicroScheduler.__new__(MicroScheduler)
-    w.scheduler.failed_rids = set()
-    w.scheduler.held_until = {}
-    w.scheduler.admit_errors = {}
-    w.scheduler.backlog = {}
+    w.sent = sent
+    for rid in rids:
+        w.lifecycle.add(rid, rid)
     w._hold_rows(CHAIN_LANE, rids)
     return w
 

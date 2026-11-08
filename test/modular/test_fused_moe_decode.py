@@ -79,6 +79,24 @@ def test_tuning_follows_the_gpu_name(monkeypatch):
     assert pick(torch.device("cpu")) is decode._H200
 
 
+def test_glm52_experts_have_an_h200_table_entry():
+    """GLM-5.2-FP8's experts at TP8 take the tiles swept at their shape on an H200, from the
+    kernel registry's shipped H200 table (the lookup itself is test_kernel_registry's)."""
+    import json
+
+    from mstar.kernels.table import TABLE_DIR, parse_table
+
+    path = TABLE_DIR / "moe_decode" / "NVIDIA_H200.json"
+    (entry,) = [e for e in parse_table(json.loads(path.read_text()), "moe_decode", str(path))
+                if dict(e.shape) == {"H": 6144, "E": 256, "I": 256, "K": 8}]
+    tuning = decode._from_entry(entry)
+    assert tuning.pair_max_tokens == 8 and tuning.router == decode._H200.router
+    assert decode._tiles(1, tuning) == (dict(bj=8, bk=512, bjs=32, bks=256, warps=2),
+                                        dict(bn=16, bc=256, warps=8))
+    assert decode._tiles(5, tuning) == (dict(bj=8, bk=1024, bjs=32, bks=256, warps=4),
+                                        dict(bn=32, bc=128, warps=4))
+
+
 def test_tile_tables():
     h200, h100 = decode._H200, decode._H100
     assert decode._tiles(3, h200) == (dict(bj=8, bk=1024, bjs=32, bks=256, warps=4),

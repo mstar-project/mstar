@@ -174,6 +174,9 @@ class DenseAttentionManager(AttentionManager):
     (``PositionManager`` would only work for labels supplying explicit pos_ids).
     """
 
+    # the gathered prefix is keyed on the stream's generation, which the KV's drop moves on
+    supports_drop = True
+
     def __init__(
         self,
         kv_cache: str,
