@@ -4,7 +4,7 @@ model: "z_image_turbo"
 # max_seq_len only satisfies the conductor's config check (prompts are truncated to 512).
 max_seq_len: 512
 
-model_kwargs:
+model_kwargs: &model_kwargs
   # sdpa (cuDNN on H100) is the reference kernel; auto runs the DiT's joint attention on the
   # engine's ragged attention resource with the platform's default kernel (FlashInfer FA3 on
   # NVIDIA GPUs, AITER's asm flash attention on MI300X/MI325X, where torch's sdpa is AOTriton)
@@ -56,3 +56,12 @@ node_groups:
     ranks: [0]
   - node_names: [dit]
     ranks: [0]
+
+# On AMD GPUs the DiT's joint attention runs on the ragged resource, as the klein configs do. An entry replaces a
+# top-level key whole, so model_kwargs repeats the block above through the merge key.
+platform_overrides:
+  rocm:
+    model_kwargs:
+      <<: *model_kwargs
+      # AITER's asm flash attention through the ragged resource; torch's sdpa is AOTriton here
+      attention_backend: auto

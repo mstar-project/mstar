@@ -1,5 +1,5 @@
 """A serving YAML's ``platform_overrides``: what each platform serves, and the
-Qwen3-Omni and FLUX.2 klein configs that rely on them."""
+Qwen3-Omni, FLUX.2 klein and Z-Image configs that rely on them."""
 
 from pathlib import Path
 
@@ -127,4 +127,21 @@ def test_the_named_fp8_klein_configs_are_their_bf16_file_with_fp8_and_the_knob(m
         **expected,
         "model_kwargs": {**bf16_kwargs, "linear_dtype": "fp8"},
         "knobs": {"dit_exact_ops": True},
+    }
+
+
+def test_z_image_serves_sdpa_on_cuda_and_the_ragged_resource_on_rocm(monkeypatch):
+    """On AMD GPUs the override moves Z-Image's DiT attention to ``auto`` and
+    changes nothing else; CUDA serves the file as written."""
+    shipped = _shipped("z_image_turbo.yaml")
+    expected = {k: v for k, v in shipped.items() if k != OVERRIDES_KEY}
+    assert expected["model_kwargs"]["attention_backend"] == "sdpa"
+    monkeypatch.setattr(serving_config, "_built_for", CudaPlatform)
+    assert load_serving_config(str(CONFIGS / "z_image_turbo.yaml")) == expected
+
+    monkeypatch.setattr(serving_config, "_built_for", RocmPlatform)
+    resolved = load_serving_config(str(CONFIGS / "z_image_turbo.yaml"))
+    assert resolved["model_kwargs"] == {**expected["model_kwargs"], "attention_backend": "auto"}
+    assert {k: v for k, v in resolved.items() if k != "model_kwargs"} == {
+        k: v for k, v in expected.items() if k != "model_kwargs"
     }
