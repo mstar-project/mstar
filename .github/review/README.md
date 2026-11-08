@@ -6,8 +6,8 @@ An advisory LLM reviewer runs on a PR when someone asks for it with `/review`, i
 
 | Trigger | Mode |
 | --- | --- |
-| Someone with write access comments exactly `/review` or `/review nogpu` | `nogpu` (P0-P3 and design questions; effort `xhigh`) |
-| Someone with write access comments exactly `/review light` on a PR | `light` (P0-P2, effort `high`) |
+| Someone with write access comments exactly `/review` or `/review nogpu` | `nogpu` (P0-P3 and design questions) |
+| Someone with write access comments exactly `/review light` on a PR | `light` (P0-P2) |
 | A contributor comments exactly `/review light` on their own PR, without the `skip-ai-review` label | `light` |
 | Anyone who may start a review comments exactly `/review continue` after a review stopped part-way | continues that review in its mode, in a fresh session; a nogpu one needs write access |
 
@@ -82,7 +82,7 @@ Even then, prefer keeping it advisory: a non-deterministic check shouldn't have 
 
 ## Cost control
 
-Current levers, roughly in order of effect: nothing runs automatically, only on request with a `/review` command, which takes write access or authorship of the PR (`/review light` only for authors, and `skip-ai-review` stops them); `concurrency` cancels a run superseded by a newer one on the same PR; a contributor's own light review triages a diff over about 4,000 lines rather than covering it in full, and `--max-turns 40` caps it (`/review continue` grants another 40; the `CLAUDE_REVIEW_MAX_TURNS` repository variable overrides it); a run someone with write access starts reviews a big diff in slices with subagents, with a cap meant only to stop a loop (`CLAUDE_REVIEW_MAX_TURNS_TEAM`, 2000) and a 5-hour timeout. The model is pinned to Opus in the workflow, at effort `high` for light reviews and `xhigh` for nogpu ones (Claude Code's default without `--effort` is medium); lowering light to `medium` is the next cost lever. Drop to Sonnet if cost matters more than recall and replay shows it catching the same defects.
+Current levers, roughly in order of effect: nothing runs automatically, only on request with a `/review` command, which takes write access or authorship of the PR (`/review light` only for authors, and `skip-ai-review` stops them); `concurrency` cancels a run superseded by a newer one on the same PR; a contributor's own light review triages a diff over about 4,000 lines rather than covering it in full, and `--max-turns 40` caps it (`/review continue` grants another 40; the `CLAUDE_REVIEW_MAX_TURNS` repository variable overrides it); a run someone with write access starts reviews a big diff in slices with subagents, with a cap meant only to stop a loop (`CLAUDE_REVIEW_MAX_TURNS_TEAM`, 2000) and a 5-hour timeout. The model is pinned to Opus in the workflow, at effort `high` in every mode (Claude Code's default without `--effort` is medium); lowering it to `medium` is the next cost lever. Drop to Sonnet if cost matters more than recall and replay shows it catching the same defects.
 
 Every run that reaches Claude records what it used: API calls (one per API response in the transcript, however many lines it spans), uncached input, cache-write, cache-read and output tokens (per model from the run's result, which also counts calls the transcript doesn't hold, or summed from the transcript when a timeout leaves no result), turns and cost, with the mode, whether it was a `/review continue`, the PR and the head commit. It goes in the run's job summary as a table and in a `review-usage-<pr>-<run id>-<attempt>` artifact kept for 30 days, never on the PR. Compare runs with `gh run download <run id> -n review-usage-<pr>-<run id>-<attempt>`.
 
