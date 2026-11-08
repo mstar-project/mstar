@@ -14,6 +14,7 @@ Slurm node when it has them free, else any open Eras listing under the hourly ca
     gpu_review.py wait     --out DIR [--start-timeout MIN]
     gpu_review.py cleanup  --pr N --tag T
     gpu_review.py approve  --pr N --sha SHA --review review.json --complete true|false --verdict pass|skipped|...
+                           [--since SHA]
     gpu_review.py comment  --pr N --sha SHA --out DIR [--site SITE] [--media-url URL]
 
 `start` exits 3 when no GPUs are free, or the bot has REVIEW_GPU_MAX_RUNS runs going, after writing
@@ -45,6 +46,8 @@ NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "pyproject.toml", "setup.py", "Cargo.to
                "requirements*.txt")
 # Approved only as a comment that doesn't count toward required reviews.
 NO_COUNT_AREAS = {"area/engine", "area/resources"}
+# No runtime code: a review's `none` alone approves a change only to these.
+NO_GPU_AREAS = {"area/docs", "area/tests", "area/benchmark"}
 ERAS_OUT = "/workspace/live-pr/out"
 # The kinds of check the review can ask for (the schema's `checks`), as the brief names them.
 CHECKS = {"correctness": "correctness (served output, parity, regressions)",
@@ -172,6 +175,8 @@ def cmd_carry(a):
         out.update(run="full", checks=",".join(CHECKS))
     elif run == "none":
         out["verdict"] = "skipped"
+        if passed:
+            out["since"] = last["sha"]
     elif run == "targeted" and passed:
         out["since"] = last["sha"]
         Path(a.earlier_report).write_text(last["body"])
@@ -360,15 +365,18 @@ def blocking(review, pages):
 
 
 def file_gate(files, repo_root):
-    """(blocked, engine): the files that rule out any approval (the bot's rules, CI, dependencies,
-    toolchains and lockfiles), and those in area/engine or area/resources, whose approval the bot
-    posts as a comment that doesn't count toward required reviews."""
+    """(blocked, engine, runtime): the files that rule out any approval (the bot's rules, CI,
+    dependencies, toolchains and lockfiles), those in area/engine or area/resources, whose approval the
+    bot posts as a comment that doesn't count toward required reviews, and those outside docs, tests and
+    benchmarks, which a review's `none` approves only after a passing live test."""
     labels = runpy.run_path(str(ROOT / ".github/labels/label_prs.py"))
     aliases = labels["model_aliases"](str(repo_root), [{"filename": f} for f in files])
+    areas = {f: set(labels["areas_of"](f, aliases)) for f in files}
     blocked = [f for f in files if f.startswith(NEVER_DIRS) or f.endswith(".lock")
                or any(fnmatch.fnmatchcase(Path(f).name, name) for name in NEVER_FILES)]
-    engine = [f for f in files if f not in blocked and NO_COUNT_AREAS & set(labels["areas_of"](f, aliases))]
-    return blocked, engine
+    engine = [f for f in files if f not in blocked and NO_COUNT_AREAS & areas[f]]
+    runtime = [f for f in files if not areas[f] <= NO_GPU_AREAS]
+    return blocked, engine, runtime
 
 
 def reasons_not_to_approve(a, review):
@@ -384,7 +392,8 @@ def reasons_not_to_approve(a, review):
               check=False).stdout.strip()
     if perm not in WRITE:
         why.append(f"the author has {perm or 'no'} access, not write")
-    # `skipped`: the review chose `none` and the workflow let it stand (no earlier live test failed).
+    # `skipped`: the review chose `none` and the workflow let it stand (the last live test passed on an
+    # ancestor, or there is none). On runtime code it counts only after that passing live test (below).
     if not (a.verdict == "pass" or (a.verdict == "skipped" and (review.get("live_test") or {}).get("run") == "none")):
         why.append(f"the live test's verdict is {a.verdict}")
     if (review.get("risk") or {}).get("level") != "low":
@@ -402,10 +411,12 @@ def reasons_not_to_approve(a, review):
     if cmp.get("files") is None or len(cmp["files"]) >= 300:
         why.append("the file list is too long to check")
     else:
-        blocked, engine = file_gate([f["filename"] for f in cmp["files"]], ROOT)
+        blocked, engine, runtime = file_gate([f["filename"] for f in cmp["files"]], ROOT)
         if blocked:
             why.append("touches the review's rules or dependencies: " + ", ".join(blocked[:8])
                        + (" and more" if len(blocked) > 8 else ""))
+        if a.verdict == "skipped" and not a.since and runtime:
+            why.append("no GPU run on runtime code")
     return why, engine
 
 
@@ -548,6 +559,7 @@ def main():
         p.add_argument(name, required=True)
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--why", help="write the reasons not to approve here")
+    p.add_argument("--since", type=commit, help="a `none`: the commit the last passing live test ran on")
     p = sub.add_parser("dismiss")
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--message", required=True)

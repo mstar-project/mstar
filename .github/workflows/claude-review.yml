@@ -817,9 +817,10 @@ jobs:
       # head, or a re-review's `none` or `targeted` has no live test before it (gpu_review.py carry):
       # then the live test runs in full, every kind of check, so a failure is never hidden. After a
       # pass on an ancestor, a `targeted` run is told that commit and given that report. A `none`
-      # that stands runs nothing, and counts as a pass for approval (verdict `skipped`). It posts no
-      # live-test marker: it isn't a live test, so the next run still checks against the last real
-      # one. A failed read of the PR's comments fails this step.
+      # that stands runs nothing (verdict `skipped`), and counts as a pass for approval after that
+      # pass, or on docs, tests and benchmarks alone. It posts no live-test marker: it isn't a live
+      # test, so the next run still checks against the last real one. A failed read of the PR's
+      # comments fails this step.
       - name: Check the last live test
         if: steps.cfg.outputs.trusted == 'true'
         id: carry
@@ -959,10 +960,11 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app.outputs.token || secrets.GITHUB_TOKEN }}
           VERDICT: ${{ steps.render.outputs.verdict || steps.carry.outputs.verdict }}
+          SINCE: ${{ steps.carry.outputs.since }}
         run: |
           set -o pipefail  # an error in the rule fails this step, rather than tee's exit 0 hiding it
           python3 .github/review/gpu_review.py approve --pr "$PR" --sha "$HEAD_SHA" --review review.json \
-            --complete true --verdict "$VERDICT" --why "$RUNNER_TEMP/why.txt" | tee approve.log
+            --complete true --verdict "$VERDICT" ${SINCE:+--since "$SINCE"} --why "$RUNNER_TEMP/why.txt" | tee approve.log
           grep '^approval=' approve.log >> "$GITHUB_OUTPUT" || true
 
       # Model output from untrusted input, posted only from the redacted copies.

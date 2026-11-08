@@ -484,7 +484,9 @@ can be more than the commits since the last review.
   - `full`: plan the live test over the whole change;
   - `targeted`: only the checks the change reaches, plus the "how to confirm" lines of open P0–P2
     findings;
-  - `none`: nothing in the change needs a GPU run to settle it; the reason says why in one sentence.
+  - `none`: nothing in the change needs a GPU run to settle it: docs, comments, tests, or code no
+    served request runs; never a change to what a model or the server does, however small. The
+    reason says why in one sentence.
 - `checks`, the kinds of check: `correctness` (served output, parity, regressions) and/or
   `performance` (throughput and latency A/Bs). Leave `performance` out when the change can't
   plausibly move speed; leave `correctness` out only for a pure performance change whose outputs you
@@ -495,8 +497,8 @@ head (it failed, was partial or unavailable, or ran on a commit since rebased aw
 runs in full, with both kinds of check, whatever the review asked for, so a failure is never hidden
 behind a narrower run; and so does a re-review's `targeted` or `none` when no live test ran before
 it, since no GPU run covered the commits that review built on. After a pass on an ancestor, a `targeted` run is told that commit and given its report. A `none`
-starts no box; the PR's comment says "No GPU run" with your reason, and it counts as a pass for
-approval.
+starts no box; the PR's comment says "No GPU run" with your reason. It counts as a pass for approval
+after a passing live test on an ancestor, or when the PR changes only docs, tests and benchmarks.
 
 **GPUs are expensive; use as few as settle the question.** Size the box to the largest config the
 plan needs, not the largest the model supports; prefer the smallest model and layout that reaches

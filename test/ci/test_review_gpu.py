@@ -51,32 +51,38 @@ class TestApproval(unittest.TestCase):
                      "scripts/ci/check.sh"):
             self.assertTrue(file_gate([path], REPO_ROOT)[0], f"a change to {path} could be approved")
         engine = ["mstar/engine/engine.py", "mstar/engine/resources/kv_cache.py"]
-        self.assertEqual(file_gate(engine, REPO_ROOT), ([], engine),
+        self.assertEqual(file_gate(engine, REPO_ROOT)[:2], ([], engine),
                          "an engine change's approval would count toward required reviews")
         self.assertEqual(file_gate(["mstar/worker/worker.py", "mstar/model/kokoro/model.py",
-                                    "mstar/model/orpheus/model.py", "docs/models.rst"], REPO_ROOT), ([], []),
+                                    "mstar/model/orpheus/model.py", "docs/models.rst"], REPO_ROOT)[:2], ([], []),
                          "a low-risk worker or model change couldn't get a counting approval")
 
     def test_a_none_run_counts_as_a_pass_only_when_the_review_chose_none(self):
         pr = {"head": {"sha": "0123456789"}, "base": {"sha": "abcdef"}, "user": {"login": "joe"}}
-        compare = {"files": [{"filename": "docs/models.rst"}]}
         globs = GPU_REVIEW["reasons_not_to_approve"].__globals__
         saved = {k: globs[k] for k in ("gh", "gh_json", "review_threads")}
         self.addCleanup(globs.update, saved)
-        globs.update(gh=lambda *a, check=True: argparse.Namespace(stdout="write\n"),
-                     gh_json=lambda path: compare if "/compare/" in path else pr, review_threads=lambda pr: [])
 
-        def why(verdict, run):
+        def why(verdict, run, files=("docs/models.rst",), since=None):
+            compare = {"files": [{"filename": f} for f in files]}
+            globs.update(gh=lambda *a, check=True: argparse.Namespace(stdout="write\n"),
+                         gh_json=lambda path: compare if "/compare/" in path else pr, review_threads=lambda pr: [])
             r = {"outside_diff": [], "prior_findings": [], "questions": [], "skipped": [],
                  "risk": {"level": "low", "reason": "docs only", "look_at": []},
                  "live_test": {"run": run, "reason": "docs only", "confirm": [], "checks": ["correctness"], "gpus": 1}}
-            a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict)
+            a = argparse.Namespace(pr=7, sha="0123456789", complete="true", verdict=verdict, since=since)
             return GPU_REVIEW["reasons_not_to_approve"](a, r)[0]
 
         self.assertEqual(why("pass", "full"), [])
-        self.assertEqual(why("skipped", "none"), [], "a change that needs no GPU run could never be approved")
+        self.assertEqual(why("skipped", "none", ("docs/models.rst", "test/ci/test_x.py", "benchmark/run.py")), [],
+                         "a change that needs no GPU run could never be approved")
         self.assertEqual(why("skipped", "targeted"), ["the live test's verdict is skipped"],
                          "a skipped run the review didn't choose would count as a pass")
+        runtime = ("docs/models.rst", "mstar/worker/worker.py")
+        self.assertEqual(why("skipped", "none", runtime), ["no GPU run on runtime code"],
+                         "a model's `none` alone would approve runtime code no GPU ran")
+        self.assertEqual(why("skipped", "none", runtime, since="f" * 40), [],
+                         "a change since a passing live test could never be approved without a GPU")
 
 
 
@@ -98,7 +104,7 @@ class TestCarry(unittest.TestCase):
         ("re-review with no live test, full", True, "full", ["performance"], [], "",
          {"run": "full", "checks": "performance"}),
         ("pass on an ancestor, none", True, "none", ["correctness"], [live_test("pass")], "ahead",
-         {"run": "none", "checks": "correctness", "verdict": "skipped"}),
+         {"run": "none", "checks": "correctness", "verdict": "skipped", "since": "a" * 40}),
         ("pass on an ancestor, targeted", True, "targeted", ["correctness"], [live_test("pass")], "ahead",
          {"run": "targeted", "checks": "correctness", "since": "a" * 40}),
         ("pass on an ancestor, full", True, "full", ["correctness"], [live_test("pass")], "ahead",
@@ -146,7 +152,7 @@ class TestCarry(unittest.TestCase):
                 outputs, report = self.carry(rereview, run, checks, comments, status)
                 self.assertEqual(outputs, expected)
                 self.assertEqual(report, "<!-- claude-live-test sha={} verdict=pass -->\nreport pass".format("a" * 40)
-                                 if "since" in expected else None)
+                                 if "since" in expected and expected["run"] == "targeted" else None)
         with self.assertRaises(RuntimeError, msg="a failed fetch would read as no earlier live test"):
             self.carry(True, "none", ["correctness"], None, "")
 
