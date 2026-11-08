@@ -74,8 +74,8 @@ class RequestLifecycle:
 
     def add(self, rid: int, wire_rid: str) -> list[WorkerMessage]:
         """A NEW_REQUEST, of which a request with several partitions here sends
-        one per partition: it keeps its first arrival. Returns the messages
-        parked for it, for the caller to replay once the request is set up."""
+        one per partition: it keeps its first arrival. Its parked messages
+        stay parked until ``take_parked``."""
         if rid not in self._wires:
             self._wires[rid] = wire_rid
             self._handles[wire_rid] = rid
@@ -84,7 +84,12 @@ class RequestLifecycle:
         if wire_rid in self.draining or wire_rid in self.pending_drains:
             # Drained before admission: no new work, while committed TP steps still run.
             self.failed_rids.add(rid)
-        return self._parked.pop(wire_rid, ())
+
+    def take_parked(self, wire_rid: str) -> list[WorkerMessage]:
+        """The messages parked for a request, for the caller to replay now. Taken
+        only at the replay, so a setup that raises leaves them for the request's
+        teardown to drop."""
+        return self._parked.pop(wire_rid, [])
 
     def park(self, message: WorkerMessage) -> bool:
         """Hold a message for a request that has not arrived. False if it never
@@ -114,7 +119,8 @@ class RequestLifecycle:
         for rid, msg in errors.items():
             if rid in self._wires:
                 self.failed_rids.add(rid)
-                self._unreported[rid] = msg
+                # the first error is the specific one; a step's generic one can follow it
+                self._unreported.setdefault(rid, msg)
 
     def take_failures(self) -> dict[int, str]:
         """The failures not yet reported to the conductor."""
@@ -179,6 +185,13 @@ class RequestLifecycle:
         self._reads_done_sent.discard(wire_rid)
         self._removed.add(wire_rid)
         return self._parked.pop(wire_rid, ())
+
+    def teardown_failed(self, rid: int) -> None:
+        """A teardown that raised after ``removed``: the request's state is
+        partly gone, so it takes no more work. It is not retried, since it would
+        likely raise again every pass, and its handle is never freed (that is
+        the teardown's last step), so no later request inherits the mark."""
+        self.failed_rids.add(rid)
 
     # -- drains --------------------------------------------------------------
 

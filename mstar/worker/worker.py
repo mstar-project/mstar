@@ -759,6 +759,13 @@ class Worker:
         laps = PhaseLaps("worker.msg.remove_request.")
         for message in self.lifecycle.removed(rid, wire_rid):
             self.ingest.drop_for_removed(message)
+        try:
+            self._release_request(rid, wire_rid, laps)
+        except BaseException:
+            self.lifecycle.teardown_failed(rid)
+            raise
+
+    def _release_request(self, rid: int, wire_rid: str, laps: PhaseLaps) -> None:
         freed = self.engine_manager.remove_request(rid)
         if freed:
             self.admission.lift_caps(freed)
