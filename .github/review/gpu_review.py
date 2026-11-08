@@ -84,12 +84,13 @@ def slurm_allowed(pr, slurm_authors, commenter):
     return commenter in listed and bot.api(f"repos/{REPO}/pulls/{pr}")["user"]["login"] in listed
 
 
-def configure(out, runner_temp, pr: int = 0, slurm_key="", slurm_nodes="", slurm_authors="", commenter="",
+def configure(out, runner_temp, pr="0", slurm_key="", slurm_nodes="", slurm_authors="", commenter="",
               max_gpus="4", hours="4", max_usd="30", max_runs="2", eras_secret=""):
     """gpu.py's config.local.json from the workflow's variables and secrets, and the ssh keys. The Slurm
     nodes only with their key (one for all of them) and for a run `slurm_allowed` lets use them; Eras
     only with ERAS_API_KEY (gpu.py checks). SLURM_NODES is a JSON list of nodes, each with its name, host,
     port and pinned host key, and optionally any other field of gpu.py's node. Nothing here reaches the box."""
+    pr = int(pr)
     Path(os.environ["LIVE_PR_STATE"]).mkdir(parents=True, exist_ok=True)
     ssh = Path.home() / ".ssh"
     ssh.mkdir(mode=0o700, exist_ok=True)
@@ -298,12 +299,16 @@ def pending_ahead(cfg, offer):
     return len(out.split())
 
 
-def start(out, pr: int, head_sha, runner_temp, tag, base: branch, gpus: int, hours: float, run, checks: check_kinds,
-          since: commit = "", forced="", asked="", asked_checks: check_kinds = (), turns: int = 2000):
+def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, since="", forced="", asked="",
+          asked_checks="", turns="2000"):
     """Get GPUs and start the live-test session on them: the brief (fixed text, the commits and carry's
     call), the review's notes (findings.json) and the PR's title and description (pr-body.md) as data,
     and the box's own Anthropic key. Exits 3, with `unavailable` set, when the bot is past the spend cap,
     no GPUs are free or it has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md."""
+    pr, gpus, hours, turns = int(pr), int(gpus), float(hours), int(turns)
+    base, checks = branch(base), check_kinds(checks)
+    since = commit(since) if since else ""
+    asked_checks = check_kinds(asked_checks) if asked_checks else ()
     if run not in ("full", "targeted") or forced not in ("", *FORCED) or asked not in ("", "none", "targeted", "full"):
         raise ValueError(f"unexpected run {run!r}, forced {forced!r} or asked {asked!r}")
     lt = Path(runner_temp, "lt")
@@ -385,9 +390,10 @@ def instance(lt):
     return key, state["entry"](key), state
 
 
-def wait(out, runner_temp, start_timeout: int = 30):
+def wait(out, runner_temp, start_timeout="30"):
     """Until the box's session finishes; then copy its results back and let the box go. Exits 3, with
     `unavailable` set, when a Slurm job never started."""
+    start_timeout = int(start_timeout)
     lt = Path(runner_temp, "lt")
     key, e, g = instance(lt)
     cfg = g["load_config"]()
@@ -447,10 +453,11 @@ def run_cost(lt, now):
     return gpu_usd, box_usd
 
 
-def cleanup(out, pr: int, tag, runner_temp):
+def cleanup(out, pr, tag, runner_temp):
     """Release whatever this run launched, and delete the ssh key it registered, from the ledger and by
     name, for a run cancelled mid-launch; and first what the run's GPUs and box session cost, for the
     ledger, so a failed release can't lose it."""
+    pr = int(pr)
     try:  # nothing here may stop the release below
         out.update(zip(("gpu_usd", "box_usd"), map(str, run_cost(Path(runner_temp, "lt"), time.time())), strict=True))
     except Exception as e:
@@ -600,12 +607,13 @@ def left_for_you(pr, review, extra):
     return render_summary.checklist(review, review_threads(pr), stacked, extra)
 
 
-def approve(out, pr: int, head_sha, runner_temp, verdict, since: commit = ""):
+def approve(out, pr, head_sha, runner_temp, verdict, since=""):
     """Approve the PR when the rule holds (reasons_not_to_approve) and REVIEW_APPROVALS is on, as a comment
     that doesn't count toward required reviews when it touches area/engine or area/resources. What the
     live-test comment says of it goes in $RUNNER_TEMP/decision.md: the approval line, or the checklist of
     what's left, which with approvals off also says what the rule would have done; then no GitHub review
     is posted at all. The review finished cleanly: the live-test job runs only then."""
+    pr, since = int(pr), commit(since) if since else ""
     review = json.loads(Path("review.json").read_text())
     refresh_above()
     why, engine, extra = reasons_not_to_approve(pr, head_sha, verdict, since, review)

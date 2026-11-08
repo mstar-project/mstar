@@ -258,7 +258,7 @@ class TestStart(unittest.TestCase):
                 (ws / "earlier-live-test.md").write_text(earlier)
             out, _ = step(gpu_review.start, routes, **{"pr": 7, "head_sha": "0123456789", "runner_temp": str(lt),
                                                       "tag": "1-1", "base": "main", "gpus": 1, "hours": 4.0,
-                                                      "run": "full", "checks": ["correctness", "performance"],
+                                                      "run": "full", "checks": "correctness,performance",
                                                       "turns": 10, **args})
         self.assertIn(out.get("exit"), (None, 3))
         return lt / "lt", launched
