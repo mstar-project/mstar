@@ -37,8 +37,9 @@ verifies what they return.
 ## Working efficiently
 
 These rules make the review faster, not shallower: never skip a pass, a read or a check to save
-turns. A run someone with write access starts has a turn cap that only stops a loop. A review's cost
-is its turns times its context: every turn re-reads everything read so far.
+turns; only a contributor's capped run may skip files, as below. A run someone with write access
+starts has a turn cap that only stops a loop. A review's cost is its turns times its context: every
+turn re-reads everything read so far.
 
 - **Batch.** Issue independent reads and searches as parallel tool calls in one message. A turn
   with one small call is the exception.
@@ -58,7 +59,8 @@ is its turns times its context: every turn re-reads everything read so far.
   an independent subagent with this skill, the slice's files, the base tree, and the contracts it
   relies on from other slices. Then verify every finding they return yourself, merge duplicates, and
   review what crosses slices (a caller in one and a callee in another, state one writes and another
-  reads): those are the defects no slice sees. Phase A and the big picture stay yours.
+  reads): those are the defects no slice sees. Phase A and the big picture stay yours. A run
+  someone with write access starts never skips a file: it slices.
 - **Nothing runs in light or thorough mode.** No tests, scripts, servers or reproductions: findings
   are traced (§5).
 
@@ -527,7 +529,8 @@ Finish verifying everything before reporting anything. The bot's prompt says whe
 - **Design verdict** (thorough), always present, even when the approach is right; at most six lines:
   the Phase A ideal, the rows where the code differs and which side is better, the north star and
   the PR's distance from it. Every gap named here is also a finding or a question.
-- **Skipped:** files not reviewed, on a diff too large to cover.
+- **Skipped:** files not reviewed, only on a contributor's capped run whose diff is too large for
+  its cap.
 - **Risk:** the design-risk rating, its sentence and, above low, the decisions (§6).
 
 **Before reporting, check:** every cited `path:line` says what the finding claims at the head; every

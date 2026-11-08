@@ -54,7 +54,7 @@ The skill's bar (§2), description pass (§4.4), questions and output (§7): rep
 
 The skill's modes table: every mode runs every pass, and the modes differ in what they report. **light** runs on each `/review`. **thorough** runs on request and covers the whole diff.
 
-**A big diff, in any mode,** is reviewed as a stack of slices with subagents, as the skill's "Working efficiently" says, when your turn cap is in the hundreds or more. With a small cap, review the files most likely to hold a defect and list the rest in `skipped`. Subagents read and report; only you post, and only findings you have verified.
+**A big diff, in any mode,** is reviewed as a stack of slices with subagents, as the skill's "Working efficiently" says, when your turn cap is in the hundreds or more. With a small cap (a contributor's own review), review the files most likely to hold a defect and list the rest in `skipped`; with a large one, never skip a file. Subagents read and report; only you post, and only findings you have verified.
 
 Don't repost a finding that already has an inline comment, whether its thread is open or resolved, unless the code has since changed so that it applies again; report it in `prior_findings` instead. Don't re-raise a point the author answered with a reason that holds.
 
@@ -80,7 +80,7 @@ Keep the body to one short paragraph that names the triggering inputs or state; 
 - `description_problems`: inaccuracies first, including anything the code does that the description doesn't say, then what's missing.
 - `questions`: each question with what its answer would change. A second sentence is fine for that.
 - `checked`: the paths and claims you traced and found sound, one line each, so a review with few or no findings shows its evidence. The comment shows them collapsed.
-- `skipped`: the files you didn't review, on a diff too large to cover. Empty otherwise.
+- `skipped`: the files you didn't review, only with a small turn cap (a contributor's own review) on a diff too large for it. Empty otherwise: a run with a large cap reviews every file, in slices.
 - `design`: thorough, the skill's design verdict, a few lines. Empty in light mode.
 - `risk`: the design risk, by the skill's §6: whether a human must make a design or direction decision before merging, not how likely a defect is (your findings cover that). `level` (`low`, `medium` or `high`), `reason`, and `look_at`: when it isn't low, each decision, with `location` where the choice lives and, as `why`, the choice made, the alternatives (Phase A's included), what it does well, what would be better and what changing it costs. Empty when it is low.
 

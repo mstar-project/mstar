@@ -52,7 +52,8 @@ SCHEMA = {
         "description_problems": STRINGS,
         "questions": STRINGS,
         "checked": STRINGS,
-        "skipped": STRINGS,
+        "skipped": {**STRINGS, "description": "files not reviewed: only with a small turn cap (a contributor run) "
+                                              "and a diff too large for it; else empty"},
         "types": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": True,
                   "items": {"type": "string", "enum": list(TYPES)}},
         "prior_findings": {"type": "array", "items": {
