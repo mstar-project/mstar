@@ -117,7 +117,10 @@ SCHEMA = {
                                                           "the change only shows on"},
                 "why": {"type": "string", "description": "one line"},
             }, "required": ["what", "why"]}},
-        }, "required": ["run", "reason", "checks", "gpus", "focus"]},
+            # What the bot's GPUs can't run in this PR; it stops the bot's approval, not the GPU run.
+            "untestable": {"type": "string", "description": "the hardware or path the live test can not exercise, "
+                                                            "short; empty when there is nothing"},
+        }, "required": ["run", "reason", "checks", "gpus", "focus", "untestable"]},
     },
     "required": ["outside_diff", "since_last", "description_problems", "questions", "checked", "skipped", "types",
                  "prior_findings", "design", "latent", "risk"],
