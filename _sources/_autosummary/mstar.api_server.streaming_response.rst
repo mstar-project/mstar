@@ -9,6 +9,12 @@ mstar.api\_server.streaming\_response
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      errors_in_band
+   
    
 
    

@@ -580,6 +580,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.ws_frames.html">mstar.api_server.ws_frames</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1000,15 +1001,36 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.api_server.streaming_response</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""A streaming response that cleans up after a body Starlette never started."""</span>
+<span></span><span class="sd">"""Streaming-response helpers: a response that cleans up after a body</span>
+<span class="sd">Starlette never started, and a body that reports a mid-stream error in band."""</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">inspect</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncGenerator</span><span class="p">,</span> <span class="n">Callable</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi.responses</span><span class="w"> </span><span class="kn">import</span> <span class="n">StreamingResponse</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.request_types</span><span class="w"> </span><span class="kn">import</span> <span class="n">ResultChunk</span>
+
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="errors_in_band">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.streaming_response.html#mstar.api_server.streaming_response.errors_in_band">[docs]</a>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">errors_in_band</span><span class="p">(</span><span class="n">request_id</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">chunks</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""``chunks``, with an ``HTTPException`` raised mid-stream (``--timeout``)</span>
+<span class="sd">    ending it as the error chunk an engine error ends it with: the 200 is</span>
+<span class="sd">    already sent, so raising would only cut the body off."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">async</span> <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">chunks</span><span class="p">:</span>
+            <span class="k">yield</span> <span class="n">chunk</span>
+    <span class="k">except</span> <span class="n">HTTPException</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">ResultChunk</span><span class="p">(</span>
+            <span class="n">request_id</span><span class="o">=</span><span class="n">request_id</span><span class="p">,</span> <span class="n">modality</span><span class="o">=</span><span class="s2">"error"</span><span class="p">,</span>
+            <span class="n">data</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">detail</span><span class="p">)</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s2">"utf-8"</span><span class="p">),</span> <span class="n">metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">"status"</span><span class="p">:</span> <span class="n">exc</span><span class="o">.</span><span class="n">status_code</span><span class="p">},</span>
+        <span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="ReleasingStreamingResponse">

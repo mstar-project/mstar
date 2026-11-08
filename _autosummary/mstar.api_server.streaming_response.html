@@ -50,7 +50,7 @@
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.communication" href="mstar.communication.html" />
+    <link rel="next" title="mstar.api_server.ws_frames" href="mstar.api_server.ws_frames.html" />
     <link rel="prev" title="mstar.api_server.rust_frontend" href="mstar.api_server.rust_frontend.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -227,6 +227,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 <li class="toctree-l3 current active"><a class="current reference internal" href="#">mstar.api_server.streaming_response</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.ws_frames.html">mstar.api_server.ws_frames</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -710,6 +711,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.streaming_response.ReleasingStreamingResponse"><code class="docutils literal notranslate"><span class="pre">ReleasingStreamingResponse</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.streaming_response.errors_in_band"><code class="docutils literal notranslate"><span class="pre">errors_in_band()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -723,7 +725,17 @@
                   
   <section id="module-mstar.api_server.streaming_response">
 <span id="mstar-api-server-streaming-response"></span><h1>mstar.api_server.streaming_response<a class="headerlink" href="#module-mstar.api_server.streaming_response" title="Link to this heading">#</a></h1>
-<p>A streaming response that cleans up after a body Starlette never started.</p>
+<p>Streaming-response helpers: a response that cleans up after a body
+Starlette never started, and a body that reports a mid-stream error in band.</p>
+<p class="rubric">Functions</p>
+<div class="pst-scrollable-table-container"><table class="autosummary longtable table">
+<tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.streaming_response.errors_in_band" title="mstar.api_server.streaming_response.errors_in_band"><code class="xref py py-obj docutils literal notranslate"><span class="pre">errors_in_band</span></code></a>(request_id, chunks)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">chunks</span></code>, with an <code class="docutils literal notranslate"><span class="pre">HTTPException</span></code> raised mid-stream (<code class="docutils literal notranslate"><span class="pre">--timeout</span></code>) ending it as the error chunk an engine error ends it with: the 200 is already sent, so raising would only cut the body off.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 <p class="rubric">Classes</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
@@ -757,6 +769,19 @@ process restarts.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.streaming_response.errors_in_band">
+<span class="property"><span class="k"><span class="pre">async</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.streaming_response.</span></span><span class="sig-name descname"><span class="pre">errors_in_band</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">chunks</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/streaming_response.html#errors_in_band"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.streaming_response.errors_in_band" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">chunks</span></code>, with an <code class="docutils literal notranslate"><span class="pre">HTTPException</span></code> raised mid-stream (<code class="docutils literal notranslate"><span class="pre">--timeout</span></code>)
+ending it as the error chunk an engine error ends it with: the 200 is
+already sent, so raising would only cut the body off.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -780,11 +805,11 @@ process restarts.</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.communication.html"
+       href="mstar.api_server.ws_frames.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.communication</p>
+        <p class="prev-next-title">mstar.api_server.ws_frames</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -807,6 +832,7 @@ process restarts.</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.streaming_response.ReleasingStreamingResponse"><code class="docutils literal notranslate"><span class="pre">ReleasingStreamingResponse</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.streaming_response.errors_in_band"><code class="docutils literal notranslate"><span class="pre">errors_in_band()</span></code></a></li>
 </ul>
   </nav></div>
 

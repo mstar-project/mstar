@@ -227,6 +227,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.ws_frames.html">mstar.api_server.ws_frames</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 current active has-children"><a class="reference internal" href="mstar.communication.html">mstar.communication</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
@@ -725,8 +726,10 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.DEPLOYMENT_ANCHOR_ENTITY"><code class="docutils literal notranslate"><span class="pre">DEPLOYMENT_ANCHOR_ENTITY</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.DEPLOYMENT_LOCK_ENTITIES"><code class="docutils literal notranslate"><span class="pre">DEPLOYMENT_LOCK_ENTITIES</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION"><code class="docutils literal notranslate"><span class="pre">EXPECTED_MSTAR_RUST_VERSION</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.BEHIND_WARN_S"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.BEHIND_WARN_S</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.flush"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.flush()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.send"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.send_each"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.send_each()</span></code></a></li>
@@ -754,6 +757,9 @@
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.communication.communicator.DEPLOYMENT_ANCHOR_ENTITY" title="mstar.communication.communicator.DEPLOYMENT_ANCHOR_ENTITY"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DEPLOYMENT_ANCHOR_ENTITY</span></code></a></p></td>
 <td><p>the one every deployment has exactly one of.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.communication.communicator.DEPLOYMENT_LOCK_ENTITIES" title="mstar.communication.communicator.DEPLOYMENT_LOCK_ENTITIES"><code class="xref py py-obj docutils literal notranslate"><span class="pre">DEPLOYMENT_LOCK_ENTITIES</span></code></a></p></td>
+<td><p>the anchor, and the first one the API-server process binds, so a second <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> on the prefix is refused before it takes over the first deployment's API-server sockets (its conductor starts later).</p></td>
 </tr>
 </tbody>
 </table>
@@ -901,6 +907,20 @@ notably the tensor-file namespace in <code class="docutils literal notranslate">
 </dd></dl>
 
 <dl class="py data">
+<dt class="sig sig-object py" id="mstar.communication.communicator.DEPLOYMENT_LOCK_ENTITIES">
+<span class="sig-prename descclassname"><span class="pre">mstar.communication.communicator.</span></span><span class="sig-name descname"><span class="pre">DEPLOYMENT_LOCK_ENTITIES</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">('conductor',</span> <span class="pre">'api_server_preprocess_worker')</span></span><a class="headerlink" href="#mstar.communication.communicator.DEPLOYMENT_LOCK_ENTITIES" title="Link to this definition">#</a></dt>
+<dd><p>the
+anchor, and the first one the API-server process binds, so a second
+<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> on the prefix is refused before it takes over the first
+deployment’s API-server sockets (its conductor starts later).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>The entities that lock the deployment’s IPC prefix when they bind</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py data">
 <dt class="sig sig-object py" id="mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION">
 <span class="sig-prename descclassname"><span class="pre">mstar.communication.communicator.</span></span><span class="sig-name descname"><span class="pre">EXPECTED_MSTAR_RUST_VERSION</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'0.1.1'</span></span><a class="headerlink" href="#mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION" title="Link to this definition">#</a></dt>
 <dd><p>The <code class="docutils literal notranslate"><span class="pre">mstar_rust</span></code> extension version this tree expects (the vendored
@@ -916,8 +936,9 @@ is refused at startup rather than left to carry the mesh.</p>
 <p>A communicator whose sends never block: a send the peer can’t take now
 (at its high-water mark) is queued, in order behind any earlier one to the
 same peer, and retried by <code class="docutils literal notranslate"><span class="pre">flush</span></code>.</p>
-<p>For a loop that peers block on while it sends to them (the API server’s
-preprocess thread, against the conductor and the workers): if it blocked on
+<p>For a loop that peers block on while it sends to them (the conductor
+against the workers, and the API server’s preprocess thread against the
+conductor and the workers): if it blocked on
 a full peer it would stop reading the input that peer waits to deliver, and
 the two would wait on each other for good. Everything else is the wrapped
 communicator’s.</p>
@@ -926,13 +947,21 @@ communicator’s.</p>
 <dd class="field-odd"><p><strong>inner</strong> (<a class="reference internal" href="#mstar.communication.communicator.BaseCommunicator" title="mstar.communication.communicator.BaseCommunicator"><em>BaseCommunicator</em></a>)</p>
 </dd>
 </dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.communication.communicator.OutboxCommunicator.BEHIND_WARN_S">
+<span class="sig-name descname"><span class="pre">BEHIND_WARN_S</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">10.0</span></span><a class="headerlink" href="#mstar.communication.communicator.OutboxCommunicator.BEHIND_WARN_S" title="Link to this definition">#</a></dt>
+<dd><p>How often a peer that stays behind is reported.</p>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.communication.communicator.OutboxCommunicator.flush">
 <span class="sig-name descname"><span class="pre">flush</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/communication/communicator.html#OutboxCommunicator.flush"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.communication.communicator.OutboxCommunicator.flush" title="Link to this definition">#</a></dt>
 <dd><p>Send what peers can take now; True if anything is still queued.</p>
 <p>A queued message whose send fails outright (not just a full peer) is
 dropped and logged: there is no caller left to raise to, and keeping
-it would stop every message behind it.</p>
+it would stop every message behind it. Nothing bounds the queue, since
+blocking or dropping would hang the requests behind it, so a peer that
+stays behind is logged with its depth every <code class="docutils literal notranslate"><span class="pre">BEHIND_WARN_S</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Return type<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
@@ -975,15 +1004,15 @@ it would stop every message behind it.</p>
 <dd><p>Construct the process’s communicator: <code class="docutils literal notranslate"><span class="pre">RustZMQCommunicator</span></code>, on the
 vendored <code class="docutils literal notranslate"><span class="pre">rust/</span></code> extension (see <code class="docutils literal notranslate"><span class="pre">communication/rust_communicator.py</span></code>).</p>
 <p>Raises when the extension is missing or is not the version this tree
-expects. <code class="docutils literal notranslate"><span class="pre">nonblocking_send</span></code> is for a communicator <code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code>
-wraps, which needs <code class="docutils literal notranslate"><span class="pre">try_send_bytes</span></code>: an extension built before
+expects. <code class="docutils literal notranslate"><span class="pre">nonblocking_send</span></code> wraps it in an <code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code>, which
+needs <code class="docutils literal notranslate"><span class="pre">try_send_bytes</span></code>: an extension built before
 <code class="docutils literal notranslate"><span class="pre">ZmqCommunicator.try_send</span></code> is refused for it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>nonblocking_send</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference internal" href="#mstar.communication.communicator.BaseCommunicator" title="mstar.communication.communicator.BaseCommunicator"><em>BaseCommunicator</em></a></p>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.communication.communicator.BaseCommunicator" title="mstar.communication.communicator.BaseCommunicator"><em>BaseCommunicator</em></a> | <a class="reference internal" href="#mstar.communication.communicator.OutboxCommunicator" title="mstar.communication.communicator.OutboxCommunicator"><em>OutboxCommunicator</em></a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1053,8 +1082,10 @@ wraps, which needs <code class="docutils literal notranslate"><span class="pre">
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.DEPLOYMENT_ANCHOR_ENTITY"><code class="docutils literal notranslate"><span class="pre">DEPLOYMENT_ANCHOR_ENTITY</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.DEPLOYMENT_LOCK_ENTITIES"><code class="docutils literal notranslate"><span class="pre">DEPLOYMENT_LOCK_ENTITIES</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION"><code class="docutils literal notranslate"><span class="pre">EXPECTED_MSTAR_RUST_VERSION</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.BEHIND_WARN_S"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.BEHIND_WARN_S</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.flush"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.flush()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.send"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.send()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.communication.communicator.OutboxCommunicator.send_each"><code class="docutils literal notranslate"><span class="pre">OutboxCommunicator.send_each()</span></code></a></li>

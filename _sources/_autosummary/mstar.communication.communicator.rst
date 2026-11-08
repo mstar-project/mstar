@@ -11,6 +11,7 @@ mstar.communication.communicator
    
       EXPECTED_MSTAR_RUST_VERSION
       DEPLOYMENT_ANCHOR_ENTITY
+      DEPLOYMENT_LOCK_ENTITIES
    
    
 

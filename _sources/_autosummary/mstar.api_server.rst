@@ -38,4 +38,5 @@
    rust_frontend
    served_models
    streaming_response
+   ws_frames
 

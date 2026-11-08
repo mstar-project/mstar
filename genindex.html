@@ -580,6 +580,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.ws_frames.html">mstar.api_server.ws_frames</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1752,6 +1753,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.begin_suppress_tokens">begin_suppress_tokens (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.OutboxCommunicator.BEHIND_WARN_S">BEHIND_WARN_S (mstar.communication.communicator.OutboxCommunicator attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.model.waypoint.components.layers.html#mstar.model.waypoint.components.layers.bf16_roundtrip">bf16_roundtrip() (in module mstar.model.waypoint.components.layers)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.Resource.bind_dependencies">bind_dependencies() (mstar.engine.resources.base.Resource method)</a>
@@ -1814,14 +1817,14 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.command_a_plus.config.html#mstar.model.command_a_plus.config.CommandAPlusTextConfig.bos_token_id">bos_token_id (mstar.model.command_a_plus.config.CommandAPlusTextConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.html#mstar.engine.resources.kv.bounded.BoundedKVConfig">BoundedKVConfig (class in mstar.engine.resources.kv.bounded)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.kv.bounded.config.html#mstar.engine.resources.kv.bounded.config.BoundedKVConfig">(class in mstar.engine.resources.kv.bounded.config)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager">BoundedKVManager (class in mstar.engine.resources.kv.bounded.manager)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.html#mstar.engine.resources.kv.bounded.BoundedKVSpec">BoundedKVSpec (class in mstar.engine.resources.kv.bounded)</a>
@@ -2367,6 +2370,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.engine.chunking.html#mstar.engine.chunking.ChunkRange">ChunkRange (class in mstar.engine.chunking)</a>
 </li>
       <li><a href="_autosummary/mstar.worker.stream_buffers.html#mstar.worker.stream_buffers.StreamBufferManager.chunks_for">chunks_for() (mstar.worker.stream_buffers.StreamBufferManager method)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.ws_frames.html#mstar.api_server.ws_frames.SavedUpload.claim">claim() (mstar.api_server.ws_frames.SavedUpload method)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.claim_cores">claim_cores() (in module mstar.utils.cpus)</a>
 </li>
@@ -3282,6 +3287,8 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.DEPLOYMENT_ANCHOR_ENTITY">DEPLOYMENT_ANCHOR_ENTITY (in module mstar.communication.communicator)</a>
 </li>
+      <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.DEPLOYMENT_LOCK_ENTITIES">DEPLOYMENT_LOCK_ENTITIES (in module mstar.communication.communicator)</a>
+</li>
       <li><a href="_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.deployment_plan">deployment_plan() (in module mstar.utils.cpus)</a>
 </li>
       <li><a href="_autosummary/mstar.conductor.workers.html#mstar.conductor.workers.deployment_workers">deployment_workers() (in module mstar.conductor.workers)</a>
@@ -3877,6 +3884,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestFailed.error_message">error_message (mstar.api_server.request_types.RequestFailed attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.FailRequests.errors">errors (mstar.utils.ipc_format.FailRequests attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.streaming_response.html#mstar.api_server.streaming_response.errors_in_band">errors_in_band() (in module mstar.api_server.streaming_response)</a>
 </li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.S3GenConfig.estimator">estimator (mstar.model.chatterbox.config.S3GenConfig attribute)</a>
 </li>
@@ -7416,6 +7425,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.api_server.streaming_response.html#module-mstar.api_server.streaming_response">mstar.api_server.streaming_response</a>
 </li>
+        <li><a href="_autosummary/mstar.api_server.ws_frames.html#module-mstar.api_server.ws_frames">mstar.api_server.ws_frames</a>
+</li>
         <li><a href="_autosummary/mstar.communication.html#module-mstar.communication">mstar.communication</a>
 </li>
         <li><a href="_autosummary/mstar.communication.arena.html#module-mstar.communication.arena">mstar.communication.arena</a>
@@ -8098,6 +8109,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.api_server.streaming_response.html#module-mstar.api_server.streaming_response">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.api_server.ws_frames
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.ws_frames.html#module-mstar.api_server.ws_frames">module</a>
 </li>
       </ul></li>
       <li>
@@ -11037,9 +11055,11 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.prefix_index.html#mstar.engine.resources.kv.prefix_index.PrefixIndex.parent_key">parent_key() (mstar.engine.resources.kv.prefix_index.PrefixIndex method)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.LoraFile.parse">parse() (mstar.engine.resources.lora.checkpoint.LoraFile class method)</a>
+      <li><a href="_autosummary/mstar.api_server.ws_frames.html#mstar.api_server.ws_frames.parse">parse() (in module mstar.api_server.ws_frames)</a>
 
       <ul>
+        <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.LoraFile.parse">(mstar.engine.resources.lora.checkpoint.LoraFile class method)</a>
+</li>
         <li><a href="_autosummary/mstar.model.audio_watermark.html#mstar.model.audio_watermark.AudioWatermarkConfig.parse">(mstar.model.audio_watermark.AudioWatermarkConfig class method)</a>
 </li>
       </ul></li>
@@ -11048,6 +11068,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.parse_cpu_list">parse_cpu_list() (in module mstar.utils.cpus)</a>
 </li>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.config.html#mstar.model.omnilingual_asr.config.parse_dtype">parse_dtype() (in module mstar.model.omnilingual_asr.config)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.ws_frames.html#mstar.api_server.ws_frames.parse_frame">parse_frame() (in module mstar.api_server.ws_frames)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.parse_lora_key">parse_lora_key() (in module mstar.engine.resources.lora.checkpoint)</a>
 </li>
@@ -13545,7 +13567,11 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_data_url">save_data_url() (in module mstar.api_server.media_io)</a>
 </li>
+      <li><a href="_autosummary/mstar.api_server.ws_frames.html#mstar.api_server.ws_frames.save_entry">save_entry() (in module mstar.api_server.ws_frames)</a>
+</li>
       <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.save_remote_url">save_remote_url() (in module mstar.api_server.media_io)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.ws_frames.html#mstar.api_server.ws_frames.SavedUpload">SavedUpload (class in mstar.api_server.ws_frames)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.LoraFile.scale">scale (mstar.engine.resources.lora.checkpoint.LoraFile attribute)</a>
 
@@ -14493,9 +14519,11 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.worker.scheduled_batch.html#mstar.worker.scheduled_batch.MidPrefillRow.start">(mstar.worker.scheduled_batch.MidPrefillRow attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.conductor.mps.html#mstar.conductor.mps.MpsDaemon.start">start() (mstar.conductor.mps.MpsDaemon method)</a>
+      <li><a href="_autosummary/mstar.api_server.ws_frames.html#mstar.api_server.ws_frames.start">start() (in module mstar.api_server.ws_frames)</a>
 
       <ul>
+        <li><a href="_autosummary/mstar.conductor.mps.html#mstar.conductor.mps.MpsDaemon.start">(mstar.conductor.mps.MpsDaemon method)</a>
+</li>
         <li><a href="_autosummary/mstar.model.nemotron_duplex.realtime_api.html#mstar.model.nemotron_duplex.realtime_api.RealtimeConnection.start">(mstar.model.nemotron_duplex.realtime_api.RealtimeConnection method)</a>
 </li>
         <li><a href="_autosummary/mstar.utils.threads.html#mstar.utils.threads.Thread.start">(mstar.utils.threads.Thread method)</a>
@@ -14629,9 +14657,11 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.MediaSpan.stop">(mstar.model.multimodal.MediaSpan attribute)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.RustFrontendBridge.stop">stop() (mstar.api_server.rust_frontend.RustFrontendBridge method)</a>
+      <li><a href="_autosummary/mstar.api_server.ws_frames.html#mstar.api_server.ws_frames.stop">stop() (in module mstar.api_server.ws_frames)</a>
 
       <ul>
+        <li><a href="_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.RustFrontendBridge.stop">(mstar.api_server.rust_frontend.RustFrontendBridge method)</a>
+</li>
         <li><a href="_autosummary/mstar.conductor.mps.html#mstar.conductor.mps.MpsDaemon.stop">(mstar.conductor.mps.MpsDaemon method)</a>
 </li>
       </ul></li>

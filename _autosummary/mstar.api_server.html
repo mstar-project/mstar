@@ -223,6 +223,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.api_server.ws_frames.html">mstar.api_server.ws_frames</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -728,7 +729,10 @@
 <td><p>The Rust axum frontend in front of <code class="docutils literal notranslate"><span class="pre">APIServer</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.api_server.streaming_response.html#module-mstar.api_server.streaming_response" title="mstar.api_server.streaming_response"><code class="xref py py-obj docutils literal notranslate"><span class="pre">streaming_response</span></code></a></p></td>
-<td><p>A streaming response that cleans up after a body Starlette never started.</p></td>
+<td><p>Streaming-response helpers: a response that cleans up after a body Starlette never started, and a body that reports a mid-stream error in band.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.api_server.ws_frames.html#module-mstar.api_server.ws_frames" title="mstar.api_server.ws_frames"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ws_frames</span></code></a></p></td>
+<td><p>Parsing large <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> frames without holding the event loop.</p></td>
 </tr>
 </tbody>
 </table>

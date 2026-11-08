@@ -227,6 +227,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.api_server.ws_frames.html">mstar.api_server.ws_frames</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -848,7 +849,13 @@ was accepted ends with one such reply. Both carry the HTTP <code class="docutils
 send the next observation before the current action chunk has returned — and the
 <code class="docutils literal notranslate"><span class="pre">request_id</span></code> tells the replies apart. Pipelined messages are submitted in the order
 they were sent, so of two under one <code class="docutils literal notranslate"><span class="pre">request_id</span></code> it is the later one that gets the
-<code class="docutils literal notranslate"><span class="pre">409</span></code> while the earlier one runs; their replies may interleave. Closing the socket aborts whatever is still in flight.</p>
+<code class="docutils literal notranslate"><span class="pre">409</span></code> while the earlier one runs; their replies may interleave. Closing the socket aborts whatever is still in flight.
+A JSON message over 1 MiB, or a msgpack one over 32 MiB, is parsed and its files decoded
+and saved in a separate process rather than on the server’s event loop. Taking the message
+in still runs on the loop, and every other request on the server waits for it: about
+2 ms per MiB as JSON and 1 as msgpack, and with deflate on about 9 and 2. Text and
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> come back through the loop, so only <code class="docutils literal notranslate"><span class="pre">files</span></code> should be large. A
+deployment taking large messages should turn <code class="docutils literal notranslate"><span class="pre">ws_per_message_deflate</span></code> off.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">msgpack</span><span class="o">,</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span><span class="o">,</span><span class="w"> </span><span class="nn">websockets.sync.client</span>
 
 <span class="k">with</span> <span class="n">websockets</span><span class="o">.</span><span class="n">sync</span><span class="o">.</span><span class="n">client</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="s2">"ws://localhost:8000/generate/ws"</span><span class="p">,</span> <span class="n">max_size</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="k">as</span> <span class="n">ws</span><span class="p">:</span>
@@ -973,9 +980,10 @@ takes only <code class="docutils literal notranslate"><span class="pre">Bearer</
 handshake and has no <code class="docutils literal notranslate"><span class="pre">/healthz</span></code>. Only the Python frontend serves this route;
 <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> logs a warning and serves without it.</p>
 <p><code class="docutils literal notranslate"><span class="pre">openpi_client</span></code> sets no size limit on its messages, but the server does:
-<code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code> (16 MiB by default, see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). A larger observation closes
-the socket with <code class="docutils literal notranslate"><span class="pre">1009</span></code> and no error frame, so a deployment whose robots send several
-raw high-resolution cameras raises it.</p>
+<code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code> (by default <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_BODY_MB</span></code>, see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). A larger
+observation closes the socket with <code class="docutils literal notranslate"><span class="pre">1009</span></code> and no error frame, so a deployment whose robots
+send several raw high-resolution cameras raises it. An observation is parsed on the server’s
+event loop, so a very large one holds up the server’s other requests while it is parsed.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">openpi_client</span><span class="w"> </span><span class="kn">import</span> <span class="n">websocket_client_policy</span>
 
 <span class="n">policy</span> <span class="o">=</span> <span class="n">websocket_client_policy</span><span class="o">.</span><span class="n">WebsocketClientPolicy</span><span class="p">(</span><span class="s2">"localhost"</span><span class="p">,</span> <span class="mi">8000</span><span class="p">)</span>

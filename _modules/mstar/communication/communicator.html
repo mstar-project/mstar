@@ -580,6 +580,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.api_server.ws_frames.html">mstar.api_server.ws_frames</a></li>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
@@ -1004,6 +1005,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">fcntl</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
@@ -1024,6 +1026,12 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">#: ARE the same deployment as far as anything keyed off it is concerned --</span>
 <span class="c1">#: notably the tensor-file namespace in ``mstar.communication.tensors``.</span>
 <span class="n">DEPLOYMENT_ANCHOR_ENTITY</span> <span class="o">=</span> <span class="s2">"conductor"</span>
+
+<span class="c1">#: The entities that lock the deployment's IPC prefix when they bind: the</span>
+<span class="c1">#: anchor, and the first one the API-server process binds, so a second</span>
+<span class="c1">#: ``mstar serve`` on the prefix is refused before it takes over the first</span>
+<span class="c1">#: deployment's API-server sockets (its conductor starts later).</span>
+<span class="n">DEPLOYMENT_LOCK_ENTITIES</span> <span class="o">=</span> <span class="p">(</span><span class="n">DEPLOYMENT_ANCHOR_ENTITY</span><span class="p">,</span> <span class="s2">"api_server_preprocess_worker"</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="CommProtocol">
@@ -1098,8 +1106,9 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Claim this deployment, so a second one on the same IPC prefix fails</span>
 <span class="sd">        here instead of corrupting the first.</span>
 
-<span class="sd">        Only the anchor entity locks, and only over IPC. TCP needs no lock: two</span>
-<span class="sd">        deployments sharing a base port collide on ``bind`` already. IPC does</span>
+<span class="sd">        Only ``DEPLOYMENT_LOCK_ENTITIES`` lock, each on its own file, and only</span>
+<span class="sd">        over IPC. TCP needs no lock: two deployments sharing a base port</span>
+<span class="sd">        collide on ``bind`` already. IPC does</span>
 <span class="sd">        not -- libzmq UNLINKS an existing socket file and binds a fresh one, so</span>
 <span class="sd">        the second conductor comes up, silently steals every connection aimed</span>
 <span class="sd">        at the first, and derives the same tensor-file namespace (uuids are</span>
@@ -1111,7 +1120,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        exits, so a crashed deployment leaves nothing to clean up; the fd is</span>
 <span class="sd">        kept on the instance purely so it outlives this call.</span>
 <span class="sd">        """</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">!=</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span> <span class="ow">or</span> <span class="n">my_id</span> <span class="o">!=</span> <span class="n">DEPLOYMENT_ANCHOR_ENTITY</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">protocol</span> <span class="o">!=</span> <span class="n">CommProtocol</span><span class="o">.</span><span class="n">IPC</span> <span class="ow">or</span> <span class="n">my_id</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">DEPLOYMENT_LOCK_ENTITIES</span><span class="p">:</span>
             <span class="k">return</span>
         <span class="n">path</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_endpoint</span><span class="p">(</span><span class="n">my_id</span><span class="p">)</span><span class="o">.</span><span class="n">removeprefix</span><span class="p">(</span><span class="s2">"ipc://"</span><span class="p">)</span> <span class="o">+</span> <span class="s2">".lock"</span>
         <span class="n">fd</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">O_CREAT</span> <span class="o">|</span> <span class="n">os</span><span class="o">.</span><span class="n">O_RDWR</span><span class="p">,</span> <span class="mo">0o644</span><span class="p">)</span>
@@ -1154,13 +1163,15 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="make_communicator">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.make_communicator">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">make_communicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="n">nonblocking_send</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BaseCommunicator</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">make_communicator</span><span class="p">(</span>
+    <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="n">nonblocking_send</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"BaseCommunicator | OutboxCommunicator"</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Construct the process's communicator: ``RustZMQCommunicator``, on the</span>
 <span class="sd">    vendored ``rust/`` extension (see ``communication/rust_communicator.py``).</span>
 
 <span class="sd">    Raises when the extension is missing or is not the version this tree</span>
-<span class="sd">    expects. ``nonblocking_send`` is for a communicator ``OutboxCommunicator``</span>
-<span class="sd">    wraps, which needs ``try_send_bytes``: an extension built before</span>
+<span class="sd">    expects. ``nonblocking_send`` wraps it in an ``OutboxCommunicator``, which</span>
+<span class="sd">    needs ``try_send_bytes``: an extension built before</span>
 <span class="sd">    ``ZmqCommunicator.try_send`` is refused for it.</span>
 <span class="sd">    """</span>
     <span class="k">try</span><span class="p">:</span>
@@ -1190,10 +1201,11 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="n">nonblocking_send</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">mstar_rust</span><span class="o">.</span><span class="n">ZmqCommunicator</span><span class="p">,</span> <span class="s2">"try_send"</span><span class="p">):</span>
         <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
             <span class="sa">f</span><span class="s2">"mstar_rust </span><span class="si">{</span><span class="n">version</span><span class="si">}</span><span class="s2"> predates ZmqCommunicator.try_send, which the "</span>
-            <span class="s2">"API server's preprocess thread sends with: rebuild it with "</span>
+            <span class="s2">"conductor and the API server's preprocess thread send with: rebuild it with "</span>
             <span class="s2">"`maturin develop --release -m rust/Cargo.toml`"</span>
         <span class="p">)</span>
-    <span class="k">return</span> <span class="n">RustZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+    <span class="n">communicator</span> <span class="o">=</span> <span class="n">RustZMQCommunicator</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">OutboxCommunicator</span><span class="p">(</span><span class="n">communicator</span><span class="p">)</span> <span class="k">if</span> <span class="n">nonblocking_send</span> <span class="k">else</span> <span class="n">communicator</span></div>
 
 
 
@@ -1204,16 +1216,22 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    (at its high-water mark) is queued, in order behind any earlier one to the</span>
 <span class="sd">    same peer, and retried by ``flush``.</span>
 
-<span class="sd">    For a loop that peers block on while it sends to them (the API server's</span>
-<span class="sd">    preprocess thread, against the conductor and the workers): if it blocked on</span>
+<span class="sd">    For a loop that peers block on while it sends to them (the conductor</span>
+<span class="sd">    against the workers, and the API server's preprocess thread against the</span>
+<span class="sd">    conductor and the workers): if it blocked on</span>
 <span class="sd">    a full peer it would stop reading the input that peer waits to deliver, and</span>
 <span class="sd">    the two would wait on each other for good. Everything else is the wrapped</span>
 <span class="sd">    communicator's.</span>
 <span class="sd">    """</span>
 
+    <span class="c1">#: How often a peer that stays behind is reported.</span>
+    <span class="n">BEHIND_WARN_S</span> <span class="o">=</span> <span class="mf">10.0</span>
+
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">inner</span><span class="p">:</span> <span class="n">BaseCommunicator</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_inner</span> <span class="o">=</span> <span class="n">inner</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_outbox</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">collections</span><span class="o">.</span><span class="n">deque</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="c1"># peer -&gt; (when its backlog started, when it was last reported)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_behind</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
 
 <div class="viewcode-block" id="OutboxCommunicator.send">
 <a class="viewcode-back" href="../../../_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.OutboxCommunicator.send">[docs]</a>
@@ -1242,7 +1260,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">        A queued message whose send fails outright (not just a full peer) is</span>
 <span class="sd">        dropped and logged: there is no caller left to raise to, and keeping</span>
-<span class="sd">        it would stop every message behind it."""</span>
+<span class="sd">        it would stop every message behind it. Nothing bounds the queue, since</span>
+<span class="sd">        blocking or dropping would hang the requests behind it, so a peer that</span>
+<span class="sd">        stays behind is logged with its depth every ``BEHIND_WARN_S``."""</span>
+        <span class="n">now</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">monotonic</span><span class="p">()</span>
         <span class="k">for</span> <span class="n">entity_id</span><span class="p">,</span> <span class="n">backlog</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_outbox</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
             <span class="k">while</span> <span class="n">backlog</span><span class="p">:</span>
                 <span class="k">try</span><span class="p">:</span>
@@ -1251,6 +1272,16 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>  <span class="c1"># noqa: BLE001 — that message's failure alone</span>
                     <span class="n">logger</span><span class="o">.</span><span class="n">exception</span><span class="p">(</span><span class="s2">"Dropping a queued message to </span><span class="si">%s</span><span class="s2"> that failed to send"</span><span class="p">,</span> <span class="n">entity_id</span><span class="p">)</span>
                 <span class="n">backlog</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">backlog</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_behind</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">entity_id</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+                <span class="k">continue</span>
+            <span class="n">since</span><span class="p">,</span> <span class="n">reported</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_behind</span><span class="o">.</span><span class="n">setdefault</span><span class="p">(</span><span class="n">entity_id</span><span class="p">,</span> <span class="p">(</span><span class="n">now</span><span class="p">,</span> <span class="n">now</span><span class="p">))</span>
+            <span class="k">if</span> <span class="n">now</span> <span class="o">-</span> <span class="n">reported</span> <span class="o">&gt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">BEHIND_WARN_S</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_behind</span><span class="p">[</span><span class="n">entity_id</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">since</span><span class="p">,</span> <span class="n">now</span><span class="p">)</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                    <span class="s2">"</span><span class="si">%s</span><span class="s2"> has taken less than it was sent for </span><span class="si">%.0f</span><span class="s2"> s: </span><span class="si">%d</span><span class="s2"> messages queued for it"</span><span class="p">,</span>
+                    <span class="n">entity_id</span><span class="p">,</span> <span class="n">now</span> <span class="o">-</span> <span class="n">since</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">backlog</span><span class="p">),</span>
+                <span class="p">)</span>
         <span class="k">return</span> <span class="nb">any</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_outbox</span><span class="o">.</span><span class="n">values</span><span class="p">())</span></div>
 
 
