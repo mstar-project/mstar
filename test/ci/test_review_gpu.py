@@ -1,7 +1,9 @@
 """Check the approval rule in .github/review/gpu_review.py, which decides whether the review bot approves."""
 
 import argparse
+import base64
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -322,30 +324,44 @@ class TestEras(unittest.TestCase):
             GPU["terminate"]("eras:i-1", e)
         self.assertEqual(GPU["ledger"](), {}, "the watchdog would retry a released instance forever")
 
-    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview"):
+    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", swept=False):
         """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview (or the
         create, `refused_by`) refuses those `held` (as the spec has it), as when another box took them in
-        between; the calls it made."""
+        between; the calls it made. With `swept`, the organization has the launch's ssh key already, and
+        another session's sweep deletes it between the lookup and the create."""
         key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
         key.write_text("ssh-ed25519 AAAA test")
+        digest = hashlib.sha256(base64.b64decode("AAAA")).digest()
+        fingerprint = "SHA256:" + base64.b64encode(digest).decode().rstrip("=")
+        keys = [{"id": "k0", "name": "live-pr-1-old", "fingerprint": fingerprint}] if swept else []
         tpl = {"endpoints": {"ssh": {"port": 22}}, "pod": {"containers": [
             {"resources": {"limits": {"nvidia.com/gpu": "1"}}, "volumeMounts": []}], "volumes": []}}
 
         def eras(method, path, body=None, params=None):
-            calls.append((method, path, body))
+            calls.append((method, path, json.loads(json.dumps(body))))  # as sent, not as changed later
             bound = method == "POST" and path.startswith("/instances") and \
                 (body["run"]["bindings"]["volumes"].get("cache") or {}).get("volume_id") in held
             if path == "/instances" and bound and refused_by == "create":
                 raise GPU["ApiError"](409, {"code": "volume_bound", "message": "Another instance binds the volume.",
                                             "timestamp": "2026-11-08T00:00:00Z"})
+            if path == "/ssh-keys":
+                if method == "POST":
+                    keys.append({"id": f"k{len(calls)}", "name": body["name"], "fingerprint": fingerprint})
+                return keys[-1] if method == "POST" else {"items": keys}
+            if path == "/instances" and method == "POST" and not {k["id"] for k in keys} >= set(
+                    body["run"]["bindings"]["secrets"]["authorized-keys"]["ssh_key_ids"]):
+                raise GPU["ApiError"](404, {"code": "not_found", "message": "No such SSH key.",
+                                            "timestamp": "2026-11-08T00:00:00Z"})
             if path == "/instances/preview":
+                if swept:
+                    keys.clear()
                 bound = bound and refused_by == "preview"
                 return {"run": {"problems": []}, "is_available": not bound,
                         "unavailable_reason": "volume_bound" if bound else None,
                         "unavailable_detail": "Another instance binds the volume." if bound else None,
                         "available_until": None, "quote": {"line_items": []}}
             replies = {"/instances": {"id": "i-1"}, "/volumes/v1": {"attachment": None},
-                       "/volumes/v2": {"attachment": None}, "/ssh-keys": {"id": "k1"}}
+                       "/volumes/v2": {"attachment": None}}
             return replies.get(path, tpl)
 
         saved = {k: GPU["cmd_launch"].__globals__[k] for k in ("eras", "find_offer", "STATE", "LEDGER")}
@@ -384,6 +400,14 @@ class TestEras(unittest.TestCase):
         self.assertEqual(len(set(first)), 3, "Eras refuses a key reused with another body (idempotency_key_reused), "
                                              "so the next volume or a cold box would never launch")
         self.assertEqual(keys(), first, "a rerun of the same launch would buy a second instance, not get the first")
+
+    def test_a_launch_whose_ssh_key_was_swept_registers_it_again(self):
+        calls = self.eras_launch(swept=True, held=())
+        bound = [c[2]["run"]["bindings"]["secrets"]["authorized-keys"]["ssh_key_ids"] for c in calls
+                 if c[:2] == ("POST", "/instances")]
+        self.assertEqual([ids == ["k0"] for ids in bound], [True, False],
+                         "a launch reusing a key another session swept mid-launch would fail")
+        self.assertNotIn("exit", [c[0] for c in calls])
 
     def test_a_launch_past_the_caps_registers_nothing(self):
         calls = self.eras_launch(max_running=0)

@@ -549,7 +549,7 @@ def cmd_launch(args, cfg):
             elif o["provider"] == "eras":
                 for i, vid in enumerate(candidates):
                     try:
-                        iid = eras_create(eras_body(vid) if i else body)
+                        iid = eras_create(eras_body(vid) if i else body, pubkey)
                         break
                     except ApiError as err:  # another box took the cache volume since: the next free one, then cold
                         if not volume_refused(err) or vid is None:
@@ -691,10 +691,12 @@ def volume_refused(err: ApiError) -> bool:
     return err.code() in VOLUME_HELD
 
 
-def eras_create(body: dict) -> str:
+def eras_create(body: dict, pubkey: str) -> str:
     """Preview, accept the quoted prices, create; the instance id. Eras refuses an idempotency key
     reused with another request, so each attempt (listing, cache volume, ssh key) has its own, and
-    the same attempt sent again, after a timeout or by a rerun with the same --tag, keeps it."""
+    the same attempt sent again, after a timeout or by a rerun with the same --tag, keeps it. The
+    ssh key the body binds may be one an earlier launch registered, which another session's sweep
+    can delete before the create: then the key is registered again, under this launch's name, once."""
     import hashlib
     preview = eras("POST", "/instances/preview", body)
     problems = (preview.get("run") or {}).get("problems") or []
@@ -707,13 +709,20 @@ def eras_create(body: dict) -> str:
         raise ApiError(409, f"capacity: {detail or reason}")
     for w in (preview.get("run") or {}).get("warnings") or []:
         print(f"gpu.py: eras preview: {w.get('message')}", file=sys.stderr)
-    binds = body["run"]["bindings"]
-    attempt = json.dumps([body["listing_id"], (binds["volumes"].get("cache") or {}).get("volume_id"),
-                          binds["secrets"]["authorized-keys"]["ssh_key_ids"]])
     body = dict(body, accepted_prices={i["usage_type"]: i["unit_price"] for i in preview["quote"]["line_items"]},
-                accepted_available_until=preview.get("available_until"),
-                idempotency_key=f"{body['name']}-{hashlib.sha256(attempt.encode()).hexdigest()[:8]}")
-    return eras("POST", "/instances", body)["id"]
+                accepted_available_until=preview.get("available_until"))
+    binds = body["run"]["bindings"]
+    keys = binds["secrets"]["authorized-keys"]["ssh_key_ids"]
+    for again in (False, True):
+        attempt = json.dumps([body["listing_id"], (binds["volumes"].get("cache") or {}).get("volume_id"), keys])
+        body["idempotency_key"] = f"{body['name']}-{hashlib.sha256(attempt.encode()).hexdigest()[:8]}"
+        try:
+            return eras("POST", "/instances", body)["id"]
+        except ApiError as err:  # a key gone since the lookup: not found or not valid, by the spec's codes
+            if again or err.status not in (404, 422) or (key := eras_ssh_key_id(pubkey, body["name"])) in keys:
+                raise
+            print(f"gpu.py: ssh key {keys[0]} was deleted mid-launch; registered it again as {key}", file=sys.stderr)
+            keys[:] = [key]
 
 
 def hf_home(cfg, provider, region) -> str:
