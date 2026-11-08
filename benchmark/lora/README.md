@@ -245,11 +245,11 @@ Qwen3.5 keys no prefix-cache stream, so no adapter has a prefix-cache root in th
 That a reload of the same weights keeps its root, and of other weights does not, is the
 CPU test `test_a_runtime_load_and_unload_end_to_end` in `test/modular/test_lora_api.py`.
 
-Under TP (two GPUs; after section 4 passes), once per `MSTAR_TP_ASYNC_SCHED` setting:
+Under TP (two GPUs; after section 4 passes), on the serial protocol (`--async-sched 1`, the
+async TP scheduler, is refused with LoRA until #1082 lands):
 
 ```
 python -m benchmark.lora.runtime_load --model qwen3_5_0.8b --out ~/lora_parity --tp 2 --async-sched 0
-python -m benchmark.lora.runtime_load --model qwen3_5_0.8b --out ~/lora_parity --tp 2 --async-sched 1
 ```
 
 Loads and unloads reach each rank of the instance on its own, at whatever step it is on;
