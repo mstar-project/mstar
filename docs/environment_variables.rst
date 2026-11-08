@@ -722,7 +722,10 @@ Worker scheduling
        one. Only for a node that reads its tokens back on the device
        (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
        rank: above one, where admission doesn't decide, the masters grow and
-       the scatter runs after the replay, as with ``0``.
+       the scatter runs after the replay, as with ``0``. Loop-back state
+       masters (a drafter's carry, Whisper's timestamp rule) are allocated
+       once too.
+       A drafter with a carry is refused at startup where the masters grow.
    * - ``MSTAR_SAMPLER_SLOTS``
      - config's ``knobs: sampler_slots``, else ``4096``
      - Request rows of the sampler masters a captured graph indexes when
