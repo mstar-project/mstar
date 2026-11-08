@@ -167,7 +167,7 @@ CHAT = {
     "modalities": ["text", "audio"], "audio": {"voice": "Ethan"},
     "repetition_penalty": 1.05, "top_k": 20,
     "chat_template_kwargs": {"enable_thinking": False},
-    "tools": [], "tool_choice": "auto",
+    "tools": [], "tool_choice": "auto", "logprobs": False,
 }
 
 # ChatCompletionRequest's declared fields; the rest is model_extra.
@@ -286,6 +286,8 @@ PARITY_CASES = {
     "chat": ({"messages": [{"role": "user", "content": "Привет, 世界"}], "max_tokens": 8}, False),
     "chat-stream": ({"messages": [{"role": "user", "content": "안녕"}], "stream": True}, True),
     "tool-call": ({"messages": [{"role": "user", "content": "hi"}], "tool_choice": "required"}, False),
+    "json-mode": ({"messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_object"}},
+                  False),
     "bad-role": ({"messages": [{"role": "tool", "content": "42"}]}, False),
 }
 

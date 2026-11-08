@@ -179,11 +179,15 @@ def _forward_sent_speed(req, mk: dict) -> None:
         mk.setdefault("speed", req.speed)
 
 
-def _refuse_unserved_chat(req) -> None:
-    """Refuse a chat that asks for more than one choice, stop sequences, or a tool call.
+def _refuse_unserved_chat(req, mk: dict) -> None:
+    """Refuse a chat that asks for more than one plain reply: more choices, stop
+    sequences, log probs, sampling penalties, a response format, or a tool call.
+    ``mk`` is the request's :func:`_passthrough`; an off value of one of these
+    fields (``logprobs: false``) is dropped from it.
 
-    No chat adapter here returns more than one choice or ends a reply at a stop
-    string, so either one dropped answers a different request with a 200.
+    Every chat adapter here returns one choice, ended at a stop token or
+    max_tokens, as plain sampled text, so any of these dropped answers a
+    different request with a 200.
     No adapter parses a tool call out of a reply, so a client sent plain
     text takes it for the model declining every tool. An empty ``tools`` and a
     ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
@@ -195,12 +199,19 @@ def _refuse_unserved_chat(req) -> None:
         raise ValueError(f"n={req.n}: this model returns one choice")
     if req.stop:
         raise ValueError("stop sequences are not supported; the reply ends at a stop token or max_tokens")
-    extra = req.model_extra or {}
-    choice = extra.get("tool_choice")
-    function_call = extra.get("function_call")
+    for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
+                 "stop_token_ids"):
+        if mk.pop(name, None):
+            raise ValueError(f"{name} is not supported")
+    if mk.pop("best_of", None) not in (None, 1):
+        raise ValueError("best_of is not supported; this model returns one choice")
+    if mk.pop("response_format", None) not in (None, {"type": "text"}):
+        raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
+    choice = mk.get("tool_choice")
+    function_call = mk.get("function_call")
     if (
-        (extra.get("tools") not in (None, []) and choice != "none")
-        or (extra.get("functions") not in (None, []) and function_call != "none")
+        (mk.get("tools") not in (None, []) and choice != "none")
+        or (mk.get("functions") not in (None, []) and function_call != "none")
         or choice == "required"
         or isinstance(choice, dict)
         or function_call not in (None, "none", "auto")
@@ -395,9 +406,9 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_unserved_chat(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         _apply_sampling(req, mk)
         return SubmitArgs(
             text=text,
@@ -457,9 +468,9 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_unserved_chat(req)
-        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         # Speech output also emits text, so request both modalities when audio is asked for.
         want_audio = bool(req.modalities and "audio" in req.modalities)
         out_mods = ["text", "audio"] if want_audio else ["text"]
@@ -516,8 +527,8 @@ class Qwen3_5Adapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_unserved_chat(req)
         mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
         _template_enable_thinking(mk)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         _apply_sampling(req, mk)
@@ -1073,8 +1084,8 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_unserved_chat(req)
         mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
         _apply_sampling(req, mk)
         # Read before the attachments are saved, since a malformed value refuses the request.
         _template_enable_thinking(mk)
@@ -1574,7 +1585,8 @@ class TextChatAdapter(OpenAIAdapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
-        _refuse_unserved_chat(req)
+        mk = _passthrough(req)
+        _refuse_unserved_chat(req, mk)
         text, _, modalities, parts = flatten_messages(req.messages, upload_dir, allow_remote=False)
         # an image or audio part was decoded to disk and then dropped: the model
         # answered as if it had seen it
@@ -1587,17 +1599,6 @@ class TextChatAdapter(OpenAIAdapter):
             value = getattr(req, name, None)
             if value is not None and value < 1:
                 raise ValueError(f"{name} must be at least 1, got {value}")
-        # what the model cannot serve is refused, not dropped: off, a field passes
-        mk = _passthrough(req)
-        for name in ("logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty",
-                     "stop_token_ids"):
-            if mk.get(name):
-                raise ValueError(f"{name} is not supported; got {mk[name]!r}")
-            mk.pop(name, None)
-        if mk.pop("best_of", None) not in (None, 1):
-            raise ValueError("best_of is not supported; this model returns one choice")
-        if mk.pop("response_format", None) not in (None, {"type": "text"}):
-            raise ValueError("response_format needs constrained decoding; only {'type': 'text'} is served")
         _apply_sampling(req, mk)
         # extra_body can override max_tokens with anything; a string reached the
         # conductor's min() and took its whole message batch down

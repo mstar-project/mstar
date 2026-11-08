@@ -377,7 +377,7 @@ impl Adapter {
         allow_remote: bool,
     ) -> Result<SubmitArgs, String> {
         refuse_unserved_chat(req)?;
-        match self {
+        let mut args = match self {
             // BAGEL reads temperature / top_p from its model config; only
             // max_output_tokens and seed are honored.
             Adapter::Bagel => text_chat(req, upload_dir, allow_remote),
@@ -436,7 +436,12 @@ impl Adapter {
             Adapter::Orpheus | Adapter::Cosmos3 | Adapter::Qwen3TTS => {
                 Err("chat is not supported by this model".to_string())
             }
+        }?;
+        // what is left of these is off (`logprobs: false`), and dropped
+        for name in UNSERVED_CHAT_FIELDS.iter().chain(&["best_of", "response_format"]) {
+            args.model_kwargs.remove(*name);
         }
+        Ok(args)
     }
 
     pub fn speech_to_request(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
@@ -734,8 +739,14 @@ pub(crate) fn truthy(v: &Value) -> bool {
     }
 }
 
-/// Refuse a chat that asks for more than one choice, stop sequences, or a
-/// tool call. The rules are `_refuse_unserved_chat` in
+/// Fields no chat adapter serves, refused when on (`best_of` and
+/// `response_format` have their own off values).
+const UNSERVED_CHAT_FIELDS: [&str; 6] =
+    ["logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"];
+
+/// Refuse a chat that asks for more than one plain reply: more choices, stop
+/// sequences, log probs, sampling penalties, a response format, or a tool
+/// call. The rules are `_refuse_unserved_chat` in
 /// `api_server/openai/adapters.py`.
 fn refuse_unserved_chat(req: &ChatCompletionRequest) -> Result<(), String> {
     if let Some(n) = req.n.filter(|&n| n != 1) {
@@ -745,6 +756,22 @@ fn refuse_unserved_chat(req: &ChatCompletionRequest) -> Result<(), String> {
         return Err(
             "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
         );
+    }
+    if let Some(name) = UNSERVED_CHAT_FIELDS.iter().find(|&&f| req.extra.get(f).is_some_and(truthy)) {
+        return Err(format!("{name} is not supported"));
+    }
+    // Python's `not in (None, 1)`, where 1.0 and True equal 1
+    if let Some(v) = req.extra.get("best_of") {
+        if !(v.is_null() || v.as_f64() == Some(1.0) || *v == Value::Bool(true)) {
+            return Err("best_of is not supported; this model returns one choice".to_string());
+        }
+    }
+    if let Some(v) = req.extra.get("response_format") {
+        if !(v.is_null() || *v == serde_json::json!({"type": "text"})) {
+            return Err(
+                "response_format needs constrained decoding; only {'type': 'text'} is served".to_string(),
+            );
+        }
     }
     let listed = |field: &str| match req.extra.get(field) {
         None | Some(Value::Null) => false,
@@ -1031,11 +1058,15 @@ mod tests {
     }
 
     #[test]
-    fn a_chat_asking_for_choices_or_stop_strings_is_refused() {
+    fn a_chat_asking_for_more_than_one_plain_reply_is_refused() {
         for (fields, err) in [
             (r#""n":2"#, "n=2: this model returns one choice"),
             (r#""stop":".""#, "stop sequences are not supported"),
             (r#""stop":["END"]"#, "stop sequences are not supported"),
+            (r#""logprobs":true"#, "logprobs is not supported"),
+            (r#""presence_penalty":1.5"#, "presence_penalty is not supported"),
+            (r#""best_of":3"#, "best_of is not supported"),
+            (r#""response_format":{"type":"json_object"}"#, "response_format needs constrained decoding"),
         ] {
             for adapter in CHAT_ADAPTERS {
                 let got = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
@@ -1063,6 +1094,10 @@ mod tests {
             r#""function_call":null"#,
             r#""tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":"none""#,
             r#""functions":[{"name":"get_weather"}],"function_call":"none""#,
+            r#""logprobs":false"#,
+            r#""presence_penalty":0"#,
+            r#""best_of":1"#,
+            r#""response_format":{"type":"text"}"#,
         ] {
             for adapter in CHAT_ADAPTERS {
                 let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);

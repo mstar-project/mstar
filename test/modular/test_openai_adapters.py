@@ -242,11 +242,16 @@ def test_a_chat_that_asks_for_a_tool_call_is_refused(tmp_path, adapter, fields):
 
 
 @pytest.mark.parametrize("adapter", _CHAT_ADAPTERS, ids=lambda a: a.__name__)
-@pytest.mark.parametrize("fields", [{"n": 2}, {"stop": "."}, {"stop": ["END"]}], ids=str)
-def test_a_chat_asking_for_choices_or_stop_strings_is_refused(tmp_path, adapter, fields):
-    """Every chat adapter returns one choice and has no stop strings; dropping them was a 200."""
+@pytest.mark.parametrize(("fields", "error"), [
+    ({"n": 2}, "n=2"), ({"stop": "."}, "stop sequences"), ({"stop": ["END"]}, "stop sequences"),
+    ({"logprobs": True}, "logprobs"), ({"presence_penalty": 1.5}, "presence_penalty"),
+    ({"best_of": 3}, "best_of"), ({"response_format": {"type": "json_object"}}, "response_format"),
+], ids=lambda f: str(f) if isinstance(f, dict) else "")
+def test_a_chat_asking_for_more_than_one_plain_reply_is_refused(tmp_path, adapter, fields, error):
+    """Every chat adapter returns one choice of plain sampled text, ended at a
+    stop token; dropping any of these was a 200."""
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
-    with pytest.raises(ValueError, match="n=2" if "n" in fields else "stop sequences"):
+    with pytest.raises(ValueError, match=f"^{error}"):
         adapter().chat_to_request(req, tmp_path)
 
 
@@ -257,6 +262,7 @@ def test_a_chat_asking_for_choices_or_stop_strings_is_refused(tmp_path, adapter,
     {"functions": []}, {"functions": None}, {"function_call": "none"}, {"function_call": "auto"},
     {"function_call": None},
     {"tools": [_NAMED], "tool_choice": "none"}, {"functions": [_FUNCTION], "function_call": "none"},
+    {"logprobs": False}, {"presence_penalty": 0}, {"best_of": 1}, {"response_format": {"type": "text"}},
 ], ids=lambda f: ",".join(f"{k}={v}" for k, v in f.items()))
 def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields):
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
