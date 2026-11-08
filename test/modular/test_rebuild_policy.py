@@ -28,6 +28,7 @@ from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.engine.resources.step import Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.bagel.bagel_model import BagelModel
+from mstar.model.multimodal import vision_encoder
 from mstar.model.orpheus.orpheus_model import OrpheusModel
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
@@ -338,6 +339,22 @@ def test_a_prompt_that_read_a_pad_id_at_each_image_slot_leaves_its_copies_no_slo
     rebuilds._kept[NODE][R].sampled.append(6)
 
     assert rebuilds.tokens(R, NODE, None) == 11, "the rebuild would write other slots than the prompt's KV holds"
+
+
+def test_a_prompt_whose_ids_cover_neither_its_ids_spans_nor_every_slot_keeps_none():
+    """The host copies were counted as the slots the prompt's ids left, so the rebuild matched the KV whatever the
+    count of ids. A wrong count passed the drop check and failed `prepare_rebuild`'s assert after the drop had freed
+    the pages."""
+    rebuilds = Rebuilds({NODE: MEDIA}, _graphs(), HostPool(1 << 10, torch.device("cpu")), node_dtypes=DTYPES)
+    _ingest(rebuilds, R, IMAGE_CHAT)
+    rows = {R: {"text_inputs": [torch.arange(7)], "embeds": [torch.zeros(6, 2)]}}
+
+    rebuilds.keep_prompts(_ran(VISION, rows))
+
+    assert "keeps no ids" in rebuilds.refusal(R, NODE, DECODE, {}, None), (
+        "a drop would free the pages of a request whose rebuild writes other slots than its KV holds"
+    )
+    assert R not in rebuilds._droppable[NODE], "the request would hold its slice for its life"
 
 
 def _vision_step(rids, walks: dict, **fields) -> SimpleNamespace:
@@ -665,6 +682,31 @@ def test_a_sample_of_more_than_one_id_is_refused(host):
             rebuilds.keep_samples(_batch((R,)), {}, HostRows((R,), {"new_token": codes}))
         else:
             rebuilds.keep_samples(_batch((R,)), {R: {"new_token": [codes[0]]}}, None)
+
+
+def test_a_request_that_samples_a_pad_id_is_never_dropped():
+    """A rebuild row's sampled ids run in the packed media step, where the nth pad reads the nth encoder row. A
+    sampled pad took the row of the next pad in the step, and every row after it read the wrong encoder rows."""
+    model = Qwen3_5DenseModel.__new__(Qwen3_5DenseModel)
+    vars(model).update(
+        config=SimpleNamespace(max_position_embeddings=4096, hidden_size=2),
+        media=(SimpleNamespace(encoder=vision_encoder((90, 91))),),
+    )
+    pads = model.rebuild_policies()[NODE].pad_ids
+    pool = HostPool(1 << 10, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: replace(MEDIA, pad_ids=pads)}, _graphs(), pool, node_dtypes=DTYPES)
+    for rid in (R, A):
+        _ingest(rebuilds, rid, IMAGE_CHAT)
+    rebuilds.keep_prompts(_ran(VISION, {
+        rid: {"text_inputs": [torch.arange(11)], "embeds": [torch.zeros(6, 2)]} for rid in (R, A)
+    }))
+
+    rebuilds.keep_samples(_batch((R, A)), {}, HostRows((R, A), {"new_token": torch.tensor([91, 5])}))
+
+    assert "keeps no ids" in rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None), (
+        "a rebuild row would carry the sampled pad, and the rows after it would read the wrong encoder rows"
+    )
+    assert list(rebuilds._kept[NODE][A].sampled) == [5], "a request that sampled text would stop being droppable"
 
 
 @pytest.mark.parametrize("why, node, walk, sampled, iters", [
