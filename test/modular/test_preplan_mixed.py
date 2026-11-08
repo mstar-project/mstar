@@ -39,6 +39,7 @@ from mstar.engine.resources.step import BucketKey, SlotLease
 from mstar.model.submodule_base import InputSeqLenInfo
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.worker import make_worker
+from mstar.worker.scheduled_batch import ScheduledBatch
 from mstar.worker.worker import Worker
 
 MIXED = "mixed"
@@ -270,11 +271,12 @@ def test_only_a_walk_with_no_batched_capture_is_planned_by_spans():
 
 def test_the_graph_runner_tells_batched_captures_from_packed_ones():
     cg = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
-    ids = lambda n: _Row(n)  # noqa: E731
     cg._capture_configs = [
-        BatchedAcceleratorGraphConfig(capture_graph_walk="decode", single_request_inputs=_Row(1), capture_batch_sizes=[8]),
+        BatchedAcceleratorGraphConfig(
+            capture_graph_walk="decode", single_request_inputs=_Row(1), capture_batch_sizes=[8],
+        ),
         PackedAcceleratorGraphConfig(
-            capture_graph_walk=MIXED, capture_token_lengths=[2048], make_node_input=ids, capture_batch_sizes=[8],
+            capture_graph_walk=MIXED, capture_token_lengths=[2048], make_node_input=_Row, capture_batch_sizes=[8],
         ),
     ]
     assert cg.batched_capture_for("decode") and not cg.batched_capture_for(MIXED)
@@ -432,10 +434,13 @@ def test_the_main_thread_fixes_spans_only_for_a_step_leased_by_tokens():
     worker = make_worker(worker_id=0, device=torch.device("cpu"))
     worker.engine_manager = SimpleNamespace(get_engine=lambda node: engine)
     mixed = _batch({1: "decode", 3: "prefill_text"}, tensors={3: _prompt(514)})
-    Worker._plan_spans(worker, None, SimpleNamespace(node_batch=mixed, continuing_rids={1}))
+    scheduled = ScheduledBatch(node_name="LLM", graph_walk=MIXED, request_walks={1: "decode", 3: "prefill_text"})
+    Worker._plan_spans(worker, None, SimpleNamespace(scheduled_batch=scheduled, node_batch=mixed, continuing_rids={1}))
     assert mixed.planned_spans == (1, 514)
     decode = _batch({1: "decode", 2: "decode"})
-    decode.step_context.graph_walk = "decode"
-    decode.step_context.request_walks = {}
-    Worker._plan_spans(worker, None, SimpleNamespace(node_batch=decode, continuing_rids={1, 2}))
+    # a decode step asks the engine nothing
+    worker.engine_manager = None
+    Worker._plan_spans(worker, None, SimpleNamespace(
+        scheduled_batch=ScheduledBatch(node_name="LLM", graph_walk="decode"), node_batch=decode, continuing_rids={1, 2},
+    ))
     assert decode.planned_spans is None

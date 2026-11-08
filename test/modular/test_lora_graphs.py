@@ -269,7 +269,7 @@ def _engine_with(pool, captured_keys, model_key="cfg"):
 
 def _batch(rids):
     batch = SimpleNamespace(node_name="LLM", slot=0, request_ids=list(rids), inputs=None, cg_key_info=None,
-                            per_request_info_wrapped={}, per_request_input_metadata={},
+                            planned_spans=None, per_request_info_wrapped={}, per_request_input_metadata={},
                             step_context=SimpleNamespace(graph_walk="decode", force_prefill=None))
     batch.lease_slot = lambda lease: setattr(batch, "lease", lease)
     return batch

@@ -1079,6 +1079,10 @@ class Worker:
         planned ahead with, as it was scheduled. Here, on the main thread,
         which built the batch: once the plan thread runs, this thread threads
         N's outputs into the same batch."""
+        scheduled = speculation.scheduled_batch
+        if not (scheduled.request_walks or scheduled.chunk_ranges):
+            # no prompt row: the step is leased by its row count, as decode is
+            return
         batch = speculation.node_batch
         engine = self.engine_manager.get_engine(batch.node_name)
         if engine.plans_by_spans(batch.node_name, batch.graph_walk):
