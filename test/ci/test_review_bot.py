@@ -260,6 +260,24 @@ class TestInterdiff(unittest.TestCase):
         self.assertIn(bot.DROPPED, bot.interdiff(self.REVIEWED + other, self.REVIEWED))
 
 
+class TestDispatcher(unittest.TestCase):
+    def test_a_step_that_exits_still_writes_its_outputs_with_env_as_parameters(self):
+        seen = {}
+
+        def failing(out, pr: int, mode="light"):
+            seen.update(pr=pr, mode=mode)
+            out["reason"] = "a\nb"
+            sys.exit(1)
+
+        output = Path(tempfile.mkdtemp()) / "output"
+        with mock.patch.dict(os.environ, {"PR": "7", "MODE": "", "GITHUB_OUTPUT": str(output)}), \
+                mock.patch.object(sys, "argv", ["bot.py", "failing"]), self.assertRaises(SystemExit):
+            bot.main({"failing": failing})
+        self.assertEqual(seen, {"pr": 7, "mode": "light"})
+        self.assertRegex(output.read_text(), r"^reason<<EOF_\w+\na\nb\nEOF_\w+\n$",
+                         "the steps after a failed one read what it had found from $GITHUB_OUTPUT")
+
+
 COMMENT = "mcp__github_inline_comment__create_inline_comment"
 
 
