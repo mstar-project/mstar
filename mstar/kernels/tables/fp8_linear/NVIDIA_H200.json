@@ -8,7 +8,7 @@
       "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-08", "harness": "python -m benchmark.kernels.sweep fp8_linear --dtype float8_e4m3fn --shape N=4096,K=256,glu=0 --buckets 1,2,4,8,16,24,32,48,64,96,128,192,256,384,512,768,1024", "torch": "2.11.0+cu129", "triton": "3.6.0", "note": "q397, DeepGEMM 2.8.2, tree 342ee818b"},
       "rows": {
         "4": {"impl": "w8a16", "config": {"DOT": false, "BN": 16, "BK": 256, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
-        "16": {"impl": "triton8"},
+        "16": {"impl": "deepgemm"},
         "32": {"impl": "w8a16"},
         "64": {"impl": "w8a16", "config": {"DOT": true, "BN": 16, "BK": 128, "SPLIT": 1, "STAGES": 3, "num_warps": 4}},
         "*": {"impl": "deepgemm"}
@@ -334,7 +334,6 @@
       "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-08", "harness": "python -m benchmark.kernels.sweep fp8_linear --dtype float8_e4m3fn --shape N=17408,K=5120,glu=1 --buckets 1,2,4,8,16,24,32,48,64,96,128,192,256,384,512,768,1024", "torch": "2.11.0+cu129", "triton": "3.6.0", "note": "q27, DeepGEMM 2.8.2, tree 342ee818b"},
       "rows": {
         "1": {"impl": "w8a16", "config": {"DOT": false, "BN": 8, "BK": 512, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
-        "16": {"impl": "triton8"},
         "32": {"impl": "deepgemm"},
         "64": {"impl": "flashinfer"},
         "384": {"impl": "deepgemm"},
@@ -431,8 +430,7 @@
       "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-08", "harness": "python -m benchmark.kernels.sweep fp8_linear --dtype float8_e4m3fn --shape N=5120,K=17408,glu=0 --buckets 1,2,4,8,16,24,32,48,64,96,128,192,256,384,512,768,1024", "torch": "2.11.0+cu129", "triton": "3.6.0", "note": "q27, DeepGEMM 2.8.2, tree 342ee818b"},
       "rows": {
         "1": {"impl": "w8a16", "config": {"DOT": false, "BN": 8, "BK": 512, "SPLIT": 1, "STAGES": 3, "num_warps": 2}},
-        "8": {"impl": "flashinfer"},
-        "16": {"impl": "triton8", "config": {"BN": 64, "SPLIT": 8, "STAGES": 3, "num_warps": 4}},
+        "16": {"impl": "flashinfer"},
         "*": {"impl": "deepgemm"}
       },
       "measured": {
