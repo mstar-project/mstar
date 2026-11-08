@@ -70,6 +70,14 @@ turn re-reads everything read so far.
   tree, the diff against the merge base, the description, and existing review comments and replies.
   An agent with a shell gets them with `gh pr view <n> --json title,body,baseRefName,headRefName,files`,
   `git fetch origin pull/<n>/head:pr<n>` and `git diff origin/main...pr<n>`.
+- **A re-review** of a PR reviewed before covers only what changed since: the commits since that
+  review, or after a force-push or rebase the interdiff (the PR's own hunks whose changes differ
+  from its diff then). Re-check every earlier finding by reading the lines it cites, review only the
+  new hunks, and load nothing else: never the whole PR's diff or a file no new hunk touches, and a
+  caller only where a new hunk changes its contract, by line range. What merges of `main` brought in
+  isn't the author's change; skip it. Review the whole PR again only when the earlier review skipped
+  files or reported less than this mode does (light, for a nogpu review). With a shell, `git
+  range-diff` gives the interdiff. The bot's prompt names its files.
 - **The stack.** For a stacked PR, diff against the base PR. With a shell, find the open PRs built
   on this one (`gh pr list --base <headRefName>`, recursively) and read their code. A finding that a
   PR above fixes for real is still reported, at its priority, as fixed above (status `fixed_above`

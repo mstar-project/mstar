@@ -291,4 +291,3 @@ def partial_md(h):
         return ""
     return f"**Inline comments it made ({len(made)}):**\n" + "\n".join(
         f"- `{c['path']}:{c['line']}` {c['body']}" for c in made) + "\n"
-

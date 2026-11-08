@@ -298,7 +298,7 @@ jobs:
             pr.diff is ${{ steps.diff.outputs.lines }} lines.
             Turn cap: ${{ needs.preflight.outputs.turns }}.
             ${{ steps.prev.outputs.dir && 'This run continues a review of this PR that stopped before it finished. handoff.md has what it left; continue from there as the prompt says.' || '' }}
-            ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json, since.diff and since-commits.txt are present. Follow the prompt''s Re-review section.' || '' }}
+            ${{ steps.diff.outputs.rereview && 'This is a re-review: last-review.json is present, with since.diff and since-commits.txt or, after a rebase, interdiff.diff. Follow the prompt''s Re-review section.' || '' }}
           # No shell or edits; web reads only from the sites listed here (GitHub, the
           # vLLM and SGLang docs, Hugging Face, PyTorch, arXiv) and Claude Code's
           # built-in documentation sites, so the review can read how other projects do it. The only write tool is the inline-

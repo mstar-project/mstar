@@ -221,8 +221,8 @@ def current_mode(mode):
 
 def read_state(body, mode):
     """The state a summary comment carries (its last), for a re-review in `mode` to start from; else
-    None, and that run reviews the whole PR. None too when it doesn't decode, and for a nogpu
-    review unless the earlier one was nogpu and skipped nothing."""
+    None, and that run reviews the whole PR. None too when it doesn't decode, when the earlier review
+    skipped files, and for a nogpu review unless the earlier one was nogpu."""
     found = STATE.findall(body)
     try:
         state = json.loads(base64.b64decode(found[-1])) if found else None
@@ -232,7 +232,6 @@ def read_state(body, mode):
         return None
     state["mode"] = current_mode(state.get("mode"))
     # A state from before `skipped` was kept counts as having skipped files.
-    if mode == "nogpu" and (state.get("mode") != "nogpu" or state.get("skipped", [None])):
+    if state.get("skipped", [None]) or mode == "nogpu" and state.get("mode") != "nogpu":
         return None
     return state
-

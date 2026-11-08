@@ -171,13 +171,16 @@ def summary(head, mode="light"):
             "body": f"<!-- claude-review-summary -->\nx\n<!-- claude-review-state {state} -->"}
 
 
-def collect(mode="light", **routes):
+BASE = "b" * 40
+
+
+def collect(mode="light", diff="diff --git a/a.py b/a.py\n", **routes):
     """bot.collect on PR 7 at HEAD, its earlier comments and compares from `routes`; its outputs and files."""
     with workspace() as ws:
         out, _ = step(bot.collect, {
             "GET repos/o/r/pulls/7": {"title": "T", "body": None, "head": {"sha": HEAD, "ref": "x", "repo": None},
-                                      "base": {"ref": "main", "repo": {"full_name": "o/r"}}},
-            "pr diff": "diff --git a/a.py b/a.py\n",
+                                      "base": {"ref": "main", "sha": BASE, "repo": {"full_name": "o/r"}}},
+            "pr diff": diff,
             "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
             "GET repos/o/r/pulls/7/comments": [],
             "GET repos/o/r/issues/7/comments": [],
@@ -186,21 +189,39 @@ def collect(mode="light", **routes):
         return out, {p.name: p.read_text() for p in ws.iterdir()}
 
 
+def compare(status, diff="diff --git a/b.py b/b.py\n"):
+    """A compare of two commits, as JSON or, asked for the diff media type, as `diff`."""
+    return lambda argv, stdin: diff if "Accept: application/vnd.github.diff" in argv \
+        else json.dumps([{"status": status, "commits": []}] if "--slurp" in argv else {"status": status})
+
+
+def pr_diff(context, added, index="1111111..2222222"):
+    return (f"diff --git a/a.py b/a.py\nindex {index} 100644\n--- a/a.py\n+++ b/a.py\n"
+            f"@@ -10,3 +10,3 @@ def f():\n     {context}\n-    y = 2\n+    y = 3\n     z = 4\n"
+            f"@@ -40,2 +40,3 @@ def g():\n     return 1\n+    {added}\n")
+
+
 class TestCollect(unittest.TestCase):
-    def test_a_re_review_builds_only_on_an_ancestor(self):
-        since = f"GET repos/o/r/compare/{LAST}...{HEAD}"
-        conversation = {"GET repos/o/r/issues/7/comments": [summary(LAST)]}
+    CONVERSATION = {"GET repos/o/r/issues/7/comments": [summary(LAST)]}
 
-        def compare(status):
-            return lambda argv, stdin: "diff --git a/b.py b/b.py\n" if "Accept: application/vnd.github.diff" in argv \
-                else json.dumps([{"status": status, "commits": []}] if "--slurp" in argv else {"status": status})
-
-        out, files = collect(**conversation, **{since: compare("ahead")})
+    def test_a_re_review_reads_the_commits_since_on_an_ancestor(self):
+        out, files = collect(**self.CONVERSATION, **{f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead")})
         self.assertEqual((out.get("rereview"), files["since.diff"]), ("true", "diff --git a/b.py b/b.py\n"))
         self.assertEqual(json.loads(files["last-review.json"])["head"], LAST)
-        out, files = collect(**conversation, **{since: compare("diverged")})
-        self.assertNotIn("rereview", out, "a re-review could rest on commits no longer in the PR")
-        self.assertNotIn("last-review.json", files)
+
+    def test_after_a_rebase_a_re_review_reads_only_the_prs_hunks_that_changed(self):
+        reviewed = pr_diff("x = 1", "# unreachable")
+        routes = {**self.CONVERSATION, f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("diverged"),
+                  f"GET repos/o/r/compare/{BASE}...{LAST}": compare("ahead", reviewed)}
+        out, files = collect(diff=pr_diff("x = 10", "# unreachable", "3333333..4444444").replace("@@ -10,3 +10,3",
+                                                                                                 "@@ -12,3 +12,3"),
+                             **routes)
+        self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
+                         "a rebase that moved the PR's changes would read as new changes")
+        out, files = collect(diff=pr_diff("x = 1", "# dead code"), **routes)
+        self.assertEqual(files["interdiff.diff"], "diff --git a/a.py b/a.py\nindex 1111111..2222222 100644\n"
+                         "--- a/a.py\n+++ b/a.py\n@@ -40,2 +40,3 @@ def g():\n     return 1\n+    # dead code\n")
+        self.assertNotIn("since.diff", files)
 
 
 COMMENT = "mcp__github_inline_comment__create_inline_comment"

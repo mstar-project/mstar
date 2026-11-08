@@ -102,11 +102,13 @@ class TestReviewSummary(unittest.TestCase):
         self.assertIsNone(read_state(text + "<!-- claude-review-state bm90IGpzb24= -->", "nogpu"),
                           "a malformed state would fail every later review instead of starting a full one")
 
-    def test_a_nogpu_review_builds_only_on_a_nogpu_review_that_covered_everything(self):
+    def test_a_re_review_builds_only_on_a_review_that_covered_everything_and_nogpu_only_on_nogpu(self):
         light = render(review(), [], "0123456789", "light", [])
         partial = render(review(["a.py"]), [], "0123456789", "nogpu", [])
         self.assertIsNone(read_state(light, "nogpu"), "a nogpu re-review could rest on a light review")
         self.assertIsNone(read_state(partial, "nogpu"), "a nogpu re-review could rest on files nobody reviewed")
+        self.assertIsNone(read_state(render(review(["a.py"]), [], "0123456789", "light", []), "light"),
+                          "a light re-review could leave the files the last one skipped unreviewed for good")
         self.assertIsNotNone(read_state(render(review(), [], "0123456789", "nogpu", []), "nogpu"))
         self.assertIsNotNone(read_state(light, "light"))
         old = read_state(render(review(), [], "0123456789", "thorough", []), "nogpu")

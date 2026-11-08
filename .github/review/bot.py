@@ -9,6 +9,7 @@ its interface. It records its outputs in `out`, which `main` writes to $GITHUB_O
 step fails. Every call to another program (`gh`, `git`, gpu.py, ssh-keygen) goes through `run`, the
 one place a test replaces. Text the bot posts reaches `gh` on stdin, never its command line.
 """
+import collections
 import fnmatch
 import inspect
 import json
@@ -311,10 +312,63 @@ def stacked_above(repo, pull, head_sha):
     return found
 
 
+def diff_files(diff):
+    """{"diff --git" line: [its header lines, [its hunks, each a list of lines]]} of a unified diff."""
+    files, current = {}, None
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            current = files[line] = [[line], []]
+        elif current is None:
+            continue
+        elif line.startswith("@@"):
+            current[1].append([line])
+        elif current[1]:
+            current[1][-1].append(line)
+        else:
+            current[0].append(line)
+    return files
+
+
+def changes(hunk):
+    """What a hunk changes: its runs of added and removed lines, without the context or the line numbers
+    around them, which a rebase shifts."""
+    runs, run = [], []
+    for line in hunk[1:]:
+        if line.startswith(("+", "-", "\\")):
+            run.append(line)
+        elif run:
+            runs.append(tuple(run))
+            run = []
+    return runs + [tuple(run)] if run else runs
+
+
+def interdiff(old, new):
+    """The hunks of `new`, a PR's diff, that make a change `old`, its diff at the last review, doesn't:
+    after a rebase, only the PR's own changes that differ, whatever moved around them. A file with no
+    hunks (binary, a mode change, a pure rename) counts when its header changed, its blob ids aside."""
+    before = diff_files(old)
+    parts = []
+    for header, (head, hunks) in diff_files(new).items():
+        old_head, old_hunks = before.get(header, ([], []))
+        made = collections.Counter(run for h in old_hunks for run in changes(h))
+        kept = []
+        for h in hunks:
+            runs = collections.Counter(changes(h))
+            if runs - made:
+                kept.append(h)
+            else:
+                made -= runs
+        if kept or not hunks and [x for x in head if not x.startswith("index ")] != \
+                [x for x in old_head if not x.startswith("index ")]:
+            parts += head + [line for h in kept for line in h]
+    return "".join(parts)
+
+
 def collect(out, repo, pr, head_sha, mode, prev=""):
     """The review's inputs, in the workspace: pr.diff, pr-body.md, pr-comments.json (with each thread's
     resolved and outdated state, and `mine` on the bot's own), pr-conversation.json, a re-review's
-    last-review.json, since.diff and since-commits.txt, stacked-above.json and above-<n>.diff, and
+    last-review.json with since.diff and since-commits.txt or interdiff.diff, stacked-above.json and
+    above-<n>.diff, and
     open-issues.json; and the diff's length and the summary's schema as outputs. The PR's text and
     comments are untrusted: they only ever reach files the prompt calls untrusted."""
     if prev:
@@ -352,12 +406,13 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
                      "body": c.get("body")} for c in api_list(f"repos/{repo}/issues/{pr}/comments")]
     write_json("pr-conversation.json", conversation)
 
-    # A re-review starts from this bot's last summary, when its commit is still an ancestor of the
-    # head: the review re-checks those findings and reads only what changed since (review-prompt.md,
-    # "Re-review"). After a force-push it reviews the whole PR again, and a nogpu review does too
-    # unless the last one was nogpu and skipped nothing. The state is read only from the bot's own
-    # summaries: comments that start with the summary's marker, in which model text can't open an HTML
-    # comment. A diff GitHub won't give (too large, say) means a full review, never an empty since.diff.
+    # A re-review starts from this bot's last summary and reviews only what changed since
+    # (review-prompt.md, "Re-review"): the commits since, when that commit is still an ancestor of the
+    # head (since.diff, since-commits.txt), and after a force-push or rebase the interdiff, the PR's own
+    # hunks whose changes differ from its diff then (interdiff.diff). read_state says when it reviews the
+    # whole PR again instead. The state is read only from the bot's own summaries: comments that start
+    # with the summary's marker, in which model text can't open an HTML comment. A diff GitHub won't give
+    # (too large, say) means a full review, never an empty since.diff.
     if not prev:
         summaries = [c for c in conversation
                      if c["user"] in BOT_USERS and (c["body"] or "").startswith(render_summary.MARKER)]
@@ -368,18 +423,26 @@ def collect(out, repo, pr, head_sha, mode, prev=""):
             status = api(since)["status"] if last else ""
         except (RuntimeError, ValueError, KeyError, TypeError):
             status = ""
+        r = None
         if last and (status == "ahead" or last == head_sha):
             r = gh("api", "-H", "Accept: application/vnd.github.diff", since, check=False)
             if r.returncode == 0:
-                write("last-review.json", json.dumps(state) + "\n")
                 write("since.diff", r.stdout)
                 try:
                     write("since-commits.txt", oneline(c for page in api(since, "--paginate", "--slurp")
                                                        for c in page["commits"]))
                 except (RuntimeError, ValueError, KeyError):
                     write("since-commits.txt", "")
-                print(f"::notice::Re-review: this PR was last reviewed at {last[:10]}.")
-                out["rereview"] = "true"
+        elif last:
+            # The PR's diff at that commit: from where it forked from the base branch.
+            r = gh("api", "-H", "Accept: application/vnd.github.diff",
+                   f"repos/{repo}/compare/{pull['base']['sha']}...{last}", check=False)
+            if r.returncode == 0:
+                write("interdiff.diff", interdiff(r.stdout, diff))
+        if r is not None and r.returncode == 0:
+            write("last-review.json", json.dumps(state) + "\n")
+            print(f"::notice::Re-review: this PR was last reviewed at {last[:10]}.")
+            out["rereview"] = "true"
 
     # A failed fetch leaves none of these files, so a finding said to be fixed above stays open, and
     # the review still runs.
