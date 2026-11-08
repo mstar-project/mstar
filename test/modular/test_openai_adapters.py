@@ -269,8 +269,11 @@ def test_a_chat_asking_for_more_than_one_plain_reply_is_refused(tmp_path, adapte
     {"logprobs": False}, {"presence_penalty": 0}, {"best_of": 1}, {"response_format": {"type": "text"}},
 ], ids=lambda f: ",".join(f"{k}={v}" for k, v in f.items()))
 def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields):
+    """And are dropped, so the server does not log them as ignored."""
     req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
-    assert adapter().chat_to_request(req, tmp_path).text == "hi", "a client's default tool fields refused a plain chat"
+    sa = adapter().chat_to_request(req, tmp_path)
+    assert sa.text == "hi", "a client's default tool fields refused a plain chat"
+    assert set(fields).isdisjoint(sa.model_kwargs)
 
 
 def test_qwen3_chat_audio_url_input(tmp_path):

@@ -183,7 +183,7 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
     sequences, log probs, sampling penalties, a response format, or a tool call.
     ``mk`` is the request's :func:`_passthrough`; an off value of one of these
-    fields (``logprobs: false``) is dropped from it, before any
+    fields (``logprobs: false``, ``tools: []``) is dropped from it, before any
     ``chat_template_kwargs`` key is merged in.
 
     Every chat adapter here returns one choice, ended at a stop token or
@@ -218,6 +218,8 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
         or function_call not in (None, "none", "auto")
     ):
         raise ValueError("tool calling is not supported for this model")
+    for name in ("tools", "tool_choice", "functions", "function_call"):
+        mk.pop(name, None)
 
 
 def _flatten_template_kwargs(mk: dict) -> None:

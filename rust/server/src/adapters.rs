@@ -727,8 +727,8 @@ const UNSERVED_CHAT_FIELDS: [&str; 6] =
 /// sequences, log probs, sampling penalties, a response format, or a tool
 /// call. The rules are `_refuse_unserved_chat` in
 /// `api_server/openai/adapters.py`. `mk` is the request's passthrough; an off
-/// value of one of these fields (`logprobs: false`) is dropped from it, before
-/// any `chat_template_kwargs` key is merged in.
+/// value of one of these fields (`logprobs: false`, `tools: []`) is dropped
+/// from it, before any `chat_template_kwargs` key is merged in.
 fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut Map<String, Value>) -> Result<(), String> {
     if let Some(n) = req.n.filter(|&n| n != 1) {
         return Err(format!("n={n}: this model returns one choice"));
@@ -777,7 +777,8 @@ fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut Map<String, Value>
     {
         return Err("tool calling is not supported for this model".to_string());
     }
-    for name in UNSERVED_CHAT_FIELDS.iter().chain(&["best_of", "response_format"]) {
+    let off = ["best_of", "response_format", "tools", "tool_choice", "functions", "function_call"];
+    for name in UNSERVED_CHAT_FIELDS.iter().chain(&off) {
         mk.remove(*name);
     }
     Ok(())
