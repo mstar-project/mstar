@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Prepare a GPU box to live-test one PR: a clone + venv + Rust extension per arm.
 #
-# usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--no-main]
+# usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--no-main] [--untrusted]
 #
 #   $WORKDIR/pr     PR head (refs/pull/<n>/head), its own venv and mstar_rust build
 #   $WORKDIR/main   the PR's base (origin/main, or --base for a stacked PR), likewise (skipped with --no-main)
 #   $WORKDIR/results/{media,bench,logs}   everything the run produces; copied back at the end
 #   $WORKDIR/env.sh   source this in every shell before using an arm
+#
+# --untrusted: the PR needed the trust question (SKILL.md step 1). Its code runs with the
+# compile caches, so save_caches refuses: a tarball it wrote would load its code into every
+# later run, main arms included.
 #
 # Each arm gets its own venv because the editable install maps `mstar` to one checkout's
 # path, and a PR that touches rust/ needs its own mstar_rust: one shared venv would make
@@ -16,19 +20,28 @@
 # Runs on the box, not on your laptop. Idempotent: rerunning updates both arms.
 set -euo pipefail
 
-PR=${1:?usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--no-main]}
+USAGE="usage: bootstrap.sh <pr-number> [--workdir DIR] [--hf-home DIR] [--base BRANCH] [--no-main] [--untrusted]"
+# before anything is created or installed: a mistaken run (--help, a typo) changes nothing
+case ${1:-} in
+  -h|--help) echo "$USAGE"; exit 0;;
+  ''|*[!0-9]*) echo "bootstrap.sh: the first argument is the PR number, got '${1:-}'" >&2; echo "$USAGE" >&2; exit 2;;
+esac
+PR=$1
 shift
 WORKDIR=$HOME/live-pr
 HF=${HF_HOME:-}
 WITH_MAIN=1
 BASE=main
+UNTRUSTED=0
 while [ $# -gt 0 ]; do
   case $1 in
     --workdir) WORKDIR=$2; shift 2;;
     --hf-home) HF=$2; shift 2;;
     --base) BASE=$2; shift 2;;
     --no-main) WITH_MAIN=0; shift;;
-    *) echo "bootstrap.sh: unknown option $1" >&2; exit 1;;
+    --untrusted) UNTRUSTED=1; shift;;
+    -h|--help) echo "$USAGE"; exit 0;;
+    *) echo "bootstrap.sh: unknown option $1" >&2; echo "$USAGE" >&2; exit 2;;
   esac
 done
 [ -n "$HF" ] || { echo "bootstrap.sh: pass --hf-home (the persistent HF cache)" >&2; exit 1; }
@@ -60,7 +73,7 @@ export MSTAR_SHM_ARENA=1
 export TORCHINDUCTOR_CACHE_DIR=\$HOME/.cache/compile/inductor TRITON_CACHE_DIR=\$HOME/.cache/compile/triton
 export FLASHINFER_WORKSPACE_BASE=\$HOME/.cache/compile
 export CACHE_TAR="$CACHE_TAR"
-export LIVE_PR=$PR LIVE_WORKDIR=$WORKDIR LIVE_RESULTS=$WORKDIR/results
+export LIVE_PR=$PR LIVE_WORKDIR=$WORKDIR LIVE_RESULTS=$WORKDIR/results LIVE_UNTRUSTED=$UNTRUSTED
 # arm <pr|main>: activate that arm's venv and cd into its checkout
 arm() { deactivate 2>/dev/null || true; cd "$WORKDIR/\$1" && source .venv/bin/activate; }
 # stage_model <repo>: put a model in the local HF cache servers read. The Hub is the fast
@@ -76,6 +89,7 @@ stage_model() {
 }
 # save_caches: write the compile caches back to persistent storage (before terminating)
 save_caches() {
+  [ "\$LIVE_UNTRUSTED" = 0 ] || { echo "save_caches: not for a PR that needed the trust check (--untrusted)" >&2; return 1; }
   mkdir -p "\$(dirname "\$CACHE_TAR")" && tar -C "\$HOME/.cache" -cf "\$HOME/compile-cache.tar" compile \
     && cp "\$HOME/compile-cache.tar" "\$CACHE_TAR.tmp" && mv "\$CACHE_TAR.tmp" "\$CACHE_TAR" && ls -lh "\$CACHE_TAR"
 }

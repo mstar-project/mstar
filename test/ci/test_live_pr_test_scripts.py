@@ -113,5 +113,15 @@ class TestGpu(unittest.TestCase):
         self.assertNotIn("no availability", out.getvalue())
 
 
+class TestBootstrap(unittest.TestCase):
+    def test_help_or_a_bad_pr_number_changes_nothing(self):
+        for argv, code in ((["--help"], 0), (["-h"], 0), (["abc"], 2), ([], 2)):
+            home = tempfile.mkdtemp()
+            r = subprocess.run(["bash", str(SCRIPTS / "bootstrap.sh"), *argv], capture_output=True, text=True,
+                               env={"PATH": "/usr/bin:/bin", "HOME": home, "HF_HOME": f"{home}/hf"}, check=False)
+            self.assertEqual(r.returncode, code, r.stderr)
+            self.assertEqual(os.listdir(home), [], f"bootstrap.sh {argv} wrote to HOME")
+
+
 if __name__ == "__main__":
     unittest.main()
