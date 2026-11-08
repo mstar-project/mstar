@@ -1,8 +1,11 @@
-"""The consumer side of streaming edges on one worker.
+"""Streaming edges on one worker, both sides.
 
-Each request's ``StreamBuffer``s live on its per-request info; this object
+On the consumer side, each request's ``StreamBuffer``s live on its per-request info; this object
 creates them, turns their ready chunks into graph edges, takes back the
-chunks a step did not keep, and settles which streams a step ends.
+chunks a step did not keep, and settles which streams a step ends. On the
+producer side, ``assign_consumer_walks`` stamps each walk-driven send with the
+consumer walk it drives, from tables that also cover connections consumed on
+other workers.
 """
 from __future__ import annotations
 
@@ -41,7 +44,8 @@ def consumer_nodes(
 
 class StreamBufferManager:
     """The stream buffers of this worker's requests, for the connections whose
-    consumer runs here."""
+    consumer runs here, and the walk-driver tables this worker stamps its sends
+    with as a producer."""
 
     def __init__(
         self,

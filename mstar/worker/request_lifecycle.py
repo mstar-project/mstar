@@ -25,7 +25,11 @@ from mstar.worker.services import WorkerLayout
 logger = logging.getLogger(__name__)
 
 # Removed wire ids to remember, to drop a message that arrives after its
-# request's teardown instead of parking it for good.
+# request's teardown instead of parking it for good. Such a message trails its
+# teardown by about a loop iteration and a socket hop, far fewer teardowns than
+# this; a count, not a time, so a stalled worker that reads both late still
+# matches them. Every submission has its own key, so a remembered key never gets
+# another NEW_REQUEST.
 _REMOVED_RIDS_KEEP = 4096
 
 
