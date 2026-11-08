@@ -14,7 +14,8 @@ Slurm node when it has them free, else any open Eras listing under the hourly ca
     gpu_review.py approve  --pr N --sha SHA --review review.json --complete true|false --verdict pass|...
     gpu_review.py comment  --pr N --sha SHA --out DIR [--site SITE] [--media-url URL]
 
-`start` exits 3 when no GPUs are free, after writing DIR/unavailable.md.
+`start` exits 3 when no GPUs are free, or the bot has REVIEW_GPU_MAX_RUNS runs going, after writing
+DIR/unavailable.md.
 """
 import argparse
 import fnmatch
@@ -182,6 +183,12 @@ def cmd_start(a):
         r = gpu("launch", o["id"], "--pr", str(a.pr), "--hours", str(a.hours), "--tag", a.tag,
                 "--run", str(BOX), *inputs, check=False)
         (out / "anthropic.key").unlink(missing_ok=True)
+        if r.returncode == 4:  # budget.max_running, which holds on every provider
+            msg = (f"The bot already has {cfg['budget']['max_running']} GPU runs going (REVIEW_GPU_MAX_RUNS); "
+                   "comment `/review gpu` again when one finishes.")
+            (out / "unavailable.md").write_text(msg + "\n")
+            print(msg)
+            sys.exit(3)
         if r.returncode == 0:
             (out / "instance").write_text(r.stdout.strip().splitlines()[-1])
             (out / "offer.json").write_text(json.dumps(o))

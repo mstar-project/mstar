@@ -35,6 +35,8 @@ Either way the GPUs go when the script ends, whether or not whoever launched it 
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
 its deadline (budget.max_hours by default), even if the session that launched it is gone.
 
+`launch` exits 4 when budget.max_running refuses it, 1 on any other error.
+
 Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY; the Slurm node is reached by
 ssh. Settings from config.local.json next to the skill (see config.example.json). Stdlib
 only, so it runs from any python3.
@@ -67,9 +69,9 @@ ERAS = "https://api.erascloud.ai"
 HOPPER_PLUS = re.compile(r"\b(H100|H200|GH200|B200|B300)\b", re.I)
 
 
-def die(msg: str) -> None:
+def die(msg: str, code: int = 1) -> None:
     print(f"gpu.py: {msg}", file=sys.stderr)
-    sys.exit(1)
+    sys.exit(code)
 
 
 def load_config() -> dict:
@@ -487,7 +489,7 @@ def cmd_launch(args, cfg):
                     die(f"can't count this tool's {o['provider']} jobs for budget.max_running: {errors[o['provider']]}")
                 if len(up) >= max_running:
                     die(f"{len(up)} of this tool's jobs are up, from every session; budget.max_running is "
-                        f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget")
+                        f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget", code=4)
             committed = sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours
             if max_total is not None and committed > max_total and not args.allow_over_budget:
                 die(f"running to their deadlines, the live instances plus this one would cost ~${committed:.0f}, "
