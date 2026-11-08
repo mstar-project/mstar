@@ -38,10 +38,10 @@ name: Claude Review
 # starts the live-test session on that box (gpu_review_box.sh), waits for it,
 # collects its report and media, posts them, and approves the PR when the rule
 # in gpu_review.py holds. The box gets the PR's public code, a fixed brief, the
-# review's notes as data, and its own Anthropic key (LIVE_TEST_ANTHROPIC_KEY),
-# never a GitHub token or a cloud key; the GPUs go when the
-# box's session ends (Slurm's --time, Eras's Pod deadline), whether or not this
-# job is still running.
+# review's notes and the PR's title and description (pr-body.md) as data, and its
+# own Anthropic key (LIVE_TEST_ANTHROPIC_KEY), never a GitHub token or a cloud
+# key; the GPUs go when the box's session ends (Slurm's --time, Eras's Pod
+# deadline), whether or not this job is still running.
 
 # When it runs, and who can cause it. Only on request; opening or pushing to
 # a PR never starts a review.
