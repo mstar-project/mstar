@@ -13,6 +13,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import Resource, SlotLease, SubmoduleStep
+from mstar.engine.resources.draft.drafter import VERIFY_STOPPED
 from mstar.engine.resources.lora.config import LoraStep
 from mstar.utils.knobs import device_loopback_enabled  # noqa: F401  (re-export)
 
@@ -82,11 +83,18 @@ class TokenStop:
     # check_stop (``ARNodeSubmodule.get_stop_policies``); the prompt walks keep
     # check_stop, which can end the partition
     runtime_check: bool = False
+    # walks that verify drafts (speculative decoding), set by the engine at load:
+    # a row emits a run of tokens, which the engine's token cut ends at a stop
+    # id or the budget, and the stop check reads the cut's stopped column
+    verify_walks: frozenset[str] = frozenset()
 
     def __post_init__(self):
         if self.withhold and self.runtime_check:
             # the runtime's check never calls check_stop, which is what withholds
             raise ValueError("a TokenStop that withholds outputs needs check_stop: drop runtime_check")
+        if self.withhold and self.verify_walks:
+            # a verify step's outputs are a run of tokens, not one value a row
+            raise ValueError("a TokenStop that withholds outputs can't stop a walk that verifies drafts")
 
     def stops_on(self, graph_walk: str) -> bool:
         """Whether a row of ``graph_walk`` can stop the loop."""
@@ -144,6 +152,8 @@ if TYPE_CHECKING:
     from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, PiecewiseAcceleratorGraphConfig
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
     from mstar.engine.engine import ExecutingBatch
+    from mstar.engine.resources.draft.drafter import VerifyResult
+    from mstar.engine.resources.resident import CapturedResidentStep
     from mstar.streaming.stream_buffer import StreamChunkInfo
 
 
@@ -289,6 +299,9 @@ class BatchedModelOutput:
     # A mixed step's rows whose own walk keeps every output signal on the
     # device (see ``ExecutingBatch.loopback_rids``)
     loopback_rids: frozenset = frozenset()
+    # A verify step's outputs, uncut until postprocess: the next step reads each
+    # row's token off the sampler's loop-back slot, never these
+    verify_step: bool = False
     # output name -> [bs, 2] int64 on the forward's device: row i holds the
     # first and one-past-last index of the valid part of request i's output
     # along its last dim. The worker cuts the rows to it once the step has
@@ -798,6 +811,47 @@ class ModelInputsFromEngine:
     # rid -> this step's InputMetadata; rids without any are absent
     per_request_input_metadata: Mapping[str, InputMetadata] = field(default_factory=dict)
 
+    # the resident step a capture records around the forward, under a resident capture only
+    resident: "CapturedResidentStep | None" = None
+
+    @torch.compiler.disable
+    def _verifying_sampler(self):
+        sampler = next(
+            (r for r in self.resources.values() if getattr(r, "verify_draft_tokens", 0)), None,
+        )
+        if sampler is None:
+            raise RuntimeError("draft_verify_step on a node the engine set up no verifying sampler for")
+        return sampler
+
+    def verify_output(self, result: "VerifyResult", **row_outputs: torch.Tensor) -> "BatchedModelOutput":
+        """What a verify step's forward returns: each row's block under the
+        node's ``TokenStop.buffer``, which the engine's token cut trims to the
+        run it emits, and the stop check's buffers, the block and the accepted
+        counts, one host copy for the step. ``row_outputs``: any other
+        ``[n, ...]`` per-row outputs the walk routes."""
+        from mstar.engine.resources.draft.drafter import VERIFY_ACCEPTED, VERIFY_TOKENS
+
+        buffer = self._verifying_sampler().verify_buffer
+        return BatchedModelOutput(
+            row_outputs={buffer: result.tokens, **row_outputs},
+            check_stop_buffers={VERIFY_TOKENS: result.tokens, VERIFY_ACCEPTED: result.accepted},
+        )
+
+    def draft_verify_step(self, input_ids: torch.Tensor, target, drafter) -> "VerifyResult":
+        """A verify step of speculative decoding, in the engine's order
+        (`draft_verify_step`): ``input_ids`` ``[n]`` are each row's last
+        emitted token, ``target`` maps the block's ids ``[n * (k + 1)]`` to
+        logits, and ``drafter`` proposes. The node's verifying sampler is the
+        one the engine bound. Traced with the forward, so the target and the
+        drafter compile with it; the sampler's ``agree`` and ``verify`` are
+        out of the graph, as ``sample`` is."""
+        from mstar.engine.resources.draft.drafter import draft_verify_step
+
+        sampler = self._verifying_sampler()
+        return draft_verify_step(
+            sampler, self.request_ids, input_ids, target, drafter, self.resources, self.resident,
+        )
+
     @property
     @torch.compiler.disable
     def single_request_info(self):
@@ -885,6 +939,8 @@ class NodeSubmodule(torch.nn.Module, ABC):
         # embedder, scratch caches), bound once at load. Empty until then
         # and on engines that build none.
         self.node_resources: dict[str, Any] = {}
+        # The node's `Drafter`, on a node that verifies drafts (`Model.verify_nodes`).
+        self.drafter: Any = None
 
     def bind_node_resources(self, resources: dict[str, Any]) -> None:
         """Receive the engine-built resources for this submodule's node, and
@@ -1507,9 +1563,16 @@ def lora_rows(step: SubmoduleStep | None, lora_keys: Sequence[str]) -> Submodule
 def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     """What the engine calls for a node's step: its ``declare_step``, with the LoRA
     pools' rows added (``lora_rows``), so a model serving LoRA from its modules writes
-    no LoRA step."""
+    no LoRA step, and a drafter's share of its prompt and verify steps (``drafter_step``,
+    from the ``drafter_share`` the engine binds at load), so a target declares none of it."""
     # the engine drives duck-typed submodules too
-    return lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+    step = lora_rows(submodule.declare_step(*args, **kwargs), getattr(submodule, "lora_keys", ()))
+    share = getattr(submodule, "drafter_share", None)
+    if share is not None:
+        from mstar.engine.resources.draft.node import drafter_step
+
+        step = drafter_step(step, kwargs["graph_walk"], share)
+    return step
 
 
 class ARNodeSubmodule(NodeSubmodule):
@@ -1564,18 +1627,32 @@ class ARNodeSubmodule(NodeSubmodule):
     def uniform_row_inputs(
         self, graph_walk: str, has_loopback: bool = False,
     ) -> "NodeInputs | None":
-        # the loop-back decode row: one token, read in ``preprocess``
+        # the loop-back decode row: one token, read in ``preprocess``; a verify
+        # row runs that token and its drafts, k + 1
         if has_loopback and self._reads_loopback(graph_walk):
+            stop = self.token_stop
+            if stop is not None and graph_walk in stop.verify_walks:
+                block = self.node_resources[self.device_loopback.sampler].verify_draft_tokens + 1
+                return ARNodeInputs(input_seq_len=block)
             return ARNodeInputs(input_seq_len=1)
         return super().uniform_row_inputs(graph_walk, has_loopback)
 
     def device_loopback_signals(self, graph_walk: str) -> frozenset[str]:
+        stop = self.token_stop
+        if stop is not None and graph_walk in stop.verify_walks:
+            # a verify step's rows still get outputs, which the token cut trims
+            # for the client; the engine records their loop-back itself
+            return frozenset()
         if self._reads_loopback(graph_walk):
             return frozenset({self.device_loopback.signal})
         return super().device_loopback_signals(graph_walk)
 
     def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
         # the client's copy of the token the stop check already has on the host
+        stop = self.token_stop
+        if stop is not None and graph_walk in stop.verify_walks:
+            # a verify step emits a run of tokens a row, not one scalar
+            return {}
         if self._loops_back(graph_walk):
             return {self.device_loopback.signal: self.device_loopback.buffer}
         return super().inline_client_signals(graph_walk)
@@ -1605,7 +1682,11 @@ class ARNodeSubmodule(NodeSubmodule):
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
         stop = self.token_stop
-        if stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks:
+        if (
+            stop is None or not stop.runtime_check or graph_walk in stop.prefill_walks
+            or graph_walk in stop.verify_walks
+        ):
+            # a verify walk's runtime check would read one token a row; its stop check reads the token cut
             return super().get_stop_policies(graph_walk)
         if not stop.stops_on(graph_walk):
             return {}  # as `_token_stops`: only a row of ``walk`` ends the loop
@@ -1622,6 +1703,8 @@ class ARNodeSubmodule(NodeSubmodule):
         stop = self.token_stop
         if stop is None:
             return super().check_stop(request_id, request_info, outputs)
+        if request_info.graph_walk in stop.verify_walks:
+            raise RuntimeError("a verify walk's stop check reads the token cut's host column (check_stop_batched)")
         if stop.buffer not in outputs:
             return set()
         # a row's first element, as ``HostRows.first_values`` reads it
@@ -1639,6 +1722,11 @@ class ARNodeSubmodule(NodeSubmodule):
         stop = self.token_stop
         if stop is None:
             return super().check_stop_batched(request_ids, request_infos, host_rows)
+        if stop.verify_walks and VERIFY_STOPPED in host_rows.buffers:
+            # the engine's token cut already cut each row's run at a stop id or the budget
+            pairs = host_rows.first_values(VERIFY_STOPPED, request_ids)
+            names = self._stop_names
+            return {rid: names(request_infos[rid]) for rid, stopped in pairs if stopped}
         pairs = host_rows.first_values(stop.buffer, request_ids)
         if pairs is None:
             return None

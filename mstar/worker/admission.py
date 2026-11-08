@@ -44,11 +44,14 @@ class Admission:
     # Seconds to wait before retrying a held request after OOM
     HOLD_BACKOFF_SECONDS = 0.05
 
-    def __init__(self, services: WorkerServices, layout: WorkerLayout):
+    def __init__(
+        self, services: WorkerServices, layout: WorkerLayout, verifying_nodes: frozenset[str] = frozenset(),
+    ):
         self._engine_manager = services.engine_manager
         self._request_state = services.request_state
         self._runtime = services.graph_runtime
         self._rebuilds = services.rebuilds
+        self._verifying_nodes = verifying_nodes
         self._combined_walk_of = layout.combined_walk_of
         self._follows = layout.followed_nodes
         # rid -> message, for requests a resource declared unservable, or that a
@@ -417,6 +420,10 @@ class Admission:
         # frees nothing and the retry would re-pick it
         candidates = [
             rid for rid in active if engine.reclaimable(node_name, rid, affected_resources)
+            # nothing on the host knows the length of a row with an unrecorded
+            # verify result; filtered here, which only rank 0 runs, never in
+            # what followers replay (a recorded one is settled at the offload)
+            and not (self._verifying_nodes and engine.verify_unrecorded(rid))
         ]
 
         if not candidates:

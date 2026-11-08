@@ -3168,6 +3168,195 @@
           "instant": true
         }
       ]
+    },
+    {
+      "type": "row",
+      "title": "Speculative decoding",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 175,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [],
+      "id": 47
+    },
+    {
+      "id": 48,
+      "type": "timeseries",
+      "title": "Acceptance length (tau)",
+      "description": "Tokens a verify row emits per step, (accepted + rows) / rows, by verifying node. 1 means no draft is accepted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 176,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "(sum by (component) (rate(mstar_spec_accepted_tokens_total{model_name=~\"$model\"}[1m])) + sum by (component) (rate(mstar_spec_verify_rows_total{model_name=~\"$model\"}[1m]))) / sum by (component) (rate(mstar_spec_verify_rows_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 49,
+      "type": "timeseries",
+      "title": "Drafts accepted",
+      "description": "Share of proposed drafts the target accepted, by verifying node.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 176,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_spec_accepted_tokens_total{model_name=~\"$model\"}[1m])) / sum by (component) (rate(mstar_spec_draft_tokens_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 50,
+      "type": "timeseries",
+      "title": "Drafts accepted per verify row",
+      "description": "Drafts one verify row accepted (0 to num_draft_tokens), per node: the mean, from the histogram's sum and count, and its median and p90, which Prometheus interpolates within the integer buckets.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 176,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le, component) (rate(mstar_spec_accepted_per_row_bucket{model_name=~\"$model\"}[1m])))",
+          "legendFormat": "{{component}} p50 (interpolated)",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "histogram_quantile(0.9, sum by (le, component) (rate(mstar_spec_accepted_per_row_bucket{model_name=~\"$model\"}[1m])))",
+          "legendFormat": "{{component}} p90 (interpolated)",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_spec_accepted_per_row_sum{model_name=~\"$model\"}[1m])) / sum by (component) (rate(mstar_spec_accepted_per_row_count{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} mean",
+          "range": true
+        }
+      ]
     }
   ],
   "description": "M* /metrics (mstar-serve --enable-metrics). Families are documented in docs/metrics.rst; data source uid prom (examples/observability/grafana/provisioning)."

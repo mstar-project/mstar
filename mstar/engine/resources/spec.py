@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.draft.config import DraftConfig
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,21 @@ class NodeResourceSpec(ABC):
         The builder, not necessarily the class built: an attention spec names
         `AttentionManager`, whose `build` picks a backend subclass.
         """
+
+    def verify_refusal(self, draft: "DraftConfig") -> str | None:
+        """Why a node that verifies drafts (speculative decoding) can't use
+        this resource, or None. A verify step writes ``k + 1`` tokens a row
+        and keeps ``accepted + 1``: a resource that keeps per-token state
+        corrects it from the result (`Resource.take_back`), and one that
+        keeps none says so. Refused by default, so a resource nobody checked
+        is never assumed safe. From config alone, before workers spawn."""
+        return f"{type(self).__name__} declares no speculative decoding support"
+
+    def async_verify_refusal(self, draft: "DraftConfig") -> str | None:
+        """Why this resource can't run asynchronous verify steps, planned
+        from upper-bound lengths while the step before runs and corrected on
+        the device, or None. Asked only of a resource that verifies at all."""
+        return f"{type(self).__name__} corrects nothing on the device"
 
     def routing_mirror(self, ctx: RoutingContext) -> RoutingMirror | None:
         """A mirror of this resource for the replicas ``ctx`` describes; None

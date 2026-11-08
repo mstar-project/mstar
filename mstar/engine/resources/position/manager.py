@@ -228,6 +228,18 @@ class RopeManager(PositionManager):
         counters = self._counters.setdefault(rid, {})
         counters[label] = max(0, counters.get(label, 0) + delta)
 
+    def take_back(self, rids, counts, label: str) -> None:
+        """A verify step's rejected tokens off each stream's counter, by the
+        amounts its KV cache takes back, so a position stays its KV length
+        plus a fixed offset (the offset a resident row holds)."""
+        counters = self._counters
+        for rid, n in zip(rids, counts, strict=True):
+            if n:
+                stream = counters[rid]
+                if stream.get(label, 0) < n or n < 0:
+                    raise RuntimeError(f"positions: take-back of {n} from {rid}/{label} at {stream.get(label, 0)}")
+                stream[label] -= n
+
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
         prefix: CachedPrefix | None,
@@ -397,11 +409,18 @@ class RopeManager(PositionManager):
                 f"positions on stream {own.label!r} over {self._kv_cache_name!r}'s {pool.label!r}: "
                 "a resident step's positions advance with the stream their KV cache appends to"
             )
+        if own.span != pool.span:
+            raise ValueError(
+                f"positions on stream {own.label!r} advance {own.span} a row, "
+                f"{self._kv_cache_name!r}'s {pool.span}"
+            )
         key = CGSlotKey(bucket=step.bucket, slot=step.slot, label=own.label)
         table = self._resident_delta
+        # a verify step's row runs its span from the row's length on
         gather_column(
             self._resident_store.store, step.slots, table.stride, table.col,
             self._static_buffer(key, step.bucket.num_tokens), plus=step.buffers.kv_len[self._kv_cache_name],
+            span=own.span,
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):

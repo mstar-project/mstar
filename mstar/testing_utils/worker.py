@@ -176,10 +176,11 @@ def _build_components(worker: Worker, async_sched) -> None:
             layout=layout,
         )
     if "admission" not in worker.__dict__:
-        worker.admission = Admission(services=services, layout=layout)
+        worker.admission = Admission(services=services, layout=layout, verifying_nodes=worker._verifying_nodes)
     if "lockstep" not in worker.__dict__:
         worker.lockstep = Lockstep(
             services=services, layout=layout, admission=worker.admission, async_sched=async_sched,
+            synchronous_verify_nodes=worker._synchronous_verify_nodes,
         )
     if "ingest" not in worker.__dict__:
         worker.ingest = InputIngest(

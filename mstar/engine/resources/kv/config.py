@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext, check_sizes
 from mstar.engine.resources.step import ResourceStep
@@ -56,6 +56,17 @@ class KVConfig(ABC):
         self._unsharded_kv_heads = self.num_kv_heads
         self._unsharded_qo_heads = self.num_qo_heads
 
+    @property
+    def total_kv_heads(self) -> int:
+        """The KV heads of every rank together: what the checkpoint declares,
+        before `shard` narrows ``num_kv_heads`` to one rank's slice."""
+        return self._unsharded_kv_heads
+
+    @property
+    def total_qo_heads(self) -> int:
+        """The query heads of every rank together, as `total_kv_heads`."""
+        return self._unsharded_qo_heads
+
     def shard(self, num_shards: int) -> None:
         """Narrow the head counts to one rank's slice.
 
@@ -87,6 +98,31 @@ DEFAULT_PAGE_SIZE = 128
 # The fewest tokens a page of either group holds when the page size is derived: a window
 # keeps up to a page past it, and a smaller page adds page-table entries and plan work a token.
 MIN_GROUP_PAGE = 64
+# the layer set a paged pool's own declaration makes: the layers of the stack that declares it
+TARGET_LAYER_SET = "target"
+
+
+@dataclass(frozen=True)
+class KVLayerSet:
+    """Layers a stack writes into a paged KV pool another stack declares (a
+    drafter's, in its target's): they share its pages, lengths, reservations,
+    take-backs, eviction, offload and prefix pages. Counts are the checkpoint's,
+    unsharded. Query heads are not storage: they belong to the attention that
+    plans over the pool."""
+
+    kv_cache: str
+    name: str
+    num_layers: int
+    num_kv_heads: int
+    head_dim: int
+
+
+class LayerSetSlot(NamedTuple):
+    """Where a layer set's layers sit among a pool's: layer indices are global
+    across the pool's sets. Derived by `PagedKVConfig.join`, never declared."""
+
+    first: int
+    num_layers: int
 
 
 @dataclass(kw_only=True)
@@ -119,6 +155,9 @@ class PagedKVConfig(KVConfig):
     # is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,
     # before anything builds or sizes from the pool). One group of every layer until then.
     groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
+    # Derived, never declared: each layer set's slot among the layers, the declaring stack's
+    # as TARGET_LAYER_SET, then each stack that joined (`join`)
+    layer_sets: dict[str, LayerSetSlot] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         self._check_sizes()
@@ -131,6 +170,7 @@ class PagedKVConfig(KVConfig):
             self.num_kv_heads = 1
             self.head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         super().__post_init__()
+        self.layer_sets = {TARGET_LAYER_SET: LayerSetSlot(0, self.num_layers)}
         self.keep_window(None, ())
 
     def _check_sizes(self) -> None:
@@ -138,6 +178,26 @@ class PagedKVConfig(KVConfig):
         check_sizes({"cpu_offload_pages": self.cpu_offload_pages}, smallest=0)
         if self.page_size is not None:
             check_sizes({"page_size": self.page_size})
+
+    def join(self, layer_set: KVLayerSet) -> LayerSetSlot:
+        """Append ``layer_set``'s layers to the pool's, after every layer it holds.
+        Only a set of the pool's own storage geometry (KV heads and head size)
+        joins: the layers are more of the pool's tensor."""
+        if layer_set.name in self.layer_sets:
+            raise ValueError(f"KV {layer_set.kv_cache!r}: layer set {layer_set.name!r} joined twice")
+        if (layer_set.num_kv_heads, layer_set.head_dim) != (self.total_kv_heads, self.head_dim):
+            raise ValueError(
+                f"KV {layer_set.kv_cache!r}: layer set {layer_set.name!r} has {layer_set.num_kv_heads} KV heads "
+                f"of {layer_set.head_dim}; the pool's are {self.total_kv_heads} of {self.head_dim}. A drafter's KV "
+                "layer set must share the pool's KV heads and head size; a drafter with its own KV storage "
+                "geometry is not supported yet"
+            )
+        slot = LayerSetSlot(self.num_layers, layer_set.num_layers)
+        self.num_layers += layer_set.num_layers
+        self.layer_sets[layer_set.name] = slot
+        # every token of every layer until the specs derive the window again
+        self.keep_window(None, ())
+        return slot
 
     def keep_window(self, window: int | None, layers: tuple[int, ...]) -> None:
         """Keep about ``window`` tokens per request of ``layers``, some of the pool's, and every
@@ -446,7 +506,7 @@ class KVReqConfig(ResourceReqConfig):
             if layout.retention is not None:
                 continue
             for loop, slots in layout.growth:
-                n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
+                n = (spec.request_limit - layout.positions(caps) + slots * caps[loop]) // slots
                 room[loop] = min(n, room.get(loop, n))
         pool = spec.config.request_pages
         if self.pages(spec.nodes, caps, spec.config) > pool:
@@ -474,10 +534,10 @@ class KVReqConfig(ResourceReqConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
             positions = layout.positions(self.loop_caps or {})
-            if layout.retention is None and positions > spec.config.max_seq_len:
+            if layout.retention is None and positions > spec.request_limit:
                 raise ValueError(
                     f"this request needs {positions} positions of {label!r}, "
-                    f"past the model's context of {spec.config.max_seq_len}"
+                    f"past the model's context of {spec.request_limit}"
                 )
         pages = self.pages(spec.nodes, self.loop_caps or {}, spec.config)
         if pages > spec.config.request_pages:
@@ -638,6 +698,15 @@ class KVSpec(NodeResourceSpec):
     # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
     # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
+    # On a node that verifies drafts, the pool's max_seq_len is the serving limit plus this
+    # (`DraftConfig.kv_slack`): a request's reserved length runs that far past its verified one,
+    # so a request is held to max_seq_len less it.
+    draft_slack: int = 0
+
+    @property
+    def request_limit(self) -> int:
+        """The positions a request may hold: the pool's max_seq_len, less any draft slack."""
+        return self.config.max_seq_len - self.draft_slack
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -666,6 +735,21 @@ class KVSpec(NodeResourceSpec):
         from mstar.engine.resources.kv.routing import KVRoutingMirror
 
         return KVRoutingMirror(ctx.num_replicas, self.config.num_units, self.config.tokens_per_page, labels)
+
+    def verify_refusal(self, draft) -> str | None:
+        if not isinstance(self.config, PagedKVConfig):
+            return f"a {type(self.config).__name__} pool can't take a verify step's rejected tokens back"
+        if self.config.layout == KVLayout.MLA:
+            return "multi-head latent attention's pool is not supported with speculative decoding yet"
+        if len(self.config.groups) > 1:
+            return "a pool that keeps a sliding window per group can't take tokens back"
+        return None
+
+    def async_verify_refusal(self, draft) -> str | None:
+        if self.config.layout != KVLayout.NHD:
+            # the resident tables, which hold the device lengths, need it
+            return f"the {self.config.layout.value} layout has no resident write path"
+        return None
 
     def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
         # the attentions over a pool decide what it keeps, and their module imports this one

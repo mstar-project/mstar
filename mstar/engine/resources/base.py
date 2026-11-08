@@ -329,6 +329,37 @@ class Resource(ResidentHooks, ABC):
         """
         return
 
+    # Speculative decoding: a verify step commits its whole block of k + 1
+    # tokens a row, and the runner later takes the rejected ones back
+
+    def committed_spans(self, rids, label: str, span: int) -> list[int]:
+        """The span the last commit counted for each of ``rids``' ``label``
+        stream, which a take-back may give back at most."""
+        return [span] * len(rids)
+
+    def verify_hardware_refusal(self) -> str | None:
+        """Its node verifies drafts: set up for it, and say why this resource
+        can't be corrected on the device on this worker (a hardware or install
+        fact), or None. Asked at load, never in the conductor."""
+        return None
+
+    def holds_step(self, rid) -> bool:
+        """``rid`` is in a step admitted here and not yet committed."""
+        return False
+
+    def take_back(self, rids, counts, label: str) -> None:
+        """Give back ``counts`` committed tokens of each of ``rids``' ``label``
+        stream: a verify step's rejected drafts, applied once, at the head of
+        a later admit (`StepRunner`). Only an override is called."""
+        return
+
+    def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
+        """Its node verifies drafts on ``walk``, ``block`` (``k + 1``) tokens a
+        row, and a request's reserved length runs up to ``slack`` past its
+        verified one. Called once at load on every resource of the node; raise to
+        refuse the node."""
+        return
+
     def plan(self, step: ResourceStep, ctx: StepContext) -> Any:
         """ret is immutable and opaque to runner; only gives to `ctx.plan_results`"""
         return None
@@ -497,6 +528,15 @@ class Resource(ResidentHooks, ABC):
         check that the reload was successful."""
         return True
 
+    def debug_fingerprint(self, rid: str) -> "dict[str, bytes | torch.Tensor]":
+        """Digests of ``rid``'s device state that an offload and its reload must
+        bring back unchanged, by part (`Engine.offload_request` under
+        ``MSTAR_KV_DEBUG_ASSERTS``): the pages it moves, and the state it keeps
+        on device across the offload. A device part is a `tensor_digest`, queued on
+        the current stream and never read on the host; a host part is bytes. Debug
+        only. Nothing by default."""
+        return {}
+
     def reclaimable(self, rid: str) -> int:
         """What `offload` would free, in whatever this resource counts.
 
@@ -608,3 +648,23 @@ class PublishedInfo(ABC):
 
 def build_resource(spec: NodeResourceSpec, info: EngineResourceInfo) -> Resource:
     return spec.resource_class.build(spec, info)
+
+
+def tensor_digest(t: torch.Tensor) -> torch.Tensor:
+    """A digest of ``t``'s bytes (`Resource.debug_fingerprint`), computed and kept where
+    ``t`` lives: its 32-bit words summed plain and position-weighted, in wrapping int64,
+    as a ``[2]`` tensor. Nothing reaches the host: the engine compares two on the device
+    (`Engine._check_reload_prints`)."""
+    flat = t.detach().reshape(-1).contiguous()
+    words = flat.view(torch.int32) if flat.numel() * flat.element_size() % 4 == 0 else flat.view(torch.uint8)
+    words = words.to(torch.int64)
+    weights = torch.arange(1, words.numel() + 1, device=words.device, dtype=torch.int64) % 65521 + 1
+    return torch.stack([words.sum(), (words * weights).sum()])
+
+
+def same_fingerprint(a: Mapping, b: Mapping) -> bool:
+    """Whether two `Resource.debug_fingerprint` results agree, part by part. Reads device
+    digests on the host: tests only (the engine compares them on the device)."""
+    if a.keys() != b.keys():
+        return False
+    return all(torch.equal(a[k], b[k]) if torch.is_tensor(a[k]) else a[k] == b[k] for k in a)

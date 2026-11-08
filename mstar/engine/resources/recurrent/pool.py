@@ -283,6 +283,19 @@ class RecurrentStatePool(Resource):
 
     # Storage access
 
+    def debug_fingerprint(self, rid: str) -> "dict[str, bytes | torch.Tensor]":
+        """Each of ``rid``'s slots, every block and layer: a KV offload leaves them
+        on device, so its reload must find them as they were."""
+        from mstar.engine.resources.base import tensor_digest
+
+        return {
+            f"recurrent/{label}/{name}": tensor_digest(
+                block[:, slot.index] if self.config.blocks[name].per_layer else block[slot.index]
+            )
+            for label, slot in (self._slots.get(rid) or {}).items()
+            for name, block in self._blocks.items()
+        }
+
     def block(self, name: str, layer_idx: int | None = None) -> torch.Tensor:
         """One layer's contiguous slot-major view of a block: ``[max_slots + prefix_slots, *shape]``.
         A block that is not per layer takes no ``layer_idx``."""
