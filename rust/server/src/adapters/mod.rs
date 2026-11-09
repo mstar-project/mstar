@@ -76,6 +76,22 @@ pub struct SubmitArgs {
     pub model_kwargs: Map<String, Value>,
     /// A chat's parts, in order; empty on every other path.
     pub parts: Vec<Part>,
+    /// Decoded inputs that go to the model without a file (`submit_request`'s
+    /// `raw_inputs`): openpi's camera images.
+    pub raw_inputs: BTreeMap<String, Vec<RawArray>>,
+    /// `submit_request`'s `end_input` (true, or the client streams it ends) and
+    /// `file_streams`, for a model with client streams; `None` elsewhere.
+    pub end_input: Option<Value>,
+    pub file_streams: Option<Value>,
+}
+
+/// An array as numpy holds one: its `dtype.str` (`|u1`, `<f4`), shape and bytes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RawArray {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
 }
 
 impl Default for SubmitArgs {
@@ -88,6 +104,9 @@ impl Default for SubmitArgs {
             output_modalities: vec!["text".to_string()],
             model_kwargs: Map::new(),
             parts: Vec::new(),
+            raw_inputs: BTreeMap::new(),
+            end_input: None,
+            file_streams: None,
         }
     }
 }
