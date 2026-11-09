@@ -94,9 +94,15 @@ from mstar.model.whisper.config import (
     WORDS_MARKER,
     WhisperModelConfig,
 )
-from mstar.utils.hf_snapshot import SAFETENSORS_SNAPSHOT, resolve_snapshot_dir
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
+
+# What the checkpoint is loaded from: configs, tokenizer files and the weights
+# ``iter_safetensors_shards`` reads (model.safetensors, or the shards
+# model.safetensors.index.json names). whisper-large-v3 also ships an fp32 copy
+# of its weights under other names, which nothing reads.
+CHECKPOINT_FILES = ["*.json", "*.txt", "model.safetensors", "model-*-of-*.safetensors"]
 
 
 class WhisperDetokenizer(ByteLevelDetokenizer):
@@ -159,7 +165,7 @@ class WhisperModel(Model):
         self.model_path_hf = model_path_hf
 
         self.local_dir = str(resolve_snapshot_dir(
-            model_path_hf, cache_dir=cache_dir, allow_patterns=SAFETENSORS_SNAPSHOT,
+            model_path_hf, cache_dir=cache_dir, allow_patterns=CHECKPOINT_FILES,
         ))
         self.config = WhisperModelConfig.from_pretrained(self.local_dir)
         self.AUDIO_INPUT_RATE = self.config.sampling_rate

@@ -31,3 +31,18 @@ def test_the_shared_patterns_keep_a_chat_template_saved_as_jinja():
 
     files = ["config.json", "model.safetensors", "chat_template.jinja", "nano/chat_template.jinja"]
     assert list(filter_repo_objects(files, allow_patterns=SAFETENSORS_SNAPSHOT)) == files
+
+
+def test_whisper_fetches_the_weights_its_loader_reads_and_not_the_fp32_copy():
+    """openai/whisper-large-v3 ships its weights twice; the loader reads
+    model.safetensors (or the shards model.safetensors.index.json names), so
+    the fp32 shards are 6 GB of first-start download nothing opens."""
+    from huggingface_hub.utils import filter_repo_objects
+
+    from mstar.model.whisper.whisper_model import CHECKPOINT_FILES
+
+    read = ["config.json", "generation_config.json", "preprocessor_config.json", "tokenizer.json",
+            "vocab.json", "merges.txt", "normalizer.json", "model.safetensors",
+            "model.safetensors.index.json", "model-00001-of-00002.safetensors"]
+    unread = ["model.fp32-00001-of-00002.safetensors", "pytorch_model.bin", "flax_model.msgpack"]
+    assert list(filter_repo_objects(read + unread, allow_patterns=CHECKPOINT_FILES)) == read
