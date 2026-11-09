@@ -1285,6 +1285,77 @@ def test_a_recurrent_pool_refusal_holds_the_request_since_the_pool_cannot_evict(
     assert engine.residency("n", 1) is Residency.RESIDENT
 
 
+def test_an_offload_another_node_causes_gives_the_slot_up():
+    """Node ``m`` shares ``n``'s KV pool and plans on the host. Its refused admit
+    picks ``n``'s request as the victim (eviction searches every request the pool
+    holds) and offloads it through ``m``: the slot must go on ``n``'s planner,
+    or its row would name pages the pool has freed, and the reload is written
+    whole."""
+    from mstar.engine.resources.runner import StepRunner
+    from mstar.testing_utils.engine import make_engine, make_mgmt
+
+    live = _resources(max_num_pages=8)
+    owned = {k: live[k] for k in ("kv", "pool", "rope")}
+    planner = ResidentPlanner("n", {WALK}, owned, CPU, max_bs=4)
+    for rid, tokens in ((1, 7), (2, 7), (3, 11)):
+        _ingest(live, rid)
+        step, ctx = _host_step(live, [rid], [tokens])
+        planner.commit(step, ctx)
+    kv = live["kv"]
+    _HostPagesKV(kv)
+    _captured_step(live, planner, [1, 2, 3], slot=0, bs=3)
+    assert planner.slot_of(3) is not None and kv._arena.num_free == 0
+    engine = make_engine(
+        _resources=owned,
+        _submodules={
+            "n": make_mgmt(resources=owned, resident=planner),
+            "m": make_mgmt(resources={"kv": kv}, resident=None),
+        },
+        _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
+        _resource_planners=dict.fromkeys(owned, planner),
+    )
+
+    # a step of m's over n's two short rows, crossing a page: the pool refuses
+    step = SubmoduleStep(segments=[Segment(rid, "main", 1) for rid in (1, 2)], steps={"kv": KVStep()})
+    step.set_ctx(StepContext(request_ids=(1, 2), graph_walk="other", slot=0, capture=False))
+    outcome = StepRunner({"kv": kv}).admit(step)
+    assert not outcome.ok and outcome.failed_resource == "kv"
+
+    worker = _refused_worker(engine, line=[1, 2, 3])
+    batch = ScheduledBatch(node_name="m", graph_walk="other", request_to_worker_graph={1: "g", 2: "g"})
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason, outcome.failed_resource))
+    assert engine.residency("m", 3) is Residency.ON_HOST
+    assert planner.slot_of(3) is None, "the offload left n's row naming freed pages"
+
+    for key in ("kv", "pool", "rope"):
+        live[key].remove_request(2)
+    planner.release(2)
+    assert engine.reload_request("n", 3)
+    s = _captured_step(live, planner, [3], slot=0, bs=1)
+    assert s.ctx.resident_plan.taken == {3}
+    assert kv._resident.host_len[planner.slot_of(3)] == kv._streams[3]["main"].stored_len
+    _assert_step_read_its_streams(live, s, [3])
+    _assert_row(planner, live, 3)
+
+
+def test_a_host_step_of_another_node_over_a_held_row_marks_it():
+    """A node sharing the resident node's pool, without a planner, runs a host
+    step: over a row the planner holds it marks the row as the node's own host
+    step would; over other rows nothing."""
+    live, ref, planner = _setup({1: 9, 2: 9})
+    del ref
+    _captured_step(live, planner, [1, 2], slot=0, bs=2)
+    commits = planner._commits
+    _ingest(live, 3)
+    other, ctx = _host_step(live, [3], [5])
+    planner.note_foreign_step(other, ctx)
+    assert planner._commits == commits and not planner._moved and not planner._stale
+    step, ctx = _host_step(live, [1, 2], [1, 4])
+    planner.note_foreign_step(step, ctx)
+    assert planner._commits == commits
+    assert planner._moved == {1} and planner._stale == {2}
+
+
 def test_a_follower_replaying_an_offload_gives_the_slot_up_too():
     live, ref, planner = _setup({1: 9})
     del ref
@@ -1746,10 +1817,27 @@ def test_a_resource_without_a_table_refuses():
     assert planner is None and "_Spare keeps no resident table" in why
 
 
-def test_a_pool_shared_by_nodes_refuses():
+def test_a_pool_shared_with_a_host_planned_node_builds():
     res = _resources()
-    planner, why = _build({"kv": res["kv"]}, nodes={"kv": ("a", "b")})
-    assert planner is None and "shared by nodes" in why
+    planner, why = _build({"kv": res["kv"]}, nodes={"kv": ("n", "m")})
+    assert planner is not None and why == ""
+
+
+def test_a_pool_shared_with_another_resident_node_refuses():
+    # a resource binds one planner's tables
+    res = _resources()
+    planner, why = build_planner("n", (WALK,), {"kv": res["kv"]}, {"kv": ("n", "m")}, CPU, 4, resident_nodes={"m"})
+    assert planner is None and "shared with resident node(s) ['m']" in why
+
+
+def test_a_pool_shared_with_a_lockstep_node_refuses():
+    # offloads are journalled per node, so a follower's replay order across nodes is undefined
+    res = _resources()
+    planner, why = build_planner("n", (WALK,), {"kv": res["kv"]}, {"kv": ("n", "m")}, CPU, 4, sharded_nodes={"m"})
+    assert planner is None and "in lockstep" in why
+    # unshared, a lockstep node keeps its planner
+    planner, why = build_planner("n", (WALK,), {"kv": res["kv"]}, {"kv": ("n",)}, CPU, 4, sharded_nodes={"n"})
+    assert planner is not None
 
 
 def test_a_pool_read_across_nodes_refuses():

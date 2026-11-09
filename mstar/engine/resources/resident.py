@@ -220,6 +220,11 @@ class CapturedResidentStep:
     lengths_only: set[str] = field(default_factory=set)
 
 
+def _step_segments(step: SubmoduleStep) -> list:
+    """A step's rows: its own segments, else its resources' steps'."""
+    return step.segments or [seg for s in step.steps.values() for seg in s.segments or ()]
+
+
 class ResidentPlanner:
     """One node's request slots, tables and per-step rows.
 
@@ -557,6 +562,15 @@ class ResidentPlanner:
             resource.resident_advance(plan)
         self._committed_seq = plan.seq
 
+    def note_foreign_step(self, step: SubmoduleStep, ctx) -> None:
+        """A host-planned step of another node sharing these tables' resources:
+        a row of this planner's that it moved is marked as one of this node's
+        own host steps would mark it. No pre-plan can be staged here, since the
+        step commits before its commit event, and the plan thread pre-plans the
+        next step only after that event."""
+        if self._slot_of:
+            self._note_host_step(step, ctx)
+
     def _note_host_step(self, step: SubmoduleStep, ctx) -> None:
         """A host-planned step moved its rows without their tables. A
         one-token row moved as a resident step would have, and needs only its
@@ -564,7 +578,7 @@ class ResidentPlanner:
         held = self._slot_of
         if not held:
             return
-        segments = step.segments or [seg for s in step.steps.values() for seg in s.segments or ()]
+        segments = _step_segments(step)
         one = [seg.request_id for seg in segments if seg.span == 1 and seg.request_id in held]
         rest = [seg.request_id for seg in segments if seg.span != 1 and seg.request_id in held]
         with self._lock:
@@ -638,18 +652,33 @@ class ResidentPlanner:
 def build_planner(
     node: str, walks: Iterable[str], resources: Mapping[str, Resource],
     resource_nodes: Mapping[str, Collection[str]], device: torch.device, max_bs: int,
+    resident_nodes: Collection[str] = (), sharded_nodes: Collection[str] = (),
 ) -> tuple[ResidentPlanner | None, str]:
     """A planner for ``node``, or None and why not. Every resource of the node
     must be able to, since a capture is one graph: one host-planned resource
-    would need the row a resident step no longer stages."""
+    would need the row a resident step no longer stages.
+
+    A resource shared with other nodes binds this one planner, so it is refused
+    when another node sharing it names resident walks too (``resident_nodes``),
+    and, for now, when any node sharing it runs in lockstep (``sharded_nodes``):
+    offloads are journalled per node, so a follower could replay one node's
+    offload and another's reload in either order. The other nodes' steps stay
+    host-planned; an offload any of them causes gives up the slot here too
+    (``Engine._release_resident_slot``)."""
     walks = frozenset(walks)
     if not walks:
         return None, "its submodule names no resident walk"
     if max_bs < 1:
         return None, f"nothing captures its resident walks {sorted(walks)}"
     for key, resource in resources.items():
-        if len(resource_nodes.get(key, ())) > 1:
-            return None, f"resource {key!r} is shared by nodes {sorted(resource_nodes[key])}"
+        sharers = set(resource_nodes.get(key, ())) - {node}
+        if sharers & set(resident_nodes):
+            return None, (
+                f"resource {key!r} is shared with resident node(s) {sorted(sharers & set(resident_nodes))}, "
+                "and binds one planner"
+            )
+        if sharers and ({node} | sharers) & set(sharded_nodes):
+            return None, f"resource {key!r} is shared by nodes {sorted({node} | sharers)}, one of them in lockstep"
         refusal = resource.resident_refusal()
         if refusal is not None:
             return None, f"resource {key!r}: {refusal}"
