@@ -61,6 +61,7 @@ class ParakeetModel(Model):
     MAX_CONCURRENT_REQUESTS = 128
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
+    PREPROCESS_PARALLEL = True
     INTERNAL_KWARGS = (NUM_FRAMES, PROMPT_ID)
 
     def __init__(

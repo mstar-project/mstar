@@ -73,6 +73,8 @@ class OmnilingualASRModel(Model):
       (320): padded audio per forward; a step over it runs as several forwards.
     """
 
+    PREPROCESS_PARALLEL = True
+
     def __init__(
         self,
         model_path_hf: str | None = None,
