@@ -65,12 +65,13 @@ class _Adapter:
 
 
 def test_a_video_handler_result_renders_to_the_old_body():
-    from types import SimpleNamespace
-
     from mstar.api_server.openai import serving_videos
 
     mp4 = os.urandom(123_457)
-    result = asyncio.run(serving_videos.create_videos(_Api(mp4), "m", _Adapter(), SimpleNamespace(model="m")))
+    from mstar.api_server.openai.protocol import VideoGenerationRequest
+
+    req = VideoGenerationRequest(model="m", prompt="x")
+    result = asyncio.run(serving_videos.create_videos(_Api(mp4), "m", _Adapter(), req))
     assert base64.b64decode(result["data"][0]["b64_json"]) == mp4
     old = {"created": result["created"], "data": [{"b64_json": base64.b64encode(mp4).decode("ascii"), "url": None}]}
     assert MediaJSONResponse(result).body == JSONResponse(old).body
