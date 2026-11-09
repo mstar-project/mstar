@@ -249,7 +249,7 @@ def _receiving_worker(manager, sharding_config: ShardingConfig) -> Worker:
     request_state = RequestStateManager()
     w = make_worker(
         worker_id=manager.my_entity_id,
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
             add_request=lambda request_id, **kw: rids.intern(request_id),
             get_rid_handle=rids.handle,
             get_sharding_config=lambda rid: sharding_config,
