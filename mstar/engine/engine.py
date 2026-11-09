@@ -278,10 +278,9 @@ class SubmoduleManagement:
     def rows_idle(self, rids) -> bool:
         """Whether none of ``rids`` uses the node's idle-capable resources, which then sit
         the step out (``Resource.idle_for``). False at once for a node with none. Each
-        resource answers from its ingests, the same on every rank, except for a row
-        removed while the plan thread leases: one rank can then replay the idle graph and
-        another the plain one, which is safe only because an idle-capable resource's
-        kernels hold no collective (``Resource.idle_capture``)."""
+        resource answers from the ingests of ``rids``, so every rank answers the same: a
+        step's rows are held (``StepPipeline._hold_rows``) before its pre-plan leases, and
+        their removes wait until no step holds them (``RequestLifecycle.removes_ready``)."""
         keys = self.idle_keys
         return bool(keys) and all(self.resources[key].idle_for(rids) for key in keys)
 
