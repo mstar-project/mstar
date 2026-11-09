@@ -331,9 +331,9 @@ class Admission:
             if too_big and could_refill():
                 self.cap_batch(batch.node_name, batch.graph_walk, alone, failed)
             logger.warning(
-                "OOM on node=%s walk=%s: offloaded victim=%s, "
+                "OOM on node=%s walk=%s: offloaded one request, "
                 "retrying %d remaining requests",
-                batch.node_name, batch.graph_walk, victim_id,
+                batch.node_name, batch.graph_walk,
                 len(batch_ids) - (1 if victim_id in batch_ids else 0),
             )
             return
