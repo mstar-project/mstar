@@ -28,6 +28,7 @@
 mod adapters;
 mod auth;
 mod bridge;
+mod generation_kwargs;
 mod media;
 mod protocol;
 mod refusals;
@@ -36,6 +37,7 @@ mod serving;
 mod sndfile;
 mod speech_chunking;
 mod tokenizer;
+mod transcription;
 mod unicode_marks;
 mod utf8;
 
@@ -182,6 +184,12 @@ async fn main() {
     let api = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/audio/speech", post(audio_speech))
+        // an upload of up to 30 minutes: the route's own, larger body limit
+        .route(
+            "/v1/audio/transcriptions",
+            post(transcription::audio_transcriptions)
+                .layer(DefaultBodyLimit::max(transcription::body_limit_bytes(body_limit_mb << 20))),
+        )
         .route("/v1/images/generations", post(images_generations))
         .route("/v1/images/edits", post(images_edits))
         .route("/v1/videos/generations", post(videos_generations))
@@ -308,6 +316,7 @@ enum Surface {
     Speech,
     Images,
     Videos,
+    Transcriptions,
 }
 
 /// The OpenAI error `type` for a status: a 4xx is the client's
@@ -485,6 +494,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter
         Surface::Speech => adapter.supports_speech(),
         Surface::Images => adapter.supports_images(),
         Surface::Videos => adapter.supports_videos(),
+        Surface::Transcriptions => adapter.supports_transcriptions(),
     };
     if !ok {
         return Err(error(

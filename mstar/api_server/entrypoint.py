@@ -3234,9 +3234,11 @@ def main(argv: list[str] | None = None):
         if args.rust_frontend:
             import tempfile
 
+            from mstar.api_server.openai.adapters import get_adapter
             from mstar.api_server.rust_frontend import (
                 RustFrontendBridge,
                 launch_rust_server,
+                transcription_facts,
             )
 
             bridge_dir = tempfile.mkdtemp(prefix="mstar_rust_frontend_")
@@ -3249,7 +3251,8 @@ def main(argv: list[str] | None = None):
                 args.port, bridge_dir, args.upload_dir, api_key=api_key,
                 timeout_s=args.timeout,
                 sample_rate=model.get_output_sample_rate("audio") if model is not None else None,
-                served_models=api_server.served_models)
+                served_models=api_server.served_models,
+                transcription=transcription_facts(api_server, get_adapter(model_name)))
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
