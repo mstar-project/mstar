@@ -7,6 +7,9 @@ max_seq_len: 65536
 # two pools hold about 32 of them at full size.
 # More long files than that at once can stall (see docs/asr.rst).
 max_concurrent_requests: 64
+# See whisper_large_v3_turbo.yaml; level at a held clock, 60-75% at the default one.
+knobs:
+  step_threads: serial
 resources:
   kv_cache:
     max_num_pages: 3500
