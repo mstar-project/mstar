@@ -1,5 +1,8 @@
 model: "cosmos3_droid"
 max_seq_len: null  # retain the model's context limit for chat and video latents
+# A robot sends one request at a time, so there is nothing for the data
+# worker's prepare pool to overlap (Cosmos3 declares PREPROCESS_PARALLEL).
+preprocess_workers: 1
 # KV pool sizing, matching the Nano config: the checkpoint is Nano-sized and
 # still serves the full video paths (forward dynamics decodes a rollout
 # video), so it keeps the pool that covers single-request video at every tier.

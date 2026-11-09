@@ -150,6 +150,10 @@ class Cosmos3Model(Model):
 
     PREPROCESS_ONLY_KWARGS = ("action", "robot_state")
     REPLICA_AFFINITY_KWARG = "session_id"
+    # Requests prepare at once: the loaders and process_prompt keep no shared
+    # state, and their work (image decode, resize, torch ops) releases the GIL.
+    # Inline, a burst of image prompts queued ~10 ms each behind one another.
+    PREPROCESS_PARALLEL = True
     # The width of a policy request's robot_state, which process_prompt hands
     # the conductor (the values themselves ride the action_inputs edge).
     INTERNAL_KWARGS = ("robot_state_dim", "action_shape")

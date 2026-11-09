@@ -1178,6 +1178,65 @@ class LTX25Adapter(OpenAIAdapter):
         )
 
 
+class MiniMaxH3Adapter(OpenAIAdapter):
+    """MiniMax-H3: one mp4 with the 32 kHz stereo audio as AAC (``extra_body.audio: false``
+    for video alone). ``size`` is "WxH"; ``image`` is the first frame and
+    ``extra_body.last_image`` the last; the other knobs pass through ``extra_body``. Only
+    24 fps.
+    """
+
+    supports_videos = True
+
+    def video_to_request(self, req: VideoGenerationRequest, upload_dir: Path) -> SubmitArgs:
+        if getattr(req, "video", None):
+            raise ValueError("MiniMax-H3 takes keyframes ('image', extra_body 'last_image'), not a 'video'.")
+        if getattr(req, "fps", None) not in (None, 24, 24.0):
+            raise ValueError(f"MiniMax-H3 generates at 24 fps; got fps={req.fps!r}")
+        if getattr(req, "n", None) not in (None, 1):
+            raise ValueError(f"MiniMax-H3 generates one video per request; got n={req.n!r}")
+        mk = _passthrough(req)
+        with_audio = mk.pop("audio", None)
+        if with_audio is None:  # unset or null: the default, sound
+            with_audio = True
+        if not isinstance(with_audio, bool):
+            raise ValueError(f"extra_body 'audio' must be true or false; got {with_audio!r}")
+        last_image = mk.pop("last_image", None)
+        if getattr(req, "size", None):
+            try:
+                width, height = (int(v) for v in req.size.lower().split("x"))
+            except ValueError:
+                raise ValueError(f"size must be 'WxH' (e.g. '1344x768'); got {req.size!r}") from None
+            mk.setdefault("width", width)
+            mk.setdefault("height", height)
+        for name in ("seed", "num_frames"):
+            if getattr(req, name, None) is not None:
+                mk.setdefault(name, getattr(req, name))
+        refs = [(anchor, ref) for anchor, ref in (("first", getattr(req, "image", None)), ("last", last_image))
+                if ref is not None]
+        for anchor, ref in refs:
+            if not isinstance(ref, str):
+                name = "image" if anchor == "first" else "extra_body 'last_image'"
+                raise ValueError(f"{name} must be a data URL; got {type(ref).__name__}")
+        paths: list[str] = []
+        try:
+            for _, ref in refs:
+                paths.append(media_io.resolve_media_ref(ref, upload_dir)[1])
+        except BaseException:
+            # a refused request is never submitted, so no deferred cleanup covers the
+            # keyframe saved before the refusal
+            media_io.remove_uploads({"image": paths}, upload_dir)
+            raise
+        if paths:
+            mk["keyframe_anchors"] = [anchor for anchor, _ in refs]
+        return SubmitArgs(
+            text=req.prompt,
+            file_paths={"image": paths} if paths else None,
+            input_modalities=["image", "text"] if paths else ["text"],
+            output_modalities=["video", "audio"] if with_audio else ["video"],
+            model_kwargs=mk,
+        )
+
+
 class DiffusionImageAdapter(OpenAIAdapter):
     """Generic adapter for the DiT-scaffold image models (FLUX.2 klein, Z-Image, ...):
     text-to-image and reference-image editing.
@@ -1685,6 +1744,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
     "ltx2_5": LTX25Adapter(),
+    "minimax_h3": MiniMaxH3Adapter(),
     "whisper_large": WhisperAdapter(),
     "whisper_large_v3_turbo": WhisperAdapter(),
     "qwen3_asr": Qwen3ASRAdapter(),
