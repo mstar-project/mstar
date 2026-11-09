@@ -32,6 +32,7 @@ mod client_errors;
 mod generation_kwargs;
 mod media;
 mod protocol;
+mod realtime;
 mod refusals;
 mod served_models;
 mod serving;
@@ -150,6 +151,9 @@ async fn main() {
     }
 
     sndfile::init();
+    if adapters::from_python(&python_adapter).is_some_and(|a| a.supports_realtime_transcription()) {
+        realtime::report_availability();
+    }
     let served = Arc::new(served_models::ServedModels::from_env(&model_name));
 
     let refusals = Arc::new(refusals::Refusals::default());
@@ -217,6 +221,7 @@ async fn main() {
         .route("/", get(ws::openpi::openpi_ws))
         .route("/healthz", get(ws::openpi::healthz))
         .route("/generate/ws", get(ws::generate::generate_ws))
+        .route("/v1/realtime", get(realtime::realtime))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
@@ -325,6 +330,7 @@ enum Surface {
     Images,
     Videos,
     Transcriptions,
+    RealtimeTranscription,
 }
 
 /// The OpenAI error `type` for a status: a 4xx is the client's
@@ -486,6 +492,18 @@ fn check_request_id(id: &str) -> Result<(), String> {
 /// Resolve the loaded model's adapter and check it serves `surface`; otherwise
 /// an OpenAI-shaped error response (404), matching router.py `_resolve`.
 fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter, Response> {
+    let unknown = adapters::from_python(&st.python_adapter).is_none();
+    resolve_message(st, surface).map_err(|message| {
+        if unknown {
+            error(404, &message, "model_not_found")
+        } else {
+            error(404, &message, "invalid_request_error")
+        }
+    })
+}
+
+/// The adapter that serves `surface`, or why none does (`router._resolve`'s message).
+fn resolve_message(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter, String> {
     let message = if st.python_adapter.is_empty() {
         format!("Model '{}' has no OpenAI-compatible adapter; use POST /generate", st.model_name)
     } else {
@@ -495,21 +513,17 @@ fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter
             st.model_name, st.python_adapter
         )
     };
-    let adapter = adapters::from_python(&st.python_adapter)
-        .ok_or_else(|| error(404, &message, "model_not_found"))?;
+    let adapter = adapters::from_python(&st.python_adapter).ok_or(message)?;
     let ok = match surface {
         Surface::Chat => adapter.supports_chat(),
         Surface::Speech => adapter.supports_speech(),
         Surface::Images => adapter.supports_images(),
         Surface::Videos => adapter.supports_videos(),
         Surface::Transcriptions => adapter.supports_transcriptions(),
+        Surface::RealtimeTranscription => adapter.supports_realtime_transcription(),
     };
     if !ok {
-        return Err(error(
-            404,
-            &format!("Model '{}' does not support this endpoint", st.model_name),
-            "invalid_request_error",
-        ));
+        return Err(format!("Model '{}' does not support this endpoint", st.model_name));
     }
     Ok(adapter)
 }

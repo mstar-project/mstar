@@ -17,6 +17,7 @@ protocol are untouched):
                        | {t:"voices", rid, sub}
                        | {t:"windows", rid, sub, op, plan, ...}
                        | {t:"live", rid, sub, op, call, ...}
+                       | {t:"end_of_turn", rid, sub, audio(bin)}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
@@ -26,6 +27,7 @@ protocol are untouched):
                        | {t:"voices", rid, sub, metadata:{voices?}}
                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
                        | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status}}
+                       | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}
 
 A ``live`` request is one operation on a ``/generate/ws`` live call, the
 submission ``call`` names: ``taking`` (``taking_input``), ``append``
@@ -206,6 +208,8 @@ OPENPI_ENV = "MSTAR_OPENPI"
 WS_MAX_BYTES_ENV = "MSTAR_WS_MAX_BYTES"
 #: The model's client streams, as JSON: a request to a model with any is a live call.
 CLIENT_STREAMS_ENV = "MSTAR_CLIENT_STREAMS"
+#: What ``/v1/realtime`` runs with, as JSON (``realtime_facts``).
+REALTIME_ENV = "MSTAR_REALTIME"
 
 
 class WindowOp(StrEnum):
@@ -294,19 +298,62 @@ def openpi_facts(policy) -> dict | None:
     }
 
 
+def onnxruntime_library() -> str | None:
+    """The ONNX Runtime library the ``onnxruntime`` package loads, for mstar-server
+    to score turn detection with the same runtime; ``None`` without it."""
+    try:
+        import onnxruntime
+    except ImportError:
+        return None
+    # the versioned name (libonnxruntime.so.1.31.1) is the file itself
+    libs = sorted(Path(onnxruntime.__file__).parent.joinpath("capi").glob("libonnxruntime.so*"),
+                  key=lambda p: len(p.name))
+    return str(libs[-1]) if libs else None
+
+
+def realtime_facts(server, adapter, directory: str) -> dict | None:
+    """``REALTIME_ENV``'s value for a model with a realtime transcription surface:
+    ONNX Runtime's library and Silero's weights (``None`` where this server has
+    none, which leaves server_vad off as it is here), why Smart Turn did not
+    load (``None`` when it did), and the model's tokenizer, saved under
+    ``directory`` for the stable prefix. ``None`` for any other model."""
+    if adapter is None or not getattr(adapter, "supports_realtime_transcription", False):
+        return None
+    from mstar.api_server.openai import realtime_vad
+
+    def file(path):
+        return str(path) if path is not None and Path(path).is_file() else None
+
+    # semantic_vad's end-of-turn model runs here, over the bridge (``_end_of_turn``)
+    facts = {
+        "onnxruntime": onnxruntime_library(),
+        "silero": file(realtime_vad.silero_weights()),
+        "smart_turn_problem": None if realtime_vad.smart_turn() is not None else realtime_vad.smart_turn_problem(),
+        "tokenizer": None,
+    }
+    tokenizer = getattr(getattr(server, "model", None), "tokenizer", None)
+    if tokenizer is not None and getattr(tokenizer, "is_fast", False):
+        path = Path(directory) / "tokenizer.json"
+        tokenizer.backend_tokenizer.save(str(path))
+        facts["tokenizer"] = str(path)
+    return facts
+
+
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
                        api_key: str | None = None, timeout_s: float | None = None,
                        sample_rate: int | None = None, served_models=None,
                        transcription: dict | None = None, openpi: dict | None = None,
-                       ws_max_bytes: int | None = None, client_streams=()) -> subprocess.Popen:
+                       ws_max_bytes: int | None = None, client_streams=(),
+                       realtime: dict | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
     (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
     ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a
     request's ``model`` selects; ``None`` serves the base model alone.
     ``transcription`` is ``transcription_facts``' for the served model, ``openpi``
     ``openpi_facts``' for its policy, ``ws_max_bytes`` the config's WebSocket
-    message limit, and ``client_streams`` the model's (``APIServer.client_streams``)."""
+    message limit, ``client_streams`` the model's (``APIServer.client_streams``), and
+    ``realtime`` ``realtime_facts``' for its realtime surface."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -333,6 +380,9 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     if ws_max_bytes is not None:
         env[WS_MAX_BYTES_ENV] = str(int(ws_max_bytes))
     env[CLIENT_STREAMS_ENV] = json.dumps(sorted(client_streams))
+    env.pop(REALTIME_ENV, None)
+    if realtime is not None:
+        env[REALTIME_ENV] = json.dumps(realtime)
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile
@@ -607,6 +657,31 @@ class RustFrontendBridge:
         reply["metadata"] = meta
         self._send(reply)
 
+    def _end_of_turn(self, msg: dict) -> None:
+        """``semantic_vad``'s end-of-turn probability of a turn's last audio
+        (float32), by this side's Smart Turn: its int8 model moves by tenths
+        when its features move by 1e-5, so the frontend asks rather than
+        computing the features itself. Off this loop: a call is about 45 ms."""
+        reply = {"t": "end_of_turn", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+
+        async def run() -> None:
+            try:
+                import numpy as np
+
+                from mstar.api_server.openai import realtime_vad
+
+                model = realtime_vad.smart_turn()
+                if model is None:
+                    raise RuntimeError(realtime_vad.smart_turn_problem())
+                audio = np.frombuffer(msg["audio"], dtype="<f4")
+                reply["metadata"] = {"p": float(await asyncio.to_thread(model, audio))}
+            except Exception as exc:  # noqa: BLE001 — the session goes on without the model
+                logger.exception("bridge: the end-of-turn model failed")
+                reply["metadata"] = {"error": f"{type(exc).__name__}: {exc}"}
+            self._send(reply)
+
+        self.loop.create_task(run())
+
     def _in_uploads(self, path: Path) -> bool:
         return path.resolve().is_relative_to(Path(self.server.upload_dir).resolve())
 
@@ -725,6 +800,8 @@ class RustFrontendBridge:
             self._windows(msg)
         elif t == "live":
             self._live(msg)
+        elif t == "end_of_turn":
+            self._end_of_turn(msg)
         else:
             logger.warning("bridge: unknown message type %r", t)
 

@@ -141,9 +141,21 @@ struct ProbeMsg<'a> {
     refusals: Option<&'a Snapshot>,
     #[serde(flatten)]
     check: Option<&'a RefAudioCheck>,
-    /// A `windows` request's operation and its arguments.
+    /// A `windows` or `live` request's operation and its arguments.
     #[serde(flatten)]
     windows: Option<&'a serde_json::Map<String, Value>>,
+    /// An `end_of_turn` request's audio, float32 little-endian.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio: Option<&'a serde_bytes::Bytes>,
+}
+
+/// What a probe carries besides its kind.
+#[derive(Default, Clone, Copy)]
+struct Extras<'a> {
+    refusals: Option<&'a Snapshot>,
+    check: Option<&'a RefAudioCheck>,
+    op: Option<&'a serde_json::Map<String, Value>>,
+    audio: Option<&'a [u8]>,
 }
 
 /// Inbound message; `t` selects chunk / err / done. `data` is msgpack binary.
@@ -369,19 +381,20 @@ impl Bridge {
     /// Send `{t}` to the bridge loop and wait for its one reply (routed like
     /// a completed request). None on timeout: the bridge loop or the backend
     /// behind it is gone.
-    async fn round_trip(
-        &self,
-        t: &str,
-        refusals: Option<&Snapshot>,
-        check: Option<&RefAudioCheck>,
-        extra: Option<&serde_json::Map<String, Value>>,
-        timeout: Duration,
-    ) -> Option<StreamItem> {
+    async fn round_trip(&self, t: &str, extras: Extras<'_>, timeout: Duration) -> Option<StreamItem> {
         let rid = format!("{t}-{}", uuid::Uuid::new_v4());
         let (tx, mut rx) = unbounded_channel();
         let sub = self.next_sub.fetch_add(1, Ordering::Relaxed);
         self.routes.lock().expect("routes lock").routes.insert(sub, Route { tx, rid: None });
-        let msg = ProbeMsg { t, rid: &rid, sub, refusals, check, windows: extra };
+        let msg = ProbeMsg {
+            t,
+            rid: &rid,
+            sub,
+            refusals: extras.refusals,
+            check: extras.check,
+            windows: extras.op,
+            audio: extras.audio.map(serde_bytes::Bytes::new),
+        };
         if let Ok(payload) = rmp_serde::to_vec_named(&msg) {
             let _ = self.mbox.send("bridge", &payload);
         }
@@ -393,14 +406,14 @@ impl Bridge {
     /// Liveness round-trip for the deep health check: send `{t:"ping"}` and
     /// wait for the backend's pong. False on timeout.
     pub async fn ping(&self, timeout: Duration) -> bool {
-        self.round_trip("ping", None, None, None, timeout).await.is_some()
+        self.round_trip("ping", Extras::default(), timeout).await.is_some()
     }
 
     /// The API server's `/metrics` reply, asked with this frontend's refusal
     /// counts: the rendered text in `data` and, when metrics are on, its
     /// `content_type` in `metadata`. None on timeout.
     pub async fn metrics(&self, refusals: &Snapshot, timeout: Duration) -> Option<ResultChunk> {
-        match self.round_trip("metrics", Some(refusals), None, None, timeout).await? {
+        match self.round_trip("metrics", Extras { refusals: Some(refusals), ..Extras::default() }, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
         }
@@ -410,7 +423,7 @@ impl Bridge {
     /// Python route asks it (a model's list can change while it serves): `Ok(None)`
     /// when the model publishes no list, `Err` on timeout or a failure there.
     pub async fn voices(&self, timeout: Duration) -> Result<Option<Value>, (u16, String)> {
-        match self.round_trip("voices", None, None, None, timeout).await {
+        match self.round_trip("voices", Extras::default(), timeout).await {
             Some(StreamItem::Chunk(mut chunk)) => Ok(chunk.metadata.get_mut("voices").map(Value::take)),
             Some(StreamItem::Error { status, message }) => Err((status, message)),
             _ => Err((503, "backend bridge unreachable".to_string())),
@@ -422,7 +435,7 @@ impl Bridge {
     /// `single` and the `windows` it cut, or the `error` it raised. None on
     /// timeout.
     pub async fn windows(&self, op: &Value, timeout: Duration) -> Option<ResultChunk> {
-        match self.round_trip("windows", None, None, op.as_object(), timeout).await? {
+        match self.round_trip("windows", Extras { op: op.as_object(), ..Extras::default() }, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk),
             _ => None,
         }
@@ -435,9 +448,24 @@ impl Bridge {
     pub async fn live(&self, call: u64, op: &str, mut args: serde_json::Map<String, Value>, timeout: Duration) -> Option<Value> {
         args.insert("op".into(), Value::from(op));
         args.insert("call".into(), Value::from(call));
-        match self.round_trip("live", None, None, Some(&args), timeout).await? {
+        match self.round_trip("live", Extras { op: Some(&args), ..Extras::default() }, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk.metadata),
             _ => None,
+        }
+    }
+
+    /// `semantic_vad`'s end-of-turn probability of a turn's last audio, from the
+    /// API server's Smart Turn (`realtime_vad.smart_turn`): the int8 model moves
+    /// by tenths when its input features move by 1e-5, so only the reference's
+    /// own feature extractor makes the same turns.
+    pub async fn end_of_turn(&self, audio: &[f32], timeout: Duration) -> Result<f64, String> {
+        let bytes: Vec<u8> = audio.iter().flat_map(|f| f.to_le_bytes()).collect();
+        match self.round_trip("end_of_turn", Extras { audio: Some(&bytes), ..Extras::default() }, timeout).await {
+            Some(StreamItem::Chunk(c)) => match c.metadata.get("p").and_then(Value::as_f64) {
+                Some(p) => Ok(p),
+                None => Err(c.metadata.get("error").and_then(Value::as_str).unwrap_or("no probability").to_string()),
+            },
+            _ => Err("the API server did not answer".to_string()),
         }
     }
 
@@ -469,7 +497,7 @@ impl Bridge {
     /// deleted there.
     pub async fn check_ref_audio(&self, check: &RefAudioCheck, timeout: Duration) -> Result<(), (u16, String)> {
         let start = std::time::Instant::now();
-        match self.round_trip("check_ref_audio", None, Some(check), None, timeout).await {
+        match self.round_trip("check_ref_audio", Extras { check: Some(check), ..Extras::default() }, timeout).await {
             Some(StreamItem::Done) => Ok(()),
             Some(StreamItem::Error { status, message }) => Err((status, message)),
             // the request's budget ran out, as the Python frontend's request would
@@ -538,7 +566,7 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" | "live" => (
+        "metrics" | "voices" | "windows" | "live" | "end_of_turn" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),
@@ -806,17 +834,17 @@ mod tests {
         };
         let snap = Snapshot { route: vec!["/generate".into()], status: vec![401], count: vec![3] };
         assert_eq!(
-            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap), check: None, windows: None }),
+            encode(&ProbeMsg { t: "metrics", rid: "m", sub: 4, refusals: Some(&snap), check: None, windows: None, audio: None }),
             json!({"t": "metrics", "rid": "m", "sub": 4,
                    "refusals": {"route": ["/generate"], "status": [401], "count": [3]}})
         );
         assert_eq!(
-            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None, check: None, windows: None }),
+            encode(&ProbeMsg { t: "ping", rid: "p", sub: 5, refusals: None, check: None, windows: None, audio: None }),
             json!({"t": "ping", "rid": "p", "sub": 5})
         );
         let check = RefAudioCheck { path: "/u/a.wav".into(), decoder: "soundfile", bare: true };
         assert_eq!(
-            encode(&ProbeMsg { t: "check_ref_audio", rid: "c", sub: 6, refusals: None, check: Some(&check), windows: None }),
+            encode(&ProbeMsg { t: "check_ref_audio", rid: "c", sub: 6, refusals: None, check: Some(&check), windows: None, audio: None }),
             json!({"t": "check_ref_audio", "rid": "c", "sub": 6, "path": "/u/a.wav", "decoder": "soundfile", "bare": true})
         );
     }

@@ -301,6 +301,17 @@ impl OpenAIAdapter for Qwen3ASR {
         gk::remove(&mut mk, "timestamps");
         Ok(audio_args(audio_path, String::new(), &["audio", "text"], mk))
     }
+    fn supports_realtime_transcription(&self) -> bool {
+        true
+    }
+    /// A step continues the hypothesis through the assistant turn's prefill.
+    fn realtime_step_request(&self, req: &TranscriptionRequest, audio_path: &str, prefix: &str) -> Result<SubmitArgs, String> {
+        let mut args = self.transcription_to_request(req, audio_path)?;
+        if !prefix.is_empty() {
+            args.model_kwargs.insert("assistant_prefix".into(), Value::from(prefix));
+        }
+        Ok(args)
+    }
     fn stream_text(&self, raw: &str) -> String {
         // a detected language opens the stream as `language X<asr_text>`: hold the
         // text back until the tag is in

@@ -42,6 +42,10 @@ regex = "1"
 # Dynamic msgpack for openpi's observations and /generate/ws's binary frames;
 # already in the tree through the transport crate.
 rmpv = "1.3"
+# /v1/realtime's speech detection: Silero VAD through the ONNX Runtime library
+# the Python side loads, opened at run time (`load-dynamic`), so both frontends
+# score a frame with the same runtime and no binary is downloaded at build time.
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["load-dynamic", "std"] }
 
 [dev-dependencies]
 # a paused clock for the upload-cleanup test; the same tokio
