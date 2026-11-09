@@ -370,8 +370,8 @@ class Allotment:
     request on the host covers its reload, and ``returning`` is set while the request returns from the host: the
     pages it may take beyond its reload. ``passed`` is set for a request admitted past a head that doesn't fit,
     and its allotment then covers its growth too. ``kept`` is the count of `KVManager._kept` the last reservation
-    took, and ``grown`` is what `reserve` last added to an allotment its request waited holding. `unreserve` puts
-    back the first and takes back the second."""
+    took, ``grown`` is the shortage `reserve` last granted an allotment its request waited holding, and
+    ``grown_from`` the allotment's pages before. `unreserve` puts back the first and the last."""
     pages: int
     remaining: int = 0
     asks_again: int = 0
@@ -379,6 +379,7 @@ class Allotment:
     passed: bool = False
     kept: int = 0
     grown: int = 0
+    grown_from: int = 0
 
 
 class Dropped(NamedTuple):
@@ -400,10 +401,12 @@ class Victims(NamedTuple):
 
 
 class StalledMoves(NamedTuple):
-    """The requests that wait holding pages which a move can take now, and the host's room, which decides how many
-    of them fit there."""
+    """The requests that wait holding pages which a move can take now, the host's room, which decides how many
+    of them fit there, and the room moving them all would make, which grows when another request lets go of a page
+    they share."""
     rids: frozenset[str]
     host_room: int
+    frees: int
 
 
 class ShortGrant(NamedTuple):
@@ -416,11 +419,13 @@ class ShortGrant(NamedTuple):
 class Earmark:
     """The pages the moves of ``victims`` add to ``rid``'s allotment, past the room its grant counted, which went in
     when it ran short. ``granted`` counts the pages added so far. For a request that waits, ``pages`` is all it asks
-    for, which it takes whole, and ``granted`` counts the pages kept for it until then."""
+    for, which it takes whole, ``granted`` counts the pages kept for it until then, and ``mark`` is the refusal
+    `make_room` chose the victims for."""
     rid: str
     pages: int
     victims: set[str]
     granted: int = 0
+    mark: RoomMark | None = None
 
 
 @dataclass
@@ -3460,6 +3465,10 @@ class KVManager(AttentionResource):
             self._seed_keys(rid, label, stream)
             if stream.chain is not None and (overrides.prefix_decode or {}).get(label):
                 stream.chain.extend([rebuild.sampled[-1]], self.config.tokens_per_page)
+            prefix_chain = stream.chain
+        # `make_room` can measure this request's refusal again before its next `reserve` roots the chain
+        if prefix_chain is not None and self._index is not None:
+            self._root_chain(prefix_chain)
 
     def _rebuilt_keys(
         self, overrides: KVReqConfig, label: str, layout: StreamLayout, grown: Sequence[int],
@@ -4463,7 +4472,7 @@ class KVManager(AttentionResource):
         if rid in self._allotments:
             allotment = self._allotments[rid]
             allotment.kept = kept
-            allotment.grown = self._asks.pop(rid)
+            allotment.grown, allotment.grown_from = self._asks.pop(rid), allotment.pages
             self._stalled.discard(rid)
             self._allot(rid, allotment.grown)
             self._made = None
@@ -4489,7 +4498,7 @@ class KVManager(AttentionResource):
             self._kept += allotment.kept
             if allotment.grown:
                 # it waits holding its allotment again, for the same shortage
-                allotment.pages -= allotment.grown
+                allotment.pages = allotment.grown_from
                 self._asks[rid], allotment.grown, allotment.kept = allotment.grown, 0, 0
                 self._stalled.add(rid)
                 self._recount(rid)
@@ -4713,7 +4722,7 @@ class KVManager(AttentionResource):
                 pages = self._host_pages(rid)
                 if self._unwritten(rid) or (pages is not None and pages <= host) or droppable(rid):
                     rids.add(rid)
-            return StalledMoves(frozenset(rids), host)
+            return StalledMoves(frozenset(rids), host, self._frees(rids))
 
     def make_room(self, mark: RoomMark, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
         """Choose requests from ``newer`` that wait holding pages, newest first, to move off the device for
@@ -4730,7 +4739,7 @@ class KVManager(AttentionResource):
             if pages <= self._room():
                 return Victims([], [], [])
             victims = self._choose(pages - self._room(), stalled, droppable)
-            return None if victims is None else self._earmark(Earmark(mark.rid, pages, set()), victims)
+            return None if victims is None else self._earmark(Earmark(mark.rid, pages, set(), mark=mark), victims)
 
     def _choose(self, pages_short: int, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
         """The fewest leading requests of ``newer`` whose moves free ``pages_short`` pages, or None when moving every
@@ -4871,12 +4880,17 @@ class KVManager(AttentionResource):
                 # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
                 # window's commit frees pages at another point of the step. The engine journals the move ahead of the
                 # admit.
-                kept = min(earmark.pages - earmark.granted, freed)
+                # measured again, as a victim's move can make the pages a hit took for nothing evictable
+                mark = earmark.mark
+                pages = earmark.pages if mark is None else self._need(
+                    mark.rid, mark.node_name, mark.graph_walk, mark.published,
+                )
+                kept = max(0, min(pages - earmark.granted, freed))
                 earmark.granted += kept
                 self._kept += kept
                 freed -= kept
-                if self._decides and earmark.pages <= self._room():
-                    self._admit(earmark.rid, earmark.pages, self.journal)
+                if self._decides and pages <= self._room():
+                    self._admit(earmark.rid, pages, self.journal)
             else:
                 granted = min(earmark.pages - earmark.granted, freed)
                 if granted:

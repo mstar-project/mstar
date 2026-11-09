@@ -35,7 +35,7 @@ from test_kv_preemption import (  # noqa: F401
     _step,
     _stub_transfer,
 )
-from test_kv_prefix_lease import _manager
+from test_kv_prefix_lease import WALK, _manager
 
 from mstar.engine.engine import Engine, PagedKVCache
 from mstar.engine.resources import Residency
@@ -46,6 +46,7 @@ from mstar.engine.resources.step import ASKS, Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
+from mstar.model.submodule_base import ARNodeInputs
 from mstar.observability.recorders import EdgeTransfers
 from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.worker.host_pool import HostPool
@@ -438,6 +439,46 @@ def test_make_room_walks_again_only_once_a_refusal_or_a_request_it_could_move_ch
     w._preemption.make_room()
 
     assert kv.residency("r") is Residency.DROPPED and _admitted(kv, "o"), "o waited after r could be dropped"
+
+
+def test_make_room_walks_again_once_a_running_request_lets_go_of_a_page_a_waiting_one_shares():
+    """o waits to return, and s, waiting for its shortage, shares its prompt's pages with h. Moving s frees too little
+    while h holds them. h's removal leaves the room as it was, since s still holds every page h held, but moving s
+    now frees them. The walk read only the refusals, the requests it could move and the host's room, none of which
+    changed, so o waited until something else did."""
+    kv = _pool()
+    shared = list(range(3 * PAGE_SIZE))
+    _running(kv, "x", 2, arrival=0)
+    _running(kv, "o", 3, arrival=1)
+    _request(kv, "h", 3, arrival=2, keyed=shared)
+    assert _ready(kv, "h") and _step(kv, "h", 3 * PAGE_SIZE).ok
+    _request(kv, "s", 4, arrival=3, keyed=shared + list(range(100, 100 + PAGE_SIZE)))
+    assert _ready(kv, "s")
+    inputs = ARNodeInputs(input_seq_len=4 * PAGE_SIZE)
+    kv.apply_cached_prefix("s", NODE, WALK, inputs, kv.resolve_cached_prefix("s", NODE, WALK, inputs))
+    assert _step(kv, "s", PAGE_SIZE).ok
+    for rid in ("h", "s"):
+        kv._streams[rid]["main"].step_in_flight = True
+    short = _step(kv, "x", 2 * PAGE_SIZE).reason.pages_short
+    assert _preempt(kv, "x", short, droppable=lambda rid: True).to_drop == ["o"]
+    for rid in ("h", "s"):
+        kv._streams[rid]["main"].step_in_flight = False
+    _drop(kv, "o")
+    assert _step(kv, "x", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "s", _step(kv, "s", 3 * PAGE_SIZE).reason.pages_short, droppable=lambda rid: True).waits
+    _runner(kv).readmit("s", NODE)
+    assert not _admitted(kv, "o")
+    w = _worker(kv)
+    w._rebuilds._kept[NODE]["s"] = _kept(4 * PAGE_SIZE)
+    w._preemption.make_room()
+    assert kv.residency("s") is Residency.RESIDENT and not _admitted(kv, "o")
+    room = kv._room()
+
+    _remove(kv, "h")
+    assert kv._room() == room
+    w._preemption.make_room()
+
+    assert kv.residency("s") is Residency.DROPPED, "o waited though moving s would now let it in"
 
 
 class _Pool(Resource):

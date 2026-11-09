@@ -850,6 +850,95 @@ def test_a_dropped_request_is_charged_nothing_for_hits_another_request_holds():
     assert _step(kv, "v", PAGE_SIZE).ok and _step(kv, "v", PAGE_SIZE + 1).ok, "v ran short of its allotment"
 
 
+def _hit(kv, rid: str, pages: int) -> None:
+    inputs = ARNodeInputs(input_seq_len=pages * PAGE_SIZE)
+    kv.apply_cached_prefix(rid, NODE, WALK, inputs, kv.resolve_cached_prefix(rid, NODE, WALK, inputs))
+
+
+@pytest.mark.usefixtures("backend")
+def test_a_dropped_request_refused_before_its_rebuild_is_measured_on_the_chain_the_rebuild_lays_out():
+    """v is dropped and refused, and readiness then lays out its rebuild's chain. `make_room` measured v's refusal
+    against that chain before the next `reserve` rooted it, and raised ``TypeError``."""
+    kv = _pool()
+    shared = list(range(3 * PAGE_SIZE))
+    tokens = shared + list(range(200, 200 + PAGE_SIZE))
+    _request(kv, "a", 4, arrival=0, keyed=shared + list(range(100, 100 + PAGE_SIZE)))
+    assert _ready(kv, "a") and _step(kv, "a", 4 * PAGE_SIZE).ok
+    _running(kv, "r", 2, arrival=1)
+    _running(kv, "s", 2, arrival=2)
+    _request(kv, "v", 4, arrival=3, keyed=tokens)
+    assert _ready(kv, "v")
+    _hit(kv, "v", 4)
+    assert _step(kv, "v", PAGE_SIZE).ok
+    _running(kv, "w", 1, arrival=4)
+    kv._streams["w"]["main"].step_in_flight = True
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    kv._streams["w"]["main"].step_in_flight = False
+    _drop(kv, "v")
+    assert _step(kv, "r", 1).ok
+    assert not _admitted(kv, "v")
+    outcome = _step(kv, "w", PAGE_SIZE + 1)
+    assert _preempt(kv, "w", outcome.reason.pages_short, droppable=lambda rid: False).waits
+    _runner(kv).readmit("w", NODE)
+
+    kv.prepare_rebuild("v", Rebuild(array("i", [0])))
+
+    assert _make_room(kv, droppable=lambda rid: True) is None, "moving w frees less than v's return needs"
+    assert kv._need("v", NODE, WALK, None) == kv._dropped["v"].returns - 3, "v paid for the 3 pages a holds"
+
+
+@pytest.mark.usefixtures("backend")
+def test_a_waiting_request_whose_victim_held_its_hits_is_charged_for_them_once_the_victim_moves():
+    """v, dropped, shares 3 prompt pages with h, which holds them, so they cost v's return nothing. v moves h, which
+    waits for its shortage. h's drop leaves those pages to the index alone, where eviction can take them, so v's probe
+    pays for them. v was admitted with the count from before the move, 3 pages short."""
+    kv = _pool()
+    shared = list(range(3 * PAGE_SIZE))
+    _request(kv, "a", 4, arrival=0, keyed=shared + list(range(100, 100 + PAGE_SIZE)))
+    assert _ready(kv, "a") and _step(kv, "a", 4 * PAGE_SIZE).ok
+    _remove(kv, "a")
+    _running(kv, "r", 2, arrival=1)
+    for rid, arrival, own in (("v", 2, 200), ("h", 3, 300)):
+        _request(kv, rid, 4, arrival=arrival, keyed=shared + list(range(own, own + PAGE_SIZE)))
+        assert _ready(kv, rid)
+        _hit(kv, rid, 4)
+        assert _step(kv, rid, PAGE_SIZE).ok
+    _running(kv, "w", 3, arrival=4)
+    for rid in ("h", "w"):
+        kv._streams[rid]["main"].step_in_flight = True
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_drop == ["v"]
+    kv._streams["h"]["main"].step_in_flight = False
+    _drop(kv, "v")
+    assert _step(kv, "r", 1).ok
+    assert _preempt(kv, "h", _step(kv, "h", PAGE_SIZE + 1).reason.pages_short, droppable=lambda rid: True).waits
+    _runner(kv).readmit("h", NODE)
+    assert not _admitted(kv, "v")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["h"]
+
+    _drop(kv, "h")
+
+    returns = kv._dropped["v"].returns
+    assert "v" not in kv._allotments or kv._allotments["v"].pages == returns, "v came back short of its hits"
+
+
+def test_a_rollback_puts_back_the_allotment_of_a_request_past_it():
+    """r grew a page past its allotment of 6 and then waits for 1 more. The grow counted from the 7 pages r holds, and
+    a pool on another node refusing r took back only the page r asked for, so r's allotment grew to 7."""
+    kv, slots = _pool(), _StubPool(0)
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "slots": slots}, node_resources={NODE: ["kv"], "other": ["slots"]}))
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "r", 6, arrival=1)
+    assert _step(kv, "r", PAGE_SIZE).ok and kv._allotments["r"].pages == 6
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: False).waits
+    _runner(kv).readmit("r", NODE)
+    assert _runner(kv).admit_request("r", "other", WALK) is not None
+
+    _remove(kv, "o")
+
+    assert not _admitted(kv, "r")
+    assert kv._allotments["r"].pages == 6, "the rollback left r an allotment of the pages it holds"
+
+
 @pytest.mark.usefixtures("backend")
 def test_victims_that_share_pages_are_preempted_together():
     kv = _pool()

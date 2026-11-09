@@ -278,15 +278,15 @@ def test_no_request_passes_a_first_request_where_it_fits_while_another_resource_
     assert runner.admit_waiting(_nothing) == [(NODE, "head")]
 
 
-def test_no_request_passes_where_the_oldest_request_waits_to_return():
-    """v was dropped and waits to return, and h, refused, is first in the queue. While o, older than v, waited, c
-    passed h. Once o left, v was the oldest request, and d passed h too, into the units v waits for."""
-    kv, lora = _LendingPool(8, needs={"v": 4, "w": 3, "h": 7}), _StubPool(0)
-    runner = _runner({NODE: ["kv"], "other": ["lora"]}, kv=kv, lora=lora)
+def test_no_request_passes_where_the_oldest_request_in_the_pool_waits_to_return():
+    """v was dropped and waits to return, and h, refused, is first in the queue. While o, older than v, held the
+    pool, c passed h. Once o left, v was the oldest request in the pool, and d passed h too, into the units v waits
+    for."""
+    kv = _LendingPool(8, needs={"o": 0, "v": 4, "w": 3, "h": 7})
+    runner = _runner(kv=kv)
     for arrival, rid in enumerate(("o", "v", "w", "h", "c", "d")):
         runner.ingest_request(rid, None, arrival)
-    assert runner.admit_retrieve("o", "other", WALK).queued
-    for rid in ("v", "w"):
+    for rid in ("o", "v", "w"):
         assert runner.admit_retrieve(rid, NODE, WALK).ready
     # v returns with its history and a unit more
     kv.unreserve("v")
@@ -296,6 +296,25 @@ def test_no_request_passes_where_the_oldest_request_waits_to_return():
     assert runner.admit_retrieve("c", NODE, WALK).ready, "c waited behind h, though o is older than v"
     runner.remove_request("o")
 
-    assert runner.admit_retrieve("d", NODE, WALK).queued, "d passed h into the units v, the oldest request, waits for"
+    assert runner.admit_retrieve("d", NODE, WALK).queued, "d passed h into the units v waits for"
     runner.remove_request("w")
     assert (NODE, "v") in runner.admit_waiting(_nothing)
+
+
+def test_a_return_holds_back_its_pools_newer_prompts_while_an_older_request_holds_another_pool():
+    """A return holds back newer prompts once it is the oldest. Taking the oldest across the runner, a request older
+    than it in another pool, or one that finished there and lives on for its later stages, let every newer prompt in
+    its own pool pass it for that request's whole life."""
+    other, own = _StubPool(1), _StubPool(3, needs={"r": 2})
+    runner = _runner({"vit": ["other"], NODE: ["own"]}, other=other, own=own)
+    for rid, arrival in (("o", 0), ("r", 1), ("q", 2), ("p", 3)):
+        runner.ingest_request(rid, arrival=arrival)
+    assert runner.admit_retrieve("o", "vit", WALK).ready
+    for rid in ("r", "q"):
+        assert runner.admit_retrieve(rid, NODE, WALK).ready
+    # r is dropped and returns with its history and a page
+    own.unreserve("r")
+    own.needs["r"] = 3
+    runner.readmit("r", NODE)
+
+    assert runner.admit_retrieve("p", NODE, WALK).queued, "p passed r, the oldest request in its pool"
