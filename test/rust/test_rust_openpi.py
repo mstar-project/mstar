@@ -61,11 +61,11 @@ DROID = {"images": ["observation/exterior_image_1_left", "observation/wrist_imag
 
 @functools.cache
 def _policy() -> openpi.OpenpiPolicy:
-    from mstar.model.pi05.pi05_model import Pi05Model
-
-    model = Pi05Model(model_path_hf="lerobot/pi05_droid", skip_weight_loading=True, num_cameras=2,
-                      action_horizon=HORIZON)
-    return openpi.OpenpiPolicy.from_config(DROID, model)
+    """Pi0.5 DROID's block, as ``OpenpiPolicy.from_config`` checks it against the model."""
+    return openpi.OpenpiPolicy(
+        image_keys=tuple(DROID["images"]), state_keys=tuple(DROID["state"]), state_kwarg="state",
+        action_horizon=HORIZON, action_dim=WIDTH, action_dims=DROID["action_dims"], metadata=DROID["metadata"],
+    )
 
 
 def _droid_obs(seed: int = 0) -> dict:

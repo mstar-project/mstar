@@ -50,7 +50,6 @@ ROUTES = {
     "transcriptions": ("/v1/audio/transcriptions", {"model": "m"}),
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
-# /v1/realtime has no route there at all yet.
 NOT_PORTED: set[tuple[str, str]] = set()
 
 
