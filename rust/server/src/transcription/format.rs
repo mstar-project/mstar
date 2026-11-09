@@ -41,7 +41,7 @@ pub fn merge_windows(windows: &[Window], adapter: &dyn OpenAIAdapter, req: &Tran
             segments.push(Segment {
                 start: seg.start + window.offset,
                 end: seg.end + window.offset,
-                temperature: Some(window.temperature),
+                temperature: Some(window.temperature.unwrap_or(req.temperature.filter(|t| *t != 0.0).unwrap_or(0.0))),
                 compression_ratio: Some(window.compression_ratio),
                 ..seg
             });

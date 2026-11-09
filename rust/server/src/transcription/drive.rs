@@ -74,7 +74,8 @@ pub struct Window {
     pub raw_text: String,
     /// The accepted parse (sequential mode drops an unfinished last segment).
     pub transcript: Option<Transcript>,
-    pub temperature: f64,
+    /// The temperature it was accepted at; `None` where no retry ladder ran (the request's).
+    pub temperature: Option<f64>,
     pub compression_ratio: f64,
 }
 
@@ -376,18 +377,21 @@ impl Sequential {
         }
         let mut window = ctx.planner.window_at(self.offset).await?;
         let carry = (!self.texts.is_empty() && self.conditions).then(|| carry_over(&self.texts[self.reset_since..]));
-        let base = ctx.req.temperature.filter(|t| *t != 0.0).unwrap_or(0.0);
+        let samples = reads("temperature");
         let threshold = ctx.adapter.transcription_policy().compression_ratio_threshold;
         let mut parsed = Transcript::default();
         for (temperature, prompt) in attempts(&ctx.req, carry) {
             let mut attempt = window_request(&ctx.req, self.language.as_deref(), prompt.as_deref(), self.seeks);
-            if temperature != base {
+            // every attempt carries its rung, so the greedy retry without the
+            // prompt stays greedy whatever the checkpoint defaults to
+            if samples {
                 attempt.temperature = Some(temperature);
+                attempt.temperature_sent = true;
             }
             let stream = submit(&ctx.st, ctx.adapter, &attempt, &window, false)?;
             window.raw_text = read(stream).await?;
             parsed = ctx.adapter.parse_transcript(&window.raw_text, &attempt);
-            window.temperature = temperature;
+            window.temperature = Some(temperature);
             window.compression_ratio = super::zlib::compression_ratio(&parsed.text);
             if threshold.is_none_or(|t| window.compression_ratio <= t) {
                 break;
@@ -402,7 +406,7 @@ impl Sequential {
             }
         }
         self.texts.push(parsed.text.clone());
-        if window.temperature > PROMPT_RESET_TEMPERATURE {
+        if window.temperature.is_some_and(|t| t > PROMPT_RESET_TEMPERATURE) {
             self.reset_since = self.texts.len();
         }
         if self.language.as_deref().is_none_or(str::is_empty) {

@@ -59,10 +59,22 @@ const REAL_RULES: &[Rule<f64>] = &[
     ("top_p", "in (0, 1] (1 is off; greedy is temperature 0)", |v| 0.0 < v && v <= 1.0),
     ("min_p", "in [0, 1] (0 is off)", |v| (0.0..=1.0).contains(&v)),
     ("repetition_penalty", "> 0 (1 is off)", |v| v > 0.0),
+    // output geometry, `_REAL_RULES`' own
+    ("fps", "> 0", |v| v > 0.0),
+    ("guidance_scale", "of any sign", |_| true),
+    ("speed", "> 0", |v| v > 0.0),
 ];
-/// `INT_KNOB_RULES` and `max_output_tokens`.
-const INT_RULES: &[Rule<i128>] =
-    &[("top_k", ">= 0 (0 is off)", |v| v >= 0), ("max_output_tokens", ">= 1", |v| v >= 1)];
+/// `INT_KNOB_RULES`, and `max_output_tokens` and the output geometry (`_INT_RULES`).
+const INT_RULES: &[Rule<i128>] = &[
+    ("top_k", ">= 0 (0 is off)", |v| v >= 0),
+    ("max_output_tokens", ">= 1", |v| v >= 1),
+    ("num_inference_steps", ">= 1", |v| v >= 1),
+    ("num_step", ">= 1", |v| v >= 1),
+    ("rollout_horizon", ">= 0", |v| v >= 0),
+    ("num_frames", ">= 1", |v| v >= 1),
+    ("height", ">= 1", |v| v >= 1),
+    ("width", ">= 1", |v| v >= 1),
+];
 /// `_BOOL_KNOBS`: the sampler's, and `do_sample`, `return_token_ids` and
 /// `enable_thinking` (what a chat template reads; `"false"` is truthy there).
 const BOOL_KNOBS: &[&str] =
