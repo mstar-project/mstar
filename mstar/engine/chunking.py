@@ -106,6 +106,40 @@ class ChunkingManagement:
                 return self._overrides[key]
         return budget
 
+    def max_step_tokens(self, node_name: str, graph_walk: str, max_rows: int) -> int | None:
+        """The most tokens the scheduler gives a step of ``graph_walk`` of at
+        most ``max_rows`` rows, None where it runs under no budget.
+
+        That is the budget it was scheduled under: that of the combined walk
+        it runs in, if any (a combined batch whose rows share one real walk
+        runs relabelled to it, `ScheduledBatch.relabel_if_uniform`, and still
+        ran under the combined walk's budget). For a combined walk's step, or
+        more, by what a speculation chain's rows, one-token decode rows, take
+        of ``min_chunk_tokens``. A real walk's step carries no chain rows of
+        its own node: decode rows beside a prompt make the step the combined
+        walk's (`MicroScheduler.label_for`), and a same-node chain on a prompt
+        walk continues no row, its rows mid-prefill being the step's own.
+
+        None too where the step may hold a prompt of a walk whose chunking
+        the serving config turned off: it runs whole, however long."""
+        members = [
+            walk for (node, walk), combined in self._combined_walk_of.items()
+            if node == node_name and combined == graph_walk
+        ]
+        if any(
+            self.policy(node_name, walk).chunkable and not self.chunkable(node_name, walk)
+            for walk in members or [graph_walk]
+        ):
+            return None
+        walk = self._combined_walk_of.get((node_name, graph_walk), graph_walk)
+        budget = self.max_batch_tokens(node_name, walk)
+        if budget is None or not members:
+            return budget
+        # the chain's rows come off the budget first (`MicroScheduler._build_step`),
+        # and `batch_builder._run_head` still runs a prompt `min_chunk_tokens` where
+        # they leave it less
+        return max(budget, max_rows - 1 + self.min_chunk_tokens(budget))
+
     def set_budgets(
         self, overrides: Mapping[str, Any], walks: set[str],
         combined_walk_of: Mapping[tuple[str, str], str] | None = None,
