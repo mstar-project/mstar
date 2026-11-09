@@ -499,7 +499,8 @@ class Conductor:
         # Every check that needs only the model, this YAML and the environment,
         # before any worker exists; raises listing every problem found.
         deployment = validate_deployment(model, self.model_config, model_config_file)
-        # after the placement is read, which a declaration may follow; each worker and the API server check theirs
+        # Computed after the placement is read, since a declaration may read it. Each worker and the API server
+        # compare their own digests against these.
         self._declaration_digests = declaration_digests(self._declarations(), model.kernel_settings())
         self.device_type = accelerator_type()
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
