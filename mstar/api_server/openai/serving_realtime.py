@@ -639,7 +639,7 @@ class RealtimeTranscription:
     async def handle(self, event: dict) -> None:
         kind = event.get("type")
         if kind not in ("input_audio_buffer.append", "input_audio_buffer.commit"):
-            # these act on the whole item, so a running step has to finish first
+            # these act on the whole session, so the runner has to drain first
             await self._steps_settled()
         if kind == "transcription_session.update":
             try:
@@ -767,7 +767,7 @@ class RealtimeTranscription:
             end.set()
 
     async def _steps_settled(self) -> None:
-        """Wait out the running step, if any, for an event that needs the whole item."""
+        """Wait until the runner has drained every queued chunk and commit, if it is running."""
         if self._steps_end is not None:
             await self._steps_end.wait()
 

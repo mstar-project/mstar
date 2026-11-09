@@ -63,7 +63,7 @@ class RequestError:
     """A request failure carried from its owning worker to the API.
 
     ``fatal`` marks a sticky device fault: every later CUDA call on this worker
-    fails too, so ``StepPipeline._report_failures`` stops the worker on it.
+    fails too, so ``StepPipeline._stop_if_fatal`` stops the worker on it.
     """
 
     message: str
