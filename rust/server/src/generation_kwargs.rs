@@ -63,7 +63,10 @@ const REAL_RULES: &[Rule<f64>] = &[
 /// `INT_KNOB_RULES` and `max_output_tokens`.
 const INT_RULES: &[Rule<i128>] =
     &[("top_k", ">= 0 (0 is off)", |v| v >= 0), ("max_output_tokens", ">= 1", |v| v >= 1)];
-const BOOL_KNOBS: &[&str] = &["ignore_eos", "penalize_prompt", "return_logprobs", "do_sample", "return_token_ids"];
+/// `_BOOL_KNOBS`: the sampler's, and `do_sample`, `return_token_ids` and
+/// `enable_thinking` (what a chat template reads; `"false"` is truthy there).
+const BOOL_KNOBS: &[&str] =
+    &["ignore_eos", "penalize_prompt", "return_logprobs", "do_sample", "return_token_ids", "enable_thinking"];
 /// Other names for `max_output_tokens`, in precedence order after it.
 const MAX_OUTPUT_TOKENS_ALIASES: &[&str] = &["max_new_tokens", "max_completion_tokens", "max_tokens"];
 

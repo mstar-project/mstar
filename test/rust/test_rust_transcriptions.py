@@ -38,6 +38,7 @@ from mstar.api_server.rust_frontend import (
     openai_adapter_class,
     transcription_facts,
 )
+from mstar.utils import generation_kwargs
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
@@ -275,6 +276,9 @@ WHISPER_CASES = {
     "extra-kwargs": [("top_k", "5"), ("beam", '{"n": 2}'), ("note", "plain text")],
     # declared text fields stay text, however they would parse as JSON
     "text-fields-as-sent": [("prompt", "2024"), ("language", "null")],
+    # an empty field is json; the timestamp checks read it as sent
+    "empty-format": [("response_format", "")],
+    "empty-format-words": [("response_format", ""), ("timestamp_granularities[]", "word")],
     "stream": [("stream", "true")],
     "stream-verbose": [("stream", "true"), ("response_format", "verbose_json")],
 }
@@ -375,6 +379,21 @@ def test_a_refused_request_reads_as_pythons(stacks, monkeypatch, case):
     assert py_submits == rust_submits == []
 
 
+# every knob normalize_generation_kwargs checks (the sampler's rules and its own):
+# Rust's copy of the tables must refuse each before a stream commits to a 200
+KNOBS = [*generation_kwargs._REAL_RULES, *generation_kwargs._INT_RULES, *generation_kwargs._BOOL_KNOBS]
+
+
+@pytest.mark.parametrize("value", ["nope", "-1000000000"])
+@pytest.mark.parametrize("knob", KNOBS)
+def test_every_generation_knob_is_refused_alike(stacks, monkeypatch, knob, value):
+    fields = [(knob, value), ("stream", "true")]
+    (py, py_submits), (rust, rust_submits) = _both(stacks, monkeypatch, "whisper_large", fields)
+    assert rust == py
+    assert py[0] == 400, py
+    assert py_submits == rust_submits == []
+
+
 @pytest.mark.parametrize("file", [None, ("speech.wav", b"")], ids=["no-file", "empty-file"])
 def test_a_missing_or_empty_upload_is_refused_alike(stacks, monkeypatch, file):
     (py, _), (rust, _) = _both(stacks, monkeypatch, "whisper_large", [("model", "whisper_large")], file)
@@ -429,10 +448,13 @@ OTHERS = {
         [("task", "summarize")],
         [("timestamp_granularities[]", "word")],
         [("target_language", "5")],
+        # an untimed stream: its text is lstripped (_plain's leading space)
+        [("stream", "true")],
     ],
-    "canary_qwen": [[("language", "en_US")], [("language", "de")], [("task", "translate")]],
-    "parakeet": [[("language", "auto")], [("language", "xx")], [("language", "")], [("prompt", "dropped")]],
-    "nemotron_asr": [[("language", "xx")], [("task", "transcribe")], [("task", "translate")]],
+    "canary_qwen": [[("language", "en_US")], [("language", "de")], [("task", "translate")], [("stream", "true")]],
+    "parakeet": [[("language", "auto")], [("language", "xx")], [("language", "")], [("prompt", "dropped")],
+                 [("stream", "true")]],
+    "nemotron_asr": [[("language", "xx")], [("task", "transcribe")], [("task", "translate")], [("stream", "true")]],
     "higgs_audio": [[("prompt", "Transcribe, please.")], [("response_format", "srt")]],
     "omnilingual_asr_ctc_300m": [
         [("response_format", "verbose_json")],
