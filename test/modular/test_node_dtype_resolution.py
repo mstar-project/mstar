@@ -110,6 +110,8 @@ def test_a_node_placing_its_kv_positions_over_its_sp_ranks_loads_without_the_sp_
     ))]
     model.get_default_sharding_config = lambda: ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
     groups = WorkerParallelGroups(num_workers=2, global_rank=0)
-    groups.add_sp("inherit", CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]))
+    sp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+    groups.add("inherit", sp, "sp")
+    groups.node_to_instance_comm["inherit"] = sp
     _build(model, groups).shutdown()
     assert "sp_group" not in kwargs["inherit"]

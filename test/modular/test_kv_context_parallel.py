@@ -40,6 +40,7 @@ from mstar.engine.resources.attn.config import (
     AttnBackend,
     BlockCausalAttentionSpec,
 )
+from mstar.engine.resources.attn.ragged import wrappers as ragged_mod
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import ContextParallelWrapper, merge
 from mstar.engine.resources.kv import manager as manager_mod
@@ -66,6 +67,22 @@ def _group(rank: int, size: int) -> CommGroup:
     return CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(size)))
 
 
+def _sp_groups(*nodes: str) -> WorkerParallelGroups:
+    """Rank 0 of a worker holding each of ``nodes`` over ``P`` SP ranks."""
+    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
+    for node in nodes:
+        group = _group(0, P)
+        groups.add(node, group, "sp")
+        groups.node_to_instance_comm[node] = group
+    return groups
+
+
+def _zero_unplanned_rows_on_cpu(out: torch.Tensor, qo_indptr: torch.Tensor) -> torch.Tensor:
+    """``zero_unplanned_rows``, on a device whose Triton has no driver."""
+    out[int(qo_indptr[-1]):] = 0
+    return out
+
+
 def _placed(rank: int) -> KVCache:
     config = PagedKVConfig(
         num_layers=2, num_kv_heads=1, head_dim=2, max_seq_len=64, num_qo_heads=2, max_num_pages=4,
@@ -84,7 +101,6 @@ def _manager(rank: int, cfg: PagedKVConfig) -> KVManager:
         transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
     kv.enable_prefix_cache(ROOT, WALKS)
-    kv._plan_cache_mode = 1
     kv._cg_max_seq_len = 64
     return kv
 
@@ -146,13 +162,12 @@ def test_two_ranks_keep_logical_pages_alike_and_split_every_write():
         kv.commit(step, _ctx("b"))
     assert leader._streams["b"]["main"].page_indices[:3] == leader._streams["a"]["main"].page_indices[:3]
 
-    # decode, the second step planned off the first (the plan cache)
+    # decode
     for slot in (0, 1):
         planned = [_decode(kv, "b", slot) for kv in ranks]
         _assert_split_writes(ranks, planned[0][0])
         for kv, (step, ctx) in zip(ranks, planned, strict=True):
             kv.commit(step, ctx)
-    assert [kv.plan_cache_stats["hit"] for kv in ranks] == [1, 1]
     planned = [_decode(kv, "b", 0, leased=False) for kv in ranks]
     _assert_split_writes(ranks, planned[0][0])
     for kv, (step, ctx) in zip(ranks, planned, strict=True):
@@ -236,8 +251,7 @@ class _Submodule:
 def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_support(
     supports, tmp_path, monkeypatch,
 ):
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add_sp(NODE, _group(0, P))
+    groups = _sp_groups(NODE)
     # Qwen3.5's own declarations (dummy shapes) with its pool placed, as on SP ranks, and a
     # dependent without support
     specs = _qwen3_5(NODE, {}, tmp_path, monkeypatch).get_node_resources()
@@ -284,8 +298,7 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
      )), "FlashInferBlockCausalManager"),
 ], ids=["mla", "block_causal"])
 def test_attention_over_a_placed_pool_that_cant_plan_it_is_refused_at_load(kv, attn_spec, manager):
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    groups.add_sp(NODE, _group(0, P))
+    groups = _sp_groups(NODE)
     specs = [
         KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, max_seq_len=256, num_qo_heads=4, max_num_pages=8, page_size=PAGE_SIZE,
@@ -309,9 +322,7 @@ def test_a_resource_over_nodes_that_split_heads_differently_is_refused(monkeypat
     """A resource is sized by one head-shard count, so it can't serve a node that places its
     positions over its SP ranks (heads over TP) beside one running its own SP (heads over TP x SP)."""
     other = "other"
-    groups = WorkerParallelGroups(num_workers=P, global_rank=0)
-    for node in (NODE, other):
-        groups.add_sp(node, _group(0, P))
+    groups = _sp_groups(NODE, other)
     monkeypatch.setattr(engine_mod, "positions_over_sp", lambda specs, node, sp, enabled: node == NODE)
     with pytest.raises(ValueError, match="'shared' serves nodes that split heads different ways"):
         Engine(graph_runtime=None).load_model(
@@ -709,6 +720,7 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
     context = types.SimpleNamespace(plan=lambda **kwargs: None)
+    monkeypatch.setattr(ragged_mod, "zero_unplanned_rows", _zero_unplanned_rows_on_cpu)
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
     joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, placement = _cp_attention(joint, CPU, torch.float32)
@@ -735,6 +747,7 @@ def test_a_captured_step_exchanges_with_no_stored_context(monkeypatch):
         plan=lambda **kwargs: None,
         run=lambda q, cache, return_lse: (torch.zeros_like(q), torch.full(q.shape[:2], -math.inf)),
     )
+    monkeypatch.setattr(ragged_mod, "zero_unplanned_rows", _zero_unplanned_rows_on_cpu)
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
     exchanged = []
 

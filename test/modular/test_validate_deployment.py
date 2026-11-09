@@ -269,7 +269,7 @@ def test_ranks_not_divisible_by_the_instance_size_are_refused(tmp_path):
     ("tp", r"node_groups\[0\] has tp_size 2 and contains nodes not in tp_enabled_nodes"),
     ("sp", r"node_groups\[0\]: node 'llm' on 2 SP ranks is not in sp_enabled_nodes"),
     ("cfg", r"node_groups\[0\] has cfg_size 2 and contains nodes not in cfg_enabled_nodes"),
-])
+], ids=["tp", "sp", "cfg"])
 def test_parallel_node_group_over_a_node_without_support_is_refused(axis, pattern, tmp_path):
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": [0, 1], f"{axis}_size": 2}])
     _refused(_Model(), cfg, pattern)
