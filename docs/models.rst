@@ -862,6 +862,12 @@ pool moves a request to the host until those fill. At the cap of 32, with 2048 t
 out on an H200 (one run per size), a burst of prompts around 3.7k tokens or longer still
 waits, 2.5k does not (follow-up: reserve a request's whole layout).
 
+The vocoder's DiT runs its GEMMs, convolutions and attention, and keeps its caches, in
+float16; its residual stream, its norms' arithmetic, the Euler solver, the token encoder
+and HiFT stay float32. Its mel is within about 0.1% of a float32 DiT's, and the served
+speech's Whisper WER is unchanged. HiFT up to its spectrum is compiled (``compile_regions``),
+and the TTS's decode capture runs cuBLAS GEMMs (``compile_mode="default"``).
+
 Command A+ (``command_a_plus``)
 -------------------------------
 

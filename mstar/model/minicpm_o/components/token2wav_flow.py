@@ -484,6 +484,9 @@ class DiT(nn.Module):
         self.in_proj = nn.Linear(4 * MEL_BINS, DIT_HIDDEN)
         self.blocks = nn.ModuleList(DiTBlock(DIT_HIDDEN, DIT_HEADS, DIT_HEAD_DIM) for _ in range(DIT_DEPTH))
         self.final_layer = FinalLayer(DIT_HIDDEN, MEL_BINS)
+        # What the fused CUDA path runs its GEMMs, convolutions and attention in (None: the
+        # input's dtype); its attention caches must hold it. The residual stream stays float32.
+        self.compute_dtype: torch.dtype | None = None
 
     def forward(
         self,
@@ -502,7 +505,7 @@ class DiT(nn.Module):
         if x.is_cuda and kv and isinstance(kv[0], BoundedLayerKV):
             from mstar.model.minicpm_o.components.token2wav_kernels import dit_forward
 
-            return dit_forward(self, x, mu, mods, final_mod, spks, cond, cnn_cache, kv)
+            return dit_forward(self, x, mu, mods, final_mod, spks, cond, cnn_cache, kv, self.compute_dtype)
         x = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, x.shape[-1]), cond], dim=1)
         x = self.in_proj(x.transpose(1, 2))
         for i, block in enumerate(self.blocks):

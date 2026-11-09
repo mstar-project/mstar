@@ -2,8 +2,9 @@
 
 The DiT runs 10 Euler steps x 16 blocks per window, so its per-block cost is dominated by
 memory movement and small kernels rather than FLOPs. These fuse the elementwise work around
-the GEMMs; attention runs on the bounded KV resource. Inputs are float32; dot products use
-TF32, as the rest of the serving process does.
+the GEMMs; attention runs on the bounded KV resource. The kernels compute in float32
+whatever their operands' dtype: ``dit_forward`` keeps the residual stream in float32 and
+hands the GEMMs, convolutions and attention ``dtype`` (float16 when served).
 """
 from __future__ import annotations
 
@@ -23,16 +24,16 @@ def _res_adaln_kernel(
     row = tl.program_id(0)
     n = row // T
     offs = tl.arange(0, C)
-    x = tl.load(x_ptr + row * C + offs)
+    x = tl.load(x_ptr + row * C + offs).to(tl.float32)
     mod = n * mod_stride_n + offs
     if HAS_RES:
-        y = tl.load(y_ptr + row * C + offs)
-        x = x + tl.load(gate_ptr + mod) * y
+        y = tl.load(y_ptr + row * C + offs).to(tl.float32)
+        x = x + tl.load(gate_ptr + mod).to(tl.float32) * y
         tl.store(x_out_ptr + row * C + offs, x)
     mean = tl.sum(x, axis=0) / C
     xc = x - mean
     var = tl.sum(xc * xc, axis=0) / C
-    h = xc * tl.rsqrt(var + eps) * tl.load(scale_ptr + mod) + tl.load(shift_ptr + mod)
+    h = xc * tl.rsqrt(var + eps) * tl.load(scale_ptr + mod).to(tl.float32) + tl.load(shift_ptr + mod).to(tl.float32)
     tl.store(h_ptr + row * C + offs, h)
 
 
@@ -50,14 +51,16 @@ def res_adaln(
     shift: torch.Tensor,
     scale: torch.Tensor,
     eps: float = 1e-6,
+    out_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``x [N, T, C]`` (contiguous); with ``y`` returns ``(x + gate * y, adaLN(x + gate * y))``,
-    else ``(x, adaLN(x))``. Modulations are ``[1 or N, 1, C]``."""
+    else ``(x, adaLN(x))``. Modulations are ``[1 or N, 1, C]``. The arithmetic is float32;
+    the residual keeps ``x``'s dtype and the normed output is ``out_dtype`` (default ``x``'s)."""
     n, t, c = x.shape
     assert x.is_contiguous()
     shift, stride = _mod_rows(shift, n)
     scale, _ = _mod_rows(scale, n)
-    h = torch.empty_like(x)
+    h = torch.empty_like(x, dtype=out_dtype or x.dtype)
     if y is None:
         _res_adaln_kernel[(n * t,)](x, x, x, shift, scale, x, h, t, stride, eps, HAS_RES=False, C=c)
         return x, h
@@ -84,15 +87,17 @@ def _qk_norm_split_kernel(
     base = qkv_ptr + row * width + h * D + offs
     dst = ((n * H + h) * T + t) * D + offs
     for which in tl.static_range(2):
-        val = tl.load(base + which * H * D)
+        val = tl.load(base + which * H * D).to(tl.float32)
         mean = tl.sum(val, axis=0) / D
         vc = val - mean
         var = tl.sum(vc * vc, axis=0) / D
         normed = vc * tl.rsqrt(var + eps)
         if which == 0:
-            tl.store(q_ptr + dst, normed * tl.load(qw_ptr + offs) + tl.load(qb_ptr + offs))
+            w, b = tl.load(qw_ptr + offs).to(tl.float32), tl.load(qb_ptr + offs).to(tl.float32)
+            tl.store(q_ptr + dst, normed * w + b)
         else:
-            tl.store(k_ptr + dst, normed * tl.load(kw_ptr + offs) + tl.load(kb_ptr + offs))
+            w, b = tl.load(kw_ptr + offs).to(tl.float32), tl.load(kb_ptr + offs).to(tl.float32)
+            tl.store(k_ptr + dst, normed * w + b)
     tl.store(v_ptr + dst, tl.load(base + 2 * H * D))
 
 
@@ -115,11 +120,11 @@ def qk_norm_split(
 def _ln_mish_kernel(x_ptr, w_ptr, b_ptr, out_ptr, eps, C: tl.constexpr):
     row = tl.program_id(0)
     offs = tl.arange(0, C)
-    x = tl.load(x_ptr + row * C + offs)
+    x = tl.load(x_ptr + row * C + offs).to(tl.float32)
     mean = tl.sum(x, axis=0) / C
     xc = x - mean
     var = tl.sum(xc * xc, axis=0) / C
-    y = xc * tl.rsqrt(var + eps) * tl.load(w_ptr + offs) + tl.load(b_ptr + offs)
+    y = xc * tl.rsqrt(var + eps) * tl.load(w_ptr + offs).to(tl.float32) + tl.load(b_ptr + offs).to(tl.float32)
     softplus = tl.where(y > 20.0, y, tl.log(1.0 + tl.exp(y)))
     tanh = 1.0 - 2.0 / (tl.exp(2.0 * softplus) + 1.0)
     tl.store(out_ptr + row * C + offs, y * tanh)
@@ -140,8 +145,9 @@ def ln_mish(x: torch.Tensor, norm: torch.nn.LayerNorm) -> torch.Tensor:
 
 
 def _fused_weights(module: torch.nn.Module, name: str, make):
-    """Weights rearranged for the fused path, built on first use (after loading) and kept on
-    the module. They are copies, so they are rebuilt if the module moves to another device."""
+    """Weights rearranged (or cast) for the fused path, built on first use (after loading) and
+    kept on the module. They are copies, so they are rebuilt if the module moves to another
+    device."""
     cache = module.__dict__.setdefault("_fused_cache", {})
     hit = cache.get(name)
     if hit is None or hit[0].device != next(module.parameters()).device:
@@ -150,27 +156,38 @@ def _fused_weights(module: torch.nn.Module, name: str, make):
     return hit
 
 
+def _linear(layer: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
+    """``layer`` in ``x``'s dtype (a cast copy of its weights when they differ)."""
+    if layer.weight.dtype == x.dtype:
+        return layer(x)
+    w, b = _fused_weights(layer, f"linear.{x.dtype}", lambda: (
+        layer.weight.to(x.dtype), None if layer.bias is None else layer.bias.to(x.dtype),
+    ))
+    return torch.nn.functional.linear(x, w, b)
+
+
 def _attention(attn, h: torch.Tensor, kv) -> torch.Tensor:
-    w, b = _fused_weights(attn, "qkv", lambda: (
-        torch.cat([attn.to_q.weight, attn.to_k.weight, attn.to_v.weight]).contiguous(),
-        torch.cat([attn.to_q.bias, attn.to_k.bias, attn.to_v.bias]).contiguous(),
+    w, b = _fused_weights(attn, f"qkv.{h.dtype}", lambda: (
+        torch.cat([attn.to_q.weight, attn.to_k.weight, attn.to_v.weight]).to(h.dtype).contiguous(),
+        torch.cat([attn.to_q.bias, attn.to_k.bias, attn.to_v.bias]).to(h.dtype).contiguous(),
     ))
     n, t, _ = h.shape
     q, k, v = qk_norm_split(torch.nn.functional.linear(h, w, b), attn.num_heads, attn.q_norm, attn.k_norm)
     out = kv.attend(q, k, v)  # [N, T, H, D]
-    return attn.proj(out.reshape(n, t, -1))
+    return _linear(attn.proj, out.reshape(n, t, -1))
 
 
 def _causal_conv(conv: torch.nn.Conv1d, x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
     """Width-3 causal conv over time-major ``x [N, T, C]`` with ``cache [N, C, 2]`` (updated):
     a channels-last conv2d, so cuDNN reads the activations as they are."""
-    (w,) = _fused_weights(conv, "conv2d", lambda: (
-        conv.weight.unsqueeze(2).contiguous(memory_format=torch.channels_last),
+    w, b = _fused_weights(conv, f"conv2d.{x.dtype}", lambda: (
+        conv.weight.unsqueeze(2).to(x.dtype).contiguous(memory_format=torch.channels_last),
+        conv.bias.to(x.dtype),
     ))
     n, t, c = x.shape
-    x = torch.cat([cache.transpose(1, 2), x], dim=1)  # [N, T + 2, C]
+    x = torch.cat([cache.transpose(1, 2).to(x.dtype), x], dim=1)  # [N, T + 2, C]
     cache.copy_(x[:, -cache.shape[-1]:].transpose(1, 2))
-    out = torch.nn.functional.conv2d(x.unsqueeze(1).permute(0, 3, 1, 2), w, conv.bias)
+    out = torch.nn.functional.conv2d(x.unsqueeze(1).permute(0, 3, 1, 2), w, b)
     return out.permute(0, 2, 3, 1).reshape(n, t, c)
 
 
@@ -182,26 +199,33 @@ def _conv_block(block, x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
 
 def _mlp(mlp, h: torch.Tensor) -> torch.Tensor:
     n, t, c = h.shape
-    a = torch._addmm_activation(mlp.fc1.bias, h.reshape(n * t, c), mlp.fc1.weight.t(), use_gelu=True)
-    return mlp.fc2(a).reshape(n, t, -1)
+    w, b = _fused_weights(mlp.fc1, f"fc1.{h.dtype}", lambda: (mlp.fc1.weight.to(h.dtype), mlp.fc1.bias.to(h.dtype)))
+    a = torch._addmm_activation(b, h.reshape(n * t, c), w.t(), use_gelu=True)
+    return _linear(mlp.fc2, a).reshape(n, t, -1)
 
 
-def dit_forward(dit, x, mu, mods, final_mod, spks, cond, cnn_cache, kv) -> torch.Tensor:
+def dit_forward(dit, x, mu, mods, final_mod, spks, cond, cnn_cache, kv, dtype=None) -> torch.Tensor:
     """``DiT.forward`` over bounded KV caches on CUDA: the same blocks, with each residual
     add fused into the next adaLN (the MLP's into the next block's), the attention over the
-    cache, channels-last causal convs, and bias + GELU in the fc1 GEMM's epilogue."""
+    cache, channels-last causal convs, and bias + GELU in the fc1 GEMM's epilogue.
+
+    ``dtype`` (default ``x``'s) is what the GEMMs, convolutions and attention take; the
+    residual stream, the norms' arithmetic and the returned velocity stay in ``x``'s dtype.
+    The attention caches must hold ``dtype``."""
     t = x.shape[-1]
-    h = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, t), cond], dim=1)
-    x = dit.in_proj(h.transpose(1, 2)).contiguous()
+    low = dtype or x.dtype
+    h = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, t), cond], dim=1).to(low)
+    x = _linear(dit.in_proj, h.transpose(1, 2)).to(x.dtype).contiguous()
     pending = (None, None)
     for i, block in enumerate(dit.blocks):
         (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp,
          shift_conv, scale_conv, gate_conv) = mods[i]
-        x, h = res_adaln(x, *pending, shift_msa, scale_msa, block.norm1.eps)
-        x, h = res_adaln(x, _attention(block.attn, h, kv[i]), gate_msa, shift_conv, scale_conv, block.norm3.eps)
+        x, h = res_adaln(x, *pending, shift_msa, scale_msa, block.norm1.eps, out_dtype=low)
+        x, h = res_adaln(x, _attention(block.attn, h, kv[i]), gate_msa, shift_conv, scale_conv, block.norm3.eps,
+                         out_dtype=low)
         x, h = res_adaln(x, _conv_block(block.conv, h, cnn_cache[i]), gate_conv, shift_mlp, scale_mlp,
-                         block.norm2.eps)
+                         block.norm2.eps, out_dtype=low)
         pending = (_mlp(block.mlp, h), gate_mlp)
     shift, scale = final_mod
-    _, h = res_adaln(x, *pending, shift, scale, dit.final_layer.norm_final.eps)
-    return dit.final_layer.linear(h).transpose(1, 2)
+    _, h = res_adaln(x, *pending, shift, scale, dit.final_layer.norm_final.eps, out_dtype=low)
+    return _linear(dit.final_layer.linear, h).to(x.dtype).transpose(1, 2)

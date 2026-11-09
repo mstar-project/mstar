@@ -66,6 +66,10 @@ HIFT_MEL_CACHE = 8
 SAMPLES_PER_FRAME = 480
 HIFT_TAIL = HIFT_MEL_CACHE * SAMPLES_PER_FRAME
 MAX_LAST_TOKENS = WINDOW - 1
+# The DiT's GEMMs, convolutions and attention (and so its attention caches) run in this
+# dtype on the served path; its residual stream, the encoder, the Euler solver and HiFT
+# stay float32.
+DIT_COMPUTE_DTYPE = torch.float16
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +164,11 @@ class SlotBlock(NamedTuple):
     dtype: torch.dtype
 
 
-def slot_layout(capacity: CacheCapacity) -> dict[str, SlotBlock]:
+def slot_layout(capacity: CacheCapacity, dit_dtype: torch.dtype | None = None) -> dict[str, SlotBlock]:
     """Per-request slot of the batched path, for voices of up to ``capacity.prompt_tokens``
     tokens: ``Token2WavState``'s tensors without their batch axes, except the attention
-    caches, which live in bounded KV resources (``CACHE_FAMILIES``)."""
+    caches, which live in bounded KV resources (``CACHE_FAMILIES``). The DiT's conv
+    caches are in ``dit_dtype`` (default float32), what its convolutions run in."""
     meta = Token2WavState.allocate(capacity, "meta")
     layout = {}
     for f in fields(Token2WavState):
@@ -172,7 +177,8 @@ def slot_layout(capacity: CacheCapacity) -> dict[str, SlotBlock]:
             shape = list(t.shape)
             if f.name in _BATCH_AXIS:
                 del shape[_BATCH_AXIS[f.name]]
-            layout[f.name] = SlotBlock(tuple(shape), torch.float32)
+            dtype = dit_dtype if f.name == "dit_cnn" and dit_dtype else torch.float32
+            layout[f.name] = SlotBlock(tuple(shape), dtype)
     return layout
 
 
@@ -293,7 +299,9 @@ class VoiceBank(NamedTuple):
     dit_cnn: torch.Tensor
 
     @classmethod
-    def build(cls, voices: dict[str, Token2WavVoice]) -> VoiceBank:
+    def build(cls, voices: dict[str, Token2WavVoice], dit_dtype: torch.dtype | None = None) -> VoiceBank:
+        """``dit_dtype``: the DiT caches' dtype, attention and conv (default float32, the
+        voices' own)."""
         names = tuple(voices)
 
         def stack(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -304,10 +312,13 @@ class VoiceBank(NamedTuple):
         return cls(
             names=names,
             prompt_tokens=tuple(voices[n].prompt.tokens.shape[1] for n in names),
-            sources={f: stack([fam.source(voices[n]) for n in names]) for f, fam in CACHE_FAMILIES.items()},
+            sources={
+                f: stack([fam.source(voices[n]) for n in names]).to(dit_dtype if f == "dit" and dit_dtype else None)
+                for f, fam in CACHE_FAMILIES.items()
+            },
             spk=torch.cat([voices[n].spk for n in names]),
             enc_cnn=torch.cat([i["enc_cnn"] for i in init]),
-            dit_cnn=torch.cat([i["dit_cnn"] for i in init]),
+            dit_cnn=torch.cat([i["dit_cnn"] for i in init]).to(dit_dtype),
         )
 
     def index(self, name: str) -> int:

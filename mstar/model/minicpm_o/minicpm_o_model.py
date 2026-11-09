@@ -78,6 +78,7 @@ from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
 from mstar.model.minicpm_o.components.token2wav import (
     CACHE_FAMILIES,
+    DIT_COMPUTE_DTYPE,
     HOP,
     LEAD_SILENCE,
     CacheCapacity,
@@ -369,7 +370,7 @@ class MiniCPMOModel(Model):
         return CacheCapacity(int(self._voice_seconds()[1] * 25) + 1)
 
     def _t2w_slot_layout(self) -> dict:
-        return slot_layout(self._t2w_capacity())
+        return slot_layout(self._t2w_capacity(), dit_dtype=DIT_COMPUTE_DTYPE)
 
     def _t2w_kv(self) -> list[BoundedKVSpec]:
         """Token2wav's attention caches, sized for every voice length allowed."""
@@ -389,6 +390,7 @@ class MiniCPMOModel(Model):
                     retention=family.retention,
                     max_slots=T2W_DEFAULT_SLOTS - 1,
                     reverse_step_order=family.reverse_step_order,
+                    dtype=DIT_COMPUTE_DTYPE if name == "dit" else torch.float32,
                 ),
             )
             for name, family in CACHE_FAMILIES.items()
@@ -498,13 +500,15 @@ class MiniCPMOModel(Model):
                 GraphEdge(next_node=EMPTY_DESTINATION, name="tts_code", persist=True),
             ],
         )
+        # A decode step's code streams to the vocoder as ``tts_code`` and loops back
+        # as ``tts_next``, which the TTS keeps on the device (``device_loopback``).
         tts_decode = Loop(
             name=TTS_DECODE_LOOP,
             section=GraphNode(
                 name=TTS,
-                input_names=["tts_code"],
+                input_names=["tts_next"],
                 outputs=tts_outputs + [
-                    GraphEdge(next_node=TTS, name="tts_code"),
+                    GraphEdge(next_node=TTS, name="tts_next"),
                 ],
             ),
             max_iters=TTS_SAMPLING.max_new_tokens,
@@ -525,6 +529,10 @@ class MiniCPMOModel(Model):
             T2W_CHUNK: GraphNode(
                 name=TOKEN2WAV, input_names=["tts_code"],
                 outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="audio_chunk", output_modality="audio")],
+                # Not speculated: a window's step syncs on the host (the inverse STFT), so
+                # overlap hides little, and a batch picked after the step's postprocess
+                # can carry that step's rows again.
+                enable_async_scheduling=False,
             ),
         }
 
@@ -890,6 +898,7 @@ class MiniCPMOModel(Model):
         elif walk == TTS_PREFILL:
             metadata.graph_walk = TTS_DECODE
             inputs = self._carry(TTS, ("tts_code",), persist_signals)
+            inputs[0].name = "tts_next"
         else:
             # the decode loop has stopped; back here, the reply is done
             return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
@@ -928,6 +937,7 @@ class MiniCPMOModel(Model):
 
     def _create_token2wav(self, weights: str, device: str) -> NodeSubmodule:
         t2w = load_token2wav(str(Path(weights) / "assets" / "token2wav"), device=device)
+        t2w.flow.decoder.estimator.compute_dtype = DIT_COMPUTE_DTYPE
         # the reference prepares voice prompts on the CPU; it is once per voice
         t2w.voice_encoder.cpu()
         voices = {

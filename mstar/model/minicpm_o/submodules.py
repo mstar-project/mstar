@@ -595,12 +595,20 @@ class TTSSubmodule(ARNodeSubmodule):
         self.config = config
         self.config_tts = model.config
         self.sampling = sampling
-        # A decode row's EOS code ends the loop; the code budget is the loop's
-        # cap. The prefill's code is never EOS: the sampler bars it for 50 codes.
+        # A decode row's EOS code ends the loop, checked by the graph runtime; the
+        # code budget is the loop's cap. The prefill's code is never EOS: the
+        # sampler bars it for 50 codes.
         self.token_stop = TokenStop(
             loop=TTS_DECODE_LOOP, buffer="tts_code", stop_ids=frozenset({model.config.eos_code}),
-            sampler=TTS_SAMPLER, walk=TTS_DECODE,
+            sampler=TTS_SAMPLER, walk=TTS_DECODE, runtime_check=True,
         )
+        # a decode step reads its last code off the sampler's slot masters
+        self.device_loopback = DeviceLoopback(
+            walk=TTS_DECODE, signal="tts_next", sampler=TTS_SAMPLER, buffer="tts_code",
+        )
+
+    def inline_client_signals(self, graph_walk: str) -> dict[str, str]:
+        return {}  # the codes go to the vocoder, not the client
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
@@ -620,6 +628,9 @@ class TTSSubmodule(ARNodeSubmodule):
                     input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=1,
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
+                # cuBLAS GEMMs: at decode widths the -O2 template search picks Triton
+                # templates that run this step's kernels ~27% slower (GPU time, c=32)
+                compile_mode="default",
             ),
             PackedAcceleratorGraphConfig(
                 capture_graph_walk=TTS_PREFILL,
@@ -638,15 +649,22 @@ class TTSSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        has_loopback: bool = False,
         **kwargs: Any,
     ) -> ARNodeInputs:
+        if (row := self.uniform_row_inputs(graph_walk, has_loopback)) is not None:
+            # one code, read off the sampler's slot master in `preprocess`; the
+            # routed signal is empty here
+            return row
         device = self.get_device()
         if graph_walk == TTS_PREFILL:
             ids = torch.cat([t.reshape(-1) for t in inputs["tts_ids"]]).to(device)
             hidden = torch.cat([t.reshape(-1, t.shape[-1]) for t in inputs["tts_hidden"]]).to(device)
             embeds = self.model.condition(ids, hidden)
             return ARNodeInputs(input_seq_len=embeds.shape[0], input_embeds=embeds)
-        return ARNodeInputs(input_seq_len=1, input_ids=inputs["tts_code"][0].reshape(1).to(device))
+        # a row whose last step did not keep its code on the device (its first
+        # decode step, after the prefill) brings it routed
+        return ARNodeInputs(input_seq_len=1, input_ids=inputs["tts_next"][0].reshape(1).to(device))
 
     def preprocess(
         self,
@@ -654,6 +672,10 @@ class TTSSubmodule(ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, Any]:
+        if graph_walk == TTS_DECODE and any(inp.input_ids is None for inp in inputs):
+            # a row that looped back brings no code: it is read by slot, beside the
+            # rows that bring theirs
+            return {"input_embeds": self.model.emb_code(self.loopback_inputs(engine_inputs, inputs)["input_ids"])}
         if inputs[0].input_ids is not None:
             return {"input_embeds": self.model.emb_code(torch.cat([inp.input_ids for inp in inputs]))}
         return {"input_embeds": torch.cat([inp.input_embeds for inp in inputs])}
@@ -692,7 +714,9 @@ class TTSSubmodule(ARNodeSubmodule):
         hidden = self.model.model(input_embeds, label="main")
         if graph_walk != TTS_DECODE:
             hidden = attn.select_last_hidden(hidden)
-        return {"tts_code": sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))}
+        codes = sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        # a decode step's code streams to the vocoder and loops back (``tts_next``)
+        return {"tts_code": codes, "tts_next": codes} if graph_walk == TTS_DECODE else {"tts_code": codes}
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
         return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, **kwargs).items()}
@@ -717,17 +741,18 @@ class Token2WavSubmodule(NodeSubmodule):
     (``RecurrentStatePool``). Its stream position is the chunk's offset in the
     stream (``prepare_inputs``).
 
-    Float32. Each window runs in two stages (``forward_batched``), each a piecewise
+    Float32, but for the DiT's GEMMs, convolutions, attention and caches, which are
+    ``DIT_COMPUTE_DTYPE``. Each window runs in two stages (``forward_batched``), each a piecewise
     capture bucketed by batch size: the flow (``t2w/<voice>/flow28``), for windows
     at any position, and HiFT, separately for a request's first window, whose
     input is shorter. A last window has one of a few lengths, each a one-row
     capture; other shapes run eagerly. The inverse STFT and cross-fade stay eager.
     The tests' one-request driver over the same modules is bit-exact against the
     reference at full fp32; this path attends the DiT's cache in another order and
-    runs on fused TF32 kernels.
+    runs on fused kernels, with the DiT in float16.
     """
 
-    WINDOW_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
+    WINDOW_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32]
     # a request ends once, so last windows of one length rarely meet in a pass
     LAST_CAPTURE_BATCH_SIZES = [1]
 
@@ -739,8 +764,14 @@ class Token2WavSubmodule(NodeSubmodule):
         super().__init__()
         self.model = model
         self.eos_code = eos_code
-        self.bank = VoiceBank.build(voices)
+        self.bank = VoiceBank.build(voices, dit_dtype=model.flow.decoder.estimator.compute_dtype)
         self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
+
+    def compile_regions(self) -> dict[str, list[tuple]]:
+        # HiFT up to its spectrum, compiled once with dynamic shapes (every region's
+        # rows and frames): Inductor fuses its elementwise source and snake
+        # activations, about half its GPU time. It compiles in the captures' warm-up.
+        return {"model.hift.spectrum": []}
 
     def _caches(self, resources: Mapping) -> WindowCaches:
         """The step's ``WindowCaches``."""
