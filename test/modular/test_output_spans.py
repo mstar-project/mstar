@@ -33,8 +33,8 @@ from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmo
 from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.engine_manager import (  # noqa: E402
+    _inline_streams,
     _refuse_speculated_spans,
-    _inline_stream_keys,
     _refuse_unroutable_withholds,
 )
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
@@ -385,9 +385,16 @@ def test_startup_refuses_an_inline_stream_whose_items_cannot_go_as_values(conn, 
     talker = {NODE: SimpleNamespace(inline_stream_signals=lambda walk: {"token": "token"})}
     if refused:
         with pytest.raises(ValueError, match="sends 'token' inline"):
-            _inline_stream_keys(talker, model)
-    else:
-        assert _inline_stream_keys(talker, model) == {(NODE, "token")}
+            _inline_streams(talker, model)
+        return
+    streams = _inline_streams(talker, model)
+    assert streams.keys == {(NODE, "token")} and streams.tensor_streams == {}
+    # a lockstep node's streams keep their tensors, and so its token is not
+    # one a step keeps on the device; nor is a stream the node does not declare
+    lockstep = SimpleNamespace(get_instance_world_size_for_node=lambda node: 2)
+    for submodules, groups in ((talker, lockstep), ({NODE: SimpleNamespace(inline_stream_signals=lambda w: {})}, None)):
+        streams = _inline_streams(submodules, model, groups)
+        assert streams.keys == frozenset() and streams.tensor_streams == {(NODE, WALK): {"token"}}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stages a CUDA span to pinned host memory")

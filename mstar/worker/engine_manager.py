@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -182,25 +183,43 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
-def _inline_stream_keys(submodules: dict, model: Model) -> frozenset[tuple[str, str]]:
-    """The (node, signal) pairs whose streamed items the route sends as values
+class InlineStreams(NamedTuple):
+    """Which streamed signals go as values (``_inline_streams``)."""
+    # (node, signal) pairs whose streamed items the route sends as values
+    keys: frozenset[tuple[str, str]]
+    # (node, walk) -> its streamed signals that go as tensors: a step keeps
+    # such a signal's rows on the device only if nothing streams it
+    tensor_streams: dict[tuple[str, str], frozenset[str]]
+
+
+def _inline_streams(
+    submodules: dict, model: Model, parallel_groups: WorkerParallelGroups | None = None,
+) -> InlineStreams:
+    """The streams whose items the route sends as values
     (``NodeSubmodule.inline_stream_signals``), for the graph runtime; any other
     signal's stream keeps its tensors, even one that rides inline to the client.
 
-    Such a signal may have no tensor to fall back on: a step that keeps its
-    rows on the device stores none. So each of its streams must be one whose
-    items can ride a frame as values: not joined from a chunked producer's
-    pieces, and not driving its consumer's walk, which only a tensor's
-    descriptor carries. Startup refuses any other."""
+    A lockstep node's streams keep their tensors: a replicated stream's
+    consumer counts its items from every rank, which a value cannot say. And
+    an inline signal may have no tensor to fall back on, since a step that
+    keeps its rows on the device stores none, so each of its streams must be
+    one whose items can ride a frame as values: not joined from a chunked
+    producer's pieces, and not driving its consumer's walk, which only a
+    tensor's descriptor carries. Startup refuses any other."""
     topology = model.get_partition_topology()
     conns = {c.edge_name: c for c in (topology.connections if topology else [])}
     keys = set()
+    tensor_streams: dict[tuple[str, str], set[str]] = {}
     for walk, section in model.get_graph_walk_graphs().items():
         for name, node in section.get_nodes().items():
             submodule = submodules.get(name)
             inline = submodule.inline_stream_signals(walk) if submodule is not None else {}
+            lockstep = parallel_groups is not None and parallel_groups.get_instance_world_size_for_node(name) > 1
             for edge in node.outputs:
-                if edge.name not in inline or not edge.is_streaming:
+                if not edge.is_streaming:
+                    continue
+                if edge.name not in inline or lockstep:
+                    tensor_streams.setdefault((name, walk), set()).add(edge.name)
                     continue
                 conn = conns.get(edge.name)
                 if conn is not None and (conn.join_dim is not None or conn.consumer_walk is not None):
@@ -209,7 +228,7 @@ def _inline_stream_keys(submodules: dict, model: Model) -> frozenset[tuple[str, 
                         "but its stream joins its items or drives its consumer's walk"
                     )
                 keys.add((name, edge.name))
-    return frozenset(keys)
+    return InlineStreams(frozenset(keys), {k: frozenset(v) for k, v in tensor_streams.items()})
 
 
 def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
@@ -337,8 +356,8 @@ class EngineManager:
     # (node, walk) keys that run beside the chain, as ``build`` decided from
     # the config's ``side_stream`` (see ``_side_lane_keys``)
     side_keys: tuple[tuple[str, str], ...] = ()
-    # (node, signal) pairs whose streamed items go as values (``_inline_stream_keys``)
-    inline_stream_keys: frozenset[tuple[str, str]] = frozenset()
+    # which streamed signals go as values (``_inline_streams``)
+    inline_streams: InlineStreams = InlineStreams(frozenset(), {})
 
     @classmethod
     def build(
@@ -414,7 +433,7 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
-        inline_stream_keys = _inline_stream_keys(submodules, model)
+        inline_streams = _inline_streams(submodules, model, parallel_groups)
         side_keys = _side_lane_keys(
             submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),
             parallel_groups, (device_capability or DeviceCapability.of(device)).is_accelerator,
@@ -455,7 +474,7 @@ class EngineManager:
 
         return cls(
             engine=engine, node_names=set(node_names), side_keys=side_keys,
-            inline_stream_keys=inline_stream_keys,
+            inline_streams=inline_streams,
         )
 
     def warmup_all(self) -> None:

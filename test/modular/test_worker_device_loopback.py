@@ -18,7 +18,12 @@ class _Engine:
 
 
 def _body(inline_emit=True):
-    return make_worker(graph_runtime=SimpleNamespace(supports_inline_emit=inline_emit)).executor._body
+    from mstar.worker.engine_manager import InlineStreams
+
+    return make_worker(
+        graph_runtime=SimpleNamespace(supports_inline_emit=inline_emit),
+        engine_manager=SimpleNamespace(inline_streams=InlineStreams(frozenset(), {})),
+    ).executor._body
 
 
 def test_all_on_device_is_per_step_signals_and_cached_per_node_and_walk():
@@ -32,6 +37,23 @@ def test_all_on_device_is_per_step_signals_and_cached_per_node_and_walk():
     assert not body.all_on_device(engine, "LLM", "prefill_text", ["new_token"])
     assert not body.all_on_device(engine, "LLM", "decode", [])
     assert engine.calls == 2
+
+
+def test_a_signal_that_also_streams_as_a_tensor_is_not_kept_on_the_device():
+    """A stream that keeps its tensors (one the node does not send inline, or a
+    lockstep node's) needs the step to store them, so its signal does not make
+    the step rows-only, whatever the node keeps on the device."""
+    from mstar.worker.engine_manager import InlineStreams
+
+    engine = _Engine({("TTS", "tts_decode"): frozenset({"tts_code"})})
+    body = _body()
+    body.engine_manager = SimpleNamespace(inline_streams=InlineStreams(
+        frozenset(), {("TTS", "tts_decode"): frozenset({"tts_code"})},
+    ))
+    assert not body.all_on_device(engine, "TTS", "tts_decode", ["tts_code"])
+    body = _body()
+    body.engine_manager = SimpleNamespace(inline_streams=InlineStreams(frozenset({("TTS", "tts_code")}), {}))
+    assert body.all_on_device(engine, "TTS", "tts_decode", ["tts_code"])
 
 
 def test_no_rows_only_step_on_a_runtime_without_inline_emit():

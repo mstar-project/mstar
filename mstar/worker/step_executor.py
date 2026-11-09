@@ -241,7 +241,8 @@ class GpuStepBody:
     def all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
         """Whether every output signal of this step is one the node keeps on
         the device (cached per node and walk: it depends on the node's
-        resources, not on the step)."""
+        resources, not on the step). A signal that also streams as a tensor
+        is not: its stream needs the tensor (``InlineStreams.tensor_streams``)."""
         # without inline emit, a rows-only step has no path for the client's tokens
         if not signals or not self._graph_runtime.supports_inline_emit:
             return False
@@ -250,7 +251,7 @@ class GpuStepBody:
         if on_device is None:
             on_device = self._device_loopback[key] = frozenset(
                 engine.device_loopback_signals(node_name, graph_walk)
-            )
+            ) - self.engine_manager.inline_streams.tensor_streams.get(key, frozenset())
         return all(s in on_device for s in signals)
 
     def walk_signals(self, batch: ScheduledBatch, walk: str):
