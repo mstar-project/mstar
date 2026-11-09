@@ -22,6 +22,7 @@ from torch._C._dynamo.eval_frame import _debug_get_cache_entry_list
 
 from mstar.distributed import communication
 from mstar.distributed.communication import CommGroup, JointGroups, sp_seq_split
+from mstar.engine.resources.attn.ragged.base import _build_ragged
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.context_parallel import gather_merge, merge
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
@@ -221,6 +222,19 @@ def _split_exchanges(rank, world, total, rows, captured):
 )
 def test_sequence_shard_exchanges_match_one_rank(tmp_path, world, total, rows, captured):
     _run(_split_exchanges, world, tmp_path / "store", total, rows, captured)
+
+
+def test_a_ulysses_ragged_attention_divides_its_heads_by_the_nodes_head_shards():
+    """Not by every rank of the node's instance: CFG ranks run whole branches, so they don't divide heads."""
+    shards = []
+    spec = types.SimpleNamespace(
+        config=types.SimpleNamespace(shard=shards.append, dtype=torch.float16),
+        sp_exchange="ulysses", shard_key="shard", resource_key="ragged",
+    )
+    joint = types.SimpleNamespace(world_size=4, tp_group=types.SimpleNamespace(world_size=1))
+    info = types.SimpleNamespace(joint_comm_group=joint, head_shards=2, device="cpu", kv_dtype=None)
+    _build_ragged(spec, info, lambda **kwargs: types.SimpleNamespace())
+    assert shards == [2]
 
 
 # --- when a step splits ---------------------------------------------------------------------------

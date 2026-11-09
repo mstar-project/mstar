@@ -58,7 +58,7 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls, **kwargs):
     if joint is None:
         config.shard(1)
     else:
-        config.shard(joint.world_size if ulysses else joint.tp_group.world_size)
+        config.shard(info.head_shards if ulysses else joint.tp_group.world_size)
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(
