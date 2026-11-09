@@ -601,9 +601,10 @@ ported class is served. Chat, speech, images, videos and transcriptions are
 served for every model the Python frontend serves them for; a transcription's
 upload is decoded and cut into windows by the API server's ``WindowPlanner``,
 over the bridge, so both frontends read the same formats. The WebSocket
-routes are served too: ``/generate/ws``, ``/v1/realtime`` (its server turn
-detection runs Silero through the ONNX Runtime library ``onnxruntime`` ships;
-``semantic_vad`` asks the API server's Smart Turn), and openpi's socket at
+routes are served too: ``/generate/ws``, ``/v1/realtime`` (conversations with
+full-duplex models, and transcription, whose server turn detection runs Silero
+through the ONNX Runtime library ``onnxruntime`` ships; ``semantic_vad`` asks the
+API server's Smart Turn), and openpi's socket at
 ``/`` where the config has an ``openpi:`` block. ``mstar-server`` does not
 offer per-message deflate, so ``ws_per_message_deflate`` has no effect there:
 a client that asks for it gets uncompressed frames.

@@ -16,7 +16,7 @@ protocol are untouched):
                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
                        | {t:"voices", rid, sub}
                        | {t:"windows", rid, sub, op, plan, ...}
-                       | {t:"live", rid, sub, op, call, ...}
+                       | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}
                        | {t:"end_of_turn", rid, sub, audio(bin)}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
@@ -26,7 +26,7 @@ protocol are untouched):
                        | {t:"checked", rid, sub, error?, status?}
                        | {t:"voices", rid, sub, metadata:{voices?}}
                        | {t:"windows", rid, sub, metadata:{duration, single, windows} | {error}}
-                       | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status}}
+                       | {t:"live", rid, sub, metadata:{taking | accepted | rejected | error, status, error_id?}}
                        | {t:"end_of_turn", rid, sub, metadata:{p} | {error}}
 
 A ``live`` request is one operation on a ``/generate/ws`` live call, the
@@ -311,26 +311,55 @@ def onnxruntime_library() -> str | None:
     return str(libs[-1]) if libs else None
 
 
-def realtime_facts(server, adapter, directory: str) -> dict | None:
-    """``REALTIME_ENV``'s value for a model with a realtime transcription surface:
-    ONNX Runtime's library and Silero's weights (``None`` where this server has
-    none, which leaves server_vad off as it is here), why Smart Turn did not
-    load (``None`` when it did), and the model's tokenizer, saved under
-    ``directory`` for the stable prefix. ``None`` for any other model."""
-    if adapter is None or not getattr(adapter, "supports_realtime_transcription", False):
+def conversation_facts(server) -> dict | None:
+    """What a ``/v1/realtime`` conversation needs from a model with a
+    ``ClientAudio`` client stream, as the Python route reads it off the model:
+    how many such streams, whether it has turn tokens and its output channels
+    (which decide whether it converses), and, for one that does, its stream
+    and the reply settings. ``None`` for a model with no such stream."""
+    audio = list(getattr(server, "client_audio", None) or [])
+    if not audio:
         return None
+    model = server.model
+    facts = {"streams": len(audio), "turn_tokens": getattr(model, "turn_tokens", None) is not None,
+             "channels": model.get_output_audio_channels("audio")}
+    if facts["turn_tokens"] and len(audio) == 1 and facts["channels"] == 1:
+        stream = audio[0]
+        facts.update(
+            stream=stream.edge_name, rate=stream.audio.sample_rate, frame_samples=stream.audio.frame_samples,
+            output_rate=model.get_output_sample_rate("audio"), voice=model.get_default_voice(),
+            idle_steps=model.turn_idle_steps, silence_rms=float(model.turn_silence_rms),
+        )
+    return facts
+
+
+def realtime_facts(server, adapter, directory: str) -> dict | None:
+    """``REALTIME_ENV``'s value for a model with a ``/v1/realtime`` surface.
+    ``conversation`` is ``conversation_facts``'. For a realtime transcription
+    surface: ONNX Runtime's library and Silero's weights (``None`` where this
+    server has none, which leaves server_vad off as it is here), why Smart
+    Turn did not load (``None`` when it did), and the model's tokenizer,
+    saved under ``directory`` for the stable prefix. ``None`` for any other
+    model."""
+    conversation = conversation_facts(server)
+    transcribes = adapter is not None and getattr(adapter, "supports_realtime_transcription", False)
+    if not transcribes and conversation is None:
+        return None
+    facts = {"conversation": conversation}
+    if not transcribes:
+        return facts
     from mstar.api_server.openai import realtime_vad
 
     def file(path):
         return str(path) if path is not None and Path(path).is_file() else None
 
     # semantic_vad's end-of-turn model runs here, over the bridge (``_end_of_turn``)
-    facts = {
+    facts.update({
         "onnxruntime": onnxruntime_library(),
         "silero": file(realtime_vad.silero_weights()),
         "smart_turn_problem": None if realtime_vad.smart_turn() is not None else realtime_vad.smart_turn_problem(),
         "tokenizer": None,
-    }
+    })
     tokenizer = getattr(getattr(server, "model", None), "tokenizer", None)
     if tokenizer is not None and getattr(tokenizer, "is_fast", False):
         path = Path(directory) / "tokenizer.json"
@@ -615,9 +644,11 @@ class RustFrontendBridge:
         self.loop.create_task(answer())
 
     def _live(self, msg: dict) -> None:
-        """One operation on a ``/generate/ws`` live call, answered as the Python
-        route's ``append_one`` would act on it. The call is the submission its
-        ``call`` names; one that has ended has no key and takes nothing."""
+        """One operation on a live call (``/generate/ws``, or a ``/v1/realtime``
+        conversation, whose appends carry ``audio``: float32 samples for the
+        ``ClientAudio`` stream ``stream``), answered as the Python route would
+        act on it. The call is the submission its ``call`` names; one that has
+        ended has no key and takes nothing."""
         op, key = msg.get("op"), self._keys.get(msg.get("call"))
         reply = {"t": "live", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
         try:
@@ -639,18 +670,26 @@ class RustFrontendBridge:
                     except RuntimeError:
                         pass  # the loop has closed, and the frontend with it
 
+                audio, samples = msg.get("audio"), {}
+                if audio:
+                    import numpy as np
+
+                    # copied: torch.from_numpy warns on a read-only buffer
+                    samples = {"samples": {msg["stream"]: np.frombuffer(audio, dtype="<f4").copy()}}
                 try:
                     accepted = self.server.stream_input(
                         key, msg.get("file_paths") or None, end_input=msg.get("end_input", False),
                         text=msg.get("text"), file_streams=msg.get("file_streams"),
                         model_kwargs=msg.get("model_kwargs"), on_late=on_late if notice is not None else None,
+                        **samples,
                     )
                     meta = {"accepted": accepted}
                 except ValueError as exc:  # the client's fault
                     meta = {"error": scrub_paths(str(exc)), "status": 400}
                 except Exception as exc:  # noqa: BLE001 — the append fails, the bridge goes on
-                    text, _ = client_error_text(exc, "generate/ws append failed", log=logger, type_name=False)
-                    meta = {"error": text, "status": 500}
+                    route = "realtime" if audio else "generate/ws"
+                    text, error_id = client_error_text(exc, f"{route} append failed", log=logger, type_name=False)
+                    meta = {"error": text, "status": 500, "error_id": error_id}
         except Exception as exc:  # noqa: BLE001
             text, _ = client_error_text(exc, f"generate/ws {op} failed", log=logger, type_name=False)
             meta = {"error": text, "status": 500}
