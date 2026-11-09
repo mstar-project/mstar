@@ -363,6 +363,8 @@ class DeepseekOCRModel(Model):
         result = {"text_inputs": [ids]}
         metadata = {}
         if views:
+            # the decoded pages are spent once cut: don't hold them for the request's life
+            result["image_inputs"] = []
             result["image_views"] = views
             metadata[IMAGE_GRIDS_KEY] = grid
         # Image rows are not keyed by the placeholder ids they replace.
