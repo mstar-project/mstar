@@ -3,7 +3,8 @@ name: Review bot approval current
 # A bot approval counts only for the commit it reviewed. A required check on `main`, it runs no model and no PR code:
 # on a pull request it passes at once (a required check must report there too); in the merge queue, main's copy of
 # bot.py reads the queued PR's reviews and fails unless a person's latest review stands APPROVED or the bot's latest
-# approval is on the PR's current head (bot.py, approval_current). Any read error fails it.
+# approval is on the PR's current head (bot.py, approval_current). Any read error fails it. It reads the head when the
+# PR enters the queue: GitHub takes a PR out of the queue on a push, so a push after that can't ride on this check.
 #
 # A PR that edits this file runs its own copy in the merge queue, but `.github/` needs a code owner's approval.
 
