@@ -189,10 +189,12 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 
 The Python HTTP frontend (the FastAPI routes in `mstar/api_server/entrypoint.py`, `mstar/api_server/openai/router.py` and its `serving_*.py`) is being retired: `mstar serve` is moving to `mstar-server` (`rust/server/`) for every model. Until it is gone, both serve, and nothing new may be served by Python alone:
 
-- **A new OpenAI adapter, endpoint, request field, response format or stream shape lands in `rust/server/` in the same PR** as its Python counterpart, with a test in `test/rust/` that sends the same request to both frontends and compares what reaches `submit_request` and what the client gets back (`test_rust_openai_adapters.py` and `test_rust_frontend.py` have the pattern). A model's adapter is a class in `ADAPTER_REGISTRY` plus its `Adapter` variant in `rust/server/src/adapters.rs`.
+- **A new OpenAI adapter, endpoint, request field, response format or stream shape lands in `rust/server/` in the same PR** as its Python counterpart, with a test in `test/rust/` that sends the same request to both frontends and compares what reaches `submit_request` and what the client gets back (`test_rust_openai_adapters.py` and `test_rust_frontend.py` have the pattern). A model's adapter is a class in `ADAPTER_REGISTRY` plus a type implementing `OpenAIAdapter` in `rust/server/src/adapters/` and its row in `ADAPTERS`.
 - **`NOT_PORTED` in `test/rust/test_rust_openai_adapters.py` only shrinks.** Adding to it is a regression of the migration, not a follow-up.
 - **What the data worker does per request stays in Python for now**: `process_prompt`, tokenization, detokenization, and media a model's own loader decodes (`ref_audio` is checked by that loader, `media_io.check_ref_audio`). That code is behind both frontends and is not part of this rule.
 - **A behavior change to a surface both frontends serve changes both**, so the two don't drift (an adapter's refusal text, a default, a status code).
+
+## Testing
 
 
 ```bash

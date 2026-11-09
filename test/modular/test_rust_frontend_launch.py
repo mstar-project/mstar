@@ -37,16 +37,6 @@ def test_unset_settings_leave_the_frontends_defaults(launched, monkeypatch):
     assert "MSTAR_SAMPLE_RATE" not in launched["env"]
 
 
-def test_the_voice_list_is_the_models_and_never_an_inherited_one(launched, monkeypatch):
-    monkeypatch.setenv("MSTAR_VOICES", '{"voices": [{"id": "stale", "name": "stale"}]}')
-    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u")
-    assert "MSTAR_VOICES" not in launched["env"]
-    voices = {"object": "list", "voices": [{"id": "af", "name": "af"}], "default_voice": "af"}
-    rust_frontend.launch_rust_server("bin", "kokoro", 8000, "/b", "/u", voices=voices)
-    import json
-    assert json.loads(launched["env"]["MSTAR_VOICES"]) == voices
-
-
 def test_mstar_server_gets_the_libsndfile_soundfile_loaded(launched, monkeypatch):
     monkeypatch.setenv("MSTAR_LIBSNDFILE", "/stale/libsndfile.so")
     monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: None)

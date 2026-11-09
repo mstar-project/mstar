@@ -150,10 +150,6 @@ async fn main() {
     }
 
     sndfile::init();
-    let voices = std::env::var("MSTAR_VOICES")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| Arc::new(serde_json::from_str::<Value>(&s).expect("MSTAR_VOICES is a JSON voice list")));
 
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
@@ -167,7 +163,6 @@ async fn main() {
         tok,
         bridge,
         refusals: refusals.clone(),
-        voices,
     };
 
     // Allow-all CORS, matching mstar's CORSMiddleware configuration.
@@ -329,16 +324,18 @@ fn error_type(status: u16) -> &'static str {
     }
 }
 
-/// `MSTAR_MAX_BODY_MB`, default 128. The Python frontend parses it the same
-/// way (`mstar/api_server/body_limit.py`).
 /// The path a route sees under `MSTAR_ROOT_PATH`, by Starlette's
 /// `get_route_path`: a path under `root` loses it, and any other path is
-/// routed as sent.
+/// routed as sent. `root` is taken as set, so `/proj/job/` leaves
+/// `/proj/job/v1/models` whole, as Starlette does.
 fn route_path<'a>(root: &str, path: &'a str) -> &'a str {
-    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return path;
+    }
     match path.strip_prefix(root) {
-        Some("") if !root.is_empty() => "/",
-        Some(rest) if !root.is_empty() && rest.starts_with('/') => rest,
+        // Starlette's "" matches no route; neither does "/"
+        Some("") => "/",
+        Some(rest) if rest.starts_with('/') => rest,
         _ => path,
     }
 }
@@ -363,6 +360,8 @@ fn strip_root_path(root: &str, mut req: Request<Body>) -> Request<Body> {
     req
 }
 
+/// `MSTAR_MAX_BODY_MB`, default 128. The Python frontend parses it the same
+/// way (`mstar/api_server/body_limit.py`).
 fn body_limit_mb() -> usize {
     std::env::var("MSTAR_MAX_BODY_MB")
         .ok()
@@ -501,8 +500,6 @@ fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter
     Ok(adapter)
 }
 
-/// Delete a request's persisted media 60 s after translation, matching
-/// mstar's deferred upload cleanup. Only files under `upload_dir` are deleted.
 /// A request's uploads, scheduled for removal ([`schedule_upload_cleanup`])
 /// when this drops: when whatever it moved into is done with them.
 struct DeferredCleanup {
@@ -518,6 +515,8 @@ impl Drop for DeferredCleanup {
     }
 }
 
+/// Delete a request's persisted media 60 s after translation, matching
+/// mstar's deferred upload cleanup. Only files under `upload_dir` are deleted.
 fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
     let files: Vec<PathBuf> = args
         .file_paths
@@ -589,17 +588,23 @@ async fn list_models(State(st): State<AppState>) -> Json<ModelList> {
     Json(ModelList::new(vec![ModelCard::new(st.model_name, now())]))
 }
 
-/// `GET /v1/audio/voices`, as router.py's `audio_voices`.
+/// `GET /v1/audio/voices`, as router.py's `audio_voices`: the model's list,
+/// asked over the bridge (none in mock mode).
 async fn audio_voices(State(st): State<AppState>) -> Response {
     if let Err(r) = resolve(&st, Surface::Speech) {
         return r;
     }
-    match &st.voices {
-        Some(list) => Json(list.as_ref().clone()).into_response(),
-        None => {
+    let voices = match &st.bridge {
+        Some(bridge) => bridge.voices(BRIDGE_PROBE_TIMEOUT).await,
+        None => Ok(None),
+    };
+    match voices {
+        Ok(Some(list)) => Json(list).into_response(),
+        Ok(None) => {
             let message = format!("Model '{}' does not publish a voice list", st.model_name);
             error(404, &message, error_type(404))
         }
+        Err((status, message)) => error(status, &message, error_type(status)),
     }
 }
 
@@ -1637,7 +1642,8 @@ mod tests {
         assert_eq!(route_path("", "/v1/models"), "/v1/models");
         // a path under the prefix loses it; the bare path still routes
         assert_eq!(route_path("/proj/job", "/proj/job/v1/models"), "/v1/models");
-        assert_eq!(route_path("/proj/job/", "/proj/job/v1/models"), "/v1/models");
+        // the prefix as set: a trailing slash leaves the path whole, as Starlette does
+        assert_eq!(route_path("/proj/job/", "/proj/job/v1/models"), "/proj/job/v1/models");
         assert_eq!(route_path("/proj/job", "/v1/models"), "/v1/models");
         // a sibling that only shares the prefix's characters is not under it
         assert_eq!(route_path("/proj/job", "/proj/jobs/v1/models"), "/proj/jobs/v1/models");
@@ -1670,7 +1676,6 @@ mod tests {
             tok: None,
             bridge,
             refusals: Arc::new(refusals::Refusals::default()),
-            voices: None,
         }
     }
 
@@ -1807,6 +1812,18 @@ mod tests {
         let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
 
         let (status, _, _) = body(metrics(State(state(Some(bridge)))).await).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn voices_are_503_when_the_bridge_does_not_answer() {
+        let dir = socket_dir();
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+        let st = AppState { python_adapter: "OrpheusAdapter".into(), ..state(Some(bridge)) };
+
+        let (status, _, _) = body(audio_voices(State(st)).await).await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let _ = std::fs::remove_dir_all(dir);

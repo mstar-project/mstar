@@ -378,12 +378,6 @@ Read by the ``mstar-server`` binary and its bridge
        ``soundfile`` loaded (``soundfile_library``) and drops an inherited
        value; it is opened at run time, never linked, as its LAME encoder is
        LGPL.
-   * - ``MSTAR_VOICES``
-     - unset
-     - The Rust frontend's ``GET /v1/audio/voices`` body, as JSON; unset
-       answers 404, as for a model with no fixed voice list. Not for
-       deployments to set: ``launch_rust_server`` sets it from the model
-       (``serving_speech.list_voices``) and drops an inherited value.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -436,7 +430,7 @@ Read by the ``mstar-server`` binary and its bridge
      - The class name of the model's adapter in ``ADAPTER_REGISTRY``
        (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
        picks the OpenAI translation ``mstar-server`` uses
-       (``Adapter::from_python``). ``mstar-serve --rust-frontend`` always sets it;
+       (``adapters::from_python``, which looks it up in ``ADAPTERS``). ``mstar-serve --rust-frontend`` always sets it;
        a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset

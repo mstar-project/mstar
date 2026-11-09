@@ -14,12 +14,14 @@ protocol are untouched):
                        | {t:"ping", rid, sub}
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
+                       | {t:"voices", rid, sub}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
                        | {t:"err", rid, sub, msg} | {t:"done", rid, sub}
                        | {t:"pong", rid, sub}
                        | {t:"metrics", rid, sub, data(bin), metadata}
                        | {t:"checked", rid, sub, error?, status?}
+                       | {t:"voices", rid, sub, metadata:{voices?}}
 
 A ``metrics`` request carries the frontend's cumulative refusal counts as
 three parallel lists (route template, status, count), which the API server
@@ -59,7 +61,6 @@ bridge socket is private to the pair.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import re
@@ -170,8 +171,6 @@ def _stale_server(binary: str, rust_dir: Path) -> str | None:
 #: launcher's resolved values win over inherited ones, as the API key's does.
 REQUEST_TIMEOUT_ENV = "MSTAR_REQUEST_TIMEOUT_S"
 SAMPLE_RATE_ENV = "MSTAR_SAMPLE_RATE"
-#: ``GET /v1/audio/voices``' body as JSON (``serving_speech.list_voices``).
-VOICES_ENV = "MSTAR_VOICES"
 #: The libsndfile ``soundfile`` loaded, which mstar-server opens for mp3/flac/opus.
 LIBSNDFILE_ENV = "MSTAR_LIBSNDFILE"
 
@@ -186,17 +185,17 @@ def soundfile_library() -> str | None:
         import soundfile
     except (ImportError, OSError):
         return None
-    return getattr(soundfile, "_full_path", None) or getattr(soundfile, "_libname", None)
+    # `_libname` is set only when the packaged library failed to load and soundfile
+    # fell back to the system one; `_full_path` is set before that attempt
+    return getattr(soundfile, "_libname", None) or getattr(soundfile, "_full_path", None)
 
 
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
                        api_key: str | None = None, timeout_s: float | None = None,
-                       sample_rate: int | None = None, voices: dict | None = None) -> subprocess.Popen:
+                       sample_rate: int | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
-    (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
-    ``voices`` is the model's voice list as ``GET /v1/audio/voices`` returns it;
-    ``None`` answers that route 404, whatever the environment holds."""
+    (``get_output_sample_rate``); ``None`` leaves the frontend's own default."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -207,9 +206,6 @@ def launch_rust_server(binary: str, model_name: str, port: int,
         env[REQUEST_TIMEOUT_ENV] = repr(float(timeout_s))
     if sample_rate is not None:
         env[SAMPLE_RATE_ENV] = str(int(sample_rate))
-    env.pop(VOICES_ENV, None)
-    if voices is not None:
-        env[VOICES_ENV] = json.dumps(voices)
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile
@@ -389,6 +385,28 @@ class RustFrontendBridge:
 
         self.loop.create_task(check())
 
+    def _voices(self, msg: dict) -> None:
+        """``GET /v1/audio/voices``' body, asked per request since a model's list can
+        change while it serves (CosyVoice3 lists its voices directory); no ``voices``
+        in ``metadata`` when the model publishes none (a 404)."""
+        reply = {"t": "voices", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
+
+        async def answer() -> None:
+            try:
+                from mstar.api_server.openai.serving_speech import list_voices
+
+                voices = await asyncio.to_thread(list_voices, self.server)
+                if voices is not None:
+                    reply["metadata"] = {"voices": voices.model_dump()}
+                self._send(reply)
+            except Exception:  # noqa: BLE001 — the request fails, the bridge goes on
+                logger.exception("bridge: listing the voices raised")
+                self._send({"t": "chunk", "rid": msg.get("rid"), "sub": msg.get("sub"),
+                            "modality": "error", "data": b"the server could not list the voices",
+                            "metadata": {"status": 500}})
+
+        self.loop.create_task(answer())
+
     def _handle(self, msg: dict) -> None:
         t = msg.get("t")
         if t == "submit":
@@ -403,6 +421,8 @@ class RustFrontendBridge:
             self._metrics(msg)
         elif t == "check_ref_audio":
             self._check_ref_audio(msg)
+        elif t == "voices":
+            self._voices(msg)
         else:
             logger.warning("bridge: unknown message type %r", t)
 

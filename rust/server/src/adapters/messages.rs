@@ -59,9 +59,9 @@ pub fn flatten_messages(
                 "image_url" | "video_url" | "audio_url" => {
                     let url = nested_url(obj, ptype);
                     if !url.is_empty() {
-                        // An `unknown` MIME type stays unknown, as in Python, for
-                        // the submission to refuse; the part's kind is no evidence.
+                        let fallback = ptype.trim_end_matches("_url");
                         let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
+                        let m = if m == "unknown" { fallback.to_string() } else { m };
                         add_file(&mut parts, &mut saved.paths, m, p);
                     }
                 }

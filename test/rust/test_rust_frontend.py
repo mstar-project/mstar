@@ -1455,3 +1455,27 @@ def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
     assert ctype == (BINARY_STREAM_MEDIA_TYPE if binary else "application/x-ndjson")
     assert vary == "Accept"
     assert items(rust_body) == items(python_body)
+
+
+@pytest.mark.parametrize("root", ["/proj/job", "/proj/job/"], ids=["bare", "trailing-slash"])
+def test_both_frontends_route_under_a_root_path_alike(root, tmp_path, monkeypatch):
+    """MSTAR_ROOT_PATH as Starlette's ``root_path`` routes it: a path under the
+    prefix as set loses it, and any other path is routed as sent."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    monkeypatch.setattr(entrypoint, "api_server", None)
+    paths = ["/proj/job/v1/models", "/v1/models", "/proj/jobs/v1/models", "/proj/job", "/proj/jobv1/models"]
+    client = TestClient(entrypoint.app, root_path=root)
+    want = [client.get(p).status_code for p in paths]
+    with _model_stack("qwen3_omni", _StubAPIServer(), env={"MSTAR_ROOT_PATH": root}) as (port, _up):
+        got = []
+        for p in paths:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{p}", timeout=30) as r:
+                    got.append(r.status)
+            except urllib.error.HTTPError as e:
+                got.append(e.code)
+    assert got == want, list(zip(paths, got, want, strict=True))

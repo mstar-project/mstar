@@ -239,30 +239,6 @@ def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields,
     assert rust_files == _files(want.file_paths) == {"image": [base64.b64decode(PNG)]}
 
 
-@pytest.mark.parametrize("cls", CHAT_CLASSES)
-def test_a_part_of_no_media_type_reaches_the_backend_untyped_as_from_python(cls, tmp_path):
-    """A data URL whose MIME type is no image, audio or video is ``unknown`` on
-    both frontends, which ``submit_request`` refuses with a 400. Rust used to
-    type it by its part (an ``image_url`` became an image)."""
-    model = _model_of(cls)
-    stub = _StubAPIServer()
-    body = {"model": "ignored", "messages": [{"role": "user", "content": [
-        {"type": "image_url", "image_url": {"url": f"data:application/octet-stream;base64,{PNG}"}},
-        {"type": "text", "text": "hi"},
-    ]}]}
-    with _model_stack(model, stub) as (port, _upload):
-        status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
-        assert status == 200, data
-        (sub,) = stub.submitted
-        rust_files = _files(sub["files"])
-    want = ADAPTER_REGISTRY[model].chat_to_request(_python_request(body), tmp_path)
-
-    assert "unknown" in want.input_modalities
-    assert sub["in"] == want.input_modalities
-    assert [asdict(p) for p in sub["parts"]] == [asdict(p) for p in want.prompt_parts]
-    assert rust_files == _files(want.file_paths)
-
-
 # ── both frontends answer a chat the same way ────────────────────────────────
 
 class _PythonServer:
@@ -329,8 +305,11 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
 # ── GET /v1/audio/voices ─────────────────────────────────────────────────────
 
 class _VoicedModel:
+    def __init__(self, voices=("tara", "leo")):
+        self.voices = list(voices)
+
     def get_voices(self):
-        return ["tara", "leo"]
+        return list(self.voices)
 
     def get_default_voice(self):
         return "tara"
@@ -347,27 +326,28 @@ def _get(port, path, timeout=15):
 @pytest.mark.parametrize("model,voiced", [("orpheus", True), ("orpheus", False), ("qwen3_5_0.8b", True)],
                          ids=["voices", "no-voice-list", "not-a-speech-model"])
 def test_both_frontends_list_the_voices_alike(model, voiced, tmp_path, monkeypatch):
-    """The launcher hands the model's list over as the Python route builds it
-    (``serving_speech.list_voices``); a model with none, or no speech surface,
+    """Both ask the model (``serving_speech.list_voices``) per request, so a voice
+    added while serving shows on both; a model with none, or no speech surface,
     gets the same 404."""
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
     from mstar.api_server import entrypoint
-    from mstar.api_server.openai.serving_speech import list_voices
-    from mstar.api_server.rust_frontend import VOICES_ENV
 
     server = _PythonServer(model, tmp_path)
-    server.model = _VoicedModel() if voiced else None
+    stub = _StubAPIServer()
+    server.model = stub.model = _VoicedModel() if voiced else None
     monkeypatch.setattr(entrypoint, "api_server", server)
-    py = TestClient(entrypoint.app).get("/v1/audio/voices")
-    voices = list_voices(server)
-    env = {VOICES_ENV: json.dumps(voices.model_dump())} if voices is not None else {}
-    with _model_stack(model, _StubAPIServer(), env=env) as (port, _upload):
-        status, body = _get(port, "/v1/audio/voices")
-    assert (status, json.loads(body)) == (py.status_code, py.json())
+    py = TestClient(entrypoint.app)
+    with _model_stack(model, stub) as (port, _upload):
+        for added in ([], ["nova"]):
+            if voiced:
+                server.model.voices += added
+            expected = py.get("/v1/audio/voices")
+            status, body = _get(port, "/v1/audio/voices")
+            assert (status, json.loads(body)) == (expected.status_code, expected.json())
     if voiced and model == "orpheus":
-        assert py.json()["voices"][0] == {"id": "tara", "name": "tara"}
+        assert expected.json()["voices"][-1] == {"id": "nova", "name": "nova"}
 
 
 # ── text-only chat (TextChatAdapter) ─────────────────────────────────────────

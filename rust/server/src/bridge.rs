@@ -19,12 +19,14 @@
 //!                        | {t:"ping", rid, sub}
 //!                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
 //!                        | {t:"check_ref_audio", rid, sub, path, decoder, bare}
+//!                        | {t:"voices", rid, sub}
 //!   conductor -> frontend: {t:"chunk", rid, sub, modality, data(bin), metadata}
 //!                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
 //!                        | {t:"done",  rid, sub}
 //!                        | {t:"pong",  rid, sub}
 //!                        | {t:"metrics", rid, sub, data(bin), metadata}
 //!                        | {t:"checked", rid, sub, error?, status?}
+//!                        | {t:"voices", rid, sub, metadata:{voices?}}
 //!
 //! A `metrics` request carries this frontend's cumulative refusal counts
 //! (`refusals.rs`) as three parallel lists, for the API server to export. Its
@@ -108,8 +110,8 @@ fn no_parts(parts: &&[Part]) -> bool {
     parts.is_empty()
 }
 
-/// A `ping`, `metrics` or `check_ref_audio` request; only `metrics` carries
-/// `refusals`, and only `check_ref_audio` the clip.
+/// A `ping`, `metrics`, `check_ref_audio` or `voices` request; only `metrics`
+/// carries `refusals`, and only `check_ref_audio` the clip.
 #[derive(Serialize)]
 struct ProbeMsg<'a> {
     t: &'a str,
@@ -376,6 +378,17 @@ impl Bridge {
         }
     }
 
+    /// `GET /v1/audio/voices`' body from the model, asked per request as the
+    /// Python route asks it (a model's list can change while it serves): `Ok(None)`
+    /// when the model publishes no list, `Err` on timeout or a failure there.
+    pub async fn voices(&self, timeout: Duration) -> Result<Option<Value>, (u16, String)> {
+        match self.round_trip("voices", None, None, timeout).await {
+            Some(StreamItem::Chunk(mut chunk)) => Ok(chunk.metadata.get_mut("voices").map(Value::take)),
+            Some(StreamItem::Error { status, message }) => Err((status, message)),
+            _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
     /// Have the API server check a saved reference clip with the model's
     /// loader (`media_io.check_saved_ref_audio`): `Ok`, or the refusal's
     /// `(status, message)`, as the Python adapter refuses it. A refused clip is
@@ -448,9 +461,9 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" => (
+        "metrics" | "voices" => (
             Some(StreamItem::Chunk(ResultChunk {
-                modality: "metrics".to_string(),
+                modality: msg.t,
                 data: msg.data.into_vec(),
                 metadata: msg.metadata,
             })),
