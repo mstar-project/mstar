@@ -582,8 +582,9 @@ def plan_captures(
         for index, (bucket, cost) in enumerate(costs.items()) if cost.graph is not None
     ]
     # Every plain bucket first, as a deployment with no idle-capable resource plans them;
-    # then the idle buckets whose plain twin is in (see `_plain_twin`), so a cheap idle
-    # bucket never takes the room another node's plain bucket needed.
+    # then the idle buckets whose plain twin is in (see `_plain_twin`), and any plain one
+    # an idle bucket's scratch made room for, so a cheap idle bucket never takes the room
+    # another node's plain bucket needed.
     for eligible in (plain, beside_plain_twin):
         while True:
             ready = [candidate for candidate in left if eligible(candidate)]
