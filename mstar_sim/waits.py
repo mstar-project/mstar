@@ -437,6 +437,8 @@ def _watch_activity() -> None:
         _unpark()
     working = child_busy or (counted == 0 and local_busy)
     if working != _native_busy[0]:
+        if working and _running[0] == 0 and not TABLE.latest():
+            _catch_up()  # no one to follow: the real time it stood still, which a thaw would lose
         _native_busy[0] = working
         _run_one() if working else _block_one()
     _local_busy[0] = working and not child_busy

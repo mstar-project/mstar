@@ -1242,6 +1242,28 @@ def test_a_process_alone_sees_the_real_time_of_a_wait_it_cant_see_the_end_of(not
     assert 0.25 < float(out) < 5, out
 
 
+def test_a_wait_keeps_the_real_time_it_stood_still_when_native_work_is_seen_before_its_wake():
+    """The mover sees work on a task the registry doesn't count, with every counted thread still blocked."""
+    out = run_sim("""
+        import os, selectors, threading, time
+        from mstar_sim import clock, waits
+        read, write = os.pipe()
+        def reply():
+            waits._real_sleep(0.3)  # all of the process stands still
+            end = clock._real() + 0.1
+            while clock._real() < end:  # long enough for the mover to look
+                pass
+            os.write(write, b"x")
+        threading.Thread(target=reply, name=waits.OWN + "reply").start()
+        start = time.perf_counter()
+        selector = selectors.DefaultSelector()
+        selector.register(read, selectors.EVENT_READ)
+        selector.select(30)
+        print(time.perf_counter() - start)
+    """)
+    assert 0.25 < float(out) < 5, out
+
+
 def test_the_mover_waits_on_no_lock_of_threadings():
     """It holds the emulator's lock, and a thread holding ``threading``'s can run a free that wants
     that one."""
