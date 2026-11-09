@@ -559,7 +559,7 @@ def test_a_packed_replay_pads_each_label_s_spans_as_its_seq_lens():
     the padding rows' zero-length spans, as ``seq_lens`` has them."""
     declared = []
     runner = object.__new__(PiecewiseAcceleratorGraphRunner)
-    runner._label, runner._current_slot, runner._lora_keys = "region", 0, ()
+    runner._label, runner._current_slot, runner._lora_keys, runner._lean = "region", 0, (), frozenset()
     runner._config = PiecewisePackedConfig(
         capture_fn=lambda call: {}, make_static_inputs=lambda shape: {}, total_tokens=[8],
         declare_step=lambda rids, seq_lens, label_seq_lens=None: declared.append((seq_lens, label_seq_lens)),

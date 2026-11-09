@@ -43,7 +43,7 @@ KV pages and recurrent (GDN/Mamba) state slots are two forms of the same per-req
 
 ## Capture buckets
 
-- Batch buckets are geometric (`DEFAULT_CAPTURE_BATCH_SIZES` in `accelerator_graph_runner.py`: 1, 2, 4, …, 64), so a replay usually runs wider than the live batch.
+- Batch buckets are geometric (`DEFAULT_CAPTURE_BATCH_SIZES` in `accelerator_graph_config.py`: 1, 2, 4, …, 64), so a replay usually runs wider than the live batch.
 - **A padded row must be well-formed, not zeroed.** The replay always runs the bucket's full width. Point padding at `SINK_PAGE` (see `KVPlanState.copy_`) and give it a length of at least 1 unless the target kernel has handling for zero-length rows.
 - **Take the step's width from the bucket when captured, and from the live batch otherwise.** Eager buffers are reused and sized to the widest batch seen. Padding an eager step out to the buffer width makes the index tensors describe query rows that `q` does not have, and the kernel reads off the end. That surfaces as an asynchronous illegal memory access far from the cause, so a cheap `q.shape[0] != expected` assertion at the call site pays for itself. A warmup at higher concurrency followed by a timed batch of 1 is what exposes this.
 

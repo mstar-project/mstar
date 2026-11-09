@@ -23,15 +23,17 @@ tp_async_sched: true
 # fit the pool below, so a decode step never finds it empty.
 max_concurrent_requests: 64
 model_kwargs:
-  # one request's prefill captures every 64 tokens to 2048 (a 1024-token chat
-  # prompt is ~1100), a batch's coarser to 4096; longer prefills are GPU-bound
-  # and run compiled
-  prefill_token_buckets: [
-    64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
-    832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
-    1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
-  prefill_batched_token_buckets: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
   prefill_capture_batch_sizes: [1, 4, 16]
+# one request's prefill captures every 64 tokens to 2048 (a 1024-token chat
+# prompt is ~1100), a batch's coarser to 4096; longer prefills are GPU-bound
+# and run compiled
+prefill_token_buckets:
+  LLM:
+    prefill:
+      1: [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
+          832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
+          1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
+      2: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
 resources:
   kv:
     # MLA latent pages: 576 dims x bf16 = 1.15 KB/token/layer, ~90 KB/token

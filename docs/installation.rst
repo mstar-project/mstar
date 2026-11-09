@@ -561,7 +561,11 @@ Optional: the Rust HTTP frontend
 
 ``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. A Linux wheel that carries
+keeping preprocessing and the conductor protocol. It is replacing the Python
+HTTP frontend, which is being retired: new routes and adapters land in both
+(see "API surfaces land in the Rust frontend" in ``AGENTS.md``), and
+``mstar serve`` will use the Rust frontend for every model once it serves
+everything the Python one does. A Linux wheel that carries
 the extension also installs the binary next to ``mstar-serve``; otherwise build
 it. Then opt in:
 
@@ -587,9 +591,9 @@ sources a build was made from.
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ``mstar-server`` ports adapter classes, not model names, so every model of a
-ported class is served. Chat is served for every model the Python frontend serves
-it for. Some speech, image and video adapters, and the transcription and realtime
-routes, are not ported yet (``NOT_PORTED`` in
+ported class is served. Chat, speech and images are served for every model the
+Python frontend serves them for. The Wan2.2 and LTX-2.5 video adapters, and the
+transcription and realtime routes, are not ported yet (``NOT_PORTED`` in
 ``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
 logs a warning at startup, and ``/generate`` still works.
 

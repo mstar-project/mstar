@@ -116,7 +116,11 @@ is **not** the only wiring step. A model also needs:
 - an ``OpenAIAdapter`` subclass in ``ADAPTER_REGISTRY``
   (``mstar/api_server/openai/adapters.py``), *only* if the model maps onto OpenAI semantics
   such as ``chat.completions``, ``audio.speech`` or ``images.generate``. A model reached
-  only through ``POST /generate`` needs none.
+  only through ``POST /generate`` needs none. The adapter is ported to the Rust frontend in the
+  same change (a type implementing ``OpenAIAdapter`` in ``rust/server/src/adapters/`` and its
+  row in ``ADAPTERS``, tested by
+  ``test/rust/test_rust_openai_adapters.py``): the Python HTTP frontend is being retired, and a
+  surface only it serves is unfinished.
 - the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
   usage snippet. Cosmetic, but user-visible.
 
@@ -309,6 +313,16 @@ There are two ``ResourceReqConfig`` subclasses:
 
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
+
+  A step whose every row samples greedily (``samples_greedy``: temperature 0, no
+  repetition penalty, no ``min_tokens`` and no log-probs) takes each row's argmax instead
+  of the full sampler's draw, eagerly or in a twin of each batched capture (see **Lean
+  captures** below); any other step runs the full sampler. By default only a sampler whose
+  ``vocab_size`` is past the one-kernel draw (4096) does this, since a narrower one draws
+  in one kernel already. ``SamplerSpec.greedy_capture`` overrides that: ``false`` turns it
+  off, and with it the twins' capture memory and time, for a deployment that never samples
+  greedily, and ``true`` turns it on whatever the vocabulary. A deployment sets it in its
+  ``resources:`` block. The model declares nothing for it.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -502,6 +516,11 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   boundary when that is past what it restored. A shared prefix is then served from the third request
   that shares it. A step longer than the largest captured bucket checkpoints less often, so that
   its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
+- A prompt the step budget cuts into chunks keeps each chunk's last boundary (a chunk with
+  more of its prompt to come keeps its own end), so a resend restores past its first chunk,
+  and a later chunk's snapshot makes the earlier one the first to evict, as a reply's is.
+  Checkpoints fall a page apart from where a chunk starts, so the pool declares a page as its
+  ``chunk_alignment`` and the scheduler cuts its chunks whole pages long.
 - A decode step that ends a page keeps the state there, so a later turn that re-sends the
   reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated
@@ -835,6 +854,21 @@ The spec types are:
        Returned from ``get_lora_specs`` (one per node), not this list, and built only
        when the serving YAML has a ``resources: lora:`` block. See `Per-request LoRA
        adapters`_.
+
+**Lean captures.** A resource whose kernels can be left out of a step whose rows all
+allow it sets ``Resource.lean_capture``, answers ``lean_for(request_ids)`` from state
+every rank of a lockstep instance sets alike (its ingests), and says which kinds of capture
+get its twin (``lean_captures``). Beside each bucket whose step drives such resources, the
+engine captures a twin for each set of them, keyed by that set (``BucketKey.lean``). A step
+replays the twin of every resource its rows let run lean, else one with fewer of them
+(largest set first, ties in declaration order), else the plain bucket; the engine names the
+set in ``StepContext.lean``, eager steps included, and each resource checks its rows again
+at plan. Twins are sized, planned and captured after every plain bucket, and a twin left
+out (under the capture budget, say) is logged at INFO and is not a dropped bucket: its
+steps replay the plain bucket. Lean resources: the LoRA pool, for steps none of whose rows
+names an adapter, in every kind of capture; and a sampler (see ``SamplingReqConfig``), for
+steps whose rows all sample greedily, in batched captures. A model declares nothing for
+these.
 
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
@@ -1269,9 +1303,9 @@ placed exactly as weights are.
   node's does, from its own segments (an ``attn_key`` region's: one per row), planned
   per replay and handing the enclosing step's plan back at its commit. A region
   replayed as one row per step (``one_row_per_step``) addresses every row to the first
-  request's adapter, so the engine captures it base-only (``LoraBaseOnly``) and leases it
-  only for a step none of whose rows runs an adapter; a step with one runs the region
-  eagerly under the node's step.
+  request's adapter, so the engine captures it with the pool lean (``BucketKey.lean``
+  names the pool) and leases it only for a step none of whose rows runs an adapter; a
+  step with one runs the region eagerly under the node's step.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
@@ -1318,13 +1352,13 @@ placed exactly as weights are.
   kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
   latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
   without a graph break. Under Triton the launch grid depends on the token count and
-  the slot count alone. The engine captures every bucket of a node serving adapters a
-  second time, keyed ``LoraBaseOnly(<the node's own key>)``, with no LoRA kernel in it: a
-  step none of whose rows names an adapter replays that one (or runs its deltas as
-  ``y`` untouched, eagerly), and falls back to the LoRA capture when its twin was not
-  captured. The choice reads only which adapter each request named, the same on every
-  rank, and the pool checks it again at plan; ``cg_key_info`` and ``declare_step`` still
-  state only the node's own key.
+  the slot count alone. The pool is a lean resource (``Resource.lean_capture``; see
+  **Lean captures** under the resources table), so the engine captures every bucket whose
+  step drives it a second time with no LoRA kernel in it: a step none of whose rows names
+  an adapter replays that twin (or runs its deltas as ``y`` untouched, eagerly), and the
+  LoRA capture when the twin was not captured. The choice reads only which adapter each
+  request named, the same on every rank, and the pool checks it again at plan;
+  ``cg_key_info`` and ``declare_step`` still state only the node's own key.
 - **dtype.** The slot weights take the nodes' compute dtype (the serving config's
   ``autocast_dtype``, e.g. ``float16``). A node that runs outside autocast sets
   ``LoraSpec.dtype`` to its weights' dtype.
@@ -1520,10 +1554,11 @@ methods are:
    class attribute ``disable_torch_compile = True``. An encoder whose output feeds a
    prefix cache layout walk compiles with dynamic shapes instead. One that marks every
    dimension that varies with ``torch._dynamo.mark_dynamic`` in ``prepare_inputs`` sets
-   ``marks_dynamic_dims = True`` and compiles as any other submodule. A submodule whose
-   captures keep more compiled entries per frame than ``MSTAR_RECOMPILE_LIMIT`` allows
-   returns the number from ``dynamo_recompile_limit()``; the engine raises the limit
-   around that submodule's compiled calls only. Keep the compiled
+   ``marks_dynamic_dims = True`` and compiles as any other submodule. The engine raises
+   the recompile limit around a node's compiled calls, past ``MSTAR_RECOMPILE_LIMIT``, to
+   hold an entry per bucket its compiled captures take (each batch size and token count);
+   a submodule whose frames keep several entries per bucket (GLM-5.2's decoder layers are
+   traced once per layer kind) declares how many as ``compiled_entries_per_shape``. Keep the compiled
    paths compile-friendly. If a helper must not be traced, because it uses
    data-dependent Python control flow or forces a host synchronization, exclude it
    explicitly with ``@torch.compiler.disable``. A submodule that disables the
@@ -1677,7 +1712,11 @@ and ends at the prompt's length. To opt a walk in:
 
   - ``chunkable=True`` lets the walk's rows be cut.
   - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries
-    chunked rows sets one too, since its steps run under it.
+    chunked rows sets one too, since its steps run under it. Its step may pass it
+    beside a speculation chain's decode rows, by at most those rows' tokens, and the
+    engine trims a serving config's ``prefill_token_buckets`` assuming each such row
+    runs one token. A walk whose decode rows run more (an MTP verify row's k+1)
+    passes that bound, and its steps past a trimmed ladder's top run eagerly.
   - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
     one item per chunk, all when the prompt finishes.
   - ``per_chunk_outputs``: streaming edges sent on every chunk as it runs, for a consumer
@@ -1689,6 +1728,11 @@ and ends at the prompt's length. To opt a walk in:
   - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
     whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
     a walk whose state grows by something other than the tokens a step runs.
+
+  A resource that keeps state only on a grid counted from a chunk's start declares
+  ``Resource.chunk_alignment``, and a cut chunk of the node's rows is then a multiple of
+  every alignment its resources declare (``Engine.chunk_alignment``). The chunk floor rounds
+  up to it, and a budget under it fails loading.
 
   A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
   (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
@@ -2202,11 +2246,11 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
            ),
        ]
 
-An ``ARNodeSubmodule`` takes a ``prefill_token_buckets`` constructor argument, which
-replaces its class's ``PREFILL_TOKEN_BUCKETS`` for that instance: a model passes a
-deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Muse
-Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive
-token counts, or the submodule raises ``ValueError`` when it is built.
+A deployment replaces a packed capture's ``capture_token_lengths`` with the serving
+config's ``prefill_token_buckets`` (node -> capture walk -> ladder, see :doc:`serving`).
+The engine applies it to the configs ``get_accelerator_graph_configs`` returns, so a
+model plumbs nothing. A ``PiecewisePackedConfig`` region's ``total_tokens`` takes the
+ladder its label names the same way.
 
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
 ``additional_key_info=False`` and once with ``additional_key_info=True``. A decode step
@@ -2499,6 +2543,11 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``SamplerSpec``
+     - ``enable_logprobs``, ``enable_processed_logprobs`` (see ``SamplingReqConfig``),
+       ``greedy_capture`` (``true`` / ``false``; by default a sampler past the one-kernel
+       draw takes each row's argmax in a step whose rows all sample greedily, in a twin of
+       each batched capture)
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
@@ -3228,8 +3277,7 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
-``_prompt_ids`` and ``_create_submodule``, which hands the LLM node
-``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). The scaffold's
+``_prompt_ids`` and ``_create_submodule``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
 ``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
 or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through
@@ -3398,7 +3446,8 @@ producer ``CLIENT``:
 chunk policy, exactly as it would a stream from another partition. Its partition
 self-triggers from the stream, so its forward-pass args send no inputs. That node must be
 the only one, in any walk, that takes the edge; the conductor checks this at startup, and
-that the model implements ``process_stream_chunk``. A partition may take several client
+that the model implements ``process_stream_chunk`` unless each client stream declares
+``ClientAudio`` (below). A partition may take several client
 streams (audio and video, say): each has its own buffer and its own end.
 
 - ``process_stream_chunk(chunk)`` turns each append the client sends into stream items,
@@ -3408,12 +3457,15 @@ streams (audio and video, say): each has its own buffer and its own end.
   file names (``None`` where the client named none, so the model decides);
   ``model_kwargs``, the append's own; and ``request_kwargs``, the opening message's.
   Raise ``ValueError`` for an append the model doesn't take (the client gets a 400). An
-  append of text alone that yields no item is refused rather than dropped, but the data
-  worker can't tell which items text sent with files yielded: refuse such text yourself
-  if the model takes none. Keep it stateless; the
+  append of text alone, or of ``model_kwargs`` alone that ends no stream, that yields no
+  item is refused rather than dropped, but the data worker can't tell which items text
+  sent with files yielded: refuse such text yourself if the model takes none. Keep it stateless; the
   consuming node keeps its own state, in its resources or ``request_state``.
 - Tensors ``process_prompt`` returns under a client edge's name are the stream's first
   chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
+  ``process_prompt`` gets ``open_streams``, the client streams the opening leaves open; a
+  model whose request settings can't take appends on one (Qwen3-TTS text in a layout that
+  streams none) raises ``ValueError`` there, so the live opening gets a 400.
 - A client stream may declare limits, ``Connection(..., limits=ClientStreamLimits(...))``
   (``mstar.streaming.topology``), which the client-stream layer enforces before any of
   the model's code runs: ``max_items``, what the stream may carry over a call's life,
@@ -3423,18 +3475,59 @@ streams (audio and video, say): each has its own buffer and its own end.
   session cap of its own. Declare the most the consumer can take: a deployment may
   lower a declared bound under ``client_streams:`` (see :doc:`serving`), but not raise
   it.
+- An audio client stream may declare what its audio is,
+  ``Connection(..., audio=ClientAudio(sample_rate, frame_samples))``: mono audio at
+  ``sample_rate``, whose consumer computes on frames of ``frame_samples``. ``/v1/realtime``
+  then serves the model as a conversation (:doc:`clients`), when only one of its client
+  streams declares it and its audio output is mono: the route decodes the caller's codec, resamples to
+  ``sample_rate`` and turns the model's output back into the caller's format from
+  ``get_output_sample_rate``. On every route the data worker, the stream's producer,
+  sends it in whole frames: each whole frame of an append goes as an item (an opening
+  clip's frames as one) and the rest waits for the next append, or goes with the
+  stream's end. A
+  model whose client streams all declare ``ClientAudio`` needs no
+  ``process_stream_chunk``: the data worker takes appended audio files at
+  ``sample_rate`` (one at another rate is refused: resampling an append alone leaves a
+  seam), refuses non-finite samples and clamps to [-1, 1]. Nemotron VoiceChat declares
+  ``ClientAudio(16000, 1280)``: its encoder's 80 ms frame, taken from the encoder's own
+  hop and subsampling.
+- A model that declares ``ClientAudio`` decides when to speak (full duplex). To serve
+  ``/v1/realtime`` conversations it also declares ``turn_tokens = (start_id, end_id)`` on
+  the model (a property when the ids come from its config): the text tokens that open and
+  close each reply, and, if its replies may get no end mark, ``turn_idle_steps``: a reply
+  then also ends after that many steps with no text and no audio above ``turn_silence_rms``
+  (the RMS of samples in [-1, 1], 0.005 unless the model sets it), and text outside a reply
+  opens one. Without them ``/generate/ws`` still serves it, and a conversation is
+  refused (an omitted ``intent`` then means transcription, if the model's adapter serves it). The data worker marks the text chunks they arrive in with
+  ``metadata["turn"]``, their marks (``"start"`` / ``"end"``) in token order, on every
+  route, before ``postprocess`` (which may decode them to nothing), and stamps each text
+  and audio chunk with ``metadata["step"]``, the iteration of the loop that emitted it.
+  ``/v1/realtime`` frames one response per reply from the marks and puts step ``k``'s
+  audio in the reply whose text steps hold ``k``, so the text and the audio node must
+  each emit from a loop that steps once per input item. Startup refuses one that emits
+  outside a loop, or from a partition not stepped one item at a time on every connection
+  from the ``ClientAudio`` stream; ``FixedChunkPolicy(chunk_size=1)`` is the only policy
+  the check takes as one. Turns as a pair of token ids fit a
+  model that brackets each reply (Nemotron's BOS / EOS); one that marks speech another
+  way, such as Moshi-style PAD / EPAD runs, can't declare them yet, and serves
+  ``/generate/ws`` only.
 - A stream ends when the client ends it: ``end_input: true`` ends all of the call's
   streams, a list of names only those. The consumer gets ``producer_done`` for that edge
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
-  Over ``/generate/ws`` the client appends and ends input explicitly (see
-  :doc:`clients`); every other route ends the input as soon as the request is submitted.
-  ``/generate/ws`` is on the Python frontend only, not ``--rust-frontend``.
+  Over ``/generate/ws`` a client that opens with ``end_input: false`` appends and ends
+  input explicitly (see :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open
+  for the call's life; every other request ends the input as soon as it is submitted. ``/generate/ws``
+  and ``/v1/realtime`` are on the Python frontend only, not ``--rust-frontend``.
 - The API server's data worker is the stream's producer. The conductor tells it the
   consuming node and its ranks once per call, when it dispatches the request, and the data
   worker sends each append's items to every one of those ranks itself, and then the
   stream's end with how many items it carried. Every rank gets each item whole, so a client
   stream can't take a ``sharding_config.shard_dim`` entry (startup refuses one). Once the
   consuming partition ends, later appends for its streams are answered as late.
+- A consumer with nothing to do on the step that ends its last stream
+  (``is_final_stream_chunk``; empty when the last item was taken before the end arrived)
+  returns None from ``prepare_inputs``. The row still completes its node, so its loop ends
+  and its partition reports done. None on any other chunk drops the row from the step. Every rank sees the same chunk, so all decline alike.
 
 Checklist
 ---------
@@ -3466,6 +3559,7 @@ Checklist
          [ ] the client-example tuples lower down (cosmetic, user-visible)
    [ ] docs/models.rst                            — one row in the registry-key table
    [ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
+         [ ] and rust/server/src/adapters/ — the same adapter in the Rust frontend
    [ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
    [ ] (optional) async partitions if pipelined
 

@@ -2,7 +2,6 @@ from mstar.engine.resources.lora.config import (
     LORA_ADAPTER_KWARG,
     LORA_RESOURCE_KEY,
     AdapterInfo,
-    LoraBaseOnly,
     LoraModuleRef,
     LoraModuleResolver,
     LoraReqConfig,
@@ -10,7 +9,6 @@ from mstar.engine.resources.lora.config import (
     LoraStep,
     LoraTarget,
     lora_enabled,
-    node_capture_key,
     resolve_adapter_path,
     served_lora_adapters,
 )
@@ -19,7 +17,6 @@ __all__ = [
     "LORA_ADAPTER_KWARG",
     "LORA_RESOURCE_KEY",
     "AdapterInfo",
-    "LoraBaseOnly",
     "LoraModuleResolver",
     "LoraModuleRef",
     "LoraReqConfig",
@@ -27,7 +24,6 @@ __all__ = [
     "LoraStep",
     "LoraTarget",
     "lora_enabled",
-    "node_capture_key",
     "resolve_adapter_path",
     "served_lora_adapters",
 ]

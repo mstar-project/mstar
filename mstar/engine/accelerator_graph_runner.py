@@ -12,12 +12,13 @@ from torch.distributed import ReduceOp
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine import with_recompile_limit
+from mstar.engine import recompile_limit, with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
 )
 from mstar.engine.accelerator_graph_config import (
+    DEFAULT_CAPTURE_BATCH_SIZES,
     DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
@@ -25,12 +26,12 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
+    apply_token_ladders,
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import ResidentPlanner
-from mstar.engine.resources.step import PIECEWISE_WALK
+from mstar.engine.resources.step import PIECEWISE_WALK, lean_subsets
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
@@ -45,9 +46,6 @@ from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
-
-
-DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
 # torch.compile arguments per compile level (``mstar serve -O``), for a captured
@@ -252,6 +250,21 @@ def fail_if_graphs_required(missing: list[str]) -> None:
         "accelerator graph capture failed for " + ", ".join(missing)
         + " and accelerator graphs are required"
     )
+
+
+def _plain_twin(key) -> BucketKey | None:
+    """The plain bucket a lean twin is captured beside, None for a plain bucket. A
+    piecewise pool keys its buckets ``(label, bucket)``, and a region is never a twin:
+    a ``one_row_per_step`` one is captured lean alone."""
+    return replace(key, lean=frozenset()) if isinstance(key, BucketKey) and key.lean else None
+
+
+def _beside_plain(buckets: Collection) -> set:
+    """``buckets`` without the lean twins whose plain bucket is not among them: a twin
+    serves only steps its plain bucket would, so it is planned, captured and kept only
+    beside it."""
+    buckets = set(buckets)
+    return {key for key in buckets if (plain := _plain_twin(key)) is None or plain in buckets}
 
 
 def fail_if_required_regions_dropped(missing: list[str]) -> None:
@@ -558,26 +571,38 @@ def plan_captures(
         pool, _, _, cost = candidate
         return added(pool, cost) + cost.slots * cost.outside - reused(cost)
 
-    left = [
+    def take(left: list) -> None:
+        """Add the cheapest of ``left`` while it fits."""
+        nonlocal room, bound
+        while left:
+            # a tie goes to the pool named first, which leads with its node, then to capture order
+            best = min(left, key=lambda candidate: (on_device(candidate), *candidate[:2]))
+            pool, _, bucket, cost = best
+            if on_device(best) > room:
+                return
+            room -= on_device(best)
+            used = reused(cost)
+            if used:
+                unused[cost.executable] -= used
+                bound -= used
+            plan.predicted[pool] += added(pool, cost)
+            plan.outside[pool] += cost.slots * cost.outside
+            scratch[pool] = max(scratch[pool], cost.graph - cost.kept)
+            plan.buckets[pool].add(bucket)
+            left.remove(best)
+
+    candidates = [
         (pool, index, bucket, cost) for pool, costs in pools.items()
         for index, (bucket, cost) in enumerate(costs.items()) if cost.graph is not None
     ]
-    while left:
-        # a tie goes to the pool named first, which leads with its node, then to capture order
-        best = min(left, key=lambda candidate: (on_device(candidate), *candidate[:2]))
-        pool, _, bucket, cost = best
-        if on_device(best) > room:
-            break
-        room -= on_device(best)
-        used = reused(cost)
-        if used:
-            unused[cost.executable] -= used
-            bound -= used
-        plan.predicted[pool] += added(pool, cost)
-        plan.outside[pool] += cost.slots * cost.outside
-        scratch[pool] = max(scratch[pool], cost.graph - cost.kept)
-        plan.buckets[pool].add(bucket)
-        left.remove(best)
+    # Every plain bucket before any lean twin, so a twin never takes a plain bucket's
+    # room; then the twins whose plain bucket is in, cheapest first. A twin left out
+    # costs its steps only the lean kernels: they replay the plain bucket.
+    take([candidate for candidate in candidates if _plain_twin(candidate[2]) is None])
+    take([
+        candidate for candidate in candidates
+        if (plain := _plain_twin(candidate[2])) is not None and plain in plan.buckets[candidate[0]]
+    ])
     return plan
 
 
@@ -690,7 +715,13 @@ class AcceleratorGraphRunner:
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
+        token_ladders: Mapping[str, Any] | None = None,
+        step_tokens: Callable[[str, int], int | None] = lambda walk, max_rows: None,
     ):
+        """``token_ladders``: the serving config's ``prefill_token_buckets``
+        for this node, applied to its packed captures under ``step_tokens``
+        ((walk, the capture's widest batch) -> the most tokens the scheduler
+        gives such a step, None for no budget; `apply_token_ladders`)."""
         self._submodule_name = submodule_name
         self._capture_stream = capture_stream
         self._submodule = submodule
@@ -702,6 +733,10 @@ class AcceleratorGraphRunner:
                 device, joint_comm_group.world_size
             )
         )
+        if token_ladders:
+            apply_token_ladders(
+                submodule_name, self._capture_configs, token_ladders, step_tokens, self._batch_sizes,
+            )
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
@@ -716,6 +751,8 @@ class AcceleratorGraphRunner:
         self._num_slots = num_slots
 
         self._buckets: dict[BucketKey, AcceleratorGraphBucket] = {}
+        # plain bucket -> its captured lean twins, by lean set (`lease_slot`)
+        self._twins: dict[BucketKey, dict[frozenset[str], BucketKey]] = {}
 
         self._memory_pool: AcceleratorGraphPool | None = None
         # buckets that failed to capture (here or on a peer rank) and run eagerly
@@ -768,6 +805,7 @@ class AcceleratorGraphRunner:
             (max(self._batch_sizes(config)) for config in self._capture_configs),
             default=1,
         )
+        self.recompile_limit = self._recompile_limit()
 
     @property
     def any_graphs(self):
@@ -775,6 +813,19 @@ class AcceleratorGraphRunner:
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+
+    def _recompile_limit(self) -> int | None:
+        """The dynamo recompile limit this node's compiled calls run under, None where the
+        engine's holds: ``compiled_entries_per_shape`` entries per compiled bucket the runner
+        captures (each batch size, token count and key traces apart; a LoRA node's base-only
+        twin is a key), and some for the engine's compiled forward, which shares the code
+        objects. A capture past the limit would run uncompiled inside its graph."""
+        shapes = {
+            (spec.config_idx, spec.bs, spec.num_tokens, spec.bucket.cg_key_info)
+            for spec in self._get_slot_specs() if spec.config.compile
+        }
+        need = self._submodule.compiled_entries_per_shape * len(shapes) + 16
+        return need if need > recompile_limit() else None
 
     def max_capture_bs(self, walks: Collection[str]) -> int:
         """The widest capture of any of ``walks``, 0 when none of them has one."""
@@ -791,21 +842,25 @@ class AcceleratorGraphRunner:
 
     def _get_slot_specs(self) -> list[CGSlotSpec]:
         specs = []
+        lean_keys = [key for key, resource in self._resources.items() if resource.lean_capture]
         for config_idx, config in enumerate(self._capture_configs):
-            keys = [config.additional_key_info]
-            if getattr(self._submodule, "lora_keys", ()):
-                # a node serving adapters also captures each bucket for steps with no
-                # adapter row, recording no LoRA kernel (see `LoraBaseOnly`); the two
-                # share the config's compiled forward, static buffers and padding rows
-                keys.append(LoraBaseOnly(config.additional_key_info))
+            # Beside each bucket, a lean twin for every set of the node's lean resources
+            # that take this kind of capture (`Resource.lean_captures`), recording none
+            # of their kernels; `prepare_for_capture` keeps those whose step drives them.
+            # A twin shares its bucket's compiled forward, static buffers and padding rows.
+            config_type = config.get_config_type()
+            leans = (frozenset(), *lean_subsets(
+                [key for key in lean_keys if self._resources[key].lean_captures(config_type)]
+            ))
             for bs in self._batch_sizes(config):
                 for num_tokens in config.get_total_tokens(bs):
-                    for key in keys:
+                    for lean in leans:
                         bucket = BucketKey(
                             graph_walk=config.capture_graph_walk,
-                            cg_key_info=key,
+                            cg_key_info=config.additional_key_info,
                             bs=bs,
                             num_tokens=num_tokens,
+                            lean=lean,
                         )
                         for slot in range(self._num_slots):
                             specs.append(CGSlotSpec(
@@ -833,10 +888,15 @@ class AcceleratorGraphRunner:
         """
         if self._prepared_slot_specs is None:
             slot_specs = self._get_slot_specs()
-            # reverse sort based on batch size, then total tokens (largest first)
-            slot_specs.sort(key=lambda s: (s.bs, s.num_tokens), reverse=True)
+            # every plain bucket before any lean twin, each by batch size, then total
+            # tokens (largest first), so sizing and capture place the plain ones first
+            slot_specs.sort(key=lambda s: (not s.bucket.lean, s.bs, s.num_tokens), reverse=True)
             blocked_configs = set()
             checked_configs = set()
+            # config -> the lean resources its step drives: a twin leaving lean one it
+            # doesn't would record the plain bucket's kernels again
+            lean_keys = [key for key, resource in self._resources.items() if resource.lean_capture]
+            driven: dict[int, frozenset[str]] = {}
             for spec in slot_specs:
                 if spec.config_idx in checked_configs:
                     continue
@@ -850,6 +910,9 @@ class AcceleratorGraphRunner:
                     slot_lease=SlotLease(slot=0, bucket=spec.bucket),
                     per_request_info=dummy_metadata(rids, spec.bucket.graph_walk),
                 )
+                driven[spec.config_idx] = frozenset(
+                    key for key in lean_keys if step is not None and key in step.steps
+                )
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
                     logger.error(
@@ -859,11 +922,12 @@ class AcceleratorGraphRunner:
                     )
                     blocked_configs.add(spec.config_idx)
             self._blocked_buckets = list(dict.fromkeys(
-                spec.bucket for spec in slot_specs if spec.config_idx in blocked_configs
+                spec.bucket for spec in slot_specs if spec.config_idx in blocked_configs and not spec.bucket.lean
             ))
             self.dropped_buckets = list(self._blocked_buckets)
             slot_specs = [
-                spec for spec in slot_specs if spec.config_idx not in blocked_configs
+                spec for spec in slot_specs
+                if spec.config_idx not in blocked_configs and spec.bucket.lean <= driven[spec.config_idx]
             ]
             max_seq_len = max((
                 spec.bucket.num_tokens for spec in slot_specs
@@ -897,7 +961,8 @@ class AcceleratorGraphRunner:
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
                     if spec.slot == 0:
-                        walk = (spec.bucket.graph_walk, spec.bucket.cg_key_info)
+                        # a lean twin runs other kernels, so it is sized as a walk of its own
+                        walk = (spec.bucket.graph_walk, spec.bucket.cg_key_info, spec.bucket.lean)
                         self._capture_costs[spec.bucket], lent = _size_in_walk(
                             captured.setdefault(walk, []),
                             CaptureCost(warmed.peak, None, warmed.returned, self._num_slots), True,
@@ -944,7 +1009,7 @@ class AcceleratorGraphRunner:
                             stream=self._capture_stream,
                         ),
                         f"{self._submodule_name} {spec}",
-                        self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info)],
+                        self._executables[(spec.bucket.graph_walk, spec.bucket.cg_key_info, spec.bucket.lean)],
                     )
                 if memory is not None:
                     cost = cost._replace(graph=memory.pool, outside=memory.outside)
@@ -976,10 +1041,10 @@ class AcceleratorGraphRunner:
         slot_specs = self.prepare_for_capture()
         sized = planned is not None
         # what every rank planned, as though captured in full (see `_buckets_captured_everywhere`)
-        planned = self._buckets_captured_everywhere(slot_specs, {
+        planned = _beside_plain(self._buckets_captured_everywhere(slot_specs, {
             bucket: range(self._num_slots)
             for bucket in (planned if sized else {spec.bucket for spec in slot_specs})
-        })
+        }))
         # costliest first, so the graphs after it fit in what it leaves free; by
         # the most each costs on any rank, so every rank warms up in one order
         buckets = list(dict.fromkeys(spec.bucket for spec in slot_specs))
@@ -992,7 +1057,8 @@ class AcceleratorGraphRunner:
         # one shape, so a bucket holding only some of them would silently hand
         # pre-plan and replay the same buffers.
         captured: dict[BucketKey, dict[int, tuple[CGSlotSpec, AcceleratorGraphSlot]]] = {}
-        for spec in sorted(slot_specs, key=lambda spec: -costs[spec.bucket]):
+        # every plain bucket before any lean twin, so a twin can't take a plain one's memory
+        for spec in sorted(slot_specs, key=lambda spec: (bool(spec.bucket.lean), -costs[spec.bucket])):
             if spec.bucket not in planned:
                 continue
             # every rank barriers once per spec, pass or fail — a rank that
@@ -1002,7 +1068,9 @@ class AcceleratorGraphRunner:
             try:
                 slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
             except Exception:
-                logger.error(
+                # a lean twin's steps replay its plain bucket instead (`_report_dropped`)
+                logger.log(
+                    logging.WARNING if spec.bucket.lean else logging.ERROR,
                     "Failed to capture accelerator graph for %s: %s",
                     self._submodule_name, spec, exc_info=True
                 )
@@ -1015,14 +1083,15 @@ class AcceleratorGraphRunner:
                     self._submodule_name, spec.bucket, self._num_slots
                 )
 
-        agreed = self._buckets_captured_everywhere(slot_specs, captured)
+        agreed = _beside_plain(self._buckets_captured_everywhere(slot_specs, captured))
         for bucket_key, slots in captured.items():
             if bucket_key not in agreed:
-                logger.error(
-                    "Dropping accelerator graph bucket %s for %s: captured %d of %d "
-                    "slots here, or fewer on another rank",
-                    bucket_key, self._submodule_name, len(slots), self._num_slots,
-                )
+                if not bucket_key.lean:
+                    logger.error(
+                        "Dropping accelerator graph bucket %s for %s: captured %d of %d "
+                        "slots here, or fewer on another rank",
+                        bucket_key, self._submodule_name, len(slots), self._num_slots,
+                    )
                 continue
             # by slot index, so a bucket's list position is its slot index
             for slot_idx in sorted(slots):
@@ -1047,15 +1116,29 @@ class AcceleratorGraphRunner:
     def _report_dropped(self, wanted: list, kept) -> None:
         """Say loudly which buckets run eagerly. A dropped bucket is a silent
         10-20x latency cliff otherwise, and one failure used to take every
-        later bucket with it."""
+        later bucket with it. A lean twin left out is no such cliff: its steps
+        replay a twin with fewer resources lean, or the plain bucket."""
         wanted = list(dict.fromkeys([*self._blocked_buckets, *wanted]))
-        self.dropped_buckets = [key for key in wanted if key not in kept]
+        plain = [key for key in wanted if not key.lean]
+        self.dropped_buckets = [key for key in plain if key not in kept]
         if self.dropped_buckets:
             logger.error(
                 "AcceleratorGraphRunner[%s]: captured %d of %d buckets; these run "
                 "eagerly: %s",
-                self._submodule_name, len(wanted) - len(self.dropped_buckets),
-                len(wanted), self.dropped_buckets,
+                self._submodule_name, len(plain) - len(self.dropped_buckets),
+                len(plain), self.dropped_buckets,
+            )
+        missing = [key for key in wanted if key.lean and key not in kept and _plain_twin(key) in kept]
+        order = [key for key, resource in self._resources.items() if resource.lean_capture] if missing else []
+        for key in missing:
+            # what `lease_slot` takes for its steps instead: its subsets in the engine's order
+            serving = next((
+                twin for lean in lean_subsets([k for k in order if k in key.lean])[1:]
+                if (twin := replace(key, lean=lean)) in kept
+            ), None)
+            logger.info(
+                "AcceleratorGraphRunner[%s]: lean twin %s not captured; its steps replay %s",
+                self._submodule_name, key, "the plain bucket" if serving is None else f"the lean twin {serving}",
             )
 
     def _buckets_captured_everywhere(
@@ -1090,6 +1173,8 @@ class AcceleratorGraphRunner:
             bucket = self._buckets[spec.bucket] = AcceleratorGraphBucket(
                 config=spec.config, config_idx=spec.config_idx,
             )
+            if spec.bucket.lean:
+                self._twins.setdefault(replace(spec.bucket, lean=frozenset()), {})[spec.bucket.lean] = spec.bucket
         # the caller registers a bucket's slots in index order, and only once
         # all of them captured, so append keeps list position == slot index
         bucket.slots.append(slot)
@@ -1160,6 +1245,8 @@ class AcceleratorGraphRunner:
                 capture=True,
                 slot_lease=lease,
                 force_prefill=_is_packed(config),
+                # a lean twin records none of its lean resources' kernels
+                lean=spec.bucket.lean,
             ))
 
         engine_inputs.step = step
@@ -1267,7 +1354,7 @@ class AcceleratorGraphRunner:
             )
         return with_recompile_limit(with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
-        ), self._submodule)
+        ), self.recompile_limit)
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,
@@ -1359,7 +1446,8 @@ class AcceleratorGraphRunner:
         self, graph_walk: str, bs: int, num_tokens: int,
         cg_key_info: Any | None = None,
     ) -> BucketKey | None:
-        """Tightest captured bucket that fits this batch, or None for eager.
+        """Tightest captured plain bucket that fits this batch, or None for eager
+        (``lease_slot`` takes its lean twin).
 
         A walk may have several captures (e.g. one per image resolution, each a
         fixed shape with its own token count), so every matching bucket is
@@ -1369,7 +1457,7 @@ class AcceleratorGraphRunner:
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
-            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
+            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info or key.lean:
                 continue
             needed = num_tokens * bucket.config.total_tokens_multiplier
             if key.bs < bs or key.num_tokens < needed or not bucket.slots:
@@ -1395,7 +1483,7 @@ class AcceleratorGraphRunner:
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
-            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
+            if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info or key.lean:
                 continue
             if key.bs < bs or not bucket.slots:
                 continue
@@ -1448,6 +1536,7 @@ class AcceleratorGraphRunner:
         slot: int,
         num_tokens: int | None = None,
         cg_key_info: Any | None = None,
+        lean: Sequence[frozenset[str]] = (),
     ) -> SlotLease | None:
         """Pick the bucket and double-buffer slot an upcoming step replays on.
 
@@ -1457,6 +1546,11 @@ class AcceleratorGraphRunner:
         ``slot=None`` advances the bucket's counter so the next lease lands on
         the other slot; a caller that already reserved one (pre-plan) passes it
         back so both submissions target the same slot.
+
+        ``lean`` lists the lean sets the step allows, in the order to try them:
+        the tightest plain bucket's first captured twin among them is leased, the
+        plain bucket when none is. A twin has its plain bucket's batch size and token
+        count, so it pads no more.
         """
         key = (
             self.select_batched_bucket(graph_walk, bs, cg_key_info)
@@ -1465,6 +1559,13 @@ class AcceleratorGraphRunner:
         )
         if key is None:
             return None
+        twins = self._twins.get(key) if lean else None
+        if twins:
+            for subset in lean:
+                twin = twins.get(subset)
+                if twin is not None:
+                    key = twin
+                    break
         bucket = self._buckets[key]
 
         # Hand back the bucket the capture ran under, not the alias this walk
@@ -1754,9 +1855,16 @@ class PiecewiseAcceleratorGraphRunner:
         self._label = label
         self._capture_stream = capture_stream
         self._config = config
-        # the node's LoRA pools (`_region_step`, `can_lease`)
+        # the node's LoRA pools (`_region_step`)
         self._lora_keys = lora_keys
         self._resources = resources
+        # A `one_row_per_step` region replays every row as its first request's, so it
+        # runs the node's lean resources lean (`_bucket`) and leases only a step whose
+        # rows all let them (`can_lease`).
+        self._lean = frozenset(
+            key for key, resource in resources.items()
+            if resource.lean_capture and resource.lean_captures(config.get_config_type())
+        ) if config.one_row_per_step else frozenset()
         self._step_runner = step_runner
         self._device = device
         self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
@@ -1832,16 +1940,14 @@ class PiecewiseAcceleratorGraphRunner:
         return f"{shape.bs}_{shape.total_tokens}_slot{slot}"
 
     def _bucket(self, shape: PiecewiseCaptureShape) -> BucketKey:
-        """A ``one_row_per_step`` region on a LoRA node replays only base-only steps
-        (``can_lease``), so it is captured under ``LoraBaseOnly``, recording no LoRA kernel."""
-        key = self._label
-        if self._config.one_row_per_step and self._lora_keys:
-            key = LoraBaseOnly(key)
+        """Captured with the region's lean resources lean (``_lean``), recording none of
+        their kernels, and with no plain twin beside it."""
         return BucketKey(
             graph_walk=PIECEWISE_WALK,
             bs=shape.bs,
             num_tokens=shape.total_tokens,
-            cg_key_info=key,
+            cg_key_info=self._label,
+            lean=self._lean,
         )
 
     # ── Capture ─────────────────────────────────────────────────────────
@@ -2183,6 +2289,7 @@ class PiecewiseAcceleratorGraphRunner:
             capture=capture,
             slot_lease=SlotLease(slot=slot, bucket=bucket),
             force_prefill=self._config.get_config_type() == PiecewiseConfigType.PACKED,
+            lean=self._lean,
         )
         ctx.set_padded_rids(tuple(request_ids))
         step.set_ctx(ctx)
@@ -2270,16 +2377,16 @@ class PiecewiseAcceleratorGraphRunner:
         return self._config.lease_before_step
 
     def can_lease(self, inputs: list[NodeInputs], request_ids: Sequence) -> bool:
-        """The config's ``can_lease`` for this batch; True when it sets none. A
-        ``one_row_per_step`` region on a LoRA node is captured base-only (``_bucket``),
-        so it is refused a batch any of whose rows runs an adapter (the pool's answer is
-        the same on every rank), which runs the region eagerly under the node's step."""
-        if self._config.one_row_per_step and self._runs_adapters(request_ids):
+        """The config's ``can_lease`` for this batch; True when it sets none. A region
+        captured lean (``_lean``) is refused a batch some row of which doesn't let its
+        resources run lean (each answers the same on every rank), which runs the region
+        eagerly under the node's step."""
+        if self._config.one_row_per_step and not self._rows_lean(request_ids):
             return False
         return self._config.can_lease is None or self._config.can_lease(inputs)
 
-    def _runs_adapters(self, request_ids: Sequence) -> bool:
-        return any(self._resources[key].runs_adapters(request_ids) for key in self._lora_keys)
+    def _rows_lean(self, request_ids: Sequence) -> bool:
+        return all(self._resources[key].lean_for(request_ids) for key in self._lean)
 
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,
@@ -2314,8 +2421,8 @@ class PiecewiseAcceleratorGraphRunner:
         is baked into the graph.
 
         A ``one_row_per_step`` region replays the step as one row named by its
-        first request, however many requests or segments it is passed, and base-only
-        on a LoRA node (``can_lease``): no row may run an adapter.
+        first request, however many requests or segments it is passed, with its lean
+        resources lean (``can_lease``): every row must let them.
 
         ``label_seq_lens`` is for a region whose step plans several ragged
         layouts over the same tokens (windows and whole frames): label ->
@@ -2323,10 +2430,10 @@ class PiecewiseAcceleratorGraphRunner:
         every label, so the bucket is the one ``seq_lens`` picked.
         """
         if self._config.one_row_per_step:
-            if request_ids is not None and self._runs_adapters(request_ids):
+            if request_ids is not None and not self._rows_lean(request_ids):
                 raise RuntimeError(
-                    f"piecewise {self._label!r} replays one row per step, base-only, but a "
-                    "row of this step runs a LoRA adapter (can_lease refuses such a step)"
+                    f"piecewise {self._label!r} replays one row per step with {sorted(self._lean)} lean, "
+                    "but a row of this step doesn't let them run lean (can_lease refuses such a step)"
                 )
             real_bs = 1
             if request_ids is not None:
