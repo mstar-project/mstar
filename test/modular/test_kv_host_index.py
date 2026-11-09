@@ -41,6 +41,7 @@ class _HostPool(CPUPagePool):
         self.index = PrefixIndex(self.arena)
         self.arena.index = self.index
         self.offloaded, self.reserved = {}, {}
+        self._unmoved = 0
         self._refused_logged_at = None
         self._refused_unlogged = 0
         self.dropped = self.written = self.cancelled = self.guaranteed = 0

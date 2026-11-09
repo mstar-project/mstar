@@ -4201,6 +4201,8 @@ class KVManager(AttentionResource):
                 if counts.get(page, 0) != refs.get(page, 0)
             )
         )
+        unmoved = sum(pool._unmoved_by(rid) for rid in pool.reserved)
+        assert pool._unmoved == unmoved, f"the host counts {pool._unmoved} pages set aside, but requests hold {unmoved}"
 
     def post_warmup_validate(self):
         """Assert ``num_free_pages`` is identical across every rank of the
