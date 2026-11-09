@@ -1242,7 +1242,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">max_text_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">512</span>  <span class="c1"># prompt text + text</span>
     <span class="n">max_reference_seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">30.0</span>  <span class="c1"># the tokenizer's single-pass limit</span>
     <span class="n">max_speech_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2048</span>  <span class="c1"># ~82 s of audio per request</span>
-    <span class="n">voice_cache_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>
+    <span class="c1"># about 100 KB a voice on the GPU; a miss stalls the flow node about 30 ms</span>
+    <span class="n">voice_cache_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1024</span>
     <span class="n">max_new_tokens_limit</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Streaming. The flow decoder re-runs over the prompt and every settled</span>

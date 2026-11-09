@@ -1068,7 +1068,7 @@ share while its captures are sized, so its eager step must fit in it.</p></td>
 <td><p><em>(optional)</em> <code class="docutils literal notranslate"><span class="pre">true</span></code> runs the workers as clients of a CUDA MPS control daemon the
 conductor starts in a private directory, so workers that share a GPU overlap their
 kernels instead of time-slicing (the ASR <code class="docutils literal notranslate"><span class="pre">*_split</span></code> configs, and the speech ones:
-<code class="docutils literal notranslate"><span class="pre">chatterbox*_split</span></code>, <code class="docutils literal notranslate"><span class="pre">omnivoice_split</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3tts_split</span></code>). NVIDIA only, and it
+<code class="docutils literal notranslate"><span class="pre">chatterbox*_split</span></code>, <code class="docutils literal notranslate"><span class="pre">omnivoice_split</span></code>, <code class="docutils literal notranslate"><span class="pre">cosyvoice3_split</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3tts_split</span></code>). NVIDIA only, and it
 needs <code class="docutils literal notranslate"><span class="pre">nvidia-cuda-mps-control</span></code> on <code class="docutils literal notranslate"><span class="pre">PATH</span></code>. The conductor stops the daemon on
 shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
 <code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></td>
@@ -1428,7 +1428,7 @@ before it spawns the workers, run every worker as its client so their kernels ov
 and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
 processes on the GPU are unaffected. <code class="docutils literal notranslate"><span class="pre">nvidia-cuda-mps-control</span></code> (part of the NVIDIA
 driver) must be on <code class="docutils literal notranslate"><span class="pre">PATH</span></code>. The <code class="docutils literal notranslate"><span class="pre">*_split.yaml</span></code> configs for Whisper, Qwen3-ASR, the three
-Chatterbox models and OmniVoice set it, and so does <code class="docutils literal notranslate"><span class="pre">qwen3tts_split.yaml</span></code> (the 0.6B).</p>
+Chatterbox models, OmniVoice and CosyVoice3 set it, and so does <code class="docutils literal notranslate"><span class="pre">qwen3tts_split.yaml</span></code> (the 0.6B).</p>
 <p><strong>A light node beside a heavy one, on one worker.</strong> <code class="docutils literal notranslate"><span class="pre">side_stream:</span> <span class="pre">true</span></code> on a node
 group runs that node’s steps on a lane of their own instead of the worker’s main chain:
 they take no turn on it, run on a second CUDA stream beside its steps, and whatever

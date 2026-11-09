@@ -28,6 +28,7 @@ mstar.model.cosyvoice3.components
    :recursive:
 
    dit
+   dit_kernels
    flow
    hift
    lm
