@@ -22,6 +22,7 @@ from jinja2 import TemplateError
 from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.components.sampled_token_decoder import PROMPT_TOKENS
 from mstar.model.cosmos3.cosmos3_model import (
     DIT_NODE,
     REASONER_NODE,
@@ -461,6 +462,60 @@ def test_a_mixed_step_carries_media_prompt_rows(tmp_path) -> None:
     out = SampledTokenDecoder.preprocess(sub, "mixed", engine_inputs, [decode, media])
     assert out["input_ids"].tolist() == [42, 5, 6, 7, 8, 9] + [image_pad] * 4 + [10]
     assert torch.equal(out["vision_embeds"], torch.ones(4, 8))
+    assert out[PROMPT_TOKENS].tolist() == [False] + [True] * 10
+
+
+def test_a_sampled_pad_in_a_mixed_step_takes_no_media_row(tmp_path) -> None:
+    """A decode row whose sampled token is the image pad sits before the media
+    row in a mixed step. The splice reads the prompt rows' pads alone, so each
+    of the media row's pads still gets its own embedding and the decode row
+    keeps its token's."""
+    import types
+
+    from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+    from mstar.model.multimodal import splice_media
+    from mstar.model.submodule_base import ARNodeInputs
+
+    model = _model(tmp_path)
+    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
+    image_pad = model.config.reasoner.image_token_id
+    decode = ARNodeInputs(input_seq_len=1)
+    decode.graph_walk = Cosmos3Model.REASONER_DECODE_WALK
+    rows = torch.arange(3.0).unsqueeze(1).expand(3, 4)
+    media = ARNodeInputs(
+        input_seq_len=5, input_ids=torch.tensor([5] + [image_pad] * 3 + [6]),
+        resource_step_info=4, tensor_inputs={"vision_embeds": rows},
+    )
+    media.graph_walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
+    sampler = types.SimpleNamespace(loopback_tokens=lambda rids: torch.tensor([image_pad, 0]))
+    engine_inputs = types.SimpleNamespace(resources={SAMPLER: sampler}, request_ids=["d", "m"])
+    out = SampledTokenDecoder.preprocess(sub, "mixed", engine_inputs, [decode, media])
+    ids, mask = out["input_ids"], out[PROMPT_TOKENS]
+    encoder = model._vision_encoder()
+    embeds = torch.full((ids.shape[0], 4), -1.0)
+    spliced = splice_media(embeds, encoder.pads(ids) & mask, out["vision_embeds"])
+    assert spliced[0].tolist() == [-1.0] * 4  # the decode row keeps its token's embedding
+    assert torch.equal(spliced[2:5], rows)  # each pad its own row, in order
+    # without the mask the sampled pad would take row 0 and shift the rest
+    assert not torch.equal(splice_media(embeds, encoder.pads(ids), out["vision_embeds"])[2:5], rows)
+
+
+def test_a_mixed_step_that_can_carry_media_keeps_host_positions(tmp_path, monkeypatch) -> None:
+    """With ``ingraph_decode_rope`` on, text prefill builds its rope in the graph,
+    but a mixed step keeps host-built 3D positions while media rows can join it."""
+    import types
+
+    from mstar.model.cosmos3 import submodules as cosmos3_submodules
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+    model = _model(tmp_path)
+    sub = Cosmos3ReasonerSubmodule(transformer=None, config=model.config, encoders=(model._vision_encoder(),))
+    monkeypatch.setattr(cosmos3_submodules, "ingraph_decode_rope", lambda: True)
+    captured = types.SimpleNamespace(captured=True)
+    assert sub._rope_in_graph(captured, "decode") and sub._rope_in_graph(captured, "prefill_text")
+    assert not sub._rope_in_graph(captured, "mixed")
+    assert not sub._rope_in_graph(types.SimpleNamespace(captured=False), "decode")
 
 
 def test_edge_chat_adapter(tmp_path) -> None:

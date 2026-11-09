@@ -3324,15 +3324,16 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
         # so its `preprocess` reads nothing the tables fill
         return frozenset({self.DECODE_WALK})
 
-    @staticmethod
-    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+    def _rope_in_graph(self, engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
         """A captured step of a text walk, whose rotary tables come from the
         planned positions inside the graph (as Qwen3.5's): always for decode,
-        with ``ingraph_decode_rope`` for text prefill and mixed steps. Only a
-        media walk's rows bring their own 3D positions."""
+        with ``ingraph_decode_rope`` for text prefill. Media rows bring their own
+        3D positions, so a mixed step does too while media rows can join it
+        (``MIXED_MEDIA``)."""
         if not engine_inputs.captured:
             return False
-        return graph_walk == "decode" or (graph_walk in ("prefill_text", MIXED) and ingraph_decode_rope())
+        text_walks = ("prefill_text",) if self._mixes_media else ("prefill_text", MIXED)
+        return graph_walk == "decode" or (graph_walk in text_walks and ingraph_decode_rope())
 
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]) -> dict:
         out = super().preprocess(graph_walk, engine_inputs, inputs)

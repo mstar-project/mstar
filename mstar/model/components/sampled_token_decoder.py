@@ -77,6 +77,9 @@ from mstar.model.submodule_base import (
 )
 from mstar.utils.profiler import PHASE_PERIOD, PhaseLaps, phase_record
 
+# A media-mixed step's mask of its prompt rows' tokens (`_mask_prompt_tokens`)
+PROMPT_TOKENS = "prompt_tokens"
+
 
 class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     SAMPLER = SAMPLER
@@ -252,7 +255,9 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 compile_mode=self.capture_compile_mode(MIXED),
                 # the layout the resources split; a replay's padding rows stay empty
                 token_layout=decode_rows_then_prompt,
-                input_seq_dims={e.output: 0 for e in self._encoders} if self._mixes_media else None,
+                input_seq_dims=(
+                    {PROMPT_TOKENS: 0, **{e.output: 0 for e in self._encoders}} if self._mixes_media else None
+                ),
             )]
         if self._encoders and self.CAPTURE_PREFILL:
             walks = media_walk_names(self._encoders)
@@ -423,10 +428,35 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             if not decode:
                 # a mixed step's media prompt rows
                 self._pack_media(out, inputs)
+                self._mask_prompt_tokens(out, graph_walk, inputs)
             return out
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs], dim=0)}
         self._pack_media(out, inputs)
+        self._mask_prompt_tokens(out, graph_walk, inputs)
         return out
+
+    def _mask_prompt_tokens(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
+        """A media-mixed step's ``PROMPT_TOKENS``: which of its ids are prompt
+        rows' own. A decode row's id is a sampled token, and a sampled media
+        pad would otherwise take the next media row's embedding and shift every
+        row after it. Both of the walk's paths emit it, so the capture (which
+        runs on prompt rows) holds the buffer every replay stages. A fill per
+        run of rows (decode rows come first, so usually two), no host copy."""
+        if graph_walk != MIXED or not self._mixes_media:
+            return
+        device = out["input_ids"].device
+        pieces: list[torch.Tensor] = []
+        run_len, run_prompt = 0, None
+        for inp in inputs:
+            prompt = (inp.graph_walk or graph_walk) != self.DECODE_WALK
+            n = 1 if inp.input_ids is None else inp.input_ids.numel()
+            if prompt != run_prompt and run_len:
+                pieces.append(torch.full((run_len,), run_prompt, dtype=torch.bool, device=device))
+                run_len = 0
+            run_prompt, run_len = prompt, run_len + n
+        if run_len:
+            pieces.append(torch.full((run_len,), run_prompt, dtype=torch.bool, device=device))
+        out[PROMPT_TOKENS] = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
     def _pack_media(self, out: dict, inputs: list[ARNodeInputs]) -> None:
         for e in self._encoders:
@@ -497,13 +527,15 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         if input_ids is None:
             input_ids = sampler.loopback_tokens(engine_inputs.request_ids)
         media = {e.output: tensors.pop(e.output) for e in self._encoders if e.output in tensors}
+        prompt_tokens = tensors.pop(PROMPT_TOKENS, None)
         decoder_kwargs = self.decoder_kwargs(graph_walk, engine_inputs, input_ids.shape[0], **tensors)
         embeds = self.model.embed(input_ids)
         for e in self._encoders:
             rows = media.get(e.output)
             # a host shape: an eager step without this medium skips it
             if rows is not None and rows.shape[0]:
-                embeds = splice_media(embeds, e.pads(input_ids), rows)
+                pads = e.pads(input_ids)
+                embeds = splice_media(embeds, pads if prompt_tokens is None else pads & prompt_tokens, rows)
         hidden = self.model(embeds, label="main", **decoder_kwargs)
         if graph_walk != self.DECODE_WALK:
             # only the last token of each prefill row feeds the head
