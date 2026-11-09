@@ -47,6 +47,7 @@ only, so it runs from any python3.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import fcntl
 import functools
@@ -632,8 +633,12 @@ class Eras(Provider):
         i = eras("GET", f"/instances/{e['instance_id']}")
         ssh = next((p for p in (i.get("standalone") or {}).get("endpoints") or []
                     if p.get("name") == "ssh" and p.get("ready")), None)
-        run = ((i.get("standalone") or {}).get("current_run") or {}).get("status")
-        st = f"run {run}" if e.get("run") and run in ("succeeded", "failed", "stopped") else i.get("status", "?")
+        run = (i.get("standalone") or {}).get("current_run") or {}
+        st = i.get("status", "?")
+        if e.get("run") and run.get("status") in ("succeeded", "failed", "stopped"):
+            failure = run.get("failure") or {}  # why the platform says it failed, e.g. launch_refused
+            st = f"run {run['status']}" + (f" ({failure.get('code')}: {str(failure.get('message') or '')[:300]})"
+                                           if failure else "")
         return st, ssh and ssh.get("host"), int((ssh or {}).get("port") or 22)
 
     def named(self, name):
@@ -985,7 +990,6 @@ ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Noteboo
 def eras_ssh_key_id(pubkey: str, name: str) -> str:
     """The organization's id for this public key, registering it the first time, under the launch's
     name. It stays registered for later launches."""
-    import base64
     import hashlib
     blob = base64.b64decode(pubkey.split()[1])
     fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
@@ -1025,7 +1029,9 @@ def eras_launch_body(cfg: dict, o: dict, name: str, ssh_key_id: str, hours: floa
     if run:
         pod["volumes"].append({"name": "live-pr", "configMap": {"name": "live-pr"}})
         box["volumeMounts"].append({"mountPath": "/run/live-pr", "name": "live-pr", "readOnly": True})
-        config_maps = {"live-pr": {"data": {Path(f).name: Path(f).read_text() for f in [run, *inputs]}}}
+        # Base64, since Eras refuses a Pod whose ConfigMap text holds a 4-byte UTF-8 character (an emoji, say).
+        config_maps = {"live-pr": {"binaryData": {Path(f).name: base64.b64encode(Path(f).read_bytes()).decode()
+                                                  for f in [run, *inputs]}}}
         if er.get("run_secret_id"):  # a saved Eras secret (an API key, say), at /run/live-pr-key/value
             pod["volumes"].append({"name": "live-pr-key", "secret": {"secretName": "live-pr-key",
                                                                       "items": [{"key": "value", "path": "value"}]}})

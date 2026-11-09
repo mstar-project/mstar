@@ -300,7 +300,8 @@ class TestSlurm(unittest.TestCase):
 
 
 class TestEras(unittest.TestCase):
-    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", dry_run=False):
+    def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", dry_run=False, run=None,
+                    inputs=()):
         """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview (or the
         create, `refused_by`) refuses those `held` (as the spec has it), as when another box took them in
         between; the calls it made."""
@@ -341,7 +342,7 @@ class TestEras(unittest.TestCase):
                 "storage": True})
         cfg = {"ssh_public_key": str(key), "eras": {"cache_volume_ids": ["v1", "v2"]},
                "budget": {"max_usd_per_hour": 30, "max_hours": 4, "max_running": max_running}}
-        args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=None, input=[], cache="ro",
+        args = argparse.Namespace(offer="eras:l1", pr=0, hours=1, tag="c", run=run, input=list(inputs), cache="ro",
                                   cache_write=write, allow_over_budget=False, dry_run=dry_run)
         with unittest.mock.patch.object(subprocess, "Popen"), contextlib.redirect_stdout(io.StringIO()), \
                 unittest.mock.patch.dict(os.environ, {"ERAS_API_KEY": "k"}), contextlib.redirect_stderr(io.StringIO()):
@@ -366,6 +367,18 @@ class TestEras(unittest.TestCase):
         script = created["run"]["pod"]["containers"][0]["args"][0]
         self.assertIn("ssh-keygen -A\n", script.split("sshd -D")[0],
                       "sshd would exit with no host keys, and the Pod with it, about 49 s after every launch")
+
+    def test_a_runs_files_reach_the_pod_byte_for_byte_with_an_emoji(self):
+        d = Path(tempfile.mkdtemp())
+        box, body = d / "box.sh", d / "pr-body.md"
+        box.write_text("echo hello\n")
+        body.write_text("Generated with Claude Code \N{ROBOT FACE}\n", encoding="utf-8")
+        created = next(c[2] for c in self.eras_launch(held=(), run=str(box), inputs=[str(body)])
+                       if c[:2] == ("POST", "/instances"))
+        files = created["run"]["config_maps"]["live-pr"]
+        self.assertNotIn("data", files, "Eras refuses a ConfigMap whose text data holds a 4-byte character")
+        self.assertEqual(base64.b64decode(files["binaryData"]["pr-body.md"]), body.read_bytes(),
+                         "the box would read a changed PR description")
 
     def test_a_dry_run_writes_nothing_to_eras(self):
         self.assertEqual([c[:2] for c in self.eras_launch(dry_run=True) if c[0] != "GET"], [],
