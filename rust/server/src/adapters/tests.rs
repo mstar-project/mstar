@@ -421,3 +421,11 @@ fn two_images_are_indexed_in_order() {
         "the second image does not address the second upload"
     );
 }
+
+#[test]
+fn fish_forwards_a_sent_voice_to_be_logged_as_ignored() {
+    let mk = |body: &str| FishS2Pro.speech_args(&speech(body)).unwrap().model_kwargs;
+    assert_eq!(mk(r#"{"input":"x","voice":"ryan"}"#)["voice"], serde_json::json!("ryan"));
+    assert!(!mk(r#"{"input":"x"}"#).contains_key("voice"));
+    assert_eq!(mk(r#"{"input":"x","speed":"2"}"#)["speed"], serde_json::json!(2.0));
+}
