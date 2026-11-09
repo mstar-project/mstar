@@ -1,7 +1,8 @@
 """Everything inbound: the message dispatch, input reads, ready tensors and
-stream polls. Holds no state of its own: lifecycle messages are recorded on
-``RequestLifecycle`` for the worker to apply at its next teardown point, and
-TP-follow messages go to ``Lockstep``."""
+stream polls. Holds no state of its own beside ``LoraLoads``, the runtime LoRA
+loads in flight, which it builds and finishes after each message pass: lifecycle
+messages are recorded on ``RequestLifecycle`` for the worker to apply at its next
+teardown point, and TP-follow messages go to ``Lockstep``."""
 from __future__ import annotations
 
 import logging
@@ -32,6 +33,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.profiler import PhaseLaps, phase_end, phase_start, range_pop, range_push
 from mstar.worker.lockstep import Lockstep
+from mstar.worker.lora_loads import LoraLoads
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.worker_metrics import WorkerMetrics
@@ -83,6 +85,7 @@ class InputIngest:
         self._enable_nvtx = enable_nvtx
         # marks each paged KV cache of a request's first NewRequest rebuildable or not, before the engine adds it
         self._set_rebuildable = set_rebuildable
+        self.lora_loads = LoraLoads(services)
         self._handlers = {
             WorkerMessageType.NEW_REQUEST: self._add_new_request,
             WorkerMessageType.DRAIN_REQUEST: self._drain_request,
@@ -94,6 +97,8 @@ class InputIngest:
             WorkerMessageType.STOP_LOOPS: self._stop_loops,
             WorkerMessageType.SCHEDULE_TP: lockstep.enqueue_follow,
             WorkerMessageType.TP_NO_SPEC: lockstep.enqueue_no_spec,
+            WorkerMessageType.LOAD_LORA_ADAPTER: self.lora_loads.load,
+            WorkerMessageType.UNLOAD_LORA_ADAPTER: self.lora_loads.unload,
         }
         if metrics is not None:
             # sent only with metrics on
@@ -109,6 +114,8 @@ class InputIngest:
 
     def process_messages(self) -> None:
         self._dispatch(self._communicator.get_all_new_messages())
+        if self.lora_loads:
+            self.lora_loads.finish()
 
     def _dispatch(self, messages: list[WorkerMessage]) -> None:
         handlers = self._handlers

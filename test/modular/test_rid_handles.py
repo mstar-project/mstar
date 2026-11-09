@@ -129,11 +129,12 @@ def _worker(
     scheduler = make_scheduler(graph_runtime=runtime, request_state=request_state)
     w = make_worker(
         communicator=SimpleNamespace(send=lambda e, m: sent.append((e, m))),
-        _graph_runtime=runtime, request_state=request_state,
+        graph_runtime=runtime, request_state=request_state,
         tensor_manager=tensor_manager, engine_manager=engine_manager or SimpleNamespace(),
         streams=StreamBufferManager(request_state, tensor_manager, list(connections)),
         wakeup_event=SimpleNamespace(register_futures=lambda f: None),
         scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
+        profile_info=SimpleNamespace(pop_request=lambda h: None),
     )
     w.sent = sent
     w.removed_in_runtime = []
@@ -159,7 +160,7 @@ def _worker(
 
 def test_failures_leave_the_worker_as_wire_strings():
     w, t = _worker("req-a", "req-b")
-    w._fail_requests({t.handle("req-a"): "boom"})
+    w.pipeline._fail_requests({t.handle("req-a"): "boom"})
     [(entity, msg)] = w.sent
     assert entity == "conductor"
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
@@ -174,13 +175,11 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
         tensor_manager=SimpleNamespace(force_cleanup_request=lambda h: None),
     )
     a, b = t.handle("req-a"), t.handle("req-b")
-    w._in_flight_rids = set()
     w._rebuilds._kept, w._rebuilds._keeps_ids = {"n": {a: None, b: None}}, {"n": {a, b}}
     w._rebuilds._refused = {"n": {a: 32}}
     w._rebuilds._cursors[("n", a)] = None
-    w._preemption._preempted[a] = Preempted()
+    w.preemption._preempted[a] = Preempted()
     w.streams._rids.add(a)
-    w.profile_info = SimpleNamespace(pop_request=lambda h: None)
     w.scheduler.admission.held_until[a] = float("inf")
 
     deliver(w, WorkerMessage(
@@ -195,7 +194,7 @@ def test_remove_purges_handle_keyed_state_then_frees_the_handle():
     assert w._rebuilds._kept == {"n": {b: None}}, "the next request would rebuild from these ids"
     assert w._rebuilds._keeps_ids == {"n": {b}}, "the next request would keep ids it can't be dropped with"
     assert w._rebuilds._refused == {"n": {}}, "the next request would keep no ids from its last prompt chunk"
-    assert not (w._rebuilds._cursors or w._preemption._preempted), (
+    assert not (w._rebuilds._cursors or w.preemption._preempted), (
         "the next request would run this one's rebuild, or be counted as preempted"
     )
     # Freed last, and reused by the next request: nothing of req-a's may remain.
@@ -212,7 +211,6 @@ def test_a_request_whose_engine_teardown_raises_stays_out_of_the_schedule():
         tensor_manager=SimpleNamespace(force_cleanup_request=lambda h: None),
     )
     a = t.handle("req-a")
-    w._in_flight_rids = set()
 
     with pytest.raises(RuntimeError, match="engine teardown failed"):
         deliver(w, WorkerMessage(
@@ -227,7 +225,7 @@ def test_a_request_whose_engine_teardown_raises_stays_out_of_the_schedule():
 def test_remove_for_an_unknown_request_is_a_no_op():
     w, _ = _worker("req-a")
     w.ingest._remove_request(RemoveRequest(request_id="gone", source=MessageSource.SELF))
-    w._teardown(set())
+    w.pipeline._teardown(set())
     assert len(w.request_state.per_request_info) == 1
 
 

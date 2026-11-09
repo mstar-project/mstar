@@ -10,6 +10,7 @@ import logging
 import sys
 from array import array
 from collections import Counter
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -49,10 +50,9 @@ from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ARNodeInputs
 from mstar.observability.recorders import EdgeTransfers
-from mstar.testing_utils.worker import make_scheduler, make_worker
+from mstar.testing_utils.worker import make_scheduler, make_worker, preempting
 from mstar.worker.host_pool import HostCopy, HostSlice
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
-from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, Prefilling, Rebuilds, policies_run_here
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker_metrics import PreemptionCounts
@@ -98,8 +98,8 @@ def _worker(kv):
     )
     w = make_worker(
         worker_id="w",
-        _rebuilds=Rebuilds({NODE: POLICY}, _graphs()),
-        _graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, wgs: None, get_rid_string=str),
+        rebuilds=Rebuilds({NODE: POLICY}, _graphs()),
+        graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, wgs: None, get_rid_string=str),
         scheduler=SimpleNamespace(
             backlog={}, return_backlogged=lambda rid: None, could_refill=lambda *args: False,
             last_in_line=lambda node, walk, rids: rids[-1], prefilling=lambda node, rid, walk: None,
@@ -114,19 +114,12 @@ def _worker(kv):
     )
     w._rebuilds._kept[NODE] = {rid: _kept(5 * PAGE_SIZE) for rid in "rv"}
     w.tried, w.failed = [], {}
-    w._fail_requests = w.failed.update
+    w.pipeline._fail_requests = w.failed.update
     w.admission._evict = lambda node, batch_ids, arrivals, last_in_line, affected_resources=None, inside_only=False: (
         w.tried.append(node)
     )
-    _preemption(w)
+    preempting(w)
     return w
-
-
-def _preemption(w) -> None:
-    """The worker's `Preemption`, over its rebuilds and its own drop."""
-    w._preemption = Preemption(
-        w.engine_manager, w._rebuilds, w.scheduler, w.request_state, w.admission.log_throttled, w._rid_str,
-    )
 
 
 def _held(w) -> list:
@@ -150,17 +143,18 @@ def _preempting(case: str = "deciding kv pool", in_flight: tuple[str, ...] = ())
     kv._decides = case != "a pool that doesn't decide"
     reason = _step(kv, "r", 1).reason
     w = _worker(kv)
-    w._in_flight_rids = set(in_flight)
+    w.pipeline.in_flight_rids.update(in_flight)
     if case == "a node that keeps no ids":
         w._rebuilds = Rebuilds({}, {})
-        _preemption(w)
+        preempting(w)
     elif case == "a node where no request keeps ids":
         w._rebuilds._kept[NODE] = {}
     elif case == "nothing to drop":
         w.engine_manager.get_engine(NODE).drop_refusal = lambda node, rid, tokens: "refused"
     rows = dict.fromkeys(("r", *in_flight), 0)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph=rows)
-    w._handle_admit_failure(batch, _refused(batch, reason, "recurrent" if case == "another resource" else "kv"))
+    resource = "recurrent" if case == "another resource" else "kv"
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason, resource))
     return kv, w
 
 
@@ -175,7 +169,7 @@ def test_only_a_deciding_kv_pool_preempts(case):
         assert not w.tried, "a pool that decides chose its victim by recency"
         assert kv.residency("v") is Residency.DROPPED and not _held(w), "r's shortage didn't drop v"
         assert _step(kv, "r", 1).ok, "r didn't get the page v's drop freed"
-        assert w._preemption.counts[NODE] == PreemptionCounts(victims=1, drops=1), "the drop went uncounted"
+        assert w.preemption.counts[NODE] == PreemptionCounts(victims=1, drops=1), "the drop went uncounted"
     elif case == "a node where no request keeps ids":
         # the node's policy decides how it preempts, whichever requests keep ids now
         assert not w.tried and not _held(w) and _returns(kv) == ["r"] and kv.residency("v") is Residency.RESIDENT, (
@@ -203,7 +197,7 @@ def test_a_victim_the_host_takes_whole_goes_there_and_its_pages_to_the_request_t
     w = _worker(kv)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
-    w._handle_admit_failure(batch, _refused(batch, reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
 
     assert kv.residency("v") is Residency.ON_HOST and not _held(w), "v wasn't moved to the host"
     assert not kv.can_reload("v"), "v could reload into the page r ran short of"
@@ -237,7 +231,7 @@ def test_a_newer_request_that_wrote_nothing_gives_back_its_allotment_before_an_o
     w = _worker(kv)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
-    w._handle_admit_failure(batch, _refused(batch, reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
 
     assert kv.residency("r") is Residency.RESIDENT and "n" not in kv._allotments, (
         "the older decode dropped itself while a newer request that hadn't prefilled kept its allotment")
@@ -257,7 +251,7 @@ def test_an_older_decode_short_by_a_page_drops_the_newest_request_mid_prefill_no
         rid == "v") else None
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
-    w._handle_admit_failure(batch, _refused(batch, reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
 
     assert kv.residency("v") is Residency.DROPPED and kv.residency("r") is Residency.RESIDENT, (
         "the older decode dropped itself while the newest request kept its pages")
@@ -281,7 +275,7 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
             rid == "v") else None
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
-    w._handle_admit_failure(batch, _refused(batch, reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
 
     assert kv.residency("v") is Residency.RESIDENT, "v was chosen though its rebuild doesn't write what its KV holds"
     assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], "r didn't wait for room beside v"
@@ -306,7 +300,7 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed)
     _remove(kv, "x")
     w = _worker(kv)
 
-    w._preemption.make_room()
+    w.preemption.make_room()
 
     assert kv.is_offloaded("z") and _ready(kv, "p"), "z, newer and waiting, kept the pages p needs"
 
@@ -322,7 +316,7 @@ def test_a_request_whose_kept_ids_dont_rebuild_its_kv_waits_rather_than_dropping
     w._rebuilds._kept[NODE] = {"r": _kept(5 * PAGE_SIZE - 1)}
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
-    w._handle_admit_failure(batch, _refused(batch, reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
 
     assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], (
         "r dropped itself with ids short of its KV"
@@ -347,7 +341,7 @@ def test_make_room_helps_the_oldest_refused_request_moves_can_let_in():
     w = _worker(kv)
     w._rebuilds._kept[NODE]["p"] = _kept(3 * PAGE_SIZE)
 
-    w._preemption.make_room()
+    w.preemption.make_room()
 
     assert kv.residency("p") is Residency.DROPPED and _admitted(kv, "y"), "y waited behind o, which no move lets in"
 
@@ -364,7 +358,7 @@ def test_make_room_asks_nothing_while_no_request_waits_holding_its_allotment():
     # a locked section raises
     kv._lock = None
 
-    w._preemption.make_room()
+    w.preemption.make_room()
 
     assert not read, "make_room read the refusals with no request it could move"
 
@@ -389,7 +383,7 @@ def test_make_room_moves_nothing_once_the_oldest_refused_request_fits():
     w = _worker(kv)
     w._rebuilds._kept[NODE]["p"] = _kept(2 * PAGE_SIZE)
 
-    w._preemption.make_room()
+    w.preemption.make_room()
 
     assert kv.residency("p") is Residency.RESIDENT, "p was dropped for y, though x, older, fit"
     assert _admitted(kv, "x") and not _admitted(kv, "y"), "y took the room x fit in"
@@ -409,7 +403,7 @@ def test_a_request_its_moves_admitted_starts_while_an_older_return_holds_its_poo
     assert not _admitted(kv, "b")
     w = _worker(kv)
     w._rebuilds._kept[NODE]["w"] = _kept(3 * PAGE_SIZE)
-    w._preemption.make_room()
+    w.preemption.make_room()
     assert kv.residency("w") is Residency.DROPPED and "b" in kv._allotments
     _drop(kv, "a")
     _remove(kv, "x")
@@ -435,7 +429,7 @@ def test_an_older_return_moves_a_request_its_moves_admitted_while_it_waits_for_a
     assert not _admitted(kv, "b")
     w = _worker(kv)
     w._rebuilds._kept[NODE]["w"] = _kept(3 * PAGE_SIZE)
-    w._preemption.make_room()
+    w.preemption.make_room()
     assert kv.residency("w") is Residency.DROPPED and "b" in kv._allotments
     _drop(kv, "a")
     _remove(kv, "x")
@@ -444,7 +438,7 @@ def test_an_older_return_moves_a_request_its_moves_admitted_while_it_waits_for_a
     assert _runner(kv).admit_request("f", NODE, WALK).queued
 
     started = _runner(kv).admit_waiting(lambda rid, node: None)
-    w._preemption.make_room()
+    w.preemption.make_room()
     started += _runner(kv).admit_waiting(lambda rid, node: None)
 
     assert (NODE, "a") in started and (NODE, "f") in started, "a waited for b's pages, b for f, and f for a"
@@ -470,14 +464,14 @@ def test_make_room_walks_again_only_once_a_refusal_or_a_request_it_could_move_ch
     w = _worker(kv)
     walked, make_room = [], kv.make_room
     kv.make_room = lambda *args: walked.append(args[0].rid) or make_room(*args)
-    w._preemption.make_room()
+    w.preemption.make_room()
     assert walked == ["o", "r"] and kv.residency("r") is Residency.RESIDENT
     walked.clear()
 
-    w._preemption.make_room()
+    w.preemption.make_room()
     assert not walked, "make_room walked the refusals again with nothing changed"
     w._rebuilds._kept[NODE]["r"] = _kept(7 * PAGE_SIZE)
-    w._preemption.make_room()
+    w.preemption.make_room()
 
     assert kv.residency("r") is Residency.DROPPED and _admitted(kv, "o"), "o waited after r could be dropped"
 
@@ -511,13 +505,13 @@ def test_make_room_walks_again_once_a_running_request_lets_go_of_a_page_a_waitin
     assert not _admitted(kv, "o")
     w = _worker(kv)
     w._rebuilds._kept[NODE]["s"] = _kept(4 * PAGE_SIZE)
-    w._preemption.make_room()
+    w.preemption.make_room()
     assert kv.residency("s") is Residency.RESIDENT and not _admitted(kv, "o")
     room = kv._room()
 
     _remove(kv, "h")
     assert kv._room() == room
-    w._preemption.make_room()
+    w.preemption.make_room()
 
     assert kv.residency("s") is Residency.DROPPED, "o waited though moving s would now let it in"
 
@@ -586,7 +580,7 @@ def test_a_request_on_the_host_without_a_step_of_its_own_holds_back_no_newer_req
     reason = _step(kv, "r", 1).reason
     w = _worker(kv)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
-    w._handle_admit_failure(batch, _refused(batch, reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
     _remove(kv, "r")
     _request(kv, "x", 2, arrival=3)
 
@@ -611,7 +605,7 @@ def test_a_request_back_from_the_host_that_gives_back_its_allotment_waits_as_a_r
     w = _worker(kv)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
-    w._handle_admit_failure(batch, _refused(batch, reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
 
     assert "v" not in kv._allotments, "v kept the allotment r's shortage asked it to give back"
     assert _returns(kv) == ["v"] and not _queue(kv), "v waits in the queue, though it is on the host"
@@ -634,14 +628,14 @@ def test_a_backlogged_victim_goes_back_to_the_runtime():
 def test_preemptions_after_metrics_start_are_reported():
     """The worker hands the metrics its counts before anything is preempted."""
     w = _worker(_pool())
-    w.parallel_leader_nodes, w.scheduler.pending_rows = {NODE}, dict
+    w.layout, w.scheduler.pending_rows = replace(w.layout, parallel_leader_nodes=frozenset({NODE})), dict
     w.engine_manager.engine = SimpleNamespace(paged_kv_caches=list)
     w.communicator = SimpleNamespace(send=lambda peer, message: None)
     w.tensor_manager = SimpleNamespace(enable_transfer_metrics=lambda: EdgeTransfers("SHM"))
     metrics = w._start_metrics(3600.0)
     metrics.start_counting()
 
-    w._preemption.counts[NODE].victims += 1
+    w.preemption.counts[NODE].victims += 1
 
     (snapshot,) = [s for s in metrics.snapshot() if s.name == "mstar_kv_preemptions_total"]
     reported = dict(zip(map(tuple, snapshot.label_values), snapshot.values, strict=True))
@@ -721,7 +715,7 @@ def test_an_older_request_waits_rather_than_moving_a_newer_guaranteed_one():
     w = _worker(kv)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
-    w._handle_admit_failure(batch, _refused(batch, _step(kv, "r", 1).reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, _step(kv, "r", 1).reason))
 
     assert kv.residency("v") is Residency.RESIDENT and _returns(kv) == ["r"], (
         "a guaranteed request was dropped for an older page"
@@ -736,13 +730,12 @@ def test_a_tp_nodes_victim_drops_in_the_call_that_chose_it_and_a_pass_without_a_
     _running(kv, "v", 5, arrival=2)
     reason = _step(kv, "r", 1).reason
     w = _worker(kv)
-    w.parallel_nodes = w.parallel_leader_nodes = {NODE}
     w.lockstep._led = frozenset({NODE})
     owed = []
     w.engine_manager.get_engine(NODE).owes_moves = lambda: bool(owed)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
-    w._handle_admit_failure(batch, _refused(batch, reason))
+    w.pipeline._handle_admit_failure(batch, _refused(batch, reason))
     assert kv.residency("v") is Residency.DROPPED, "rank 0 left the victim for a later step"
 
     sent = []
@@ -800,7 +793,7 @@ def test_requests_short_of_pages_all_finish_and_each_goes_to_the_host_at_most_tw
         if not outcome.ok:
             kv.rollback_admit(step, ctx)
             batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph=dict.fromkeys(ready, 0))
-            w._handle_admit_failure(batch, _refused(batch, outcome.reason))
+            w.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason))
             continue
         kv.plan(step, ctx)
         kv.commit(step, ctx)

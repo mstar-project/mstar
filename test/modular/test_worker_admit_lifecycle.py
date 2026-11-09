@@ -80,7 +80,7 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
     )
     request_state = RequestStateManager(node_to_partition=node_to_partition)
     w = make_worker(
-        worker_id=WORKER, tensor_manager=tensor_manager, _graph_runtime=runtime,
+        worker_id=WORKER, tensor_manager=tensor_manager, graph_runtime=runtime,
         request_state=request_state,
         engine_manager=SimpleNamespace(
             engine=SimpleNamespace(publisher_nodes={}, skip_publish=lambda rid, keys: None),
@@ -91,8 +91,8 @@ def _worker(graphs=((WG_ID, NODE, WALK, "default"),)):
         communicator=SimpleNamespace(send=lambda *a, **k: None),
         wakeup_event=SimpleNamespace(register_futures=lambda f: None),
         streams=StreamBufferManager(request_state, tensor_manager, []),
+        profile_info=SimpleNamespace(pop_request=lambda rid: None),
     )
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
     return w
 
 
