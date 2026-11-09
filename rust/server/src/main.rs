@@ -503,6 +503,21 @@ fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter
 
 /// Delete a request's persisted media 60 s after translation, matching
 /// mstar's deferred upload cleanup. Only files under `upload_dir` are deleted.
+/// A request's uploads, scheduled for removal ([`schedule_upload_cleanup`])
+/// when this drops: when whatever it moved into is done with them.
+struct DeferredCleanup {
+    upload_dir: PathBuf,
+    args: SubmitArgs,
+}
+
+impl Drop for DeferredCleanup {
+    fn drop(&mut self) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            schedule_upload_cleanup(&self.upload_dir, &self.args);
+        }
+    }
+}
+
 fn schedule_upload_cleanup(upload_dir: &std::path::Path, args: &SubmitArgs) {
     let files: Vec<PathBuf> = args
         .file_paths
@@ -832,6 +847,9 @@ async fn audio_speech(
         Ok(s) => s,
         Err((status, e)) => return error(status, &e, error_type(status)),
     };
+    // Every piece reads the reference clip, and a stream submits the later ones
+    // while it plays, so the clip goes when the last piece is done with it.
+    let uploads = DeferredCleanup { upload_dir: st.upload_dir.clone(), args: args.clone() };
     // The model's own loader judges the clip, before any piece is submitted.
     if let (Some(check), Some(bridge)) = (&ref_audio, &st.bridge) {
         if let Err((status, e)) = bridge.check_ref_audio(check, st.request_timeout).await {
@@ -845,7 +863,7 @@ async fn audio_speech(
             Err(e) => return error(400, &e, "invalid_request_error"),
         };
     let n = pieces.len();
-    let submit = piece_submitter(st.clone(), args, pieces, rid("speech"), stream);
+    let submit = piece_submitter(st.clone(), args, pieces, rid("speech"), stream, uploads);
     // Pieces in flight ahead of the one being read; dropping one unread aborts it.
     let mut pending: std::collections::VecDeque<OutStream> =
         (0..chunking.lookahead.clamp(1, n)).map(&*submit).collect();
@@ -937,8 +955,10 @@ fn piece_submitter(
     pieces: Vec<String>,
     request_id: String,
     stream: bool,
+    uploads: DeferredCleanup,
 ) -> Arc<dyn Fn(usize) -> OutStream + Send + Sync> {
     Arc::new(move |i| {
+        let _ = &uploads; // dropped with the last submitter, which schedules the cleanup
         let piece = SubmitArgs {
             text: Some(pieces[i].clone()),
             model_kwargs: speech_chunking::chunk_kwargs(&args.model_kwargs, i),
@@ -1587,6 +1607,29 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn a_speech_clip_is_removed_once_the_last_piece_is_done_with_it() {
+        let dir = std::env::temp_dir().join(format!("mstar_cleanup_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("ref.wav");
+        std::fs::write(&clip, b"RIFF").unwrap();
+        let mut args = super::SubmitArgs::default();
+        args.file_paths.insert("audio".into(), vec![clip.to_string_lossy().into_owned()]);
+        let uploads = super::DeferredCleanup { upload_dir: dir.clone(), args };
+        let held = std::sync::Arc::new(uploads); // as the speech's piece submitter holds it
+        let second = held.clone();
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert!(clip.exists(), "removed while a piece still held it");
+        drop(second);
+        tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+        assert!(clip.exists(), "removed before its 60 s grace");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(!clip.exists(), "never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_root_path_is_stripped_as_starlette_strips_it() {
         use super::route_path;

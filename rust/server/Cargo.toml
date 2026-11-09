@@ -41,6 +41,8 @@ subtle = "2"
 regex = "1"
 
 [dev-dependencies]
+# a paused clock for the upload-cleanup test; the same tokio
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3
