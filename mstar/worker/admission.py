@@ -365,11 +365,9 @@ class Admission:
             return
         self._hold_logged[key] = (now, 0)
         logger.warning(
-            "OOM on node=%s walk=%s: no offload possible, holding %s of %d "
+            "OOM on node=%s walk=%s: no offload possible, holding %d of %d "
             "requests so the retry is smaller (%d earlier holds not logged)",
-            batch.node_name, batch.graph_walk,
-            blamed if len(shed) == 1 else f"all {len(shed)}",
-            len(batch_ids), unlogged,
+            batch.node_name, batch.graph_walk, len(shed), len(batch_ids), unlogged,
         )
 
     def _evict(
