@@ -78,16 +78,16 @@ def test_every_output_of_a_decode_step_stays_on_the_device(tmp_path):
     one the node keeps on the device, the client's copy included."""
     from mstar.model.qwen3.config import DECODE_WALK, LLM_NODE, SAMPLER
     from mstar.model.qwen3.submodules import Qwen3LMSubmodule
-    from mstar.worker.worker import Worker
+    from mstar.worker.step_executor import GpuStepBody
 
     sub = Qwen3LMSubmodule(None, [STOP])
     sub.node_resources = {SAMPLER: SimpleNamespace(has_slot_masters=True)}
-    worker = Worker.__new__(Worker)
-    worker._graph_runtime = SimpleNamespace(supports_inline_emit=True)
-    worker._device_loopback = {}
+    body = GpuStepBody.__new__(GpuStepBody)
+    body._graph_runtime = SimpleNamespace(supports_inline_emit=True)
+    body._device_loopback = {}
     engine = SimpleNamespace(device_loopback_signals=lambda node, walk: sub.device_loopback_signals(walk))
     signals = [edge.name for edge in _model(tmp_path).get_graph_walk_graphs()[DECODE_WALK].section.outputs]
-    assert worker._all_on_device(engine, LLM_NODE, DECODE_WALK, signals)
+    assert body.all_on_device(engine, LLM_NODE, DECODE_WALK, signals)
 
 
 def test_enable_thinking_reaches_the_template_flat_or_as_chat_template_kwargs(tmp_path):
