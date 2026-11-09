@@ -388,9 +388,13 @@ class Pi05LLMSubmodule(ARNodeSubmodule):
 
         Allocated once at the largest capture batch size (float32, matching
         noisy_actions dtype). sincos_timestep_embedding fully overwrites it
-        every step, so no zeroing is needed — torch.empty suffices.
+        every step, so no zeroing is needed — torch.empty suffices. An eager
+        batch past the capture sizes gets its own, so the captured graphs keep
+        the buffer they wrote.
         """
         max_bs = max(self.ACTION_GEN_CAPTURE_BATCH_SIZES)
+        if bs > max_bs:
+            return torch.empty(bs, self.config.action_hidden_size, device=self.get_device(), dtype=torch.float32)
         if self._time_emb_buffer is None:
             self._time_emb_buffer = torch.empty(
                 max_bs, self.config.action_hidden_size,

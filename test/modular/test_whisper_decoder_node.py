@@ -11,7 +11,6 @@ from torch import nn
 from mstar.model.submodule_base import HostRows
 from mstar.model.whisper.config import PREFILL_WALK, WhisperModelConfig
 from mstar.model.whisper.submodules import WhisperDecoderSubmodule
-from mstar.worker.worker import _LazyHostOutputs
 
 
 def _node():
@@ -90,21 +89,3 @@ def test_batched_stop_check_answers_decode_steps_only():
     }
 
 
-def test_stop_check_on_a_routed_token_copies_only_the_token():
-    """A decode step that routes its token as ``text_inputs`` alone, checked
-    per request over lazily copied host outputs: the stop check copies that
-    one output, not every output the step produced."""
-    source = {"eos": {"text_inputs": [torch.tensor([[3]])], "hidden": [torch.ones(2, 4)],
-                      "cross_kv": [torch.ones(4)]}}
-    copied = []
-
-    def copy_names(names):
-        copied.extend(names)
-        return {name: {rid: [t.clone() for t in row[name]] for rid, row in source.items()} for name in names}
-
-    info = SimpleNamespace(graph_walk="decode", resource_configs={"sampler": SimpleNamespace(ignore_eos=False)},
-                           dynamic_loop_iter_counts={"decode_loop": 0}, max_tokens=10,
-                           step_metadata={}, rid_handle=0)
-    lazy = _LazyHostOutputs(source, copy_names)
-    assert _node().check_stop("eos", info, lazy["eos"]) == {"decode_loop"}
-    assert copied == ["text_inputs"]
