@@ -192,6 +192,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``Overworld/Waypoint-1.5-1B``
      - Waypoint-1.5 interactive video world model: 1.28B DiT generating one latent
        frame per step, TAEHV encode/decode. Live RGB frame output; no OpenAI surface.
+       A request carries a seed image and ``model_kwargs.actions`` (1 to ``max_frames``,
+       512 latent frames, controller dicts); it generates one frame per action. A live
+       ``/generate/ws`` call (opened with ``end_input: false``) appends more as
+       ``{"append": {"model_kwargs": {"actions": [...]}}}`` and plays until it ends its
+       input, or for at most ``max_frames`` actions in all.
    * - ``lingbot_world_1_3b``
      - ``robbyant/lingbot-world-v2-1.3b-causal-fast``
      - LingBot-World-V2 1.3B causal-fast: camera-controlled image-to-world video, streamed
@@ -347,8 +352,9 @@ OmniVoice notes
   and each residual add folds into the next RMSNorm (flashinfer
   ``fused_add_rmsnorm``), so logits match the reference to half-precision
   rounding rather than bit for bit. ``model_kwargs: {backbone_graphs: false}``
-  runs the same layer loop eagerly, and ``backbone_token_buckets`` sets the
-  packed-token buckets (256 to 4096 by default).
+  runs the same layer loop eagerly, and the serving config's
+  ``prefill_token_buckets: {backbone: {backbone_layers: [...]}}`` sets the
+  packed-token buckets (see :doc:`serving`).
 - ``configs/omnivoice_split.yaml`` runs code2wav (the codec decode) on a
   second worker sharing GPU 0, so the unmask loop no longer stops for each
   finished request's decode; the silence trim and the rest of the output
@@ -368,6 +374,8 @@ Higgs Audio notes
   to the full width and masked (``HiggsAudioTower``'s ``valid_frames``) so it
   replays a graph too. ``model_kwargs: {encoder_graphs: false}`` runs the
   tower eagerly.
+- The model drops or repeats text on long audio, so ``/v1/audio/transcriptions``
+  cuts an upload longer than 30 s into windows of at most 30 s run in parallel.
 - One prefill step per request: the ChatML text around the audio and the audio
   embeddings go into the KV cache as one span.
 - Decode keeps each request's last token in the sampler's slot master and
@@ -384,6 +392,10 @@ Orpheus notes
   renormalizes over the custom tokens: the reference samples the full
   vocabulary, where a text token's probability during speech is negligible but
   not zero, so sampled output is not identical to the reference's.
+- ``/v1/audio/speech`` input of 250+ characters is synthesized as sentence chunks of
+  about 200: the default 2,048 output tokens are about 25 s of speech, and a longer
+  input would be cut off there (``sentence_chunking: false`` opts out). An input of
+  more than 32 chunks (some 6,400 characters) is a 400.
 
 Omnilingual ASR notes
 ~~~~~~~~~~~~~~~~~~~~~
@@ -516,7 +528,9 @@ unless the checkpoint's generation_config sets a ``min_p``, which turns the
 sampler's min-p filter on. ``reasoning_effort`` (``low``, ``medium``, ``high``,
 ``xhigh``; default ``high``) sets the template's reasoning strength, and
 ``enable_thinking: false`` means ``low``, as the template has no off: the model
-still reasons, at the template's lowest strength. The reply
+still reasons, at the template's lowest strength. Either, or the template's own
+``reasoning_strength`` and ``current_date``, may also come in
+``chat_template_kwargs``; a flat key wins. The reply
 is the model's channel stream as generated: reasoning addressed ``to=self``,
 then the answer ``to=user``. Tool calls are refused for now. Images resize with the
 reference's antialiased Lanczos, which torchvision has from 0.27 (torch 2.12); an older
@@ -589,24 +603,23 @@ not the 256-slot default. The state defaults to the checkpoint's
 needs FlashInfer's fused bf16 decode kernel (K = V = 128).
 
 Text prefill and mixed steps replay captured graphs by total tokens, on the
-ladder ``32 ... 8192`` (powers of two, plus 2176 as slack for a step a few
-tokens over the 2048-token step budget); a step pads to its bucket and a longer
-one runs eagerly. A text-prefill step, one with no decode rows beside it, also
-has 1152, 1280, 1536 and 1792, so a prompt a little past 1024 tokens doesn't
-pad to 2048; a mixed step captures only the ladder's powers of two and 2176, on
-a deployment's own ladder too, so a ladder needs at least one of those.
-``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own ladder
-(distinct positive token counts, checked when the worker loads):
-``configs/qwen3_5_9b*.yaml`` take the powers of two to 2048,
-1152-1792, and 2176 as slack, since the LLM's 2048-token step budget
-(``MAX_BATCH_TOKENS``) caps prefill and mixed steps and no bucket past 2176 is
-reached. Each bucket adds captures and startup time. 4096 and 8192 stay in the
-default ladder for a deployment that raises ``max_batch_tokens`` or turns
-chunking off, which fills them exactly. The ladder leaves out slack rungs above
-them (4352, 8704): such a deployment adds them to its own ladder, and without
-them a step just past a power of two pads to the next one and a step past 8192
-runs eagerly. Added rungs serve text-prefill steps only; a mixed step's slack
-stays 2176.
+ladder ``32 ... 8192`` (powers of two, plus 2176 as a mixed step's slack: a
+step passes its budget only when its decode rows leave its next prompt less
+than ``min_chunk_tokens`` of it, and then by at most its decode rows); a step
+pads to its bucket and a longer one runs eagerly. A text-prefill step, one with
+no decode rows beside it, also has 1152, 1280, 1536 and 1792, so a prompt a
+little past 1024 tokens doesn't pad to 2048; a mixed step captures only the
+ladder's powers of two and 2176. 4096 and 8192 stay in the default ladder for a
+deployment that raises ``max_batch_tokens`` or turns chunking off, which fills
+them exactly. The ladder leaves out slack rungs above them (4352, 8704): such a
+deployment adds them to its own ladder, and without them a step just past a
+power of two pads to the next one and a step past 8192 runs eagerly. The
+serving config's ``prefill_token_buckets`` sets a deployment's own ladder per
+walk (see :doc:`serving`): ``configs/qwen3_5_9b*.yaml`` take the powers of two
+to 2048 for ``prefill_text`` and ``mixed``, and 1152-1792 for ``prefill_text``,
+since the LLM's 2048-token step budget (``MAX_BATCH_TOKENS``) caps both and at
+the default ``min_chunk_tokens`` no step passes it. Each bucket adds captures
+and startup time.
 
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
@@ -626,8 +639,9 @@ c=4 up it makes no difference.
 
 ``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
 ``top_k``, ``min_p``, ``repetition_penalty``, ``penalize_prompt`` and
-``enable_thinking`` (default true; the template opens a ``<think>`` block) are
-read by the model but are not OpenAI fields — pass them via ``extra_body``.
+``enable_thinking`` (default true; the template opens a ``<think>`` block;
+``chat_template_kwargs.enable_thinking`` also works) are read by the model but
+are not OpenAI fields — pass them via ``extra_body``.
 Sampling defaults to the checkpoint's generation_config, under whatever the
 request sets. Qwen3.5-27B's sets temperature 0.6, top_k 20 and top_p 0.95,
 and Qwen3.8-27B's temperature 1, top_k 20 and top_p 0.95; the 0.8B, 2B, 4B
@@ -792,7 +806,7 @@ the key and hard-codes SiLU. Video is still
 refused and the MTP head is skipped. The chat template's new
 ``reasoning_effort`` and ``preserve_thinking`` are not forwarded: every
 request gets the template's defaults (``xhigh`` and preserved), whatever the
-client sends.
+client sends, and a request that sends one is logged as ignoring it.
 
 Command A+ (``command_a_plus``)
 -------------------------------
@@ -960,9 +974,10 @@ Qwen3-Omni notes
   ops. Its 15 depth steps feed each sampled code into the next, so small
   differences can change later codes at near-ties.
 - The Thinker's text and audio prefill replay captured graphs on the ladder
-  ``128 ... 2048`` tokens, and a longer step runs eagerly.
-  ``model_kwargs: prefill_token_buckets: [...]`` sets a deployment's own
-  ladder. Each bucket adds captures, graph memory and startup time.
+  ``128 ... 2048`` tokens, and a longer step runs eagerly. The serving
+  config's ``prefill_token_buckets: {Thinker: {prefill_text: [...]}}`` sets a
+  deployment's own ladder (see :doc:`serving`). Each bucket adds captures,
+  graph memory and startup time.
 - The MoE layers route through the fused softmax-top-k kernel
   (``TopKRouter(fused_softmax_topk=True)``), which gives equal probabilities to
   the lower expert id where ``torch.topk`` may pick another. On one GPU a
@@ -1033,9 +1048,11 @@ CosyVoice3 notes
   runs as several steps. ``hift_capture_frame_buckets: []`` runs the vocoder
   eagerly.
 - The LM's prefill is captured with its decode, per prompt token bucket and
-  batch size (``lm_prefill_token_buckets``, ``lm_prefill_batch_sizes``; the LM's
-  graphs take about 130 MB together). A prompt past the largest bucket runs
-  eagerly, and ``lm_prefill_token_buckets: []`` captures no prefill.
+  batch size (the serving config's ``prefill_token_buckets: {llm: {prefill_voice:
+  [...]}}``, see :doc:`serving`, and ``lm_prefill_batch_sizes``; the LM's graphs
+  take about 130 MB together). A prompt past the largest bucket runs eagerly, and
+  ``lm_prefill_batch_sizes: []`` captures no prefill. The flow's new-frame region
+  keeps ``model_kwargs.flow_new_frame_buckets``, which the key can't set.
 
 Qwen3-TTS notes
 ---------------
@@ -1060,6 +1077,15 @@ Qwen3-TTS notes
 - Text layout follows the reference defaults: CustomVoice and VoiceDesign put
   the whole text in the prefill; Base feeds it one token per frame. Override
   per request with ``non_streaming_mode``.
+- Live text: with ``non_streaming_mode: false`` (Base, or x-vector-only
+  cloning), a ``/generate/ws`` call opened with ``end_input: false`` takes the
+  rest of its text as ``append`` messages, one token per frame as it arrives,
+  through the ``text_in`` client stream (see :doc:`clients`). Each append is
+  tokenized alone, which matches tokenizing the whole text when the cut falls
+  before a space or at punctuation. In ``non_streaming_mode`` and for an
+  in-context clone, the prefill's pairing fixes the text's length and where TTS
+  EOS sits, so a live opening (``end_input: false``) gets a 400; send those
+  one-shot.
 - ``/v1/audio/speech`` inputs of 600 or more characters are synthesized as
   ordered sentence chunks of about 400 characters (one Talker request each,
   two kept in flight while the current one streams); set
@@ -1266,6 +1292,15 @@ VoxCPM2 notes
   in the deployment YAML captures the eager step instead: on a B200 the server
   is up in about 15 seconds, with about a third less throughput at
   concurrency 1 and a sixth less at concurrency 8.
+- The Talker's prefill (both LMs over the prompt, the first patch's solve and
+  the stop head) is captured too, per total prompt tokens (up to 2,048) and
+  prompts in a step (up to 32); a step past them runs the LMs eagerly.
+- ``configs/voxcpm2.yaml`` runs the VAE decoder's windows on the worker's side
+  lane (``side_stream: true``), beside the Talker's steps rather than taking
+  turns with them.
+- The streaming VAE decoder is ``torch.compile``'d at start-up, about a
+  quarter faster per window batch; ``model_kwargs: {compile_vae: false}``
+  decodes eagerly.
 - A request may hold the whole 8,192-position context, and nothing preempts a
   request once a KV cache is full, so each LM's cache defaults to 2,049 pages
   (32 such requests and the sink page, about 9.7 GB for both) and the YAML sets
@@ -1379,12 +1414,18 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   without egress.
 - Inputs are user-only 16 kHz mono audio plus an optional system prompt (the
   request's text, primed before the first frame exactly as the reference
-  does): one clip uploaded with the request, or a live call over
-  ``/generate/ws``, ``append`` messages until ``end_input`` (see
-  :doc:`clients`; a one-shot request over the socket carries ``end_input:
-  true`` on its opening message, or it waits for appends). Output is clocked by
-  the input, one agent frame per 80 ms of user audio, so a live client keeps
-  streaming (silence included) for as long as it wants the agent to talk. The
+  does): one clip uploaded with the request, a live call over
+  ``/generate/ws`` (an opening with ``end_input: false``, then ``append``
+  messages until ``end_input``; see :doc:`clients`), or an OpenAI
+  Realtime conversation over ``/v1/realtime``, which takes PCM16 at one of
+  the eight rates :doc:`clients` lists (8 to 48 kHz) or G.711, resamples it
+  to 16 kHz, appends it as it comes, and sends each agent reply as one
+  response (BOS / EOS on the agent text channel mark the reply,
+  ``metadata.turn`` on ``/generate``). The voice is ``Aria``. Output is clocked by
+  the input, one agent frame per 80 ms of user audio, so a ``/generate/ws``
+  client keeps streaming (silence included) for as long as it wants the agent
+  to talk; ``/v1/realtime`` pads a pause in the client's audio with silence,
+  up to 30 s. The
   model answers in the frames *after* the user stops, so append a few seconds
   of trailing silence to a clip. The checkpoint's demo recordings are
   two-channel conversations (user left, agent right); feed the left channel
@@ -1396,11 +1437,12 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   sees them (raise ``max_session_s``, not the stream's limit, for longer calls). A
   call that ends with no more than 16 ms of audio, which the encoder cannot
   featurize, fails with a 500 (the worker reports it without a client status).
-  Appends must be 16 kHz audio (they are neither
-  resampled nor rescaled one by one, which would put a seam at every append).
-  Send appends of 80 ms or more: the encoder takes one append per step, so
-  shorter appends need several steps per frame and fall behind once a step
-  takes longer than an append.
+  ``/generate/ws`` appends must be 16 kHz audio (they are neither
+  resampled nor rescaled one by one, which would put a seam at every append);
+  ``/v1/realtime`` resamples for the client. On both, ``audio_in`` declares the
+  encoder's 80 ms frame (``ClientAudio``), and the data worker sends a live
+  call's audio in whole frames, a step each, the rest waiting for the next
+  append or the call's end.
 - Encoder numerics, measured on CPU at the checkpoint's dimensions with random
   weights on the duplex encoder the shared FastConformer replaced, and not
   since: an upload was one encoder pass, bit for bit that encoder's offline
@@ -1424,16 +1466,13 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   which keeps a call's last 70 frames per layer and runs the attention, each new
   frame over the 70 before it, with the relative-position term as a band of
   distances; its conv inputs (``encoder_state``); and its newest audio and mel
-  frames (``encoder_front``), the last two recurrent-state pools. A
-  call that appends one frame of audio (1280 samples) on the frame grid, every
-  live step of an 80 ms client, runs its whole step as a CUDA graph (the grid is
-  the call's start: an opening clip or append that is not a multiple of 1280
-  samples keeps the call off it for good); other calls take the front end
-  eagerly, then the layer stack as a graph when each got at most one frame (a
-  live step, the call's end), or eagerly (a one-shot upload, a large append:
-  a chunk over a second is not batched with other calls, so the engine runs
-  each call of that step on its own). Appends of other sizes are served the same,
-  without the whole-step graph.
+  frames (``encoder_front``), the last two recurrent-state pools. Every live
+  step, one frame (1280 samples) whatever the client's append size, runs whole
+  as a CUDA graph; other steps take the front end eagerly, then the layer stack
+  as a graph when each got at most one frame (the call's end), or eagerly (a
+  one-shot upload, an opening clip, the call's last append: a chunk over a
+  second is not batched with other calls, so the engine runs each call of that
+  step on its own).
 - Checks: ``test/nemotron_duplex/duplex_request.py`` prepares a clip from the
   bundled ``turn_taking.wav`` and sends it; ``parity_compare.py`` runs the
   standalone reference path on the same clip and checks the served text

@@ -8,6 +8,7 @@ end-to-end tests run the real admin, conductor ops, worker handlers and pools ov
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import subprocess
 import sys
@@ -590,8 +591,9 @@ def test_a_failed_read_on_one_worker_is_undone_everywhere_without_leaking_the_io
     assert "a1" not in d.pools["worker_0"].store and d.served.adapters == ()
 
 
-def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, tmp_path):
+def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, tmp_path, caplog):
     d = _Deployment(paths)
+    caplog.set_level(logging.WARNING, logger="mstar.api_server.lora_admin")
     other = tmp_path / "notes.txt"
     other.write_text("not an adapter")
     model = tmp_path / "model.safetensors"
@@ -626,6 +628,9 @@ def test_a_refused_path_tells_the_client_nothing_about_the_servers_files(paths, 
         answers.add(_message(err.value))
     # a missing file, a file of another kind, a directory, a model's weights and a FIFO read the same
     assert len(answers) == 1 and "could not be read" in answers.pop()
+    # and the server log has what the client is told it has: each cause, with the file
+    logged = [r for r in caplog.records if r.name == "mstar.api_server.lora_admin"]
+    assert len(logged) == 5 and all(r.exc_info and str(tmp_path) in r.getMessage() for r in logged)
     # as they do on a worker, should the file change after the API server's check
     read = LoraAdapterPool(make_spec({}), "cpu").load_adapter_async("x", str(model), bytes(32))
     assert "could not be read" in describe_load_error(read.exception(timeout=30))

@@ -433,13 +433,43 @@ def test_only_a_config_whose_step_drives_the_idle_resource_captures_idle_twins()
     resource = SimpleNamespace(can_capture=lambda: True, force_double_buffer=False, idle_capture=True)
     runner = AcceleratorGraphRunner(
         submodule_name="LLM", resources={"lora": resource}, step_runner=Mock(), device=CPU,
-        submodule=SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step),
+        submodule=SimpleNamespace(
+            get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step,
+            compiled_entries_per_shape=1,
+        ),
         autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
     )
 
     buckets = {spec.bucket for spec in runner.prepare_for_capture()}
     assert {(b.cg_key_info, b.idle) for b in buckets} == {(True, False), (True, True), (False, False)}
     assert len(buckets) == 6 and not runner.dropped_buckets
+
+
+def test_the_recompile_limit_counts_each_idle_twin(monkeypatch):
+    """An idle twin traces apart from its plain bucket. Counted as one shape, a node with
+    many buckets ran its later captures uncompiled inside their graphs."""
+    from unittest.mock import Mock
+
+    import mstar.engine.accelerator_graph_runner as agr
+
+    configs = [BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", capture_batch_sizes=[1, 2],
+        single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+    )]
+    resource = SimpleNamespace(can_capture=lambda: True, force_double_buffer=False, idle_capture=True)
+    monkeypatch.setattr(agr, "recompile_limit", lambda: 0)
+    runner = agr.AcceleratorGraphRunner(
+        submodule_name="LLM", resources={"lora": resource}, step_runner=Mock(), device=CPU,
+        submodule=SimpleNamespace(
+            get_accelerator_graph_configs=lambda *args: configs,
+            declare_step=lambda slot_lease, **kwargs: SimpleNamespace(steps={"lora": object()}),
+            compiled_entries_per_shape=1,
+        ),
+        autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+    )
+
+    # bs 1 and 2, each plain and idle
+    assert runner.recompile_limit == 4 + 16
 
 
 def test_a_node_takes_at_most_one_idle_capable_resource():

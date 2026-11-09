@@ -82,6 +82,8 @@ Keep resident capacity separate from one-step batching: a pool may retain many s
 
 **Register it: [registration.md](references/registration.md) is the checklist.** `test/modular/test_model_registration.py` enforces the registry, the CLI default config and the docs row, so CI catches those three. Forgetting the CLI entry means `mstar serve <model>` exits `unknown model` no matter how correct the code is.
 
+If the model gets OpenAI routes, its adapter lands in both frontends: the Python HTTP frontend is being retired, so the Rust port (`rust/server/src/adapters/`) is part of the adapter, not a follow-up (AGENTS.md invariant 15; [registration.md](references/registration.md) §5).
+
 Grep for callers before overriding any base-model or submodule hook — the hook surface contains refactored-out methods that nothing calls, and overriding one is a silent no-op.
 
 The engine calls `submodule.to(device, dtype)` *after* `get_submodule` (`mstar/worker/engine_manager.py:82`), so per-parameter dtype fixes applied at construction do not survive. If a module has dtype-sensitive parameters — FlashInfer's GDN kernels assert fp32 on the decay terms — enforce it in the module's own `_apply`, so it holds against any caller rather than one loader.

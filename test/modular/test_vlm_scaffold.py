@@ -314,7 +314,7 @@ def test_qwen_media_capture_stages_every_media_buffer():
         c for c in llm.get_accelerator_graph_configs(torch.device("cpu"))
         if c.capture_graph_walk == "prefill_vision"
     ]
-    for n in config.capture_token_lengths:
+    for n in config.get_total_tokens(1):
         rows = [config.make_node_input(n)]
         engine_inputs = SimpleNamespace(resources={}, request_ids=[0], captured=True)
         out = type(llm).preprocess(llm, "prefill_vision", engine_inputs, rows)
