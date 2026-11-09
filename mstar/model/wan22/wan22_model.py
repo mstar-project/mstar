@@ -26,6 +26,7 @@ request's ``num_inference_steps`` is the loop's cap (``get_loop_caps``).
 
 import html
 import logging
+import math
 import os
 import re
 
@@ -382,8 +383,8 @@ class Wan22Model(Model):
                 fps = float(raw_fps)
             except (TypeError, ValueError):
                 raise ValueError(f"Wan2.2 fps must be a number; got {raw_fps!r}.") from None
-            if fps <= 0:
-                raise ValueError(f"Wan2.2 fps must be positive; got {raw_fps!r}.")
+            if not math.isfinite(fps) or fps <= 0:
+                raise ValueError(f"Wan2.2 fps must be positive and finite; got {raw_fps!r}.")
 
     def process_prompt(
         self,

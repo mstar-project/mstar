@@ -58,6 +58,7 @@ NOT_PORTED = {
     ("VoxCPM2Adapter", "speech"),
     ("DiffusionImageAdapter", "images"),
     ("LTX25Adapter", "videos"),
+    ("MiniMaxH3Adapter", "videos"),
     ("Wan22Adapter", "videos"),
     ("TextChatAdapter", "chat"),
 }

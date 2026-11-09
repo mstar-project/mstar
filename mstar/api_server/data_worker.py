@@ -299,6 +299,8 @@ class PreprocessWorker:
         self.results_wakeup = EventWakeup()
         self.output_queue = ResultQueue(self.results_wakeup)
         self.profile_queue = ResultQueue(self.results_wakeup)
+        # ConductorMessages from other threads (runtime LoRA loads), sent by this one
+        self.conductor_outbox = queue.Queue()
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
         # Set by enable_worker_metrics(); the worker thread tells the conductor.
@@ -335,7 +337,7 @@ class PreprocessWorker:
             copy_workers=cpus.plan().copy_workers,
         )
 
-        # the serving config's adapters' prefix-cache roots
+        # registered adapters' prefix-cache roots; a runtime load or unload updates it
         self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
 
         self.thread = Thread(
@@ -360,6 +362,7 @@ class PreprocessWorker:
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
                 adapter_roots=self.adapter_prefix_roots,
+                conductor_outbox=self.conductor_outbox,
                 is_pending=is_pending,
             )
         )
@@ -378,6 +381,12 @@ class PreprocessWorker:
         submission, so it reaches the conductor before any request submitted
         after this call."""
         self.worker_metrics_requested.set()
+        self._signal()
+
+    def send_to_conductor(self, message) -> None:
+        """Send ``message`` to the conductor from the thread that owns the socket, on
+        the socket every submission goes out on."""
+        self.conductor_outbox.put(message)
         self._signal()
 
     def queue_depth(self) -> int:
@@ -667,6 +676,8 @@ class PreprocessWorkerThread:
     _next_transfer_publish = 0.0
     # class-level so a thread built without __init__ never sends ENABLE_METRICS
     worker_metrics_requested: threading.Event | None = None
+    # class-level so a thread built without __init__ has nothing to send
+    conductor_outbox: queue.Queue | None = None
     # None (a thread built without __init__) postprocesses every output inline
     _encode_pool: ThreadPool | None = None
     # class-level so a thread built without __init__ stamps no read times
@@ -705,9 +716,11 @@ class PreprocessWorkerThread:
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
         adapter_roots: AdapterPrefixRoots | None = None,
+        conductor_outbox: queue.Queue | None = None,
         is_pending: Callable[[str], bool] | None = None,
     ):
         self._adapter_roots = adapter_roots
+        self.conductor_outbox = conductor_outbox
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -1418,6 +1431,7 @@ class PreprocessWorkerThread:
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
         sequence: int | None = None, abort: bool = True, traceback: bool = True,
+        intake: bool = False,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -1435,12 +1449,16 @@ class PreprocessWorkerThread:
 
         ``traceback`` False logs one line, for an error already logged where
         it happened.
+
+        ``intake`` marks a failure while taking client input in (a request or
+        an append), where a ValueError or TypeError refuses it (a 400). Past
+        intake one is a server bug like any other error (a 500).
         """
+        status = 400 if intake and isinstance(exc, (ValueError, TypeError)) else 500
         text, _ = client_error_text(
             exc, f"{stage} failed for request {request_id}", log=logger,
-            traceback=traceback,
+            traceback=traceback, refusal=status < 500,
         )
-        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
         chunks = [
             ResultChunk(
                 request_id=request_id,
@@ -1850,6 +1868,14 @@ class PreprocessWorkerThread:
                 self._hard_cleanup(body.request_id)
         return did_work
 
+    def _send_conductor_outbox(self) -> bool:
+        outbox = self.conductor_outbox
+        if outbox is None or outbox.empty():
+            return False
+        while not outbox.empty():
+            self.communicator.send("conductor", outbox.get())
+        return True
+
     def _send_enable_metrics_if_requested(self) -> None:
         requested = self.worker_metrics_requested
         if requested is not None and requested.is_set():
@@ -1983,7 +2009,7 @@ class PreprocessWorkerThread:
             try:
                 self._process_stream_input(pre_input)
             except Exception as exc:  # noqa: BLE001 — must reach the client
-                self._fail_request(pre_input.request_id, exc, "stream input")
+                self._fail_request(pre_input.request_id, exc, "stream input", intake=True)
             return
         profile = None
         try:
@@ -2008,7 +2034,7 @@ class PreprocessWorkerThread:
         # reaches the conductor, so nothing downstream would ever complete
         # it; surface the failure as an error chunk instead of leaving the
         # client to wait out the server timeout.
-        self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False)
+        self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False, intake=True)
         # Never reached the conductor, so there are no remote readers to
         # race: hard-drop the (possibly persisted) input signals directly.
         self._cleanup_request_state(pre_input.request_id, force=True)
@@ -2085,6 +2111,7 @@ class PreprocessWorkerThread:
                 sends_pending = self.communicator.flush()
                 did_work = self._process_messages()
                 self._send_enable_metrics_if_requested()
+                did_work = self._send_conductor_outbox() or did_work
                 # Output delivery is latency-sensitive: the API server holds a
                 # finished request open for its final chunks only briefly, so
                 # queued read-starts / acks / cleanups must never wait behind a

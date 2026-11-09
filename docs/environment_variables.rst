@@ -534,6 +534,12 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_STEP_THREADS``
+     - config's ``knobs: step_threads``, else ``threaded``
+     - Where a worker runs a step's host work. ``threaded`` runs admit, plan and
+       the forward's launch on its GPU thread, and the pre-plan on its plan
+       thread. ``serial`` runs them on the main thread, so host work overlaps the
+       GPU but not other host work. Read by ``knobs.step_threads``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``auto``
      - Pin each worker's main, GPU and plan threads, and the API server's

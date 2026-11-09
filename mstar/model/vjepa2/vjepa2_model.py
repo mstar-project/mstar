@@ -64,7 +64,7 @@ from mstar.model.base import (
     video_metadata_dict,
 )
 from mstar.model.components.video_decode import decode_frames_at
-from mstar.model.media_limits import VideoBudget, video_decode_threads
+from mstar.model.media_limits import VideoBudget, decoding_upload, video_decode_threads
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -624,7 +624,8 @@ class VJepa2Model(Model):
         from torchcodec.decoders import VideoDecoder
 
         target_frames = self.config.frames_per_clip
-        decoder = VideoDecoder(filepath, num_ffmpeg_threads=video_decode_threads())
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            decoder = VideoDecoder(filepath, num_ffmpeg_threads=video_decode_threads())
 
         metadata_obj = getattr(decoder, "metadata", None)
         total = None

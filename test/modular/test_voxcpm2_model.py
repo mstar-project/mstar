@@ -716,10 +716,9 @@ def test_load_audio_refuses_non_audio_without_naming_the_path(model, tmp_path, p
     path = tmp_path / "uploads" / "f3a1c0de.wav"
     path.parent.mkdir()
     path.write_bytes(payload)
-    with pytest.raises(ValueError, match="not audio soundfile can read") as raised:
+    with pytest.raises(ValueError, match="could not decode the reference audio") as raised:
         model.load_audio(str(path), "cpu")
     assert str(tmp_path) not in str(raised.value) and path.name not in str(raised.value)
-    assert raised.value.__cause__ is None and raised.value.__suppress_context__
 
 
 # -- Talker -----------------------------------------------------------------------

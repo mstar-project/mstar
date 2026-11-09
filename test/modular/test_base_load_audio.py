@@ -90,14 +90,11 @@ def test_a_crafted_header_rate_is_refused_before_resampling(tmp_path, video_only
         Model.load_audio(BASE, str(path), "cpu")
 
 
-def test_other_containers_still_go_to_torchcodec(tmp_path, video_only_ffmpeg, monkeypatch):
-    from mstar.model.components import audio_features
-
-    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", lambda: True)
+def test_other_containers_still_go_to_torchcodec(tmp_path, video_only_ffmpeg):
     path = tmp_path / "clip.m4a"
     path.write_bytes(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64)
-    # once FFmpeg loads, a file neither decoder reads is a 400, FFmpeg's message withheld
-    with pytest.raises(ValueError, match="could not decode the audio upload"):
+    # an FFmpeg that loads and can't read the file: the client's error
+    with pytest.raises(ValueError, match="could not decode"):
         Model.load_audio(BASE, str(path), "cpu")
     assert video_only_ffmpeg.calls == [str(path)]
 

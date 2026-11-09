@@ -38,7 +38,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMPTY_DESTINATION
-from mstar.model.media_limits import VideoBudget, read_image, video_decode_threads
+from mstar.model.media_limits import VideoBudget, decoding_upload, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import (
@@ -1074,12 +1074,13 @@ class Model(ABC):
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
         budget = VideoBudget()
         frames = []
-        for frame in decoder:
-            budget.add(*frame.shape[-2:])
-            frames.append(frame)
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
+            for frame in decoder:
+                budget.add(*frame.shape[-2:])
+                frames.append(frame)
         video = torch.stack(frames)
         del frames
         video = video.float().div_(255.0)

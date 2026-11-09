@@ -872,20 +872,20 @@ class NemotronDuplexModel(Model):
 
         from mstar.api_server.media_io import AudioTooLongError, check_resample_rate, read_soundfile_capped
         from mstar.model.base import TensorAndMetadata
+        from mstar.model.media_limits import decoding_upload
 
         try:
-            # refused before the decode, which reads every channel of each block
-            info = sf.info(filepath)
-            check_resample_rate(info.samplerate, 16000)
-            if info.channels > self.max_upload_channels:
-                raise ValueError(
-                    f"audio must have at most {self.max_upload_channels} channels; got {info.channels}"
-                )
-            data, sr = read_soundfile_capped(filepath, self.max_session_s)   # mono
+            with decoding_upload(filepath, "the audio"):
+                # refused before the decode, which reads every channel of each block
+                info = sf.info(filepath)
+                check_resample_rate(info.samplerate, 16000)
+                if info.channels > self.max_upload_channels:
+                    raise ValueError(
+                        f"audio must have at most {self.max_upload_channels} channels; got {info.channels}"
+                    )
+                data, sr = read_soundfile_capped(filepath, self.max_session_s)   # mono
         except AudioTooLongError:
             raise session_too_long(self.max_session_s) from None
-        except sf.SoundFileError as exc:   # garbage or truncated upload
-            raise ValueError(f"could not decode the audio file: {exc}") from exc
         audio = torch.from_numpy(data)
         if sr != 16000:
             import torchaudio.functional as AF

@@ -127,6 +127,13 @@ def test_gen_params_and_step_metadata() -> None:
         assert sm["num_inference_steps"] == 7
 
 
+@pytest.mark.parametrize("fps", [0, -24, float("nan"), float("inf")])
+def test_gen_params_reject_a_bad_fps(fps) -> None:
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="fps must be positive"):
+        model._resolve_gen_params({"fps": fps}, ["text"], ["video"])
+
+
 @pytest.mark.skipif(not NANO_DIR.exists(), reason="set COSMOS3_NANO_DIR to a Cosmos3-Nano dir")
 def test_process_prompt_emits_cond_and_uncond() -> None:
     model = Cosmos3Model(model_path_hf=str(NANO_DIR))

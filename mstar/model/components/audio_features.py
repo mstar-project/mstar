@@ -18,9 +18,7 @@ mel (Chatterbox's S3Gen, CosyVoice3, the Qwen3-TTS speaker encoder).
 """
 from __future__ import annotations
 
-import functools
 import math
-import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -33,6 +31,7 @@ from mstar.api_server.media_io import check_resample_rate
 from mstar.engine.fp32_precision import Fp32Precision, fp32_precision_scope
 from mstar.model.components.dft import stft_as_real
 from mstar.model.components.masking import length_mask
+from mstar.model.media_limits import decoding_upload
 from mstar.utils.device import DeviceCapability
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -424,16 +423,6 @@ def check_nemo_preprocessor(preprocessor: dict[str, Any], **model_settings: Any)
         raise ValueError(f"unsupported NeMo preprocessor settings {unsupported}; expected {expected}")
 
 
-@functools.cache
-def _ffmpeg_decoder_loads() -> bool:
-    """Whether torchcodec, and the FFmpeg libraries it loads, work here."""
-    try:
-        from torchcodec.decoders import AudioDecoder  # noqa: F401
-    except Exception:  # noqa: BLE001 -- ImportError, or RuntimeError without FFmpeg
-        return False
-    # newer torchcodec imports without FFmpeg and records whether its FFmpeg ops
-    # loaded; older releases fail the import above
-    return getattr(sys.modules.get("torchcodec._core.ops"), "_FFMPEG_AVAILABLE", True)
 
 
 def _decode(path: str, sample_rate: int, max_seconds: float) -> tuple[torch.Tensor, int]:
@@ -468,16 +457,9 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
     undecodable file is the client's error, so it surfaces as ``ValueError``
     (HTTP 400). A missing decoder or memory, and anything after the decode, is
     the server's, and stays as it is."""
-    try:
-        # decoded at its own rate, so a resampling failure isn't blamed on the file
+    # decoded at its own rate, so a resampling failure isn't blamed on the file
+    with decoding_upload(path, "the audio", ffmpeg=True):
         waveform, rate = _decode(path, sample_rate, max_seconds)
-    except (ImportError, MemoryError, ValueError):
-        raise
-    except Exception as exc:  # noqa: BLE001 -- libsndfile and FFmpeg both refused it
-        if not _ffmpeg_decoder_loads():
-            raise
-        # FFmpeg's message (paths, internals) stays out of the response
-        raise ValueError("could not decode the audio upload") from exc
     return _resample(waveform, rate, sample_rate)
 
 
@@ -491,25 +473,26 @@ def load_reference_clip(
     length the header declares before anything decodes: a small compressed
     file can hold hours of audio. The header can understate it, so the decode
     stops past ``max_seconds`` too; a header with no length is checked on what
-    decodes.
+    decodes. A file libsndfile can't read is the client's error (400).
     """
     import soundfile
 
     from mstar.api_server.media_io import read_soundfile_capped
     from mstar.model.media_limits import read_sound_file, sound_file_seconds
 
-    info = soundfile.info(path)
-    check_resample_rate(info.samplerate, sample_rate)
-    seconds = sound_file_seconds(info.frames, info.samplerate)
-    if seconds is not None:
-        check_seconds(seconds)
-        waveform, rate = read_soundfile_capped(path, max_seconds)
-        audio = torch.from_numpy(waveform)
-    else:
-        # no sample count in the header (a FLAC written to a pipe)
-        waveform, rate = read_sound_file(path, max_seconds)
-        check_seconds(len(waveform) / rate)
-        audio = torch.from_numpy(waveform).mean(dim=1)
+    with decoding_upload(path, "the reference audio"):
+        info = soundfile.info(path)
+        check_resample_rate(info.samplerate, sample_rate)
+        seconds = sound_file_seconds(info.frames, info.samplerate)
+        if seconds is not None:
+            check_seconds(seconds)
+            waveform, rate = read_soundfile_capped(path, max_seconds)
+            audio = torch.from_numpy(waveform)
+        else:
+            # no sample count in the header (a FLAC written to a pipe)
+            waveform, rate = read_sound_file(path, max_seconds)
+            check_seconds(len(waveform) / rate)
+            audio = torch.from_numpy(waveform).mean(dim=1)
     return _resample(audio, rate, sample_rate)
 
 

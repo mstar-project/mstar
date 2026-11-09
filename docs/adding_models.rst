@@ -1242,8 +1242,8 @@ placed exactly as weights are.
   ``link_lora_specs``: a module belongs to the spec that places it (the one whose
   ``adapter_roots`` claim it most specifically, when several do), and the others leave
   it alone (``ignored_modules``), so one adapter file serves both. The one ``lora:`` block sizes them all, the conductor opens every request
-  with the same adapter on each, and the startup check reads an adapter under every
-  spec.
+  with the same adapter on each, and the startup and runtime-load checks read an adapter
+  under every spec.
 - **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every placed module
   under ``root_path``, after checking it is the declared target and that the pool's
   shard is its rank-local shape (a module built whole on a TP node fails here, not in a
@@ -1297,7 +1297,8 @@ placed exactly as weights are.
   tokens and bias LoRA are refused by name. A YAML ``targets: [...]`` keeps a subset of
   the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
   touching a dropped target is refused, and its modules stay unbound. Without the list,
-  a deployment keeps the targets its configured adapters touch: the conductor reads them once at startup (``served_lora_targets``) and spawns
+  a deployment with ``runtime_updates`` off keeps the targets its configured adapters
+  touch: the conductor reads them once at startup (``served_lora_targets``) and spawns
   every worker with that list, so every process builds the same pools; an adapter it
   cannot read fails the deployment.
 - **Requests.** Nothing per model. The conductor opens every request with a
@@ -1392,6 +1393,17 @@ A node that runs sequence parallelism (SP > 1) or CFG parallelism (cfg_size > 1)
 serve LoRA yet: the pool lays rows out per request over the whole batch, while each SP rank
 holds a shard of the tokens and each CFG rank one guidance branch's rows, so building the
 pool refuses the deployment.
+
+Adapters loaded and unloaded at runtime (``/v1/load_lora_adapter``) reach each worker as
+a control message from the conductor, which each rank applies whenever it arrives rather
+than at a step the instance agrees on. ``LoraAdapterPool.load_adapter_async`` only reads the
+adapter into the host tier, on the reader thread (the worker acknowledges the load from its
+main loop once every pool has it), and ``unload_adapter`` only stops new requests from naming
+it; once no live request names it (immediately, or at the last one's teardown) the pool
+forgets its host copy and its name's slot entry, and leaves the slot's weights and LRU
+standing as they were. Neither touches what an admit decides from, and the next request
+that names the adapter is ingested after a reload, which reaches every rank after the
+unload did. Nothing per model is needed for either.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -2064,7 +2076,7 @@ worker with a heavier one can set ``side_stream_walks`` on its submodule to the 
 may run beside the chain instead, and a deployment turns that on with ``side_stream: true``
 on the node's group (see :doc:`serving`). Such a step neither takes a turn on the chain nor
 makes it yield, runs on a second stream, and the windows that come ready while it runs
-batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture on a stream
+batch into the next one (see ``StepPipeline._launch_side`` in ``mstar/worker/step_pipeline.py``). Its graphs capture on a stream
 of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
 walk that nothing on the chain reads, such as a codec. Where the config asks,
 ``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
@@ -2490,10 +2502,13 @@ that a misspelled setting is never silently ignored:
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``
        (adapters held in pinned host memory), ``adapters`` (adapter name to safetensors
        path: the names requests can ask for), ``targets`` (the subset of the model's
-       targets to allocate; by default the targets the configured adapters touch; a
-       secondary node's spec
+       targets to allocate; by default, with ``runtime_updates`` off, the targets the
+       configured adapters touch, and every target with it on; a secondary node's spec
        left with none builds no pool, while a YAML list leaving the model's first spec
-       (its LLM's) none is an error). One ``lora:`` block sizes every LoRA spec of the
+       (its LLM's) none is an error), ``runtime_updates`` (default false: serve
+       ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``),
+       ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
+       worker to answer one before giving up on it). One ``lora:`` block sizes every LoRA spec of the
        model
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
@@ -2587,9 +2602,10 @@ in arrival order. A deployment sets the pool at the top level of its config; 1 t
    model: "qwen3_omni"
    preprocess_workers: 2
 
-The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni and
-V-JEPA2 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8 and 4, the
-sizes measured for their video decode). A model with client streams always prepares inline,
+The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni,
+V-JEPA2 and Cosmos3 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
+and 4, the sizes measured for their video decode; Cosmos3's DROID policy configs set 1, since
+a robot sends one request at a time). A model with client streams always prepares inline,
 since an append has to follow its request.
 
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
