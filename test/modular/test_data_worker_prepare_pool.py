@@ -3,6 +3,7 @@ they reach the conductor in arrival order, output delivery runs meanwhile, and a
 abandoned request ends as it does inline. A model that doesn't declare it runs as before."""
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -117,7 +118,27 @@ def _thread(model, config=None, pending=None, sized=True) -> PreprocessWorkerThr
     )
     if sized:
         wt._size_prepare_pool()
+    _threads.append(wt)
     return wt
+
+
+_threads: list[PreprocessWorkerThread] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_threads():
+    """Stop each test's threads and close their two eventfds, so a long run doesn't
+    leave select() fds past its 1024 limit for the tests after it."""
+    yield
+    while _threads:
+        wt = _threads.pop()
+        for gate in getattr(wt.model, "gates", {}).values():
+            gate.set()
+        for pool in (wt._prepare_pool, wt._encode_pool):
+            if pool is not None:
+                pool.shutdown(wait=True)
+        for results in (wt.out_queue, wt.profile_queue):
+            os.close(results.wakeup.fd)
 
 
 @pytest.fixture(autouse=True)
@@ -130,12 +151,7 @@ def _two_intra_op_threads(monkeypatch):
 @pytest.fixture
 def worker(monkeypatch):
     monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
-    wt = _thread(_Model())
-    yield wt
-    for gate in wt.model.gates.values():
-        gate.set()
-    wt._prepare_pool.shutdown(wait=True)
-    wt._encode_pool.shutdown(wait=True)
+    return _thread(_Model())
 
 
 def _input(request_id: str, text: str | None = None) -> PreprocessInput:
