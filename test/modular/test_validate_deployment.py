@@ -720,18 +720,39 @@ def test_concurrency_limit_must_be_a_positive_integer(tmp_path, value):
     assert any("max_concurrent_requests" in p for p in problems)
 
 
-@pytest.mark.parametrize("qo_heads,kv_heads,degree,valid", [
-    (8, 2, 3, False), (6, 3, 3, True), (12, 3, 4, False), (8, 2, 4, True),
-])
-def test_attention_head_geometry_is_checked_before_workers_start(tmp_path, qo_heads, kv_heads, degree, valid):
-    spec = KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
-        num_layers=1, num_qo_heads=qo_heads, num_kv_heads=kv_heads, head_dim=8, max_seq_len=64,
+def _head_spec(kind, qo_heads, kv_heads):
+    """A resource whose heads (a recurrent state's shard axis) a node's TP splits."""
+    from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
+    from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
+
+    if kind == "kv":
+        return KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
+            num_layers=1, num_qo_heads=qo_heads, num_kv_heads=kv_heads, head_dim=8, max_seq_len=64,
+        ))
+    if kind == "ragged":
+        return RaggedAttentionSpec(resource_key="vit", nodes={"llm"}, config=RaggedAttentionConfig(
+            num_qo_heads=qo_heads, num_kv_heads=kv_heads, head_dim=8,
+        ))
+    block = RecurrentBlockConfig(shape=(qo_heads, 4), dtype=None, shard_dims=(0,))
+    return RecurrentStateSpec(resource_key="state", nodes={"llm"}, config=RecurrentStateConfig(
+        num_layers=1, blocks={"state": block},
     ))
-    model = _Model(specs=[spec], kv_labels={"kv": {"main": KVLabel()}}, tp_enabled_nodes=["llm"])
+
+
+@pytest.mark.parametrize("kind,qo_heads,kv_heads,degree,valid", [
+    ("kv", 8, 2, 3, False), ("kv", 6, 3, 3, True), ("kv", 12, 3, 4, False), ("kv", 8, 2, 4, True),
+    # 6 query heads over 3 ranks: each rank's 2 would read 2 different KV heads
+    ("ragged", 6, 2, 3, False), ("ragged", 6, 3, 3, True),
+    ("recurrent", 8, None, 3, False), ("recurrent", 6, None, 3, True),
+])
+def test_head_geometry_is_checked_before_workers_start(tmp_path, kind, qo_heads, kv_heads, degree, valid):
+    spec = _head_spec(kind, qo_heads, kv_heads)
+    model = _Model(specs=[spec], kv_labels={"kv": {"main": KVLabel()}} if kind == "kv" else None,
+                   tp_enabled_nodes=["llm"])
     cfg = _cfg(tmp_path, [{"node_names": ["llm"], "ranks": list(range(degree)), "tp_size": degree}])
     if valid:
         _validate(model, cfg)
     else:
         problems = _problems(model, cfg)
-        assert any("head" in problem and "kv" in problem for problem in problems), problems
-    assert spec.config.num_qo_heads == qo_heads and spec.config.num_kv_heads == kv_heads
+        assert any(spec.resource_key in problem for problem in problems), problems
+    assert spec.config == _head_spec(kind, qo_heads, kv_heads).config, "the check sharded the model's own config"

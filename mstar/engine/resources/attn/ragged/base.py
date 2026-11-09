@@ -65,11 +65,7 @@ def _build_ragged(
     geometry (``kernels.kernel_rows``) and hand them to the manager. ``cudnn``:
     hand it cuDNN's one row, refused here if cuDNN can't run the geometry."""
     config = spec.config
-    joint = info.joint_comm_group
-    if config.shard_over_sp or joint is None:
-        config.shard(info.head_shards)
-    else:
-        config.shard(joint.tp_group.world_size)
+    config.shard(config.head_shards(info.joint_comm_group))
     dtype = config.dtype if config.dtype is not None else info.kv_dtype
     if dtype is None:
         raise ValueError(

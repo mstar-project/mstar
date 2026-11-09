@@ -11,7 +11,7 @@ import torch
 
 from mstar.distributed.communication import JointGroups
 from mstar.engine.resources.resident_hooks import ResidentHooks
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, head_shards
 from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, BucketKey, ResourceStep, StepContext
 
 if TYPE_CHECKING:
@@ -92,8 +92,7 @@ class EngineResourceInfo:
         builder sizes head counts by: its TP × SP ranks (CFG ranks run whole
         branches, every head). A ragged resource declaring
         ``RaggedAttentionConfig.shard_over_sp=False`` splits over TP only."""
-        group = self.joint_comm_group
-        return 1 if group is None else group.tp_group.world_size * group.sp_group.world_size
+        return head_shards(self.joint_comm_group)
 
     def dependency(self, key: str) -> NodeResourceSpec:
         spec = self.dependencies.get(key)

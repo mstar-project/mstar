@@ -7,14 +7,23 @@ without pulling FlashInfer in behind it.
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
+from copy import copy
 from dataclasses import dataclass, field, replace
 from enum import Enum, StrEnum
 from typing import TYPE_CHECKING
 
-from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, RoutingContext, check_sizes
+from mstar.engine.resources.spec import (
+    NodeResourceSpec,
+    ResourceReqConfig,
+    RoutingContext,
+    check_sizes,
+    head_shards,
+    split_heads,
+)
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
+    from mstar.distributed.communication import JointGroups
     from mstar.engine.resources.base import Resource
 
 
@@ -64,16 +73,9 @@ class KVConfig(ABC):
         ``num_shards`` is the instance session size (tp * sp): Ulysses SP
         all-to-alls heads, so attention runs at head-degree tp*sp.
         """
-        qo_heads, kv_heads = self._unsharded_qo_heads, self._unsharded_kv_heads
-        if (num_shards < 1 or qo_heads % num_shards
-                or max(kv_heads, num_shards) % min(kv_heads, num_shards)):
-            raise ValueError(
-                f"KV attention heads (query={qo_heads}, key/value={kv_heads}) cannot be split "
-                f"over {num_shards} head shards; query heads must divide evenly and KV heads "
-                "must divide evenly or be replicated equally across ranks"
-            )
-        self.num_kv_heads = max(1, kv_heads // num_shards)
-        self.num_qo_heads = qo_heads // num_shards
+        self.num_qo_heads, self.num_kv_heads = split_heads(
+            self._unsharded_qo_heads, self._unsharded_kv_heads, num_shards,
+        )
 
     @abstractmethod
     def apply_yaml_overrides(self, **kwargs) -> None:
@@ -640,6 +642,9 @@ class KVSpec(NodeResourceSpec):
     # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
     # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
+
+    def check_head_shards(self, group: "JointGroups") -> None:
+        copy(self.config).shard(head_shards(group))  # the builder shards the model's own
 
     @property
     def resource_class(self) -> "type[Resource]":
