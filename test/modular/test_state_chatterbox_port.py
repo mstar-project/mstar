@@ -618,6 +618,19 @@ def test_a_final_chunk_arriving_alone_gives_the_offline_audio(meanflow):
     _assert_same_audio(ported, before, "the whole utterance")
 
 
+@pytest.mark.parametrize("meanflow", [False, True])
+def test_a_chunk_prepared_again_after_a_refused_admit_draws_the_same_noise(meanflow):
+    """A refused admit drops a prepared row, and a later step prepares it again. Each prepare draws from the generator
+    state the last committed step left, so the step that runs draws what the dropped prepare drew."""
+    both = _Both(meanflow)
+    tokens = torch.randint(0, 6561, (130,), generator=torch.Generator().manual_seed(3))
+    for start, end, is_final in ((0, 15, False), (15, 65, False), (65, 130, True)):
+        history = torch.cat([both.histories.get(4, torch.empty(0, dtype=torch.long)), tokens[start:end]])
+        _prepare(both.node, 4, history, is_final, seed=1004)
+        ported, before = both.step({4: (tokens[start:end], is_final)})
+        _assert_same_audio(ported, before, f"tokens {start} to {end}, prepared twice")
+
+
 def test_a_call_after_the_final_chunk_emits_nothing_and_draws_nothing():
     both = _Both()
     tokens = torch.randint(0, 6561, (40,), generator=torch.Generator().manual_seed(5))
