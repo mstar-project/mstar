@@ -1095,9 +1095,9 @@ def test_a_request_back_from_the_host_moves_again_for_an_older_request_waiting_i
 
 def test_a_request_back_from_a_drop_is_still_a_victim_for_an_older_request():
     kv = _pool()
-    _running(kv, "o", 3, arrival=0)
+    _running(kv, "o", 4, arrival=0)
     _running(kv, "v", 2, arrival=2)
-    assert _step(kv, "o", 5 * PAGE_SIZE).ok
+    assert _step(kv, "o", 4 * PAGE_SIZE).ok
     assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: True).to_drop == ["v"]
     _drop(kv, "v")
     _request(kv, "a", 2, arrival=1)
@@ -1200,10 +1200,10 @@ def test_a_victim_that_can_be_rebuilt_never_moves_into_room_set_aside_on_the_hos
 def test_a_request_no_drop_can_free_moves_into_its_own_room_on_a_full_host():
     kv = _pool()
     kv._cpu_pool = host._HostPool(4)
-    _running(kv, "o", 3, arrival=0)
+    _running(kv, "o", 4, arrival=0)
     _running(kv, "r", 2, arrival=1, rebuildable=False)
     _running(kv, "x", 2, arrival=2)
-    assert _step(kv, "o", 3 * PAGE_SIZE).ok
+    assert _step(kv, "o", 2 * PAGE_SIZE).ok
     assert _preempt(kv, "o", _step(kv, "o", PAGE_SIZE).reason.pages_short, droppable=lambda rid: False) == (
         Victims(["x"], [], [])
     )
