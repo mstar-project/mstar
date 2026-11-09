@@ -758,12 +758,13 @@ The spec types are:
        ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
        ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
        defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO``, the
-       default, ``RaggedAttnBackend.FLASHINFER``, or ``RaggedAttnBackend.DENSE``),
-       ``flashinfer_backend``, the
+       default, ``RaggedAttnBackend.FLASHINFER``, ``RaggedAttnBackend.DENSE``, or
+       ``RaggedAttnBackend.CUDNN``), ``flashinfer_backend``, the
        two CUDA-graph ceilings ``max_segments_per_request`` (``max_segments_per_step``
        for a ``one_row_per_step`` region) and
        ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp`` and
-       ``workspace_mb``. ``DENSE`` runs FA3
+       ``workspace_mb``. ``CUDNN`` runs torch's cuDNN SDPA over
+       equal-length segments (see `Cacheless attention (encoder towers)`_). ``DENSE`` runs FA3
        ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
        missing. By default the heads are split across all TP × SP ranks of the node;
        ``shard_over_sp=False`` splits them across the TP ranks only, for an attention
@@ -1042,7 +1043,28 @@ attends through them. A kernel that reads ``cu_seqlens`` as an argument, or buil
 mask from it, cannot be captured this way.
 
 ``RaggedAttnBackend.AUTO`` (and an explicit ``FLASHINFER``) plan through FlashInfer's
-ragged prefill wrapper. ``RaggedAttnBackend.DENSE`` plans the same layouts into static
+ragged prefill wrapper. For a self-attention whose config names neither a backend nor a
+``flashinfer_backend`` (``None``, the default; an explicit ``auto`` is FlashInfer's own choice), ``AUTO`` first reads the ``ragged_attention`` kernel table
+(``mstar/kernels/tables/ragged_attention/``, see `Tuned kernel configs`_) for the rank's head
+geometry on the GPU. An eager plan runs the row its layout's longest query segment falls in, so
+one slot can run a different kernel from one layout to the next; a captured bucket runs the row of
+the layout that first plans it. On ``sm_103`` the table names torch's cuDNN SDPA (``RaggedAttnBackend.CUDNN``) for
+klein 4B / 9B and Z-Image's geometries (24, 32 and 30 heads of 128; Wan2.2-TI2V-5B's 24 heads read
+klein 4B's entry, LTX-2.5's 32-head video self-attention klein 9B's): under a CUDA graph FlashInfer's
+``auto`` stays on FA2 there (its cutlass plan can't be replanned in graph mode, and its cuDNN path needs
+cuDNN 9.24), which is 3.5-5x slower from 1k to 64k tokens. An entry whose larger sizes no served model
+has run bounds them with a numeric last row and a ``"*"`` row naming ``flashinfer``, the resource's own
+default. A GPU of the architecture reads the file
+whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
+segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
+the layout it was planned with, so a captured bucket takes it only when the step that plans it
+declares ``AttentionStep(fixed_layout=True)``, and stays on FlashInfer otherwise. The DiT
+scaffold's denoise step declares it (``DenoiseLoopSubmodule.attention_step``): every row of a
+denoise bucket, padding rows included, spans the bucket's tokens. An eager layout of unequal
+segments runs FlashInfer. It is self-attention only. A config that names ``backend: cudnn``
+fails at build where cuDNN can't run it: on a cross-attention or block-causal resource, under
+GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the
+geometry, ``AUTO`` is FlashInfer with its own ``auto`` choice. ``RaggedAttnBackend.DENSE`` plans the same layouts into static
 ``cu_seqlens`` buffers and runs FA3 ``flash_attn_varlen`` (AITER on ROCm) instead, with
 no page scatter. If that kernel is not importable, or the spec is a
 ``RaggedBlockCausalAttentionSpec`` (whose overlapping prefixes varlen cannot express),
@@ -2538,8 +2560,10 @@ that a misspelled setting is never silently ignored:
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
    * - ``RaggedAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
-       (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
+     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``cudnn``), ``flashinfer_backend``
+       (unset by default: a self-attention reads the ``ragged_attention`` kernel table; any name,
+       ``auto`` / ``fa2`` / ``fa3`` / ``cudnn`` / ``cutlass``, runs that FlashInfer backend and no
+       table), ``max_segments_per_request``,
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.
@@ -2839,7 +2863,10 @@ per process and keeps the default config where no table has it, and the server l
 command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048,top_k=8 ...``).
 A block-fp8 dense linear (``fp8_linear``, ``mstar/utils/dense_fp8.py``) takes its kernel per token
 count the same way: the w8a16 Triton kernel, FlashInfer's or cuBLAS's block-scale GEMM, where the
-GPU's row names one that runs there.
+GPU's row names one that runs there. A cacheless self-attention (``ragged_attention``) takes its
+kernel per head geometry and longest query segment: torch's cuDNN SDPA or one of FlashInfer's
+ragged backends. A table can also be named for an architecture (``sm_103.json``) rather than one
+GPU model, for rows that hold on every GPU of it; the sweep's ``--arch`` writes that file.
 
 ``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
 each against a reference output, and writes the winners with where they were measured.
