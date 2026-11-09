@@ -102,9 +102,8 @@ __global__ __launch_bounds__(352) void warp_query_attention(__grid_constant__ co
     }
 }
 
-__global__ __launch_bounds__(128) void phase(__grid_constant__ const Params p, int kind, int step) {
+__global__ __launch_bounds__(128) void prepare_inputs(__grid_constant__ const Params p) {
     int rows = 2 * p.batch;
-    if (kind == 0) {
     for (int i = index(); i < p.batch * 256; i += stride()) p.x[i] = p.noise[i];
     for (int i = index(); i < rows * 256; i += stride()) {
         int row = i / 256, patch = i % 256 / 64, feat = i % 64;
@@ -112,23 +111,19 @@ __global__ __launch_bounds__(128) void phase(__grid_constant__ const Params p, i
     }
     // Inputs use [B, patch, feature]; the evolving state uses [B, feature, patch].
     for (int i = index(); i < rows * 256; i += stride()) p.cond_in[i] = p.cond[i % (p.batch * 256)];
-    asm volatile("fence.proxy.async.global;" ::: "memory");
-    __syncthreads();
+}
+__global__ __launch_bounds__(128) void prepare_time(__grid_constant__ const Params p) {
+    int rows = 2 * p.batch;
+    // Every replay refreshes all nine embeddings from the current schedule.
+    for (int i = index(); i < 9 * rows * WIDTH; i += stride()) {
+        int d = i % WIDTH, f = d % 512;
+        int step_index = i / (rows * WIDTH) + 1;
+        float frequency = expf(float(f) * -0.01802414945592208f);
+        float angle = 1000.f * float(p.span[step_index]) * frequency;
+        p.embedding[i] = Element(d < 512 ? sinf(angle) : cosf(angle));
     }
-    if (kind == 7) {
-        // Every replay refreshes all nine embeddings from the current schedule.
-        for (int i = index(); i < 9 * rows * WIDTH; i += stride()) {
-            int d = i % WIDTH, f = d % 512;
-            int step_index = i / (rows * WIDTH) + 1;
-            float frequency = expf(float(f) * -0.01802414945592208f);
-            float angle = 1000.f * float(p.span[step_index]) * frequency;
-            p.embedding[i] = Element(d < 512 ? sinf(angle) : cosf(angle));
-        }
-        for (int i = index(); i < rows * WIDTH; i += stride())
-            p.delta_embedding[i] = Element(i % WIDTH < 512 ? 0.f : 1.f);
-        asm volatile("fence.proxy.async.global;" ::: "memory");
-    __syncthreads();
-    }
+    for (int i = index(); i < rows * WIDTH; i += stride())
+        p.delta_embedding[i] = Element(i % WIDTH < 512 ? 0.f : 1.f);
 }
 // Assemble all eleven tokens and immediately consume them in initial RMSNorm.
 // No other CTA reads this token until the kernel boundary.
@@ -193,15 +188,12 @@ __global__ __launch_bounds__(32) void finish_cfg_euler(
         if (step == 9) p.output[b * 256 + i] = next;
     }
 }
-__global__ void finish_contract(float const* partial, Element* out, Element const* bias,
-                                Element const* residual, int m, int n, int epilogue) {
+__global__ void finish_time_silu(float const* partial, Element* out, Element const* bias,
+                                 int m, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < m * n) {
-        float value = partial[i];
-        if (epilogue) value = float(Element(value));
-        if (epilogue != 1 && bias) value += float(bias[i % n]);
-        if (epilogue == 2) value = value / (1.f + expf(-value));
-        if (residual) value += float(residual[i]);
+        float value = bf(partial[i]) + float(bias[i % n]);
+        value = value / (1.f + expf(-value));
         out[i] = Element(value);
     }
 }
@@ -241,7 +233,7 @@ __global__ void finish_qkv_rope(float const* partial, Element* out,
 // unique writer. GEMM planes and all original BF16 boundaries are retained.
 template<int Parts>
 __global__ __launch_bounds__(256) void finish_residual_norm(
-    float const* partial, Element* out, Element const* bias, Element const* residual,
+    float const* partial, Element* out, Element const* residual,
     Element const* norm_weight, Element* normed, float eps, int partition_stride, Element* final_slice) {
     int row = blockIdx.x, tid = threadIdx.x, col = 4 * tid, i = row * WIDTH + col;
     float4 packed = reinterpret_cast<float4 const*>(partial)[i / 4];
@@ -251,7 +243,7 @@ __global__ __launch_bounds__(256) void finish_residual_norm(
         float4 v = reinterpret_cast<float4 const*>(partial + part * partition_stride)[i / 4];
         values[0] += v.x; values[1] += v.y; values[2] += v.z; values[3] += v.w;
     }
-    struct alignas(8) Four { Element lanes[4]; } res, biases, weights, rounded, normalized;
+    struct alignas(8) Four { Element lanes[4]; } res, weights, rounded, normalized;
     if (residual) *reinterpret_cast<uint2*>(&res) = reinterpret_cast<uint2 const*>(residual)[i / 4];
     *reinterpret_cast<uint2*>(&weights) = reinterpret_cast<uint2 const*>(norm_weight)[col / 4];
     float sum = 0.f;
@@ -462,6 +454,7 @@ at::Tensor vox_solve(at::Tensor lm, at::Tensor res, at::Tensor cond, at::Tensor 
     for(int l=0;l<12;++l) {
         proj[9+4*l]={p.normed,p.qkv,nullptr}; proj[10+4*l]={p.attn,p.hidden,p.hidden};
         proj[11+4*l]={p.normed,p.activated,nullptr}; proj[12+4*l]={p.activated,p.hidden,p.hidden};
+        if (batch != 1) continue;
         auto a=cute::make_tensor(static_cast<Element const*>(p.normed),cute::make_shape(tokens,1024),cute::make_stride(1024,cute::_1{}));
         auto b=cute::make_tensor(static_cast<Element const*>(bfptr(weights[11+4*l])),cute::make_shape(8192,1024),cute::make_stride(1024,cute::_1{}));
         gates[l]={cute::make_tma_atom(cute::SM90_TMA_LOAD{},b,vox::SmemLayout{}(cute::_,cute::_,0),cute::Shape<cute::_64,cute::_64>{}),
@@ -487,18 +480,18 @@ at::Tensor vox_solve(at::Tensor lm, at::Tensor res, at::Tensor cond, at::Tensor 
         } else if(i>=9) {
             int ni=2*((i-9)/4)+((i-9)%4==1 ? 1 : 2);
             if (batch == 8) {
-                finish_residual_norm<4><<<d.m,256,0,st>>>(p.partial,v.output,nullptr,v.residual,
+                finish_residual_norm<4><<<d.m,256,0,st>>>(p.partial,v.output,v.residual,
                     p.norms[ni],p.normed,p.eps,d.m*d.n,ni==24 ? p.slice : nullptr);
             } else {
-                finish_residual_norm<8><<<d.m,256,0,st>>>(p.partial,v.output,nullptr,v.residual,
+                finish_residual_norm<8><<<d.m,256,0,st>>>(p.partial,v.output,v.residual,
                     p.norms[ni],p.normed,p.eps,d.m*d.n,ni==24 ? p.slice : nullptr);
             }
         } else {
-            finish_contract<<<(d.m*d.n+255)/256,256,0,st>>>(p.partial,v.output,bias,nullptr,d.m,d.n,2);
+            finish_time_silu<<<(d.m*d.n+255)/256,256,0,st>>>(p.partial,v.output,bias,d.m,d.n);
         }
     };
-    phase<<<alg.blocks,128,0,st>>>(p,0,0); mm(0); mm(1); mm(2);
-    phase<<<alg.blocks,128,0,st>>>(p,7,0); mm(4); mm(5); mm(6); mm(7);
+    prepare_inputs<<<alg.blocks,128,0,st>>>(p); mm(0); mm(1); mm(2);
+    prepare_time<<<alg.blocks,128,0,st>>>(p); mm(4); mm(5); mm(6); mm(7);
     for(int step=1;step<10;++step) {
         mm(3); assemble_norm<<<tokens,256,0,st>>>(p,step);
         for(int layer=0;layer<12;++layer) {
