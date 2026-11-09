@@ -9,6 +9,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SESSION = runpy.run_path(str(REPO_ROOT / ".github/review/session.py"))
 load, usage, handoff, diff_paths = SESSION["load"], SESSION["usage"], SESSION["handoff"], SESSION["diff_paths"]
+numbered = SESSION["numbered"]
 ROOT = "/home/runner/work/mstar/mstar"
 
 
@@ -153,6 +154,30 @@ class TestHandoff(unittest.TestCase):
                 # A hunk the PR's author wrote to look like a quoted path.
                 '@@ -1 +1 @@\n--- a/x\n+++ "b/x" ' + "+" * 30000 + "\n")
         self.assertEqual(diff_paths(diff), ["y", "caf\u00e9\t1"], "a path git quotes would be left out")
+
+    def test_numbered_gives_each_hunk_line_its_file_line_across_files_renames_and_deletions(self):
+        def diff(a, r, b, c, d, e):
+            return ("diff --git a/new.py b/new.py\nnew file mode 100644\n--- /dev/null\n+++ b/new.py\n"
+                    f"@@ -0,0 +1,2 @@\n{a}+one\n{a}+two\n\\ No newline at end of file\n"
+                    "diff --git a/old.py b/moved.py\nsimilarity index 90%\nrename from old.py\nrename to moved.py\n"
+                    "--- a/old.py\n+++ b/moved.py\n"
+                    f"@@ -10,3 +20,3 @@ def f():\n{r} ctx\n{b}-gone\n{c}+back\n{d} ctx2\n"
+                    # A deletion and an addition that look like file headers, then a second hunk.
+                    f"@@ -40,2 +50,2 @@\n{b.replace('11', '40')}--- a/x\n{c.replace('21', '50')}+++ b/x\n{e} end\n"
+                    "diff --git a/dead.py b/dead.py\ndeleted file mode 100644\n--- a/dead.py\n+++ /dev/null\n"
+                    f"@@ -1,2 +0,0 @@\n{b.replace('11', '1')}-a\n{b.replace('11', '2')}-b\n")
+
+        raw = diff(*[""] * 6)
+        plain = "R{} |", "L11 |", "R21 |", "R22 |", "R51 |"
+        marked = diff("R1 |", "R20 |", "L11 |", "R21 |", "R22 |", "R51 |").replace("R1 |+two", "R2 |+two")
+        self.assertEqual(numbered(raw), marked, "a comment would land on the wrong line")
+        self.assertEqual(diff_paths(numbered(raw)), ["new.py", "moved.py"],
+                         "a handoff would lose the changed files it never opened, or list a hunk line as one")
+        self.assertNotIn("L", "".join(x.split("|")[0] for x in numbered(raw, left=False).split("\n") if "|" in x),
+                         "a since.diff's old side isn't the PR's base")
+        broken = "@@ -1,2 +1,2 @@\n a\nnot a hunk line\n b\n"
+        self.assertEqual(numbered(broken), "@@ -1,2 +1,2 @@\nR1 | a\nnot a hunk line\n b\n",
+                         "text after a hunk that doesn't match its counts would be numbered")
 
 
 if __name__ == "__main__":

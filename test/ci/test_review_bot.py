@@ -470,6 +470,10 @@ class TestCollect(unittest.TestCase):
         out, files = collect(**self.CONVERSATION, **{f"GET repos/o/r/compare/{LAST}...{HEAD}": compare("ahead")})
         self.assertEqual((out.get("rereview"), files["since.diff"]), ("true", "diff --git a/b.py b/b.py\n"))
         self.assertEqual(json.loads(files["last-review.json"])["head"], LAST)
+        _, files = collect(**self.CONVERSATION, **{f"GET repos/o/r/compare/{LAST}...{HEAD}":
+                                                   compare("ahead", pr_diff("x = 1", "z"))})
+        self.assertIn(" |-    y = 2\nR11 |+    y = 3", files["since.diff"],
+                      "a deleted line's number here is from the last review, and GitHub would refuse or misplace it")
 
     def test_with_the_review_app_only_its_login_is_the_bot(self):
         forged = {**summary(LAST), "user": {"login": "github-actions[bot]"}}
@@ -500,7 +504,10 @@ class TestCollect(unittest.TestCase):
         self.assertEqual((out.get("rereview"), files["interdiff.diff"]), ("true", ""),
                          "a rebase that moved the PR's changes would read as new changes")
         out, files = collect(diff=pr_diff("x = 1", "# dead code"), **routes)
-        self.assertEqual(files["interdiff.diff"], f"{pr_diff('x = 1', '# dead code')}{bot.DROPPED}{reviewed}")
+        self.assertEqual(files["interdiff.diff"],
+                         f"{bot.session.numbered(pr_diff('x = 1', '# dead code'))}{bot.DROPPED}{reviewed}",
+                         "the new patch is commented on by its numbers, and the dropped one can't be")
+        self.assertIn("L11 |-    y = 2\nR11 |+    y = 3", files["pr.diff"])
         self.assertNotIn("since.diff", files)
 
     def test_a_merge_in_the_range_takes_the_interdiff(self):
@@ -765,7 +772,8 @@ class TestAfterTheReview(unittest.TestCase):
                   "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
                   "risk": {"level": "low", "reason": "r", "look_at": []}, "inline_comments": [
                       {"path": "a.py", "line": 3, "body": f"**[P1]** first\n\nleaks {token}"},
-                      {"path": "b.py", "line": 9, "start_line": 7, "side": "LEFT", "body": "**[P0]** range"},
+                      {"path": "b.py", "line": 9, "start_line": 7, "side": "LEFT",
+                       "body": "**[P0]** range\n\nwhy it matters"},
                       {"path": "c.py", "line": 1, "body": "**[P2]** not in the diff"},
                   ]}
         posted, answers = [], iter([{"id": 41}, Fail("HTTP 422"), {"id": 43}])
@@ -789,8 +797,8 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertEqual([k for k, _ in fake.writes()][-1], "pr comment", "the summary is posted last")
         summary = fake.writes()[-1][1]
         self.assertEqual(render_summary.saved_state(summary)["outside_diff"],
-                         [{"priority": "P0", "claim": "range", "location": "b.py:9", "detail": "range"}],
-                         "a finding GitHub refused would be lost")
+                         [{"priority": "P0", "claim": "range", "location": "b.py:9", "detail": "why it matters"}],
+                         "a finding GitHub refused would be lost, or repeat its claim as its detail")
         self.assertEqual(json.loads(out["result"])["inline"], {"41": "P1", "43": "P2"},
                          "the approval rule's snapshot would miss a finding this run posted")
         self.assertNotIn("inline_comments", json.loads(out["result"]), "the job output holds what the rule reads")
