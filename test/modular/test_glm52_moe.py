@@ -472,6 +472,7 @@ def test_load_end_to_end_reduced_fp8():
 
     loaded = planned_load(model, state, load=lambda stream: load_glm52_hf_weights(
         model, stream, cfg.n_routed_experts, num_hidden_layers=cfg.num_hidden_layers,
+        load_indexer=cfg.dsa_long_context,
     ))
 
     # Completeness both ways: every model param got a tensor, nothing extra.

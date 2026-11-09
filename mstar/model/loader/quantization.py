@@ -66,9 +66,11 @@ def checkpoint_quantization(path: str | Path) -> CheckpointQuantization | None:
 
 
 def refuse_unserved_quantization(path: str | Path, quant_methods: Collection[str] = ()) -> None:
-    """Raise if the checkpoint at ``path`` is quantized with a method that is not in ``quant_methods``."""
+    """Raise if the checkpoint at ``path`` is quantized with a method that is not in ``quant_methods``,
+    unless the node loading it reads it under a quantization scope (``mstar.quantization``), whose
+    plans load each quantized layer and refuse at boot what they can't."""
     quant = checkpoint_quantization(path)
-    if quant is None or quant.method in quant_methods:
+    if quant is None or quant.method in quant_methods or _scope_reads(path):
         return
     serves = "only unquantized checkpoints"
     if quant_methods:
@@ -87,3 +89,13 @@ def _read_json(path: Path) -> object:
     except (OSError, ValueError):
         # absent or not JSON: the file declares nothing
         return None
+
+
+def _scope_reads(path: str | Path) -> bool:
+    """Whether the active quantization scope declares a weights root read from ``path``'s directory."""
+    # here, not at the top: mstar.quantization imports this package's loader
+    from mstar.quantization.scope import active_scope
+
+    scope = active_scope()
+    root = Path(path) if Path(path).is_dir() else Path(path).parent
+    return scope is not None and any(Path(d).resolve() == root.resolve() for d in scope.checkpoint_dirs())

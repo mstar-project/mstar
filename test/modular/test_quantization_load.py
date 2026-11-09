@@ -120,7 +120,7 @@ def test_a_stored_layer_kept_bf16_is_dequantized_exactly(checkpoints):
 
 
 def _stored(path, base):
-    tensors = dict(iter_safetensors_shards(path))
+    tensors = dict(iter_safetensors_shards(path, quant_methods=("fp8",)))  # the stored tensors, raw
     return tensors[f"{base}.weight"], tensors[f"{base}.weight_scale_inv"]
 
 

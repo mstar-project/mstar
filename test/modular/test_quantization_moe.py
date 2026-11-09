@@ -155,7 +155,7 @@ def test_fp8_experts_track_bf16_and_skip_padding_rows(checkpoints):
 
 def test_the_stored_scales_are_the_checkpoints(checkpoints):
     root, _ = load(checkpoints["fp8"])
-    tensors = dict(iter_safetensors_shards(checkpoints["fp8"]))
+    tensors = dict(iter_safetensors_shards(checkpoints["fp8"], quant_methods=("fp8",)))  # the stored tensors, raw
     got = root.layers[0].ep.experts.down_proj_scale_inv.view(torch.float32)[3]
     assert torch.equal(got, tensors["layers.0.ep.experts.3.down_proj.weight_scale_inv"])
     w = root.layers[0].ep.experts.down_proj[3]

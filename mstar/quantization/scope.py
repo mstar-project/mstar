@@ -73,6 +73,10 @@ class NodeQuantization:
             self._checkpoints[directory] = scan_checkpoint(directory)
         return self._checkpoints[directory]
 
+    def checkpoint_dirs(self) -> list[str]:
+        """The local checkpoint directories the declared roots load from."""
+        return [d for d in (r.checkpoint_dir() for r in self.roots) if d is not None]
+
     def plan_for(self, module: nn.Module) -> QuantPlan | None:
         """The plan for ``module`` if it is one of this node's declared roots (resolved, checked and prepared
         on first sight), else None."""
