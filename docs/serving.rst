@@ -498,15 +498,14 @@ its shortage. Each moves to the host when the host pool (``cpu_offload_pages``) 
 its pages, and is otherwise dropped if it can be rebuilt from its token ids. The request that
 ran short gets the pages freed, up to its shortage. When the newer requests can't cover it, it
 moves to the host if the host pool can hold all of its pages, and otherwise waits holding its
-pages. A request on the host and one waiting for pages wait outside the queue, so a new prompt
-that fits still starts. They are tried oldest first, before the queue. A dropped request waits
-in the queue at its arrival, and the only requests that start ahead of it are those whose pages
-are already set aside. The oldest waiting request that moves can let in moves newer requests that
-wait holding pages, to the host or by a drop as above, and the pages they free are set aside for
+pages. A request on the host, a dropped one and one waiting for pages wait outside the queue, so a
+new prompt that fits still starts, unless one of them is the oldest request, which no newer prompt
+passes. They are tried oldest first, before the queue. The oldest refused request that moves can let
+in moves newer requests that wait holding pages, to the host or by a drop as above, and the pages they free are set aside for
 it. A request on the host returns once its pages and one more page fit, or every page its
 grant needed when it moved itself, and its pages are then copied back. A dropped request returns
-once its prompt, or its history and one more page if that is larger, fits, then recomputes its KV
-in prefill chunks cut by its walk's chunk budget, and isn't taken again until it writes a token past
+once its prompt, or its history and one more page if that is larger, fits, counting no prompt page
+another request holds, then recomputes its KV in prefill chunks cut by its walk's chunk budget, and isn't taken again until it writes a token past
 that. A request that streams an output in
 ``unpausable_outputs`` reserves its whole footprint in every pool, with every cache hit counted,
 and is never dropped or moved to the host. Voice requests then queue when the pool is short and
@@ -529,9 +528,9 @@ such requests can hold with only their prompt reserved.
 Above one rank, rank 0 makes each of these decisions, and the other ranks apply them before the
 step that follows, so every rank admits each step from the same reservations. On a node with a
 second paged KV cache, such as Whisper's decoder, a decode step that finds no page and nothing to
-offload holds its requests until they time out. Elsewhere, a request that runs short and can
-neither move to the host nor be dropped waits holding its pages until its shortage fits, when
-moving or dropping the newer requests wouldn't cover it. Several such requests can wait on each
+offload holds its requests until they time out. Elsewhere, a request that runs short, when moving
+or dropping the newer requests wouldn't cover it and the host pool can't hold it, waits holding its
+pages until its shortage fits. Several such requests can wait on each
 other. ``max_concurrent_requests`` prevents both. It caps how many requests run at once, and the
 pool's pages divided by the pages one request needs, prompt and output together, is a safe value.
 ``cpu_offload_pages`` lets a full pool move a request to the host instead of dropping it. An

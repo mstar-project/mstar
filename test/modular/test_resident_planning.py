@@ -1116,7 +1116,7 @@ def _offload_engine(resources, planner):
         _submodules={"n": make_mgmt(resources=resources, resident=planner)},
         _graph_runtime=SimpleNamespace(get_rid_string=str, get_rid_handle=int),
         # these requests were taken in by their resources alone, so no admission queue holds them
-        _runner=SimpleNamespace(readmit=lambda rid, node, queued: None),
+        _runner=SimpleNamespace(readmit=lambda rid, node: None),
     )
     return engine
 

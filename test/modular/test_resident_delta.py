@@ -254,7 +254,7 @@ class _Engine(Engine):
         self._submodules["node"] = make_mgmt(resources={"kv": self.resource})
         self._runner = SimpleNamespace(
             admit_retrieve=lambda **kw: FULL_ADMIT_OK, admit_request=lambda *args: None,
-            readmit=lambda *args, queued: None,
+            readmit=lambda *args: None,
         )
         self._resident_delta = OffloadDelta.new() if role == "leader" else None
         self._tp_leader_nodes = {"node"} if role == "leader" else set()
@@ -1293,7 +1293,7 @@ def _ingest(kvs, rid: str, pages: int, arrival: int, rebuildable: bool = True) -
 def _counts(kv) -> tuple:
     """What the next admit reads, and the order the next grant takes free pages in."""
     return (
-        kv._unused, {rid: (a.pages, a.remaining, a.prompt) for rid, a in kv._allotments.items()},
+        kv._unused, {rid: (a.pages, a.remaining, a.asks_again) for rid, a in kv._allotments.items()},
         {rid: (e.pages, sorted(e.victims), e.granted) for rid, e in kv._earmarks.items()},
         sorted(rid for rid, earmark in kv._victims.items() if earmark is not None), sorted(kv._dropped),
         kv._arena.free_pages(),
@@ -1489,11 +1489,14 @@ def test_a_follower_settles_a_passer_dropped_for_an_older_request_into_rank_0s_c
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert _counts(leader) == _counts(follower), "a rank settled the drop of the request that passed another way"
     assert leader._kept == 4, "rank 0 left a passer the pages p freed past r's shortage"
-    assert not _returns(leader, "p"), "p, dropped, came back ahead of the head it arrived behind"
+    assert _returns(leader, "p"), "p, dropped, waited behind the head, though r is older than both"
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert _counts(leader) == _counts(follower), "p's return took the kept pages into its allotment on one rank"
 
     for engine in (lead, follow):
         engine.remove_request("r")
-    assert _admits(leader, "head") and not _returns(leader, "p")
+        engine.remove_request("p")
+    assert _admits(leader, "head")
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert _counts(leader) == _counts(follower), "the head took the kept pages into another allotment on one rank"
 
@@ -1633,8 +1636,8 @@ def test_only_rank_0_moves_requests_for_the_ones_that_wait(monkeypatch):
 
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
 
-    assert follower._parked == leader._parked == {"v"}, "the follower holds other requests waiting with allotments"
-    assert leader.any_parked() and not follower.any_parked(), "a follower would walk the refusals for make_room"
+    assert follower._stalled == leader._stalled == {"v"}, "the follower holds other requests waiting with allotments"
+    assert leader.any_stalled() and not follower.any_stalled(), "a follower would walk the refusals for make_room"
 
 
 def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_class(monkeypatch):
@@ -1819,7 +1822,7 @@ def test_a_follower_admits_the_request_rank_0_moved_a_newer_one_for_as_the_move_
         assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
     assert not _step(leader, "v", 1).ok and not _step(follower, "v", 1).ok
     _waits(leader, "v")
-    lead.readmit_request(NODE, "v", queued=False)
+    lead.readmit_request(NODE, "v")
     _ingest((leader, follower), "o", 2, arrival=2, rebuildable=rebuildable)
     assert not _admits(leader, "o")
 
@@ -1865,7 +1868,7 @@ def test_a_follower_admits_the_request_rank_0_moved_a_newer_one_for_whatever_roo
         assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
     assert not _step(leader, "v", PAGE_SIZE).ok and not _step(follower, "v", PAGE_SIZE).ok
     _waits(leader, "v")
-    lead.readmit_request(NODE, "v", queued=False)
+    lead.readmit_request(NODE, "v")
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     step, ctx = KVStep(segments=(Segment("w", "main", PAGE_SIZE),)), _ctx("w")
     for kv in (leader, follower):
@@ -1903,10 +1906,10 @@ def test_a_follower_grows_a_request_waiting_for_its_shortage_once_as_rank_0s_mov
     leader._streams["v"]["main"].step_in_flight = True
     _waits(leader, "o")
     leader._streams["v"]["main"].step_in_flight = False
-    lead.readmit_request(NODE, "o", queued=False)
+    lead.readmit_request(NODE, "o")
     assert not _step(leader, "v", 1).ok and not _step(follower, "v", 1).ok
     _waits(leader, "v")
-    lead.readmit_request(NODE, "v", queued=False)
+    lead.readmit_request(NODE, "v")
     assert not _admits(leader, "o")
 
     assert _make_room(leader).to_host == ["v"]
@@ -1935,10 +1938,10 @@ def _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable: bool):
     leader._streams["v2"]["main"].step_in_flight = True
     _waits(leader, "v1")
     leader._streams["v2"]["main"].step_in_flight = False
-    lead.readmit_request(NODE, "v1", queued=False)
+    lead.readmit_request(NODE, "v1")
     assert not _step(leader, "v2", 1).ok and not _step(follower, "v2", 1).ok
     _waits(leader, "v2")
-    lead.readmit_request(NODE, "v2", queued=False)
+    lead.readmit_request(NODE, "v2")
     _ingest((leader, follower), "o", 2, arrival=1, rebuildable=rebuildable)
     assert not _admits(leader, "o")
     victims = _make_room(leader, droppable=True)
@@ -2005,7 +2008,7 @@ def test_an_unreserve_cancels_no_reservation_that_grew_an_allotment(monkeypatch)
         assert _step(leader, rid, 5 * PAGE_SIZE).ok and _step(follower, rid, 5 * PAGE_SIZE).ok
     assert not _step(leader, "o", 1).ok and not _step(follower, "o", 1).ok
     _waits(leader, "o")
-    lead.readmit_request(NODE, "o", queued=False)
+    lead.readmit_request(NODE, "o")
     for engine in (lead, follow):
         engine.remove_request("v")
     assert _returns(leader, "o")

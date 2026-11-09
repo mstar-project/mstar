@@ -39,10 +39,9 @@ class Admission:
     asked reserves for it, all or nothing. It may also pass the first request of a queue whose resource
     overrides `Resource.reserve_past`, while that request can't start (`_pass`), and stand anywhere in the queue of a
     resource that already holds what it asked for (`Resource.reserved`), since that takes nothing from the requests
-    ahead of it. A request that asks again (`readmit`) holding something to return to waits in no queue, so it holds
-    up no newer request, and `admit_waiting` tries it, oldest first, whenever what it didn't fit has grown. One that
-    holds nothing waits in the queues at its arrival, as a prompt does, and no request passes it, so newer prompts
-    can't keep passing it.
+    ahead of it. A request that asks again (`readmit`) waits in no queue, and `admit_waiting` tries it, oldest first,
+    whenever what it didn't fit has grown. It holds up no newer request unless it is the oldest request, when the
+    queues of the resources it waits for admit no one, so newer prompts can't keep passing it.
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -51,8 +50,8 @@ class Admission:
         # one, in the order it first asked. `_numbered` lists the requests with a number, in that order.
         # `_waiting` holds what each waiting request asked.
         # `_queues` holds, per resource, the requests waiting for it in arrival order.
-        # `_returns` maps each waiting request that asks again holding something to return to, to the resource and the
-        # mark it didn't fit against, or to None until `admit_waiting` tries it. Such a request is in no queue.
+        # `_returns` maps each waiting request that asks again to the resource and the mark it didn't fit
+        # against, or to None until `admit_waiting` tries it. Such a request is in no queue.
         # `_short` maps each resource whose first waiting request didn't fit to the mark it didn't fit
         # against, until that request leaves the front of the queue.
         # `_untried` is set when a queue has a new first request that `admit_waiting` hasn't tried.
@@ -134,26 +133,18 @@ class Admission:
             return None
         return FULL_ADMIT_QUEUED
 
-    def readmit(self, rid: str, node_name: str, keys: Collection[str], queued: bool) -> None:
+    def readmit(self, rid: str, node_name: str, keys: Collection[str]) -> None:
         """Ask ``node_name``'s resources again for ``rid``, since a drop or a move to the host may have given
-        back what they admitted it with. A resource that did asks now. ``rid`` waits as a return unless it
-        already waits as a new request, or, when ``queued``, in its queues at its arrival, as a request that holds
-        nothing to return to waits like a prompt. ``keys`` are the resources of ``node_name`` that ask."""
+        back what they admitted it with. A resource that did asks now, and ``rid`` waits as a return unless it
+        already waits as a new request. ``keys`` are the resources of ``node_name`` that ask."""
         walk = self._admitted.get(rid, {}).pop(node_name, None)
+        # a return moved again asks for something else, so `admit_waiting` tries it again
+        if rid in self._returns or (walk is not None and rid not in self._waiting):
+            self._returns[rid] = None
         if walk is not None:
-            if not queued and rid not in self._waiting:
-                self._returns[rid] = None
             self.admit(rid, node_name, walk, None, keys)
-        if queued and rid in self._returns:
-            # dropped while it waited as a return
-            del self._returns[rid]
-            for key in self._waiting[rid].asked:
-                self._enqueue(rid, key)
-            self._untried = True
-        elif rid not in self._waiting:
+        if rid not in self._waiting:
             self._returns.pop(rid, None)
-        if queued and rid in self._waiting:
-            self._placed.add(rid)
 
     def refusals(self) -> list[Refusal]:
         """The waiting requests that have been tried and didn't fit, oldest first."""
@@ -165,9 +156,9 @@ class Admission:
         self, published_of: Callable[[str, str], Mapping[str, PublishedInfo] | None],
     ) -> list[tuple[str, str]]:
         """Admit each return that now fits, oldest first, then each waiting request that is now first
-        in every queue it is in and fits, then each that passes a first request that can't start, or waits
-        where a resource holds what it asked for, in arrival order, and return the (node, rid) pairs that may
-        start. ``published_of(rid, node)`` gives what the request published for that node's resources.
+        in every queue it is in, held back by no return, and fits, then each that passes a first request that can't
+        start, or waits where a resource holds what it asked for, in arrival order, and return the (node, rid) pairs
+        that may start. ``published_of(rid, node)`` gives what the request published for that node's resources.
 
         Nothing is tried until a resource whose first waiting request didn't fit has grown, a mark that
         requests passing were refused against has grown, or a queue has a new first request, and a return
@@ -196,6 +187,7 @@ class Admission:
             nodes = self._reserve(rid, lambda node, rid=rid: published_of(rid, node))
             if nodes:
                 started.extend((node, rid) for node in nodes)
+        held = self._held_back()
         admitted = True
         while admitted:
             admitted = False
@@ -204,7 +196,7 @@ class Admission:
                     continue
                 rid = queue[0]
                 entry = self._waiting[rid]
-                if any(self._queues[key][0] != rid or key in self._short for key in entry.asked):
+                if any(self._queues[key][0] != rid or key in self._short or key in held for key in entry.asked):
                     continue
                 nodes = self._reserve(rid, lambda node, rid=rid: published_of(rid, node))
                 if nodes:
@@ -234,17 +226,14 @@ class Admission:
             self._numbered.remove(rid)
 
     def _park_request(self, rid: str, key: str, node_name: str, graph_walk: str) -> _Waiting:
-        """Put ``rid`` in ``key``'s queue at its arrival, and return what it waits for."""
+        """Put ``rid`` in ``key``'s queue at its arrival, unless it waits as a return, and return what it waits for."""
         entry = self._waiting.get(rid)
         if entry is None:
             entry = self._waiting[rid] = _Waiting()
             self._arrival.setdefault(rid, (True, next(self._arrivals)))
         entry.asked[key] = (node_name, graph_walk)
-        if rid not in self._returns:
-            self._enqueue(rid, key)
-        return entry
-
-    def _enqueue(self, rid: str, key: str) -> None:
+        if rid in self._returns:
+            return entry
         queue = self._queues[key]
         bisect.insort(queue, rid, key=self._arrival.__getitem__)
         if queue[0] == rid and len(queue) > 1:
@@ -252,6 +241,7 @@ class Admission:
             # the mark is gone nothing else tries it again.
             self._short.pop(key, None)
             self._untried = True
+        return entry
 
     def _reserve(
         self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None],
@@ -288,19 +278,23 @@ class Admission:
     def _pass(
         self, rid: str, published_of: Callable[[str], Mapping[str, PublishedInfo] | None], blocked: dict[str, str],
     ) -> dict[str, str] | None:
-        """Admit waiting ``rid`` where it stands in each queue: first, behind a first request in ``blocked``
-        whose resource lets requests pass, or anywhere where the resource holds what ``rid`` asked for. Return
-        the nodes waiting on it, or None, and add ``rid`` to ``blocked`` when a resource refuses it."""
+        """Admit waiting ``rid`` where it stands in each queue: first, or behind a first request in ``blocked``
+        whose resource lets requests pass, in a queue no return holds back, or anywhere where the resource holds
+        what ``rid`` asked for. Return the nodes waiting on it, or None, and add ``rid`` to ``blocked`` when a
+        resource refuses it."""
         if rid in self._refused:
             return None
+        held = self._held_back()
         passing, reserved = [], []
         for key in self._waiting[rid].asked:
             first = self._queues[key][0]
-            if first == rid:
+            if self._resources[key].reserved(rid):
+                reserved.append(key)
+            elif key in held:
+                return None
+            elif first == rid:
                 if key in self._short:
                     return None
-            elif self._resources[key].reserved(rid):
-                reserved.append(key)
             elif key in self._passes and first in blocked:
                 passing.append(key)
             else:
@@ -328,13 +322,20 @@ class Admission:
                 blocked[rid] = held[0]
         return blocked
 
+    def _held_back(self) -> Collection[str]:
+        """The resources the oldest request waits for, while it waits as a return."""
+        oldest = self._numbered[0] if self._numbered else None
+        return self._waiting[oldest].asked.keys() if oldest in self._returns else ()
+
     def _leave(self, rid: str, keys: Collection[str]) -> None:
         """Take ``rid`` out of the queues of ``keys``. A queue it was first in drops its mark,
         which measured ``rid``, and its next request is left for `admit_waiting` to try as a first
-        request, even if a resource refused it while it passed."""
+        request, even if a resource refused it while it passed, as are the first requests ``rid`` held back."""
         self._placed.discard(rid)
         if rid in self._returns:
             del self._returns[rid]
+            if self._numbered[:1] == [rid]:
+                self._untried = True
             return
         self._unrefuse(rid)
         for key in keys:
