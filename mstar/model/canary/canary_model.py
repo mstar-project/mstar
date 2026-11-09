@@ -75,7 +75,6 @@ class CanaryModel(Model):
     MAX_CONCURRENT_REQUESTS = 64
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
-    PREPROCESS_PARALLEL = True
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs):
         self.model_path_hf = model_path_hf

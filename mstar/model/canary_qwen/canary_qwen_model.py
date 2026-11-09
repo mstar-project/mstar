@@ -95,7 +95,6 @@ class CanaryQwenModel(Model):
     MAX_AUDIO_SECONDS = 40.96
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
-    PREPROCESS_PARALLEL = True
     MAX_SEQ_LEN = 2048
     # the requests the default cache holds at full length; configs/canary_qwen.yaml
     # caps max_concurrent_requests here, so the conductor queues the rest

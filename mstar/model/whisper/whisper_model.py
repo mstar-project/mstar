@@ -151,7 +151,6 @@ class WhisperModel(Model):
     # The API server decodes uploads and stages their tensors with small CPU
     # ops; a thread per core spins between them and starves its event loop.
     PREPROCESS_TORCH_THREADS = 4
-    PREPROCESS_PARALLEL = True
     # Mel frames that carry audio, set by ``process_prompt`` for the align walk
     INTERNAL_KWARGS = ("audio_frames",)
     # Set from the deployment by validate_config_yaml: the align walk re-runs
