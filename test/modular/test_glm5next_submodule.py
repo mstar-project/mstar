@@ -11,8 +11,8 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES, AcceleratorGraphRunner
+from mstar.engine.accelerator_graph_config import DEFAULT_CAPTURE_BATCH_SIZES, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.resources import (
     SamplingReqConfig,
     Segment,

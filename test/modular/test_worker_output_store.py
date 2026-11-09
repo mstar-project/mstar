@@ -53,7 +53,7 @@ def test_new_token_counts_dedup_per_rid_not_across_rids(tmp_path):
                   stored.flat_uuids[1]]
     signal_idxs = [0, 0, 0]
 
-    counts = w._count_new_tokens(
+    counts = w.executor._count_new_tokens(
         [0, 1, 2], flat_rids, flat_uuids, signals, signal_idxs,
     )
 

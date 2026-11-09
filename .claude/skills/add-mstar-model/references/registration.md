@@ -44,7 +44,7 @@ One row in the registry-key table, marked `*(Beta)*` if that applies. This is th
 
 ## 5. `mstar/api_server/openai/adapters.py` — only if the model needs OpenAI routes
 
-Subclass `OpenAIAdapter` and add it to `ADAPTER_REGISTRY`. This is genuinely optional: roughly half the registered models have an adapter, because it only makes sense where the model maps onto OpenAI semantics (`chat.completions`, `audio.speech`, `images.generate`). A model reachable only through `POST /generate` needs no adapter and should not get an empty one.
+Subclass `OpenAIAdapter` and add it to `ADAPTER_REGISTRY`, **and port it to the Rust frontend in the same PR**: a type implementing the `OpenAIAdapter` trait in `rust/server/src/adapters/` (the file for its kind of model) and a row in `ADAPTERS` naming its Python class, with the test `test/rust/test_rust_openai_adapters.py` runs for every registry class. The Python frontend is being retired (AGENTS.md invariant 15), so a class that only Python serves is not done, and `NOT_PORTED` there only shrinks. This is genuinely optional: roughly half the registered models have an adapter, because it only makes sense where the model maps onto OpenAI semantics (`chat.completions`, `audio.speech`, `images.generate`). A model reachable only through `POST /generate` needs no adapter and should not get an empty one.
 
 ## Also
 
