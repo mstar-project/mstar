@@ -75,7 +75,6 @@ from mstar.distributed.base import PARALLEL_AXES
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, Resource
 from mstar.engine.resources.lora.backend import LoraBackend, make_backend
 from mstar.engine.resources.lora.config import (
-    LoraBaseOnly,
     LoraReqConfig,
     LoraSpec,
     LoraStep,
@@ -281,6 +280,9 @@ class LoraAdapterPool(Resource):
     prefix_skip_safe = True
     # a dropped request keeps its adapter and slot, and its rebuild runs under that adapter
     supports_drop = True
+    # a step none of whose rows names an adapter runs no delta (`lean_for`), so each
+    # bucket, piecewise regions' included, has a twin with no LoRA kernel
+    lean_capture = True
 
     @classmethod
     def build(cls, spec: LoraSpec, info: EngineResourceInfo) -> "LoraAdapterPool":
@@ -325,6 +327,7 @@ class LoraAdapterPool(Resource):
         chooses batches, and so admits requests (``ask``): False on a lockstep instance's
         followers."""
         self.spec = spec
+        self.resource_key = spec.resource_key
         self._device = torch.device(device)
         self.dtype = spec.dtype or dtype
         if self.dtype is None:
@@ -972,20 +975,21 @@ class LoraAdapterPool(Resource):
         get, empty = self._adapter_of.get, self._empty
         return any((name := get(rid)) is not None and name not in empty for rid in rids)
 
+    def lean_for(self, rids) -> bool:
+        """A step runs base-only when none of its rows names an adapter with something
+        for this pool (``runs_adapters``)."""
+        return not self.runs_adapters(rids)
+
     def _adds_deltas(self, segments, ctx: StepContext) -> bool:
-        """Whether this step's deltas run: under a capture lease, unless its bucket is a
-        base-only one (``LoraBaseOnly``), whose graph records none; eagerly, when a row
-        names an adapter."""
-        lease = ctx.slot_lease
-        if lease is None or lease.bucket is None:
-            return self.runs_adapters(seg.request_id for seg in segments)
-        if not isinstance(lease.bucket.cg_key_info, LoraBaseOnly):
+        """Whether this step's deltas run: unless the step runs this pool lean
+        (``StepContext.lean``), a capture recording none and an eager step skipping them."""
+        if self.resource_key not in ctx.lean:
             return True
         if not ctx.capture and self.runs_adapters(seg.request_id for seg in segments):
             # its rows would lose their deltas silently
             raise RuntimeError(
-                f"LoRA resource {self.spec.resource_key!r}: leased base-only {lease.bucket} "
-                "for a step whose rows name an adapter"
+                f"LoRA resource {self.spec.resource_key!r}: a base-only step "
+                f"({ctx.slot_lease.bucket if ctx.slot_lease is not None else 'eager'}) has rows that name an adapter"
             )
         return False
 
