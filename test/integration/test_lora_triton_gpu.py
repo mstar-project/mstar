@@ -555,11 +555,14 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, case):
     mixes = [[("m0", "e1", 9), ("m1", None, 1), ("m2", "e2", 20)], [("m3", "e2", 5), ("m4", None, 30)],
              [("m5", "e1", 3), ("m6", None, 2)]]
     if case == "eager":
+        per_pair = 0
         for mix in mixes:
             step, ctx = eager_step(pool, mix)
             x, weights, ids = routed(sum(n for *_, n in mix), g)
             crossover = routed_tuning(x, plain.gate_up_proj, MOE_TOP_K).pair_max_tokens
-            assert runs_per_pair(x, plain.gate_up_proj, MOE_TOP_K) == (len(x) <= crossover)
+            unbound_per_pair = runs_per_pair(x, plain.gate_up_proj, MOE_TOP_K)
+            assert unbound_per_pair == (len(x) <= crossover)
+            per_pair += unbound_per_pair
             # the unbound layer given the alignment fused_experts would make: the grouped path at
             # every size, so its rows compare bitwise
             block_m = moe_block_m(len(x), plain.gate_up_proj, MOE_TOP_K)
@@ -571,6 +574,8 @@ def test_bound_experts_match_each_rows_merged_adapter(tmp_path, case):
             compare(mix, out, base, x, weights, ids)
             for rid, *_ in mix:
                 pool.remove_request(rid)
+        # a crossover under every mix's size here would leave the `lora is None` gate untested
+        assert per_pair, f"no mix is at or below the per-pair crossover ({crossover}); shrink one"
         return
     lease = SlotLease(slot=0, bucket=BucketKey("prefill_text", BUCKET_BS, BUCKET_TOKENS))
     for i in range(BUCKET_BS):
