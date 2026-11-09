@@ -1,6 +1,7 @@
-"""GLM-5.2 prefill: capture buckets from model_kwargs, the router under autocast."""
+"""GLM-5.2 prefill: capture batch sizes from model_kwargs, the router under autocast."""
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -26,39 +27,23 @@ def _prefill_config(sub) -> PackedAcceleratorGraphConfig:
     return packed
 
 
-def test_prefill_buckets_from_model_kwargs():
+def test_prefill_capture_batch_sizes_from_model_kwargs():
     model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced",
-                       prefill_token_buckets=[16, 32, 64],
                        prefill_capture_batch_sizes=[1, 4])
-    assert model.config.prefill_token_buckets == [16, 32, 64]
     assert model.config.prefill_capture_batch_sizes == [1, 4]
-    packed = _prefill_config(_submodule(model.config))
-    assert packed.get_total_tokens(1) == [16, 32, 64]
-    assert packed.capture_batch_sizes == [1, 4]
+    assert _prefill_config(_submodule(model.config)).capture_batch_sizes == [1, 4]
 
 
 def test_prefill_buckets_default_without_kwargs():
     model = Glm52Model("", tokenizer_mode="byte", config_variant="full")
-    assert model.config.prefill_token_buckets is None
     packed = _prefill_config(_submodule(model.config))
     assert packed.get_total_tokens(1) == Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS
     assert packed.capture_batch_sizes == Glm52LLMSubmodule.PREFILL_CAPTURE_BATCH_SIZES
 
 
-@pytest.mark.parametrize("buckets", [[], [64, 64], [64.5, 128], [True, 64], "64"])
-def test_a_bad_prefill_ladder_is_refused(buckets):
-    """Checked as Qwen3.5's and Qwen3-Omni's ladders are: an empty ladder is
-    not the default, a repeat is not captured twice, and a float, a bool or a
-    string is not read as some other ladder."""
-    model = Glm52Model("", tokenizer_mode="byte", config_variant="reduced", prefill_token_buckets=buckets)
-    with pytest.raises(ValueError, match="prefill_token_buckets"):
-        _submodule(model.config)
-
-
 @pytest.mark.parametrize("kwargs", [
     {"prefill_capture_batch_sizes": [0, 1]}, {"prefill_capture_batch_sizes": [-4, 1]},
-    {"prefill_capture_batch_sizes": []}, {"prefill_batched_token_buckets": [0, 256]},
-    {"prefill_batched_token_buckets": [256, 256]}, {"graph_compile": "false"},
+    {"prefill_capture_batch_sizes": []}, {"graph_compile": "false"},
     {"mtp_num_draft_tokens": True}, {"mtp_num_draft_tokens": 2.5}, {"mtp_num_draft_tokens": 1023},
 ])
 def test_a_bad_serving_knob_is_refused_at_load(kwargs):
@@ -69,8 +54,7 @@ def test_a_bad_serving_knob_is_refused_at_load(kwargs):
         Glm52Model("", tokenizer_mode="byte", config_variant="reduced", **kwargs)
 
 
-def test_config_default_buckets_unchanged():
-    assert Glm52ModelConfig().prefill_token_buckets is None
+def test_config_default_batch_sizes_unchanged():
     assert Glm52ModelConfig().prefill_capture_batch_sizes is None
 
 
@@ -212,25 +196,40 @@ def test_compiled_forward_does_not_recompile_per_request(monkeypatch):
         torch._dynamo.reset()
 
 
-def test_prefill_buckets_past_the_context_limit_skip_small_batches():
+def test_prefill_buckets_past_the_context_limit_skip_small_batches(monkeypatch):
     # a 4096-token bucket needs two rows under the 2048-token limit
-    cfg = Glm52ModelConfig(prefill_token_buckets=[1024, 2048, 3072, 4096],
-                           prefill_capture_batch_sizes=[1, 2, 4])
-    packed = _prefill_config(_submodule(cfg))
+    monkeypatch.setattr(Glm52LLMSubmodule, "PREFILL_TOKEN_BUCKETS", [1024, 2048, 3072, 4096])
+    packed = _prefill_config(_submodule(Glm52ModelConfig(prefill_capture_batch_sizes=[1, 2, 4])))
     assert packed.get_total_tokens(1) == [1024, 2048]
     assert packed.get_total_tokens(2) == [1024, 2048, 3072, 4096]
     assert packed.get_total_tokens(4) == [1024, 2048, 3072, 4096]
 
 
-def test_batched_prefill_buckets_get_their_own_capture():
-    model = Glm52Model("", tokenizer_mode="byte", config_variant="full",
-                       prefill_token_buckets=[64, 128, 192],
-                       prefill_batched_token_buckets=[1024, 2048],
-                       prefill_capture_batch_sizes=[1, 4, 16])
-    prefill = [c for c in _submodule(model.config).get_accelerator_graph_configs(torch.device("cpu"))
-               if c.capture_graph_walk == "prefill"]
-    assert [(c.capture_batch_sizes, c.get_total_tokens(c.capture_batch_sizes[0]))
-            for c in prefill] == [([1], [64, 128, 192]), ([4, 16], [1024, 2048])]
+@pytest.mark.parametrize("name", ["glm52_tp8.yaml", "glm52_tp8_mtp.yaml"])
+def test_a_shipped_config_s_ladders_reach_their_batch_sizes(name):
+    """The YAML's ``prefill_token_buckets`` mapping passes the load-time checks and, as the
+    engine applies it, captures one request's prefill on the fine ladder and a batch's on
+    the coarse one."""
+    import yaml
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from mstar.worker.engine_manager import _prefill_token_buckets, _split_token_ladders
+
+    config = yaml.safe_load((Path(__file__).resolve().parents[2] / "configs" / name).read_text())
+    model = Glm52Model("", tokenizer_mode="byte", config_variant="full", **config["model_kwargs"])
+    walks, regions = _split_token_ladders(_prefill_token_buckets(config), model)
+    assert (walks, regions) == (config["prefill_token_buckets"], {})
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=_submodule(model.config), resources={}, step_runner=None,
+        device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
+        num_slots=1, token_ladders=config["prefill_token_buckets"]["LLM"],
+    )
+    ladders = config["prefill_token_buckets"]["LLM"]["prefill"]
+    captured = {}
+    for spec in runner._get_slot_specs():
+        if spec.bucket.graph_walk == "prefill":
+            captured.setdefault(spec.bucket.bs, []).append(spec.bucket.num_tokens)
+    assert captured == {1: ladders[1], 4: ladders[2], 16: ladders[2]}
 
 
 # ── the router's top-k kernel (kernels: auto) ──
@@ -316,20 +315,30 @@ def test_last_layer_ffn_runs_on_the_sampled_rows(monkeypatch):
     torch.testing.assert_close(logits[1], logits[0], rtol=1e-5, atol=1e-5)
 
 
-def test_capture_configs_ask_for_the_recompile_limit_they_need():
-    # every captured token count costs a decoder layer's frames up to three entries
-    buckets = list(range(64, 2049, 64))
-    cfg = Glm52ModelConfig(prefill_token_buckets=buckets,
-                           prefill_batched_token_buckets=[2304, 2560, 3072, 3584, 4096],
-                           prefill_capture_batch_sizes=[1, 4, 16])
-    before = torch._dynamo.config.recompile_limit
-    sub = _submodule(cfg)
-    sub.get_accelerator_graph_configs(torch.device("cpu"))
-    shapes = len(buckets) + 5 + 7  # + the decode batch sizes
-    assert sub.dynamo_recompile_limit() >= 3 * shapes
-    assert torch._dynamo.config.recompile_limit == before  # the engine applies it, per call
-    default = _submodule(Glm52ModelConfig())
-    default.get_accelerator_graph_configs(torch.device("cpu"))
-    assert default.dynamo_recompile_limit() <= 84  # the default buckets fit
+def _recompile_limit(ladders):
+    """The recompile limit the capture runner of an LLM capturing prefill at batch sizes 1,
+    4 and 16 asks for under the serving config's ``ladders``."""
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+
+    return AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=_submodule(Glm52ModelConfig(prefill_capture_batch_sizes=[1, 4, 16])),
+        resources={}, step_runner=None, device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1, token_ladders=ladders,
+    ).recompile_limit
 
 
+def test_the_runner_sizes_the_recompile_limit_for_a_config_s_ladder():
+    """Every captured token count costs a decoder layer's frames up to three entries; the
+    runner counts the serving config's ladder, not the model's default."""
+    # past dynamo's default 256 entries per code object, which the wrapper raises too
+    buckets = list(range(64, 4097, 32))
+    shapes = len(buckets) + 7  # + the decode batch sizes
+    assert _recompile_limit({"prefill": buckets}) >= 3 * shapes > 256
+
+
+def test_a_token_count_captured_at_several_batch_sizes_costs_entries_at_each():
+    """A frame is traced per captured batch size too (the last layer runs on a row per
+    request), so one request's ladder and a batch's each count at every batch size."""
+    fine, coarse = list(range(64, 1025, 64)), list(range(256, 2049, 256))
+    shapes = len(fine) + 2 * len(coarse) + 7  # bs 1 on the fine ladder, 4 and 16 on the coarse
+    assert _recompile_limit({"prefill": {1: fine, 2: coarse}}) >= 3 * shapes

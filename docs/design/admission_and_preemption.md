@@ -113,7 +113,7 @@ Why this shape:
 
 ## 3. Preemption
 
-Preemption starts when a grant past a reservation fails, in `Worker._handle_admit_failure` ([worker.py](../../mstar/worker/worker.py)), which calls `Preemption.preempt` ([preemption.py](../../mstar/worker/preemption.py)) before `Admission.relieve`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, or makes the request wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
+Preemption starts when a grant past a reservation fails, in `StepPipeline._handle_admit_failure` ([step_pipeline.py](../../mstar/worker/step_pipeline.py)), which calls `Preemption.preempt` ([preemption.py](../../mstar/worker/preemption.py)) before `Admission.relieve`. In place of today's 50 ms hold, the worker moves victims to the host or drops them, or makes the request wait. A victim moves to the host when the host pool can hold all of its pages, since dropping and rebuilding requests the host pool could hold made 32 Bagel requests sharing a prefix take about 4x as long with 256 host pages.
 
 Only KV pages trigger it. Qwen3.5’s recurrent state pool, the sampler's in-graph rows and the ring KV manager give each request one fixed-size slot for its whole life, so a running request never runs short there. A new request waits at admission until a slot is free beyond those already reserved, so it never holds KV pages it can't use.
 

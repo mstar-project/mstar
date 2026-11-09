@@ -43,6 +43,7 @@ from mstar.api_server.auth import (
 )
 from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
+from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
 from mstar.api_server.request_types import (
     APIServerMessage,
@@ -446,6 +447,8 @@ class APIServer:
     # not pinned) and the process mask; see ``mstar.utils.cpus``.
     _result_cpu: int | None = None
     _process_cpus: frozenset[int] = frozenset()
+    # set in __init__; None until then, which a server built without it (a test's) keeps
+    lora_admin: LoraAdmin | None = None
 
     def __init__(
         self,
@@ -511,6 +514,8 @@ class APIServer:
         ) if model is not None else frozenset()
         self.takes_stream_input = bool(self.client_streams)
         self._model_config = model_config
+        # the conductor's cap; the transcription route splits it between uploads
+        self.max_concurrent_requests = (model_config or {}).get("max_concurrent_requests")
         self._take_result_cpu()
 
         # Before any tensor manager; the conductor and workers inherit it.
@@ -533,6 +538,17 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
             adapter_digests=self.lora_adapter_digests,
             is_pending=self.is_pending,
+            upload_dir=self.upload_dir,
+        )
+
+        # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker
+        # thread, which owns this process's socket to the conductor
+        self.lora_admin = LoraAdmin(
+            lora_spec, self.served_models,
+            self.preprocess_worker.adapter_prefix_roots,
+            lambda message: self.preprocess_worker.send_to_conductor(message),  # noqa: PLW0108 - late-bound
+            timeout_s=timeout_seconds,
+            others=specs[1:],
         )
 
         self._init_request_state()
@@ -1151,6 +1167,11 @@ class APIServer:
                                 self.preprocess_worker.new_result_tokens(
                                     rids, values, body.signal, body.modality, logprobs or None,
                                 )
+                        continue
+
+                    if message.message_type == "lora_adapter_result":
+                        if self.lora_admin is not None:
+                            self.lora_admin.on_result(message.body)
                         continue
 
                     if message.message_type == "conductor_status":
@@ -3052,7 +3073,8 @@ def main(argv: list[str] | None = None):
 
     if args.rust_frontend and lora_enabled(config):
         # The Rust frontend translates OpenAI requests itself: it does not map the `model`
-        # field onto an adapter, so it would serve every request on the base model.
+        # field onto an adapter, so it would serve every request on the base model, and it
+        # has no /v1/load_lora_adapter or /v1/unload_lora_adapter.
         raise SystemExit(
             "LoRA adapters (`resources: lora:` in the serving config) are served by the "
             "Python frontend only; drop --rust-frontend"
@@ -3171,9 +3193,12 @@ def main(argv: list[str] | None = None):
             # Forward --host to the Rust frontend (it binds 127.0.0.1 by
             # default; --host 0.0.0.0 for the multi-node / container case).
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
+            model = api_server.model
             rust_proc = launch_rust_server(
                 rust_frontend_bin, model_name,
-                args.port, bridge_dir, args.upload_dir, api_key=api_key)
+                args.port, bridge_dir, args.upload_dir, api_key=api_key,
+                timeout_s=args.timeout,
+                sample_rate=model.get_output_sample_rate("audio") if model is not None else None)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)

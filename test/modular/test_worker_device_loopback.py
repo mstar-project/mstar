@@ -17,28 +17,27 @@ class _Engine:
         return self.on_device.get((node, walk), frozenset())
 
 
-def _worker(inline_emit=True):
-    w = make_worker(_graph_runtime=SimpleNamespace(supports_inline_emit=inline_emit))
-    return w
+def _body(inline_emit=True):
+    return make_worker(graph_runtime=SimpleNamespace(supports_inline_emit=inline_emit)).executor._body
 
 
 def test_all_on_device_is_per_step_signals_and_cached_per_node_and_walk():
     engine = _Engine({("LLM", "decode"): frozenset({"text_inputs"})})
-    w = _worker()
-    assert w._all_on_device(engine, "LLM", "decode", ["text_inputs"])
-    assert w._all_on_device(engine, "LLM", "decode", ["text_inputs"])
+    body = _body()
+    assert body.all_on_device(engine, "LLM", "decode", ["text_inputs"])
+    assert body.all_on_device(engine, "LLM", "decode", ["text_inputs"])
     assert engine.calls == 1, "the node's answer is cached per (node, walk)"
     # a step that also routes a signal the node does not keep stays on tensors
-    assert not w._all_on_device(engine, "LLM", "decode", ["text_inputs", "kv"])
-    assert not w._all_on_device(engine, "LLM", "prefill_text", ["new_token"])
-    assert not w._all_on_device(engine, "LLM", "decode", [])
+    assert not body.all_on_device(engine, "LLM", "decode", ["text_inputs", "kv"])
+    assert not body.all_on_device(engine, "LLM", "prefill_text", ["new_token"])
+    assert not body.all_on_device(engine, "LLM", "decode", [])
     assert engine.calls == 2
 
 
 def test_no_rows_only_step_on_a_runtime_without_inline_emit():
     """Rows-only steps send the client's tokens inline; without it they were dropped."""
     engine = _Engine({("LLM", "decode"): frozenset({"text_inputs"})})
-    assert not _worker(inline_emit=False)._all_on_device(engine, "LLM", "decode", ["text_inputs"])
+    assert not _body(inline_emit=False).all_on_device(engine, "LLM", "decode", ["text_inputs"])
 
 
 def test_the_zero_tensor_store_shape_matches_the_route_layout():

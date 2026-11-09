@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -7,6 +7,7 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.accelerator_graph_config import check_token_ladder
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS
 from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
@@ -20,6 +21,65 @@ from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
 
 logger = logging.getLogger(__name__)
+
+
+def _prefill_token_buckets(model_config: dict) -> Mapping:
+    """The serving config's ``prefill_token_buckets``: node -> capture walk or
+    piecewise region -> ladder (`_split_token_ladders`)."""
+    # the model_kwargs ladders this key replaced; a model now drops them in **kwargs unread
+    moved = sorted(
+        {"prefill_token_buckets", "prefill_batched_token_buckets", "backbone_token_buckets", "lm_prefill_token_buckets"}
+        & set(model_config.get("model_kwargs") or {})
+    )
+    if moved:
+        raise ValueError(
+            f"model_kwargs {moved} moved to the top level of the serving config, per node and "
+            "capture walk or region: prefill_token_buckets: {<node>: {<walk or region>: [...]}}"
+        )
+    ladders = model_config.get("prefill_token_buckets")
+    if ladders is None:
+        return {}
+    if not isinstance(ladders, Mapping) or not all(isinstance(v, Mapping) for v in ladders.values()):
+        raise ValueError(
+            f"prefill_token_buckets takes node -> capture walk -> ladder, got {ladders!r}"
+        )
+    return ladders
+
+
+def _split_token_ladders(
+    ladders: Mapping[str, Mapping], model: Model,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Each node's ladders by walk (a walk the node is in, or a combined walk
+    of it), which its packed captures take (`apply_token_ladders`), and by
+    any other name, which can only be a piecewise region's label
+    (`Engine._build_piecewise_runners` checks that, once the node declares
+    its regions). Refuses, from the config and the model's graph alone, a
+    ladder that is not one, a region's that is not a list, and a walk of the
+    model that does not run the node."""
+    graphs = model.get_graph_walk_graphs()
+    combined = model.get_combined_graph_walks()
+    every_walk = set(graphs) | {name for walks in combined.values() for name in walks}
+    by_walk: dict[str, dict] = {}
+    by_region: dict[str, dict] = {}
+    for node, named in ladders.items():
+        walks = {walk for walk, graph in graphs.items() if node in graph.get_nodes()} | set(combined.get(node, {}))
+        for name, ladder in named.items():
+            check_token_ladder(f"{node}/{name}", ladder)
+            if name in walks:
+                by_walk.setdefault(node, {})[name] = ladder
+            elif name in every_walk:
+                raise ValueError(
+                    f"prefill_token_buckets names walk {name!r} for {node}, which it does not run; "
+                    f"its walks are {sorted(walks)}"
+                )
+            elif isinstance(ladder, Mapping):
+                raise ValueError(
+                    f"prefill_token_buckets names {name!r} for {node}, not one of its walks {sorted(walks)}, "
+                    f"so a piecewise region, which takes one ladder for every batch size, got {ladder!r}"
+                )
+            else:
+                by_region.setdefault(node, {})[name] = ladder
+    return by_walk, by_region
 
 
 def _unchunkable_nodes(
@@ -141,7 +201,7 @@ def _side_lane_keys(
     parallel_groups: WorkerParallelGroups, accelerator: bool,
 ) -> tuple[tuple[str, str], ...]:
     """The (node, walk) keys this worker runs beside its chain
-    (``mstar.worker.side_steps``): the ``side_stream_walks`` of the node whose
+    (``StepPipeline._launch_side``): the ``side_stream_walks`` of the node whose
     group sets ``side_stream: true``, or a ``ValueError`` naming why the lane
     can't take it. Only nodes that ask are checked.
 
@@ -269,6 +329,19 @@ class EngineManager:
         the latter, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
+        # the per-node settings read only the config: refuse a bad one before any weights load
+        budgets = model_config.get("max_batch_tokens") or {}
+        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
+        ladders = _prefill_token_buckets(model_config)
+        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
+        for key, setting in (
+            ("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed),
+            ("prefill_token_buckets", ladders),
+        ):
+            unknown = sorted(set(setting) - known)
+            if unknown:
+                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
+        walk_ladders, region_ladders = _split_token_ladders(ladders, model)
         specs = serving_resources(model, model_config)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
@@ -332,14 +405,9 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            token_ladders=walk_ladders,
+            region_ladders=region_ladders,
         )
-        budgets = model_config.get("max_batch_tokens") or {}
-        override_mixed = model_config.get("can_override_mixed_max_tokens") or {}
-        known = {n for group in model_config.get("node_groups", []) for n in group.get("node_names", [])}
-        for key, setting in (("max_batch_tokens", budgets), ("can_override_mixed_max_tokens", override_mixed)):
-            unknown = sorted(set(setting) - known)
-            if unknown:
-                raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         if not all(isinstance(flag, bool) for flag in override_mixed.values()):
             raise ValueError(f"can_override_mixed_max_tokens takes node -> true/false, not {override_mixed!r}")
         engine.set_chunking_policies(model.chunking_policy_of())

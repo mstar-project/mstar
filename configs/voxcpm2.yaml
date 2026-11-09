@@ -17,7 +17,10 @@ node_groups:
   - node_names: [VAEDecoder]
     ranks: [0]
     graph_walks: [vae_chunk]
+    # its windows run on a lane of their own, beside the Talker's steps rather than taking turns with them
+    side_stream: true
 # Constructor options (forwarded to VoxCPM2Model.__init__):
 # model_kwargs:
 #   compile_talker: false   # capture the eager decode step: up in seconds instead of 10-30 min cold, 15-30% less throughput
+#   compile_vae: false      # decode the streaming VAE eagerly: faster start-up, about a quarter slower per window batch
 #   max_text_tokens: 1365   # longest text per request (default max_len / 3); longer text gets a 400

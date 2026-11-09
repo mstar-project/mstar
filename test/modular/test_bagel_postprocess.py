@@ -5,6 +5,7 @@ import io
 import numpy as np
 import pytest
 import torch
+from test_model_kv_layouts import _bagel
 
 from mstar.model.bagel.bagel_model import BagelModel
 from mstar.model.bagel.config import BagelAutoEncoderConfig, BagelModelConfig, BagelViTConfig
@@ -14,7 +15,7 @@ PIL = pytest.importorskip("PIL.Image")
 
 
 def _model() -> BagelModel:
-    model = BagelModel.__new__(BagelModel)
+    model = _bagel()  # a stand-in tokenizer: a generation without an image needs a prompt
     model.config = BagelModelConfig(vae_config=BagelAutoEncoderConfig(), vit_config=BagelViTConfig())
     return model
 
@@ -33,7 +34,7 @@ def test_image_png_decodes_to_the_truncated_pixels():
 def test_unsupported_output_format_fails_at_intake():
     model = _model()
     with pytest.raises(ValueError, match="output_format"):
-        model.process_prompt(None, [], ["image"], output_format="gif")
+        model.process_prompt("a cat", ["text"], ["image"], output_format="gif")
 
 
 @pytest.mark.parametrize("size", [{"width": 8}, {"height": 15}, {"width": 0}, {"height": True}, {"width": "512"}])
@@ -42,8 +43,8 @@ def test_an_image_under_one_latent_patch_fails_at_intake(size):
     request would otherwise fail deep in the denoise loop."""
     model = _model()
     with pytest.raises(ValueError, match="width|height|16 pixels"):
-        model.process_prompt(None, [], ["image"], **size)
-    model.process_prompt(None, [], ["image"], width=16, height=512)
+        model.process_prompt("a cat", ["text"], ["image"], **size)
+    model.process_prompt("a cat", ["text"], ["image"], width=16, height=512)
 
 
 @pytest.mark.parametrize("hw, size", [((50, 5000), {}), ((512, 512), {"width": 8})])
@@ -59,7 +60,7 @@ def test_an_edit_whose_output_is_under_one_latent_patch_fails_at_intake(hw, size
 def test_a_null_size_is_the_default_size():
     """An explicit null width/height, as a client's extra_body can send, is the
     default 1024x1024 a generation gets when it names no size."""
-    output = _model().process_prompt(None, [], ["image"], tensors={}, width=None, height=None)
+    output = _model().process_prompt("a cat", ["text"], ["image"], tensors={}, width=None, height=None)
     assert output.metadata["kv_layout"]["kv"]["main"].scratch == (1024 // 16) ** 2 + IMAGE_SENTINELS
 
 

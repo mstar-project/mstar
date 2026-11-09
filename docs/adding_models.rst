@@ -116,7 +116,11 @@ is **not** the only wiring step. A model also needs:
 - an ``OpenAIAdapter`` subclass in ``ADAPTER_REGISTRY``
   (``mstar/api_server/openai/adapters.py``), *only* if the model maps onto OpenAI semantics
   such as ``chat.completions``, ``audio.speech`` or ``images.generate``. A model reached
-  only through ``POST /generate`` needs none.
+  only through ``POST /generate`` needs none. The adapter is ported to the Rust frontend in the
+  same change (a type implementing ``OpenAIAdapter`` in ``rust/server/src/adapters/`` and its
+  row in ``ADAPTERS``, tested by
+  ``test/rust/test_rust_openai_adapters.py``): the Python HTTP frontend is being retired, and a
+  surface only it serves is unfinished.
 - the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
   usage snippet. Cosmetic, but user-visible.
 
@@ -502,6 +506,11 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   boundary when that is past what it restored. A shared prefix is then served from the third request
   that shares it. A step longer than the largest captured bucket checkpoints less often, so that
   its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
+- A prompt the step budget cuts into chunks keeps each chunk's last boundary (a chunk with
+  more of its prompt to come keeps its own end), so a resend restores past its first chunk,
+  and a later chunk's snapshot makes the earlier one the first to evict, as a reply's is.
+  Checkpoints fall a page apart from where a chunk starts, so the pool declares a page as its
+  ``chunk_alignment`` and the scheduler cuts its chunks whole pages long.
 - A decode step that ends a page keeps the state there, so a later turn that re-sends the
   reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated
@@ -765,6 +774,10 @@ The spec types are:
      - Block-causal self-attention within each span (``AttentionStep(causal=False)``): causal
        between ``block_size``-token blocks, bidirectional within one. Same config. See
        `Block-causal attention within spans`_.
+   * - ``BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...), block_size=...)``
+     - The same mask over a paged KV cache: a row's new tokens attend its cached blocks and
+       their own, and a step runs only new tokens. FlashInfer only. See `Block-causal
+       attention over a KV cache`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -1097,6 +1110,17 @@ for the worst layout the bucket's token count allows.
    us to zero-pad to 128. So that tower attends through the resource only when it is
    replaying a captured graph, and runs flash-attn varlen otherwise.
 
+Block-causal attention over a KV cache
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Under a block-causal mask a frame's output never depends on a later block, so what a stream
+has already computed stays valid and need not be run again. Declare a paged ``KVSpec`` and a
+``BlockCausalAttentionSpec`` on it, with the block length as ``block_size``, and step only the
+new tokens: ``KVStep(commit=True)`` and ``AttentionStep(causal=False)``, the layer writing K/V
+as usual. A step's new tokens must start on a block, and may run several blocks: the KV plan's
+rows expand into one paged request per block, each reading its row's prefix pages. CosyVoice3's
+flow solves its hops this way, one KV layer per DiT block per Euler step.
+
 Bounded (sink + window) caches
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -1147,21 +1171,21 @@ model declares which linears adapters may touch; it never indexes the pool itsel
 
 A model declares LoRA from its own modules: the shared linears add the delta
 themselves once bound, and ``module_lora_spec`` builds the spec by walking each node's
-weights root. For an autoregressive LLM node such as Orpheus's:
+weights root. Orpheus is the reference (``OrpheusModel.get_lora_specs``):
 
 .. code-block:: python
 
-   from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+   from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
 
    def get_lora_specs(self) -> list[LoraSpec]:
        # the module the node's weight loader fills, at one rank, on the meta device
-       with torch.device("meta"):
-           root = OrpheusForCausalLM(self.config, comm_group=CommGroup.trivial())
+       root = meta_root(lambda group: OrpheusForCausalLM(self.config, comm_group=group))
        return [module_lora_spec(
            root, resource_key=LORA_RESOURCE_KEY, nodes={"LLM"},
-           root_path="language_model",    # the root's attribute path in the node submodule
-           rows={"lm_head": PER_SEGMENT},  # rows that are not the step's tokens
-           embeddings=True,                # every embedding call is in the forward
+           root_path="language_model",      # the root's attribute path in the node submodule
+           adapter_roots=[("", "model.")],  # adapters saved on the bare LlamaModel
+           rows={"lm_head": PER_SEGMENT},    # rows that are not the step's tokens
+           embeddings=True,                  # every embedding call is in the forward
        )]
 
 The weights root states how the checkpoint lands on it once
@@ -1199,12 +1223,9 @@ placed exactly as weights are.
   one row per segment (``PER_SEGMENT``: a head after the last-token select) or one per
   ``k`` folded tokens. ``exclude`` (with a reason): modules called outside the planned
   step, a text projection or a conditioning encoder run in ``prepare_inputs``.
-  ``deferred``: modules called both before the step and in it, whose delta the node adds
-  itself where the step's rows are planned (Qwen3.5 embeds a vision prompt's text in
-  ``prepare_inputs``): bound as ``lora_deferred``, which the module's forward never adds.
-  ``embeddings=True`` only when every embedding call is in the step; a deferred
-  embedding is served without it. ``adapter_roots`` / ``aliases`` / ``adapter_stacked_params``: the prefixes,
-  names and split projections adapters write, rewritten to the checkpoint's before the
+  ``embeddings=True`` only when every embedding call is in the step.
+  ``adapter_roots`` / ``aliases`` / ``adapter_stacked_params``: the prefixes, names and
+  split projections adapters write, rewritten to the checkpoint's before the
   root's rules place them. ``ignore``: modules an adapter may carry that never run.
 - **Several nodes.** A model whose adapters reach several nodes (an LLM and its vision
   encoder, which a TP config may put on different ranks) returns a spec per node, the
@@ -1212,8 +1233,8 @@ placed exactly as weights are.
   ``link_lora_specs``: a module belongs to the spec that places it (the one whose
   ``adapter_roots`` claim it most specifically, when several do), and the others leave
   it alone (``ignored_modules``), so one adapter file serves both. The one ``lora:`` block sizes them all, the conductor opens every request
-  with the same adapter on each, and the startup check reads an adapter under every
-  spec.
+  with the same adapter on each, and the startup and runtime-load checks read an adapter
+  under every spec.
 - **Binding and rows.** ``NodeSubmodule.bind_node_resources`` binds every placed module
   under ``root_path``, after checking it is the declared target and that the pool's
   shard is its rank-local shape (a module built whole on a TP node fails here, not in a
@@ -1267,7 +1288,8 @@ placed exactly as weights are.
   tokens and bias LoRA are refused by name. A YAML ``targets: [...]`` keeps a subset of
   the model's targets (dropping vocabulary-sized ones saves their slots); an adapter
   touching a dropped target is refused, and its modules stay unbound. Without the list,
-  a deployment keeps the targets its configured adapters touch: the conductor reads them once at startup (``served_lora_targets``) and spawns
+  a deployment with ``runtime_updates`` off keeps the targets its configured adapters
+  touch: the conductor reads them once at startup (``served_lora_targets``) and spawns
   every worker with that list, so every process builds the same pools; an adapter it
   cannot read fails the deployment.
 - **Requests.** Nothing per model. The conductor opens every request with a
@@ -1358,9 +1380,21 @@ ingest can leave a follower without a copy rank 0 kept. Neither the wait nor the
 agreement holds the pool's lock, so the main thread's ingests and removes go on
 meanwhile.
 
-A node that runs sequence parallelism (SP > 1) cannot serve LoRA yet: the pool lays rows
-out per request, while each SP rank holds a shard of the tokens, so building the pool
-refuses the deployment.
+A node that runs sequence parallelism (SP > 1) or CFG parallelism (cfg_size > 1) cannot
+serve LoRA yet: the pool lays rows out per request over the whole batch, while each SP rank
+holds a shard of the tokens and each CFG rank one guidance branch's rows, so building the
+pool refuses the deployment.
+
+Adapters loaded and unloaded at runtime (``/v1/load_lora_adapter``) reach each worker as
+a control message from the conductor, which each rank applies whenever it arrives rather
+than at a step the instance agrees on. ``LoraAdapterPool.load_adapter_async`` only reads the
+adapter into the host tier, on the reader thread (the worker acknowledges the load from its
+main loop once every pool has it), and ``unload_adapter`` only stops new requests from naming
+it; once no live request names it (immediately, or at the last one's teardown) the pool
+forgets its host copy and its name's slot entry, and leaves the slot's weights and LRU
+standing as they were. Neither touches what an admit decides from, and the next request
+that names the adapter is ingested after a reload, which reaches every rank after the
+unload did. Nothing per model is needed for either.
 
 Step 3 — Declare the computation graph
 --------------------------------------
@@ -1473,10 +1507,11 @@ methods are:
    class attribute ``disable_torch_compile = True``. An encoder whose output feeds a
    prefix cache layout walk compiles with dynamic shapes instead. One that marks every
    dimension that varies with ``torch._dynamo.mark_dynamic`` in ``prepare_inputs`` sets
-   ``marks_dynamic_dims = True`` and compiles as any other submodule. A submodule whose
-   captures keep more compiled entries per frame than ``MSTAR_RECOMPILE_LIMIT`` allows
-   returns the number from ``dynamo_recompile_limit()``; the engine raises the limit
-   around that submodule's compiled calls only. Keep the compiled
+   ``marks_dynamic_dims = True`` and compiles as any other submodule. The engine raises
+   the recompile limit around a node's compiled calls, past ``MSTAR_RECOMPILE_LIMIT``, to
+   hold an entry per bucket its compiled captures take (each batch size and token count);
+   a submodule whose frames keep several entries per bucket (GLM-5.2's decoder layers are
+   traced once per layer kind) declares how many as ``compiled_entries_per_shape``. Keep the compiled
    paths compile-friendly. If a helper must not be traced, because it uses
    data-dependent Python control flow or forces a host synchronization, exclude it
    explicitly with ``@torch.compiler.disable``. A submodule that disables the
@@ -1577,6 +1612,8 @@ methods are:
    resource's request config sets ``ignore_eos``) or when the loop's iteration count plus
    one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
    only the count, and ``StopKind.EOS`` only the token, for a loop whose cap is its budget.
+   ``ignores_eos=`` replaces ``sampler`` for a node with no such resource: a callable on
+   the forward-pass info, which it reads for every partition of the request on the worker.
    The limits are computed from the request's forward-pass info whenever
    the worker receives it, not per step. Return ``{}`` for a
    walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
@@ -1628,7 +1665,11 @@ and ends at the prompt's length. To opt a walk in:
 
   - ``chunkable=True`` lets the walk's rows be cut.
   - ``max_batch_tokens``: the most tokens a step runs. A combined walk that carries
-    chunked rows sets one too, since its steps run under it.
+    chunked rows sets one too, since its steps run under it. Its step may pass it
+    beside a speculation chain's decode rows, by at most those rows' tokens, and the
+    engine trims a serving config's ``prefill_token_buckets`` assuming each such row
+    runs one token. A walk whose decode rows run more (an MTP verify row's k+1)
+    passes that bound, and its steps past a trimmed ladder's top run eagerly.
   - ``accumulated_outputs``: output edges a consumer needs every chunk of. They arrive as
     one item per chunk, all when the prompt finishes.
   - ``per_chunk_outputs``: streaming edges sent on every chunk as it runs, for a consumer
@@ -1640,6 +1681,11 @@ and ends at the prompt's length. To opt a walk in:
   - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
     whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
     a walk whose state grows by something other than the tokens a step runs.
+
+  A resource that keeps state only on a grid counted from a chunk's start declares
+  ``Resource.chunk_alignment``, and a cut chunk of the node's rows is then a multiple of
+  every alignment its resources declare (``Engine.chunk_alignment``). The chunk floor rounds
+  up to it, and a budget under it fails loading.
 
   A streaming consumer of an accumulated edge whose ``ChunkPolicy`` expects one item
   (``FixedChunkPolicy(1)``, say) sets ``Connection.join_dim``, so its ``StreamBuffer``
@@ -1972,6 +2018,19 @@ is built with a ``comm_group`` and ``tp_world_size > 1``, the loader slices the 
 tensor along that parameter's shard dimension before copying it. For this reason, one
 ``load_weights`` path serves both single-GPU runs and tensor-parallel runs without change.
 
+A quantized checkpoint is refused at load unless the model reads its format itself. Without this, a
+model that knows only unquantized weights would load fp8 values unscaled and drop the scales and
+packed weights, and then serve garbage. There are two checks:
+
+- The safetensors iterators refuse a checkpoint that declares a quantization: ``quantization_config``
+  in ``config.json`` (HF fp8, AWQ, GPTQ, bitsandbytes, mxfp4, compressed-tensors, ModelOpt), ModelOpt's
+  ``hf_quant_config.json``, or AutoGPTQ's or AutoAWQ's config file.
+- ``load_weights_into`` refuses a quantized weight's part, such as ``weight_scale_inv``,
+  ``weight_scale``, ``weight_packed`` or ``qweight``, when no parameter takes it.
+
+A model that loads a format itself names its ``quant_method``. GLM-5.2 and GLM-5.3-Flash, for
+example, pass ``quant_methods=("fp8",)`` to ``load_weights`` and to the iterators.
+
 .. _step-5:
 
 Step 5 — Continuous batching and CUDA graphs
@@ -2030,7 +2089,7 @@ worker with a heavier one can set ``side_stream_walks`` on its submodule to the 
 may run beside the chain instead, and a deployment turns that on with ``side_stream: true``
 on the node's group (see :doc:`serving`). Such a step neither takes a turn on the chain nor
 makes it yield, runs on a second stream, and the windows that come ready while it runs
-batch into the next one (see ``mstar/worker/side_steps.py``). Its graphs capture on a stream
+batch into the next one (see ``StepPipeline._launch_side`` in ``mstar/worker/step_pipeline.py``). Its graphs capture on a stream
 of their own, since graphs captured on one stream must not overlap. It suits a stream-fed
 walk that nothing on the chain reads, such as a codec. Where the config asks,
 ``EngineManager.build`` refuses what the lane can't serve, since a side step is neither
@@ -2140,11 +2199,11 @@ For example, the Orpheus LLM submodule captures a batched ``decode`` graph and a
            ),
        ]
 
-An ``ARNodeSubmodule`` takes a ``prefill_token_buckets`` constructor argument, which
-replaces its class's ``PREFILL_TOKEN_BUCKETS`` for that instance: a model passes a
-deployment's ``model_kwargs.prefill_token_buckets`` through to it (Qwen3.5, Muse
-Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive
-token counts, or the submodule raises ``ValueError`` when it is built.
+A deployment replaces a packed capture's ``capture_token_lengths`` with the serving
+config's ``prefill_token_buckets`` (node -> capture walk -> ladder, see :doc:`serving`).
+The engine applies it to the configs ``get_accelerator_graph_configs`` returns, so a
+model plumbs nothing. A ``PiecewisePackedConfig`` region's ``total_tokens`` takes the
+ladder its label names the same way.
 
 BAGEL shows the case of two captures for one walk. It captures ``decode`` twice, once with
 ``additional_key_info=False`` and once with ``additional_key_info=True``. A decode step
@@ -2208,6 +2267,10 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   naming the buffer.
 - ``forward_kwargs`` holds static keyword arguments that are passed to ``capture_fn`` on
   every call, for example a layer count or an ``is_causal`` flag.
+- ``required`` refuses to start the worker when any of the region's shapes is left out of
+  capture, for memory or by a failure, rather than serving those shapes eagerly. Set it on a
+  region with no eager path, such as one whose per-stream state only its captures read and
+  write. The default is ``False``.
 - ``declare_step`` has signature
   ``(request_ids, seq_lens) -> SubmoduleStep | None``. It declares the region's own
   resource work over the padded batch. It is separate from the submodule's
@@ -2455,10 +2518,13 @@ that a misspelled setting is never silently ignored:
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``
        (adapters held in pinned host memory), ``adapters`` (adapter name to safetensors
        path: the names requests can ask for), ``targets`` (the subset of the model's
-       targets to allocate; by default the targets the configured adapters touch; a
-       secondary node's spec
+       targets to allocate; by default, with ``runtime_updates`` off, the targets the
+       configured adapters touch, and every target with it on; a secondary node's spec
        left with none builds no pool, while a YAML list leaving the model's first spec
-       (its LLM's) none is an error). One ``lora:`` block sizes every LoRA spec of the
+       (its LLM's) none is an error), ``runtime_updates`` (default false: serve
+       ``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``),
+       ``runtime_update_timeout_s`` (default 120: how long the conductor waits for every
+       worker to answer one before giving up on it). One ``lora:`` block sizes every LoRA spec of the
        model
 
 Tune the cache shape on the KV resource, not on the attention resource that reads it. For
@@ -2552,9 +2618,10 @@ in arrival order. A deployment sets the pool at the top level of its config; 1 t
    model: "qwen3_omni"
    preprocess_workers: 2
 
-The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni and
-V-JEPA2 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8 and 4, the
-sizes measured for their video decode). A model with client streams always prepares inline,
+The pool only helps work that releases the GIL, so measure each stage first. Qwen3-Omni,
+V-JEPA2 and Cosmos3 declare it (``configs/vjepa2.yaml`` and ``configs/vjepa2_ac.yaml`` set 8
+and 4, the sizes measured for their video decode; Cosmos3's DROID policy configs set 1, since
+a robot sends one request at a time). A model with client streams always prepares inline,
 since an append has to follow its request.
 
 A pool that small is slow for a large copy, and a 121-frame 832x480 video is 145 MB. A
@@ -3153,8 +3220,7 @@ submodule cache and where the files come from. A model sets ``NAME`` and
 ``METADATA_FILES`` and writes ``__init__`` (setting
 ``config``, ``tokenizer`` and ``media``), its resources (the sampler from
 ``_sampler_spec``; ``MIXED_SPLIT`` is the attention resources' split of a mixed step),
-``_prompt_ids`` and ``_create_submodule``, which hands the LLM node
-``self.prefill_token_buckets`` (``model_kwargs.prefill_token_buckets``). The scaffold's
+``_prompt_ids`` and ``_create_submodule``. The scaffold's
 ``rebuild_policies`` lets the KV cache drop a text request and reprefill its ids on
 ``prefill_text``. A model whose LLM node holds a resource that can't drop returns ``{}``,
 or the engine refuses to start; Muse Glimmer returns ``{}`` until a drop has run through
@@ -3227,7 +3293,9 @@ LayerNorm, which autocast returns in fp32). The runner refuses an ``embed`` outp
 buffers may round, and widens a narrower one, so a declaration wider than ``embed``'s
 output replays the loop in more precision than the eager loop runs. A step whose spans
 under some label exceed the ragged resource's ``max_segments_per_step`` takes no lease and
-runs eagerly. Qwen3-Omni's ViT node is one too, off the scaffold: its region also returns
+runs eagerly. On a node serving LoRA adapters a leased step still declares its spans, with
+no attention step, so the engine plans the LoRA rows of the bound modules around the loop
+(``lora_rows``). Qwen3-Omni's ViT node is one too, off the scaffold: its region also returns
 the deepstack taps (its ``_capture_block_loop``), which its own ``forward_batched`` reads
 off the replay.
 A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
@@ -3389,6 +3457,7 @@ Checklist
          [ ] the client-example tuples lower down (cosmetic, user-visible)
    [ ] docs/models.rst                            — one row in the registry-key table
    [ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
+         [ ] and rust/server/src/adapters/ — the same adapter in the Rust frontend
    [ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
    [ ] (optional) async partitions if pipelined
 
