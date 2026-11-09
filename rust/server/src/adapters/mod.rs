@@ -44,7 +44,7 @@ pub use images::*;
 pub use messages::flatten_messages;
 use messages::*;
 pub use speech::*;
-pub use video::{Cosmos3, Cosmos3Edge};
+pub use video::{Cosmos3, Cosmos3Edge, MiniMaxH3, Wan22, LTX25};
 
 /// One element of a chat prompt, in request order: mstar's `PromptPart`,
 /// field for field, so the bridge builds one from each as it arrives.
@@ -297,6 +297,9 @@ pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
     ("CosyVoice3Adapter", &CosyVoice3),
     ("OmniVoiceAdapter", &OmniVoice),
     ("VoxCPM2Adapter", &VoxCPM2),
+    ("Wan22Adapter", &Wan22),
+    ("LTX25Adapter", &LTX25),
+    ("MiniMaxH3Adapter", &MiniMaxH3),
 ];
 
 /// The adapter for a Python class name; `None` for a class with no port here.
@@ -308,6 +311,65 @@ fn set_seed(mk: &mut Map<String, Value>, seed: Option<i64>) {
     if let Some(seed) = seed {
         set_default(mk, "seed", Value::from(seed));
     }
+}
+
+/// Python's `repr` of a JSON value as `json.loads` gives it, for a refusal
+/// that quotes it as the Python frontend's does. An object's keys come in
+/// serde_json's (sorted) order, not the client's.
+pub(crate) fn py_value_repr(v: &Value) -> String {
+    match v {
+        Value::Null => "None".to_string(),
+        Value::Bool(true) => "True".to_string(),
+        Value::Bool(false) => "False".to_string(),
+        Value::Number(n) if n.is_f64() => py_float_repr(n.as_f64().unwrap_or(f64::NAN)),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => crate::media::py_repr(s),
+        Value::Array(items) => format!("[{}]", items.iter().map(py_value_repr).collect::<Vec<_>>().join(", ")),
+        Value::Object(m) => format!(
+            "{{{}}}",
+            m.iter().map(|(k, v)| format!("{}: {}", crate::media::py_repr(k), py_value_repr(v))).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Python's `repr(float)`: the shortest round-trip digits, positional for a
+/// decimal exponent in -4..16 (with at least one fractional digit) and
+/// scientific with a two-digit exponent otherwise.
+fn py_float_repr(x: f64) -> String {
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0.0" } else { "0.0" }.to_string();
+    }
+    let sci = format!("{x:e}"); // shortest round-trip digits, e.g. "-1.25e-5"
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    if !(-4..16).contains(&exp) {
+        let (head, tail) = digits.split_at(1);
+        let frac = if tail.is_empty() { String::new() } else { format!(".{tail}") };
+        let esign = if exp < 0 { '-' } else { '+' };
+        return format!("{sign}{head}{frac}e{esign}{:02}", exp.abs());
+    }
+    if exp < 0 {
+        return format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize));
+    }
+    let point = exp as usize + 1;
+    if digits.len() <= point {
+        format!("{sign}{}{}.0", digits, "0".repeat(point - digits.len()))
+    } else {
+        format!("{sign}{}.{}", &digits[..point], &digits[point..])
+    }
+}
+
+/// Python's `str.isspace()`, which `strip` and `split` use: Unicode whitespace
+/// and the four ASCII separators U+001C..U+001F.
+pub(crate) fn py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// `str.strip()`.
+pub(crate) fn py_strip(s: &str) -> &str {
+    s.trim_matches(py_space)
 }
 
 /// Python's `bool()` of a JSON value.

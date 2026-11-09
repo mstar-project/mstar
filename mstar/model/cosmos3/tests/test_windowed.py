@@ -29,7 +29,6 @@ from mstar.model.cosmos3.submodules import (
     COND_LABEL,
     KV_CACHE,
     UNCOND_LABEL,
-    VIDEO_GEN_AR_LOOP,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderARSubmodule,
 )
@@ -60,10 +59,8 @@ def _dit(cfg=None):
 
 
 def test_windowed_gen_params_and_walk_selection() -> None:
-    """Windowed knobs quantize to latent units, the AR walk is selected at the
-    prefill transition, and every rejection fires at request resolution."""
-    from mstar.conductor.request_info import CurrentForwardConductorMetadata
-
+    """Windowed knobs quantize to latent units, the plan runs the AR walk after
+    the prefill, and every rejection fires at request resolution."""
     model = _windowed_model()
     p = model._resolve_gen_params(
         {"window_mode": "chained", "num_frames": 189, "size": "832x480"}, [], ["video"],
@@ -75,31 +72,12 @@ def test_windowed_gen_params_and_walk_selection() -> None:
     assert p["num_frames"] == 189
     assert p["flow_shift"] == C.V2V_DEFAULT_FLOW_SHIFT
 
-    md = CurrentForwardConductorMetadata(
-        input_modalities=[], output_modalities=["video"],
-        graph_walk=C.PREFILL_WALK, is_prefill=True, kwargs=p,
-    )
-    args = model.get_partition_forward_pass_args("default", md, {})
-    assert args.full_metadata.graph_walk == C.VIDEO_GEN_AR_WALK
-    assert [e.name for e in args.inputs] == ["latents", "unipc_model_outputs", "unipc_last_sample", "cond_latents"]
-    done = model.get_partition_forward_pass_args("default", args.full_metadata, {})
-    assert done.request_done
-
-    dec = model.get_partition_forward_pass_args(
-        C.WINDOW_DECODER_PARTITION,
-        CurrentForwardConductorMetadata(
-            input_modalities=[], output_modalities=["video"],
-            graph_walk=C.VIDEO_DECODE_AR_WALK, is_prefill=False, kwargs=p,
-        ),
-        {},
-    )
-    assert dec.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
-    assert not dec.request_done and dec.inputs == []
-    init = model.get_initial_forward_pass_args(
+    plan = model.walk_plan("default", [], ["video"], {}, {"window_mode": "chained", "num_frames": 189})
+    assert [step.walk for step in plan] == [C.PREFILL_WALK, C.VIDEO_GEN_AR_WALK]
+    (dec,) = model.walk_plan(
         C.WINDOW_DECODER_PARTITION, ["text"], ["video"], {}, {"window_mode": "kv", "num_frames": 61},
     )
-    assert init.full_metadata.graph_walk == C.VIDEO_DECODE_AR_WALK
-    assert init.step_metadata["num_windows"] == 2 and init.inputs == []
+    assert dec.walk == C.VIDEO_DECODE_AR_WALK and dec.step_metadata["num_windows"] == 2
 
     for bad in (
         {"window_mode": "bogus", "num_frames": 189},
@@ -160,7 +138,6 @@ def test_windowed_walks_partitions_and_topology() -> None:
     parts = {p.name: p for p in model.get_partitions()}
     assert set(parts) == {"default", C.WINDOW_DECODER_PARTITION}
     assert parts[C.WINDOW_DECODER_PARTITION].graph_walks == {C.VIDEO_DECODE_AR_WALK}
-    assert parts[C.WINDOW_DECODER_PARTITION].initial_walk == C.VIDEO_DECODE_AR_WALK
     assert C.VIDEO_DECODE_AR_WALK not in parts["default"].graph_walks
     topo = model.get_partition_topology()
     (conn,) = topo.connections
@@ -171,24 +148,6 @@ def test_windowed_walks_partitions_and_topology() -> None:
     assert C.VIDEO_GEN_AR_WALK not in plain.get_graph_walk_graphs()
     assert [p.name for p in plain.get_partitions()] == ["default"]
     assert plain.get_partition_topology().connections == []
-
-
-def test_windowed_check_stop_counts_all_windows() -> None:
-    """The AR loop stops at num_windows x iterations, not at one scheduler's
-    length."""
-    sub = _dit()
-    st = sub.request_state("r")
-    st.add_all(
-        ar_schedule=WindowSchedule(48, 8, overlap_units=1),
-        ar_total_iters=7 * 5,
-        scheduler=SimpleNamespace(timesteps=list(range(5))),
-    )
-    info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: 4})
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 33
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 34
-    assert sub.check_stop("r", info, {}) == {VIDEO_GEN_AR_LOOP}
 
 
 def test_windowed_finish_window_bookkeeping(monkeypatch) -> None:
@@ -271,9 +230,10 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
     sees the tail behind ``chained_head_context_latents`` latents, the encode
     sees those frames quantized as served (``_to_uint8``), and the head's
     first latent is the encoder's clip-start latent."""
+    import mstar.model.cosmos3.submodules as cosmos3_submodules
     from mstar.model.cosmos3.submodules import ChainedWindowHead, Cosmos3VAEDecoderSubmodule
 
-    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setattr(cosmos3_submodules, "wan_vae_decode_dtype", lambda: torch.float32)
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
     cfg.chained_head_context_latents = ctx
@@ -298,9 +258,10 @@ def test_chained_window_head_layout(ctx, monkeypatch) -> None:
 def test_chained_window_head_encodes_in_the_encode_vaes_dtype(monkeypatch) -> None:
     """The head encodes in the encode VAE's own dtype (bf16 as built) and never
     casts it: the instance is the encoder node's when the two share a process."""
+    import mstar.model.cosmos3.submodules as cosmos3_submodules
     from mstar.model.cosmos3.submodules import ChainedWindowHead
 
-    monkeypatch.setenv("COSMOS3_VAE_DECODE_FP32", "1")
+    monkeypatch.setattr(cosmos3_submodules, "wan_vae_decode_dtype", lambda: torch.float32)
     monkeypatch.setenv("COSMOS3_COMPILE_VAE", "0")
     cfg = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True).config
     encode_vae = _CausalVAE(cfg.latent_channel).to(torch.bfloat16)
@@ -314,7 +275,7 @@ def test_chained_window_head_encodes_in_the_encode_vaes_dtype(monkeypatch) -> No
 def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
     """A kv request runs steps + 1 loop iterations per window (the +1 is the
     commit pass); the prefill records the pacing, the schedule and the
-    per-unit token stride, and check_stop fires after the final commit."""
+    per-unit token stride."""
     sub = _dit()
     monkeypatch.setattr(sub, "_new_scheduler", lambda *a, **k: StubSampler(()))
     md = {
@@ -331,11 +292,6 @@ def test_windowed_kv_prefill_state_and_pacing(monkeypatch) -> None:
     assert st["ar_tokens_per_unit"] == 4
     assert st["ar_schedule"].context_units == 6
     assert sub._window_step(st, 4) == (0, 4, True) and sub._window_step(st, 7) == (1, 2, False)
-
-    info = SimpleNamespace(graph_walk=C.VIDEO_GEN_AR_WALK, dynamic_loop_iter_counts={VIDEO_GEN_AR_LOOP: 13})
-    assert sub.check_stop("r", info, {}) == set()
-    info.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = 14
-    assert sub.check_stop("r", info, {}) == {VIDEO_GEN_AR_LOOP}
 
 
 def test_windowed_kv_statics_absolute_positions() -> None:
@@ -434,9 +390,6 @@ def test_windowed_kv_commit_iteration_declares_and_commits(monkeypatch) -> None:
     assert ni2.input_seq_len == 4 * stride and not ni2.resource_step_info.commit
     step2 = sub.declare_step(C.VIDEO_GEN_AR_WALK, ["r"], [ni2]).steps[KV_CACHE]
     assert not step2.commit and step2.retention == {}
-    # Past the last iteration the loop's extra dispatch is vetoed.
-    counts["video_gen_ar_loop"] = 15
-    assert sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, fwd, {"latents": [x0]}) is None
 
     # Window 0 commit forward, driven through forward() so the step's
     # resources reach it: the full window appended under the combined label
@@ -675,7 +628,11 @@ def test_windowed_stream_video_gen_params() -> None:
 def test_video_streaming_ndjson_lines() -> None:
     """stream_video turns the video handler into an NDJSON generator: indexed
     video lines closed by a done line, an in-band error line terminal instead
-    on failure, and the non-streaming path collecting as before."""
+    on a failure after the first window, a refusal before it raised with its
+    status, and the non-streaming path collecting as before."""
+    from fastapi import HTTPException
+
+    from mstar.api_server.entrypoint import APIServer
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import VideoGenerationRequest
     from mstar.api_server.openai.serving_videos import create_videos
@@ -683,6 +640,7 @@ def test_video_streaming_ndjson_lines() -> None:
 
     class _Api:
         upload_dir = "/tmp"
+        open_result_stream = APIServer.open_result_stream
 
         def __init__(self, chunks):
             self._chunks = chunks
@@ -726,6 +684,11 @@ def test_video_streaming_ndjson_lines() -> None:
     lines = asyncio.run(_lines(api))
     assert [ln["modality"] for ln in lines] == ["video", "error"]
     assert base64.b64decode(lines[1]["data"]) == b"boom"
+
+    api = _Api([ResultChunk(request_id="r", modality="error", data=b"bad image", metadata={"status": 400})])
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(_lines(api))
+    assert (refused.value.status_code, refused.value.detail) == (400, "bad image")
 
     api = _Api([ResultChunk(request_id="r", modality="video", data=b"v")])
     out = asyncio.run(create_videos(api, "cosmos3", adapter, VideoGenerationRequest(prompt="x", num_frames=57)))

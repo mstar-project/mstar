@@ -49,6 +49,23 @@ def check_compile_mode(mode: str | None) -> str | None:
     return mode
 
 
+def check_inductor_options(options: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """A capture config's ``inductor_options``, refused at build: each must name
+    an Inductor config entry, and none may turn on Inductor's CUDA graphs."""
+    if not options:
+        return None
+    import torch._inductor.config as inductor_config
+
+    known = inductor_config.get_config_copy()
+    unknown = sorted(name for name in options if name not in known)
+    if unknown:
+        raise ValueError(f"inductor_options names no Inductor config entry: {unknown}")
+    if options.get("triton.cudagraphs"):
+        # Inductor's own graphs inside the runner's capture fail it
+        raise ValueError("inductor_options turns on Inductor's CUDA graphs inside the runner's capture")
+    return dict(options)
+
+
 class AcceleratorGraphConfigType(Enum):
     BASIC_BATCHED = "basic_batched"
     FLASH_INFER_PACKED = "flash_infer_packed"
@@ -67,6 +84,10 @@ class AcceleratorGraphConfig(ABC):
         # torch.compile mode for the captured forward; None takes the deployment's
         # compile level (mstar serve -O), a mode opts the config out of it
         compile_mode: str | None = None,
+        # Inductor config entries the compile runs under, over the mode's (or
+        # the compile level's) own: e.g. which GEMM backends max-autotune may
+        # pick, ``{"max_autotune_gemm_backends": "ATEN"}``
+        inductor_options: Mapping[str, Any] | None = None,
 
         # Per-config override for the set of batch sizes to capture
         capture_batch_sizes: list[int] | None = None,
@@ -88,6 +109,7 @@ class AcceleratorGraphConfig(ABC):
         self.additional_key_info = additional_key_info
         self.compile = compile
         self.compile_mode = check_compile_mode(compile_mode)
+        self.inductor_options = check_inductor_options(inductor_options)
         self.capture_batch_sizes = capture_batch_sizes
         self.capture_forward_method = capture_forward_method
         self.caps_eager_batch_size = caps_eager_batch_size
@@ -126,6 +148,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
         total_tokens_multiplier: int = 1,
         compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
+        inductor_options: Mapping[str, Any] | None = None,
     ):
         super().__init__(
             capture_graph_walk=capture_graph_walk,
@@ -137,6 +160,7 @@ class BatchedAcceleratorGraphConfig(AcceleratorGraphConfig):
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
+            inductor_options=inductor_options,
         )
         self.single_request_inputs = single_request_inputs
         # ``single_request_inputs.input_seq_len`` is also read per-label by the
@@ -214,6 +238,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
         total_tokens_multiplier: int = 1,
         compile_mode: str | None = None,
         input_seq_dims: dict[str, int] | None = None,
+        inductor_options: Mapping[str, Any] | None = None,
         # (input tokens, bs) -> each capture row's span; `distribute_tokens`
         # by default. A walk whose kernels split rows by span (a mixed step's
         # one-token rows beside a prompt) captures a layout it will replay.
@@ -229,6 +254,7 @@ class PackedAcceleratorGraphConfig(AcceleratorGraphConfig):
             capture_forward_method=capture_forward_method,
             caps_eager_batch_size=caps_eager_batch_size,
             input_seq_dims=input_seq_dims,
+            inductor_options=inductor_options,
         )
         if total_tokens_multiplier < 1:
             raise ValueError("total_tokens_multiplier must be at least 1")

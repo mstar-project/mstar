@@ -93,6 +93,17 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         order, off the walk's ``MEDIA_LAYOUT``."""
         return media_grids(fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}, self.output)
 
+    def bind_node_resources(self, resources: dict[str, Any]) -> None:
+        super().bind_node_resources(resources)
+        # a resource whose step is the segments (a LoRA pool) reads them as the rows the
+        # tower's linears see, in order; a second label would count every patch again
+        if self.segment_keys and len(self.SEGMENT_LABELS) > 1:
+            raise ValueError(
+                f"{type(self).__name__}: {list(self.segment_keys)} take one row per segment, but "
+                f"this tower declares each patch under {len(self.SEGMENT_LABELS)} labels "
+                f"{list(self.SEGMENT_LABELS)}"
+            )
+
     def _declare(
         self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
     ) -> SubmoduleStep:
@@ -119,13 +130,14 @@ class PackedBlockLoopEncoder(NodeSubmodule):
     ) -> SubmoduleStep | None:
         # Leased, the captured block loop declares, plans and commits the
         # attention per replay, and that is the node's whole step, unless the
-        # node serves LoRA: no row of a leased step runs an adapter (the
-        # base-only loop refuses them in `can_lease`), but the bound modules
-        # outside the loop (patch embed, projection) still need a planned step
-        # to run base-only against, so the spans are declared for the engine
-        # to add their LoRA rows (`lora_rows`).
+        # node has a resource whose step is its segments (a LoRA pool): no row
+        # of a leased step uses it (the lean loop refuses them in `can_lease`),
+        # but the bound modules outside the loop (patch embed, projection)
+        # still need a planned step to run lean against, so the spans are
+        # declared for the engine to add the resource's step of them
+        # (`engine_step`).
         leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
-        if leased and not self.lora_keys:
+        if leased and not self.segment_keys:
             return None
         return self._declare(
             [(rid, inp.resource_step_info) for rid, inp in zip(request_ids, inputs, strict=True)],

@@ -458,7 +458,7 @@ def test_glm5next_model_constructs_from_config():
         assert isinstance(build_resource(spec, info), spec.resource_class)
 
     # Per-request sampler config: model_kwargs over the config defaults.
-    (req,) = constructed.get_request_resource_configs({}, {"temperature": 0.0, "top_k": 3}).values()
+    (req,) = constructed.get_request_resource_configs([], [], {"temperature": 0.0, "top_k": 3}).values()
     assert isinstance(req, SamplingReqConfig)
     assert req.temperature == 0.0 and req.top_k == 3
     assert req.top_p == constructed.config.top_p

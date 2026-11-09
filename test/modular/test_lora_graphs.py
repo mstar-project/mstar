@@ -18,7 +18,7 @@ import test_lora_pool as P  # noqa: E402
 
 from mstar.engine.accelerator_graph_config import PackedAcceleratorGraphConfig  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, Resource  # noqa: E402
-from mstar.engine.resources.lora import LoraReqConfig, LoraStep  # noqa: E402
+from mstar.engine.resources.lora import LORA_RESOURCE_KEY, LoraReqConfig  # noqa: E402
 from mstar.engine.resources.lora.ops import LoraOpsBackend, lora_apply_, lora_expand_, lora_shrink  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool, _Layout  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
@@ -26,14 +26,14 @@ from mstar.engine.resources.step import (  # noqa: E402
     ADMIT_OK,
     PIECEWISE_WALK,
     BucketKey,
+    ResourceStep,
     Segment,
     SlotLease,
     StepContext,
     SubmoduleStep,
 )
 from mstar.model.keys import MIXED  # noqa: E402
-from mstar.model.qwen3_5.config import LORA  # noqa: E402
-from mstar.model.submodule_base import ARNodeInputs, engine_step  # noqa: E402
+from mstar.model.submodule_base import ARNodeInputs, NodeInputs, engine_step  # noqa: E402
 
 F64 = torch.float64
 CPU = torch.device("cpu")
@@ -52,7 +52,7 @@ def qwen_adapters(tmp_path):
 def _llm(paths, with_pool=True):
     rows = Q._Rows()
     pool = LoraAdapterPool(Q.lora_spec(paths), "cpu", backend=LoraOpsBackend()) if with_pool else None
-    llm = Q.bind(Q.build_stack(Q.hf_text_weights()), rows, {LORA: pool} if pool is not None else {})
+    llm = Q.bind(Q.build_stack(Q.hf_text_weights()), rows, {LORA_RESOURCE_KEY: pool} if pool is not None else {})
     return llm, pool, rows
 
 
@@ -109,7 +109,7 @@ def _capture_plan(llm, pool, config, bs, n):
     for rid in rids:
         pool.ingest_capture_row(rid)
     lease = SlotLease(slot=0, bucket=BucketKey(walk, bs, n, config.additional_key_info))
-    step = engine_step(llm, walk, rids, config.get_node_inputs(bs, n), slot_lease=lease).steps[LORA]
+    step = engine_step(llm, walk, rids, config.get_node_inputs(bs, n), slot_lease=lease).steps[LORA_RESOURCE_KEY]
     ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=True, slot_lease=lease,
                       force_prefill=isinstance(config, PackedAcceleratorGraphConfig))
     assert pool.admit(step, ctx).ok
@@ -120,7 +120,7 @@ def test_lora_changes_no_capture_bucket_and_captures_on_the_zero_slot(qwen_adapt
     """Buckets and keys are the plain node's; every capture, the mixed walk's included, spans
     its whole bucket on the zero adapter in 16-byte aligned arrays and takes no slot."""
     (plain, *_), (served, pool, _) = _llm(qwen_adapters, with_pool=False), _llm(qwen_adapters)
-    assert served.lora_keys == (LORA,) and not served.disable_torch_compile
+    assert served.segment_keys == (LORA_RESOURCE_KEY,) and not served.disable_torch_compile
     configs = served.get_accelerator_graph_configs(CPU)
 
     def buckets(configs):
@@ -136,7 +136,7 @@ def test_lora_changes_no_capture_bucket_and_captures_on_the_zero_slot(qwen_adapt
             inputs, rids = config.get_node_inputs(bs, config.get_total_tokens(bs)[0]), list(range(-1, -1 - bs, -1))
             with_lora, without = engine_step(served, walk, rids, inputs), engine_step(plain, walk, rids, inputs)
             assert with_lora.cg_key_info == without.cg_key_info
-            assert set(with_lora.steps) - set(without.steps) == {LORA}
+            assert set(with_lora.steps) - set(without.steps) == {LORA_RESOURCE_KEY}
             for n in config.get_total_tokens(bs):
                 addr, lease = _capture_plan(served, pool, config, bs, n)
                 assert addr.token_order.shape == (n,), (walk, bs, n)
@@ -162,7 +162,7 @@ def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, wa
     llm, pool, _ = _llm(qwen_adapters)
     named = {"d0": "a1", "d1": None, "d2": "a2", "p0": "a2"}
     for rid, _, _ in rows:
-        pool.ingest_request(rid, LoraReqConfig(adapter=named[rid]))
+        pool.ingest_request(rid, None if named[rid] is None else LoraReqConfig(adapter=named[rid]))
     config = next(c for c in llm.get_accelerator_graph_configs(CPU) if c.capture_graph_walk == walk)
     captured, lease = _capture_plan(llm, pool, config, bs, n)
     # the replay's plan, padded as AcceleratorGraphRunner pads it, on the capture's handles
@@ -170,7 +170,7 @@ def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, wa
     inputs = [ARNodeInputs(input_seq_len=s, input_ids=torch.zeros(s, dtype=torch.long), graph_walk=w)
               for _, w, s in rows] + (config.get_node_inputs(bs - len(rows), 0) if bs > len(rows) else [])
     padded = [*rids, *list(range(-1, -1 - bs, -1))[len(rids):]]
-    step = engine_step(llm, walk, padded, inputs, slot_lease=lease).steps[LORA]
+    step = engine_step(llm, walk, padded, inputs, slot_lease=lease).steps[LORA_RESOURCE_KEY]
     ctx = StepContext(request_ids=rids, graph_walk=walk, slot=0, capture=False, slot_lease=lease)
     ctx.set_padded_rids(padded)
     assert pool.admit(step, ctx).ok
@@ -185,7 +185,7 @@ def test_a_replay_reaches_the_graph_through_the_captured_views(qwen_adapters, wa
         base = torch.randn(n, t.out_features, generator=g, dtype=F64)
         replayed = base.clone()
         LoraOpsBackend().apply_(x, replayed, d.a, d.b, captured, d.ranks, d.scalings, d.out_slices)
-        eager_step = LoraStep(segments=tuple(Segment(rid, "main", span) for rid, _, span in rows))
+        eager_step = ResourceStep(segments=tuple(Segment(rid, "main", span) for rid, _, span in rows))
         eager_ctx = StepContext(request_ids=rids, graph_walk="eager", slot=0, capture=False)
         assert pool.admit(eager_step, eager_ctx).ok
         pool.plan(eager_step, eager_ctx)
@@ -225,7 +225,7 @@ class _Plain(Resource):
 
 
 def _runner_step(rids, keys):
-    step = SubmoduleStep(segments=[Segment(r, "main", 1) for r in rids], steps={k: LoraStep() for k in keys})
+    step = SubmoduleStep(segments=[Segment(r, "main", 1) for r in rids], steps={k: ResourceStep() for k in keys})
     step.set_ctx(StepContext(request_ids=list(rids), graph_walk="decode", slot=0, capture=False))
     return step
 
@@ -332,13 +332,12 @@ def test_a_warm_up_outside_any_step_runs_a_bound_module_as_a_base_only_step(comp
     monkeypatch.setattr(torch, "compile", (lambda fn, **kw: real(fn, backend="eager", **kw)) if compiled
                         else (lambda fn, **kw: fn))
     torch._dynamo.reset()
-    with torch.device("meta"):
-        spec = module_lora_spec(_Warmed(), resource_key="lora", nodes={"N"}, root_path="")
+    spec = module_lora_spec(lambda _: _Warmed(), nodes={"N"}, root_path="")
     node, pool = _Warmed(), lora_pool(serve(spec, {}))
     bind_module_lora(node, {"lora": pool})
     engine = make_engine(
         _device_capability=SimpleNamespace(is_available=True),
-        _submodules={"N": make_mgmt(node, lora_pools=(pool,))},
+        _submodules={"N": make_mgmt(node, resources={"lora": pool})},
     )
     engine._compile_regions()
     assert pool._current is None and pool.active
@@ -450,6 +449,58 @@ def test_the_lease_takes_the_base_only_twin_only_when_no_row_names_an_adapter(ad
     assert leased(engine_with([plain]), ["b0"]) == (plain, frozenset())
 
 
+def test_each_nodes_pool_reads_the_config_the_conductor_opens_a_request_with():
+    """One spec over two nodes is served as a pool per node (``serving_resources``),
+    keyed ``lora@<node>`` in the conductor as on the workers: a request on an adapter is
+    opened with a config under each pool's key. A base-model request carries none."""
+    import dataclasses
+
+    from mstar.conductor.conductor import Conductor
+    from mstar.engine.resources.lora import LORA_ADAPTER_KWARG
+    from mstar.testing_utils.model import make_model
+
+    spec = P.make_spec({})
+    spec.nodes = {"LLM", "vision"}
+    spec.targets = {"qkv": dataclasses.replace(P.QKV, node="LLM"), "o": dataclasses.replace(P.O, node="vision")}
+    conductor = object.__new__(Conductor)
+    conductor.model = make_model(get_node_resources=lambda: [spec], get_request_resource_configs=lambda *a, **kw: {})
+    conductor.model_config = {"resources": {LORA_RESOURCE_KEY: {}}}
+    conductor._kv_labels = {}
+    configs = conductor._get_resource_configs([], [], {LORA_ADAPTER_KWARG: "a1"})
+    assert configs == {"lora@LLM": LoraReqConfig("a1"), "lora@vision": LoraReqConfig("a1")}
+    assert conductor._get_resource_configs([], [], {}) == {}
+
+
+def test_the_recompile_limit_counts_each_lean_twin(monkeypatch):
+    """A lean twin traces apart from its plain bucket. Counted as one shape, a node with
+    many buckets ran its later captures uncompiled inside their graphs."""
+    from unittest.mock import Mock
+
+    import mstar.engine.accelerator_graph_runner as agr
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+
+    configs = [BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", capture_batch_sizes=[1, 2],
+        single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+    )]
+    resource = SimpleNamespace(
+        can_capture=lambda: True, force_double_buffer=False, lean_capture=True, lean_captures=lambda kind: True,
+    )
+    monkeypatch.setattr(agr, "recompile_limit", lambda: 0)
+    runner = agr.AcceleratorGraphRunner(
+        submodule_name="LLM", resources={"lora": resource}, step_runner=Mock(), device=CPU,
+        submodule=SimpleNamespace(
+            get_accelerator_graph_configs=lambda *args: configs,
+            declare_step=lambda slot_lease, **kwargs: SimpleNamespace(steps={"lora": object()}),
+            compiled_entries_per_shape=1,
+        ),
+        autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+    )
+
+    # bs 1 and 2, each plain and lean
+    assert runner.recompile_limit == 4 + 16
+
+
 def test_a_piecewise_region_inside_a_base_only_step_hands_its_state_back(adapters):
     """A region whose capture records LoRA kernels plans its own rows (active), and its commit restores
     the enclosing base-only step's state for the eager code after it. Past the step, and
@@ -509,7 +560,7 @@ def _region_runner(pool, **config):
     return PiecewiseAcceleratorGraphRunner(
         label="N_region", config=config, resources={"attn": _Attn(), "lora": pool},
         step_runner=step_runner,
-        device=CPU, autocast_dtype=None, num_slots=2, node_name="N", lora_keys=("lora",),
+        device=CPU, autocast_dtype=None, num_slots=2, node_name="N", segment_keys=("lora",),
     )
 
 
