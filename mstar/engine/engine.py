@@ -3824,7 +3824,7 @@ class Engine:
             return
         host = outputs.host_rows
         if host is None and outputs.check_stop_buffers is None:
-            # it raised after its commit (`Worker._step_result`): no result, and its rows are torn down
+            # it raised after its commit (`StepPipeline._step_result`): no result, and its rows are torn down
             draft.ledger.void(batch.verify_seq)
             return
         if host is not None and VERIFY_ACCEPTED in host.buffers:
