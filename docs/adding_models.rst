@@ -743,8 +743,8 @@ The spec types are:
        ``RaggedAttnBackend.CUDNN``), ``flashinfer_backend``, the
        two CUDA-graph ceilings ``max_segments_per_request`` (``max_segments_per_step``
        for a ``one_row_per_step`` region) and
-       ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp``,
-       ``fixed_bucket_layouts`` and ``workspace_mb``. ``CUDNN`` runs torch's cuDNN SDPA over
+       ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp`` and
+       ``workspace_mb``. ``CUDNN`` runs torch's cuDNN SDPA over
        equal-length segments (see `Cacheless attention (encoder towers)`_). ``DENSE`` runs FA3
        ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
        missing. By default the heads are split across all TP × SP ranks of the node;
@@ -755,7 +755,7 @@ The spec types are:
        ``MSTAR_WORKSPACE_BUFFER_MB``, 512, which doesn't apply once it is declared): a plan that
        asks for more at startup grows it. A node with many labels can declare less, since a
        ragged prefill only uses it for split-KV partials. ``compile_op``,
-       ``shard_over_sp``, ``fixed_bucket_layouts`` and ``workspace_mb`` are the model's declaration; the serving
+       ``shard_over_sp`` and ``workspace_mb`` are the model's declaration; the serving
        config's ``resources:`` overrides take only the backends and the ceilings. See
        `Cacheless attention (encoder towers)`_ for ``compile_op``.
    * - ``RaggedCrossAttentionSpec(config=RaggedAttentionConfig(...))``
@@ -1014,9 +1014,10 @@ klein 4B / 9B and Z-Image's geometries: under a CUDA graph FlashInfer's ``auto``
 there (its cutlass plan can't be replanned in graph mode, and its cuDNN path needs cuDNN 9.24),
 which is about 4.5x slower at those sizes. The cuDNN wrapper runs a layout of equal-length
 segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
-the layout it was planned with, so a captured bucket takes it only when the config declares
-``fixed_bucket_layouts=True`` (klein and Z-Image do: every row of a denoise bucket, padding rows
-included, spans the bucket's tokens), and stays on FlashInfer otherwise; an eager one runs
+the layout it was planned with, so a captured bucket takes it only when the step that plans it
+declares ``AttentionStep(fixed_layout=True)``, and stays on FlashInfer otherwise. The DiT
+scaffold's denoise step declares it (``DenoiseLoopSubmodule.attention_step``): every row of a
+denoise bucket, padding rows included, spans the bucket's tokens; an eager one runs
 unequal segments on FlashInfer. It is self-attention only. A config that names ``backend: cudnn``
 fails at build where cuDNN can't run it: on a cross-attention or block-causal resource, under
 GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the

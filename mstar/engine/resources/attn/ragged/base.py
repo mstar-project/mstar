@@ -507,7 +507,7 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     falls in, built by that row's ``WRAPPER_FACTORIES`` entry, for its lifetime:
     a captured graph can't switch kernels, and an eager wrapper keeps the
     captured ones' rule. A layout-bound row takes only equal-length segments, and
-    under capture only a config that declares ``fixed_bucket_layouts``;
+    under capture only a step that declares ``AttentionStep.fixed_layout``;
     otherwise the wrapper is the manager's own, at its defaults.
     """
 
@@ -540,13 +540,15 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
             if self._kernel_rows is None:
                 wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
             else:
-                wrapper = self._table_wrapper(ctx.slot_lease, ctx.slot, label, [seg.span for seg in segments])
+                wrapper = self._table_wrapper(ctx.slot_lease, ctx.slot, label, [seg.span for seg in segments], step)
             wrapper.plan(cu_seqlens=cu_seqlens, causal=step.causal)
             plan_states[label] = wrapper
 
-    def _table_wrapper(self, lease: SlotLease | None, slot: int, label: str, spans: list[int]) -> _RaggedPrefillBase:
+    def _table_wrapper(
+        self, lease: SlotLease | None, slot: int, label: str, spans: list[int], step: AttentionStep,
+    ) -> _RaggedPrefillBase:
         """The (label, slot)'s wrapper, built on its first plan for the row that
-        layout runs."""
+        layout runs. A captured bucket is built on the step that first plans it."""
         if lease is not None:
             key, cache = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label), self._cg_plan_states
         else:
@@ -555,7 +557,7 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
         if wrapper is not None:
             return wrapper
         graph_kwargs = {} if lease is None else self._graph_kwargs(lease.bucket)
-        choice = self._row_for(spans, captured=lease is not None)
+        choice = self._row_for(spans, layout_bound_ok=lease is None or step.fixed_layout)
         if choice is None:
             wrapper = self._build_wrapper(label, slot, **graph_kwargs)
         else:
@@ -563,13 +565,14 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
         cache[key] = wrapper
         return wrapper
 
-    def _row_for(self, spans: list[int], captured: bool) -> Choice | None:
-        """The row a layout of ``spans`` runs; None for the manager's own wrapper."""
+    def _row_for(self, spans: list[int], layout_bound_ok: bool) -> Choice | None:
+        """The row a layout of ``spans`` runs; None for the manager's own wrapper.
+        ``layout_bound_ok``: the wrapper may bake this layout in (eager, or a
+        captured bucket whose step fixes its layout)."""
         from mstar.engine.resources.attn.ragged.kernels import choice_for
 
         choice = choice_for(self._kernel_rows, max(spans, default=0))
-        if WRAPPER_FACTORIES[choice.impl].layout_bound and (
-                not uniform_lengths(spans) or (captured and not self._config.fixed_bucket_layouts)):
+        if WRAPPER_FACTORIES[choice.impl].layout_bound and not (layout_bound_ok and uniform_lengths(spans)):
             return None
         return choice
 

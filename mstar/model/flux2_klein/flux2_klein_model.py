@@ -201,9 +201,6 @@ class Flux2KleinModel(Model):
                     head_dim=tcfg.attention_head_dim,
                     # one request == one bidirectional segment over [txt | img | ref]
                     max_segments_per_request=1,
-                    # a captured bucket replays its capture's layout: every row, padding
-                    # rows included, spans the bucket's tokens (DenoiseLoopSubmodule.declare_step)
-                    fixed_bucket_layouts=True,
                     # the DiT's activation dtype: there is no KV cache to inherit one from
                     dtype=torch.bfloat16,
                 ),

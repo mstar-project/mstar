@@ -86,13 +86,6 @@ class RaggedAttentionConfig:
     # "auto" included, runs that FlashInfer backend and reads no table.
     flashinfer_backend: str | None = None
 
-    # True when a captured bucket only ever replays the layout it was captured
-    # with: a DiT batch, where every row, padding rows included, spans its
-    # bucket's tokens. Only then does a captured wrapper take a kernel that
-    # bakes the layout into the graph (the cuDNN wrapper); without it a
-    # captured bucket stays on FlashInfer, whose plan restages any layout.
-    fixed_bucket_layouts: bool = False
-
     # Whether a compiled caller keeps the attention in its graph, as the
     # ``mstar::ragged_attention`` op, rather than breaking there per layer. For
     # a compiled, uncaptured region whose fusions around attention pay; off by

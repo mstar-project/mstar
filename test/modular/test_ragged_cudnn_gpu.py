@@ -168,10 +168,10 @@ def test_eager_cudnn_runs_unequal_segments_on_its_fallback():
 @pytest.mark.parametrize(("heads", "seq"), [(24, 4608), (30, 96)])
 def test_the_resource_runs_the_tables_kernel(heads, seq, captured):
     spec = RaggedAttentionSpec(resource_key="dit_attn", nodes={"dit"}, config=RaggedAttentionConfig(
-        num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE, fixed_bucket_layouts=True))
+        num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE))
     manager = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
     step = AttentionStep(segments=tuple(Segment(request_id=f"r{i}", label="main", span=seq) for i in range(2)),
-                         causal=False)
+                         causal=False, fixed_layout=True)
     lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="image_gen", bs=2, num_tokens=2 * seq)) if captured else None
     manager.plan(step, StepContext(request_ids=["r0", "r1"], graph_walk="image_gen", slot=0, capture=False,
                                    is_preplan=False, slot_lease=lease))

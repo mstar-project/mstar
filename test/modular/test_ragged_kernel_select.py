@@ -32,6 +32,8 @@ from mstar.kernels import Choice, DeviceKey
 from mstar.kernels import registry as registry_module
 from mstar.kernels.registry import reset_lookups
 from mstar.kernels.table import find_entries
+from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
+from mstar.model.submodule_base import NodeInputs
 
 GPU = torch.device("cuda", 0)  # a stand-in: nothing here touches it
 B300 = DeviceKey("NVIDIA B300 SXM6 AC", "sm_103")
@@ -218,20 +220,22 @@ def stub_flashinfer(monkeypatch):
     monkeypatch.setattr(FlashInferRaggedManager, "wrapper_class", _StubFlashInfer)
 
 
-def manager_with(rows, fixed_bucket_layouts=True):
-    config = RaggedAttentionConfig(num_qo_heads=24, num_kv_heads=24, head_dim=128,
-                                   fixed_bucket_layouts=fixed_bucket_layouts)
+def manager_with(rows):
+    config = RaggedAttentionConfig(num_qo_heads=24, num_kv_heads=24, head_dim=128)
     return FlashInferRaggedManager(device=torch.device("cpu"), dtype=torch.bfloat16, key="dit_attn", config=config,
                                    kernel_rows=rows)
 
 
-def planned(manager, *spans, label="main", lease=None):
-    """The wrapper ``manager`` plans one segment per span under ``label`` on."""
-    rids = [f"r{i}" for i in range(len(spans))]
-    step = AttentionStep(segments=tuple(Segment(rid, label, n) for rid, n in zip(rids, spans, strict=True)),
-                         causal=False)
+def plan(manager, step, lease=None):
+    rids = sorted({seg.request_id for seg in step.segments})
     manager.plan(step, StepContext(request_ids=rids, graph_walk="image_gen", slot=0 if lease is None else lease.slot,
                                    capture=False, slot_lease=lease))
+
+
+def planned(manager, *spans, label="main", lease=None, fixed_layout=True):
+    """The wrapper ``manager`` plans one segment per span under ``label`` on."""
+    segments = tuple(Segment(f"r{i}", label, n) for i, n in enumerate(spans))
+    plan(manager, AttentionStep(segments=segments, causal=False, fixed_layout=fixed_layout), lease)
     return manager._current_plan_states[label]
 
 
@@ -267,12 +271,31 @@ def test_a_captured_wrapper_is_sized_like_the_flashinfer_one(stub_flashinfer):
     assert w._make_fallback is None
 
 
-def test_a_captured_bucket_needs_fixed_layouts_for_cudnn(stub_flashinfer):
-    """A captured cuDNN wrapper bakes its layout in; a resource whose buckets replay other
-    layouts stays on FlashInfer under capture, and takes cuDNN eagerly."""
-    m = manager_with(CUDNN_ROWS, fixed_bucket_layouts=False)
-    assert type(planned(m, 4608, 4608, lease=lease(2, 2 * 4608))) is _StubFlashInfer
-    assert type(planned(m, 4608, 4608)) is CudnnRaggedPrefillWrapper
+def test_a_step_without_a_fixed_layout_keeps_a_captured_bucket_on_flashinfer(stub_flashinfer):
+    """A captured cuDNN wrapper bakes its layout in, so only a step that fixes its bucket's
+    layout captures one; any other step's bucket stays on FlashInfer, and runs cuDNN eagerly."""
+    m = manager_with(CUDNN_ROWS)
+    assert type(planned(m, 4608, 4608, lease=lease(2, 2 * 4608), fixed_layout=False)) is _StubFlashInfer
+    assert type(planned(m, 4608, 4608, fixed_layout=False)) is CudnnRaggedPrefillWrapper
+    other_slot = lease(2, 2 * 4608, slot=0)
+    assert type(planned(m, 4608, 4608, lease=other_slot, fixed_layout=True)) is CudnnRaggedPrefillWrapper
+
+
+class _Dit(DenoiseLoopSubmodule):
+    """The scaffold's step declaration; a bucket key is its token count."""
+
+    def num_tokens(self, bucket_key):
+        return bucket_key
+
+
+def test_the_scaffolds_step_captures_its_buckets_on_cudnn(stub_flashinfer):
+    dit = _Dit(loop_name="denoise_loop", attn_resource_key="dit_attn")
+    declared = dit.declare_step("image_gen", ["r0", "r1"], [NodeInputs(resource_step_info=4608)] * 2)
+    step = declared.steps["dit_attn"]
+    assert step.fixed_layout and [seg.span for seg in step.segments] == [4608, 4608]
+    m = manager_with(CUDNN_ROWS)
+    plan(m, step, lease(2, 2 * 4608))
+    assert type(m._current_plan_states["main"]) is CudnnRaggedPrefillWrapper
 
 
 def _image_dit(model: str):
@@ -292,9 +315,8 @@ def _image_dit(model: str):
 
 
 @pytest.mark.parametrize("model", ["flux2_klein", "z_image"])
-def test_the_image_dits_declare_fixed_bucket_layouts(model):
+def test_the_image_dits_leave_their_kernel_to_the_table(model):
     (resource,) = _image_dit(model).get_node_resources()
-    assert resource.config.fixed_bucket_layouts
     assert resource.config.backend is RaggedAttnBackend.AUTO and resource.config.flashinfer_backend is None
 
 
