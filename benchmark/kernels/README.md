@@ -91,8 +91,8 @@ gets faster on a GPU without a change to model code.
   one size, with kernels the resource can't replay (FlashInfer cutlass, torch's FA2). The sm_103
   table was written with `--arch`, which names the file for the architecture, not the GPU model.
   Each entry's provenance note says which sizes a served model ran on its rows (the image DiTs
-  up to 4608 tokens, LTX-2.5's video self-attention at 8160) and which `measured` times are
-  kernel-level only. An entry whose larger sizes no served model has run bounds them with a
+  up to 4608 tokens, LTX-2.5's video self-attention at 8160, Wan2.2 at 3510 and 18480) and which
+  `measured` times are kernel-level only. An entry whose larger sizes no served model has run bounds them with a
   numeric last row and a `"*"` row naming `flashinfer`, the resource's default; a sweep writes
   its last bucket's winner as `"*"`, so bound such an entry by hand.
 - `fp8_linear`: the block-fp8 dense linear's kernel by token count (`mstar.utils.dense_fp8`:
