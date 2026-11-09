@@ -1276,10 +1276,65 @@ async fn videos_generations(
     };
     schedule_upload_cleanup(&st.upload_dir, &args);
     let request_id = rid("vid");
+    // `stream_video`: a windowed request's mp4s as NDJSON lines as they land.
+    // A refusal at submission is still its status; a later failure is in-band.
+    if args.model_kwargs.get("stream_video").is_some_and(adapters::truthy) {
+        return match open_stream(result_stream(&st, &args, &request_id, true)).await {
+            Ok(base) => Response::builder()
+                .header("content-type", "application/x-ndjson")
+                .header("cache-control", "no-cache")
+                .body(Body::from_stream(video_ndjson(base)))
+                .unwrap(),
+            Err((status, msg)) => error(status, &msg, error_type(status)),
+        };
+    }
+    let fps = args.model_kwargs.get("fps").cloned();
     match collect(result_stream(&st, &args, &request_id, false)).await {
-        Ok(chunks) => Json(videos_response(chunks)).into_response(),
+        // the mux shells out to ffmpeg
+        Ok(chunks) => Json(blocking(move || videos_response(chunks, fps.as_ref())).await).into_response(),
         Err((status, msg)) => error(status, &msg, error_type(status)),
     }
+}
+
+/// `serving_videos._ndjson_lines`: one line per chunk in `/generate`'s shape
+/// with a running `index`, closed by a `done` line carrying the count; a
+/// failure ends it with its `error` line and no `done`.
+fn video_ndjson(base: OutStream) -> impl futures::Stream<Item = Result<Bytes, Infallible>> {
+    let state = Arc::new(std::sync::Mutex::new((0u64, false)));
+    let lines = {
+        let state = state.clone();
+        base.map(move |item| {
+            let mut st = state.lock().unwrap();
+            let line = match item {
+                Out::Chunk(mut c) => {
+                    if !c.metadata.is_object() {
+                        c.metadata = json!({});
+                    }
+                    c.metadata["index"] = json!(st.0);
+                    st.0 += 1;
+                    ndjson_line(&c)
+                }
+                Out::Error { status, message } => {
+                    st.1 = true;
+                    ndjson_line(&ResultChunk {
+                        modality: "error".to_string(),
+                        data: message.into_bytes(),
+                        metadata: json!({"status": status}),
+                    })
+                }
+            };
+            Ok(Bytes::from(line))
+        })
+    };
+    let done = futures::stream::once(async move {
+        let (count, failed) = *state.lock().unwrap();
+        (!failed).then(|| {
+            let line = json!({"modality": "done", "data": "", "metadata": {"chunks": count}}).to_string() + "\n";
+            Ok(Bytes::from(line))
+        })
+    })
+    .filter_map(futures::future::ready);
+    lines.chain(done)
 }
 
 async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response {
@@ -1413,28 +1468,43 @@ fn images_response(chunks: Vec<ResultChunk>) -> Value {
     json!({"created": now(), "data": data})
 }
 
-/// Each Cosmos3 video chunk is an mp4 (H.264), returned base64-encoded in the
-/// image endpoint's `b64_json` shape. A sound request (`generate_sound`) also
-/// emits a raw PCM audio chunk that mstar muxes into the mp4 as an AAC track;
-/// the Rust frontend has no mp4/PCM muxer, so it returns the video-only
-/// container — the same shape mstar degrades to when muxing fails. If audio
-/// chunks are present they are DROPPED and a warning is logged, since the model
-/// spent extra compute generating a track the client won't receive. Muxing the
-/// audio track (or a 501 when `generate_sound` is set) is a follow-up.
-fn videos_response(chunks: Vec<ResultChunk>) -> Value {
-    let dropped_audio = chunks.iter().filter(|c| c.modality == "audio").count();
-    if dropped_audio > 0 {
-        eprintln!(
-            "mstar-server: WARNING dropping {dropped_audio} audio chunk(s) from a Cosmos3 \
-             video response — the Rust frontend cannot mux audio into the mp4; the generated \
-             sound track is discarded. Do not set 'generate_sound' on the Rust frontend, or \
-             use the Python frontend for sound video."
-        );
-    }
-    let data: Vec<Value> = chunks
-        .iter()
-        .filter(|c| c.modality == "video")
-        .map(|c| json!({"b64_json": media::b64(&c.data), "url": Value::Null}))
+/// `serving_videos.create_videos`' body: each mp4, with the generated audio
+/// chunk of the same index muxed in as an AAC track (one playable file), its
+/// timestamps rescaled to the request's `fps`. A failed mux returns the video
+/// alone. Blocking.
+fn videos_response(chunks: Vec<ResultChunk>, fps: Option<&Value>) -> Value {
+    let videos = chunks.iter().filter(|c| c.modality == "video");
+    let audios: Vec<&ResultChunk> = chunks.iter().filter(|c| c.modality == "audio").collect();
+    // `float(fps) if fps else None`; a value float() refuses fails the mux, so the video goes alone
+    let fps: Result<Option<f64>, String> = match fps {
+        Some(v) if adapters::truthy(v) => match v {
+            Value::Number(n) => Ok(n.as_f64()),
+            Value::String(s) => s.trim().parse().map(Some).map_err(|_| format!("could not convert {s:?} to float")),
+            Value::Bool(b) => Ok(Some(f64::from(u8::from(*b)))),
+            other => Err(format!("float() argument must be a string or a real number, not {other}")),
+        },
+        _ => Ok(None),
+    };
+    let int = |meta: &Value, key: &str, default: i64| {
+        meta.get(key).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))).unwrap_or(default)
+    };
+    let data: Vec<Value> = videos
+        .enumerate()
+        .map(|(i, video)| {
+            let mut mp4 = std::borrow::Cow::Borrowed(&video.data);
+            if let Some(audio) = audios.get(i) {
+                let muxed = fps.clone().and_then(|fps| {
+                    let rate = int(&audio.metadata, "sample_rate", 48000);
+                    let channels = int(&audio.metadata, "num_channels", 2);
+                    media::mux_mp4_with_pcm16(&video.data, &audio.data, rate, channels, fps)
+                });
+                match muxed {
+                    Ok(with_sound) => mp4 = std::borrow::Cow::Owned(with_sound),
+                    Err(e) => eprintln!("Muxing generated audio into the mp4 failed; returning video only: {e}"),
+                }
+            }
+            json!({"b64_json": media::b64(&mp4), "url": Value::Null})
+        })
         .collect();
     json!({"created": now(), "data": data})
 }

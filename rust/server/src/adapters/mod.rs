@@ -44,7 +44,7 @@ pub use images::*;
 pub use messages::flatten_messages;
 use messages::*;
 pub use speech::*;
-pub use video::{Cosmos3, Cosmos3Edge};
+pub use video::{Cosmos3, Cosmos3Edge, Wan22, LTX25};
 
 /// One element of a chat prompt, in request order: mstar's `PromptPart`,
 /// field for field, so the bridge builds one from each as it arrives.
@@ -297,6 +297,8 @@ pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
     ("CosyVoice3Adapter", &CosyVoice3),
     ("OmniVoiceAdapter", &OmniVoice),
     ("VoxCPM2Adapter", &VoxCPM2),
+    ("Wan22Adapter", &Wan22),
+    ("LTX25Adapter", &LTX25),
 ];
 
 /// The adapter for a Python class name; `None` for a class with no port here.

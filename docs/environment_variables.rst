@@ -443,16 +443,6 @@ The Rust frontend serves no ``/generate/ws``, so a model's live client input
 (appends to a running request, see :doc:`clients`) needs the Python frontend;
 over ``/generate`` such a model's input ends when the request is submitted.
 
-It also carries no media muxer (the Python frontend uses ``ffmpeg``), so one
-surface degrades:
-
-* ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
-  request sets ``generate_sound``, Cosmos3 generates a separate audio track that
-  mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
-  the audio is dropped and a warning is logged. Do not set ``generate_sound`` on
-  the Rust frontend (it spends compute on a track the client won't receive), or
-  run the Python frontend for sound video.
-
 Request media
 -------------
 

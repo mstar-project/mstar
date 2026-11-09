@@ -30,17 +30,10 @@ impl OpenAIAdapter for Cosmos3 {
     /// supplied, as `Cosmos3Adapter.video_to_request`.
     fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-        if let Some(size) = &req.size {
-            set_default(&mut mk, "size", Value::from(size.clone()));
+        if let Some(size) = nonempty(&req.size) {
+            set_default(&mut mk, "size", Value::from(size));
         }
-        set_seed(&mut mk, req.seed);
-        // num_frames / fps are first-class video fields (not extra_body).
-        if let Some(nf) = req.num_frames {
-            set_default(&mut mk, "num_frames", Value::from(nf));
-        }
-        if let Some(fps) = req.fps {
-            set_default(&mut mk, "fps", json_num(fps));
-        }
+        video_fields(&mut mk, req);
         let mut args = SubmitArgs {
             text: Some(req.prompt.clone()),
             input_modalities: vec!["text".to_string()],
@@ -51,7 +44,7 @@ impl OpenAIAdapter for Cosmos3 {
         // The conditioning frame (image-to-video) or clip (video-to-video) is
         // persisted and VAE-encoded by the worker into the clean frame-0 anchor /
         // pinned latent prefix. At most one may be given.
-        let reference = match (req.image.as_deref(), req.video.as_deref()) {
+        let reference = match (nonempty(&req.image), nonempty(&req.video)) {
             (Some(_), Some(_)) => return Err("Provide either 'image' or 'video' conditioning, not both.".to_string()),
             (Some(image), None) => Some(("image", image)),
             (None, Some(video)) => Some(("video", video)),
@@ -88,4 +81,91 @@ impl OpenAIAdapter for Cosmos3Edge {
     fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
         Cosmos3.video_to_request(req, upload_dir, allow_remote)
     }
+}
+
+/// Wan2.2-TI2V-5B: text- or image-to-video, `size` as the model's width and height.
+pub struct Wan22;
+
+impl OpenAIAdapter for Wan22 {
+    fn supports_videos(&self) -> bool {
+        true
+    }
+    fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        video_size_kwargs(&mut mk, nonempty(&req.size), "832x480")?;
+        video_fields(&mut mk, req);
+        if nonempty(&req.video).is_some() {
+            return Err("Wan2.2 does not support 'video' conditioning; provide 'image' or neither.".to_string());
+        }
+        let mut args = SubmitArgs {
+            text: Some(req.prompt.clone()),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["video".to_string()],
+            model_kwargs: mk,
+            ..SubmitArgs::default()
+        };
+        if let Some(image) = nonempty(&req.image) {
+            let (_, path) = media::resolve_media_ref(image, upload_dir, allow_remote)?;
+            args.file_paths.insert("image".to_string(), vec![path]);
+            args.input_modalities = vec!["image".to_string(), "text".to_string()];
+        }
+        Ok(args)
+    }
+}
+
+/// LTX-2.5: text to video, with its generated audio unless `audio` is false.
+pub struct LTX25;
+
+impl OpenAIAdapter for LTX25 {
+    fn supports_videos(&self) -> bool {
+        true
+    }
+    fn video_to_request(&self, req: &VideoGenerationRequest, _upload_dir: &Path, _allow_remote: bool) -> Result<SubmitArgs, String> {
+        if nonempty(&req.image).is_some() || nonempty(&req.video).is_some() {
+            return Err("LTX-2.5 (this port) is text-to-video only; omit 'image' and 'video'.".to_string());
+        }
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        let with_audio = mk.remove("audio").is_none_or(|v| truthy(&v));
+        video_size_kwargs(&mut mk, nonempty(&req.size), "960x544")?;
+        video_fields(&mut mk, req);
+        let output = if with_audio { vec!["video", "audio"] } else { vec!["video"] };
+        Ok(SubmitArgs {
+            text: Some(req.prompt.clone()),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: output.into_iter().map(str::to_string).collect(),
+            model_kwargs: mk,
+            ..SubmitArgs::default()
+        })
+    }
+}
+
+/// A string field as Python's truthiness reads it: `None` when unset or empty.
+fn nonempty(field: &Option<String>) -> Option<&str> {
+    field.as_deref().filter(|s| !s.is_empty())
+}
+
+/// The first-class video fields every video adapter forwards when set.
+fn video_fields(mk: &mut Map<String, Value>, req: &VideoGenerationRequest) {
+    set_seed(mk, req.seed);
+    if let Some(nf) = req.num_frames {
+        set_default(mk, "num_frames", Value::from(nf));
+    }
+    if let Some(fps) = req.fps {
+        set_default(mk, "fps", json_num(fps));
+    }
+}
+
+/// Wan2.2's and LTX-2.5's `size` onto `width` / `height`: Python's
+/// `(int(v) for v in size.lower().split("x"))` into two names, refused with the
+/// adapter's own example.
+fn video_size_kwargs(mk: &mut Map<String, Value>, size: Option<&str>, example: &str) -> Result<(), String> {
+    let Some(size) = size else { return Ok(()) };
+    let lowered = size.to_lowercase();
+    let parsed: Option<Vec<i64>> = lowered.split('x').map(|p| p.trim().parse().ok()).collect();
+    let Some([width, height]) = parsed.as_deref().and_then(|v| <[i64; 2]>::try_from(v).ok()) else {
+        return Err(format!("size must be 'WxH' (e.g. '{example}'); got {}", crate::media::py_repr(size)));
+    };
+    set_default(mk, "width", Value::from(width));
+    set_default(mk, "height", Value::from(height));
+    Ok(())
 }

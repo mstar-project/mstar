@@ -114,6 +114,65 @@ fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
     LENIENT.decode(compact.as_bytes())
 }
 
+/// `media_io.mux_mp4_with_pcm16`: an H.264 mp4 and raw interleaved 16-bit PCM
+/// into one mp4 with an AAC track, the video stream-copied, by the same
+/// `ffprobe` and `ffmpeg` commands. `video_fps` is the content's true rate: when
+/// it differs from the container's, the video timestamps are rescaled so
+/// playback stays in sync with the audio. Blocking; an `Err` leaves the caller
+/// the video alone, as Python falls back to it.
+pub fn mux_mp4_with_pcm16(
+    video_mp4: &[u8],
+    pcm: &[u8],
+    sample_rate: i64,
+    num_channels: i64,
+    video_fps: Option<f64>,
+) -> Result<Vec<u8>, String> {
+    let dir = std::env::temp_dir().join(format!("mstar_mux_{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let result = (|| {
+        let (vpath, apath, opath) = (dir.join("v.mp4"), dir.join("a.pcm"), dir.join("out.mp4"));
+        std::fs::write(&vpath, video_mp4).map_err(|e| e.to_string())?;
+        std::fs::write(&apath, pcm).map_err(|e| e.to_string())?;
+        let mut itsscale = None;
+        if let Some(fps) = video_fps {
+            let probe = std::process::Command::new("ffprobe")
+                .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate",
+                       "-of", "csv=p=0"])
+                .arg(&vpath)
+                .output();
+            if let Ok(probe) = probe {
+                let out = String::from_utf8_lossy(&probe.stdout);
+                if let Some((num, den)) = out.trim().split_once('/') {
+                    if let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>()) {
+                        let container = num / den;
+                        if den != 0.0 && container > 0.0 && (container - fps).abs() > 1e-3 {
+                            itsscale = Some(container / fps);
+                        }
+                    }
+                }
+            }
+        }
+        let mut cmd = std::process::Command::new("ffmpeg");
+        cmd.args(["-y", "-v", "error"]);
+        if let Some(scale) = itsscale {
+            cmd.args(["-itsscale".to_string(), format!("{scale:.6}")]);
+        }
+        cmd.arg("-i").arg(&vpath);
+        cmd.args(["-f", "s16le", "-ar", &sample_rate.to_string(), "-ac", &num_channels.to_string(), "-i"]);
+        cmd.arg(&apath);
+        cmd.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]);
+        cmd.arg(&opath);
+        let out = cmd.output().map_err(|e| format!("ffmpeg mux failed: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("ffmpeg mux failed: {}", stderr.trim().chars().take(500).collect::<String>()));
+        }
+        std::fs::read(&opath).map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
 /// `media_io.BARE_REF_AUDIO_REFUSAL`.
 pub const BARE_REF_AUDIO_REFUSAL: &str =
     "server file paths are refused; ref_audio must be a data URL, an http(s) URL or base64 audio the model can decode";

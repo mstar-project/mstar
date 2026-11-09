@@ -87,10 +87,6 @@ Read by the `mstar-server` binary and its bridge (`mstar-serve --rust-frontend`;
 
 The Rust frontend serves no `/generate/ws`, so a model's live client input (appends to a running request, see [Using a Server](/clients)) needs the Python frontend; over `/generate` such a model's input ends when the request is submitted.
 
-It also carries no media muxer (the Python frontend uses `ffmpeg`), so one surface degrades:
-
-- `/v1/videos/generations` (Cosmos3) returns the **video-only** mp4. When a request sets `generate_sound`, Cosmos3 generates a separate audio track that mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so the audio is dropped and a warning is logged. Do not set `generate_sound` on the Rust frontend (it spends compute on a track the client won't receive), or run the Python frontend for sound video.
-
 ## Request media {#request-media}
 
 Read by the model's media loaders in the data worker's preprocess thread, behind either frontend. All four are also checked once when the data worker starts ([`mstar.model.media_limits.check_media_limits`](https://github.com/mstar-project/mstar/blob/main/mstar/model/media_limits.py)), so an invalid value stops the server instead of failing every media request. The pixel and audio caps hold for a request's files together ([`mstar.model.media_limits.RequestMediaBudget`](https://github.com/mstar-project/mstar/blob/main/mstar/model/media_limits.py)), so attaching more files does not multiply them.
