@@ -802,7 +802,8 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
         posted = post_inline(repo, pr, head_sha, review, exact)
         pages = graphql(THREADS, repo, pr)
         # Before rendering: the summary's hidden state is base64, where `redact` over the finished text can't see it.
-        review = json.loads(redact(json.dumps(render_summary.carried(review, *earlier_review(repo, pr))), exact))
+        carried = render_summary.carried(review, *earlier_review(repo, pr))
+        review = json.loads(redact(json.dumps(carried, ensure_ascii=False), exact))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
                                      salvaged == "true")
     except Exception as e:
@@ -895,7 +896,8 @@ def handoff(out, pr, head_sha, mode, runner_temp, home, prev="", job_token=""):
     saved = Path(runner_temp, "handoff")
     saved.mkdir(parents=True, exist_ok=True)
     exact = job_token_forms(job_token)
-    (saved / "handoff.json").write_text(redact(json.dumps({"pr": pr, "head_sha": head_sha, "mode": mode, **h}), exact))
+    meta = {"pr": pr, "head_sha": head_sha, "mode": mode, **h}
+    (saved / "handoff.json").write_text(redact(json.dumps(meta, ensure_ascii=False), exact))
     (saved / "handoff.md").write_text(redact(session.handoff_md(h, pr, head_sha, mode), exact))
     out["dir"] = str(saved)
 
