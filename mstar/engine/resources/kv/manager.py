@@ -4248,8 +4248,9 @@ class KVManager(AttentionResource):
             for rid in self._victims:
                 assert rid not in self._guaranteed, f"{rid} is guaranteed and was chosen as a victim"
             stalled = {rid for rid in self._asks if rid in self._allotments}
-            assert self._stalled == stalled, (
-                f"`_stalled` lists {sorted(self._stalled)}, but {sorted(stalled)} wait holding"
+            assert stalled <= self._stalled <= self._allotments.keys(), (
+                f"`_stalled` lists {sorted(self._stalled)}, but {sorted(stalled)} wait holding "
+                f"and {sorted(self._allotments)} hold an allotment"
             )
             if self._cpu_pool is not None:
                 self._assert_host_pages_conserved()
@@ -4409,6 +4410,7 @@ class KVManager(AttentionResource):
         with self._lock:
             if rid not in self._asks:
                 # the moves `make_room` chose for ``rid`` admitted it (`_settle`)
+                self._stalled.discard(rid)
                 return None
             # read before `_need`, so that a snapshot filed between the two moves the counts past the mark
             counts = self._index_counts()
@@ -4894,7 +4896,8 @@ class KVManager(AttentionResource):
         grow the allotment of the request that ran short by that room, up to what its shortage still lacks. A
         victim that asks again at once is then measured against the room without it. A waiting request the moves
         were for takes the room as soon as it covers all it asks for, before a victim can take it back, and the moves
-        that land after that add nothing. Until then, `_kept` keeps the room for it, up to what it asks for.
+        that land after that add nothing. Until then, `_kept` keeps the room for it, up to what it asks for. It waits
+        holding that room until it starts, so an older request can move it.
 
         When ``rid``'s ``allotment`` passed the first request in the queue, `_kept` also keeps what the earmark
         doesn't take while a request waits."""
@@ -4919,8 +4922,8 @@ class KVManager(AttentionResource):
                 # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
                 # window's commit frees pages at another point of the step. The engine journals the move ahead of the
                 # admit.
-                if self._decides and pages <= self._room_for(earmark.rid):
-                    self._admit(earmark.rid, pages, passed)
+                if self._decides and pages <= self._room_for(earmark.rid) and self._admit(earmark.rid, pages, passed):
+                    self._stalled.add(earmark.rid)
             else:
                 granted = min(earmark.pages - earmark.granted, freed)
                 if granted:
