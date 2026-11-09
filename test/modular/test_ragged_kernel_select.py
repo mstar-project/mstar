@@ -137,9 +137,11 @@ def test_off_gpu_there_is_no_table():
 # --- what a config names wins ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("override", [{"backend": "flashinfer"}, {"flashinfer_backend": "fa2"}],
-                         ids=["backend", "flashinfer_backend"])
+@pytest.mark.parametrize("override", [{"backend": "flashinfer"}, {"flashinfer_backend": "fa2"},
+                                      {"flashinfer_backend": "auto"}],
+                         ids=["backend", "flashinfer_backend", "flashinfer_backend_auto"])
 def test_a_named_backend_or_kernel_wins_over_the_table(gpu, override):
+    """Any flashinfer_backend set in YAML, ``auto`` included, is FlashInfer's own choice and no table."""
     gpu(B300)
     s = spec()
     apply_yaml_overrides([s], {"resources": {"dit_attn": override}})
@@ -273,7 +275,7 @@ def _image_dit(model: str):
 def test_the_image_dits_declare_fixed_bucket_layouts(model):
     (resource,) = _image_dit(model).get_node_resources()
     assert resource.config.fixed_bucket_layouts
-    assert resource.config.backend is RaggedAttnBackend.AUTO and resource.config.flashinfer_backend == "auto"
+    assert resource.config.backend is RaggedAttnBackend.AUTO and resource.config.flashinfer_backend is None
 
 
 def test_an_eager_cudnn_wrapper_falls_back_for_unequal_segments(stub_flashinfer):

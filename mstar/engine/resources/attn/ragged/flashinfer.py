@@ -43,7 +43,7 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
     ):
         super().__init__(device=device, dtype=dtype, config=config, key=key)
         self._workspaces = WorkspacePool(device, config.workspace_mb, owner=key)
-        self._kwargs["backend"] = config.flashinfer_backend
+        self._kwargs["backend"] = "auto" if config.flashinfer_backend is None else config.flashinfer_backend
 
     def _build_wrapper(
         self, label: str, slot: int, cu_seqlens: torch.Tensor | None = None, **graph_kwargs,

@@ -87,7 +87,7 @@ def _build_ragged(
 
 def _uses_kernel_table(config: RaggedAttentionConfig) -> bool:
     """A resource that names neither a backend nor a FlashInfer kernel runs the table's."""
-    return config.backend is RaggedAttnBackend.AUTO and config.flashinfer_backend == "auto"
+    return config.backend is RaggedAttnBackend.AUTO and config.flashinfer_backend is None
 
 
 def dense_or_flashinfer(device: torch.device, dense, flashinfer, what: str):

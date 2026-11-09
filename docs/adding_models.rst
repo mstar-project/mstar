@@ -1006,7 +1006,7 @@ mask from it, cannot be captured this way.
 
 ``RaggedAttnBackend.AUTO`` (and an explicit ``FLASHINFER``) plan through FlashInfer's
 ragged prefill wrapper. For a self-attention whose config names neither a backend nor a
-``flashinfer_backend``, ``AUTO`` first reads the ``ragged_attention`` kernel table
+``flashinfer_backend`` (``None``, the default; an explicit ``auto`` is FlashInfer's own choice), ``AUTO`` first reads the ``ragged_attention`` kernel table
 (``mstar/kernels/tables/ragged_attention/``, see `Tuned kernel configs`_) for the rank's head
 geometry on the GPU, and each wrapper runs the row its first layout's longest query segment
 falls in. On ``sm_103`` the table names torch's cuDNN SDPA (``RaggedAttnBackend.CUDNN``) for
@@ -2459,8 +2459,10 @@ that a misspelled setting is never silently ignored:
      - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
    * - ``RaggedAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
-       (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
+     - ``backend`` (``auto`` / ``flashinfer`` / ``dense`` / ``cudnn``), ``flashinfer_backend``
+       (unset by default: a self-attention reads the ``ragged_attention`` kernel table; any name,
+       ``auto`` / ``fa2`` / ``fa3`` / ``cudnn`` / ``cutlass``, runs that FlashInfer backend and no
+       table), ``max_segments_per_request``,
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.

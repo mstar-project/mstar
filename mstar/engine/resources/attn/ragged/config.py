@@ -81,7 +81,10 @@ class RaggedAttentionConfig:
     max_tokens_per_request: int | None = None
 
     backend: RaggedAttnBackend = RaggedAttnBackend.AUTO
-    flashinfer_backend: str = "auto"
+    # None: under AUTO a self-attention runs the `ragged_attention` kernel
+    # table's pick, and FlashInfer's own "auto" where no table applies. A name,
+    # "auto" included, runs that FlashInfer backend and reads no table.
+    flashinfer_backend: str | None = None
 
     # True when a captured bucket only ever replays the layout it was captured
     # with: a DiT batch, where every row, padding rows included, spans its
