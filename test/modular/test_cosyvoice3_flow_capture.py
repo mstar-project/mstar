@@ -49,6 +49,7 @@ def _config(**overrides) -> CosyVoice3Config:
         flow_capture_frame_buckets=(64, 96, 128),
         flow_capture_batch_sizes=(1, 2, 4),
         flow_capture_batch_frames=256,
+        flow_cache_frames=0,  # each hop re-solves: this module is that path
     )
     for key, value in overrides.items():
         setattr(cfg, key, value)

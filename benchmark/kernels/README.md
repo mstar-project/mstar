@@ -78,7 +78,11 @@ gets faster on a GPU without a change to model code.
   count.
 - `moe_decode`: the small-batch fp8 MoE's per-pair kernels (`--dtype float8_e4m3fn --shape
   H=...,E=...,I=...,K=...`: hidden, experts, one rank's intermediate, top-k). Its rows are the
-  per-pair tiles by token count, then the grouped `"*"` row.
+  per-pair tiles by token count, then the grouped `"*"` row. Its `bfloat16` entries are
+  `fused_experts`' per-pair path (Qwen3-Omni): up to which token count it runs, and its tiles
+  (`gate_up` `bj, bk, warps`; `down` `bn, bc, warps`; no router). An entry of the `"*"` row
+  alone runs the grouped GEMMs at every count. The sweep times fp8 only, so a bf16 entry is
+  measured end to end, its provenance naming how.
 - `fp8_linear`: the block-fp8 dense linear's kernel by token count (`mstar.utils.dense_fp8`:
   `w8a16`, `flashinfer` or `cublas`; `--shape N=...,K=...,glu=0|1`, N per half with glu). Tables
   only for now: its sweep is not ported.
