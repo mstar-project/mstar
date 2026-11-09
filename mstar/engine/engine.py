@@ -3397,11 +3397,12 @@ class Engine:
     def owes_moves(self) -> bool:
         return bool(self._resident_delta)
 
-    def apply_resident_delta(self, delta: OffloadDelta, rebuilds: RankRebuilds) -> bool:
+    def apply_resident_delta(self, delta: OffloadDelta, rebuilds: RankRebuilds, caught_up: bool = True) -> bool:
         """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
         ``rebuilds`` holds this rank's kept ids and the rebuilds it is running.
+        ``caught_up`` means every step this rank took before the delta's step has committed.
         """
         for _ in range(len(delta)):
             move = delta.peek_left()
@@ -3487,6 +3488,10 @@ class Engine:
                 logger.debug(
                     "Replay: %s already resident on %s", wire_rid, node_name,
                 )
+            elif not caught_up:
+                # Rank 0 reloads after its commit of the step before, which can give back the pages the reload takes.
+                logger.debug("Replay: %s's reload on %s waits for this rank's last commit", wire_rid, node_name)
+                return False
             elif not all(
                 resource.reload(rid)
                 for resource in self._submodules[node_name].resources.values()

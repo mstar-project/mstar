@@ -1929,11 +1929,15 @@ class Worker:
         # state that is still mid-replay. Every poll retries the owed moves, so
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
-        if not self.lockstep.settle_delta(
-            # Of the steps before the head, only N may still index a page of the head's hit
-            caught_up=pending.node_batch.commit_done.is_set(),
-        ):
-            return None
+        # Of the steps before the head, only N may still index a page of the head's hit, or hold pages back
+        committed = pending.node_batch.commit_done
+        if not self.lockstep.settle_delta(caught_up=committed.is_set()):
+            if committed.is_set() or not self.lockstep.awaits_commit():
+                return None
+            # A reload in the head waits for N's commit, which every exit of N's step releases.
+            committed.wait()
+            if not self.lockstep.settle_delta(caught_up=True):
+                return None
 
         batch_N = pending.batch
         # The leader names its rids by wire string; these are this rank's handles.

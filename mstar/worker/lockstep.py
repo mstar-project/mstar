@@ -22,6 +22,7 @@ from mstar.engine.resources import Residency
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RequestWalks
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
+    MoveKind,
     OffloadDelta,
     ScheduleTPNode,
     TPNoSpeculation,
@@ -503,7 +504,9 @@ class Lockstep:
         """The leader's oldest step not yet taken, if any."""
         return self._follow_fifo[0] if self._follow_fifo else None
 
-    def _apply_resident_delta(self, node_name: str, new_delta: OffloadDelta | None = None) -> bool:
+    def _apply_resident_delta(
+        self, node_name: str, new_delta: OffloadDelta | None = None, caught_up: bool = True,
+    ) -> bool:
         delta = self._pending_delta
         if new_delta is not None:
             delta.extend(new_delta)
@@ -511,15 +514,20 @@ class Lockstep:
         if not len(delta):
             return True
 
-        return self._engine_manager.get_engine(node_name).apply_resident_delta(delta, self._rebuilds)
+        return self._engine_manager.get_engine(node_name).apply_resident_delta(delta, self._rebuilds, caught_up)
 
-    def _apply_delta_from_message(self, message: ScheduleTPNode) -> bool:
+    def awaits_commit(self) -> bool:
+        """Whether the replay stopped on a reload, which waits for this rank's commit of the step before."""
+        move = self._pending_delta.peek_left()
+        return move is not None and move.kind == MoveKind.RELOAD
+
+    def _apply_delta_from_message(self, message: ScheduleTPNode, caught_up: bool = True) -> bool:
         new_delta = None
         if self._last_delta_seq < message.spec_seq:
             self._last_delta_seq = message.spec_seq
             new_delta = message.resident_delta
         try:
-            return self._apply_resident_delta(message.node_name, new_delta)
+            return self._apply_resident_delta(message.node_name, new_delta, caught_up)
         except Exception as exc:
             raise SystemExit(f"TP ranks diverged: {exc}") from exc
 
@@ -535,7 +543,7 @@ class Lockstep:
         head = self.follow_head()
         if head is None:
             return True
-        if not self._apply_delta_from_message(head):
+        if not self._apply_delta_from_message(head, caught_up):
             return False
         engine = self._engine_manager.get_engine(head.node_name)
         try:
