@@ -95,9 +95,9 @@ class LoraAdmin:
                 )
             except Exception as exc:  # noqa: BLE001 - any unreadable or unfit file is the client's
                 # the client sees why the adapter was refused, never what the server's
-                # files hold or whether a path exists; the route logs it with the cause and,
-                # as a note (not in the client's text), the file
-                exc.add_note(f"adapter file: {path}")
+                # files hold or whether a path exists; this log has the cause and the file
+                # (the route logs a refusal as one line, without its cause)
+                logger.warning("LoRA adapter %r refused (adapter file: %s)", name, path, exc_info=exc)
                 raise ValueError(f"LoRA adapter '{name}': {describe_load_error(exc)}") from exc
             await self._request(
                 LoadLoraAdapter(

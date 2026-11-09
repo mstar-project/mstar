@@ -723,6 +723,11 @@ pub(crate) fn truthy(v: &Value) -> bool {
 const UNSERVED_CHAT_FIELDS: [&str; 6] =
     ["logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"];
 
+/// OpenAI request bookkeeping that changes no reply, dropped from a chat's
+/// passthrough: `CHAT_ENVELOPE_KEYS` in `api_server/openai/adapters.py`.
+const CHAT_ENVELOPE_FIELDS: [&str; 6] =
+    ["stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier"];
+
 /// Refuse a chat that asks for more than one plain reply: more choices, stop
 /// sequences, log probs, sampling penalties, a response format, or a tool
 /// call. The rules are `_refuse_unserved_chat` in
@@ -778,7 +783,7 @@ fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut Map<String, Value>
         return Err("tool calling is not supported for this model".to_string());
     }
     let off = ["best_of", "response_format", "tools", "tool_choice", "functions", "function_call"];
-    for name in UNSERVED_CHAT_FIELDS.iter().chain(&off) {
+    for name in UNSERVED_CHAT_FIELDS.iter().chain(&off).chain(&CHAT_ENVELOPE_FIELDS) {
         mk.remove(*name);
     }
     Ok(())
@@ -1088,6 +1093,7 @@ mod tests {
             r#""presence_penalty":0"#,
             r#""best_of":1"#,
             r#""response_format":{"type":"text"}"#,
+            r#""stream_options":{"include_usage":true},"user":"u1","store":false,"metadata":{"k":"v"},"service_tier":"auto","parallel_tool_calls":true"#,
         ] {
             for adapter in CHAT_ADAPTERS {
                 let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);

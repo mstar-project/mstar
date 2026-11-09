@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server.openai._util import check_inline_result
-from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs
+from mstar.api_server.openai.adapters import CHAT_ENVELOPE_KEYS, OpenAIAdapter, SubmitArgs
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
     ImageGenerationRequest,
@@ -78,8 +78,7 @@ _STRIP_KEYS = {
     # OpenAI-standard, no M* mapping today. Not tools, tool_choice, the
     # penalties, logit_bias, logprobs, top_logprobs or response_format: the chat
     # adapter refuses a chat that sets one of them on.
-    "min_tokens", "eos_token_ids", "stream_options", "parallel_tool_calls",
-    "user", "store", "metadata", "service_tier",
+    "min_tokens", "eos_token_ids", *CHAT_ENVELOPE_KEYS,
 }
 
 # Image-request fields that ride nvext (mirrors Dynamo's NvCreateImageRequest);

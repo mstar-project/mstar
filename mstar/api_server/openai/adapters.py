@@ -179,6 +179,12 @@ def _forward_sent_speed(req, mk: dict) -> None:
         mk.setdefault("speed", req.speed)
 
 
+# OpenAI request bookkeeping that changes no reply: dropped from a chat's
+# model_kwargs, so a client that sends it on every call (LiveKit's
+# ``stream_options``) is not logged as ignoring it. Dynamo's bridge strips the same.
+CHAT_ENVELOPE_KEYS = ("stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier")
+
+
 def _refuse_unserved_chat(req, mk: dict) -> None:
     """Refuse a chat that asks for more than one plain reply: more choices, stop
     sequences, log probs, sampling penalties, a response format, or a tool call.
@@ -218,7 +224,7 @@ def _refuse_unserved_chat(req, mk: dict) -> None:
         or function_call not in (None, "none", "auto")
     ):
         raise ValueError("tool calling is not supported for this model")
-    for name in ("tools", "tool_choice", "functions", "function_call"):
+    for name in ("tools", "tool_choice", "functions", "function_call", *CHAT_ENVELOPE_KEYS):
         mk.pop(name, None)
 
 

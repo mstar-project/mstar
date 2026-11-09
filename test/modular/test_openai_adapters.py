@@ -265,6 +265,9 @@ def test_a_chat_asking_for_more_than_one_plain_reply_is_refused(tmp_path, adapte
     {"function_call": None},
     {"tools": [_NAMED], "tool_choice": "none"}, {"functions": [_FUNCTION], "function_call": "none"},
     {"logprobs": False}, {"presence_penalty": 0}, {"best_of": 1}, {"response_format": {"type": "text"}},
+    # request bookkeeping (LiveKit sends stream_options on every call)
+    {"stream_options": {"include_usage": True}, "user": "u1", "store": False, "metadata": {"k": "v"},
+     "service_tier": "auto", "parallel_tool_calls": True},
 ], ids=lambda f: ",".join(f"{k}={v}" for k, v in f.items()))
 def test_the_tool_fields_clients_send_by_default_pass(tmp_path, adapter, fields):
     """And are dropped, so the server does not log them as ignored."""
