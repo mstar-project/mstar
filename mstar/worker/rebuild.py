@@ -111,7 +111,7 @@ class Rebuilds:
 
     def __init__(
         self, policies: Mapping[str, RebuildPolicy], graphs: Mapping[str, GraphSection],
-        pool: HostPool | None = None,
+        pool: HostPool | None = None, followed: Collection[str] = frozenset(),
     ) -> None:
         for node, policy in policies.items():
             policy.check(node, graphs)
@@ -119,6 +119,8 @@ class Rebuilds:
         self._loop_walks = {node: policy.loop_walks(node, graphs) for node, policy in policies.items()}
         # without one no request keeps ids, so none is dropped
         self._pool = pool
+        # the lockstep nodes this rank follows, whose first rank decides which requests keep ids
+        self._followed = frozenset(followed)
         # node -> handle -> its kept ids. Per node, since a colocated node of another partition samples
         # ids of its own.
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
@@ -180,14 +182,15 @@ class Rebuilds:
                     self._droppable[node].add(rid)
         return rebuildable
 
-    def keep_prompts(self, node_batch: ExecutingBatch, spill: bool = False) -> list[int]:
-        """Copy a row's prompt to the host once the first step that read the prompt completes, when the row is in the
-        policy's walk and a drop here can free its request's pages. Returns the rows the pool can't hold, which keep
-        no ids.
+    def keep_prompts(self, node_batch: ExecutingBatch, mid_prefill: Collection[int] = frozenset()) -> list[int]:
+        """Copy a row's prompt to the host once the step that read the prompt completes, when the row is in the
+        policy's walk, a drop here can free its request's pages, and the request keeps no ids yet. Returns the rows
+        the pool can't hold, which keep no ids from then on, except a row ``mid_prefill``, whose next chunk reads the
+        whole prompt again.
 
-        ``spill`` copies them outside the pool instead, for a TP follower. Each rank gives a slice back at its own
-        teardown, so a follower's pool can be fuller than rank 0's when rank 0 keeps a request's ids. The follower
-        gives back the ids of a request rank 0 kept none for at `forget`."""
+        On a node this rank follows, a prompt the pool can't hold is copied outside the pool. Each rank gives a slice
+        back at its own teardown, so a follower's pool can be fuller than rank 0's when rank 0 keeps a request's ids.
+        The follower gives back the ids of a request rank 0 kept none for at `forget`."""
         policy = self._policies.get(node_batch.node_name)
         if self._pool is None or policy is None:
             return []
@@ -195,6 +198,7 @@ class Rebuilds:
         if walk != policy.walk and policy.walk not in walks.values():
             return []
         kept, droppable = self._kept[node_batch.node_name], self._droppable[node_batch.node_name]
+        spill = node_batch.node_name in self._followed
         unkept = []
         for rid, row in node_batch.per_request_input_tensors.items():
             # a TP follower's unread row has no inputs, and the step fails it
@@ -204,6 +208,8 @@ class Rebuilds:
             copy = self._pool.copy_out(prompt, node_batch.completion_event, spill)
             if copy is not None:
                 kept[rid] = KeptIds(copy, array("i"))
+                continue
+            if rid in mid_prefill:
                 continue
             droppable.discard(rid)
             unkept.append(rid)

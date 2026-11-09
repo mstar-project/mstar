@@ -174,6 +174,7 @@ def _make_graph_runtime(
 
 def _make_rebuilds(
     model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], device: torch.device,
+    followed: frozenset[str] = frozenset(),
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
     runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
@@ -182,7 +183,7 @@ def _make_rebuilds(
     host_mb = (model_config or {}).get("rebuild_host_mb", DEFAULT_REBUILD_HOST_MB)
     if isinstance(host_mb, bool) or not isinstance(host_mb, int) or host_mb < 0:
         raise ValueError(f"rebuild_host_mb: {host_mb!r} is not a non-negative int")
-    return Rebuilds(policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None)
+    return Rebuilds(policies, graphs, HostPool(host_mb << 20, device) if host_mb and policies else None, followed)
 
 
 def _wait_ms(raw: str) -> float:
@@ -583,7 +584,7 @@ class Worker:
 
         layout = replace(layout, side_keys=frozenset(self.engine_manager.side_keys))
         self.layout = layout
-        self._rebuilds = _make_rebuilds(model, model_config, my_walks, self.device)
+        self._rebuilds = _make_rebuilds(model, model_config, my_walks, self.device, layout.followed_nodes)
         services = WorkerServices(
             worker_id=worker_id,
             device=device,
@@ -2356,7 +2357,7 @@ class Worker:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        for rid in self._rebuilds.keep_prompts(batch_N.node_batch, spill=self.lockstep.follows(batch_N.node_name)):
+        for rid in self._rebuilds.keep_prompts(batch_N.node_batch, batch_N.batch.incomplete_node_rids):
             engine.keeps_no_ids(batch_N.node_name, rid)
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
