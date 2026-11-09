@@ -1008,8 +1008,9 @@ mask from it, cannot be captured this way.
 ragged prefill wrapper. For a self-attention whose config names neither a backend nor a
 ``flashinfer_backend`` (``None``, the default; an explicit ``auto`` is FlashInfer's own choice), ``AUTO`` first reads the ``ragged_attention`` kernel table
 (``mstar/kernels/tables/ragged_attention/``, see `Tuned kernel configs`_) for the rank's head
-geometry on the GPU, and each wrapper runs the row its first layout's longest query segment
-falls in. On ``sm_103`` the table names torch's cuDNN SDPA (``RaggedAttnBackend.CUDNN``) for
+geometry on the GPU. An eager plan runs the row its layout's longest query segment falls in, so
+one slot can run a different kernel from one layout to the next; a captured bucket runs the row of
+the layout that first plans it. On ``sm_103`` the table names torch's cuDNN SDPA (``RaggedAttnBackend.CUDNN``) for
 klein 4B / 9B and Z-Image's geometries: under a CUDA graph FlashInfer's ``auto`` stays on FA2
 there (its cutlass plan can't be replanned in graph mode, and its cuDNN path needs cuDNN 9.24),
 which is about 4.5x slower at those sizes. The cuDNN wrapper runs a layout of equal-length
@@ -1017,8 +1018,8 @@ segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured o
 the layout it was planned with, so a captured bucket takes it only when the step that plans it
 declares ``AttentionStep(fixed_layout=True)``, and stays on FlashInfer otherwise. The DiT
 scaffold's denoise step declares it (``DenoiseLoopSubmodule.attention_step``): every row of a
-denoise bucket, padding rows included, spans the bucket's tokens; an eager one runs
-unequal segments on FlashInfer. It is self-attention only. A config that names ``backend: cudnn``
+denoise bucket, padding rows included, spans the bucket's tokens. An eager layout of unequal
+segments runs FlashInfer. It is self-attention only. A config that names ``backend: cudnn``
 fails at build where cuDNN can't run it: on a cross-attention or block-causal resource, under
 GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the
 geometry, ``AUTO`` is FlashInfer with its own ``auto`` choice. ``RaggedAttnBackend.DENSE`` plans the same layouts into static

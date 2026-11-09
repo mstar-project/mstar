@@ -9,8 +9,6 @@ stream capture (torch 2.12), so this is the cuDNN kernel a captured graph can
 replay.
 """
 
-from collections.abc import Callable
-
 import torch
 
 from mstar.engine.resources.attn.ragged.wrappers import RaggedPrefillWrapper
@@ -34,24 +32,14 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
 
     A captured graph bakes ``n`` and ``S`` in, so a graph-mode wrapper replays
     only the layout it was first planned with and refuses any other. An eager
-    one runs a layout of unequal segments on ``fallback``, a FlashInfer wrapper
-    built on first need.
+    one takes any layout of equal-length segments; the manager hands a layout
+    of unequal ones to another wrapper.
     """
 
-    def __init__(
-        self,
-        num_qo_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-        fallback: Callable[[], RaggedPrefillWrapper] | None = None,
-        **kwargs,
-    ):
+    def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int, **kwargs):
         if num_qo_heads != num_kv_heads:
             raise ValueError(f"{type(self).__name__} runs MHA only, got {num_qo_heads} q and {num_kv_heads} kv heads")
         super().__init__(num_qo_heads, num_kv_heads, head_dim, **kwargs)
-        self._make_fallback = fallback
-        self._fallback: RaggedPrefillWrapper | None = None
-        self._on_fallback = False
         # (segments, length, causal) this wrapper runs
         self._layout: tuple[int, int, bool] | None = None
 
@@ -69,14 +57,7 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
             self._layout = layout
             return
         if segments is None:
-            if self._make_fallback is None:
-                raise ValueError(f"{type(self).__name__} needs equal-length segments, got {self._describe(cu)}")
-            if self._fallback is None:
-                self._fallback = self._make_fallback()
-            self._fallback.plan(cu, causal=causal)
-            self._on_fallback = True
-            return
-        self._on_fallback = False
+            raise ValueError(f"{type(self).__name__} needs equal-length segments, got {self._describe(cu)}")
         self._layout = (*segments, causal)
 
     @staticmethod
@@ -87,8 +68,6 @@ class CudnnRaggedPrefillWrapper(RaggedPrefillWrapper):
     def run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if self._on_fallback:
-            return self._fallback.run(q, k, v, return_lse=return_lse)
         assert self._layout is not None, f"{type(self).__name__}: run before plan"
         n, seq, causal = self._layout
         rows = n * seq

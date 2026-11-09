@@ -264,11 +264,58 @@ def test_a_row_per_size_class(stub_flashinfer):
     assert type(planned(m, 4192, 4192)) is CudnnRaggedPrefillWrapper
 
 
+BOUNDED_ROWS = ((256, Choice("flashinfer", {"backend": "fa2"})), (4608, Choice("cudnn")), (None, Choice("flashinfer")))
+
+
+def test_one_eager_slot_runs_each_layouts_row(stub_flashinfer):
+    """Every eager plan picks its row, and a (label, slot) keeps a wrapper per implementation."""
+    m = manager_with(BOUNDED_ROWS)
+    fa2 = planned(m, 96, 96)
+    assert type(fa2) is _StubFlashInfer and fa2.backend == "fa2"
+    cudnn = planned(m, 4192, 4192)
+    assert type(cudnn) is CudnnRaggedPrefillWrapper
+    past = planned(m, 8192)
+    assert type(past) is _StubFlashInfer and past.backend == "auto"
+    assert planned(m, 96, 96) is fa2
+    assert planned(m, 4192, 4192) is cudnn
+
+
+def test_an_eager_slot_alternates_cudnn_and_flashinfer(stub_flashinfer):
+    """Equal segments run cuDNN, the next unequal layout FlashInfer, and equal ones cuDNN again."""
+    m = manager_with(CUDNN_ROWS)
+    cudnn = planned(m, 64, 64)
+    assert type(cudnn) is CudnnRaggedPrefillWrapper and cudnn._layout == (2, 64, False)
+    fallback = planned(m, 64, 32)
+    assert type(fallback) is _StubFlashInfer and fallback.backend == "auto" and fallback.planned == [[0, 64, 96]]
+    again = planned(m, 32, 32)
+    assert again is cudnn and cudnn._layout == (2, 32, False)
+
+
+def test_a_size_past_the_last_row_runs_the_default(stub_flashinfer):
+    """A table bounds its measured sizes with a ``"*"`` row naming flashinfer: past them a layout runs what
+    a resource without a table does, on the wrapper a layout cuDNN can't take falls back to."""
+    m = manager_with(BOUNDED_ROWS)
+    past = planned(m, 8192, 8192)
+    assert type(past) is _StubFlashInfer and past.backend == "auto"
+    assert planned(m, 4096, 1024) is past
+    no_table = planned(manager_with(None), 8192, 8192)
+    assert type(no_table) is _StubFlashInfer and no_table.backend == past.backend and no_table.kwargs == past.kwargs
+
+
+def test_a_captured_bucket_picks_its_row_once(stub_flashinfer):
+    m = manager_with(BOUNDED_ROWS)
+    bucket = lease(2, 2 * 4608)
+    w = planned(m, 4608, 4608, lease=bucket)
+    assert type(w) is CudnnRaggedPrefillWrapper and w.accelerator_graph
+    assert planned(m, 4608, 4608, lease=bucket) is w
+    with pytest.raises(ValueError, match="replays the 2 segments of 4608 tokens"):
+        planned(m, 4608, lease=bucket)
+
+
 def test_a_captured_wrapper_is_sized_like_the_flashinfer_one(stub_flashinfer):
     w = planned(manager_with(CUDNN_ROWS), 4608, lease=lease(1, 4608))
     assert type(w) is CudnnRaggedPrefillWrapper
     assert w.accelerator_graph and w.max_total_tokens == 4608 and w.max_num_segments == 1
-    assert w._make_fallback is None
 
 
 def test_a_step_without_a_fixed_layout_keeps_a_captured_bucket_on_flashinfer(stub_flashinfer):
@@ -320,17 +367,6 @@ def test_the_image_dits_leave_their_kernel_to_the_table(model):
     assert resource.config.backend is RaggedAttnBackend.AUTO and resource.config.flashinfer_backend is None
 
 
-def test_an_eager_cudnn_wrapper_falls_back_for_unequal_segments(stub_flashinfer):
-    w = planned(manager_with(CUDNN_ROWS), 64, 64)
-    fallback = w._make_fallback()
-    assert type(fallback) is _StubFlashInfer
-    w._make_fallback = lambda: fallback
-    w.plan(cu(64, 32))
-    assert fallback.planned == [[0, 64, 96]] and w._on_fallback
-    w.plan(cu(32, 32))
-    assert not w._on_fallback and w._layout == (2, 32, False)
-
-
 # --- the cuDNN wrapper's layouts ---------------------------------------------------------------
 
 
@@ -362,9 +398,12 @@ def test_a_captured_cudnn_wrapper_replays_only_its_layout():
         w.plan(cu(4608, 4608), causal=True)
 
 
-def test_a_captured_cudnn_wrapper_needs_equal_segments():
+@pytest.mark.parametrize("graph", [True, False], ids=["captured", "eager"])
+def test_the_cudnn_wrapper_needs_equal_segments(graph):
+    w = graph_cudnn() if graph else CudnnRaggedPrefillWrapper(num_qo_heads=24, num_kv_heads=24, head_dim=128,
+                                                              device=torch.device("cpu"))
     with pytest.raises(ValueError, match="needs equal-length segments"):
-        graph_cudnn().plan(cu(4608, 1024))
+        w.plan(cu(4608, 1024))
 
 
 def test_the_cudnn_wrapper_runs_mha_only():

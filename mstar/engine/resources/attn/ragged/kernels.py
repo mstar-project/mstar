@@ -2,9 +2,11 @@
 
 ``ragged_attention`` is keyed by one rank's head geometry, its rows by the
 longest query segment of a layout (the size class). A ``RaggedAttnBackend.AUTO``
-resource reads its entry once when it is built: each wrapper then runs the row
-its first layout falls in. Where no table has the geometry it keeps FlashInfer's
-ragged prefill and FlashInfer's own ``auto`` choice, as before.
+resource reads its entry once when it is built. An eager plan then runs the row
+its layout falls in, and a captured bucket the row of the layout that first
+plans it (``_RaggedSelfManagerBase``). Where no table has the geometry it keeps
+FlashInfer's ragged prefill and FlashInfer's own ``auto`` choice, as before, and
+a table's ``"*"`` row names ``flashinfer`` for that past its measured sizes.
 
 Rows name ``flashinfer``, with ``{"backend": ...}`` for one of FlashInfer's
 ragged backends, or ``cudnn``, torch's cuDNN SDPA over equal-length segments

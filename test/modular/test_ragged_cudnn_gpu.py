@@ -15,6 +15,7 @@ from mstar.engine.resources import (
     BucketKey,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
+    RaggedAttnBackend,
     Segment,
     SlotLease,
     StepContext,
@@ -31,8 +32,9 @@ DEVICE = torch.device("cuda", 0)
 DTYPE = torch.bfloat16
 D = 128
 # heads, segment length: klein 4B / 9B joint attention (512 text + 4096 image tokens), Z-Image's
-# main, image and caption spans (its captions are padded to a multiple of 32), and Wan2.2-5B's
-# self-attention at 832x480x33, the other dit whose geometry the sm_103 table covers
+# main, image and caption spans (its captions are padded to a multiple of 32), and Wan2.2-TI2V-5B's
+# self-attention at 832x480x33, a third model the sm_103 table reaches, by its geometry (24 heads,
+# klein 4B's entry)
 SIZES = [(24, 4608), (32, 4608), (30, 4192), (30, 4096), (30, 96), (24, 3510)]
 # bf16 kernels sit at ~0.23% rel L2 from fp32 here; the fp32 reference rounded to bf16 is 0.17%
 REL_L2 = 5e-3
@@ -147,19 +149,22 @@ def test_cudnn_takes_strided_views():
     assert rel_l2(w.run(q, k, v), reference(q, k, v, cu(1, seq))) < REL_L2
 
 
-def test_eager_cudnn_runs_unequal_segments_on_its_fallback():
+def test_an_eager_slot_runs_cudnn_then_flashinfer_then_cudnn():
+    """``backend: cudnn`` eagerly: equal segments run cuDNN, the next unequal layout on the same slot
+    FlashInfer, and equal ones cuDNN again, each matching the reference."""
     heads = 24
-    lens = torch.tensor([0, 4608, 4608 + 1024], dtype=torch.int32)
-    q, k, v = qkv(4608 + 1024, heads)
-    ws = Workspace(torch.empty(256 << 20, dtype=torch.uint8, device=DEVICE), "test")
-    w = CudnnRaggedPrefillWrapper(
-        num_qo_heads=heads, num_kv_heads=heads, head_dim=D, device=DEVICE, q_data_type=DTYPE,
-        fallback=lambda: FlashInferRaggedPrefillWrapper(ws, num_qo_heads=heads, num_kv_heads=heads, head_dim=D,
-                                                        device=DEVICE, q_data_type=DTYPE),
-    )
-    w.plan(lens)
-    assert w._on_fallback
-    assert rel_l2(w.run(q, k, v), reference(q, k, v, lens)) < REL_L2
+    spec = RaggedAttentionSpec(resource_key="dit_attn", nodes={"dit"}, config=RaggedAttentionConfig(
+        num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE, backend=RaggedAttnBackend.CUDNN))
+    manager = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    for lens, kind in (([4608, 4608], CudnnRaggedPrefillWrapper), ([4608, 1024], FlashInferRaggedPrefillWrapper),
+                       ([1024, 1024], CudnnRaggedPrefillWrapper)):
+        step = AttentionStep(segments=tuple(Segment(request_id=f"r{i}", label="main", span=n)
+                                            for i, n in enumerate(lens)), causal=False)
+        manager.plan(step, StepContext(request_ids=["r0", "r1"], graph_walk="image_gen", slot=0, capture=False))
+        assert type(manager._current_plan_states["main"]) is kind
+        bounds = torch.tensor([0, lens[0], sum(lens)], dtype=torch.int32)
+        q, k, v = qkv(sum(lens), heads)
+        assert rel_l2(manager.run(q, k, v, label="main"), reference(q, k, v, bounds)) < REL_L2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available() or current_platform.arch() != "sm_103",

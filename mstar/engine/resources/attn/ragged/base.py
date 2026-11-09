@@ -7,13 +7,13 @@ segments of one packed forward. There is nothing to page, nothing to advance,
 and nothing to carry between steps: the resource holds only planned wrappers.
 """
 
-import functools
 import itertools
 import logging
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import NamedTuple
 
 import torch
 
@@ -457,7 +457,7 @@ class _RaggedManagerBase:
 
 
 def _flashinfer_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _RaggedPrefillBase:
-    """The manager's own FlashInfer wrapper, on the row's ``backend`` (the
+    """The FlashInfer manager's own wrapper, on the row's ``backend`` (the
     manager's ``flashinfer_backend`` without one)."""
     backend = (config or {}).get("backend")
     return manager._build_wrapper(label, slot, **({} if backend is None else {"backend": backend}), **graph_kwargs)
@@ -466,9 +466,7 @@ def _flashinfer_wrapper(manager, label: str, slot: int, config, **graph_kwargs) 
 def _cudnn_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _RaggedPrefillBase:
     from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper
 
-    # an eager one runs a later layout of unequal segments on the manager's own wrapper
-    fallback = None if graph_kwargs else functools.partial(manager._build_wrapper, label, slot)
-    return CudnnRaggedPrefillWrapper(**manager._kwargs, fallback=fallback, **graph_kwargs)
+    return CudnnRaggedPrefillWrapper(**manager._kwargs, **graph_kwargs)
 
 
 @dataclass(frozen=True)
@@ -489,6 +487,11 @@ WRAPPER_FACTORIES: Mapping[str, WrapperFactory] = MappingProxyType({
     "cudnn": WrapperFactory(_cudnn_wrapper, layout_bound=True),
 })
 
+# What a layout runs where its row can't take it, and what a resource without a
+# table runs: FlashInfer at the resource's ``flashinfer_backend``. A table bounds
+# its measured sizes with a ``"*"`` row naming it.
+DEFAULT_ROW = Choice("flashinfer")
+
 
 def uniform_lengths(lens: Sequence[int]) -> bool:
     """Every non-empty segment has one length and the empty ones come last."""
@@ -498,17 +501,27 @@ def uniform_lengths(lens: Sequence[int]) -> bool:
     return n > 0 and all(length == lens[0] for length in lens[:n])
 
 
+class _EagerRowKey(NamedTuple):
+    """An eager wrapper of a table-reading manager: one per (label, slot) and
+    implementation (a row's ``Choice.describe()``), so a slot can run another
+    kernel at its next plan."""
+
+    label: str
+    slot: int
+    impl: str
+
+
 class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     """Self-attention: every label in the step is its own layout, each segment
     attending within itself.
 
     With ``kernel_rows`` (a ``ragged_attention`` table's, or the ``cudnn``
-    backend's one row) a wrapper runs the row its layout's longest query segment
-    falls in, built by that row's ``WRAPPER_FACTORIES`` entry, for its lifetime:
-    a captured graph can't switch kernels, and an eager wrapper keeps the
-    captured ones' rule. A layout-bound row takes only equal-length segments, and
-    under capture only a step that declares ``AttentionStep.fixed_layout``;
-    otherwise the wrapper is the manager's own, at its defaults.
+    backend's one row), a layout runs the row its longest query segment falls
+    in, through that row's ``WRAPPER_FACTORIES`` entry. A layout-bound row takes
+    only equal-length segments, and a captured bucket only from a step that
+    declares ``AttentionStep.fixed_layout``; otherwise the layout runs
+    ``DEFAULT_ROW``. Eagerly every plan picks its row. A captured bucket picks
+    once, at the plan that builds its wrapper: a graph can't switch kernels.
     """
 
     def __init__(
@@ -521,6 +534,7 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     ):
         super().__init__(device=device, dtype=dtype, config=config, key=key)
         self._kernel_rows = kernel_rows
+        self._eager_row_states: dict[_EagerRowKey, _RaggedPrefillBase] = {}
         if kernel_rows is None:
             return
         unknown = sorted({choice.impl for _, choice in kernel_rows} - WRAPPER_FACTORIES.keys())
@@ -547,33 +561,33 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     def _table_wrapper(
         self, lease: SlotLease | None, slot: int, label: str, spans: list[int], step: AttentionStep,
     ) -> _RaggedPrefillBase:
-        """The (label, slot)'s wrapper, built on its first plan for the row that
-        layout runs. A captured bucket is built on the step that first plans it."""
         if lease is not None:
-            key, cache = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label), self._cg_plan_states
-        else:
-            key, cache = EagerSlotKey(label=label, slot=slot), self._eager_plan_states
-        wrapper = cache.get(key)
-        if wrapper is not None:
+            key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+            wrapper = self._cg_plan_states.get(key)
+            if wrapper is None:
+                choice = self._row_for(spans, layout_bound_ok=step.fixed_layout)
+                wrapper = self._cg_plan_states[key] = self._build_row(
+                    choice, label, lease.slot, **self._graph_kwargs(lease.bucket),
+                )
             return wrapper
-        graph_kwargs = {} if lease is None else self._graph_kwargs(lease.bucket)
-        choice = self._row_for(spans, layout_bound_ok=lease is None or step.fixed_layout)
-        if choice is None:
-            wrapper = self._build_wrapper(label, slot, **graph_kwargs)
-        else:
-            wrapper = WRAPPER_FACTORIES[choice.impl].build(self, label, slot, choice.config, **graph_kwargs)
-        cache[key] = wrapper
+        choice = self._row_for(spans, layout_bound_ok=True)
+        key = _EagerRowKey(label=label, slot=slot, impl=choice.describe())
+        wrapper = self._eager_row_states.get(key)
+        if wrapper is None:
+            wrapper = self._eager_row_states[key] = self._build_row(choice, label, slot)
         return wrapper
 
-    def _row_for(self, spans: list[int], layout_bound_ok: bool) -> Choice | None:
-        """The row a layout of ``spans`` runs; None for the manager's own wrapper.
-        ``layout_bound_ok``: the wrapper may bake this layout in (eager, or a
-        captured bucket whose step fixes its layout)."""
+    def _build_row(self, choice: Choice, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
+        return WRAPPER_FACTORIES[choice.impl].build(self, label, slot, choice.config, **graph_kwargs)
+
+    def _row_for(self, spans: list[int], layout_bound_ok: bool) -> Choice:
+        """The row a layout of ``spans`` runs. ``layout_bound_ok``: its wrapper may
+        bake the layout in (eager, or a captured bucket whose step fixes it)."""
         from mstar.engine.resources.attn.ragged.kernels import choice_for
 
         choice = choice_for(self._kernel_rows, max(spans, default=0))
         if WRAPPER_FACTORIES[choice.impl].layout_bound and not (layout_bound_ok and uniform_lengths(spans)):
-            return None
+            return DEFAULT_ROW
         return choice
 
 
