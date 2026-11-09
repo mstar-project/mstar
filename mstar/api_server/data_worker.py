@@ -16,6 +16,7 @@ from typing import NamedTuple
 
 import torch
 
+from mstar.api_server.media_io import remove_uploads
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 
@@ -260,7 +261,10 @@ class PreprocessWorker:
         model_config: dict | None = None,
         enable_nvtx: bool=False,
         is_pending: Callable[[str], bool] | None = None,
+        upload_dir: str | os.PathLike | None = None,
     ):
+        """``upload_dir`` is where the API server saves uploads: a request refused in
+        preprocessing has its files there removed at once."""
         check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -335,6 +339,7 @@ class PreprocessWorker:
                 enable_nvtx=enable_nvtx,
                 conductor_outbox=self.conductor_outbox,
                 is_pending=is_pending,
+                upload_dir=upload_dir,
             )
         )
         self.thread.start()
@@ -664,6 +669,9 @@ class PreprocessWorkerThread:
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
     MAX_APPENDS_PER_PASS = 32
+    # None (a thread built without __init__) leaves a refused request's uploads to the
+    # HTTP layer's deferred cleanup
+    upload_dir: str | os.PathLike | None = None
 
     def __init__(
         self,
@@ -688,8 +696,10 @@ class PreprocessWorkerThread:
         worker_metrics_requested: threading.Event | None = None,
         conductor_outbox: queue.Queue | None = None,
         is_pending: Callable[[str], bool] | None = None,
+        upload_dir: str | os.PathLike | None = None,
     ):
         self.conductor_outbox = conductor_outbox
+        self.upload_dir = upload_dir
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -1392,6 +1402,7 @@ class PreprocessWorkerThread:
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
         sequence: int | None = None, abort: bool = True, traceback: bool = True,
+        intake: bool = False,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -1409,12 +1420,16 @@ class PreprocessWorkerThread:
 
         ``traceback`` False logs one line, for an error already logged where
         it happened.
+
+        ``intake`` marks a failure while taking client input in (a request or
+        an append), where a ValueError or TypeError refuses it (a 400). Past
+        intake one is a server bug like any other error (a 500).
         """
+        status = 400 if intake and isinstance(exc, (ValueError, TypeError)) else 500
         text, _ = client_error_text(
             exc, f"{stage} failed for request {request_id}", log=logger,
-            traceback=traceback,
+            traceback=traceback, refusal=status < 500,
         )
-        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
         chunks = [
             ResultChunk(
                 request_id=request_id,
@@ -1965,7 +1980,7 @@ class PreprocessWorkerThread:
             try:
                 self._process_stream_input(pre_input)
             except Exception as exc:  # noqa: BLE001 — must reach the client
-                self._fail_request(pre_input.request_id, exc, "stream input")
+                self._fail_request(pre_input.request_id, exc, "stream input", intake=True)
             return
         profile = None
         try:
@@ -1986,11 +2001,15 @@ class PreprocessWorkerThread:
         if profile is not None:
             profile.failed = True
             self.profile_queue.put(profile)
+        # Nothing reads a refused request's files again, so they go now rather than with
+        # the HTTP layer's deferred cleanup, and before the client hears of the refusal.
+        if self.upload_dir is not None:
+            remove_uploads(pre_input.file_paths, self.upload_dir)
         # A request whose media load or prompt processing fails never
         # reaches the conductor, so nothing downstream would ever complete
         # it; surface the failure as an error chunk instead of leaving the
         # client to wait out the server timeout.
-        self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False)
+        self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False, intake=True)
         # Never reached the conductor, so there are no remote readers to
         # race: hard-drop the (possibly persisted) input signals directly.
         self._cleanup_request_state(pre_input.request_id, force=True)

@@ -40,6 +40,8 @@ Ported from ``cosyvoice/flow/flow.py`` (``CausalMaskedDiffWithDiT``),
 
 from __future__ import annotations
 
+import contextlib
+import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -50,9 +52,34 @@ from torch import nn
 
 from mstar.model.chatterbox.components.s3gen_cfm import CausalConditionalCFM
 from mstar.model.chatterbox.loader import load_component
-from mstar.model.cosyvoice3.components.dit import DiT, chunk_attention_mask
+from mstar.model.cosyvoice3.components.dit import DiT, PackedRows, chunk_attention_mask
 from mstar.model.cosyvoice3.config import FlowConfig
 from mstar.utils.h2d import PinnedStager
+
+_native_lock = threading.Lock()
+_native_holders = 0
+_native_saved = True
+
+
+@contextlib.contextmanager
+def native_convolutions():
+    """Convolutions off cuDNN within the block. ``cudnn.enabled`` is process-wide and
+    the reference encoder runs on the main thread while the GPU thread convolves, so
+    windows nest by count rather than each restoring what it saw on entry, and only
+    ``enabled`` changes (``cudnn.flags`` would also reset TF32 and benchmark mode)."""
+    global _native_holders, _native_saved
+    with _native_lock:
+        if _native_holders == 0:
+            _native_saved = torch.backends.cudnn.enabled
+            torch.backends.cudnn.enabled = False
+        _native_holders += 1
+    try:
+        yield
+    finally:
+        with _native_lock:
+            _native_holders -= 1
+            if _native_holders == 0:
+                torch.backends.cudnn.enabled = _native_saved
 
 
 @dataclass
@@ -91,6 +118,17 @@ class SolveInputs(NamedTuple):
     streaming: torch.Tensor  # [B] bool, block-causal attention
 
 
+class NewFramesInputs(NamedTuple):
+    """A batch's new frames, packed: the fixed-shape input of ``solve_new_frames``.
+    Padded buffers leave zeros past the real tokens and rows (``PackedRows``)."""
+
+    noise: torch.Tensor  # [T, 80]
+    mu: torch.Tensor  # [T, 80]
+    cond: torch.Tensor  # [T, 80]
+    spks: torch.Tensor  # [T, 80]
+    rows: PackedRows
+
+
 class PreLookaheadLayer(nn.Module):
     """``conv1`` reads ``pre_lookahead_len`` tokens ahead (zeros past the end),
     ``conv2`` two tokens back; residual."""
@@ -108,7 +146,7 @@ class PreLookaheadLayer(nn.Module):
         # B * L under about 500, cuDNN picks a plan that reserves about 40 GiB
         # of workspace and takes about 155 ms a call (H200, cuDNN 9); the
         # native convolution takes about 0.1 ms and is as close to float64.
-        with torch.backends.cudnn.flags(enabled=False):
+        with native_convolutions():
             x = F.leaky_relu(self.conv1(x))
             x = self.conv2(F.pad(x, (self.conv2.kernel_size[0] - 1, 0)))
         return x.transpose(1, 2) + inputs
@@ -217,6 +255,30 @@ class CosyVoice3Flow(nn.Module):
         mask = chunk_attention_mask(inputs.valid, frames, cfg.dit.static_chunk_size, inputs.streaming)
         noise = self.noise[:, :, :frames].to(self.device, self.dtype).expand(batch, -1, -1).contiguous()
         return self.decoder.solve(inputs.mu, mask, inputs.spks, inputs.cond, noise, n_timesteps)
+
+    @torch.no_grad()
+    def solve_new_frames(
+        self, inputs: NewFramesInputs, tails: torch.Tensor, attend, n_timesteps: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The Euler solve of a batch's new frames, with the K/V of every frame before
+        them in the cache ``attend`` reads: ``[T, 80]`` mel and the rows' next tails.
+        ``tails`` is ``[B, S * 4, K-1, D]``: Euler step, CFG branch, convolution."""
+        estimator, rate = self.decoder.estimator, self.decoder.config.inference_cfg_rate
+        x = inputs.noise
+        t_span = self.decoder.time_grid(n_timesteps, x.device, x.dtype, meanflow=False)
+        depth = estimator.config.depth
+        b, _, width, dim = tails.shape
+        # [S, branch, convolution, B, K-1, D]
+        state = tails.reshape(b, n_timesteps, 2, 2, width, dim).permute(1, 2, 3, 0, 4, 5)
+        next_state = []
+        for i, (t, r) in enumerate(zip(t_span[:-1], t_span[1:], strict=True)):
+            v, tail = estimator.forward_new_frames(
+                x, inputs.cond, inputs.mu, inputs.spks, t, state[i], inputs.rows, attend, i * depth,
+            )
+            next_state.append(tail)
+            v = v.to(x.dtype)
+            x = x + (r - t) * ((1.0 + rate) * v[0] - rate * v[1])
+        return x, torch.stack(next_state).permute(3, 0, 1, 2, 4, 5).reshape(tails.shape)
 
     def row_mels(self, rows: Sequence[CosyVoice3FlowRow], mel: torch.Tensor) -> list[torch.Tensor]:
         """Each row's generated frames ``[80, 2 * settle]`` of a batched solve."""
