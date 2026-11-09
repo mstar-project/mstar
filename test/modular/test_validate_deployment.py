@@ -712,3 +712,9 @@ def test_worker_graph_problems_are_reported_together(tmp_path):
     assert problems[2] == (
         "Resource spec kv nodes ['llm', 'post'] must use the same parallel shape across replicas"
     )
+
+
+@pytest.mark.parametrize("value", [0, -1, "64", True])
+def test_concurrency_limit_must_be_a_positive_integer(tmp_path, value):
+    problems = _problems(_Model(), _cfg(tmp_path, max_concurrent_requests=value))
+    assert any("max_concurrent_requests" in p for p in problems)
