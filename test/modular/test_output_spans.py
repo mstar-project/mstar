@@ -32,7 +32,11 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.submodule_base import BatchedModelOutput, NodeInputs, NodeSubmodule  # noqa: E402
 from mstar.testing_utils.model import StubModel  # noqa: E402
 from mstar.testing_utils.worker import make_worker  # noqa: E402
-from mstar.worker.engine_manager import _refuse_speculated_spans, _refuse_unroutable_withholds  # noqa: E402
+from mstar.worker.engine_manager import (  # noqa: E402
+    _refuse_speculated_spans,
+    _refuse_uninlinable_streams,
+    _refuse_unroutable_withholds,
+)
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.step_executor import PendingBatch, StepExecutor  # noqa: E402
 
@@ -357,6 +361,33 @@ def test_startup_refuses_a_withheld_output_the_worker_cannot_leave_unrouted():
     # the signal loops back only on its own walk; elsewhere it is routed
     other = {NODE: SimpleNamespace(token_stop=stop, device_loopback=loopback._replace(walk="other"))}
     _refuse_unroutable_withholds(other, graph(StreamingGraphEdge(next_node="Codec", name="token")))
+
+
+@pytest.mark.parametrize("conn, refused", [
+    ({}, False),
+    ({"join_dim": 0}, True),
+    ({"consumer_walk": lambda ctx: WALK}, True),
+], ids=["plain", "joined", "walk_driven"])
+def test_startup_refuses_an_inline_stream_whose_items_cannot_go_as_values(conn, refused):
+    """A signal sent down its stream inline may have no tensor to fall back on,
+    so its stream must take items as values: not joined, not walk-driven."""
+    from mstar.streaming.chunk_policy import FixedChunkPolicy
+    from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+
+    class _Streams(_Graph):
+        def get_partition_topology(self):
+            return PartitionTopology(partitions=["a", "b"], connections=[
+                Connection("a", "b", "token", lambda: FixedChunkPolicy(chunk_size=1), **conn),
+            ])
+
+    node = GraphNode(name=NODE, input_names=["x"], outputs=[StreamingGraphEdge(next_node="Codec", name="token")])
+    model = _Streams(Loop(name="loop", section=node, max_iters=4, outputs=[]))
+    talker = {NODE: SimpleNamespace(inline_stream_signals=lambda walk: {"token": "token"})}
+    if refused:
+        with pytest.raises(ValueError, match="sends 'token' inline"):
+            _refuse_uninlinable_streams(talker, model)
+    else:
+        _refuse_uninlinable_streams(talker, model)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="stages a CUDA span to pinned host memory")

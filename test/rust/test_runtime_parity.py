@@ -1558,6 +1558,42 @@ def test_a_sibling_graph_chunk_is_held_once_not_twice(streams_to_sibling):
     assert book.can_gc(1), "still held after its only reader released"
 
 
+def test_a_local_streams_inline_items_go_to_its_buffer_by_value(streams_to_sibling):
+    """A step that kept its rows on the device routes no tensor; its streamed
+    signal's inline values reach this worker's buffer by value, one per row,
+    with nothing staged. A row that also stored a tensor keeps the tensor
+    path locally, which is what the consumer would read anyway."""
+    rt, book, store = streams_to_sibling
+    rids = [
+        rt.add_request(
+            request_id=f"r{i}", partition="default", graph_walk=WALK,
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
+        )
+        for i in (1, 2)
+    ]
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM")] * 2))
+    rt.pop_rids("LLM", WALK, rids)
+    book.put_tensor(1, _info(1))
+    book.increment_ref(1, 1)
+
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="LLM",
+            output_signals=["new_token"],
+            wg_ids=ParallelList(rids, [0, 0]),
+            tensors=[1], num_tensors=[1, 0],
+            inline_signal="new_token", inline_values=[5, 6],
+        ),
+    )
+    assert out.local_streaming_by_signal["new_token"].keys == [rids[0]]
+    assert out.local_streaming_by_signal["new_token"].values == [1]
+    assert out.local_stream_values_by_signal["new_token"].keys == [rids[1]]
+    assert out.local_stream_values_by_signal["new_token"].values == [6]
+    assert out.register_uuids == []
+
+
 def test_a_row_with_no_tensor_on_a_stream_sends_it_no_item(streams_to_sibling):
     """A row may route zero tensors on a streaming signal (its producer
     withheld that step's item): it gets no chunk, the rest of the batch

@@ -683,6 +683,15 @@ class RustGraphRuntime(GraphRuntime):
                     strict=True,
                 )
             },
+            local_stream_values_by_signal={
+                name: ParallelList(rids, values)
+                for name, rids, values in zip(
+                    out.local_stream_value_signals,
+                    out.local_stream_value_rids,
+                    out.local_stream_values,
+                    strict=True,
+                )
+            },
             rids_needing_request_info=frozenset(out.rids_needing_request_info),
             freed_inputs=FreedTensors(
                 out.freed_input_uuids, out.freed_input_registered,

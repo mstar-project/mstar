@@ -100,8 +100,9 @@ class _Mesh:
             [], [],
         )
 
-    def run(self, rid, uuids, **send_kwargs):
-        """Ingest, pop, complete and send. Returns the frames each peer got."""
+    def run(self, rid, uuids, route=None, **send_kwargs):
+        """Ingest, pop, complete and send. Returns the frames each peer got.
+        ``route``: more of the route's input (an inline signal and its values)."""
         self.rt.ingest_inputs_batch(_one_signal(rid, "prompt", "only"))
         self.rt.pop_rids("only", WALK, [rid])
         signals = self.rt.get_output_signals("only", WALK)
@@ -112,6 +113,7 @@ class _Mesh:
             "num_tensors": [
                 len(uuids) if s == signals[0] else 0 for s in signals
             ],
+            **(route or {}),
         })
         args = dict(
             request_infos=[(rid, None)], new_token_counts=[], profiling=[],
@@ -1111,6 +1113,24 @@ def test_a_streamed_edge_goes_as_the_edge_items_python_builds(tmp_path):
     assert frame == _sent(WorkerMessage(
         message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build(),
     ))
+
+
+@pytest.mark.parametrize("with_tensor", [False, True], ids=["rows_only", "stored"])
+def test_a_streamed_value_goes_as_the_value_frame_python_builds(tmp_path, with_tensor):
+    """A streamed edge whose signal rides inline goes to a peer as a value row
+    of EDGE_ITEMS: no descriptor, whether or not the step stored a tensor, and
+    the frame decodes to the one EdgeItemsBuilder.add_values makes. It counts
+    as one item sent, as a descriptor would."""
+    mesh = _stream_mesh(tmp_path)
+    rid = mesh.admit(wgs=(WG_ID, 1), workers=(ME, PEER))
+    if with_tensor:
+        _put(mesh, 1, _source_node_name="only", _source_graph_walk=WALK)
+    got = mesh.run(rid, uuids=[1] if with_tensor else [], route={"inline_signal": "out", "inline_values": [7]})
+    (frame,) = got[PEER]
+    builder = EdgeItemsBuilder("default")
+    assert builder.add_values("r1", "out", "remote", None, [7], ("", ME, "only", 1, 0))
+    assert frame == _sent(WorkerMessage(message_type=WorkerMessageType.EDGE_ITEMS, body=builder.build()))
+    assert got["conductor"][0].body.stream_items_sent == {"out": {PEER: 1}}
 
 
 def test_a_streamed_row_unlike_the_frame_goes_as_input_signals(tmp_path):

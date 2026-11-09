@@ -3,6 +3,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.communication.tensors import NameToTensorList, TensorStore
@@ -535,6 +536,10 @@ class RouteOutput(NamedTuple):
     # tear down -- see ``cleanup_consumed_inputs``. Empty in the normal order,
     # where that call has already taken them.
     freed_inputs: FreedTensors = FreedTensors.none()
+    # Inline items of a local stream whose edge carried no tensor (the step
+    # kept its rows on the device): edge name -> (rid, value) per item, for
+    # the request's stream buffer.
+    local_stream_values_by_signal: Mapping[str, ParallelList[int, int]] = MappingProxyType({})
 
 
 
@@ -681,7 +686,8 @@ def _route_needs_python(route: RouteOutput) -> bool:
     return bool(
         route.rids_needing_request_info is None or route.rids_needing_request_info
         or route.register_uuids or route.new_token_output_idxs
-        or route.local_streaming_by_signal or route.freed_inputs.uuids
+        or route.local_streaming_by_signal or route.local_stream_values_by_signal
+        or route.freed_inputs.uuids
     )
 
 

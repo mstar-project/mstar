@@ -1222,6 +1222,19 @@ class NodeSubmodule(torch.nn.Module, ABC):
         del graph_walk
         return {}
 
+    def inline_stream_signals(self, graph_walk: str) -> dict[str, str]:
+        """``inline_client_signals`` for a streaming edge to another node: the
+        signal's value is one scalar per row that the stop check already
+        copies to the host (signal name -> its row-addressed stop buffer), and
+        its consumer takes a window of the stream as a tensor of those values.
+        The worker then sends each item as its value, in the step's one frame
+        per consumer worker (``EdgeItems.values``), with nothing to stage, read
+        or acknowledge; a walk whose other outputs all stay on the device then
+        runs rows-only (``device_loopback_signals``). Not for a stream whose
+        items are joined or drive the consumer's walk. Empty by default."""
+        del graph_walk
+        return {}
+
     def unpack_packed_outputs(
         self,
         static_output: dict,

@@ -182,6 +182,30 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
+def _refuse_uninlinable_streams(submodules: dict, model: Model) -> None:
+    """A signal a node sends down its streams inline
+    (``NodeSubmodule.inline_stream_signals``) may have no tensor to fall back
+    on: a step that keeps its rows on the device stores none. So each of its
+    streams must be one whose items can ride a frame as values: not joined
+    from a chunked producer's pieces, and not driving its consumer's walk,
+    which only a tensor's descriptor carries."""
+    topology = model.get_partition_topology()
+    conns = {c.edge_name: c for c in (topology.connections if topology else [])}
+    for walk, section in model.get_graph_walk_graphs().items():
+        for name, node in section.get_nodes().items():
+            submodule = submodules.get(name)
+            inline = submodule.inline_stream_signals(walk) if submodule is not None else {}
+            for edge in node.outputs:
+                if edge.name not in inline or not edge.is_streaming:
+                    continue
+                conn = conns.get(edge.name)
+                if conn is not None and (conn.join_dim is not None or conn.consumer_walk is not None):
+                    raise ValueError(
+                        f"{type(model).__name__}: {name!r} sends {edge.name!r} inline in walk {walk!r}, "
+                        "but its stream joins its items or drives its consumer's walk"
+                    )
+
+
 def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
     """The nodes whose node groups set ``side_stream: true``. A node listed by
     several groups, one per graph walk, must get the same answer from each."""
@@ -382,6 +406,7 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
+        _refuse_uninlinable_streams(submodules, model)
         side_keys = _side_lane_keys(
             submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),
             parallel_groups, (device_capability or DeviceCapability.of(device)).is_accelerator,
