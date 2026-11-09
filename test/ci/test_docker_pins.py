@@ -61,16 +61,26 @@ class DockerPinTests(unittest.TestCase):
             self.assertIsNotNone(pin, f"{path.name}: no setuptools floor in the .[all] install")
             self.assertGreaterEqual(version(pin.group(1)), build_floor, path.name)
 
-    def test_asr_pins_the_images_torch_and_torchcodec_pair(self):
+    def test_asr_pins_the_images_torch_stack(self):
         # torchcodec declares no torch requirement and fails to load next to another torch
-        # (0.17 on torch 2.10, 0.10 on torch 2.12), so the extra pins both halves of the pair
+        # (0.17 on torch 2.10, 0.10 on torch 2.12), and torchaudio's floor-only metadata let
+        # torch 2.10 take torchaudio 2.11, so the extra pins all three as the images do
         args = build_args(DOCKERFILES[0])
         extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
         asr = extras["asr"]
         major, minor = version(args["TORCH_VERSION"])[:2]
         self.assertIn(f"torch>={args['TORCH_VERSION']},<{major}.{minor + 1}", asr)
+        audio_major, audio_minor = version(args["TORCHAUDIO_VERSION"])[:2]
+        self.assertIn(f"torchaudio=={audio_major}.{audio_minor}.*", asr)
         codec_minor = version(args["TORCHCODEC_VERSION"])[1]
         self.assertIn(f"torchcodec==0.{codec_minor}.*", asr)
+
+    def test_no_requirement_names_triton(self):
+        # CUDA torch pins the Triton it was built with; a bare "triton" beside it let uv's
+        # --torch-backend=auto pick the newest Triton and a CPU torch for [glm], [pi05] and [all]
+        project = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]
+        for group, reqs in ({"dependencies": project["dependencies"]} | project["optional-dependencies"]).items():
+            self.assertFalse([r for r in reqs if re.match(r"triton\b", r, re.I)], group)
 
     def test_every_pillow_requirement_has_the_same_floor(self):
         extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]

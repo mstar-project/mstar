@@ -38,7 +38,10 @@ dependencies = [
     "requests",
     "torch>=2.10.0,<2.13.0",
     "torchvision>=0.25.0",
-    "torchaudio>=2.10.0",
+    # torchaudio 2.11.1 needs a newer torch than its metadata says (torch>=2.11): its
+    # libtorchaudio.so needs stable-ABI symbols torch 2.11 and 2.12 don't export, so it
+    # fails to load, and serving with it, since transformers imports torchaudio.
+    "torchaudio>=2.10.0,!=2.11.1",
     "uvicorn",
     # uvicorn serves WebSockets (/v1/realtime) only with a ws library installed
     "websockets",
@@ -309,7 +312,6 @@ pi05 = [
     "mooncake-transfer-engine>=0.3.13.post1",
     "safetensors",
     "transformers",
-    "triton",
 ]
 
 vjepa2 = [
@@ -401,8 +403,10 @@ asr = [
     # decodes WAV / FLAC / OGG / MP3 uploads without FFmpeg (torchcodec takes the rest)
     "soundfile",
     # torchcodec doesn't declare its torch requirement and loads only next to the torch
-    # it was built for, so the extra pins the pair the Dockerfiles ship (torch 2.10 with 0.10)
+    # it was built for, so the extra pins the set the Dockerfiles ship (torch 2.10 with
+    # torchcodec 0.10, and torchaudio 2.10, since 2.11 is built for torch 2.11)
     "torch>=2.10.0,<2.11",
+    "torchaudio==2.10.*",
     "torchcodec==0.10.*",
     "transformers",
     "datasets",
@@ -418,7 +422,6 @@ glm = [
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     "safetensors",
     "transformers",
-    "triton",
 ]
 
 all = [
@@ -444,7 +447,6 @@ all = [
     # and Qwen3-Omni's vision encoder needs transformers.vision_utils
     "transformers>=5.18",
     "safetensors",
-    "triton",
     "qwen-omni-utils",
     "audioread",  # see the qwen3_omni extra
     # qwen-tts is installed separately with --no-deps; see the [qwen3_tts] extra.
