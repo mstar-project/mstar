@@ -2006,7 +2006,10 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 ``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot's. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it.
+Higgs Audio, Qwen3-ASR and Whisper declare it. A decode step whose token also streams to
+another node keeps only the loop-back on the device: give the loop-back its own signal
+(MiniCPM-o's TTS loops back ``tts_next`` and streams ``tts_code`` to the vocoder), and the
+worker routes that signal without a tensor while the step's other outputs go as tensors.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are
