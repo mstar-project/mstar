@@ -259,17 +259,13 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 """
 
 
-def free_offers(gpus, max_usd_per_hour=None, provider=None):
+def free_offers(gpus, max_usd_per_hour=None):
     """(the offers that can start now, the listing they came from): `gpu.py offers`, keeping those under
-    `max_usd_per_hour` (default gpu.py's cap) and, when `provider` is given, only its own. check=False:
-    offers exits 1 with its JSON when something errored and nothing has an offer, which is "no GPUs"
-    here too, with the errors listed."""
+    `max_usd_per_hour` (default gpu.py's cap). check=False: offers exits 1 with its JSON when something
+    errored and nothing has an offer, which is "no GPUs" here too, with the errors listed."""
     listing = json.loads(gpu("offers", "--gpus", str(gpus), "--json", check=False).stdout)
     cap = listing["max_usd_per_hour"] if max_usd_per_hour is None else max_usd_per_hour
-    return [o for o in listing["offers"]
-            if o["usd_per_hour"] <= cap and o["availability"] != "none"
-            and not str(o["availability"]).startswith("busy")
-            and provider in (None, o["provider"])], listing
+    return [o for o in listing["offers"] if o["usd_per_hour"] <= cap and o["availability"] != "none"], listing
 
 
 def launch_first(offers, launch):
@@ -366,7 +362,7 @@ def refresh(out, runner_temp, tag, volume, gpus, hours, models, skip, weights, m
     main_sha = bot.run(["git", "rev-parse", "HEAD"]).stdout.strip()
     (lt / "run.json").write_text(json.dumps({"repo": github_repository, "main_sha": main_sha, "models": models,
                                              "skip": skip, "weights": weights}))
-    free, listing = free_offers(gpus, float(max_usd) * 2, "eras")
+    free, listing = free_offers(gpus, float(max_usd) * 2)  # configure turned every provider but Eras off
     if not free:
         print(f"::error::No Eras listing with {gpus} GPUs free now: {json.dumps(listing['errors'])}")
         sys.exit(1)

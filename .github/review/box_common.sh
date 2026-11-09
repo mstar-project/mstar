@@ -5,7 +5,7 @@
 # field NAME: one field of run.json.
 field() { python3 -c "import json; print(json.load(open('$IN/run.json'))['$1'])"; }
 
-# On Eras the Pod is the only copy of the results: stay up until the runner has them (15 min at most).
+# The Pod is the only copy of the results: stay up until the runner has them (15 min at most).
 await_collection() {
   for _ in $(seq 90); do [ -e "$OUT/collected" ] && break; sleep 10; done
 }
