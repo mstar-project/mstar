@@ -129,6 +129,12 @@ def test_a_fatal_device_failure_stops_the_worker_at_the_report():
     assert w.sent == []
 
 
+def test_a_fatal_device_error_with_no_rows_in_flight_still_stops_the_worker():
+    w = _worker()
+    with pytest.raises(SystemExit, match="fatal device error"):
+        w.pipeline._handle_error(torch.AcceleratorError("illegal memory access"), (None, None), None, None)
+
+
 @pytest.mark.parametrize("exc, status", [
     (TypeError("not iterable"), 500),
     (HTTPException(status_code=404, detail="gone"), 404),

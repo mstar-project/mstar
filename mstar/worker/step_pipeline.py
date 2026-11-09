@@ -804,6 +804,8 @@ class StepPipeline:
         err = RequestError.from_exception(
             exc, f"Worker {self.worker_id} error in main loop", log=logger, whole_step=True,
         )
+        # before the rows: there may be none to carry this to the report
+        self._stop_if_fatal(err)
 
         # the chain's rows: a side lane's step fails on its own (``_fail_side``)
         failed_rids: set[int] = set(self._rows_by_lane.get(CHAIN_LANE, ()))
@@ -877,16 +879,20 @@ class StepPipeline:
         self.lifecycle.fail(errors)
         self._report_failures()
 
+    def _stop_if_fatal(self, err: RequestError) -> None:
+        """A sticky device fault fails all later work here. The conductor's
+        dead-worker check fails the rest."""
+        if err.fatal:
+            raise SystemExit(f"Worker {self.worker_id}: fatal device error ({err.message})")
+
     def _report_failures(self) -> None:
         """Tell the conductor of the failures ``RequestLifecycle`` has recorded,
         and stop what the scheduler has queued for them."""
         errors = self.lifecycle.take_failures()
         if not errors:
             return
-        fatal = next((err for err in errors.values() if err.fatal), None)
-        if fatal is not None:
-            # The conductor's dead-worker check fails the rest.
-            raise SystemExit(f"Worker {self.worker_id}: fatal device error ({fatal.message})")
+        for err in errors.values():
+            self._stop_if_fatal(err)
         wire_errors = {self._graph_runtime.get_rid_string(rid): msg for rid, msg in errors.items()}
         for wire_rid, msg in wire_errors.items():
             logger.error("Worker %s failing request %s: %s", self.worker_id, wire_rid, msg)
