@@ -1093,8 +1093,7 @@ def test_the_worker_builds_its_server_on_the_deployment_config(monkeypatch, tmp_
     path = tmp_path / "c.yaml"
     path.write_text(yaml.safe_dump(config))
     seen = {}
-    topology = SimpleNamespace(client_connections=lambda: [])  # not a full-duplex model
-    model = SimpleNamespace(get_partition_topology=lambda: topology)
+    model = SimpleNamespace()
     monkeypatch.setattr("mstar.model.registry.get_model_class", lambda name: lambda **kw: model)
     monkeypatch.setattr(entrypoint, "deployment_cpu_plan", lambda c: None)
     monkeypatch.setattr(worker.cpus, "install", lambda plan: None)
