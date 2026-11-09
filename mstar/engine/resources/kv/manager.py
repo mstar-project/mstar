@@ -4039,6 +4039,7 @@ class KVManager(AttentionResource):
             if allotment is not None:
                 self._unused -= allotment.remaining
             self._asks.pop(rid, None)
+            self._stalled.discard(rid)
             if rid in self._streams:
                 for stream in self._streams[rid].values():
                     self._release_lease(rid, stream)
@@ -4065,7 +4066,6 @@ class KVManager(AttentionResource):
                     del self._victims[victim]
                     self._hosted.discard(victim)
             self._ran_short.pop(rid, None)
-            self._stalled.discard(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
