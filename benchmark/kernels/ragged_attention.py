@@ -43,6 +43,8 @@ CANDIDATES = (
 )
 # what a resource without a table row runs: FlashInfer's own `auto`
 DEFAULT = Choice("flashinfer")
+# the fp32 scores the reference holds at once
+REF_SCORE_BYTES = 8 << 30
 
 
 class Problem:
@@ -61,12 +63,18 @@ class Problem:
         if self._ref is None:
             tf32 = torch.backends.cuda.matmul.allow_tf32
             torch.backends.cuda.matmul.allow_tf32 = False
+            # math SDPA holds fp32 scores for every head it is given, [H, S, S]: a few heads at a
+            # time keeps that near REF_SCORE_BYTES, so the reference fits at 32k-64k tokens
+            step = max(1, REF_SCORE_BYTES // (4 * self.seq * self.seq))
             try:
                 q, k, v = (t.float().view(self.n, self.seq, self.heads, self.head_dim).transpose(1, 2)
                            for t in (self.q, self.k, self.v))
                 with sdpa_kernel(SDPBackend.MATH):
-                    out = torch.cat([F.scaled_dot_product_attention(q[i:i + 1], k[i:i + 1], v[i:i + 1])
-                                     for i in range(self.n)])
+                    out = torch.cat([
+                        torch.cat([F.scaled_dot_product_attention(q[i:i + 1, h:h + step], k[i:i + 1, h:h + step],
+                                                                  v[i:i + 1, h:h + step])
+                                   for h in range(0, self.heads, step)], dim=1)
+                        for i in range(self.n)])
             finally:
                 torch.backends.cuda.matmul.allow_tf32 = tf32
             self._ref = out.transpose(1, 2).reshape(self.n * self.seq, self.heads, self.head_dim)
