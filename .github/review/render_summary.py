@@ -241,6 +241,9 @@ def inline_findings(pages):
     return {str(first.get("databaseId", "")): priority for first, priority, _ in bot_threads(pages)}
 
 
+EDITED = "edited after the bot posted it; a person decides"
+
+
 def open_findings(review, pages, stacked):
     """(where, priority, what) of every open finding: the bot's inline threads, outdated ones too, this
     run's findings outside the diff and the earlier ones `carried` added to them, and anything else a
@@ -264,7 +267,7 @@ def open_findings(review, pages, stacked):
         if ref in cleared and not edited:
             continue
         where = ":".join(str(x) for x in (first.get("path"), first.get("line")) if x) or f"inline {ref}"
-        found.append((where, "P0", "someone edited this finding after the bot posted it; a person decides") if edited
+        found.append((where, "P0", EDITED) if edited
                      else (where, priority, what(ref, text.strip().split("\n")[0])))
         counted.add(ref)
     found += [(f"outside the diff, {f['location']}", f["priority"], what(f["location"], f["claim"]))

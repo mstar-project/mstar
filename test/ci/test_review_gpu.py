@@ -252,9 +252,9 @@ class TestCarry(unittest.TestCase):
                                      ({"inline": {"4": "P2"}}, (), "deleted or retagged since the bot"),
                                      ({"inline": {"4": "P2"}}, [thread(4, "**[P3]** retagged")],
                                       "deleted or retagged since the bot"),
-                                     ({}, [thread(4, "**[P3]** x", edited="2026-11-09T00:00:00Z")], "inline 4 (P0)"),
+                                     ({}, [thread(4, "**[P3]** x", edited="t")], "inline 4 (P0, edited"),
                                      ({"prior_findings": [{"ref": "4", "status": "fixed", "why": "w"}]},
-                                      [thread(4, "**[P3]** x", edited="2026-11-09T00:00:00Z")], "inline 4 (P0)")]:
+                                      [thread(4, "**[P3]** x", edited="t")], "inline 4 (P0, edited")]:
             with self.subTest(why):
                 self.assertEqual(self.carry(False, "full", ["correctness"], [], "", review=review,
                                             threads=threads)[0], {"gated": "true"}, "a box would start")
@@ -572,6 +572,18 @@ class TestPost(unittest.TestCase):
         self.assertEqual(gated.count("<!--"), 0, "the review's text could forge a passing live test")
         self.assertEqual(none, "<!-- claude-live-test-none -->\nNo GPU run: docs <\u200b!-- x -->\n\n"
                                "**Approved** on `0123456` by the rule in `.github/review/gpu_review.py`.\n")
+
+
+    def test_an_edited_finding_is_left_to_a_person_not_to_another_review(self):
+        with tempfile.TemporaryDirectory() as temp, workspace():
+            findings = gpu_review.blocking(review(), [threads_page(thread(4, "**[P3]** x", edited="t"))], [])
+            Path(temp, "gate.txt").write_text("open P0–P2 findings: " + ", ".join(findings))
+            _, posted = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789", runner_temp=temp,
+                             run_url="u", trusted="true", gated="true")
+        (_, comment), = posted.writes()
+        self.assertIn("edited after the bot posted it", comment)
+        self.assertIn("a person has to decide", comment)
+        self.assertNotIn("then comment `/review` again", comment, "no later review can clear an edited thread")
 
 
 class TestEras(unittest.TestCase):

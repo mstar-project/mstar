@@ -653,6 +653,9 @@ class TestAfterTheReview(unittest.TestCase):
             out, fake = step(bot.salvage, {"pr comment": ""}, repo="o/r", pr="7", runner_temp=temp)
             self.assertEqual((out, len(fake.writes())), ({"billing": "true"}, 1))
 
+    def test_the_threads_query_asks_when_a_finding_was_edited(self):
+        self.assertIn("lastEditedAt", bot.THREADS, "an edited finding would read as the bot's own text")
+
     def test_a_gpu_ask_above_the_cap_reaches_the_saved_review(self):
         output = json.dumps({"outside_diff": [], "since_last": "", "description_problems": [], "questions": [],
                              "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
