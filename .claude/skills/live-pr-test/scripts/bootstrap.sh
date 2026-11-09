@@ -140,7 +140,12 @@ build_arm() {  # build_arm <dir>
     cd "$dir"
     [ -d .venv ] || uv venv -q --python 3.12 --seed
     source .venv/bin/activate
-    uv pip install -q --torch-backend=auto -e ".[all]" maturin
+    # The pins lose only to an arm that moves torch or torchcodec past them: uv can't resolve that, so the arm
+    # installs as it asks and says so. A PR that merely widens the range still resolves to the pinned family.
+    uv pip install -q --torch-backend=auto -e ".[all]" maturin || {
+      echo "bootstrap.sh: $dir doesn't resolve with the pinned torch family ($UV_CONSTRAINT); installing it without the pins, so this arm is not on that family: check that its torch and torchaudio match" >&2
+      env -u UV_CONSTRAINT uv pip install -q --torch-backend=auto -e ".[all]" maturin
+    }
     maturin develop -q --release -m rust/Cargo.toml
     # mstar-server, for rows served with --rust-frontend
     [ ! -d rust/server ] || (cd rust/server && cargo build --release -q)
