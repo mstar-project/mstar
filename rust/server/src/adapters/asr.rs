@@ -537,6 +537,10 @@ impl OpenAIAdapter for HiggsAudio {
     fn supports_transcriptions(&self) -> bool {
         true
     }
+    fn transcription_policy(&self) -> TranscriptionPolicy {
+        // it drops or repeats text on long audio, and takes no previous text
+        TranscriptionPolicy { max_audio_seconds: Some(30.0), long_form: "parallel", ..TranscriptionPolicy::DEFAULT }
+    }
     fn transcription_to_request(&self, req: &TranscriptionRequest, audio_path: &str) -> Result<SubmitArgs, String> {
         let mut mk = transcription_kwargs(req)?;
         gk::remove(&mut mk, "initial_prompt");

@@ -189,8 +189,13 @@ struct Form {
     fields: Vec<(String, FieldValue)>,
 }
 
-/// One field into the collected fields: `name[]` gathers raw strings, any other
-/// name is `json.loads`-ed, a repeat keeping the first one's place.
+/// The fields `TranscriptionRequest` declares as text (the router's
+/// `_TRANSCRIPTION_TEXT_FIELDS`): kept as sent, so a prompt of "2024" is not a number.
+const TEXT_FIELDS: [&str; 4] = ["model", "language", "prompt", "response_format"];
+
+/// One field into the collected fields: `name[]` gathers raw strings, a text
+/// field stays text, any other name is `json.loads`-ed, a repeat keeping the
+/// first one's place.
 fn collect_field(fields: &mut Vec<(String, FieldValue)>, name: &str, text: String) {
     if let Some(list) = name.strip_suffix("[]") {
         let item = serde_json::Value::String(text);
@@ -201,7 +206,11 @@ fn collect_field(fields: &mut Vec<(String, FieldValue)>, name: &str, text: Strin
         }
         return;
     }
-    let value = FieldValue::from_form(text);
+    let value = if TEXT_FIELDS.contains(&name) {
+        FieldValue::Json(serde_json::Value::String(text))
+    } else {
+        FieldValue::from_form(text)
+    };
     match fields.iter_mut().find(|(k, _)| k == name) {
         Some((_, v)) => *v = value,
         None => fields.push((name.to_string(), value)),

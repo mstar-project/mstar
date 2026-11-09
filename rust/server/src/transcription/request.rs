@@ -1,6 +1,7 @@
 //! `TranscriptionRequest` (`api_server/openai/protocol.py`) from the multipart
-//! form's fields, as the Python route builds it: each field `json.loads`-ed
-//! when it parses (`name[]` fields collected as a list of strings), then
+//! form's fields, as the Python route builds it: each field but the declared
+//! text ones `json.loads`-ed when it parses (`name[]` fields collected as a
+//! list of strings), then
 //! validated by pydantic's lax rules for the declared fields, with pydantic's
 //! error text. Unknown fields pass through, in form order, as the request's
 //! `extra` (pydantic's `model_extra`).

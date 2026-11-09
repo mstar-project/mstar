@@ -273,6 +273,8 @@ WHISPER_CASES = {
     "verbose-words-only": [("response_format", "verbose_json"), ("timestamp_granularities[]", "word")],
     "language-and-prompt": [("language", "de"), ("prompt", "Hallo"), ("temperature", "0.2"), ("seed", "7")],
     "extra-kwargs": [("top_k", "5"), ("beam", '{"n": 2}'), ("note", "plain text")],
+    # declared text fields stay text, however they would parse as JSON
+    "text-fields-as-sent": [("prompt", "2024"), ("language", "null")],
     "stream": [("stream", "true")],
     "stream-verbose": [("stream", "true"), ("response_format", "verbose_json")],
 }
