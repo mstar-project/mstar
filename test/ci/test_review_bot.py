@@ -500,6 +500,46 @@ class TestAfterTheReview(unittest.TestCase):
                          [{"priority": "P0", "claim": "range", "location": "b.py:9", "detail": "why it matters"}],
                          "a finding GitHub refused would be lost, or repeat its claim as its detail")
 
+    def test_inline_comments_are_inert_but_a_suggestion_applies_as_written(self):
+        posted = []
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []}, "inline_comments": [
+                      {"path": "a.py", "line": 3,
+                       "body": "**[P1]** @org/team ![x](https://x.example/a.png)\n\n```suggestion\nuse(@team)\n```"},
+                  ]}
+        with workspace():
+            step(bot.post, {
+                "POST repos/o/r/pulls/7/comments": lambda argv, stdin: posted.append(json.loads(stdin)) or {"id": 1},
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": "https://github.com/o/r/pull/7#issuecomment-99", "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="false")
+        for markup in ("@org", "!["):
+            self.assertNotIn(markup, posted[0]["body"], "the model's text would ping a team or load an image")
+        self.assertIn("```suggestion\nuse(@team)\n```", posted[0]["body"], "an applied suggestion would carry "
+                      "zero-width spaces")
+        self.assertTrue(posted[0]["body"].startswith("**[P1]** "), "the tag the bot counts findings by would be gone")
+
+    def test_the_jobs_token_is_removed_from_all_it_posts_however_spelled(self):
+        token = "ghs1234567890abcdef"  # not shaped like a credential, so only `exact` can catch it
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        posted, summaries = [], []
+        review = {"outside_diff": [], "since_last": f"plain {token}, stored {basic}", "description_problems": [],
+                  "questions": [], "checked": [], "skipped": [], "types": ["bug"], "prior_findings": [], "design": [],
+                  "latent": [], "risk": {"level": "low", "reason": "r", "look_at": []}, "inline_comments": [
+                      {"path": "a.py", "line": 3, "body": f"**[P1]** x {basic.rstrip('=')} y"}]}
+        url = "https://github.com/o/r/pull/7#issuecomment-99"
+        with workspace():
+            step(bot.post, {
+                "POST repos/o/r/pulls/7/comments": lambda argv, stdin: posted.append(json.loads(stdin)) or {"id": 1},
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "pr comment": lambda argv, stdin: summaries.append(stdin) or url, "GET repos/o/r/issues/7/comments": [],
+            }, repo="o/r", pr="7", runner_temp=finished(review), head_sha=HEAD, mode="light", salvaged="false",
+                job_token=token)
+        for text in (posted[0]["body"], summaries[0]):
+            self.assertNotIn(token, text, "the token itself would be posted")
+            self.assertNotIn(basic.rstrip("="), text, "the token as actions/checkout stores it would be posted")
+
     def test_a_refused_comment_cant_start_a_workflow_command(self):
         review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
                   "skipped": [], "types": ["bug"], "prior_findings": [], "design": [], "latent": [],

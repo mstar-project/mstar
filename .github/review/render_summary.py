@@ -8,6 +8,7 @@ bot.py passes SCHEMA to the review, posts what `render` makes of its fields, and
 a re-review from what `read_state` reads back.
 """
 import base64
+import itertools
 import json
 import os
 import re
@@ -37,6 +38,25 @@ CLEARS = ("fixed", "moot")
 # Handoffs saved before the modes were renamed carry the old names (current_mode).
 RENAMED_MODES = {"thorough": "nogpu"}
 TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci")
+# The first character of anything that can start markup, a link, or a reference to a person, issue or commit.
+# `#` not before a space or another `#`: those are a Markdown heading, which links nothing.
+MARKUP = re.compile(r"(?i)(?:[@<&\\]|#(?![\s#]|$)|\](?=[(:])|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))"
+                    r"(?!\u200b)")
+# A live-test report's fenced code, read as GitHub's CommonMark does (`report_blocks`): lines end at \n, \r or \r\n,
+# which isn't str.splitlines.
+LINE = re.compile(r"[^\r\n]*(?:\r\n?|\n|\Z)")
+FENCE_OPEN = re.compile(r"( {0,3})(?:(`{3,})([^`]*)|(~{3,})(.*))")
+FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
+# The start of a run that could open a fence, and only the start: splitting it there leaves no run a fence can open,
+# and a run already split isn't matched again.
+FENCE_RUN = re.compile(r"(?<![\u200b`~])([`~])(?=\1\1)")
+LIST_ITEM = re.compile(r"[ \t]*(?:[-+*]|\d+[.)])(?:[ \t]|$)")
+# The HTML a report may keep, exactly so, for a folded section. At the start of a line it opens an HTML block
+# that lasts until a blank line.
+BARE_TAG = re.compile(r"</?(?:details|summary)>")
+# A fence language GitHub leaves as code. These it draws instead, and anything else (`&#109;ermaid`) may spell them.
+PLAIN_LANGUAGE = re.compile(r"[A-Za-z0-9_+.-]*")
+DRAWN_LANGUAGES = ("mermaid", "geojson", "topojson", "stl", "math")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
     "type": "object",
@@ -122,6 +142,65 @@ SCHEMA = {
 FOOTER = "<sub>Advisory, not a merge gate. Rules: `AGENTS.md`. Reply to discuss.</sub>"
 
 
+def inert(value):
+    """Untrusted text, or the strings in a list or dict of it, with a zero-width space after the first character of
+    every `@`, `#`, `<`, `&`, `\\`, `](`, `]:`, `![`, `://`, `GH-` and `www.`, in any case. (`#` before whitespace,
+    another `#` or the end of the text is left alone: that's a heading or plain, and can't reference anything.) So it
+    can't ping anyone, mark another issue's timeline, link (inline or by a reference definition), load an image, open
+    HTML or a comment, or spell any of those as an entity or a backslash escape. Nothing is escaped, so text in a code
+    span still reads right and a second pass changes nothing."""
+    if isinstance(value, str):
+        return MARKUP.sub("\\g<0>\u200b", value)
+    if isinstance(value, list):
+        return [inert(v) for v in value]
+    if isinstance(value, dict):
+        return {k: inert(v) for k, v in value.items()}
+    return value
+
+
+def report_blocks(text):
+    """`text`, at the top level of a comment, as ([piece, in a fence] for each run of lines, the fence left open or
+    ""). A fenced code block by CommonMark's rule is left out of `inert` only where GitHub is sure to read it as one.
+    An opener that isn't sure ends that for the rest of the text, which is then just `inert`, fence or not, with
+    every run that could open a fence split, so GitHub opens none either and none swallows the bot's text after the
+    report: one indented under what may be a list item (the item's end also ends the fence, so the next line is
+    outside it), one in the HTML block a bare tag opens (no fence at all), one GitHub draws instead of showing.
+    Skipping only that line wouldn't do: if GitHub does read it as a fence, GitHub's closing line would look like an
+    opener here, and the text after it, outside any fence, would go through unneutralised."""
+    lines, fence, sure, listed, html = [], "", True, False, False
+    for line in LINE.findall(text):
+        body, code = line.rstrip("\r\n"), bool(fence)
+        if fence:
+            close = FENCE_CLOSE.fullmatch(body)
+            if close and close[1][0] == fence[0] and len(close[1]) >= len(fence):
+                fence = ""
+        else:
+            opener = FENCE_OPEN.fullmatch(body) if sure else None
+            if opener:
+                language = re.match(r"[^ \t]*", (opener[3] or opener[5] or "").strip(" \t"))[0]
+                sure = not (opener[1] and listed or html or not PLAIN_LANGUAGE.fullmatch(language)
+                            or language.lower() in DRAWN_LANGUAGES)
+                if sure:
+                    fence, code = opener[2] or opener[4], True
+            listed = listed or bool(LIST_ITEM.match(body))
+            html = bool(BARE_TAG.search(body)) or (html and body.strip(" \t") != "")
+        lines.append((line if sure else FENCE_RUN.sub("\\1\u200b", line), code))
+    return [("".join(line for line, _ in run), code) for code, run in itertools.groupby(lines, lambda x: x[1])], fence
+
+
+def inert_report(text):
+    """The box's report as `inert` makes it, except what GitHub shows as written anyway: its fenced code (so a command
+    in one still copies) and the exact tags `<details>`, `</details>`, `<summary>` and `</summary>`. A fence can't
+    ping, link or load anything, but the bot reads its markers from a comment's raw text, so `<!--` is split there
+    too. Leading byte order marks go first: GitHub skips one at the start of a comment, and a fence after it would
+    open there and not here. A second pass changes nothing."""
+    def neutral(m):
+        return m[0] if m[0] == "<" and BARE_TAG.match(m.string, m.start()) else m[0] + "\u200b"
+
+    return "".join(piece.replace("<!--", "<\u200b!--") if code else MARKUP.sub(neutral, piece)
+                   for piece, code in report_blocks(text.lstrip("\ufeff"))[0])
+
+
 def stacked_above(path):
     """The numbers of the PRs stacked above whose diffs the review was given: stacked-above.json, which
     bot.collect leaves out when a fetch failed. [] without it."""
@@ -202,7 +281,7 @@ def open_findings(review, pages, stacked):
 
 def status(review, pages, head, mode, stacked):
     found = [p for _, p, _ in open_findings(review, pages, stacked)]
-    review = judged(review, stacked)
+    review = inert(judged(review, stacked))
     counts = {p: found.count(p) for p in PRIORITIES}
     if counts["P0"] or counts["P1"]:
         icon = "🔴"
@@ -237,23 +316,24 @@ def checklist(review, pages, stacked, extra=()):
     design decisions, questions, open P2s and skipped files. P3s and latent bugs aren't decisions. Past
     ten lines the rest fold away, so a question or decision, whose only home this is, is never lost."""
     found = open_findings(review, pages, stacked)
-    review = judged(review, stacked)
+    review = inert(judged(review, stacked))
 
     def where(item):
         return f"`{item['location']}`" if item.get("location") else "(PR-wide)"
 
     def findings(*priorities):
-        return [f"**[{p}]** `{w}`: {what}" for wanted in priorities for w, p, what in found if p == wanted]
+        return [f"**[{p}]** `{inert(w)}`: {inert(what)}"
+                for wanted in priorities for w, p, what in found if p == wanted]
 
-    items = [*findings("P0", "P1"), *extra,
+    items = [*findings("P0", "P1"), *inert(list(extra)),
              *[f"{where(d)}: {d['why']}" for d in (review.get("risk") or {}).get("look_at", [])],
              *[f"{where(q)}: {q['text']}" for q in review["questions"]],
              *findings("P2"), *[f"Not reviewed: `{path}`" for path in review["skipped"]]]
     title = "#### What's left for you"
     if not items:
         return f"{title}\nNothing left from the review."
-    # Model text and file names: kept to one line, and unable to open an HTML comment.
-    lines = [f"- [ ] {' '.join(str(item).split()).replace('<!--', '&lt;!--')}" for item in items]
+    # Model text and file names: kept to one line (`inert` above, so unable to open an HTML comment).
+    lines = [f"- [ ] {' '.join(str(item).split())}" for item in items]
     text = "\n".join([title, *lines[:10]])
     if lines[10:]:
         rest = "\n".join(lines[10:])
@@ -264,7 +344,8 @@ def checklist(review, pages, stacked, extra=()):
 def render(review, pages, head, mode, stacked):
     """The summary comment. `stacked`: the PRs stacked above whose diffs the review was given (stacked_above)."""
     parts = ["### Automated review", status(review, pages, head, mode, stacked)]
-    review = judged(review, stacked)
+    raw = judged(review, stacked)  # the saved state and the checklist; what's shown goes through `inert`
+    review = inert(raw)
     if review["since_last"]:
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
@@ -295,13 +376,13 @@ def render(review, pages, head, mode, stacked):
         parts.append(f"<details><summary>What the review checked</summary>\n\n{checked}\n\n</details>")
     if review["skipped"]:
         parts.append("Not reviewed: " + ", ".join(f"`{path}`" for path in review["skipped"]) + ".")
-    parts.append(checklist(review, pages, stacked))
+    parts.append(checklist(raw, pages, stacked))
     parts.append(FOOTER)
-    risk = review.get("risk")  # its rating, not the look_at prose the summary already shows
-    state = {"head": head, "mode": mode, "skipped": review["skipped"], "outside_diff": review["outside_diff"],
-             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": review.get("latent", [])}
-    # Model text can't open an HTML comment, so it can't forge a marker this bot or the workflow reads.
-    text = "\n\n".join(parts).replace("<!--", "&lt;!--")
+    risk = raw.get("risk")  # its rating, not the look_at prose the summary already shows
+    state = {"head": head, "mode": mode, "skipped": raw["skipped"], "outside_diff": raw["outside_diff"],
+             "risk": risk and {"level": risk["level"], "reason": risk["reason"]}, "latent": raw.get("latent", [])}
+    # `inert` keeps model text from opening an HTML comment, so it can't forge a marker this bot or the workflow reads.
+    text = "\n\n".join(parts)
     return f"{MARKER}\n{text}\n\n<!-- claude-review-state {base64.b64encode(json.dumps(state).encode()).decode()} -->\n"
 
 
