@@ -154,8 +154,8 @@ class Resource(ResidentHooks, ABC):
     # it (``idle_for``); at most one on a node. The engine then captures each bucket whose
     # step drives it a second time, idle (``BucketKey.idle``), and tells the resource
     # through ``StepContext.idle``, eager steps included. Its kernels must hold no
-    # collective: TP ranks can replay different twins of one step, when a row is removed
-    # on one rank while another leases (``SubmoduleManagement.rows_idle``).
+    # collective: TP ranks can replay different twins of one step, when one rank's
+    # pre-plan was skipped and the step then lost a row (``SubmoduleManagement.rows_idle``).
     idle_capture: bool = False
 
     def idle_for(self, request_ids) -> bool:

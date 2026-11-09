@@ -2214,19 +2214,21 @@ over the same token count. BAGEL's ``cg_key_info`` reports which of the two a ba
 Idle captures
 ^^^^^^^^^^^^^
 
-A resource whose kernels do nothing for rows that don't use it (a LoRA pool for
-base-model requests) sets ``Resource.idle_capture`` and answers ``Resource.idle_for(rids)``;
-a node takes at most one. The engine then captures a second time, with ``BucketKey.idle``
-set and none of those kernels recorded, every bucket of each capture config whose
-declared step drives the resource. The idle twin compiles separately and is sized as a
-walk of its own. A step ``idle_for`` answers True for replays the idle twin of the bucket
-it would lease anyway, or that bucket when the twin was not captured; an idle bucket is
-planned and kept only beside its plain one. The engine tells the resource through
-``StepContext.idle``, eager steps included, so the resource plans nothing and launches
-nothing for an idle step. ``idle_for`` reads state every rank sets alike (its ingests), so
-every rank chooses the same. Nothing changes for the model: its ``cg_key_info`` and
-``declare_step`` state the same key either way. A piecewise region's bucket can be idle
-too (see the ``one_row_per_step`` regions above).
+A resource whose kernels do nothing for rows that don't use it (a LoRA pool for base-model
+requests) sets ``Resource.idle_capture`` and answers ``Resource.idle_for(rids)``; a node
+takes at most one. The engine then captures a second time, with ``BucketKey.idle`` set and
+none of those kernels recorded, every bucket of each capture config whose declared step
+drives the resource. The idle twin compiles separately and is sized as a walk of its own.
+A step ``idle_for`` answers True for replays the idle twin of the bucket it would lease
+anyway, or that bucket when the twin was not captured; an idle bucket is planned after
+every plain bucket that fits, and kept only beside its plain one. The engine tells the
+resource through ``StepContext.idle``, eager steps included, so the resource plans nothing
+and launches nothing for an idle step. ``idle_for`` reads state every rank sets alike (its
+ingests), so ranks leasing over the same rows choose the same. A rank whose pre-plan was
+skipped leases over the rows the step kept, while another keeps the lease its pre-plan
+took, so the resource's kernels must hold no collective. Nothing changes for the model:
+its ``cg_key_info`` and ``declare_step`` state the same key either way. A piecewise
+region's bucket can be idle too (see the ``one_row_per_step`` regions above).
 
 Piecewise CUDA graphs (capturing an inner loop)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
