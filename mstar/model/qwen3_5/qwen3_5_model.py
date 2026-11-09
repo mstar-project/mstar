@@ -347,6 +347,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     ) -> torch.Tensor:
         """The chat template's prompt, each video's pad written out as one
         ``<t seconds>``-stamped pad per temporal group (`expand_video_pads`)."""
+        enable_thinking = kwargs.get("enable_thinking", True)
+        if not isinstance(enable_thinking, bool):
+            raise ValueError(f"enable_thinking must be a boolean; got {enable_thinking!r}")
         raw_videos = raw.get(VIDEO, [])
         video_metadata = (kwargs.get("input_metadata") or {}).get("video_inputs", [])
         if len(video_metadata) != len(raw_videos):
@@ -366,7 +369,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                 messages_from_parts(parts),
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=kwargs.get("enable_thinking", True),
+                enable_thinking=enable_thinking,
             )
         except TemplateError as exc:
             # a chat the template refuses (a system message after the first turn,
@@ -412,6 +415,9 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
     def media_advance(self, tokens: int, grid: list[int]) -> int:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
         return image_position_advance(torch.tensor(grid), self._merge())
+
+    def request_kwargs(self) -> frozenset[str]:
+        return super().request_kwargs() | {"enable_thinking"}
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
