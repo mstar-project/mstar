@@ -563,7 +563,8 @@ def for_approval(review, pages):
     unmoved = {str(first.get("databaseId", "")) for first, _, _, outdated in render_summary.bot_threads(pages)
                if not outdated}
     return {**review, "prior_findings": [
-        {**f, "status": "disputed", "why": f"none of this thread's lines changed; a review judged it {f['status']}"}
+        {**f, "status": "disputed", "why": f"a re-review judged it {f['status']}, but none of this thread's lines "
+                                           "changed: a person decides, or change one of those lines"}
         if f["status"] in render_summary.CLEARS and f["ref"] in unmoved else f
         for f in review.get("prior_findings") or []]}
 
@@ -713,8 +714,9 @@ def approvals_on():
 
 
 def left_for_you(pr, review, decision):
+    pages = review_threads(pr)
     stacked = render_summary.stacked_above("stacked-above.json")
-    return render_summary.checklist(review, review_threads(pr), stacked, list(decision.rule))
+    return render_summary.checklist(for_approval(review, pages), pages, stacked, list(decision.rule))
 
 
 def approve(out, pr, head_sha, runner_temp, verdict, since=""):

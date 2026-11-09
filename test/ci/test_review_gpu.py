@@ -545,7 +545,7 @@ class TestComment(unittest.TestCase):
 
 class TestApprove(unittest.TestCase):
     def approve(self, variable, verdict="pass", head="0123456789", perm="write", risk="low", files=None,
-                outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD, inline=None):
+                outside=(), above=None, extra=None, untestable="", head_repo=OWN_HEAD, inline=None, prior=()):
         """approve on a PR that meets the rule (a docs change) with REVIEW_APPROVALS as `variable`, unless
         `verdict` or the other arguments fail it; its decision text, the outputs and the writes."""
         pr = {"head": {"sha": head, "repo": head_repo}, "base": {"sha": "abcdef", "repo": BASE_REPO},
@@ -558,7 +558,7 @@ class TestApprove(unittest.TestCase):
                   **(extra or {})}
         with tempfile.TemporaryDirectory() as temp, workspace() as ws:
             (ws / "review.json").write_text(json.dumps({
-                "outside_diff": list(outside), "prior_findings": [], "questions": [], "skipped": [],
+                "outside_diff": list(outside), "prior_findings": list(prior), "questions": [], "skipped": [],
                 "inline": inline or {}, "risk": {"level": risk, "reason": "docs only", "look_at": []},
                 "live_test": {"run": "full", "reason": "r", "checks": ["correctness"], "gpus": 1,
                               "untestable": untestable}}))
@@ -645,6 +645,15 @@ class TestApprove(unittest.TestCase):
             self.assertTrue(text.startswith("Approvals are off, or their setting can't be read (`REVIEW_APPROVALS`). "
                                             "By the rule this would be approved."), text)
             self.assertIn("Nothing left from the review.", text)
+
+    def test_a_fixed_on_unchanged_lines_is_named_in_the_checklist(self):
+        for variable in ({"value": "on"}, {"value": "off"}):
+            text, _, writes = self.approve(variable, extra={"POST graphql": threads_page(thread(4, "**[P1]** x"))},
+                                           prior=[{"ref": "4", "priority": "P1", "status": "fixed", "why": "done"}])
+            self.assertEqual(writes, [])
+            self.assertNotIn("Nothing left from the review.", text)
+            self.assertIn("`inline 4`: disputed, you decide: a re-review judged it fixed, but none of this thread's "
+                          "lines changed", text, "the checklist wouldn't name the finding and why")
 
     def test_not_approved_lists_the_rules_conditions_as_the_checklist(self):
         text, out, writes = self.approve({"value": "on"}, verdict="fail")
