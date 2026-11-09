@@ -16,7 +16,7 @@ MODEL_USAGE = {"input_tokens": "inputTokens", "cache_creation_input_tokens": "ca
                "cache_read_input_tokens": "cacheReadInputTokens", "output_tokens": "outputTokens"}
 # The prompt asks for notes that start with "Progress:"; tolerate Markdown around it.
 PROGRESS = re.compile(r"[#*_\s]*progress[*_\s]*:", re.IGNORECASE)
-NOTE_CHARS = 6000
+NOTE_CHARS = 30000
 RECENT_TEXT_CHARS = 3000
 ELIDED = " [...] "
 # The escapes git writes in a path it quotes: \" \\ \a \b \t \n \v \f \r, and other bytes in octal.
