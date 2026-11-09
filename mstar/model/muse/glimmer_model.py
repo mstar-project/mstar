@@ -196,6 +196,9 @@ class MuseGlimmerModel(MultimodalDecoderModel):
             ids = ids[1:]
         return torch.tensor(ids, dtype=torch.long)
 
+    def request_kwargs(self) -> frozenset[str]:
+        return super().request_kwargs() | {"reasoning_strength", "reasoning_effort", "current_date"}
+
     def render_prompt(self, parts: list[PromptPart], **kwargs) -> str:
         template_kwargs = {}
         strength = kwargs.get("reasoning_strength") or kwargs.get("reasoning_effort")

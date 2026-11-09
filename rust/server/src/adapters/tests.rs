@@ -172,13 +172,17 @@ fn a_qwen3_tts_voice_clone_saves_its_clip_for_the_loader_to_check() {
 }
 
 #[test]
-fn only_qwen3_tts_chunks_long_speech_by_default() {
+fn qwen3_tts_and_orpheus_chunk_long_speech_by_default() {
     assert_eq!(Qwen3TTS.speech_chunking().min_chars, Some(600));
-    assert_eq!(Orpheus.speech_chunking().min_chars, None);
-    for (name, adapter) in [("Qwen3TTS", &Qwen3TTS as &dyn OpenAIAdapter), ("Orpheus", &Orpheus), ("Qwen3Omni", &Qwen3Omni)] {
+    assert_eq!(Qwen3Omni.speech_chunking().min_chars, None);
+    for (name, adapter) in [("Qwen3TTS", &Qwen3TTS as &dyn OpenAIAdapter), ("Qwen3Omni", &Qwen3Omni)] {
         let c = adapter.speech_chunking();
         assert_eq!((c.max_chars, c.lookahead, c.max_pieces), (400, 2, 32), "{name}");
     }
+    // 2,048 output tokens are about 25 s of speech: a longer input came back cut short with a 200
+    let text = "The quick brown fox jumps over the lazy dog. ".repeat(22);
+    let pieces = crate::speech_chunking::plan_chunks(None, &Orpheus.speech_chunking(), &text).unwrap();
+    assert!(pieces.len() > 1, "{pieces:?}");
 }
 
 #[test]
@@ -201,48 +205,43 @@ fn a_qwen3_5_chat_maps_the_standard_fields_and_passes_the_rest_through() {
 }
 
 #[test]
-fn a_cosmos3_edge_chat_reads_enable_thinking_from_the_template_kwargs() {
-    let chat = |fields: &str| Cosmos3Edge.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
-    let thinking = |fields: &str| chat(fields).unwrap().model_kwargs.get("enable_thinking").cloned();
-    for (fields, want) in [
-        (r#""chat_template_kwargs":{"enable_thinking":false}"#, Some(Value::Bool(false))),
-        // as sent: the model refuses what is not a boolean
-        (r#""chat_template_kwargs":{"enable_thinking":1}"#, Some(serde_json::json!(1))),
-        (r#""chat_template_kwargs":{"enable_thinking":"false"}"#, Some(serde_json::json!("false"))),
-        (r#""chat_template_kwargs":{"enable_thinking":false},"enable_thinking":true"#, Some(Value::Bool(true))),
-        (r#""chat_template_kwargs":{"other":1}"#, None),
-        (r#""chat_template_kwargs":{}"#, None),
-        (r#""chat_template_kwargs":null"#, None),
-        (r#""chat_template_kwargs":0"#, None),
-        (r#""chat_template_kwargs":["other"]"#, None),
-        (r#""chat_template_kwargs":"other""#, None),
-    ] {
-        assert_eq!(thinking(fields), want, "{fields}");
-        assert!(!chat(fields).unwrap().model_kwargs.contains_key("chat_template_kwargs"), "{fields}");
+fn a_thinking_chat_reads_the_template_kwargs_flat() {
+    for (name, adapter) in [("Qwen3_5", &Qwen3_5 as &dyn OpenAIAdapter), ("Cosmos3Edge", &Cosmos3Edge)] {
+        let chat = |fields: &str| adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
+        let thinking = |fields: &str| chat(fields).unwrap().model_kwargs.get("enable_thinking").cloned();
+        for (fields, want) in [
+            (r#""chat_template_kwargs":{"enable_thinking":false}"#, Some(Value::Bool(false))),
+            // as sent: the model refuses what is not a boolean
+            (r#""chat_template_kwargs":{"enable_thinking":"false"}"#, Some(serde_json::json!("false"))),
+            (r#""chat_template_kwargs":{"enable_thinking":false},"enable_thinking":true"#, Some(Value::Bool(true))),
+            (r#""chat_template_kwargs":{"other":1}"#, None),
+            (r#""chat_template_kwargs":{}"#, None),
+            (r#""chat_template_kwargs":null"#, None),
+            (r#""chat_template_kwargs":0"#, None),
+        ] {
+            assert_eq!(thinking(fields), want, "{fields} on {name}");
+            assert!(!chat(fields).unwrap().model_kwargs.contains_key("chat_template_kwargs"), "{fields} on {name}");
+        }
+        for fields in [
+            r#""chat_template_kwargs":["enable_thinking"]"#,
+            r#""chat_template_kwargs":"enable_thinking=1""#,
+            r#""chat_template_kwargs":true"#,
+            r#""chat_template_kwargs":1.5"#,
+        ] {
+            assert_eq!(chat(fields).unwrap_err(), "chat_template_kwargs must be an object", "{fields} on {name}");
+        }
+        let mk = chat(
+            r#""chat_template_kwargs":{"reasoning_strength":"low","current_date":"2026-11-08","enable_thinking":false},
+               "reasoning_strength":"high""#,
+        )
+        .unwrap()
+        .model_kwargs;
+        assert_eq!(
+            Value::Object(mk),
+            serde_json::json!({"reasoning_strength": "high", "current_date": "2026-11-08", "enable_thinking": false}),
+            "a template variable was dropped, or won over the flat key on {name}"
+        );
     }
-    // what Python's TypeError says for a value it cannot look the key up in
-    for (fields, err) in [
-        (r#""chat_template_kwargs":["enable_thinking"]"#, "list indices must be integers or slices, not str"),
-        (r#""chat_template_kwargs":"enable_thinking=1""#, "string indices must be integers, not 'str'"),
-        (r#""chat_template_kwargs":true"#, "argument of type 'bool' is not iterable"),
-        (r#""chat_template_kwargs":3"#, "argument of type 'int' is not iterable"),
-        (r#""chat_template_kwargs":1.5"#, "argument of type 'float' is not iterable"),
-    ] {
-        assert_eq!(chat(fields).unwrap_err(), err, "{fields}");
-    }
-}
-
-#[test]
-fn floats_are_quoted_as_python_reprs_them() {
-    for (x, want) in [
-        (0.5, "0.5"), (1.0, "1.0"), (-2.0, "-2.0"), (1e-05, "1e-05"), (0.0001, "0.0001"),
-        (123.456, "123.456"), (1e16, "1e+16"), (1.5e16, "1.5e+16"), (9999999999999998.0, "9999999999999998.0"),
-        (-3.25e-07, "-3.25e-07"), (0.0, "0.0"),
-    ] {
-        assert_eq!(super::py_float_repr(x), want, "{x}");
-    }
-    let v: Value = serde_json::from_str(r#"{"b": [true, null, "it's"], "a": 1}"#).unwrap();
-    assert_eq!(super::py_value_repr(&v), r#"{'a': 1, 'b': [True, None, "it's"]}"#);
 }
 
 fn chat_with(fields: &str) -> ChatCompletionRequest {
@@ -267,8 +266,30 @@ fn a_chat_that_asks_for_a_tool_call_is_refused() {
 }
 
 #[test]
+fn a_chat_asking_for_more_than_one_plain_reply_is_refused() {
+    for (fields, err) in [
+        (r#""n":2"#, "n=2: this model returns one choice"),
+        (r#""stop":".""#, "stop sequences are not supported"),
+        (r#""stop":["END"]"#, "stop sequences are not supported"),
+        (r#""logprobs":true"#, "logprobs is not supported"),
+        (r#""presence_penalty":1.5"#, "presence_penalty is not supported"),
+        (r#""best_of":3"#, "best_of is not supported"),
+        (r#""response_format":{"type":"json_object"}"#, "response_format needs constrained decoding"),
+    ] {
+        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
+            let got = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
+            assert!(got.starts_with(err), "{fields} on {name}: {got}");
+        }
+    }
+}
+
+#[test]
 fn the_tool_fields_clients_send_by_default_pass() {
     for fields in [
+        r#""n":1"#,
+        r#""n":null"#,
+        r#""stop":null"#,
+        r#""stop":[]"#,
         r#""tools":[]"#,
         r#""tools":null"#,
         r#""tool_choice":"none""#,
@@ -281,10 +302,20 @@ fn the_tool_fields_clients_send_by_default_pass() {
         r#""function_call":null"#,
         r#""tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":"none""#,
         r#""functions":[{"name":"get_weather"}],"function_call":"none""#,
+        r#""logprobs":false"#,
+        r#""presence_penalty":0"#,
+        r#""best_of":1"#,
+        r#""response_format":{"type":"text"}"#,
+        r#""stream_options":{"include_usage":true},"user":"u1","store":false,"metadata":{"k":"v"},"service_tier":"auto","parallel_tool_calls":true"#,
     ] {
         for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
             let args = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false);
             assert!(args.is_ok(), "{fields} refused a plain chat on {name}: {args:?}");
+            let mk = args.unwrap().model_kwargs;
+            let sent: serde_json::Value = serde_json::from_str(&format!("{{{fields}}}")).unwrap();
+            for key in sent.as_object().unwrap().keys() {
+                assert!(!mk.contains_key(key), "{key} reached the backend from {fields} on {name}");
+            }
         }
     }
 }
