@@ -815,6 +815,9 @@ impl Realtime {
         let mut request = s.request.clone();
         for name in ["language", "prompt"] {
             let Some(value) = transcription.and_then(|t| t.get(name)) else { continue };
+            // revalidated from its dump, as `model_validate({**model_dump(), **fields})`
+            // does: every field counts as sent, temperature included
+            request.temperature_sent = true;
             let text = match value {
                 Value::Null => None,
                 Value::String(v) => Some(v.clone()),
