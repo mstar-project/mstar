@@ -9,9 +9,11 @@ from __future__ import annotations
 from pathlib import Path
 
 #: ``allow_patterns`` for a model that loads safetensors weights: its configs,
-#: tokenizer files and shards, not the copies of the weights in other formats
+#: tokenizer files, chat templates and shards, not the copies of the weights in other formats
 #: (pytorch ``.bin``, flax, tf) a repo may also ship.
-SAFETENSORS_SNAPSHOT = ["*.safetensors", "*.safetensors.index.json", "*.json", "*.txt", "*.model", "tokenizer*"]
+SAFETENSORS_SNAPSHOT = [
+    "*.safetensors", "*.safetensors.index.json", "*.json", "*.jinja", "*.txt", "*.model", "tokenizer*",
+]
 
 
 def resolve_snapshot_dir(
