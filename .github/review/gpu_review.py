@@ -15,6 +15,7 @@ lt/unavailable.md.
 import fnmatch
 import html
 import json
+import math
 import os
 import re
 import runpy
@@ -387,6 +388,18 @@ def instance(lt):
     return key, gpu_py.entry(key)
 
 
+def box_cost(path):
+    """Print the box session's Claude cost from its `claude.json` to the job's log. The PR's code can write that
+    file, so only a finite non-negative number is printed, and it's labelled as the box's own word."""
+    try:
+        cost = json.loads(path.read_text())["total_cost_usd"]
+        usable = isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0 and math.isfinite(cost)
+    except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        usable = False
+    print(f"The box's own report of its Claude cost: ${cost:.4f} (written by the box, not verified)."
+          if usable else "The box left no usable report of its Claude cost.")
+
+
 def wait(out, runner_temp, start_timeout="30"):
     """Until the box's session finishes; then copy its results back and let the box go. Exits 3, with
     `unavailable` set, when a Slurm job never started or the box left no results (Eras refused the Pod, say):
@@ -430,6 +443,7 @@ def wait(out, runner_temp, start_timeout="30"):
         gpu("ssh", key, f"touch {ERAS_OUT}/collected", check=False, timeout=120)
     gpu("terminate", key, check=False)
     print(f"collected: {sorted(p.name for p in results.iterdir())}")
+    box_cost(results / "claude.json")
     if not any((results / f).is_file() for f in ("result.json", "report.md", "refresh.log")):
         unavailable(out, lt, f"The GPU box ended with no results: {st}.\n"
                              "Comment `/review` to retry.")
@@ -639,7 +653,8 @@ def approve(out, pr, head_sha, runner_temp, verdict, since=""):
     outcome = decide(approval_facts(pr, head_sha, verdict, since, review))
     decision = Path(runner_temp, "decision.md")
     if not approvals_on():
-        decision.write_text(f"Approvals are off (`REVIEW_APPROVALS`). By the rule this would "
+        decision.write_text(f"Approvals are off, or their setting can't be read (`REVIEW_APPROVALS`). "
+                            "By the rule this would "
                             f"{'not ' if outcome.why else ''}be approved.\n\n{left_for_you(pr, review, outcome)}\n")
         return
     if outcome.why:
@@ -711,18 +726,19 @@ def render_comment(sha, lt, media_url=""):
 
     # The box's text is made inert first, so it can't ping, link, load an image or forge the verdict marker the
     # workflow reads; then only links to the gallery's own media come back to life.
-    report = re.sub(r"(!\u200b)?\[([^\]]*)\]\u200b\(([^)\s]+)\)", link, render_summary.inert(report))
+    report = re.sub(r"(!\u200b)?\[([^\]]*)\]\u200b\(([^)\s]+)\)", link, render_summary.inert_report(report))
     head = ("> 🤖 **Automated live test, AI-generated** (Claude Code). Not checked line by line by a human. "
             "Numbers come from one allocation, so treat small deltas as provisional.")
     verdict = result.get("verdict") if result.get("verdict") in ("pass", "partial", "fail", "unavailable") else "none"
+    summary = " ".join(str(result.get("summary", "")).split())  # on one line, so it can't open a fence over the report
     lines = [f"<!-- claude-live-test sha={sha} verdict={verdict} -->", head, "",
-             f"**Live test of `{sha[:7]}`: {verdict}.** "
-             f"{render_summary.inert(str(result.get('summary', '')))}".rstrip()]
+             f"**Live test of `{sha[:7]}`: {verdict}.** {render_summary.inert(summary)}".rstrip()]
     if files and media_url:
         lines.append(f"Media: [gallery]({media_url.rstrip('/')}/index.html) ({len(files)} files).")
-    body = "\n".join(lines) + "\n\n" + report
-    if len(body) > 60000:
-        body = body[:60000] + "\n\n… (cut; the full report is in the run's artifact)\n"
+    top, cut = "\n".join(lines) + "\n\n", ""
+    if len(top) + len(report) > 60000:
+        report, cut = report[:60000 - len(top)], "\n\n… (cut; the full report is in the run's artifact)\n"
+    body = top + report + render_summary.report_closers(report) + cut
     (lt / "comment.md").write_text(body)
     (lt / "verdict").write_text(verdict)
     print(f"verdict {verdict}, {len(files)} media files")
