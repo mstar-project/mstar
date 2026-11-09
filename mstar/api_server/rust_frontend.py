@@ -77,6 +77,7 @@ import re
 import shutil
 import subprocess
 import sysconfig
+from enum import StrEnum
 from pathlib import Path
 
 from mstar.api_server.auth import API_KEY_ENV
@@ -187,6 +188,15 @@ LIBSNDFILE_ENV = "MSTAR_LIBSNDFILE"
 SERVED_MODELS_ENV = "MSTAR_SERVED_MODELS"
 #: What ``/v1/audio/transcriptions`` needs from the model, as JSON (``transcription_facts``).
 TRANSCRIPTION_ENV = "MSTAR_TRANSCRIPTION"
+
+
+class WindowOp(StrEnum):
+    """A ``windows`` request's operation on a transcription upload's ``WindowPlanner``."""
+    PLAN = "plan"     # read the upload, and check it against the route's caps
+    FIXED = "fixed"   # fixed-length windows over the whole upload
+    AT = "at"         # the window that starts at ``offset``
+    CUT = "cut"       # ``duration`` seconds from ``offset``
+    CLOSE = "close"   # the request ended: delete the upload and its windows
 
 
 def soundfile_library() -> str | None:
@@ -495,7 +505,11 @@ class RustFrontendBridge:
         route answers it: its status and message (an ``HTTPException``'s, or
         ``client_error_text``'s), and the exception's type for a stream's
         ``transcription failed (<type>)``."""
-        op, plan = msg.get("op"), msg.get("plan")
+        try:
+            op = WindowOp(msg.get("op"))
+        except ValueError:
+            op = None   # answered with an error below
+        plan = msg.get("plan")
         reply = {"t": "windows", "rid": msg.get("rid"), "sub": msg.get("sub"), "data": b"", "metadata": {}}
 
         async def run() -> None:
@@ -504,7 +518,7 @@ class RustFrontendBridge:
             from mstar.api_server import media_io
             from mstar.api_server.openai import serving_transcriptions as st
 
-            if op == "close":
+            if op is WindowOp.CLOSE:
                 planner = self._planners.pop(plan, None)
                 if planner is not None:
                     await asyncio.to_thread(planner.cleanup)
@@ -512,7 +526,9 @@ class RustFrontendBridge:
                     Path(msg["path"]).unlink(missing_ok=True)
                 return
             try:
-                if op == "plan":
+                if op is None:
+                    raise RuntimeError(f"unknown windows operation {msg.get('op')!r}")
+                if op is WindowOp.PLAN:
                     path = Path(msg["path"])
                     # the planner deletes the upload, so only one the frontend saved under upload_dir
                     if not self._in_uploads(path):
@@ -526,9 +542,9 @@ class RustFrontendBridge:
                     windows = await self._prepare(planner, plan, st, media_io)
                 else:
                     planner = self._planners[plan]
-                    if op == "fixed":
+                    if op is WindowOp.FIXED:
                         windows = await asyncio.to_thread(planner.fixed)
-                    elif op == "at":
+                    elif op is WindowOp.AT:
                         windows = [await asyncio.to_thread(planner.window_at, msg["offset"])]
                     else:
                         windows = [await asyncio.to_thread(planner.cut, msg["offset"], msg["duration"])]

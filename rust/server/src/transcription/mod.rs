@@ -292,7 +292,9 @@ pub async fn audio_transcriptions(State(st): State<AppState>, req: axum::extract
 
 /// `create_transcription`'s checks, in its order, before the upload is planned.
 fn check(adapter: &dyn crate::adapters::OpenAIAdapter, req: &TranscriptionRequest) -> Result<(String, &'static str, Option<f64>), String> {
-    let fmt = req.response_format.to_lowercase();
+    // an empty field is json, as `(req.response_format or "json")` reads it; the
+    // timestamp checks read the field as sent
+    let fmt = if req.response_format.is_empty() { "json".to_string() } else { req.response_format.to_lowercase() };
     if !RESPONSE_FORMATS.contains(&fmt.as_str()) {
         return Err(format!(
             "response_format must be one of ['json', 'text', 'verbose_json', 'srt', 'vtt']; got {}",
