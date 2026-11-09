@@ -148,7 +148,7 @@ fn apply_sampling(mk: &mut Map<String, Value>, s: Sampling) {
     }
 }
 
-fn json_num(f: f64) -> Value {
+pub(crate) fn json_num(f: f64) -> Value {
     serde_json::Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null)
 }
 
@@ -206,6 +206,18 @@ pub trait OpenAIAdapter: Send + Sync {
 
     fn supports_transcriptions(&self) -> bool {
         false
+    }
+
+    /// `/v1/realtime`: the model can continue a hypothesis it is handed.
+    fn supports_realtime_transcription(&self) -> bool {
+        false
+    }
+
+    /// One realtime step: transcribe `audio_path` (everything heard so far)
+    /// continuing from `prefix`, the stable part of the previous hypothesis.
+    fn realtime_step_request(&self, req: &crate::transcription::TranscriptionRequest, audio_path: &str, prefix: &str) -> Result<SubmitArgs, String> {
+        let _ = (req, audio_path, prefix);
+        Err("realtime transcription is not supported by this model".to_string())
     }
 
     /// The class attributes that steer `/v1/audio/transcriptions`.
