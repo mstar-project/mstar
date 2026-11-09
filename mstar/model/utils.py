@@ -49,6 +49,9 @@ def load_weights_from_file(
 ):
     from safetensors.torch import safe_open
 
+    from mstar.model.loader.quantization import refuse_unserved_quantization
+
+    refuse_unserved_quantization(safetensors_file)
     # Precompute expected keys for each module
     module_key_maps = []
     for mod in modules:
@@ -255,7 +258,10 @@ def load_weights_from_hf_shards(
     """
     from safetensors.torch import safe_open
 
+    from mstar.model.loader.quantization import refuse_unserved_quantization
+
     repo_dir = Path(repo_dir)
+    refuse_unserved_quantization(repo_dir)
     index_path = repo_dir / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as f:
