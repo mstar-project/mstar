@@ -42,7 +42,10 @@ def _build(monkeypatch) -> Worker:
     monkeypatch.setattr(worker_mod, "_make_graph_runtime", lambda **kw: SimpleNamespace(
         set_node_metadata=lambda **metadata: None,
     ))
-    monkeypatch.setattr(worker_mod.EngineManager, "build", lambda *a, **kw: SimpleNamespace(side_keys=()))
+    monkeypatch.setattr(worker_mod.EngineManager, "build", lambda *a, **kw: SimpleNamespace(
+        side_keys=(),
+        engine=SimpleNamespace(verifying_nodes=frozenset, synchronous_verify_nodes=frozenset),
+    ))
     monkeypatch.setattr(Worker, "_plan_step_cpus", lambda self, *a: (None, frozenset()))
     return Worker(
         worker_id="w0", worker_ids=["w0"], model=None, my_worker_graphs=[],

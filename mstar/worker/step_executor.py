@@ -295,6 +295,7 @@ class StepExecutor:
         self.streams = services.streams
         self._rebuilds = services.rebuilds
         self._layout = layout
+        self._verifying_nodes = layout.verifying_nodes
         self.timer = timer
         self.lockstep = lockstep
         self.lifecycle = lifecycle
@@ -686,7 +687,7 @@ class StepExecutor:
     def _record_verify(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
         """A verify step that leaves postprocess early still hands its result
         to the take-back."""
-        if batch_N.node_name in self._layout.verifying_nodes:
+        if self._verifying_nodes and batch_N.node_name in self._verifying_nodes:
             self.engine_manager.get_engine(batch_N.node_name).record_verify(batch_N.node_batch, outputs)
 
     def postprocess(
@@ -828,7 +829,7 @@ class StepExecutor:
             request_ids=batch_N.node_batch.request_ids,
         )
         self._rebuilds.keep_prompts(batch_N.node_batch)
-        if batch_N.node_name in self._layout.verifying_nodes:
+        if self._verifying_nodes and batch_N.node_name in self._verifying_nodes:
             # a verify step's runs, cut at stops and the budget before the
             # prefix chains, the stop check or the store read them
             engine.cut_verify_step(batch_N.node_batch, outputs, host_rows)
