@@ -206,3 +206,18 @@ def test_startup_refuses_more_requests_than_slots(tmp_path):
     # slot 0 is the sink, so one slot leaves none to admit into, with or without a cap
     with pytest.raises(ValueError, match="max_slots must be an int >= 2"):
         model.validate_config_yaml({"resources": {TRANSDUCER_STATE: {"max_slots": 1}}}, "a.yaml")
+
+
+@pytest.mark.parametrize("nemotron", [False, True])
+def test_request_kwargs_are_the_keys_the_model_reads(tmp_path, nemotron):
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
+    assert model.request_kwargs() == {"language"}
+    # decoding is greedy: a sent temperature is not read, so the server logs it as ignored;
+    # an unsent one is not forwarded at all
+    adapter = TransducerAdapter(detects_language=not nemotron)
+    mk = adapter.transcription_to_request(TranscriptionRequest(model="parakeet", language="en"), "a").model_kwargs
+    assert set(mk) == model.request_kwargs()
+    mk = adapter.transcription_to_request(
+        TranscriptionRequest(model="parakeet", language="en", temperature=0.2), "a"
+    ).model_kwargs
+    assert set(mk) - model.request_kwargs() == {"temperature"}
