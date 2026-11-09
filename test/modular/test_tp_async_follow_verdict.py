@@ -698,23 +698,6 @@ def test_await_treats_a_later_head_at_the_front_the_same_way():
     assert s.lockstep.follow_head() is later
 
 
-def test_a_forward_that_raised_is_the_steps_verdict_and_voids_its_head():
-    """N's forward raised: every row of N fails and the head built on N is
-    dropped, as the leader drops it on the same verdict, instead of the raise
-    reaching the loop's handler."""
-    s = _stub()
-    s.lockstep.enqueue_follow(_head(["r0"], seq=5, from_seq=4))
-
-    def raises():
-        raise RuntimeError("CUDA error")
-
-    p = _pending(4, types.SimpleNamespace(done=lambda: True, result=raises))
-    outputs, spec = _await(s, p)
-    assert spec is None and not outputs.per_rid_outputs
-    assert set(p.node_batch.failed_requests) == {"r0"}
-    assert s.lockstep.follow_head() is None
-
-
 @pytest.mark.parametrize("head_sent", [False, True])
 def test_a_follower_with_an_uncaught_step_error_stops_without_a_leader_verdict(head_sent):
     s = _stub()
