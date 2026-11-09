@@ -13,7 +13,13 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key, read_lora_file
+from mstar.engine.resources.lora.checkpoint import (
+    normalize_lora_key,
+    parse_lora_key,
+    read_lora_file,
+    refuse_non_adapter,
+    require_regular_file,
+)
 from mstar.engine.resources.lora.config import (
     AdapterInfo,
     LoraSpec,
@@ -101,6 +107,7 @@ def inspect_adapter(spec: LoraSpec, path: str) -> AdapterInfo:
     if spec.convert_keys is None:
         from safetensors import safe_open
 
+        require_regular_file(path)
         with safe_open(path, "pt") as f:
             return inspect_keys(spec, ((key, f.get_slice(key).get_shape()) for key in f.keys()))
     adapter = read_lora_file(path, convert_keys=spec.convert_keys)
@@ -115,6 +122,7 @@ def adapter_targets(spec: LoraSpec, path: str) -> set[str]:
     if spec.convert_keys is None:
         from safetensors import safe_open
 
+        require_regular_file(path)
         with safe_open(path, "pt") as f:
             keys = list(f.keys())
         modules = set()
@@ -130,6 +138,8 @@ def adapter_targets(spec: LoraSpec, path: str) -> set[str]:
 
 def inspect_keys(spec: LoraSpec, items) -> AdapterInfo:
     """``inspect_adapter`` over ``(checkpoint key, shape)`` pairs, as a header lists them."""
+    items = list(items)
+    refuse_non_adapter(key for key, _ in items)
     shapes: dict[str, dict[str, tuple[int, ...]]] = {}
     for key, shape in items:
         # a key no plain LoRA has (DoRA, modules_to_save, ...) raises a refusal, named
