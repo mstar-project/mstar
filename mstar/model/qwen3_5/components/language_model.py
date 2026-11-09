@@ -307,7 +307,22 @@ class Qwen3_5ForCausalLM(nn.Module):
             gather_output=True,
         )
         if config.tie_word_embeddings:
+            # PEFT adapts the head and the embedding apart even when they share a weight
             self.lm_head.weight = self.model.embed_tokens.weight
+
+    def checkpoint_rules(self):
+        """How the checkpoint's text tower lands here (the vision tower dropped, and the
+        MTP head unless this model was built with it), for its weight loader and for
+        LoRA adapters."""
+        from mstar.model.loader import CheckpointRules
+        from mstar.model.qwen3_5.weight_loader import (
+            _STACKED_PARAMS,
+            qwen3_5_mtp_name_remapper,
+            qwen3_5_name_remapper,
+        )
+
+        remap = qwen3_5_name_remapper if self.mtp is None else qwen3_5_mtp_name_remapper
+        return CheckpointRules(stacked_params=tuple(_STACKED_PARAMS), remap=remap)
 
     # The decoder contract `SampledTokenDecoder` drives (as `Qwen3DenseLM`).
 

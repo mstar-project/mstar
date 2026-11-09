@@ -142,7 +142,7 @@ def _side_lane_keys(
     parallel_groups: WorkerParallelGroups, accelerator: bool,
 ) -> tuple[tuple[str, str], ...]:
     """The (node, walk) keys this worker runs beside its chain
-    (``mstar.worker.side_steps``): the ``side_stream_walks`` of the node whose
+    (``StepPipeline._launch_side``): the ``side_stream_walks`` of the node whose
     group sets ``side_stream: true``, or a ``ValueError`` naming why the lane
     can't take it. Only nodes that ask are checked.
 

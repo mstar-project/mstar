@@ -1,4 +1,4 @@
-"""Speculative decoding through the real ``Worker._postprocess_batch``: every
+"""Speculative decoding through the real ``StepExecutor.postprocess``: every
 path that reaches postprocess hands the step's verify result to the ledger
 before it returns, so the take-back at a later admit finds it recorded.
 
@@ -26,7 +26,8 @@ from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.graph.runtime.base import PhasedPostprocess  # noqa: E402
 from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
-from mstar.worker.worker import PendingBatch, Worker  # noqa: E402
+from mstar.worker.speculation import Speculator  # noqa: E402
+from mstar.worker.step_executor import PendingBatch  # noqa: E402
 
 WALK = "decode"
 
@@ -64,17 +65,17 @@ def _worker(eng, stopped=frozenset(), failed=frozenset()):
 
     worker = make_worker(
         device=torch.device("cpu"),
-        _graph_runtime=_Runtime(
+        graph_runtime=_Runtime(
             cleanup_consumed_inputs=lambda node, rids, wgs: ([], []),
             clear_pending_loop_stops=lambda: None,
             pending_loop_stop_rids=lambda walks, loop: set(stopped),
             begin_postprocess=begin,
             supports_inline_emit=False,
         ),
-        tensor_manager=SimpleNamespace(cleanup_collectable=lambda *args: None),
+        tensor_manager=SimpleNamespace(cleanup_collectable=lambda *args: None, get_tensor=None),
         engine_manager=SimpleNamespace(get_engine=lambda node: eng),
         request_state=SimpleNamespace(buffer_publish_info=lambda *args: None),
-        _verifying_nodes=eng.verifying_nodes(),
+        verifying_nodes=eng.verifying_nodes(),
     )
     worker.lifecycle.failed_rids.update(failed)
     return worker
@@ -113,7 +114,7 @@ def test_the_normal_path_cuts_and_records_before_the_stop_check():
     eng, driver = _setup()
     batch, pending, outputs = _verify_step(eng, driver, [1, 2])
     with pytest.raises(_ReachedRuntimeError):
-        _worker(eng)._postprocess_batch(pending, outputs)
+        _worker(eng).executor.postprocess(pending, outputs)
     assert _recorded(eng, batch.verify_seq)
     # each row's output is its emitted run, not the whole block
     for rid in (1, 2):
@@ -125,7 +126,7 @@ def test_a_step_whose_rows_all_stopped_still_records():
     result is the take-back's."""
     eng, driver = _setup()
     batch, pending, outputs = _verify_step(eng, driver, [1, 2])
-    _worker(eng, stopped={1, 2})._postprocess_batch(pending, outputs)
+    _worker(eng, stopped={1, 2}).executor.postprocess(pending, outputs)
     assert _recorded(eng, batch.verify_seq)
 
 
@@ -133,9 +134,8 @@ def test_a_step_whose_rows_all_failed_still_records():
     eng, driver = _setup()
     batch, pending, outputs = _verify_step(eng, driver, [1, 2])
     worker = _worker(eng, failed={1, 2})
-    worker._drop_failed_rids = Worker._drop_failed_rids.__get__(worker)
     pending.speculative_new_iter = False
-    worker._postprocess_batch(pending, outputs)
+    worker.executor.postprocess(pending, outputs)
     assert _recorded(eng, batch.verify_seq)
 
 
@@ -147,8 +147,8 @@ def test_the_main_loop_error_path_voids_a_verify_step_it_never_recorded():
     assert not _recorded(eng, batch.verify_seq)
     worker = _worker(eng)
     worker._graph_runtime.set_in_flight = lambda *args: None
-    worker._fail_requests = lambda failed: None
-    worker._handle_main_loop_error(RuntimeError("the step's iteration failed"), (pending,), None)
+    worker.pipeline._fail_requests = lambda failed: None
+    worker.pipeline._handle_error(RuntimeError("the step's iteration failed"), (pending,), None)
     assert _recorded(eng, batch.verify_seq)
 
 
@@ -160,13 +160,12 @@ def test_a_verify_step_that_raised_after_its_commit_is_voided():
     assert batch.verify_seq in eng._drafts[NODE].ledger._entries
     pending.future.set_exception(RuntimeError("out of memory staging the step's rows"))
     worker = _worker(eng)
-    worker._drop_failed_rids = Worker._drop_failed_rids.__get__(worker)
     failed = {}
-    worker._fail_requests = failed.update
-    outputs = worker._step_result(pending)
+    worker.pipeline._fail_requests = failed.update
+    outputs = worker.pipeline._step_result(pending)
     assert outputs.host_rows is None and outputs.check_stop_buffers is None
-    worker._fail_step_rows(pending, outputs)
-    worker._finish_step(pending, outputs)
+    worker.pipeline._fail_step_rows(pending, outputs)
+    worker.pipeline._finish_step(pending, outputs)
     assert set(failed) == {1, 2}
     assert batch.verify_seq not in eng._drafts[NODE].ledger._entries
 
@@ -177,8 +176,8 @@ def test_without_the_early_record_the_next_admits_raise():
     eng, driver = _setup()
     batch, pending, outputs = _verify_step(eng, driver, [1, 2])
     worker = _worker(eng, stopped={1, 2})
-    worker._record_verify = lambda batch_N, outputs: None
-    worker._postprocess_batch(pending, outputs)
+    worker.executor._record_verify = lambda batch_N, outputs: None
+    worker.executor.postprocess(pending, outputs)
     assert not _recorded(eng, batch.verify_seq)
     eng._drafts[NODE].ledger.committed(None)
     with pytest.raises(RuntimeError, match="never recorded"):
@@ -187,13 +186,13 @@ def test_without_the_early_record_the_next_admits_raise():
 
 def _tp_worker(node, leader: bool, synchronous: bool):
     worker = make_worker(
-        tp_async_sched=True,
-        _synchronous_verify_nodes=frozenset({node}) if synchronous else frozenset(),
+        async_sched=(True, None),
+        synchronous_verify_nodes={node} if synchronous else set(),
         parallel_nodes={node},
         parallel_leader_nodes={node} if leader else set(),
         is_tp_follower=not leader,
     )
-    worker._async_schedulable = lambda batch: True
+    worker.speculator._async_schedulable = lambda batch: True
     return worker
 
 
@@ -204,8 +203,8 @@ def test_a_synchronous_verify_node_is_serial_on_leader_and_follower_alike(synchr
     pending = SimpleNamespace(node_name=NODE, batch=SimpleNamespace(node_name=NODE))
     leader = _tp_worker(NODE, leader=True, synchronous=synchronous)
     follower = _tp_worker(NODE, leader=False, synchronous=synchronous)
-    assert leader._can_speculate(pending.batch) is (not synchronous)
-    assert follower._is_tp_follow_pending(pending) is (not synchronous)
+    assert leader.speculator.can_speculate(pending.batch) is (not synchronous)
+    assert follower.speculator.is_tp_follow_pending(pending) is (not synchronous)
 
 
 @pytest.mark.parametrize("verify", [True, False])
@@ -223,7 +222,7 @@ def test_a_verify_steps_uncut_outputs_never_reach_the_speculated_step(verify):
         continuing_rids={1}, consumed_edges=[("ids", None)],
         scheduled_batch=SimpleNamespace(chunk_ranges={}),
     )
-    Worker._thread_outputs_to_speculative(Worker.__new__(Worker), speculation, outputs)
+    Speculator.thread_outputs(Speculator.__new__(Speculator), speculation, outputs)
     assert inputs[1]["ids"] == ([] if verify else [block])
     assert speculation.continuing_rids == {1}
 
@@ -246,6 +245,6 @@ def test_a_row_the_verify_step_skipped_is_not_read_off_its_loop_back_slot():
         continuing_rids={1, 2}, consumed_edges=[("ids", None)],
         scheduled_batch=SimpleNamespace(chunk_ranges={}, discard_rid=dropped_from.append),
     )
-    Worker._thread_outputs_to_speculative(Worker.__new__(Worker), speculation, outputs)
+    Speculator.thread_outputs(Speculator.__new__(Speculator), speculation, outputs)
     assert inputs[1]["ids"] == [] and 2 not in inputs
     assert speculation.continuing_rids == {1} and speculation.dropped == {2} and dropped_from == [2]

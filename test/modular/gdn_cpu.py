@@ -181,5 +181,5 @@ def install(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "flashinfer.gdn_decode", decode)
     monkeypatch.setattr(conv, "causal_conv1d_fn", causal_conv1d_fn)
     monkeypatch.setattr(conv, "causal_conv1d_update", causal_conv1d_update)
-    monkeypatch.setattr(wrappers, "compiled", lambda fn, dynamic=None: fn)
-    monkeypatch.setattr(gdn, "compiled", lambda fn, dynamic=None: fn)
+    monkeypatch.setattr(wrappers, "compiled", lambda fn, **options: fn)
+    monkeypatch.setattr(gdn, "compiled", lambda fn, **options: fn)

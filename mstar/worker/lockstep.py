@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from mstar.engine.engine import ExecutingBatch
     from mstar.graph.base import GraphEdge
     from mstar.worker.speculation import Speculation
-    from mstar.worker.worker import PendingBatch
+    from mstar.worker.step_executor import PendingBatch
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,6 @@ class Lockstep:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, admission: Admission,
         async_sched: tuple[bool, frozenset[str] | None] = (False, None),
-        synchronous_verify_nodes: frozenset[str] = frozenset(),
     ):
         self._worker_id = services.worker_id
         self._runtime = services.graph_runtime
@@ -95,12 +94,11 @@ class Lockstep:
         self._admission = admission
         self._chunk_loop_walks = layout.chunk_loops.walks_by_node
         self._parallel_nodes = layout.parallel_nodes
-        self._leader_nodes = layout.parallel_leader_nodes
         self._followed_nodes = layout.followed_nodes
         self._is_follower = layout.is_tp_follower
         self._streaming_edge_names = layout.streaming_edge_names
         self._async_sched, self._async_nodes = async_sched
-        self._synchronous_verify_nodes = synchronous_verify_nodes
+        self._synchronous_verify_nodes = layout.synchronous_verify_nodes
 
         # -- leader --
         # monotonic seq stamped on every ScheduleTPNode it sends

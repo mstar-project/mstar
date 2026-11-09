@@ -17,7 +17,7 @@ def test_a_mixed_batch_flags_each_worker_graph():
     and their node never went ready again."""
     calls = []
     worker = make_worker(
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
         set_in_flight=lambda node, rids, wg_ids, value: calls.append(
             (dict(zip(rids, wg_ids, strict=True)), value)),
     ),
@@ -28,7 +28,7 @@ def test_a_mixed_batch_flags_each_worker_graph():
         request_walks={0: "decode", 1: "prefill", 2: "decode"},
     )
 
-    worker._clear_in_flight_flag(batch)
+    worker.executor.clear_in_flight(batch)
 
     assert calls == [({0: 7, 1: 9, 2: 7}, False)]  # one call, each row its own graph
 
@@ -39,7 +39,7 @@ def test_a_mixed_speculative_batch_is_flagged_in_each_worker_graph():
     node never went ready again."""
     flagged = []
     worker = make_worker(
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
         commit_speculation=lambda spec_id, success, dropped, node=None, wg_ids=None,
         scheduled_rids=(): flagged.append(dict(zip(scheduled_rids, wg_ids, strict=True)))
         if node else None,
@@ -54,7 +54,7 @@ def test_a_mixed_speculative_batch_is_flagged_in_each_worker_graph():
         scheduled_batch=batch, spec_id=1, consumed_streaming_edges={},
     )
 
-    worker._settle_speculation(speculation, success=True)
+    worker.speculator.settle(speculation, success=True)
 
     assert flagged == [{0: 5, 1: 0, 2: 5}]  # one call, each row its own graph
 
@@ -64,7 +64,7 @@ def test_a_batch_of_one_walk_names_its_worker_graph_once():
     sends that id once rather than once per row."""
     calls = []
     worker = make_worker(
-        _graph_runtime=SimpleNamespace(
+        graph_runtime=SimpleNamespace(
         set_in_flight=lambda node, rids, wg_ids, value: calls.append((list(rids), list(wg_ids))),
     ),
     )
@@ -72,6 +72,6 @@ def test_a_batch_of_one_walk_names_its_worker_graph_once():
         node_name="LLM", graph_walk="decode", request_to_worker_graph={0: 7, 1: 7, 2: 7},
     )
 
-    worker._clear_in_flight_flag(batch)
+    worker.executor.clear_in_flight(batch)
 
     assert calls == [([0, 1, 2], [7])]
