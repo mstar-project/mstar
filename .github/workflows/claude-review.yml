@@ -420,6 +420,8 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.post-app.outputs.token || secrets.GITHUB_TOKEN }}
+          # What post removes from everything it posts, however it's spelled, whatever the read rules do.
+          JOB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           MODE: ${{ steps.pr.outputs.mode }}
           SALVAGED: ${{ steps.review.outcome != 'success' }}

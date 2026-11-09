@@ -21,10 +21,10 @@ from mstar.streaming.stream_buffer import (  # noqa: E402
     StreamingEdge,
 )
 from mstar.streaming.topology import Connection  # noqa: E402
+from mstar.testing_utils.worker import make_worker  # noqa: E402
 from mstar.worker.executing_batch import make_executing_batch  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
-from mstar.worker.worker import Worker  # noqa: E402
 
 PARTITION = "Decoder"
 
@@ -55,7 +55,10 @@ def _worker(rids=("r",)):
     streams = StreamBufferManager(request_state, None, [])
     streams.consumer_node = {name: node for name, (node, _) in TOPOLOGY.items()}
     streams._partition = dict.fromkeys(TOPOLOGY, PARTITION)
-    return SimpleNamespace(request_state=request_state, streams=streams)
+    return make_worker(
+        graph_runtime=SimpleNamespace(commit_speculation=lambda *a, **kw: None),
+        request_state=request_state, streams=streams,
+    )
 
 
 def _step(worker, node, final_edges):
@@ -142,17 +145,10 @@ def test_a_dropped_speculative_rid_neither_flushes_nor_reports_done():
         scheduled_batch=ScheduledBatch(node_name="n", graph_walk="w", request_to_worker_graph={"r": 0}),
         consumed_streaming_edges={"r": [edge]}, spec_id=0,
     )
-    # The dropped rid's staged ingest is undone before its chunk goes back.
-    worker._graph_runtime = SimpleNamespace(commit_speculation=lambda *a, **kw: None)
-    worker._set_in_flight_flag = lambda batch, value: None
-    worker._settle_speculation = (
-        lambda spec, success, dropped_rids=frozenset():
-        Worker._settle_speculation(worker, spec, success, dropped_rids)
-    )
-
-    Worker._thread_outputs_to_speculative(worker, speculation, outputs_N={})
-    # The caller settles, keyed off ``dropped``; that is what reopens the stream.
-    worker._settle_speculation(speculation, True, speculation.dropped)
+    worker.speculator.thread_outputs(speculation, outputs_N={})
+    # The caller settles, keyed off ``dropped``; the dropped rid's staged ingest is
+    # undone before its chunk goes back, and that is what reopens the stream.
+    worker.speculator.settle(speculation, True, speculation.dropped)
 
     assert speculation.dropped == {"r"}
     assert (batch.final_stream_rids, batch.partition_done_rids) == (set(), set())
@@ -178,7 +174,7 @@ def test_a_rows_only_step_threads_its_loop_back_signal_as_present():
     )
     outputs_N = SimpleNamespace(rows_only=True, row_request_ids=("r",))
 
-    Worker._thread_outputs_to_speculative(worker, speculation, outputs_N)
+    worker.speculator.thread_outputs(speculation, outputs_N)
 
     assert speculation.continuing_rids == {"r"}
     assert batch.per_request_input_tensors["r"] == {"loop": []}

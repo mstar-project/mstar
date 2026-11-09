@@ -754,18 +754,18 @@ def earlier_review(repo, pr):
     return state, any(permission(repo, login) in WRITE for login in answering)
 
 
-def post_inline(repo, pr, head_sha, review):
+def post_inline(repo, pr, head_sha, review, exact=()):
     """Post the review's inline comments (`inline_comments`, taken out of `review`), anchored to the reviewed commit:
-    model output from untrusted input, so redacted and then made inert, with its fenced code left as written so a
-    suggestion applies cleanly. One call each, a second apart, since one line GitHub refuses fails a whole batched
-    review, and a batch doesn't say which comment got which id. GitHub also decides whether a line is in the diff.
-    One it won't take goes on the review's `outside_diff`, as the summary's own, so no finding is lost. {id: priority
-    tag} of what posted."""
+    model output from untrusted input, so redacted (with the `exact` values too) and made inert. A fenced block is
+    left as written, so a suggestion applies cleanly. One call each, a second apart, since one line GitHub refuses
+    fails a whole batched review, and a batch doesn't say which comment got which id. GitHub also decides whether a
+    line is in the diff. One it won't take goes on the review's `outside_diff`, as the summary's own, so no finding
+    is lost. {id: priority tag} of what posted."""
     posted = {}
     for i, c in enumerate(review.pop("inline_comments", [])):
         if i:
             time.sleep(1)
-        body = render_summary.inert_report(redact(c["body"]))
+        body = render_summary.inert_report(redact(c["body"], exact))
         side, tag = c.get("side", "RIGHT"), render_summary.TAG.match(body)
         fields = {"commit_id": head_sha, "path": c["path"], "line": c["line"], "side": side, "body": body}
         if c.get("start_line", c["line"]) < c["line"]:
@@ -783,15 +783,26 @@ def post_inline(repo, pr, head_sha, review):
     return posted
 
 
-def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4"):
+def job_token_forms(token):
+    """The job's token as a read of it could carry it: as is, and base64, alone or as actions/checkout stores it
+    (`x-access-token:<token>`). No padding, so a copy that drops it is caught too."""
+    if not token:
+        return ()
+    encoded = [base64.b64encode(v.encode()).decode().rstrip("=") for v in (token, f"x-access-token:{token}")]
+    return (token, *encoded)
+
+
+def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gpus="4", job_token=""):
     """Post the review's inline comments and the summary, rendered from the review's fields by render_summary and
-    redacted: model output from untrusted input. Read the PR's threads after posting the inline comments, so the
+    redacted, and with the job's token removed however it is spelled (`job_token`): model output from untrusted
+    input. Read the PR's threads after posting the inline comments, so the
     status line counts them along with earlier ones still open. Each run posts its own summary comment, so a
     re-review doesn't overwrite the last one. A "didn't complete" comment an earlier run left is then rewritten to
     point here, and loses its marker so a later failure starts a fresh one."""
+    exact = job_token_forms(job_token)
     try:
         review = render_summary.over_gpu_cap(finished_review(runner_temp), max_gpus)
-        posted = post_inline(repo, pr, head_sha, review)
+        posted = post_inline(repo, pr, head_sha, review, exact)
         pages = graphql(THREADS, repo, pr)
         review = render_summary.carried(review, *earlier_review(repo, pr))
         text = render_summary.render(review, pages, head_sha, mode, render_summary.stacked_above("stacked-above.json"),
@@ -799,14 +810,14 @@ def post(out, repo, pr, runner_temp, head_sha, mode, salvaged, detail="", max_gp
     except Exception as e:
         text = ""
         print(f"::warning::The review's summary didn't render: {type(e).__name__}: {log_value(str(e))}")
-    text = redact(text)
+    text = redact(text, exact)
     if not text.strip():
         print("::warning::The review returned no summary to render.")
         sys.exit(1)
     # What the approval rule reads, with what it carried over and the inline findings as they stand now (and this
     # run's as post_inline made them, so one deleted the moment it posted is still seen), for the rule to check
     # they are still there, unchanged.
-    out["result"] = redact(json.dumps({**review, "inline": {**render_summary.inline_findings(pages), **posted}}))
+    out["result"] = redact(json.dumps({**review, "inline": {**render_summary.inline_findings(pages), **posted}}), exact)
     if salvaged == "true":
         text += (f"\n<sub>This review finished but went past the workflow's turn limit ({detail}), so the action "
                  "reported it as failed.</sub>\n")

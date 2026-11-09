@@ -145,6 +145,14 @@ class TestReviewSummary(unittest.TestCase):
         text = render(r, threads(thread("P1", comment_id=7)), "0123456789", "light", [13])
         self.assertEqual(text.count("Said to be fixed in #\u200b12, not checked."), 2, "each run would repeat the note")
 
+    def test_a_report_is_inert_once_and_stays_so(self):
+        inert_report = SUMMARY["inert_report"]
+        self.assertIn("@a\n```\r@\u200bteam", inert_report("```\n@a\n```\r@team"),
+                      "a bare \\r ends a line, so that close is a close")
+        for twice in ("- x\n@a\n```\n@b\n```\n<details>\n@c\n", "```mermaid\n@a\n`````\n~~~~\n@b\n"):
+            once = inert_report(twice)
+            self.assertEqual(inert_report(once), once, "a second pass would change the report")
+
     def test_a_latent_bug_on_main_is_reported_but_doesnt_block(self):
         r = review()
         r["latent"] = [{"location": "mstar/engine/a.py:9", "detail": "leaks a slot on abort.", "priority": "P1",
