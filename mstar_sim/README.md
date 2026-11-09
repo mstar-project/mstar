@@ -44,13 +44,31 @@ Then drive it with mstar's own harnesses (`benchmark.runner`, `benchmark/worker_
 | Memory | The simulated card's capacity, accounted as torch's caching allocator does: allocated bytes by storage; reserved bytes per pool, the default one and each graph's private pool, at its high-water mark until `empty_cache` (or until the graph goes); `mem_get_info` and `memory_snapshot` from those. A block is rounded to 512 B and a pool grows by the allocator's segment (2 MiB, 20 MiB, or the block rounded to 2 MiB). A reservation past the card raises `torch.cuda.OutOfMemoryError`. It is a lower bound, per process: the CUDA context, cuBLAS and NCCL workspaces and fragmentation are not counted, and each process sees the whole card, so workers sharing a GPU (MPS) each size from all of it. | `memory.py`, `cuda.py` |
 | Autocast | The engine runs forwards under CUDA autocast, which never sees the emulated tensors' payloads; its cast policy is applied by hand, so matmuls run (and are priced) in the autocast dtype. | `device.py` |
 | Weights | Small tensors (under 65,536 elements: norms, fp8 scales) are read for real; the rest from a copy's safetensors headers or value-less torch files, or a large `.onnx` model's holes. A model built on the CPU in a worker allocates nothing. | `patches.py`, `checkpoint.py` |
-| Kernel stand-ins | A `flashinfer` package, mstar's GDN and causal-conv kernels, Triton launches, the ops of a CUDA extension `cpp_extension.load` builds (their `TORCH_LIBRARY` schemas): each is one priced kernel that returns its outputs' shapes (`clock.kernel_fn`). A JIT-built op's outputs are never computed, where a CPU box's torch fallback would compute them (the fused MoE's sorted ids, expert ids and padded count). FlashInfer's planners lay out their workspaces by a port of FlashInfer's own sizing (0.7.2's `scheduler.cuh`), so a workspace too small for a plan raises its overflow. `tests/planner_golden.json` holds what the real planner answered on 140 named cases, on the device properties it stores (the emulated GPUs' when it was generated), and a test holds the port to it; a new FlashInfer means regenerating it on a box with a CUDA toolkit (`python -m mstar_sim.planner_golden`). | `fake_libs/`, `kernels.py`, `triton_launch.py`, `cpp_extension.py` |
+| Kernel stand-ins | A `flashinfer` package, mstar's GDN and causal-conv kernels, Triton launches, the ops of a CUDA extension `cpp_extension.load` builds (their `TORCH_LIBRARY` schemas): each is one priced kernel that returns its outputs' shapes (`clock.kernel_fn`). A JIT-built op's outputs are never computed, where a CPU box's torch fallback would compute them (the fused MoE's sorted ids, expert ids and padded count). FlashInfer's planners lay out their workspaces by a port of FlashInfer's own sizing (0.7.2's `scheduler.cuh`), so a workspace too small for a plan raises its overflow. `tests/planner_golden.json` holds what the real planner answered on 140 named cases, on the device properties it stores (the emulated GPUs' when it was generated), and a test holds the port to it; updating the emulator's FlashInfer port means regenerating it on a box with a CUDA toolkit (`python -m mstar_sim.planner_golden`). | `fake_libs/`, `kernels.py`, `triton_launch.py`, `cpp_extension.py` |
 | Multi-GPU | One process per emulated GPU, as on a node. NCCL groups become gloo. Ranks meet at each collective over GPU tensors and at each barrier, as NCCL's do, and a rank whose collective doesn't pair with its peers' (skipped, reordered, another size) aborts, printing every rank's; a captured graph meets once per group at each replay, on its collectives over that group's ranks. Data moves only if every rank holds values; each collective is charged its NCCL time on every rank. | `dist.py` |
 | Bootstrap | A `sitecustomize` the launcher puts on `PYTHONPATH` installs the emulator in every process. The launcher also puts the driver's `nvidia-cuda-mps-control` on `PATH`, a stand-in that runs mstar's MPS daemon lifecycle (`mps: true`). | `_site/`, `_bin/`, `install.py`, `__main__.py` |
 
 Prior art it follows: SGLang's simulator (real scheduler, predicted forward, fake tokens),
 AIConfigurator (measured op tables, utilization-space interpolation), Vidur (per-request
 attention features), Maya (one interposed process per device, symmetric collectives).
+
+## Emulator tests and upstream compatibility
+
+CPU Core runs `mstar_sim/tests`, including emulator behavior regressions and the planner
+port against its pinned golden. Updating mstar's FlashInfer dependency does not require
+regenerating that golden; updating the emulator's planner port does.
+
+Run the upstream compatibility audit separately when maintaining the emulator:
+
+```bash
+python -m pytest mstar_sim/audits -q
+```
+
+It reports new CUDA, accelerator, FlashInfer, torch.ops and ctypes entry points, private
+wrappers that no longer apply, and upstream FlashInfer version changes. It is outside
+required CPU Core so an unrelated mstar change need not extend the emulator. Optional
+capability probes must retain their meaning: an absent `flashinfer.rocm` must not be faked
+into existence to make the stand-in appear to be AMD's fork.
 
 ## Fast mode, for bug repros
 
