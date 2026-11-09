@@ -172,8 +172,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install libzmq
-        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+      - name: Install libzmq and ffmpeg
+        # ffmpeg: the video parity tests mux a generated sound track, which skip without it
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev ffmpeg
       - name: Cargo tests (transport + arena semantics)
         working-directory: rust
         # The bindings without extension-module (see rust/Cargo.toml): the test
@@ -198,9 +199,11 @@ jobs:
           # pyyaml: the runtime tests reach mstar.model.base, which imports it;
           # prometheus-client: the frontend's /metrics test renders a real registry;
           # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
-          # parity cases run the Python app through fastapi's TestClient
+          # parity cases run the Python app through fastapi's TestClient;
+          # soundfile (its wheel bundles libsndfile): the voice-clip checks and
+          # the compressed-speech byte parity, which skip without it
           pip install pytest==9.2.0 msgpack numpy pyyaml prometheus-client \
-            fastapi uvicorn python-multipart httpx
+            fastapi uvicorn python-multipart httpx soundfile
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
           pip install torch --index-url https://download.pytorch.org/whl/cpu

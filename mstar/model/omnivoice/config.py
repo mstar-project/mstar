@@ -55,7 +55,7 @@ class OmniVoiceGenerationDefaults:
     """Per-request decoding knobs and their defaults.
 
     Every one of these is per-request: they ride ``step_metadata`` and are
-    resolved once in ``OmniVoiceModel.get_initial_forward_pass_args``.  This is
+    resolved once in ``OmniVoiceModel.walk_plan``.  This is
     the reason to serve OmniVoice on a graph runtime at all — a fixed-pipeline
     port has to pick one value for the whole server.
     """
@@ -69,7 +69,7 @@ class OmniVoiceGenerationDefaults:
     denoise: bool = True
 
     # Ceiling for the unmask Loop's ``max_iters``.  A request's own num_step
-    # stops the loop early via check_stop; this only bounds the graph.
+    # is the loop's cap; this only bounds the graph.
     max_num_step: int = 64
 
 
@@ -124,17 +124,6 @@ class OmniVoiceConfig:
     # runs the same layer loop eagerly.
     backbone_graphs: bool = True
     backbone_capture_batch_sizes: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
-    # Packed tokens per step (both CFG documents of every request); a step
-    # above the largest bucket runs eagerly. Eager steps stay launch-bound well
-    # past 4096 tokens: at 16 requests (~5-9k tokens) the eager layer loop took
-    # ~12 ms of host time for ~10 ms of GPU work on an H100. 8192 covers 16
-    # requests of up to ~10 s of speech each.
-    backbone_token_buckets: list[int] = field(
-        default_factory=lambda: [
-            256, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096,
-            4608, 5120, 5632, 6144, 6656, 7168, 7680, 8192,
-        ]
-    )
 
     @property
     def audio_embedding_rows(self) -> int:

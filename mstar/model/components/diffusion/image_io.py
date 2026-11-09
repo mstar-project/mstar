@@ -82,6 +82,14 @@ def pixels_to_uint8(image: torch.Tensor) -> torch.Tensor:
     return (image * 255).round().to(torch.uint8)
 
 
+def truncate_to_uint8(pixels: torch.Tensor) -> torch.Tensor:
+    """VAE output in ``[-1, 1]`` -> uint8 in the input's layout, truncated rather
+    than rounded (the Wan-VAE video models' convention). Run eagerly, the
+    arithmetic is in the input's dtype; inside a compiled region Inductor keeps
+    fp32 intermediates."""
+    return (pixels / 2 + 0.5).clamp(0, 1).mul(255).to(torch.uint8)
+
+
 def uint8_to_png(
     image: torch.Tensor, compress_level: int = 1, adaptive_filters: bool = False, workers: int | None = None,
 ) -> bytes:

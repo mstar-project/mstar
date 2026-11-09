@@ -15,12 +15,15 @@ max_concurrent_requests: 64
 model_kwargs:
   dense_bf16_min_tokens: 1
   routed_experts_routing: "kernel"
-  prefill_token_buckets: [
-    64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
-    832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
-    1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
-  prefill_batched_token_buckets: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
   prefill_capture_batch_sizes: [1, 4, 16]
+# the capture ladder glm52_tp8.yaml uses
+prefill_token_buckets:
+  LLM:
+    prefill:
+      1: [64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768,
+          832, 896, 960, 1024, 1088, 1152, 1216, 1280, 1344, 1408, 1472, 1536,
+          1600, 1664, 1728, 1792, 1856, 1920, 1984, 2048]
+      2: [256, 512, 1024, 1536, 2048, 2304, 2560, 3072, 3584, 4096]
 resources:
   attn:
     # captured one-token decode on trtllm-gen's MLA kernel, kept only where its load probe

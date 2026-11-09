@@ -14,6 +14,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.conductor.request_info import WalkStep  # noqa: E402
 from mstar.conductor.routing import ReplicaRouter, RoutingWeights, routing_cost  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import (  # noqa: E402
@@ -384,24 +385,30 @@ def test_a_request_that_runs_none_of_a_resources_nodes_takes_no_part_in_its_mirr
     )
 
 
-def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors():
+def _refused_plan(*args):
+    raise ValueError("no walk for this request")
+
+
+@pytest.mark.parametrize("plan", [lambda *args: [WalkStep("prefill")], _refused_plan], ids=["validate", "plan"])
+def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors(plan):
+    """Refused in the resource configs' validation, or by the model's walk plan
+    (which runs before the replica pick)."""
     conductor = _kv_conductor()
-    walk = SimpleNamespace(request_done=False, step_metadata={}, full_metadata=SimpleNamespace(
-        graph_walk="prefill", kwargs={},
-    ))
     conductor.model = make_model(
         LENGTH_KWARGS=("max_output_tokens",),
         get_partitions=lambda: [SimpleNamespace(name="default", graph_walks={"prefill"})],
         get_partition_topology=lambda: SimpleNamespace(connections=[]),
-        get_initial_forward_pass_args=lambda **kw: walk,
+        walk_plan=plan,
         get_max_output_tokens=lambda **kw: 8,
         get_loop_caps=lambda **kw: {},
-        get_request_resource_configs=lambda **kw: {},
+        get_request_resource_configs=lambda *args: {},
         # what ingest reads for the partitions a keyed node streams into
         kv_labels=_Model().kv_labels,
     )
     conductor._status_interval_s = None
     conductor._loop_max_iters = {}
+    conductor._walk_inputs = {"prefill": []}
+    conductor.producer_triggered_partitions = set()
     conductor._kv_labels = {"kv": ("main",)}
     conductor._build_request_sharding_config = lambda workers: None
     refused = []

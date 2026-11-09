@@ -237,8 +237,9 @@ class Admission:
         A rid prepare_inputs dropped (vetoed, as a loop's extra step past the
         rid's own count is, or failed) has no step to retry: on success the
         routing drops it too. Re-queued, it would run again with its loop-back
-        inputs already spent. A row the cache served is retried, because its
-        walk completes only on a step that runs.
+        inputs already spent. A row the cache served, or one that declined its
+        stream's final chunk, is retried, because its node completes only on a
+        step that runs.
 
         A ``terminal`` reason would refuse the same step again on every pass,
         so the requests it names fail and the rest are re-queued;
@@ -246,7 +247,7 @@ class Admission:
         rank 0 refused the same step, fails the same requests, and their
         teardown reaches this rank as a REMOVE.
         """
-        prepared = set(node_batch.request_ids) | node_batch.cached_rids
+        prepared = set(node_batch.request_ids) | node_batch.no_forward_rids
         for rid in list(batch.request_to_worker_graph):
             if rid not in prepared:
                 batch.discard_rid(rid)

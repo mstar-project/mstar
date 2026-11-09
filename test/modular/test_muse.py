@@ -18,6 +18,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import RowParallelLinear
 from mstar.model.loader.base import apply_stacked
@@ -622,16 +623,6 @@ def test_a_checkpoint_intake_would_misread_is_refused(model_dir, monkeypatch, pr
         glimmer_model.MuseGlimmerModel(str(model_dir))
 
 
-def test_a_deployment_s_prefill_ladder_reaches_the_llm(model_dir, monkeypatch):
-    """``model_kwargs.prefill_token_buckets`` is the LLM node's captured
-    ladder, not dropped in ``**kwargs``."""
-    from mstar.model.muse import glimmer_model, weight_loader
-
-    monkeypatch.setattr(weight_loader, "load_text_weights", lambda *args, **kwargs: None)
-    model = glimmer_model.MuseGlimmerModel(str(model_dir), prefill_token_buckets=[64, 32])
-    assert model._create_submodule("LLM", "cpu", torch.float32, None).PREFILL_TOKEN_BUCKETS == [32, 64]
-
-
 def test_the_tokenizer_s_eot_stops_without_a_generation_config(model_dir):
     from mstar.model.muse import glimmer_model
 
@@ -685,7 +676,7 @@ def test_each_image_expands_to_its_tokens_with_one_bos(model_dir, low):
 
     signals = {k: list(v) for k, v in out.items()}
     step = model._prefill_step(signals, layout)
-    assert step.walk == "prefill_vision" and step.metadata == {MEDIA_LAYOUT: layout}
+    assert step.walk == "prefill_vision" and step.step_metadata == {MEDIA_LAYOUT: layout, FINAL_PREFILL: True}
 
 
 def test_a_spelled_out_patch_is_a_bad_request(model_dir):
@@ -704,21 +695,21 @@ def test_the_checkpoint_sampling_defaults_apply_under_the_request(model_dir):
     from mstar.model.muse.glimmer_model import MuseGlimmerModel
 
     model = MuseGlimmerModel(str(model_dir))
-    cfg = model.get_request_resource_configs({}, {"temperature": 0.0, "penalize_prompt": False})[SAMPLER]
+    cfg = model.get_request_resource_configs([], [], {"temperature": 0.0, "penalize_prompt": False})[SAMPLER]
     assert (cfg.temperature, cfg.top_p, cfg.top_k, cfg.penalize_prompt) == (0.0, 0.95, 64, False)
     specs = {spec.resource_key: spec for spec in model.get_node_resources()}
     cfg.validate(specs[SAMPLER])
     # the checkpoint sets no min_p, so the sampler has no min-p filter and a
     # request's min_p is refused at admission, not dropped
     with pytest.raises(ValueError, match="min_p"):
-        model.get_request_resource_configs({}, {"min_p": 0.1})[SAMPLER].validate(specs[SAMPLER])
+        model.get_request_resource_configs([], [], {"min_p": 0.1})[SAMPLER].validate(specs[SAMPLER])
     # one that does turns the filter on, and a request's min_p overrides it
     gen = json.loads((model_dir / "generation_config.json").read_text())
     (model_dir / "generation_config.json").write_text(json.dumps({**gen, "min_p": 0.05}))
     model = MuseGlimmerModel(str(model_dir))
     (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
-    assert model.get_request_resource_configs({}, {})[SAMPLER].min_p == 0.05
-    cfg = model.get_request_resource_configs({}, {"min_p": 0.2})[SAMPLER]
+    assert model.get_request_resource_configs([], [], {})[SAMPLER].min_p == 0.05
+    cfg = model.get_request_resource_configs([], [], {"min_p": 0.2})[SAMPLER]
     cfg.validate(spec)
     assert (spec.enable_min_p, cfg.min_p) == (True, 0.2)
     assert set(specs) == {KV_CACHE, ATTN_SLIDING, ATTN_FULL, ROPE, "sampler", "vision_attn"}

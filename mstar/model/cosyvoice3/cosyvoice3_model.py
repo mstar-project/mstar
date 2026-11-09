@@ -34,17 +34,15 @@ from __future__ import annotations
 
 import itertools
 import logging
+from collections.abc import Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -65,13 +63,13 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
     ProcessPromptOutput,
     Span,
     TensorAndMetadata,
+    WalkStep,
 )
 from mstar.model.chatterbox.chatterbox_model import (
     ChatterboxModel,
@@ -110,6 +108,7 @@ from mstar.model.cosyvoice3.config import (
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
     DECODE_LOOP,
+    FLOW_NEW_FRAMES_REGION,
     MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
@@ -168,7 +167,7 @@ def _sizes(name: str, values: Any) -> tuple[int, ...]:
 
 class CosyVoice3Model(Model):
     """Model contract: prompt processing, graph, partitions, resources and the
-    per-partition state machine. No GPU compute lives here."""
+    per-partition walk plans. No GPU compute lives here."""
 
     INTERNAL_KWARGS = (MIN_SPEECH_TOKENS, MAX_SPEECH_TOKENS, VOICE_KEY, PROMPT_MODE)
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
@@ -191,6 +190,9 @@ class CosyVoice3Model(Model):
         flow_capture_batch_frames: int | None = None,
         hift_capture_frame_buckets: list[int] | None = None,
         hift_capture_batch_sizes: list[int] | None = None,
+        lm_prefill_batch_sizes: list[int] | None = None,
+        flow_max_batch_size: int | None = None,
+        hift_max_batch_size: int | None = None,
         flow_cache_frames: int | None = None,
         flow_new_frame_buckets: list[int] | None = None,
         flow_new_batch_sizes: list[int] | None = None,
@@ -229,6 +231,10 @@ class CosyVoice3Model(Model):
             cfg.hift_capture_frame_buckets = _sizes("hift_capture_frame_buckets", hift_capture_frame_buckets)
         if hift_capture_batch_sizes is not None:
             cfg.hift_capture_batch_sizes = _sizes("hift_capture_batch_sizes", hift_capture_batch_sizes)
+        if flow_max_batch_size is not None:
+            cfg.flow_max_batch_size = _integer("flow_max_batch_size", flow_max_batch_size, low=1)
+        if hift_max_batch_size is not None:
+            cfg.hift_max_batch_size = _integer("hift_max_batch_size", hift_max_batch_size, low=1)
         if (
             cfg.hift_captured
             and cfg.hift_capture_batch_sizes
@@ -244,6 +250,8 @@ class CosyVoice3Model(Model):
                 f"the largest hift_capture_frame_buckets must hold more than a stream's {needed} frames of "
                 "tail and pending mel"
             )
+        if lm_prefill_batch_sizes is not None:
+            cfg.lm_prefill_batch_sizes = _sizes("lm_prefill_batch_sizes", lm_prefill_batch_sizes)
         if flow_cache_frames is not None:
             cfg.flow_cache_frames = _integer("flow_cache_frames", flow_cache_frames, low=0)
         if flow_new_frame_buckets is not None:
@@ -324,7 +332,17 @@ class CosyVoice3Model(Model):
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the LM KV pool or a stream-state pool cannot hold:
-        nothing preempts a stream once a pool is full."""
+        nothing preempts a stream once a pool is full, and a serving-config ladder
+        for the flow's new-frame region, whose frame buckets also cap how rows
+        pack and size the flow's cache (``flow_new_frame_buckets``)."""
+        # a malformed key is EngineManager's to report
+        ladders = config.get("prefill_token_buckets")
+        flow = ladders.get(FLOW_NODE) if isinstance(ladders, Mapping) else None
+        if isinstance(flow, Mapping) and FLOW_NEW_FRAMES_REGION in flow:
+            raise ValueError(
+                f"{config_path}: prefill_token_buckets can't set {FLOW_NODE}/{FLOW_NEW_FRAMES_REGION}; its "
+                "buckets also pack the flow's rows and size its cache, so set model_kwargs.flow_new_frame_buckets"
+            )
         check_kv_pools_fit(self, config, config_path, logger)
         cap = config.get("max_concurrent_requests")
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
@@ -367,7 +385,11 @@ class CosyVoice3Model(Model):
         )
         specs: list[NodeResourceSpec] = [
             KVSpec(resource_key=LM_KV, nodes={LM_NODE}, config=kv),
-            AttentionSpec(resource_key=LM_ATTN, nodes={LM_NODE}, config=AttentionConfig(kv_cache=LM_KV)),
+            AttentionSpec(
+                resource_key=LM_ATTN,
+                nodes={LM_NODE},
+                config=AttentionConfig(kv_cache=LM_KV, decode_fmha=True),
+            ),
             PositionSpec(
                 resource_key=LM_POS,
                 nodes={LM_NODE},
@@ -422,11 +444,9 @@ class CosyVoice3Model(Model):
         ]
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args, model_kwargs
+        del input_modalities, output_modalities, model_kwargs
         configs: dict[str, ResourceReqConfig] = {LM_KV: KVReqConfig(needed_labels=[LM_LABEL])}
         if self.config.flow_cache_frames:
             configs[FLOW_KV] = KVReqConfig(needed_labels=[FLOW_COND_LABEL, FLOW_UNCOND_LABEL])
@@ -568,14 +588,10 @@ class CosyVoice3Model(Model):
             PartitionDefinition(
                 name=LM_PARTITION,
                 graph_walks={"prefill", "prefill_voice", "decode"},
-                initial_walk="prefill",
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name=TOKEN2WAV_PARTITION,
                 graph_walks={"token2wav"},
-                initial_walk=None,
-                producer_partitions=[LM_PARTITION],
             ),
         ]
 
@@ -758,7 +774,7 @@ class CosyVoice3Model(Model):
         )
 
     # -----------------------------------------------------------------------
-    # Conductor state machine
+    # Walk plan
     # -----------------------------------------------------------------------
 
     @staticmethod
@@ -769,106 +785,31 @@ class CosyVoice3Model(Model):
             raise ValueError(f"CosyVoice3 request is missing {missing}, which process_prompt sets")
         return {k: mk[k] for k in keys}
 
-    @staticmethod
-    def _step_metadata(metadata: CurrentForwardConductorMetadata, keys) -> dict[str, Any]:
-        step = {k: metadata.kwargs[k] for k in keys}
-        step["is_prefill"] = metadata.is_prefill
-        return step
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
         knobs = self.resolve_generation_kwargs(model_kwargs)
-        wants_audio = "audio" in output_modalities
         if partition_name == LM_PARTITION:
             zero_shot = self._prompt_facts(model_kwargs, (PROMPT_MODE,))[PROMPT_MODE] == "zero_shot"
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="prefill_voice" if zero_shot else "prefill",
-                is_prefill=True,
-                kwargs={**{k: knobs[k] for k in _LM_KNOBS}, **self._prompt_facts(model_kwargs, _LM_FACTS)},
-            )
-            names = [TEXT_INPUTS] + ([REF_AUDIO] if zero_shot else [])
-            targets = {TEXT_INPUTS: LM_NODE, REF_AUDIO: SPEAKER_ENCODER_NODE}
-            inputs = []
-            for name in names:
-                edge = GraphEdge(next_node=targets[name], name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=inputs,
-                # the clip stays persisted for the flow node
-                unpersist_tensors=list(input_signals.get(TEXT_INPUTS, [])),
-                request_done=not wants_audio,
-                step_metadata=self._step_metadata(metadata, _LM_KNOBS + _LM_FACTS),
-            )
+            lm = {**{k: knobs[k] for k in _LM_KNOBS}, **self._prompt_facts(model_kwargs, _LM_FACTS)}
+            if "audio" not in output_modalities:
+                return []
+            return [
+                WalkStep("prefill_voice" if zero_shot else "prefill", step_metadata=lm),
+                WalkStep("decode", bind={PREV_TOKEN: SPEECH_TOKENS}, step_metadata=lm),
+            ]
         if partition_name == TOKEN2WAV_PARTITION:
-            metadata = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk="token2wav",
-                is_prefill=False,
-                kwargs={**{k: knobs[k] for k in _FLOW_KNOBS}, **self._prompt_facts(model_kwargs, _FLOW_FACTS)},
-            )
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=self._voice_inputs(input_signals),
-                unpersist_tensors=[],
-                request_done=not wants_audio,
-                step_metadata=self._step_metadata(metadata, _FLOW_KNOBS + _FLOW_FACTS),
-            )
-        raise ValueError(f"Unknown CosyVoice3 partition {partition_name!r}")
-
-    @staticmethod
-    def _voice_inputs(signals: dict[str, list[TensorPointerInfo]], with_tensors: bool = True) -> list[GraphEdge]:
-        """The reference clip for the flow node: the tensor with the first chunk
-        only, a signal-only edge after (see Chatterbox's S3Gen)."""
-        edge = GraphEdge(next_node=FLOW_NODE, name=REF_AUDIO)
-        edge.tensor_info = list(signals.get(REF_AUDIO, [])) if with_tensors else []
-        return [edge]
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        del incoming_connections
-        if partition_name == LM_PARTITION:
-            if partition_metadata.is_prefill:
-                partition_metadata.is_prefill = False
-                partition_metadata.graph_walk = "decode"
-                edge = GraphEdge(next_node=LM_NODE, name=PREV_TOKEN)
-                edge.tensor_info = persist_signals.get(SPEECH_TOKENS, [])
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[edge],
-                    unpersist_tensors=list(edge.tensor_info),
-                    step_metadata=self._step_metadata(partition_metadata, _LM_KNOBS + _LM_FACTS),
-                )
-            if partition_metadata.graph_walk == "decode":
-                return ForwardPassArgs(
-                    full_metadata=partition_metadata,
-                    inputs=[],
-                    unpersist_tensors=[],
-                    request_done=True,
-                )
-            raise ValueError(f"LM in unexpected walk {partition_metadata.graph_walk!r}")
-        if partition_name == TOKEN2WAV_PARTITION:
-            return ForwardPassArgs(
-                full_metadata=partition_metadata,
-                inputs=self._voice_inputs(persist_signals, with_tensors=False),
-                unpersist_tensors=[],
-                step_metadata=self._step_metadata(partition_metadata, _FLOW_KNOBS + _FLOW_FACTS),
-            )
+            flow = {**{k: knobs[k] for k in _FLOW_KNOBS}, **self._prompt_facts(model_kwargs, _FLOW_FACTS)}
+            if "audio" not in output_modalities:
+                return []
+            # The reference clip rides every chunk's pass beside the stream, so
+            # the flow node is ready for it; the tensor only the first one's.
+            return [WalkStep("token2wav", step_metadata=flow)]
         raise ValueError(f"Unknown CosyVoice3 partition {partition_name!r}")
 
     # -----------------------------------------------------------------------
@@ -880,19 +821,6 @@ class CosyVoice3Model(Model):
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return SAMPLE_RATE
-
-    def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
-        del request_kwargs
-        if modality != "audio":
-            raise ValueError(f"Unsupported CosyVoice3 output modality {modality!r}")
-        if output.numel() == 0:
-            return b""
-        pcm = output.detach().cpu()
-        if pcm.is_floating_point():
-            pcm = (pcm.clamp(-1, 1) * 32767).to(torch.int16)
-        elif pcm.dtype != torch.int16:
-            pcm = pcm.to(torch.int16)
-        return pcm.contiguous().numpy().tobytes()
 
     # -----------------------------------------------------------------------
     # Submodules (worker side)
@@ -944,9 +872,9 @@ class CosyVoice3Model(Model):
         speaker-encoder and flow nodes share them when colocated."""
         key = f"reference_encoder:{device}"
         if key not in self._shared:
-            from mstar.model.chatterbox.components.audio import MelSpectrogram24k
             from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
             from mstar.model.chatterbox.components.s3gen_xvector import CAMPPlus
+            from mstar.model.components.audio_features import MatchaLogMel
             from mstar.model.cosyvoice3.components.onnx_weights import load_campplus, load_speech_tokenizer
             from mstar.model.cosyvoice3.submodules import ReferenceEncoder
 
@@ -956,7 +884,7 @@ class CosyVoice3Model(Model):
             load_speech_tokenizer(tokenizer, self._path(cfg.speech_tokenizer_onnx))
             campplus = CAMPPlus(cfg.xvector).to(device).eval()
             load_campplus(campplus, self._path(cfg.campplus_onnx), cfg.xvector.feat_dim)
-            mel = MelSpectrogram24k(cfg.mel).to(device)
+            mel = MatchaLogMel(**asdict(cfg.mel)).to(device)
             self._shared[key] = ReferenceEncoder(tokenizer, mel, campplus)
         return self._shared[key]
 

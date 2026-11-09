@@ -339,7 +339,6 @@ pub struct GraphRuntime {
         is_first_tp_rank: bool,
         partition_name: &str,
         graph_walk: &str,
-        stream_tokens_consumed: &[(String, i64)],
         publication_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
         speculative: bool,
@@ -374,7 +373,6 @@ pub struct GraphRuntime {
             partition_name,
             partition_done,
             graph_walk,
-            stream_tokens_consumed,
             stream_items_sent: stream_items,
             resource_publish_info: frames::spliced_value(publication_encoded),
             profiling: frames::split_profiling(profiling_encoded),
@@ -1248,11 +1246,12 @@ pub struct RouteArg {
     /// One output signal whose per-request value is a scalar the worker
     /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
     /// then rides inline in one frame per step instead of as a tensor per
-    /// request; `inline_values` are in `rids` order, or empty for none.
+    /// request; `inline_values` are in `rids` order, or empty for none. A
+    /// row whose value is None (it ran no forward) takes the tensor path.
     /// Both keys may be absent or None: a caller with no inline signal sends
     /// the plain route input.
     inline_signal: Option<String>,
-    inline_values: Vec<i64>,
+    inline_values: Vec<Option<i64>>,
     /// The log-prob of the token row i sampled (None without one): it rides
     /// with the row's client emits, inline or in a tensor emit's metadata.
     /// Empty (or absent) when no row has one.
@@ -2718,6 +2717,7 @@ impl GraphRuntime {
             .collect();
 
         for (i, &rid) in input.rids.iter().enumerate() {
+            let inline_value = if inline_on { input.inline_values[i] } else { None };
             let ctx = &ctxs[rid_walk_idx.map_or(0, |idx| idx[i] as usize)];
             let (wg, node, g, walk_sym, walk_wgs) = (ctx.0, ctx.1, &ctx.2, ctx.3, &ctx.4);
             let walk = walk_sym.unwrap_or_default();
@@ -3081,14 +3081,12 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let inline_edge = inline_on
+                let inline_edge = inline_value.is_some()
                     && matches!(e.dest, Dest::EmitToClient)
                     && Some(e.name) == inline_sym
                     && !e.persist;
-                if inline_edge {
-                    emit_inline.insert(
-                        rid, (e.name, e.modality, input.inline_values[i]),
-                    );
+                if let (true, Some(value)) = (inline_edge, inline_value) {
+                    emit_inline.insert(rid, (e.name, e.modality, value));
                 }
                 let remote = (e.persist && has_remote)
                     || e.declined_local
@@ -3152,7 +3150,7 @@ impl GraphRuntime {
                         // An inline emit holds no reference: nothing reads
                         // the tensor on the api server's behalf.
                         Dest::EmitToClient => i64::from(
-                            !(inline_on && Some(e.name) == inline_sym && !e.persist),
+                            !(inline_value.is_some() && Some(e.name) == inline_sym && !e.persist),
                         ),
                         // One reference per destination WORKER, minus this
                         // one when the edge was already ingested into a local
@@ -3425,7 +3423,7 @@ impl GraphRuntime {
     #[pyo3(signature = (tensors, num_tensors, inline_signal, inline_values, logprobs = Vec::new()))]
     fn resume_postprocess_store(
         &mut self, py: Python<'_>, tensors: Vec<u64>, num_tensors: Vec<usize>,
-        inline_signal: Option<String>, inline_values: Vec<i64>, logprobs: Vec<Option<f64>>,
+        inline_signal: Option<String>, inline_values: Vec<Option<i64>>, logprobs: Vec<Option<f64>>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let stored = postprocess::Stored {
             tensors, num_tensors, inline_signal, inline_values, logprobs,
@@ -3436,8 +3434,7 @@ impl GraphRuntime {
     /// Resume a step parked for its send's Python payloads (SEND), given as
     /// `send_outputs` takes them.
     #[pyo3(signature = (
-        info_rids, request_infos, ntc_rids, new_token_counts,
-        consumed_rids, stream_tokens_consumed, prof_rids, profiling,
+        info_rids, request_infos, ntc_rids, new_token_counts, prof_rids, profiling,
         publish_rids, publications, skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -3445,14 +3442,13 @@ impl GraphRuntime {
         &mut self, py: Python<'_>,
         info_rids: Vec<u32>, request_infos: Vec<Option<Vec<u8>>>,
         ntc_rids: Vec<u32>, new_token_counts: Vec<FxHashMap<String, i64>>,
-        consumed_rids: Vec<u32>, stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
         prof_rids: Vec<u32>, profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>, publications: Vec<Option<Vec<u8>>>,
         skip_rids: Vec<u32>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let args = postprocess::SendArgs {
-            info_rids, request_infos, ntc_rids, new_token_counts, consumed_rids,
-            stream_tokens_consumed, prof_rids, profiling, publish_rids, publications, skip_rids,
+            info_rids, request_infos, ntc_rids, new_token_counts, prof_rids, profiling,
+            publish_rids, publications, skip_rids,
         };
         self.pp_resume_send(py, args)
     }
@@ -3544,8 +3540,7 @@ impl GraphRuntime {
     /// `skip_rids` failed after routing: none of their frames go out.
     #[pyo3(signature = (
         completion_id, info_rids, request_infos,
-        ntc_rids, new_token_counts,
-        consumed_rids, stream_tokens_consumed, prof_rids, profiling,
+        ntc_rids, new_token_counts, prof_rids, profiling,
         publish_rids, publications, skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -3559,8 +3554,6 @@ impl GraphRuntime {
         // Taken as dicts: PyO3 extracts them directly, so Python does not
         // have to flatten each one to a list of pairs.
         new_token_counts: Vec<FxHashMap<String, i64>>,
-        consumed_rids: Vec<u32>,
-        stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
         prof_rids: Vec<u32>,
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
@@ -3590,8 +3583,7 @@ impl GraphRuntime {
         let t_body = std::time::Instant::now();
         let built = self.build_send_frames(
             completion_id, info_rids, request_infos, ntc_rids, new_token_counts,
-            consumed_rids, stream_tokens_consumed, prof_rids, profiling,
-            publish_rids, publications, skip_rids,
+            prof_rids, profiling, publish_rids, publications, skip_rids,
         );
         send_timing::record_body(t_body);
         let (out, frames) = built?;
@@ -3911,8 +3903,6 @@ impl GraphRuntime {
         request_infos: Vec<Option<Vec<u8>>>,
         ntc_rids: Vec<u32>,
         new_token_counts: Vec<FxHashMap<String, i64>>,
-        consumed_rids: Vec<u32>,
-        stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
         prof_rids: Vec<u32>,
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
@@ -3927,11 +3917,6 @@ impl GraphRuntime {
             let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
                 .into_iter()
                 .zip(new_token_counts)
-                .map(|(r, m)| (r, m.into_iter().collect()))
-                .collect();
-            let stream_tokens_consumed: Vec<(u32, Vec<(String, i64)>)> = consumed_rids
-                .into_iter()
-                .zip(stream_tokens_consumed)
                 .map(|(r, m)| (r, m.into_iter().collect()))
                 .collect();
             let profiling: Vec<(u32, Option<Vec<u8>>)> =
@@ -3955,8 +3940,6 @@ impl GraphRuntime {
                 request_infos.into_iter().collect();
             let profiling: FxHashMap<u32, Option<Vec<u8>>> =
                 profiling.into_iter().collect();
-            let consumed: FxHashMap<u32, Vec<(String, i64)>> =
-                stream_tokens_consumed.into_iter().collect();
             let publications: FxHashMap<u32, Option<Vec<u8>>> =
                 publish_rids.into_iter().zip(publications).collect();
             let mut sent_rids = Vec::new();
@@ -4147,7 +4130,6 @@ impl GraphRuntime {
                     .unwrap_or_default();
                 let bytes = self.worker_graphs_done_frame(
                     rid, &wg_ids, is_first_tp_rank, &partition, &graph_walk,
-                    consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
                     publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),

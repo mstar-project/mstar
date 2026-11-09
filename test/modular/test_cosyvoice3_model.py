@@ -17,6 +17,7 @@ import importlib.util
 import io
 import math
 import urllib.error
+from dataclasses import asdict
 from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
@@ -204,6 +205,19 @@ def test_registry_yaml_and_adapter_agree(model):
         model.validate_config_yaml({**deployment, "max_concurrent_requests": 64}, str(CONFIG_PATH))
     # a pool left at its declared page size
     model.validate_config_yaml({**deployment, "resources": {"lm_kv": {"max_num_pages": 1792}}}, str(CONFIG_PATH))
+    # the flow packs its rows and sizes its cache by its frame buckets, so the region
+    # ladder that mirrors them isn't the key's
+    with pytest.raises(ValueError, match="flow_new_frame_buckets"):
+        model.validate_config_yaml(
+            {**deployment, "prefill_token_buckets": {"flow": {"solve_new_frames": [64]}}}, str(CONFIG_PATH),
+        )
+    # a malformed key is EngineManager's to report, and the pool checks still run past it
+    for malformed in ([64], {"flow": "solve_new_frames_x"}):
+        model.validate_config_yaml({**deployment, "prefill_token_buckets": malformed}, str(CONFIG_PATH))
+    with pytest.raises(ValueError, match="pages"):
+        model.validate_config_yaml(
+            {**deployment, "prefill_token_buckets": {"flow": 64}, "max_concurrent_requests": 64}, str(CONFIG_PATH),
+        )
     assert isinstance(adapters.get_adapter("cosyvoice3"), adapters.CosyVoice3Adapter)
 
 
@@ -215,7 +229,6 @@ def test_graph_walks_and_partitions(model):
     assert walks["decode"].max_iters == model.config.max_speech_tokens
     partitions = {p.name: p for p in model.get_partitions()}
     assert partitions[LM_PARTITION].graph_walks == {"prefill", "prefill_voice", "decode"}
-    assert partitions[TOKEN2WAV_PARTITION].producer_partitions == [LM_PARTITION]
     (connection,) = model.get_partition_topology().connections
     assert connection.edge_name == SPEECH_TOKENS
     policy = connection.chunk_policy_factory()
@@ -354,53 +367,26 @@ def test_conductor_walk_follows_the_prompt_process_prompt_built(
     assert torch.equal(ids[: zero_shot_prompt.numel()], zero_shot_prompt) == (walk == "prefill_voice")
     # the data worker folds the metadata into model_kwargs, over the caller's keys
     model_kwargs = {**kwargs, **out.metadata}
-    signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, "ref_audio")}
-    args = model.get_initial_forward_pass_args(LM_PARTITION, modalities, ["audio"], signals, model_kwargs=model_kwargs)
-    assert args.full_metadata.graph_walk == walk
-    assert ("speaker_encoder" in {edge.next_node for edge in args.inputs}) == (walk == "prefill_voice")
+    assert model.walk_plan(LM_PARTITION, modalities, ["audio"], {}, model_kwargs)[0].walk == walk
 
 
-def test_initial_and_partition_args_route_the_walks(model):
-    signals = {name: [f"ptr-{name}"] for name in (TEXT_INPUTS, "ref_audio")}
+def test_walk_plan_binds_decode_to_the_prefill_token(model):
     facts = {MIN_SPEECH_TOKENS: 3, MAX_SPEECH_TOKENS: 40, VOICE_KEY: 77}
-    zero = model.get_initial_forward_pass_args(
-        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={PROMPT_MODE: "zero_shot", **facts}
-    )
-    assert zero.full_metadata.graph_walk == "prefill_voice"
-    routes = sorted((edge.next_node, edge.name) for edge in zero.inputs)
-    assert routes == [("llm", TEXT_INPUTS), ("speaker_encoder", "ref_audio")]
-    # the clip stays persisted for the flow node
-    assert zero.unpersist_tensors == [f"ptr-{TEXT_INPUTS}"]
-    assert facts.items() <= zero.step_metadata.items()
-    cross = model.get_initial_forward_pass_args(
-        LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs={PROMPT_MODE: "cross_lingual", **facts}
-    )
-    assert cross.full_metadata.graph_walk == "prefill"
-    assert {edge.next_node for edge in cross.inputs} == {"llm"}
+    lm = model.walk_plan(LM_PARTITION, ["text", "audio"], ["audio"], {}, {PROMPT_MODE: "zero_shot", **facts})
+    assert [(step.walk, dict(step.bind)) for step in lm] == [
+        ("prefill_voice", {}), ("decode", {PREV_TOKEN: SPEECH_TOKENS}),
+    ]
+    assert all(facts.items() <= step.step_metadata.items() for step in lm)
+    cross = model.walk_plan(LM_PARTITION, ["text", "audio"], ["audio"], {}, {PROMPT_MODE: "cross_lingual", **facts})
+    assert [step.walk for step in cross] == ["prefill", "decode"]
     with pytest.raises(ValueError, match="process_prompt"):
-        model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals)
+        model.walk_plan(LM_PARTITION, ["text", "audio"], ["audio"], {}, {})
     with pytest.raises(ValueError, match="process_prompt"):
-        model.get_initial_forward_pass_args(LM_PARTITION, ["text", "audio"], ["audio"], signals, model_kwargs=facts)
+        model.walk_plan(LM_PARTITION, ["text", "audio"], ["audio"], {}, facts)
 
-    decode = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {SPEECH_TOKENS: ["ptr-token"]})
-    assert zero.full_metadata.graph_walk == "decode" and decode.inputs[0].name == PREV_TOKEN
-    assert decode.unpersist_tensors == ["ptr-token"]
-    assert facts.items() <= decode.step_metadata.items()
-    done = model.get_partition_forward_pass_args(LM_PARTITION, zero.full_metadata, {})
-    assert done.request_done
-
-    t2w = model.get_initial_forward_pass_args(TOKEN2WAV_PARTITION, ["text", "audio"], ["audio"], signals, facts)
-    assert t2w.full_metadata.graph_walk == "token2wav"
-    assert [edge.tensor_info for edge in t2w.inputs] == [["ptr-ref_audio"]]
-    assert t2w.step_metadata[VOICE_KEY] == 77
-    later = model.get_partition_forward_pass_args(TOKEN2WAV_PARTITION, t2w.full_metadata, signals)
-    assert all(edge.tensor_info == [] for edge in later.inputs) and later.step_metadata[VOICE_KEY] == 77
-
-
-def test_postprocess_encodes_pcm16(model):
-    pcm = model.postprocess(torch.tensor([0.0, 0.5, -2.0]), "audio")
-    assert torch.frombuffer(bytearray(pcm), dtype=torch.int16).tolist() == [0, 16383, -32767]
-    assert model.get_output_sample_rate() == SR
+    # the flow's voice walk reads the clip beside the stream, on every chunk's pass
+    [t2w] = model.walk_plan(TOKEN2WAV_PARTITION, ["text", "audio"], ["audio"], {}, facts)
+    assert t2w.walk == "token2wav" and t2w.step_metadata[VOICE_KEY] == 77
 
 
 # -- adapter (#411 media rules) -----------------------------------------------------------
@@ -846,7 +832,6 @@ def _info(rid: int, seed: int, limits=(0, 30), **knobs):
         "ras_window": 10,
         "ras_tau": 0.1,
         "ignore_eos": False,
-        "is_prefill": True,
         **knobs,
     }
     return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=meta)
@@ -1102,21 +1087,21 @@ def test_the_lm_partition_carries_what_its_stop_policy_reads(model):
     mk = {
         "ignore_eos": True, "min_speech_tokens": 0, "max_speech_tokens": 8, "voice_key": 1, "prompt_mode": "zero_shot",
     }
-    lm = model.get_initial_forward_pass_args(LM_PARTITION, ["text"], ["audio"], {}, model_kwargs=mk)
-    assert lm.step_metadata["ignore_eos"] is True
-    flow = model.get_initial_forward_pass_args(TOKEN2WAV_PARTITION, ["text"], ["audio"], {}, model_kwargs=mk)
-    assert "ignore_eos" not in flow.step_metadata
+    lm = model.walk_plan(LM_PARTITION, ["text"], ["audio"], {}, mk)
+    assert all(step.step_metadata["ignore_eos"] is True for step in lm)
+    flow = model.walk_plan(TOKEN2WAV_PARTITION, ["text"], ["audio"], {}, mk)
+    assert all("ignore_eos" not in step.step_metadata for step in flow)
 
 
 @pytest.mark.parametrize("seconds", [0.5, 1.0 + 1 / SR, 7.3, 30.0])
 def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(seconds):
-    from mstar.model.chatterbox.components.audio import MelSpectrogram24k
     from mstar.model.chatterbox.components.s3_tokenizer import S3Tokenizer
+    from mstar.model.components.audio_features import MatchaLogMel
     from mstar.model.cosyvoice3.submodules import ReferenceEncoder, reference_tokens
 
     cfg = CosyVoice3Config()
     # token counts follow from the clip's length alone, so the weights are left as allocated
-    encoder = ReferenceEncoder(S3Tokenizer(cfg.tokenizer).eval(), MelSpectrogram24k(cfg.mel), None)
+    encoder = ReferenceEncoder(S3Tokenizer(cfg.tokenizer).eval(), MatchaLogMel(**asdict(cfg.mel)), None)
     clip = _clip(seconds)
     with torch.no_grad():
         tokens = encoder.tokens(clip)
@@ -1161,7 +1146,7 @@ def test_kv_labels_pass_the_load_checks_and_the_longest_request_fits(model):
     kwargs["max_new_tokens"] = model.config.max_speech_tokens
     out = model.process_prompt(text, ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip(30.0)]}, **kwargs)
     model_kwargs = {**kwargs, **out.metadata}
-    configs = model.get_request_resource_configs({}, model_kwargs)
+    configs = model.get_request_resource_configs([], [], model_kwargs)
     layout = model_kwargs["kv_layout"]
     refuse_undeclared_labels("CosyVoice3Model", {k: tuple(v) for k, v in model.kv_labels().items()}, layout, configs)
     caps = model.get_loop_caps(**model_kwargs)
@@ -1317,7 +1302,7 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
             commit(prepared)
         assert ended == {0: False, 1: True, 2: True, 3: False, 4: False}
 
-        (graph,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
+        graph = sub.get_accelerator_graph_configs(torch.device("cpu"))[0]
         template = graph.single_request_inputs
         per_value = {
             HISTORY: torch.full((sub.window,), -1, dtype=torch.long),
@@ -1398,8 +1383,31 @@ def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():
     step = sub.declare_step("decode", [0, 1], [SimpleNamespace(input_seq_len=1)] * 2)
     assert set(step.steps) == {LM_KV, LM_ATTN, LM_POS}
     assert [(s.request_id, s.span) for s in step.segments] == [(0, 1), (1, 1)]
-    (graph,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
+    graph = sub.get_accelerator_graph_configs(torch.device("cpu"))[0]
     assert graph.capture_graph_walk == "decode" and graph.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
+    prefill = sub.get_accelerator_graph_configs(torch.device("cpu"))[1]
+    assert prefill.replay_graph_walks == ["prefill", "prefill_voice"]
+    assert prefill.capture_token_lengths == {1: sub.LM_PREFILL_TOKEN_BUCKETS}
+    assert sub.resident_walks() == {"decode"}
+    # no prefill batch sizes is the switch that captures no prefill
+    sub, _ = _lm(_tiny_config(lm_prefill_batch_sizes=()))
+    assert [c.capture_graph_walk for c in sub.get_accelerator_graph_configs(torch.device("cpu"))] == ["decode"]
+
+
+def test_the_serving_configs_ladder_reaches_the_lm_prefill_capture():
+    from mstar.engine.accelerator_graph_config import apply_token_ladders
+
+    sub, _ = _lm(_tiny_config())
+
+    def ladders(walk_ladders):
+        configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
+        apply_token_ladders("llm", configs, walk_ladders, lambda walk, rows: None, lambda c: c.capture_batch_sizes)
+        return configs[1].capture_token_lengths
+
+    assert ladders({"prefill_voice": [96, 32]}) == {1: [32, 96]}
+    # `prefill` steps replay the `prefill_voice` capture, which the refusal names
+    with pytest.raises(ValueError, match="prefill_voice"):
+        ladders({"prefill": [32]})
 
 
 # -- flow -----------------------------------------------------------------------------
@@ -1699,3 +1707,28 @@ def test_offline_deployment_decodes_once_with_full_attention(model):
     assert [c.numel() for c in chunks if c.numel()] == [60 * 960]
     whole = (whole[0].clamp(-1, 1) * 32767).to(torch.int16)
     assert (torch.cat(chunks).int() - whole.int()).abs().max() <= 1
+
+
+def test_native_convolution_windows_nest_across_threads():
+    """Two threads' windows overlap; cuDNN comes back only when both have left."""
+    import threading
+
+    from mstar.model.cosyvoice3.components.flow import native_convolutions
+
+    before = torch.backends.cudnn.enabled
+    entered, release = threading.Event(), threading.Event()
+
+    def other():
+        with native_convolutions():
+            entered.set()
+            release.wait(5)
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    entered.wait(5)
+    with native_convolutions():
+        assert not torch.backends.cudnn.enabled
+    assert not torch.backends.cudnn.enabled  # the other thread is still inside
+    release.set()
+    thread.join(5)
+    assert torch.backends.cudnn.enabled == before

@@ -8,7 +8,7 @@
 //! keep the multimodal shapes (audio in `message.audio`, images as data URLs)
 //! flexible, exactly as the Python side does.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -120,7 +120,7 @@ pub enum Content {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    /// A LoRA adapter's name runs that adapter (`ServedModels`); the base model's, or none, runs it.
     #[serde(default)]
     pub model: Option<String>,
     /// Passed on as sent; the server's normalize_generation_kwargs holds the rules.
@@ -132,13 +132,10 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<i64>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub max_completion_tokens: Option<i64>,
-    /// Accepted for OpenAI compatibility (declared so it does NOT leak into
-    /// `extra` -> model_kwargs); single-choice responses only, as in mstar.
-    #[allow(dead_code)]
+    /// Single-choice responses only: anything but 1 is refused.
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
-    /// Accepted for OpenAI compatibility; stop sequences are not applied.
-    #[allow(dead_code)]
+    /// Stop sequences are not applied, so a non-empty one is refused.
     #[serde(default)]
     pub stop: Option<Value>, // str | [str]
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -163,7 +160,7 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpeechRequest {
     pub input: String,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    /// A LoRA adapter's name runs that adapter (`ServedModels`); the base model's, or none, runs it.
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -205,7 +202,7 @@ pub struct SpeechRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageGenerationRequest {
     pub prompt: String,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    /// A LoRA adapter's name runs that adapter (`ServedModels`); the base model's, or none, runs it.
     #[serde(default)]
     pub model: Option<String>,
     /// OpenAI `n`: number of images to generate (submitted as n engine requests).
@@ -213,7 +210,6 @@ pub struct ImageGenerationRequest {
     pub n: Option<i64>,
     #[serde(default)]
     pub size: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -231,15 +227,13 @@ pub struct ImageGenerationRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct VideoGenerationRequest {
     pub prompt: String,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    /// A LoRA adapter's name runs that adapter (`ServedModels`); the base model's, or none, runs it.
     #[serde(default)]
     pub model: Option<String>,
-    #[allow(dead_code)]
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
     #[serde(default)]
     pub size: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -262,40 +256,6 @@ pub struct VideoGenerationRequest {
 
 fn default_wav() -> String {
     "wav".to_string()
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelCard {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub owned_by: String,
-}
-
-impl ModelCard {
-    pub fn new(id: impl Into<String>, created: i64) -> Self {
-        Self {
-            id: id.into(),
-            object: "model".to_string(),
-            created,
-            owned_by: "mstar".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelList {
-    pub object: String,
-    pub data: Vec<ModelCard>,
-}
-
-impl ModelList {
-    pub fn new(data: Vec<ModelCard>) -> Self {
-        Self {
-            object: "list".to_string(),
-            data,
-        }
-    }
 }
 
 #[cfg(test)]
