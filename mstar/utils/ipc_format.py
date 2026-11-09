@@ -385,7 +385,6 @@ class WorkerGraphsDone(MessageBody):
     # The walk the completed pass ran under. The conductor follows it for a
     # partition whose walk the stream drives.
     graph_walk: str = field(default="")
-    stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
     # Stream edge -> destination worker -> items sent since the last report.
     # Every rank reports its own.
     stream_items_sent: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -452,7 +451,7 @@ class LoadLoraAdapter(MessageBody):
     op_id: str
     lora_name: str
     lora_path: str
-    lora_digest: str | None = None
+    lora_digest: str
 
 
 @dataclass

@@ -16,11 +16,11 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnSpec,
     LinearAttnVariant,
 )
-from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.base import TensorAndMetadata
+from mstar.model.components.mrope import image_position_advance
 from mstar.model.keys import MIXED
 from mstar.model.media_limits import read_image
 from mstar.model.multimodal import (
@@ -37,7 +37,6 @@ from mstar.model.multimodal_decoder import (
     PreparedMedia,
 )
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-from mstar.model.qwen3_5.components.rope import vision_position_advance
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -131,6 +130,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         return torch.float32
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
+        from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+
         num_kv_layers = len(self.config.full_layer_indices)
         num_gdn_layers = len(self.config.linear_layer_indices)
         return [
@@ -180,13 +181,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             ),
             self._sampler_spec(self.config.vocab_size),
             *self._vision_resources(),
+            qwen3_5_lora_spec(self.config, self.vision_config),
         ]
-
-    def get_lora_specs(self) -> list[LoraSpec]:
-        """The LLM's, then the vision encoder's when the checkpoint has a vision tower."""
-        from mstar.model.qwen3_5.lora import qwen3_5_lora_specs
-
-        return qwen3_5_lora_specs(self.config, self.vision_config)
 
     def _vision_resources(self) -> list[NodeResourceSpec]:
         """The ViT tower's attention, its only resource; none when text-only."""
@@ -224,7 +220,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
         budget = LLMSubmodule.MAX_BATCH_TOKENS
         return {"LLM": (
-            ChunkingPolicy(walks=("prefill_text",), chunkable=True, max_batch_tokens=budget),
+            ChunkingPolicy(walks=(LLMSubmodule.PREFILL_WALK,), chunkable=True, max_batch_tokens=budget),
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
         )}
@@ -415,7 +411,7 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
 
     def media_advance(self, tokens: int, grid: list[int]) -> int:
         # an image spans max(h', w') MRoPE positions, not its t * h' * w' tokens
-        return vision_position_advance(torch.tensor(grid), self._merge())
+        return image_position_advance(torch.tensor(grid), self._merge())
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

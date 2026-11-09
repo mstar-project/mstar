@@ -1370,6 +1370,7 @@ def _pool_rank(monkeypatch, rank: int, cfg: PagedKVConfig | None = None) -> tupl
     engine._submodules = {NODE: SimpleNamespace(resources={"kv": kv}, resident=None, submodule=SimpleNamespace(
         cleanup_request=lambda rid: None))}
     engine._runner, engine._loopback_steps = StepRunner({"kv": kv}), {}
+    engine._resource_planners = {}
     engine._chunking = ChunkingManagement({})
     engine._graph_runtime = SimpleNamespace(
         get_rid_string=str, get_rid_handle=lambda rid: rid if rid in kv._streams else None,

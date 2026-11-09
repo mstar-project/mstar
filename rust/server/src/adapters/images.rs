@@ -2,18 +2,30 @@
 
 use super::*;
 
-/// OpenAI `size` ("WxH") onto the model's `width` / `height`, as the Python
-/// adapters' `_size_kwargs`.
-pub(super) fn size_kwargs(mk: &mut Map<String, Value>, size: Option<&str>) -> Result<(), String> {
+/// Python's `int(s)` of a string: surrounding whitespace, a sign, and `_`
+/// between digits.
+fn py_int(s: &str) -> Option<i64> {
+    static INT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let int = INT.get_or_init(|| regex::Regex::new(r"^[+-]?[0-9](?:_?[0-9])*$").unwrap());
+    let t = py_strip(s);
+    int.is_match(t).then(|| t.replace('_', "").parse().ok()).flatten()
+}
+
+/// OpenAI `size` ("WxH") onto the model's `width` / `height`: the adapters'
+/// `(int(v) for v in size.lower().split("x"))` into two names, refused with
+/// the adapter's own `example`.
+pub(super) fn size_kwargs(mk: &mut Map<String, Value>, size: Option<&str>, example: &str) -> Result<(), String> {
     let Some(size) = size.filter(|s| !s.is_empty()) else {
         return Ok(());
     };
-    let parsed = size
-        .to_lowercase()
-        .split_once('x')
-        .and_then(|(w, h)| Some((w.trim().parse::<i64>().ok()?, h.trim().parse::<i64>().ok()?)));
+    let lowered = size.to_lowercase();
+    let parts: Vec<&str> = lowered.split('x').collect();
+    let parsed = match parts.as_slice() {
+        [w, h] => py_int(w).zip(py_int(h)),
+        _ => None,
+    };
     let Some((width, height)) = parsed else {
-        return Err(format!("size must be 'WxH' (e.g. '1024x1024'); got {size:?}"));
+        return Err(format!("size must be 'WxH' (e.g. '{example}'); got {}", media::py_repr(size)));
     };
     set_default(mk, "width", Value::from(width));
     set_default(mk, "height", Value::from(height));
@@ -23,7 +35,7 @@ pub(super) fn size_kwargs(mk: &mut Map<String, Value>, size: Option<&str>) -> Re
 /// `BagelAdapter.image_to_request` (`DiffusionImageAdapter`'s is the same, line for line).
 pub(super) fn sized_image(req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
     let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-    size_kwargs(&mut mk, req.size.as_deref())?;
+    size_kwargs(&mut mk, req.size.as_deref(), "1024x1024")?;
     set_seed(&mut mk, req.seed);
     Ok(SubmitArgs {
         text: Some(req.prompt.clone()),
@@ -40,7 +52,7 @@ pub(super) fn sized_image_edit(prompt: &str, image_path: &str, mut extra_kwargs:
     let size = extra_kwargs
         .remove("size")
         .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string));
-    size_kwargs(&mut extra_kwargs, size.as_deref())?;
+    size_kwargs(&mut extra_kwargs, size.as_deref(), "1024x1024")?;
     let mut file_paths = BTreeMap::new();
     file_paths.insert("image".to_string(), vec![image_path.to_string()]);
     Ok(SubmitArgs {
