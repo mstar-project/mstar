@@ -893,9 +893,12 @@ class StreamResampler:
 
     def push(self, x: np.ndarray) -> np.ndarray:
         self._buf = np.concatenate([self._buf, np.asarray(x, dtype=np.float64)])
-        self._n_in += int(np.size(x))
+        n_in = self._n_in + int(np.size(x))
         # output k is final once every input within half a kernel of it is in
-        return self._emit(-(-(self._n_in * self.up - self.half) // self.down))
+        out = self._emit(-(-(n_in * self.up - self.half) // self.down), n_in)
+        # last: ``held`` can run during a push on a thread, and may lag but not run ahead
+        self._n_in = n_in
+        return out
 
     def held(self, extra: int = 0) -> int:
         """Output samples ``flush`` would still emit, after ``extra`` more
@@ -903,11 +906,11 @@ class StreamResampler:
         return -(-((self._n_in + extra) * self.up) // self.down) - self._k_out
 
     def flush(self) -> np.ndarray:
-        out = self._emit(-(-(self._n_in * self.up) // self.down))
+        out = self._emit(-(-(self._n_in * self.up) // self.down), self._n_in)
         self.reset()
         return out
 
-    def _emit(self, k_end: int) -> np.ndarray:
+    def _emit(self, k_end: int, n_in: int) -> np.ndarray:
         up, down, half = self.up, self.down, self.half
         if k_end <= self._k_out or not self._buf.size:
             n, self._k_out = max(0, k_end - self._k_out), max(self._k_out, k_end)
@@ -919,7 +922,7 @@ class StreamResampler:
             t = np.arange(k0, min(k0 + 4096, k_end))[:, None] * down   # centers, upsampled
             ns = t // up + taps                                  # candidate input indices
             idx = t - ns * up + half
-            ok = (idx >= 0) & (idx <= 2 * half) & (ns >= 0) & (ns < self._n_in)
+            ok = (idx >= 0) & (idx <= 2 * half) & (ns >= 0) & (ns < n_in)
             vals = self._buf[np.clip(ns - self._base, 0, self._buf.size - 1)]
             out.append((np.where(ok, vals * self.kernel[np.clip(idx, 0, 2 * half)], 0.0)).sum(axis=1))
         self._k_out = k_end

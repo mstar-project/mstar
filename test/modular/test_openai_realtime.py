@@ -1207,3 +1207,20 @@ def test_a_commit_keeps_intake_open_and_the_audio_after_it_in_the_next_item():
         # 40 s of frames, cut to whole 2 s chunks; the committed item's 2 s stay out of it
         assert 38 * 32000 < api.audio_sizes[1] <= 40 * 32000 + 44
     asyncio.run(exercise())
+
+
+def test_resampler_held_does_not_run_ahead_of_a_push_on_a_thread():
+    """A push of a long append runs on a thread while the step runner reads
+    ``held``. Counting input before its output is emitted would call a chunk
+    full whose audio has not been added yet, and move the step's boundary."""
+    from mstar.api_server.media_io import StreamResampler
+
+    r = StreamResampler(24000, 16000)
+    r.push(np.zeros(1200, dtype=np.float32))
+    before, emit, seen = r.held(), r._emit, []
+    def spy(*args):
+        seen.append(r.held())
+        return emit(*args)
+    r._emit = spy
+    r.push(np.zeros(12000, dtype=np.float32))
+    assert seen == [before]
