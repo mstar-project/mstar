@@ -174,7 +174,7 @@ CHAT = {
 # ChatCompletionRequest's declared fields; the rest is model_extra.
 DECLARED = {"messages": None, "model": None, "temperature": None, "top_p": None,
             "max_tokens": None, "max_completion_tokens": None, "n": 1, "seed": None,
-            "stop": None, "stream": False, "modalities": None, "audio": None}
+            "stop": None, "stream": False, "stream_options": None, "modalities": None, "audio": None}
 
 
 def _python_request(body: dict):
