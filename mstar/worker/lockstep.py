@@ -403,11 +403,7 @@ class Lockstep:
         sharding = self._runtime.get_sharding_config(rid)
         if sharding is None:
             return
-        followers = {
-            worker for workers in sharding.tp_groups_of(self._worker_id) if workers[0] == self._worker_id
-            for worker in workers[1:]
-        }
-        for worker in followers:
+        for worker in sharding.followers_of(self._worker_id):
             self._communicator.send(worker, msg=message)
 
     def enqueue_follow(self, message: ScheduleTPNode) -> None:
