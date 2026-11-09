@@ -4479,6 +4479,9 @@ class KVManager(AttentionResource):
             earmark.granted = earmark.pages
 
     def unreserve(self, rid: str) -> None:
+        """`Resource.unreserve`, which also gives back the allotment the moves `make_room` chose for ``rid`` made
+        (`_settle`), though `reserve` took nothing then. That room is free again, and ``rid`` asks for it as any
+        other request does."""
         with self._lock:
             made = self._made == rid
             allotment = self._allotments[rid]

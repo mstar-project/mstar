@@ -297,8 +297,8 @@ class Admission:
                 passing.append(key)
             else:
                 return None
-        # The KV cache lends a passer the pages a first request it didn't refuse would fit in, so ``rid`` passes a
-        # first request only if it also passes, or takes nothing, at the resource ``blocked`` names for that request.
+        # `Resource.reserve_past` leaves a first request what it needs only at the resource ``blocked`` names for it,
+        # so ``rid`` passes a first request only if it also passes, or takes nothing, there.
         if any(blocked[self._queues[key][0]] not in passing + reserved for key in passing):
             return None
         nodes = self._reserve(rid, published_of, passing)

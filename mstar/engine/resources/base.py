@@ -328,9 +328,14 @@ class Resource(ResidentHooks, ABC):
     def reserve_past(
         self, rid: str, node_name: str, graph_walk: str, published: "PublishedInfo | None",
     ) -> object | None:
-        """`reserve` for ``rid`` ahead of an earlier request that can't start: take what ``rid`` asked
-        for while leaving that request what it needs, or return a mark. The base refuses, so a
-        resource that doesn't override it admits in order."""
+        """`reserve` for ``rid`` ahead of an earlier request that can't start: take what ``rid`` asked for, or
+        return a mark. When this resource refused that request and hasn't grown since, it leaves that request what
+        it needs. The runner calls it only while ``rid`` passes, or takes nothing, at the resource that refused that
+        request, or whose queue the oldest request holds back while it waits to return. The base refuses, so a
+        resource that doesn't override it admits in order.
+
+        A resource that overrides it asks nothing more of a waiting request (`ask` returns None) only once `reserve`
+        would take nothing for it, and the request may then start wherever it stands in this resource's queue."""
         return 0
 
     def unreserve(self, rid: str) -> None:

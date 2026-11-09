@@ -1402,7 +1402,8 @@ request pass a first request that can't start, by overriding
 leaving the first request what it needs, so passing can't starve that request, or returns a mark,
 and the runner tries a passing request again only once ``grew_since`` that mark. The runner calls
 it only while the first request can't start: a resource that lets requests pass refused it and
-hasn't grown since, and the passing request passes at that resource too. A resource that doesn't
+hasn't grown since, or the oldest request holds back that resource's queue while it waits to return,
+and the passing request passes, or takes nothing, at that resource too. A resource that doesn't
 override it keeps strict order, and a request waiting in its queue can't pass anywhere. A resource
 that overrides it asks nothing more of a waiting request whose capacity it set aside on its own, as
 the KV cache does when it moves other requests for it, and the request may then start wherever it
