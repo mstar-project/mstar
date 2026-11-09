@@ -570,35 +570,40 @@ def plan_captures(
         pool, _, _, cost = candidate
         return added(pool, cost) + cost.slots * cost.outside - reused(cost)
 
+    def plain(candidate) -> bool:
+        return _plain_twin(candidate[2]) == candidate[2]
+
     def beside_plain_twin(candidate) -> bool:
         pool, _, bucket, _ = candidate
-        twin = _plain_twin(bucket)
-        return twin == bucket or twin in plan.buckets[pool]
+        return plain(candidate) or _plain_twin(bucket) in plan.buckets[pool]
 
     left = [
         (pool, index, bucket, cost) for pool, costs in pools.items()
         for index, (bucket, cost) in enumerate(costs.items()) if cost.graph is not None
     ]
-    while left:
-        # an idle bucket only once its plain twin is planned (see `_plain_twin`)
-        ready = [candidate for candidate in left if beside_plain_twin(candidate)]
-        if not ready:
-            break
-        # a tie goes to the pool named first, which leads with its node, then to capture order
-        best = min(ready, key=lambda candidate: (on_device(candidate), *candidate[:2]))
-        pool, _, bucket, cost = best
-        if on_device(best) > room:
-            break
-        room -= on_device(best)
-        used = reused(cost)
-        if used:
-            unused[cost.executable] -= used
-            bound -= used
-        plan.predicted[pool] += added(pool, cost)
-        plan.outside[pool] += cost.slots * cost.outside
-        scratch[pool] = max(scratch[pool], cost.graph - cost.kept)
-        plan.buckets[pool].add(bucket)
-        left.remove(best)
+    # Every plain bucket first, as a deployment with no idle-capable resource plans them;
+    # then the idle buckets whose plain twin is in (see `_plain_twin`), so a cheap idle
+    # bucket never takes the room another node's plain bucket needed.
+    for eligible in (plain, beside_plain_twin):
+        while True:
+            ready = [candidate for candidate in left if eligible(candidate)]
+            if not ready:
+                break
+            # a tie goes to the pool named first, which leads with its node, then to capture order
+            best = min(ready, key=lambda candidate: (on_device(candidate), *candidate[:2]))
+            pool, _, bucket, cost = best
+            if on_device(best) > room:
+                break
+            room -= on_device(best)
+            used = reused(cost)
+            if used:
+                unused[cost.executable] -= used
+                bound -= used
+            plan.predicted[pool] += added(pool, cost)
+            plan.outside[pool] += cost.slots * cost.outside
+            scratch[pool] = max(scratch[pool], cost.graph - cost.kept)
+            plan.buckets[pool].add(bucket)
+            left.remove(best)
     return plan
 
 
