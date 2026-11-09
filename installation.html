@@ -804,7 +804,9 @@ extension (see <a class="reference internal" href="#rust-extension">Rust extensi
 <div class="admonition important">
 <p class="admonition-title">Important</p>
 <p><strong>For CUDA installs, always pass</strong> <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar</span></code> floors
-PyTorch at 2.10 (<code class="docutils literal notranslate"><span class="pre">torch&gt;=2.10.0</span></code> / <code class="docutils literal notranslate"><span class="pre">torchvision&gt;=0.25.0</span></code> / <code class="docutils literal notranslate"><span class="pre">torchaudio&gt;=2.10.0</span></code>).
+PyTorch at 2.10 (<code class="docutils literal notranslate"><span class="pre">torch&gt;=2.10.0</span></code> / <code class="docutils literal notranslate"><span class="pre">torchvision&gt;=0.25.0</span></code> /
+<code class="docutils literal notranslate"><span class="pre">torchaudio&gt;=2.10.0,!=2.11.1</span></code>; torchaudio 2.11.1 needs a newer torch than its
+metadata says and fails to load next to torch 2.11 or 2.12).
 The flag tells
 <code class="docutils literal notranslate"><span class="pre">uv</span></code> to detect your driver’s CUDA version and fetch the <strong>matching</strong> torch build
 — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
@@ -898,7 +900,7 @@ see <a class="reference internal" href="#omnivoice-omnivoice">omnivoice (OmniVoi
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[pi05]</span></code></p></td>
 <td><p>Pi0.5 runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
-<code class="docutils literal notranslate"><span class="pre">triton</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>. Its tokenizer
+<code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>. Its tokenizer
 comes from the gated <code class="docutils literal notranslate"><span class="pre">google/paligemma-3b-pt-224</span></code>: accept its license on
 Hugging Face and set <code class="docutils literal notranslate"><span class="pre">HF_TOKEN</span></code>, or the server refuses to start.</p></td>
 </tr>
@@ -908,7 +910,7 @@ Hugging Face and set <code class="docutils literal notranslate"><span class="pre
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">.[glm]</span></code></p></td>
 <td><p>GLM runtime: <code class="docutils literal notranslate"><span class="pre">transformers</span></code>, <code class="docutils literal notranslate"><span class="pre">flashinfer-python</span></code>, <code class="docutils literal notranslate"><span class="pre">safetensors</span></code>,
-<code class="docutils literal notranslate"><span class="pre">triton</span></code>, <code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>, and <code class="docutils literal notranslate"><span class="pre">ninja</span></code>
+<code class="docutils literal notranslate"><span class="pre">huggingface-hub</span></code>, <code class="docutils literal notranslate"><span class="pre">mooncake-transfer-engine</span></code>, and <code class="docutils literal notranslate"><span class="pre">ninja</span></code>
 (speeds up the JIT build of the vendored MoE align kernel).</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">.[waypoint]</span></code></p></td>
@@ -1185,8 +1187,8 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code> doesn’t declare its <code class="docutils literal notranslate"><span class="pre">torch</span></code> version, so the resolver otherwise picks the
 newest release (0.17 at the time of writing), which fails to load next to torch 2.10; 0.10
 is the release built against it.
-The <code class="docutils literal notranslate"><span class="pre">[asr]</span></code> extra pins that pair itself (<code class="docutils literal notranslate"><span class="pre">torch</span></code> 2.10 with <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code> 0.10, as in the
-Docker images), so installing it puts <code class="docutils literal notranslate"><span class="pre">torch</span></code> on 2.10.</p>
+The <code class="docutils literal notranslate"><span class="pre">[asr]</span></code> extra pins that set itself (<code class="docutils literal notranslate"><span class="pre">torch</span></code> 2.10 with <code class="docutils literal notranslate"><span class="pre">torchaudio</span></code> 2.10 and
+<code class="docutils literal notranslate"><span class="pre">torchcodec</span></code> 0.10, as in the Docker images), so installing it puts <code class="docutils literal notranslate"><span class="pre">torch</span></code> on 2.10.</p>
 </section>
 <section id="verify-the-install">
 <h2>Verify the install<a class="headerlink" href="#verify-the-install" title="Link to this heading">#</a></h2>

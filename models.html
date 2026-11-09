@@ -1908,9 +1908,7 @@ SMs, a step of up to 64 rows whose residual draws the graph sampler can hand
 over runs the whole loop, sampling included, as one persistent kernel
 (<code class="docutils literal notranslate"><span class="pre">mstar.model.qwen3_tts.components.depth_frame</span></code>). The kernel needs Triton
 3.7, which comes with torch 2.12. Under torch 2.11’s Triton 3.6, startup logs
-why and runs the loop. torchaudio has no build for torch 2.12, and decoding a
-reference clip imports it, so a Base deployment that clones voices can’t turn
-the kernel on yet.</p></li>
+why and runs the loop.</p></li>
 <li><p>The Codec does not run beside the Talker on a side stream (<code class="docutils literal notranslate"><span class="pre">side_stream</span></code>,
 see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>): its windows read and write their streams’ <code class="docutils literal notranslate"><span class="pre">codec_state</span></code>
 rows, and the side lane only takes a node that holds no resources, since it
