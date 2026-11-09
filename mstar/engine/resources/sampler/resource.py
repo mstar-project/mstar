@@ -796,13 +796,10 @@ class SamplerResource(Resource):
     def fused_draw_args(self) -> FusedDrawArgs | None:
         """This step's per-row parameters, for a kernel in the forward that draws each row's tokens as `sample` would
         on a vocabulary of at most ``FUSED_SAMPLE_MAX_VOCAB``. Rows are the batch the forward runs on, as for
-        `sample`. None when `sample` would draw any other way: an eager or greedy step, the penalty, a kept last
-        token, or a filter, write or broadcast besides the draw. The kernel's caller advances the offsets with
+        `sample`. None when `sample` would draw any other way: an eager step, the penalty, a kept last token, or a
+        filter, write or broadcast besides the draw. The kernel's caller advances the offsets with
         `advance_offsets`."""
-        if (
-            self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token
-            or self._greedy_this_step
-        ):
+        if self._cg_sampler is None or self._apply_penalty_this_step or self._keep_last_token:
             return None
         return self._cg_sampler.fused_draw_args(self._apply_filters_this_step)
 

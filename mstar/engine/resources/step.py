@@ -32,32 +32,6 @@ class ResourceStep:
     segments: tuple[Segment, ...] | None = None
 
 @dataclass(frozen=True)
-class CaptureVariant:
-    """A capture the engine adds beside a node's own (``key``, the node's
-    ``cg_key_info``), for steps whose rows can't need some of its kernels: the
-    same forward with those left out. Variants nest; the node only ever sees
-    its own key (``node_capture_key``)."""
-
-    key: Any = None
-
-
-def node_capture_key(key: Any) -> Any:
-    """The node's own ``cg_key_info`` in a capture key, without its variants."""
-    while isinstance(key, CaptureVariant):
-        key = key.key
-    return key
-
-
-def has_variant(key: Any, kind: type[CaptureVariant]) -> bool:
-    """Whether the capture key ``key`` is a ``kind`` variant, at any depth."""
-    while isinstance(key, CaptureVariant):
-        if isinstance(key, kind):
-            return True
-        key = key.key
-    return False
-
-
-@dataclass(frozen=True)
 class BucketKey:
     graph_walk: str
     bs: int
