@@ -13,8 +13,6 @@ from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule, Cosmos3ReasonerSubmodule
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
-# the reasoner captures decode only; its prefills run eagerly
-REASONER_WALKS = [C.REASONER_DECODE_WALK]
 GRAPH_CONFIGS = [
     path for path in sorted(CONFIGS.glob("cosmos3*.yaml"))
     if "accelerator_graph" in yaml.safe_load(path.read_text()).get("model_kwargs", {})
@@ -81,7 +79,14 @@ def test_switch_gates_all_cosmos3_captures(monkeypatch, enabled, disable_env):
         assert [config.capture_graph_walk for config in dit_configs] == [
             C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK, C.PREFILL_WALK,
         ]
-        assert [config.capture_graph_walk for config in reasoner_configs] == REASONER_WALKS
+        # the VLM scaffold's: decode, packed text prefill, and mixed prefill + decode
+        assert [config.capture_graph_walk for config in reasoner_configs] == [
+            C.REASONER_DECODE_WALK, C.REASONER_PREFILL_WALK, "mixed",
+        ]
+        # decode GEMMs on cuBLAS, the rest of the compile at max-autotune
+        decode = next(c for c in reasoner_configs if c.capture_graph_walk == C.REASONER_DECODE_WALK)
+        assert decode.compile_mode == "max-autotune-no-cudagraphs"
+        assert decode.inductor_options == {"max_autotune_gemm_backends": "ATEN"}
     else:
         assert dit_configs == reasoner_configs == []
 
@@ -107,4 +112,7 @@ def test_prefill_environment_switch_leaves_other_captures_enabled(monkeypatch):
     assert {config.capture_graph_walk for config in dit.get_accelerator_graph_configs("cpu")} == {
         C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK,
     }
-    assert [config.capture_graph_walk for config in reasoner.get_accelerator_graph_configs("cpu")] == REASONER_WALKS
+    # the reasoner's prefill captures go with the DiT's; its decode stays
+    assert [config.capture_graph_walk for config in reasoner.get_accelerator_graph_configs("cpu")] == [
+        C.REASONER_DECODE_WALK,
+    ]
