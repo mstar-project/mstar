@@ -47,6 +47,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     HostRows,
+    InputSeqLenInfo,
     ModelInputsFromEngine,
     NodeInputs,
 )
@@ -123,6 +124,16 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         return self
 
     # -- engine seam ----------------------------------------------------------
+
+    def get_input_sequence_len(
+        self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
+    ) -> InputSeqLenInfo | None:
+        """A prompt's token count, which the chunked prefill (``get_chunking_policies``) cuts by; it is
+        ``prepare_inputs``' ``input_seq_len`` of the whole prompt. Main's engine manager refuses a node that
+        chunks a walk without it, at startup."""
+        if graph_walk == "prefill" and inputs.get("text_inputs"):
+            return InputSeqLenInfo(int(inputs["text_inputs"][0].shape[0]))
+        return None
 
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,

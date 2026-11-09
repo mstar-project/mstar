@@ -91,6 +91,18 @@ class NodeQuantization:
         self.plans[key] = (module, plan)
         return plan
 
+    def prepare_meta(self, module: nn.Module) -> list[nn.Module]:
+        """Resolve and prepare the declared roots at or under ``module`` while it is on the meta device; returns
+        them, for ``mark_unloaded`` once ``to_empty`` has given them storage (``materialize`` does both)."""
+        roots = [m for m in module.modules() if any(type(m) is r.root_type for r in self.roots)]
+        for root in roots:
+            self.plan_for(root)
+        return roots
+
+    def mark_unloaded(self, roots: Iterable[nn.Module]) -> None:
+        for root in roots:
+            apply.mark_unloaded(root, self.plans[id(root)][1])
+
     def wrap_load(
         self, module: nn.Module, weights: Iterable[tuple[str, torch.Tensor]],
         stacked_params: list[StackedParamRule] | None, name_remapper: Callable[[str], str | None] | None,
@@ -147,6 +159,18 @@ def node_scope(
         yield scope
     finally:
         _ACTIVE.reset(token)
+
+
+def materialize(module: nn.Module, device: torch.device | str) -> nn.Module:
+    """``module.to_empty(device=device)`` for a module built on the meta device, with the active scope's declared
+    roots under it prepared first: each layer that loads as stored allocates its stored format (MXFP4 experts
+    their packed bytes), never the bf16 weight it replaces, and its scales are marked not loaded after."""
+    scope = active_scope()
+    roots = scope.prepare_meta(module) if scope is not None else []
+    module.to_empty(device=device)
+    if scope is not None:
+        scope.mark_unloaded(roots)
+    return module
 
 
 def load_submodule(model: Any, node: str, model_config: Mapping[str, Any] | None = None,

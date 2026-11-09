@@ -1,5 +1,6 @@
 """Kimi K3 / K3.1's model-level declarations on CPU without weights: resources per serving
-config, the shipped configs through the deployment check, prompt limits, decode graphs."""
+config, the shipped configs through the deployment check, prompt limits, and the
+quantization API's view of the LLM root."""
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,12 @@ import yaml
 from mstar.engine.resources.dsa.config import DSASpec
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.model.kimi_k3.config import KimiK3ModelConfig
-from mstar.model.kimi_k3.kimi_k3_model import KimiK3Model, KimiK31Model
+from mstar.model.kimi_k3.kimi_k3_model import (
+    QUANTIZABLE_CANDIDATES,
+    KimiK3Model,
+    KimiK31Model,
+    quantization_keep_bf16,
+)
 
 ROOT = Path(__file__).resolve().parents[4]
 CONFIGS = {
@@ -60,6 +66,43 @@ def test_prompt_limit_and_byte_mode():
         model.process_prompt("x" * model.config.context_limit, ["text"], ["text"])
     assert model.postprocess(torch.tensor([104, 105]), "text") == b"hi"
     assert model.get_loop_caps(max_output_tokens=10) == {"decode_loop": 9}
+
+
+def test_quantization_roots_cover_every_linear():
+    """Every linear of the root is a candidate or kept bf16 and the routed experts are a candidate."""
+    from mstar.distributed.communication import CommGroup
+    from mstar.quantization.resolve import discover_layers
+
+    model = KimiK31Model("x", config_variant="reduced")
+    (root,) = model.get_quantization_roots()
+    assert root.node == "LLM" and root.rules.prefix == "language_model."
+    with torch.device("meta"):
+        module = root.build(CommGroup.trivial())
+    layers = discover_layers(module)
+    picked = {path for path in layers if root.linears.selected(path)}
+    assert "model.layers.1.block_sparse_moe.experts" in picked
+    assert "model.layers.3.self_attn.o_proj" in picked  # an MLA layer's
+    assert "model.layers.0.self_attn.o_proj" not in picked  # a KDA layer's
+    assert "lm_head" not in picked
+
+
+def test_quantization_patterns_name_real_modules():
+    """Every declared pattern matches some module of the tiny root, so none is stale."""
+    from fnmatch import fnmatchcase
+
+    from mstar.model.kimi_k3.components.causal_lm import KimiK3ForCausalLM
+
+    cfg = KimiK3ModelConfig.reduced(dsa_long_context=True)  # the indexer built
+    with torch.device("meta"):
+        names = [n for n, _ in KimiK3ForCausalLM(cfg).named_modules()]
+    names += [n + ".experts" for n in names if n.endswith("block_sparse_moe")]
+
+    def matches(name, pattern):
+        parts, pats = name.split("."), pattern.split(".")
+        return len(parts) == len(pats) and all(fnmatchcase(a, b) for a, b in zip(parts, pats, strict=True))
+
+    for pattern in QUANTIZABLE_CANDIDATES + quantization_keep_bf16(cfg):
+        assert any(matches(n, pattern) for n in names), pattern
 
 
 def test_decode_capture_is_declared_where_it_can_replay():

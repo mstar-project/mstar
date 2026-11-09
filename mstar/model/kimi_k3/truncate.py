@@ -12,6 +12,7 @@ mxfp4-pack-quantized layout: low nibble first, E2M1 codes, an E8M0 scale per 32 
 merceod's #257 reads it); bf16 holds it exactly.
 
     python -m mstar.model.kimi_k3.truncate --src <release snapshot> --dst <dir> [--layers 4] [--experts 128]
+        [--keep-mxfp4]
 """
 from __future__ import annotations
 
@@ -46,6 +47,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--dst", required=True)
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--experts", type=int, default=128)
+    # keep the kept experts MXFP4 as the release stores them (and its quantization_config), for the
+    # quantization API to load as stored, instead of decoding them to bf16
+    ap.add_argument("--keep-mxfp4", action="store_true")
     args = ap.parse_args(argv)
     src, dst = Path(args.src), Path(args.dst)
     dst.mkdir(parents=True, exist_ok=True)
@@ -72,7 +76,7 @@ def main(argv: list[str] | None = None) -> None:
             for name in names:
                 t = f.get_tensor(name)
                 e = _EXPERT.match(name)
-                if e:
+                if e and not args.keep_mxfp4:
                     base = f"{e.group(1)}.{e.group(2)}.{e.group(3)}"
                     packed.setdefault(base, {})[e.group(4)] = t
                     continue
@@ -98,8 +102,9 @@ def main(argv: list[str] | None = None) -> None:
     text["dsa_config"]["dsa_layers"] = list(linear["full_attn_layers"])
     text["num_hidden_layers"] = n
     text["num_experts"] = args.experts
-    text.pop("quantization_config", None)
-    config.pop("quantization_config", None)
+    if not args.keep_mxfp4:
+        text.pop("quantization_config", None)
+        config.pop("quantization_config", None)
     (dst / "config.json").write_text(json.dumps(config, indent=2))
     (dst / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": out_map}, indent=1))
     for extra in ("generation_config.json",):

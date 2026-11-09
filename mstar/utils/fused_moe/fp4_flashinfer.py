@@ -25,6 +25,38 @@ _EPILOGUE_TILE_M = 128  # the TRT-LLM kernels' tile along a GEMM's rows
 _SUPPORTED = ((10, 0), (10, 3))
 
 
+def unsupported_activation(activation, fmt: str = "mxfp4", activation_dtype: str = "bf16") -> str | None:
+    """Why the TRT-LLM FP4 MoE can't run the experts' gated activation, None when it can: SwiGLU, or a SiTU
+    with both betas (its ``activation_type`` Situ takes them per expert as ``gemm1_alpha`` / ``gemm1_beta``),
+    except SiTU on MXFP4 weights with bf16 activations: FlashInfer 0.7.2.post1's trtllm-gen ships no
+    ``MxE2m1 x Bfloat16`` SiTuGlu batched GEMM (B300 04c: "No kernel found" at decode, tiles 8 and 16), so
+    Kimi's W4A16 experts take the Triton kernel. Its Kimi W4A8 SiTU MoE (``backend="cake"``, sm_103a,
+    MXFP4 x MXFP8) is not wired here."""
+    from mstar.utils.situ import SiTU
+
+    if activation == "silu":
+        return None
+    if isinstance(activation, SiTU) and activation.linear_beta is not None:
+        if fmt == "mxfp4" and activation_dtype == "bf16":
+            return "FlashInfer's trtllm-gen has no MXFP4 x bf16 SiTU kernel"
+        return None
+    return f"the TRT-LLM FP4 MoE has no {activation!r} activation"
+
+
+def _gated_act(activation, num_experts: int, device: torch.device):
+    """``(activation_type, gemm1_alpha, gemm1_beta)``. FlashInfer's SiTU is ``beta*tanh(x0/beta) *
+    alpha*tanh(x1/alpha)*sigmoid(x1)`` over ``[up; gate]`` rows (x0 up, x1 gate): ``alpha`` is the gate's
+    beta, ``beta`` the up half's linear beta."""
+    from flashinfer.tllm_enums import ActivationType
+
+    from mstar.utils.situ import SiTU
+
+    if not isinstance(activation, SiTU):
+        return ActivationType.Swiglu.value, None, None
+    full = lambda v: torch.full((num_experts,), float(v), dtype=torch.float32, device=device)  # noqa: E731
+    return ActivationType.Situ.value, full(activation.beta), full(activation.linear_beta)
+
+
 def unavailable_reason(device: torch.device) -> str | None:
     from mstar.platforms import current_platform
 
@@ -78,6 +110,7 @@ class TrtllmFp4Experts:
             _shuffle(w1[i], s1[i], True, sf_block, cache)
             _shuffle(w2[i], s2[i], False, sf_block, cache)
         out = cls(block, fmt, activation)
+        out.gated = _gated_act(getattr(block, "activation", "silu"), e, device)
         ones = torch.ones(e, dtype=torch.float32, device=device)
         if fmt == "mxfp4":
             out.scalars = (ones, ones, ones)
@@ -117,11 +150,12 @@ class TrtllmFp4Experts:
                   else (experts.gate_up_proj, experts.down_proj))
         hidden, hidden_scale = self._hidden(flat)
         out1, out1_gate, out2 = self.scalars
+        act_type, alpha, beta = self.gated
         # the sentinel id ``e`` (padding rows, another rank's experts) is one more expert no rank holds here
         return trtllm_fp4_block_scale_routed_moe(
             (selected_experts.to(torch.int32), routing_weights.to(torch.float32)), None, hidden, hidden_scale,
-            w1, experts.gate_up_proj_scale.view(torch.float8_e4m3fn), None, None, None, None,
+            w1, experts.gate_up_proj_scale.view(torch.float8_e4m3fn), None, alpha, beta, None,
             w2, experts.down_proj_scale.view(torch.float8_e4m3fn), None, out1, out1_gate, out2,
             e + 1 if skip_invalid else e, selected_experts.shape[1], None, None, two_inter // 2, 0, e, None,
-            do_finalize=True,
+            do_finalize=True, activation_type=act_type,
         )[0]

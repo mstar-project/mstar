@@ -465,10 +465,13 @@ def act_and_mul_kernel(
     SWIGLU_LIMIT,
     SITU_BETA,
     SITU_LINEAR_BETA,
+    rows_ptr,
+    num_rows,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
     HAS_SWIGLU_CLAMP: tl.constexpr,
     HAS_SITU_LINEAR_BETA: tl.constexpr,
+    HAS_ROWS: tl.constexpr,
 ):
     """Per-slot gated activation.
 
@@ -482,7 +485,13 @@ def act_and_mul_kernel(
     out_dtype = down_input_ptr.dtype.element_ty
 
     half = hidden_size // 2
-    pid = tl.program_id(0)
+    # int64: a slot's row offset, M * top_k * 2I, passes 2^31 past ~21K tokens at EP8's 2I = 6144
+    pid = tl.program_id(0).to(tl.int64)
+    if HAS_ROWS:
+        # only the rows a GEMM tile wrote (expert-parallel: the other ranks' slots are never written or read)
+        pid = tl.load(rows_ptr + pid).to(tl.int64)
+        if pid >= num_rows:
+            return
 
     gate_row = gateup_output_ptr + pid * hidden_size
     up_row = gate_row + half
@@ -512,16 +521,18 @@ def act_and_mul_triton(
     down_input: torch.Tensor,
     activation: "str | SiTU" = "silu",
     swiglu_limit: float | None = None,
+    rows: torch.Tensor | None = None,
 ) -> None:
-    """Launch the gated activation (``silu``, ``gelu`` or a ``SiTU`` spec) with an optional
-    pre-activation clamp."""
+    """Launch the gated activation (``silu``, ``gelu``, a ``SiTU`` or its ``spec`` string) with an
+    optional pre-activation clamp; with ``rows`` (``moe_align_block_size``'s sorted slot ids), only
+    the slots listed there (ids past the last slot are padding)."""
     assert gateup_output.is_contiguous()
     assert down_input.is_contiguous()
     assert gateup_output.shape[0] == down_input.shape[0]
     assert gateup_output.shape[1] == 2 * down_input.shape[1]
 
-    situ = activation if isinstance(activation, SiTU) else None
-    grid = (down_input.shape[0],)
+    situ = activation if isinstance(activation, SiTU) else SiTU.parse(activation)
+    grid = (down_input.shape[0] if rows is None else rows.shape[0],)
     hidden_size = gateup_output.shape[1]
     act_and_mul_kernel[grid](
         gateup_output,
@@ -530,10 +541,13 @@ def act_and_mul_triton(
         0.0 if swiglu_limit is None else swiglu_limit,
         1.0 if situ is None else situ.beta,
         1.0 if situ is None or situ.linear_beta is None else situ.linear_beta,
+        rows if rows is not None else down_input,
+        down_input.shape[0],
         BLOCK_SIZE=512,
         ACTIVATION_TYPE="situ" if situ is not None else activation,
         HAS_SWIGLU_CLAMP=swiglu_limit is not None,
         HAS_SITU_LINEAR_BETA=situ is not None and situ.linear_beta is not None,
+        HAS_ROWS=rows is not None,
     )
 
 

@@ -8,9 +8,9 @@ vision tower and projector (``vision_tower.*``, ``mm_projector.*``, skipped). Wi
   for 96 heads (the tail is zeros); the stream keeps the first ``linear_num_heads``.
 * routed experts: ``experts.<e>.{w1,w3,w2}`` fill the stacked ``experts.gate_up_proj`` (gate:e,
   up:e) and ``experts.down_proj`` (down:e). bf16 checkpoints name them ``.weight``; the MXFP4
-  release names ``.weight_packed`` / ``.weight_scale``, which land on ``gate_up_proj`` /
-  ``gate_up_proj_scale`` and ``down_proj`` / ``down_proj_scale`` once the quantization API's
-  mxfp4 experts format has given the block that storage.
+  release names ``.weight_packed`` / ``.weight_scale``, which the same rules route to
+  ``gate_up_proj_packed`` / ``gate_up_proj_scale`` (the suffix after ``weight`` is kept), the
+  storage the quantization API's mxfp4 experts format gives the block when it loads as stored.
 * dense and shared MLPs: ``gate_proj`` / ``up_proj`` fill ``gate_up_proj`` (0, 1).
 * the indexer (K3.1) loads only under ``dsa_long_context``.
 """
@@ -34,9 +34,6 @@ _SKIPPED_PREFIXES = ("vision_tower.", "mm_projector.")
 _EXPERT_RE = re.compile(r"^(.*\.experts)\.(\d+)\.(w1|w2|w3)\.(weight|weight_packed|weight_scale)$")
 _KDA_FORGET_RE = re.compile(r"\.self_attn\.(f_a_proj\.weight|f_b_proj\.weight|dt_bias|A_log)$")
 _A_LOG_RE = re.compile(r"\.self_attn\.A_log$")
-
-# checkpoint suffix -> the stacked experts parameter it fills
-_EXPERT_TARGET = {"weight": "", "weight_packed": "", "weight_scale": "_scale"}
 
 # parameters the checkpoint stores fp32 and the forward reads fp32; restored after the
 # module-wide cast to the serving dtype, before loading
@@ -67,14 +64,13 @@ def kimi_k3_name_remapper(dsa_long_context: bool):
 def build_stacked_params(num_experts: int) -> list[StackedParamRule]:
     rules: list[StackedParamRule] = []
     for e in range(num_experts):
-        # first-win substring matching: the _scale / _packed suffixes before plain .weight
-        for suffix in ("weight_scale", "weight_packed", "weight"):
-            tail = _EXPERT_TARGET[suffix]
-            rules += [
-                StackedParamRule(f".experts.gate_up_proj{tail}", f".experts.w1.__expert{e}__.{suffix}", f"gate:{e}"),
-                StackedParamRule(f".experts.gate_up_proj{tail}", f".experts.w3.__expert{e}__.{suffix}", f"up:{e}"),
-                StackedParamRule(f".experts.down_proj{tail}", f".experts.w2.__expert{e}__.{suffix}", f"down:{e}"),
-            ]
+        # a rule replaces ``.experts.w1.__expert<e>__.weight`` and keeps what follows it, so
+        # ``weight_packed`` / ``weight_scale`` reach the quantized storage's ``_packed`` / ``_scale``
+        rules += [
+            StackedParamRule(".experts.gate_up_proj", f".experts.w1.__expert{e}__.weight", f"gate:{e}"),
+            StackedParamRule(".experts.gate_up_proj", f".experts.w3.__expert{e}__.weight", f"up:{e}"),
+            StackedParamRule(".experts.down_proj", f".experts.w2.__expert{e}__.weight", f"down:{e}"),
+        ]
     # KDA's three checkpoint convs row-concat into one [3 * qkv, 1, K] parameter
     rules += [StackedParamRule(".conv1d.weight", f".{b}_conv1d.weight", b) for b in ("q", "k", "v")]
     # specific targets, so strict loading's shard check never pairs them with the experts'
@@ -139,16 +135,18 @@ def load_kimi_k3_weights(
     text tensor must land, and every parameter (each stacked shard) must get one."""
     from mstar.model.loader import load_weights_into
 
-    params = dict(module.named_parameters())
-    packed_storage = any(n.endswith(".experts.gate_up_proj_scale") for n in params)
-
     def guard(stream):
+        packed = None  # whether the experts hold packed storage, read once the scope prepared them
         for name, tensor in stream:
-            if name.endswith((".weight_packed", ".weight_scale")) and not packed_storage:
-                raise ValueError(
-                    f"{name}: the routed experts are MXFP4 (compressed-tensors) in this checkpoint, "
-                    "and this build holds them bf16. They need the quantization API's mxfp4 experts "
-                    "format (a `quantization:` block), or a checkpoint with bf16 experts")
+            if name.endswith((".weight_packed", ".weight_scale")):
+                if packed is None:
+                    packed = any(n.endswith(".experts.gate_up_proj_packed") for n, _ in module.named_parameters())
+                if not packed:
+                    raise ValueError(
+                        f"{name}: the routed experts are MXFP4 (compressed-tensors) in this checkpoint, "
+                        "but this load holds them bf16: load the node under its quantization scope "
+                        "(mstar.quantization.scope.load_submodule, as the engine does), or use a "
+                        "checkpoint with bf16 experts")
             yield name, tensor
 
     restore_fp32_params(module)

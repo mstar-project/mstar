@@ -1751,6 +1751,9 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "z_image_turbo": DiffusionImageAdapter(),
     "glm52": TextChatAdapter(),
     "glm5_next": TextChatAdapter(),
+    # Kimi K3 / K3.1 Pro: text in, text out; the model applies its own chat template (kimi_k3_model.process_prompt)
+    "kimi_k3": TextChatAdapter(),
+    "kimi_k31": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
 }

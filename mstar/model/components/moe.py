@@ -78,6 +78,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
 from mstar.model.components.quant_linear import QuantCapability, QuantGeometry
 from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight, quantize_fp8_block_weight
+from mstar.utils.situ import activation_spec
 
 logger = logging.getLogger(__name__)
 
@@ -433,7 +434,8 @@ def _sync_routing(
     packed = torch.cat([selected_experts.float(), routing_weights.float()], dim=-1)
     if comm_group.rank != 0:
         packed = torch.zeros_like(packed)
-    comm_group.all_reduce(packed)
+    # an all-reduce may return the sum in a new tensor (tp_allreduce: flashinfer), not in its input
+    packed = comm_group.all_reduce(packed)
     return packed[:, top_k:].to(routing_weights.dtype), packed[:, :top_k].long()
 
 
@@ -772,13 +774,19 @@ class Fp8Experts:
                 for w, s in ((w1, s1), (w2, s2))
             ]
             return dispatch_experts_fused(flat, *bf16, w1.shape[0], selected_experts, routing_weights,
-                                          skip_invalid=skip_invalid)
+                                          skip_invalid=skip_invalid, activation=self._experts_activation)
         from mstar.utils.fused_moe import fused_experts_fp8
 
         return fused_experts_fp8(
             flat, w1, w2, s1, s2, routing_weights, selected_experts,
             block_size=self.experts_fp8_block, skip_invalid=skip_invalid,
+            activation=activation_spec(self._experts_activation),
         )
+
+    @property
+    def _experts_activation(self):
+        """The experts' gated activation: the block's ``activation`` (``silu`` or a ``SiTU``)."""
+        return getattr(self, "activation", "silu")
 
 
 # a stored 4-bit tensor's checkpoint suffix -> the stacked experts param's, after ``gate_up_proj`` / ``down_proj``
@@ -938,8 +946,13 @@ class QuantExperts(Fp8Experts):
         from mstar.utils.fused_moe import fp4_flashinfer
 
         device = next(iter(self.experts.parameters())).device
-        if fp4_flashinfer.unavailable_reason(device) is None:
+        reason = (fp4_flashinfer.unavailable_reason(device)
+                  or fp4_flashinfer.unsupported_activation(self._experts_activation, self.experts_packed.name))
+        if reason is None:
             self._experts_kernel = fp4_flashinfer.TrtllmFp4Experts.convert(self, device)
+        elif fp4_flashinfer.unavailable_reason(device) is None:
+            # a Blackwell GPU whose FP4 MoE lacks this activation: the Triton kernel serves it
+            logger.info("%s experts on the Triton kernel: %s", self.experts_packed.name, reason)
 
     def _experts_quant(
         self, flat: torch.Tensor, routing_weights: torch.Tensor, selected_experts: torch.Tensor,
@@ -966,7 +979,7 @@ class QuantExperts(Fp8Experts):
                 s1, s2 = s1.view(torch.uint8), s2.view(torch.uint8)
             return fused_experts_w4a16(
                 flat, w1.view(torch.uint8), w2.view(torch.uint8), s1, s2, z1, z2, routing_weights, selected_experts,
-                kind, fmt.group, "silu", skip_invalid,
+                kind, fmt.group, activation_spec(self._experts_activation), skip_invalid,
             )
         if flat.is_cuda:
             raise RuntimeError(f"{fmt.name} experts need FlashInfer's FP4 MoE (compute capability 10.0)")
@@ -985,8 +998,7 @@ class QuantExperts(Fp8Experts):
                 continue
             x = flat[tokens].float()
             gate_up = self._expert_matmul(fmt, "gate_up_proj", i, x)
-            gate, up = gate_up.chunk(2, dim=-1)
-            h = (F.silu(gate) * up).to(flat.dtype).float()
+            h = _gated(gate_up, self._experts_activation).to(flat.dtype).float()
             y = self._expert_matmul(fmt, "down_proj", i, h)
             out.index_add_(0, tokens, y * routing_weights[tokens, slot, None].float())
         return out.to(flat.dtype)
@@ -1159,8 +1171,7 @@ class ParallelSparseMoeBlock(QuantExperts, nn.Module):
         )
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
-        self.comm_group.all_reduce(output)
-        return output
+        return self.comm_group.all_reduce(output)
 
 
 class ParallelSparseMoeBlockWithSharedExpert(QuantExperts, nn.Module):
@@ -1256,7 +1267,7 @@ class ParallelSparseMoeBlockWithSharedExpert(QuantExperts, nn.Module):
             routing_weights, selected_experts, router_states_next, _ = _route(self.gate, flat, None, router_states)
             routed = self._experts_quant(flat, routing_weights, selected_experts)
             if self.comm_group.world_size > 1:
-                self.comm_group.all_reduce(routed)
+                routed = self.comm_group.all_reduce(routed)
             out = (routed + torch.sigmoid(self.shared_expert_gate(flat)) * shared).view(input_shape)
             return (out, router_states_next) if return_router_states else out
         routing_weights, selected_experts, router_states_next, alignment = _route(
@@ -1286,8 +1297,7 @@ class ParallelSparseMoeBlockWithSharedExpert(QuantExperts, nn.Module):
         )
         output = torch.empty_like(flat)
         moe_sum_reduce_triton(cache3, output, routed_scaling_factor=1.0)
-        self.comm_group.all_reduce(output)
-        return output
+        return self.comm_group.all_reduce(output)
 
 
 # ---------------------------------------------------------------------------
@@ -1556,5 +1566,4 @@ class ExpertParallelSparseMoeBlock(QuantExperts, nn.Module):
                 self.num_local_experts, local, routing_weights, skip_invalid=True,
                 activation=self.activation,
             )
-        self.comm_group.all_reduce(out)
-        return out
+        return self.comm_group.all_reduce(out)

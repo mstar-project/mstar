@@ -4,8 +4,10 @@ shapes, at TP1 and on TP8 ranks, through the real loader; every parameter gets o
 ``fixtures/k31_tensors.json.gz`` holds the release's non-expert tensors and expert 0's (name,
 dtype, shape) from the safetensors headers at the pinned revision; its 896 experts expand to the
 index's 497,340 names exactly (checked when the fixture was made, and by the count here). The
-model is built on the meta device, so nothing is allocated; the experts stream as the bf16
-tensors their MXFP4 packing stands for (what a dequantized checkpoint holds)."""
+model is built on the meta device, so nothing is allocated. The MXFP4 experts load as stored through
+the quantization API's storage (a scope given the release's header scan, as the engine's would read
+it from the files), or stream as the bf16 tensors their packing stands for (what a dequantized
+checkpoint holds)."""
 import gzip
 import json
 import re
@@ -57,22 +59,46 @@ def _build(cfg: KimiK3ModelConfig, rank: int = 0, tp: int = 1) -> KimiK3ForCausa
         return KimiK3ForCausalLM(cfg, comm_group=group).to(torch.bfloat16)
 
 
+def _release_scan(drop_indexer: bool = False):
+    """The release's ``CheckpointQuant``, as the quantization API reads it from the headers."""
+    from mstar.quantization.checkpoint import CheckpointQuant, TensorInfo
+
+    quant = json.loads((FIXTURE.parent / "k31_config.json").read_text())["text_config"]["quantization_config"]
+    tensors = {name: TensorInfo(dtype, tuple(shape)) for name, (dtype, shape) in _tensors(drop_indexer).items()}
+    return CheckpointQuant.from_tensors(tensors, quant)
+
+
+def _scope(cfg: KimiK3ModelConfig, scan):
+    """The LLM node's quantization scope with no ``quantization:`` block (``auto``: load as stored)."""
+    from mstar.model.kimi_k3.kimi_k3_model import KimiK31Model
+    from mstar.quantization.scope import NodeQuantization
+    from mstar.quantization.spec import parse_quantization
+
+    model = KimiK31Model("x", config_variant="reduced")
+    model.config = cfg
+    return NodeQuantization("LLM", parse_quantization(None).for_node("LLM"), model.get_quantization_roots(),
+                            device="meta", checkpoint=scan)
+
+
 @pytest.mark.parametrize("dsa_long_context", [False, True])
 def test_every_release_name_maps(dsa_long_context):
+    """Every release tensor lands on a parameter of the root as the scope prepares it: the MXFP4
+    experts on their packed storage (``gate_up_proj_packed`` / ``_scale``, ``down_proj_*``)."""
     cfg = KimiK3ModelConfig.k31(dsa_long_context=dsa_long_context,
                                 max_seq_len=8192 if dsa_long_context else 2048)
-    names = list(_tensors())
-    params = {n for n, _ in _build(cfg).named_parameters()}
-    out = resolve_index_names(names, cfg, params)
+    module = _build(cfg)
+    plan = _scope(cfg, _release_scan()).plan_for(module)
+    experts = [p for p in plan.layers.values() if p.kind == "experts"]
+    assert len(experts) == 92 and {(p.stored, p.runtime, p.action.value) for p in experts} == {
+        ("mxfp4", "mxfp4", "direct")}
+    params = {n for n, _ in module.named_parameters()}
+    out = resolve_index_names(list(_tensors()), cfg, params)
     assert len(out["skipped"]) == 168  # vision tower + projector
     assert len(out["dropped"]) == (0 if dsa_long_context else 120)  # the indexer, unbuilt
-    # the MXFP4 scales land on the storage the quantization API's mxfp4 format gives the experts
-    unmapped = [line for line in out["unmapped"]
-                if not re.search(r"\.weight_scale -> .*\.experts\.(gate_up|down)_proj_scale$", line)]
-    assert not unmapped, unmapped[:5]
-    assert len(out["unmapped"]) == 92 * 896 * 3
+    assert not out["unmapped"], out["unmapped"][:5]
     targets = {line.split(" -> ")[1] for line in out["loaded"]}
     assert params - targets == set()
+    assert "model.layers.1.block_sparse_moe.experts.gate_up_proj_packed" in targets
 
 
 def _stream(tensors: dict, bf16_experts: bool = True):
@@ -85,18 +111,21 @@ def _stream(tensors: dict, bf16_experts: bool = True):
         yield name, torch.empty(shape, dtype=_DTYPES[dtype], device="meta")
 
 
+_VARIANTS = {
+    "k31": KimiK3ModelConfig.k31,
+    "k3": KimiK3ModelConfig.k3,
+    "k31_long": lambda: KimiK3ModelConfig.k31(dsa_long_context=True, max_seq_len=8192),
+    "k31_ep": lambda: KimiK3ModelConfig.k31(moe_expert_parallel=True),
+}
+
+
 @pytest.mark.parametrize("variant, rank, tp", [
     ("k31", 0, 1), ("k31", 0, 8), ("k31", 7, 8), ("k3", 3, 8), ("k31_long", 5, 8), ("k31_ep", 6, 8),
 ])
 def test_release_shapes_load_strictly(variant, rank, tp):
-    """The loaders take the release's shapes (A_log's padding, the three convs, the stacked
-    experts, each rank's slices) and fill every parameter; strict loading raises otherwise."""
-    cfg = {
-        "k31": KimiK3ModelConfig.k31(),
-        "k3": KimiK3ModelConfig.k3(),
-        "k31_long": KimiK3ModelConfig.k31(dsa_long_context=True, max_seq_len=8192),
-        "k31_ep": KimiK3ModelConfig.k31(moe_expert_parallel=True),
-    }[variant]
+    """bf16 experts (the dequantized cut): the loaders take the release's shapes (A_log's padding,
+    the three convs, the stacked experts, each rank's slices) and fill every parameter."""
+    cfg = _VARIANTS[variant]()
     module = _build(cfg, rank, tp)
     loaded = load_kimi_k3_weights(module, _stream(_tensors(drop_indexer=not cfg.dsa)), cfg)
     assert loaded == {n for n, _ in module.named_parameters()}
@@ -110,9 +139,44 @@ def test_release_shapes_load_strictly(variant, rank, tp):
         assert experts.shape == (896, 2 * 3072 // tp, 3584)
 
 
-def test_mxfp4_experts_need_the_quantization_format():
+@pytest.mark.parametrize("variant, rank, tp", [("k31", 0, 1), ("k31", 7, 8), ("k3", 2, 8), ("k31_ep", 5, 8)])
+def test_release_mxfp4_experts_load_as_stored(variant, rank, tp):
+    """The release as it ships: its MXFP4 experts (packed e2m1 u8 and e8m0 scales) load into the
+    quantization API's mxfp4 storage, each rank its intermediate slice (TP) or its whole experts
+    (EP), and every parameter gets a tensor."""
+    cfg = _VARIANTS[variant]()
+    module = _build(cfg, rank, tp)
+    with _scope(cfg, _release_scan(drop_indexer=not cfg.dsa)).activated():
+        loaded = load_kimi_k3_weights(module, _stream(_tensors(drop_indexer=not cfg.dsa), bf16_experts=False), cfg)
+    assert loaded == {n for n, _ in module.named_parameters()}
+    block = module.model.layers[1].block_sparse_moe
+    assert block.experts_packed.name == "mxfp4"
+    e, inter = (896 // tp, 3072) if variant == "k31_ep" else (896, 3072 // tp)
+    assert block.experts.gate_up_proj_packed.shape == (e, 2 * inter, 3584 // 2)
+    assert block.experts.gate_up_proj_scale.shape == (e, 2 * inter, 3584 // 32)
+    assert block.experts.down_proj_packed.shape == (e, 3584, inter // 2)
+    assert block.experts.down_proj_scale.shape == (e, 3584, inter // 32)
+
+
+@pytest.mark.parametrize("variant, rank", [("k31", 0), ("k31_ep", 5)])
+def test_a_b300_rank_allocates_its_mxfp4_experts_packed(variant, rank):
+    """A TP8 / EP8 rank's bytes as the scope prepares the root on meta, which is what ``materialize``'s
+    ``to_empty`` then allocates: the experts packed, 168.4 GiB (as bf16 stacks 634 GiB, which ran every
+    B300 rank out of memory at load in 04c), 187.1 GiB in all. With tp8's KV and KDA pools (~6.8 GiB;
+    tp8_c128 ~13.5) that leaves ~70 GiB of a B300's 267.68 GiB for activations and graphs."""
+    cfg = _VARIANTS[variant]()
+    module = _build(cfg, rank, 8)
+    _scope(cfg, _release_scan()).prepare_meta(module)
+    sizes = {n: t.numel() * t.element_size() for n, t in [*module.named_parameters(), *module.named_buffers()]}
+    assert not any(t.dtype == torch.bfloat16 for n, t in module.named_parameters() if ".experts." in n)
+    weights = 92 * 896 * (2 * 3072 * 3584 + 3584 * 3072) // 8  # every rank an eighth, TP or EP
+    assert sum(b for n, b in sizes.items() if ".experts." in n) == weights // 2 + weights // 32
+    assert 187 < sum(sizes.values()) / 2**30 < 187.5
+
+
+def test_mxfp4_experts_outside_the_scope_are_refused():
     cfg = KimiK3ModelConfig.k31()
-    with pytest.raises(ValueError, match="mxfp4 experts format"):
+    with pytest.raises(ValueError, match="quantization scope"):
         load_kimi_k3_weights(_build(cfg), _stream(_tensors(), bf16_experts=False), cfg)
 
 

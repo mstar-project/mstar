@@ -50,3 +50,20 @@ def test_generate_reads_each_steps_logits_even_when_the_sampler_runs_no_python(t
     ref = reference_logits({k: v.float() for k, v in ref_sd.items()}, seq, model.config,
                            logits_from=len(prompt) - 1)
     torch.testing.assert_close(run["logits"], ref, atol=2e-4, rtol=0)
+
+
+def test_the_dsa_control_attends_only_keys_the_engine_did_not_pick():
+    """B300 04c: the dense control sat ~1 logit from the top-16 reference, under twice a bf16 engine's
+    error on one prompt. The control replays each query past top-k on visible keys outside the
+    engine's picks (the earliest, at most top-k); queries within top-k see every key either way."""
+    harness = _harness()
+    run = {"dsa": {3: {2: torch.tensor([0, 1, 2, 3])},
+                   6: {2: torch.tensor([6, 4, 0, 2]), 3: torch.tensor([1, 2, 3, -1])},
+                   9: {2: torch.tensor([9, 8, 7, 6])}}}
+    out = harness._unpicked(run, topk=4)
+    assert set(out) == {2, 3} and 3 not in out[2]
+    assert out[2][6].tolist() == [1, 3, 5] and out[3][6].tolist() == [0, 4, 5, 6]
+    assert out[2][9].tolist() == [0, 1, 2, 3]
+    for layer, rows in out.items():
+        for pos, keys in rows.items():
+            assert not set(keys.tolist()) & set(run["dsa"][pos][layer].tolist())

@@ -66,6 +66,51 @@ METADATA_FILES = (
     "tokenizer_config.json", "tiktoken.model", "tokenization_kimi.py", "encoding_k3.py",
 )
 
+# The quantization API's view of the LLM root (``get_quantization_roots``): which linears may run
+# low precision. KDA's linears feed its fused input projection and the absorbed MLA folds its down
+# projections, so both stay bf16, as do the latent projections, the router and the LM head
+# (the checkpoint's own ignore list).
+QUANTIZABLE_CANDIDATES = (
+    "model.layers.*.self_attn.q_b_proj",
+    "model.layers.*.self_attn.o_proj",
+    "model.layers.*.self_attn.g_proj",
+    "model.layers.*.mlp.*",
+    "model.layers.*.block_sparse_moe.shared_experts.*",
+    "model.layers.*.block_sparse_moe.experts",
+)
+_KEEP_BF16 = (
+    "model.layers.*.self_attn.q_a_proj",
+    "model.layers.*.self_attn.kv_a_proj_with_mqa",
+    "model.layers.*.self_attn.kv_b_proj",
+    "model.layers.*.self_attn.indexer.*",
+    "model.layers.*.block_sparse_moe.routed_expert_down_proj",
+    "model.layers.*.block_sparse_moe.routed_expert_up_proj",
+    "model.layers.*.self_attention_res_proj",
+    "model.layers.*.mlp_res_proj",
+    "model.output_attn_res_proj",
+    "lm_head",
+)
+
+
+def quantization_keep_bf16(config: KimiK3ModelConfig) -> tuple[str, ...]:
+    """``_KEEP_BF16`` plus every linear of the KDA layers (named per layer: an MLA layer's
+    ``o_proj`` and ``g_proj`` are candidates)."""
+    kda = tuple(p for i in config.kda_layers
+                for p in (f"model.layers.{i}.self_attn.*", f"model.layers.{i}.self_attn.forget_gate.*"))
+    return _KEEP_BF16 + kda
+
+
+
+def thinking_requested(kwargs: dict) -> bool:
+    """Whether the reply thinks first (the release's template default: yes). Off with ``reasoning_effort:
+    none``, or ``enable_thinking: false`` sent flat (M*'s key) or in ``chat_template_kwargs`` (vLLM's and
+    SGLang's; there also ``thinking``), so the same request thinks or not on every engine."""
+    template = kwargs.get("chat_template_kwargs") or {}
+    switch = next((v for v in (kwargs.get("enable_thinking"), template.get("enable_thinking"),
+                               template.get("thinking")) if v is not None), None)
+    return kwargs.get("reasoning_effort") != "none" and (switch is None or bool(switch))
+
+
 class KimiK3Model(Model):
     """Kimi K3 (``moonshotai/Kimi-K3``): no DSA indexer, dense MLA at any length."""
 
@@ -332,9 +377,11 @@ class KimiK3Model(Model):
              "content": "\n".join(p.text or "" for p in turn.parts if p.modality == TEXT)}
             for turn in chat_turns(parts)
         ]
+        thinking = thinking_requested(kwargs)
         effort = kwargs.get("reasoning_effort")
         ids = self.tokenizer.apply_chat_template(
-            messages, thinking=effort != "none", thinking_effort=None if effort in (None, "none") else effort)
+            messages, thinking=thinking,
+            thinking_effort=None if not thinking or effort in (None, "none") else effort)
         return torch.tensor(ids, dtype=torch.long)
 
     def max_decode_steps(self) -> int:
@@ -360,12 +407,29 @@ class KimiK3Model(Model):
         # raw bytes: a character split across tokens reaches the client whole
         return self.tokenizer.decode_bytes(token_ids)
 
-    # -- sharding, submodules ------------------------------------------------------------
+    # -- sharding, quantization, submodules ------------------------------------------------
 
     def get_default_sharding_config(self):
         from mstar.distributed.base import ShardingConfig
 
         return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
+
+    def get_quantization_roots(self):
+        """The LLM root for the quantization API: the routed experts (MXFP4 in the release, loaded as
+        stored by default) and the candidate linears."""
+        from mstar.model.components.quant_linear import QuantizableLinears
+        from mstar.model.kimi_k3.components.causal_lm import KimiK3ForCausalLM
+        from mstar.model.kimi_k3.weight_loader import checkpoint_rules
+        from mstar.quantization.resolve import QuantizationRoot
+
+        return [QuantizationRoot(
+            node="LLM", root_type=KimiK3ForCausalLM,
+            linears=QuantizableLinears(candidates=QUANTIZABLE_CANDIDATES,
+                                       keep_bf16=quantization_keep_bf16(self.config)),
+            rules=checkpoint_rules(self.config),
+            checkpoint_dir=lambda: self._metadata_dir,
+            build=lambda comm_group: KimiK3ForCausalLM(self.config, comm_group),
+        )]
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -387,11 +451,14 @@ class KimiK3Model(Model):
 
         from mstar.model.kimi_k3.components.causal_lm import KimiK3ForCausalLM
         from mstar.model.kimi_k3.submodules import KimiK3LLMSubmodule
+        from mstar.quantization.scope import materialize
 
         with torch.device("meta"):
             language_model = KimiK3ForCausalLM(self.config, comm_group=tp_group)
         language_model = language_model.to(autocast_dtype or torch.bfloat16)
-        language_model.to_empty(device=device)
+        # the MXFP4 experts get their packed storage on meta: to_empty must never allocate the bf16 stacks
+        # they replace (TP8: 4.59 GiB of gate_up a layer, 92 layers; B300 04c ran out of memory there)
+        materialize(language_model, device)
         self._load_checkpoint(language_model, source, device)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()

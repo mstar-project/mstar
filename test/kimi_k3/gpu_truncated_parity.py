@@ -8,7 +8,8 @@ each whole sequence in fp32 and bf16, teacher-forced on the engine's own tokens 
 causal: one forward gives every step's logits). A case passes when the engine's error is within a
 few times the reference's own bf16-vs-fp32 spread, its picks agree where the fp32 top-1 leads by
 more than twice that spread, and a control (the reference without the MLA output gate; for DSA,
-the dense reference) is clearly further off. K3.1's DSA runs with index_topk cut to 16 so decode
+the reference replayed on keys the engine did not pick) is clearly further off. K3.1's DSA runs
+with index_topk cut to 16 so decode
 goes past it, or (--dsa-topk 2048 --dsa-prompt-len 8192 --prefill-chunk 2048) at the release's top-k
 with long prompts prefilled in chunks: the engine's picks (prefill rows' too) are recorded and the
 reference is replayed with them
@@ -75,6 +76,7 @@ def build(ckpt: str, device: str, overrides: dict | None = None, group=None, gro
     from mstar.model.kimi_k3.config import SAMPLER
     from mstar.model.kimi_k3.kimi_k3_model import KimiK31Model
     from mstar.model.kimi_k3.tests import engine_helpers as H
+    from mstar.quantization.scope import load_submodule
 
     kv_mod.KVTransferManager = H._StubTransfer  # one engine, nothing to transfer
     model = KimiK31Model(ckpt, strict_config=False, kda_max_requests=4, tokenizer_mode="byte",
@@ -82,10 +84,13 @@ def build(ckpt: str, device: str, overrides: dict | None = None, group=None, gro
     if overrides:
         model.config = dataclasses.replace(model.config, **overrides)
         model._check_checkpoint_config = lambda source: None  # the overrides are deliberate
-    sub = model.get_submodule("LLM", device=device, tp_group=group, autocast_dtype=dtype)
+    # as the engine loads a node: under its quantization scope (MXFP4 experts load as stored)
+    sub = load_submodule(model, "LLM", {}, device, tp_group=group, autocast_dtype=dtype)
     # the step's logits come back as a row output: a captured decode replays the graph, not the
     # sampler's Python, so a list the sampler appends to would hold the last eager step's (job 1461)
     sub.__class__ = _logits_submodule_class()
+    block = next(m for m in sub.modules() if hasattr(m, "experts_packed"))
+    print(f"experts: {block.experts_packed.name if block.experts_packed else 'bf16'}", flush=True)
     engine = Engine(None, autocast_dtype=dtype)
     if groups is None:
         groups = WorkerParallelGroups(num_workers=1, global_rank=0)
@@ -205,6 +210,23 @@ def _forced(run: dict) -> dict[int, dict[int, torch.Tensor]]:
     return out
 
 
+def _unpicked(run: dict, topk: int) -> dict[int, dict[int, torch.Tensor]]:
+    """The DSA control: each query past ``topk`` replayed on visible keys the engine did not pick (the
+    earliest, at most ``topk``), so the check must tell a wrong selection apart. The dense reference was
+    the control before: on a 4-layer cut at top-16 it sits only ~1 logit from the sparse one, under twice
+    a B300 bf16 engine's error on a sensitive prompt (04c dsa/p3: 0.90 vs 0.58, the engine 1.6x the bf16
+    reference's spread, the same against a CPU fp32 reference)."""
+    out: dict[int, dict[int, torch.Tensor]] = {}
+    for pos, layers in run["dsa"].items():
+        if pos + 1 <= topk:
+            continue
+        for layer, keys in layers.items():
+            keep = torch.ones(pos + 1, dtype=torch.bool)
+            keep[keys[keys >= 0].long().cpu()] = False
+            out.setdefault(layer, {})[pos] = torch.arange(pos + 1)[keep][:topk]
+    return out
+
+
 def reference_rows(sd, cfg, run: dict, use_dsa: bool, forced=None, trace=None) -> torch.Tensor:
     """The reference's logits at each step's position, teacher-forced on the engine's tokens."""
     from mstar.model.kimi_k3.tests.reference import reference_logits
@@ -313,9 +335,12 @@ def evaluate(cases: list[tuple], args, failures: list) -> list[dict]:
                 if use_dsa:
                     ref[key, dtype, "forced"] = reference_rows(sd, cfg, run, use_dsa=True, forced=_forced(run))
                 if dtype == torch.float32:
-                    control = (dataclasses.replace(cfg, mla_use_output_gate=False), False) if not use_dsa \
-                        else (cfg, False)
-                    ref[key, "control"] = reference_rows(sd, control[0], run, use_dsa=control[1])
+                    if use_dsa:
+                        control = reference_rows(sd, cfg, run, use_dsa=True, forced=_unpicked(run, cfg.index_topk))
+                    else:
+                        control = reference_rows(sd, dataclasses.replace(cfg, mla_use_output_gate=False), run,
+                                                 use_dsa=False)
+                    ref[key, "control"] = control
         del sd
         _empty_cache()
     for name, cfg, runs, use_dsa in cases:
@@ -548,11 +573,12 @@ class Stepper:
         from mstar.engine.resources.spec import resolve_spec_dependencies
         from mstar.model.kimi_k3.kimi_k3_model import KimiK31Model
         from mstar.model.kimi_k3.tests import engine_helpers as H
+        from mstar.quantization.scope import load_submodule
 
         kv_mod.KVTransferManager = H._StubTransfer
         self.dev = torch.device(args.engine_device)
         model = KimiK31Model(args.ckpt, strict_config=False, kda_max_requests=8, tokenizer_mode="byte")
-        sub = model.get_submodule("LLM", device=self.dev, autocast_dtype=args.dtype)
+        sub = load_submodule(model, "LLM", {}, self.dev, autocast_dtype=args.dtype)
         sub.__class__ = _logits_submodule_class()
         specs = model.get_node_resources()
         by_key = resolve_spec_dependencies(specs)

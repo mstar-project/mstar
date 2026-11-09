@@ -23,7 +23,7 @@ from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.kv.config import KVConfig, KVLayout
-from mstar.engine.resources.kv.plan import KVPlanOutputs, build_paged_indptrs, context_only_views
+from mstar.engine.resources.kv.plan import KVPlanOutputs, PagedIndptrs, build_paged_indptrs, context_only_views
 from mstar.engine.resources.step import SlotLease, StepContext
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,7 @@ class FlashInferMLAWrapper:
         device: torch.device = torch.device("cuda"),
         use_cuda_graph: bool = False,
         backend: str = "auto",
+        num_requests: int | None = None,
     ):
         self.device = device
         self.use_cuda_graph = use_cuda_graph
@@ -90,6 +91,12 @@ class FlashInferMLAWrapper:
         self.kv_dtype = None
         self._qo_indptr_buf: torch.Tensor | None = None
         self._kv_len_buf: torch.Tensor | None = None  # the rows' planned kv lengths, on device
+        # the step's requests' query offsets and kv lengths, as the consumers read them
+        # (``select_last_hidden``); the kernel's rows differ when short causal rows are split
+        # (``rowwise_causal_indptrs``), and then a captured wrapper keeps them in their own buffers
+        self.request_qo_indptr: torch.Tensor | None = None
+        self.request_kv_len: torch.Tensor | None = None
+        self._req_bufs: tuple[torch.Tensor, torch.Tensor] | None = None
         on_gpu = torch.device(device).type == "cuda"
         self.fallback = not on_gpu or not flashinfer_mla_supports(kv_lora_rank, qk_rope_head_dim)
         if self.fallback:
@@ -112,6 +119,9 @@ class FlashInferMLAWrapper:
                 max_num_pages + batch_size, dtype=torch.int32, device=device,
             )
             self._kv_len_buf = torch.zeros(batch_size, dtype=torch.int32, device=device)
+            if num_requests is not None and num_requests != batch_size:
+                self._req_bufs = (torch.zeros(num_requests + 1, dtype=torch.int32, device=device),
+                                  torch.zeros(num_requests, dtype=torch.int32, device=device))
             self.attn_wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
                 self._workspace.tensor, use_cuda_graph=True,
                 qo_indptr=self._qo_indptr_buf, kv_indptr=self._kv_indptr_buf,
@@ -132,9 +142,12 @@ class FlashInferMLAWrapper:
         causal: bool = True,
         dtype: torch.dtype = torch.bfloat16,
         kv_dtype: torch.dtype | None = None,
+        requests: PagedIndptrs | None = None,
         **kwargs,
     ):
-        """Inputs may be CPU tensors (the KV plan builds them on the host)."""
+        """Inputs may be CPU tensors (the KV plan builds them on the host). ``requests``: the
+        step's own rows when the kernel's are split (``rowwise_causal_indptrs``), for the
+        consumers of ``request_qo_indptr`` / ``request_kv_len``."""
         num_pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
         kv_len_arr = (num_pages - 1).clamp_min(0) * self.page_size + paged_kv_last_page_len
         kv_len_arr = torch.where(num_pages > 0, kv_len_arr, torch.zeros_like(kv_len_arr)).to(torch.int32)
@@ -146,6 +159,7 @@ class FlashInferMLAWrapper:
             self._kv_len_buf[: kv_len_arr.numel()].copy_(kv_len_arr.to(torch.int32), non_blocking=True)
         self.dtype = dtype
         self.kv_dtype = kv_dtype or dtype
+        self._stage_requests(requests)
         if self.fallback:
             self._fb = (
                 qo_indptr.tolist(), paged_kv_indptr.tolist(), paged_kv_indices.to(self.device, dtype=torch.long),
@@ -169,6 +183,21 @@ class FlashInferMLAWrapper:
         )
         self.dtype = dtype
         self.kv_dtype = kv_dtype or dtype
+
+    def _stage_requests(self, requests: PagedIndptrs | None) -> None:
+        if requests is None:
+            self.request_qo_indptr, self.request_kv_len = self._qo_indptr_buf, self._kv_len_buf
+            return
+        qo = requests.qo_indptr.to(torch.int32)
+        lens = requests.kv_lens.to(torch.int32)
+        if self._req_bufs is None:
+            self.request_qo_indptr = qo.to(self.device, non_blocking=True)
+            self.request_kv_len = lens.to(self.device, non_blocking=True)
+            return
+        qo_buf, len_buf = self._req_bufs
+        qo_buf[: qo.numel()].copy_(qo, non_blocking=True)
+        len_buf[: lens.numel()].copy_(lens, non_blocking=True)
+        self.request_qo_indptr, self.request_kv_len = qo_buf, len_buf
 
     @torch.compiler.disable
     def run(self, q_nope: torch.Tensor, q_pe: torch.Tensor, kv_cache_layer: torch.Tensor, return_lse: bool = False):
@@ -213,6 +242,68 @@ class FlashInferMLAWrapper:
             out[qo[i]:qo[i + 1]] = torch.einsum("hqk,kl->qhl", probs, ckv).to(out.dtype)
             lse[qo[i]:qo[i + 1]] = torch.logsumexp(scores, dim=-1).transpose(0, 1)
         return (out, lse) if return_lse else out
+
+
+# Where the head count is one FlashInfer's 64/128-query tile doesn't divide (Kimi K3's 96, 12 a rank at
+# TP8), its planned MLA backends (fa2, fa3) refuse a multi-query causal row whose tile boundary falls
+# inside a query at a key that starts a KV tile (``_validate_fa_causal_tile_bound``; GPU job 1529:
+# "causal tile boundary ... query=2, key=64"). Which rows: those whose first query sits at an offset off
+# a 64-key boundary (at 12 heads, offsets 11, 22, 43 and 54 mod 64): a verify block, a drafter's block,
+# and a prompt the scheduler cut mid-way, whose next chunk starts anywhere (B300 pre-flight audit: ~90%
+# of c=64 waves of ~1K-token prompts). A one-query row, and a row starting on a 64-key boundary, pass for
+# every head count and KV tile (16, 32, 64; checked exhaustively against the rule in the tests).
+ROW_ALIGN = 64
+
+
+def rowwise_causal_indptrs(indptrs: PagedIndptrs, page_size: int, align: int = ROW_ALIGN) -> PagedIndptrs:
+    """``indptrs`` with each causal row of 2+ queries whose first query is off an ``align``-key boundary
+    planned as single-query rows up to that boundary, then the rest of the row as one causal row: query
+    ``j`` of a row of ``q`` over ``m`` keys becomes a row of one query over the row's first
+    ``m - q + 1 + j`` keys (its pages cut to them). The queries keep their order, so the step's query
+    tensor and the output need no reshuffle. Unchanged when no row qualifies."""
+    qo = indptrs.qo_indptr.tolist()
+    kv = indptrs.paged_kv_indptr.tolist()
+    last = indptrs.paged_kv_last_page_len.tolist()
+
+    def keys(i):
+        n = kv[i + 1] - kv[i]
+        return (n - 1) * page_size + last[i] if n else 0
+
+    def peel(i):
+        q = qo[i + 1] - qo[i]
+        return min(q, -(keys(i) - q) % align) if q > 1 else 0
+
+    if not any(peel(i) for i in range(len(qo) - 1)):
+        return indptrs
+    pages = indptrs.paged_kv_indices.tolist()
+    new_qo, new_kv, new_pages, new_last, new_lens = [0], [0], [], [], []
+
+    def row(queries, row_pages, length):
+        n = -(-length // page_size)
+        new_qo.append(new_qo[-1] + queries)
+        new_pages.extend(row_pages[:n])
+        new_kv.append(new_kv[-1] + n)
+        new_last.append(length - (n - 1) * page_size if n else page_size)
+        new_lens.append(length)
+
+    for i in range(len(qo) - 1):
+        q, row_pages, m, k = qo[i + 1] - qo[i], pages[kv[i]:kv[i + 1]], keys(i), peel(i)
+        for j in range(k):
+            row(1, row_pages, max(m - (q - 1 - j), 0))
+        if q > k:
+            row(q - k, row_pages, m)
+
+    def ints(values):
+        return torch.tensor(values, dtype=torch.int32)
+
+    return PagedIndptrs(qo_indptr=ints(new_qo), paged_kv_indptr=ints(new_kv), paged_kv_indices=ints(new_pages),
+                        paged_kv_last_page_len=ints(new_last), kv_lens=ints(new_lens))
+
+
+def _kv_lens(indptrs: PagedIndptrs, page_size: int) -> torch.Tensor:
+    pages = indptrs.paged_kv_indptr[1:] - indptrs.paged_kv_indptr[:-1]
+    lens = (pages - 1).clamp_min(0) * page_size + indptrs.paged_kv_last_page_len
+    return torch.where(pages > 0, lens, torch.zeros_like(lens)).to(torch.int32)
 
 
 class FlashInferMLAManager(AttentionManager):
@@ -264,12 +355,19 @@ class FlashInferMLAManager(AttentionManager):
         return {self._kv_cache_name}
 
     @property
+    def _splits_short_rows(self) -> bool:
+        """Whether causal rows are aligned to 64 keys by single-query rows: on the kernel, for a
+        head count FlashInfer's query tile doesn't divide (Kimi K3's 96, 12 a rank at TP8), where its
+        planned backends refuse some offsets of a multi-query causal row (``rowwise_causal_indptrs``)."""
+        return self.uses_kernel and 128 % self._kv_config.num_qo_heads != 0
+
+    @property
     def uses_kernel(self) -> bool:
         """False when the torch fallback serves the plans, which cannot be captured."""
         return torch.device(self._device).type == "cuda" and flashinfer_mla_supports(
             self._kv_config.kv_lora_rank, self._kv_config.qk_rope_head_dim)
 
-    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int):
+    def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int, num_requests: int | None = None):
         if not self.uses_kernel:
             # the fallback reads its plan from host lists, so a replay would
             # attend the capture's pages
@@ -284,7 +382,7 @@ class FlashInferMLAManager(AttentionManager):
                 num_rows, lease.bucket.num_tokens, self._kv_config)}
             wrapper = FlashInferMLAWrapper(
                 workspace_buffer=self._workspaces.get(label, lease.slot),
-                batch_size=num_rows, use_cuda_graph=True, **kwargs,
+                batch_size=num_rows, use_cuda_graph=True, num_requests=num_requests, **kwargs,
             )
             self._cg_plan_states[key] = wrapper
         return wrapper
@@ -334,11 +432,19 @@ class FlashInferMLAManager(AttentionManager):
                 spans = [int(seg.span) for seg in (step.segments or ()) if seg.label == label]
                 views = context_only_views(kv_out.views, spans, self._kv_config.tokens_per_page)
                 indptrs = build_paged_indptrs(views, self._kv_config.tokens_per_page)
+            requests = None
+            if step.causal and self._splits_short_rows:
+                rows = rowwise_causal_indptrs(indptrs, self._kv_config.tokens_per_page)
+                if rows is not indptrs:
+                    requests = indptrs if indptrs.kv_lens is not None else indptrs._replace(
+                        kv_lens=_kv_lens(indptrs, self._kv_config.tokens_per_page))
+                    indptrs = rows
             if lease is not None:
-                wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1)
+                wrapper = self._cg_wrapper(lease, label, indptrs.qo_indptr.shape[0] - 1,
+                                           None if requests is None else requests.qo_indptr.shape[0] - 1)
             else:
                 wrapper = self._eager_wrapper(label, ctx.slot)
-            wrapper.plan(causal=step.causal, dtype=self._dtype, **indptrs.to_kwargs_dict())
+            wrapper.plan(causal=step.causal, dtype=self._dtype, requests=requests, **indptrs.to_kwargs_dict())
             plan_states[label] = wrapper
         self._preplanned = ctx.is_preplan
 
@@ -349,14 +455,20 @@ class FlashInferMLAManager(AttentionManager):
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str = "main") -> torch.Tensor | None:
         wrapper = self._current_plan_states.get(label)
-        return None if wrapper is None else wrapper._qo_indptr_buf
+        if wrapper is None:
+            return None
+        # the step's requests' offsets (the kernel's rows differ when short causal rows split)
+        qo = getattr(wrapper, "request_qo_indptr", None)
+        return wrapper._qo_indptr_buf if qo is None else qo
 
     @torch.compiler.disable
     def kv_len_buf(self, label: str = "main") -> torch.Tensor:
         """The rows' planned kv lengths, int32 on device (static under a lease): for a
         ``context_only`` plan the length of each row's stored context, which is where the row's
         queries (and the entries the step appends) start."""
-        return self._current_plan_states[label]._kv_len_buf
+        wrapper = self._current_plan_states[label]
+        lens = getattr(wrapper, "request_kv_len", None)
+        return wrapper._kv_len_buf if lens is None else lens
 
     def run(
         self, q: torch.Tensor, label: str | None = None,

@@ -148,3 +148,24 @@ def test_truncated_release_loads_and_matches_the_reference(tmp_path):
     ref = reference_logits(sd, prompt, cfg)
     torch.testing.assert_close(greedy.logits[-1][-1], ref[-1], atol=5e-5, rtol=0)
 
+
+def test_keep_mxfp4_cuts_without_decoding(tmp_path):
+    """``--keep-mxfp4``: the kept experts stay packed with the release's quantization_config, and
+    load as stored through the quantization scope."""
+    src, dst = tmp_path / "release", tmp_path / "trunc"
+    src.mkdir()
+    make_tiny_release(src)
+    truncate.main(["--src", str(src), "--dst", str(dst), "--layers", "4", "--experts", "4", "--keep-mxfp4"])
+    t = json.loads((dst / "config.json").read_text())["text_config"]
+    assert t["num_experts"] == 4 and t["quantization_config"]["format"] == "mxfp4-pack-quantized"
+    names = set(json.loads((dst / "model.safetensors.index.json").read_text())["weight_map"])
+    assert "language_model.model.layers.1.block_sparse_moe.experts.3.w1.weight_packed" in names
+    assert not any(".experts.4." in n or n.endswith("experts.0.w1.weight") for n in names)
+
+    from mstar.model.kimi_k3.kimi_k3_model import KimiK31Model
+    from mstar.quantization.scope import load_submodule
+
+    model = KimiK31Model(str(dst), strict_config=False, tokenizer_mode="byte", kda_conv_dtype=torch.float32)
+    sub = load_submodule(model, "LLM", {}, "cpu", autocast_dtype=torch.float32)
+    block = sub.language_model.model.layers[1].block_sparse_moe
+    assert block.experts_packed.name == "mxfp4" and block.experts.gate_up_proj_packed.shape[0] == 4
