@@ -186,7 +186,7 @@ class InputIngest:
                 loop_caps=body.loop_caps,
             )
             body.request_info.rid_handle = rid
-            lifecycle.add(rid, wire_rid)
+            lifecycle.add(rid, wire_rid, follows=self._lockstep.follows_leader(rid))
             laps.lap("runtime_add")
 
             # One NewRequest comes per partition this worker serves, and a later one

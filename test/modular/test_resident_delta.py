@@ -922,6 +922,7 @@ def _forwarding_leader(broadcast_seq: int) -> Worker:
     request_state = SimpleNamespace(remove_request=lambda rid: None)
     tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
     leader = make_worker(
+        worker_id="rank0",
         # ``remove_request`` here is what frees the handle
         graph_runtime=SimpleNamespace(
             get_rid_handle=lambda rid: 0 if rid == "gone" else None,

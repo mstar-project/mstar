@@ -43,9 +43,13 @@ class _StubRuntime(SimpleNamespace, PhasedPostprocess):
     supports_inline_emit = False
 
 
+def _tp_group(*workers):
+    return SimpleNamespace(tp_size=len(workers), _workers=list(workers))
+
+
 def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
-    pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(), **fields,
+    pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(), tp_group=None, **fields,
 ):
     sent = []
     # Identity interning: these tests use the rid string as its own handle, so
@@ -55,10 +59,11 @@ def _worker(
         register_stop_limits=lambda rid, info: None,
         get_rid_string=lambda h: h,
         remove_request=lambda h: None,
-        # The TP fan-out reads the sharding config off the runtime now; no
-        # groups means no followers, which is what these tests assume.
+        # The request's TP groups: on a follower, by default, it runs on
+        # leader "lead"'s group, which this worker ("w0") follows.
         get_sharding_config=lambda r: (
-            SimpleNamespace(groups=[]) if r in known_rids else None
+            SimpleNamespace(groups=[tp_group or _tp_group("lead", "w0")] if is_follower else [])
+            if r in known_rids else None
         ),
     )
     request_state = SimpleNamespace(
@@ -89,7 +94,7 @@ def _worker(
     w.cleared = cleared
     w.forced = forced
     for rid in known_rids:
-        w.lifecycle.add(rid, rid)
+        w.lifecycle.add(rid, rid, follows=w.lockstep.follows_leader(rid))
     for rid in tp_follow:
         w.lockstep.enqueue_follow(ScheduleTPNode(node_name="n", graph_walk="w", request_ids=[rid]))
     w.pipeline.in_flight_rids.update(in_flight)
@@ -371,6 +376,23 @@ def test_follower_ignores_conductor_drain():
     # ... but honors the leader's forwarded drain.
     _drain(w, request_id="X", source=MessageSource.TP_RANK_0)
     assert "X" in w.lifecycle.draining and len(_reads_done(w)) == 1
+
+
+@pytest.mark.parametrize("replica", ["followed", "another"])
+def test_a_follower_takes_the_conductors_teardown_of_a_request_it_follows_no_leader_for(replica):
+    """Data-parallel over a TP group: this worker follows rank 0 of one replica,
+    and also runs a node of a request whose TP node runs on the other one. No
+    leader forwards that request's drain and remove here, so the conductor's
+    count; ignored, its abort stalls for the drain TTL and its state leaks."""
+    w = _worker(is_follower=True, tp_group=_tp_group("lead", "w0") if replica == "followed" else _tp_group("w2", "w3"))
+    _drain(w, request_id="X")  # source=CONDUCTOR
+    _remove(w, request_id="X")
+    w.pipeline._teardown(w.pipeline.in_flight_rids)
+    if replica == "followed":
+        assert not _reads_done(w) and not w.forced
+    else:
+        assert len(_reads_done(w)) == 1 and w.forced == ["X"]
+        assert not [to for to, msg in w.sent if to != "conductor"], "it leads no group of this request"
 
 
 def test_follower_honors_conductor_drain_of_a_request_it_never_admitted():
