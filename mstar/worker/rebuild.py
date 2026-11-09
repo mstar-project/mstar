@@ -213,8 +213,8 @@ class Rebuilds:
         self._keeps_ids: dict[str, dict[int, HostSlice]] = {node: {} for node in policies}
         # The lockstep nodes this rank follows, whose first rank's pool decides which requests keep a log. A log on
         # one of them takes room past the pool when the pool has none, so this rank holds every log rank 0 holds.
-        # `_verdicts` keeps a request such a node writes: each paged KV cache's writers here, and whether a drop
-        # can free the request's pages there, until rank 0 says which logs its pool couldn't hold (`refuse`).
+        # `_verdicts` keeps, until its teardown, a request such a node writes: each paged KV cache's writers here,
+        # and whether a drop can free the request's pages there, for `refuse` to redo once rank 0 refuses a log.
         self._followed = frozenset(followed)
         self._verdicts: dict[int, tuple[dict[str, list[str]], dict[str, bool]]] = {}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
