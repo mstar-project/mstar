@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from torch.distributed import ReduceOp
 
+from mstar.distributed.base import tp_groups_of
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RequestWalks
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
@@ -397,31 +398,14 @@ class Lockstep:
         if self.async_for(message.node_name):
             self._no_spec.add(message.spec_from_seq)
 
-    def _tp_groups(self, rid: int) -> list[list[str]]:
-        """The workers, rank-ordered, of each of ``rid``'s TP groups this rank is
-        in. A group of this rank's layout can hold another replica's workers for
-        the request, on a deployment data-parallel over that TP group."""
-        sharding = self._runtime.get_sharding_config(rid)
-        if sharding is None:
-            return []
-        # a group none of the request's nodes run in is never given workers
-        return [
-            group._workers for group in sharding.groups
-            if group.tp_size > 1 and self._worker_id in getattr(group, "_workers", ())
-        ]
-
-    def follows_leader(self, rid: int) -> bool:
-        """Whether a leader fans ``rid``'s teardown out to this rank
-        (``forward_teardown``), which then takes only the leader's."""
-        return self._is_follower and any(
-            workers[0] != self._worker_id for workers in self._tp_groups(rid)
-        )
-
     def forward_teardown(self, rid: int, message: WorkerMessage) -> None:
         """Fan a DRAIN or a REMOVE out to the followers of each TP group this
         rank leads for the request."""
+        sharding = self._runtime.get_sharding_config(rid)
+        if sharding is None:
+            return
         followers = {
-            worker for workers in self._tp_groups(rid) if workers[0] == self._worker_id
+            worker for workers in tp_groups_of(sharding, self._worker_id) if workers[0] == self._worker_id
             for worker in workers[1:]
         }
         for worker in followers:

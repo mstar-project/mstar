@@ -102,7 +102,8 @@ def _speculator(scheduler, runtime, lockstep=None):
     layout = WorkerLayout()
     return Speculator(
         services=services, layout=layout, scheduler=scheduler,
-        lifecycle=RequestLifecycle(layout=layout, graph_runtime=runtime), lockstep=lockstep, admission=None, timer=None,
+        lifecycle=RequestLifecycle(layout=layout, graph_runtime=runtime, worker_id="w0"),
+        lockstep=lockstep, admission=None, timer=None,
     )
 
 

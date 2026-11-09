@@ -94,7 +94,7 @@ def _worker(
     w.cleared = cleared
     w.forced = forced
     for rid in known_rids:
-        w.lifecycle.add(rid, rid, follows=w.lockstep.follows_leader(rid))
+        w.lifecycle.add(rid, rid)
     for rid in tp_follow:
         w.lockstep.enqueue_follow(ScheduleTPNode(node_name="n", graph_walk="w", request_ids=[rid]))
     w.pipeline.in_flight_rids.update(in_flight)

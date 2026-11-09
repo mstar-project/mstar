@@ -40,6 +40,8 @@ class ShardingGroup:
     tp_size: int
     graph_walks: set[str] | None = None  # None = all graph walks
     _tp_rank: int | None = None  # set by the conductor
+    # rank-ordered, once ``register_workers`` names them
+    _workers: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         self.nodes = set(self.nodes)
@@ -79,6 +81,19 @@ class ShardDestination:
     tp_rank: int
     start_idxs: list[int] | None = None
     end_idxs: list[int] | None = None
+
+
+def tp_groups_of(sharding: "ShardingConfig", worker: str) -> list[list[str]]:
+    """The workers, rank-ordered, of each of ``sharding``'s TP groups ``worker``
+    is in. In a request's config, a group of the worker's layout can hold
+    another replica's workers, on a deployment data-parallel over that group."""
+    return [group._workers for group in sharding.groups if group.tp_size > 1 and worker in group._workers]
+
+
+def follows_leader(sharding: "ShardingConfig", worker: str) -> bool:
+    """Whether a leader fans the request's teardown out to ``worker``
+    (``Lockstep.forward_teardown``), which then takes only the leader's."""
+    return any(workers[0] != worker for workers in tp_groups_of(sharding, worker))
 
 
 @dataclass

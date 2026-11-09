@@ -849,7 +849,10 @@ def _consume(rank, seq: int) -> None:
 
 def _remove_rank(consumed: int, *, follower: bool = True) -> Worker:
     """A rank whose lifecycle orders a forwarded removal against the step stream."""
-    rank = make_worker(engine_manager=SimpleNamespace(), is_tp_follower=follower)
+    # each request runs on the TP group a follower follows
+    group = SimpleNamespace(tp_size=2, _workers=["rank0", "w0"])
+    runtime = SimpleNamespace(get_sharding_config=lambda rid: SimpleNamespace(groups=[group]))
+    rank = make_worker(engine_manager=SimpleNamespace(), is_tp_follower=follower, graph_runtime=runtime)
     if consumed >= 0:
         _consume(rank, consumed)
     return rank

@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Collection, Iterable, Set
 
+from mstar.distributed.base import follows_leader
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     DrainRequest,
@@ -38,19 +39,16 @@ _NONE: frozenset[int] = frozenset()
 
 
 class RequestLifecycle:
-    def __init__(self, layout: WorkerLayout, graph_runtime):
+    def __init__(self, layout: WorkerLayout, graph_runtime, worker_id: str):
         self._is_tp_follower = layout.is_tp_follower
         self._runtime = graph_runtime
+        self._worker_id = worker_id
 
         # rid -> the order requests arrived at this worker in. Also which rids
         # are admitted here and not yet torn down: the runtime keeps a handle
         # past `removed`, until the teardown's last step frees it.
         self.arrivals: dict[int, int] = {}
         self._arrived = 0
-        # On a follower worker, the requests it follows no leader for: their
-        # TP replica is another one, and they run here on a node it does not
-        # follow for them. They take the conductor's teardown themselves.
-        self._unfollowed: set[int] = set()
 
         # wire id -> messages for a request that has not arrived. Keyed by the
         # string: these come before the NEW_REQUEST that mints the handle.
@@ -80,16 +78,13 @@ class RequestLifecycle:
 
     # -- arrival ------------------------------------------------------------
 
-    def add(self, rid: int, wire_rid: str, *, follows: bool = True) -> list[WorkerMessage]:
+    def add(self, rid: int, wire_rid: str) -> list[WorkerMessage]:
         """A NEW_REQUEST, of which a request with several partitions here sends
         one per partition: it keeps its first arrival. Its parked messages
-        stay parked until ``take_parked``. ``follows``: a leader forwards the
-        request's teardown to this rank (``Lockstep.follows_leader``)."""
+        stay parked until ``take_parked``."""
         if rid not in self.arrivals:
             self._arrived += 1
             self.arrivals[rid] = self._arrived
-            if self._is_tp_follower and not follows:
-                self._unfollowed.add(rid)
         if wire_rid in self.draining or wire_rid in self.pending_drains:
             # Drained before admission: no new work, while committed TP steps still run.
             self.failed_rids.add(rid)
@@ -117,7 +112,13 @@ class RequestLifecycle:
         return wire_rid not in self._reads_done_sent
 
     def _follows(self, rid: int) -> bool:
-        return self._is_tp_follower and rid not in self._unfollowed
+        """Whether a leader forwards ``rid``'s teardown here. A follower worker
+        can also run a request whose TP replica is another one, on a node it
+        follows no leader for; that request takes the conductor's teardown."""
+        if not self._is_tp_follower:
+            return False
+        sharding = self._runtime.get_sharding_config(rid)
+        return sharding is not None and follows_leader(sharding, self._worker_id)
 
     # -- failure -------------------------------------------------------------
 
@@ -181,7 +182,6 @@ class RequestLifecycle:
         Returns the messages that were parked for it, for the caller to drop."""
         if rid is not None:
             self.arrivals.pop(rid, None)
-            self._unfollowed.discard(rid)
             self.failed_rids.discard(rid)
             self.pending_removes.pop(rid, None)
             self._unreported.pop(rid, None)

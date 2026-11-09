@@ -1,5 +1,7 @@
 """The order ``RequestLifecycle`` hands teardowns back in, which keeps a TP
 follower's page state in step with rank 0's."""
+from types import SimpleNamespace
+
 from mstar.utils.ipc_format import DrainRequest, MessageSource, RemoveRequest
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout
@@ -19,6 +21,10 @@ class _Runtime:
     def get_rid_handle(self, wire_rid):
         return next((h for h, w in self.names.items() if w == wire_rid), None)
 
+    def get_sharding_config(self, handle):
+        # on a follower, every request runs on the TP group it follows
+        return SimpleNamespace(groups=[SimpleNamespace(tp_size=2, _workers=["lead", "w0"])])
+
 
 def _add(lifecycle: RequestLifecycle, rid: int, wire_rid: str) -> None:
     lifecycle._runtime.names[rid] = wire_rid
@@ -26,7 +32,9 @@ def _add(lifecycle: RequestLifecycle, rid: int, wire_rid: str) -> None:
 
 
 def _lifecycle(*rids, follower=False) -> RequestLifecycle:
-    lifecycle = RequestLifecycle(layout=WorkerLayout(is_tp_follower=follower), graph_runtime=_Runtime())
+    lifecycle = RequestLifecycle(
+        layout=WorkerLayout(is_tp_follower=follower), graph_runtime=_Runtime(), worker_id="w0",
+    )
     for rid in rids:
         _add(lifecycle, rid, f"r{rid}")
     return lifecycle
