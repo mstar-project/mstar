@@ -266,9 +266,9 @@ class ChatterboxModel(Model):
     # -----------------------------------------------------------------------
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a request cap the T3 KV pool cannot hold.
+        """Refuse a request cap the T3 KV pool or S3Gen's stream slots cannot hold.
 
-        A stream holds the prompt (conditioning, text, the speech BOS, twice
+        A T3 stream holds the prompt (conditioning, text, the speech BOS, twice
         where T3 repeats it) and a token per decode step, the step that runs
         past the stop included. CFG keeps a conditional and an unconditional one.
         """

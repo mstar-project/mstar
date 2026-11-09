@@ -1,5 +1,5 @@
-"""Whisper timestamp decoding rules as a per-request state that travels with
-the token.
+"""Whisper timestamp decoding rules as a per-request state kept in the decoder
+state.
 
 When a request asks for timestamps (no ``<|notimestamps|>`` in its prompt),
 Whisper's decoding is constrained the way openai-whisper / HF's

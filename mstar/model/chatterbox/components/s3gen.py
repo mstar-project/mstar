@@ -61,10 +61,9 @@ class ReferenceConditioning:
 @dataclass
 class FlowRow:
     """One request's share of a batched flow solve: its tokens so far, its
-    reference, the noise field it denoises (``[1, 80, >= 2(N + n)]``), which a
-    stream keeps from its first chunk so every chunk denoises the same draw,
-    and whether the sequence is complete (else the look-ahead tokens are
-    provisional)."""
+    reference, the noise field it denoises (``[1, 80, >= 2(N + n)]``), the
+    same draw for every chunk of a stream, and whether the sequence is complete
+    (else the look-ahead tokens are provisional)."""
     tokens: torch.Tensor  # [n] long, S3 speech tokens
     ref: ReferenceConditioning
     noise: torch.Tensor
