@@ -3489,9 +3489,10 @@ shared pieces are in <code class="docutils literal notranslate"><span class="pre
 </li>
 <li><p><strong>Build the MoE layers with</strong> <code class="docutils literal notranslate"><span class="pre">instantiate_moe_block</span></code>. Accept <code class="docutils literal notranslate"><span class="pre">moe_parallel</span></code> in
 <code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> and pass it, with the node’s <code class="docutils literal notranslate"><span class="pre">tp_group</span></code>, down to each MoE layer.
-The helper returns a <code class="docutils literal notranslate"><span class="pre">ParallelSparseMoeBlock</span></code> or an <code class="docutils literal notranslate"><span class="pre">ExpertParallelSparseMoeBlock</span></code>,
-whose weight loaders keep only the rank’s slice or its own experts. <code class="docutils literal notranslate"><span class="pre">moe_parallel=None</span></code>
-gives TP.</p>
+The helper returns a <code class="docutils literal notranslate"><span class="pre">ParallelSparseMoeBlock</span></code>, with <code class="docutils literal notranslate"><span class="pre">expert_parallel=True</span></code> under EP.
+It keeps its experts in a <code class="docutils literal notranslate"><span class="pre">FusedExperts</span></code> (<code class="docutils literal notranslate"><span class="pre">block.experts</span></code>), which owns the
+<code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">down_proj</span></code> parameters, the weight loaders that keep only the rank’s
+slice or its own experts, and the dispatch. <code class="docutils literal notranslate"><span class="pre">moe_parallel=None</span></code> gives TP.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="bp">self</span><span class="o">.</span><span class="n">mlp</span> <span class="o">=</span> <span class="n">instantiate_moe_block</span><span class="p">(</span>
     <span class="n">hidden_size</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">hidden_size</span><span class="p">,</span>
     <span class="n">moe_intermediate_size</span><span class="o">=</span><span class="n">cfg</span><span class="o">.</span><span class="n">moe_intermediate_size</span><span class="p">,</span>
@@ -3519,8 +3520,9 @@ as a static input, so a replay can update it; fill it from
 </ul>
 </li>
 </ol>
-<p>The shared-expert block (<code class="docutils literal notranslate"><span class="pre">ParallelSparseMoeBlockWithSharedExpert</span></code>) has no EP variant, so
-a node built from it stays TP-only.</p>
+<p><code class="docutils literal notranslate"><span class="pre">instantiate_moe_block</span></code> builds no shared-expert block. A node with one
+(<code class="docutils literal notranslate"><span class="pre">ParallelSparseMoeBlock(shared_expert=...)</span></code>, the Qwen3-Omni Talker’s) builds it directly and
+stays TP-only.</p>
 </section>
 <section id="tuned-kernel-configs">
 <h3>Tuned kernel configs<a class="headerlink" href="#tuned-kernel-configs" title="Link to this heading">#</a></h3>
