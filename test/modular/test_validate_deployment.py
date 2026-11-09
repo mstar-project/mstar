@@ -729,6 +729,13 @@ def _head_spec(kind, qo_heads, kv_heads):
         return KVSpec(resource_key="kv", nodes={"llm"}, config=PagedKVConfig(
             num_layers=1, num_qo_heads=qo_heads, num_kv_heads=kv_heads, head_dim=8, max_seq_len=64,
         ))
+    if kind == "bounded":
+        from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec, SinkWindow
+
+        return BoundedKVSpec(resource_key="enc", nodes={"llm"}, config=BoundedKVConfig(
+            num_layers=1, num_heads=qo_heads, head_dim=8, rows_per_request=1, max_source_len=0,
+            retention=SinkWindow(0, 4),
+        ))
     if kind == "ragged":
         return RaggedAttentionSpec(resource_key="vit", nodes={"llm"}, config=RaggedAttentionConfig(
             num_qo_heads=qo_heads, num_kv_heads=kv_heads, head_dim=8,
@@ -744,6 +751,7 @@ def _head_spec(kind, qo_heads, kv_heads):
     # 6 query heads over 3 ranks: each rank's 2 would read 2 different KV heads
     ("ragged", 6, 2, 3, False), ("ragged", 6, 3, 3, True),
     ("recurrent", 8, None, 3, False), ("recurrent", 6, None, 3, True),
+    ("bounded", 4, None, 2, False), ("bounded", 4, None, 1, True),
 ])
 def test_head_geometry_is_checked_before_workers_start(tmp_path, kind, qo_heads, kv_heads, degree, valid):
     spec = _head_spec(kind, qo_heads, kv_heads)

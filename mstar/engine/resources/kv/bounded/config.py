@@ -15,10 +15,11 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, head_shards
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
+    from mstar.distributed.communication import JointGroups
     from mstar.engine.resources.base import Resource
 
 
@@ -110,6 +111,10 @@ class BoundedKVConfig:
 @dataclass
 class BoundedKVSpec(NodeResourceSpec):
     config: BoundedKVConfig
+
+    def check_head_shards(self, group: "JointGroups") -> None:
+        if head_shards(group) > 1:
+            raise ValueError("bounded KV does not shard heads across ranks yet")
 
     @property
     def resource_class(self) -> "type[Resource]":
