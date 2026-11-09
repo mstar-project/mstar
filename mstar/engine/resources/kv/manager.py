@@ -703,6 +703,8 @@ class KVManager(AttentionResource):
         #   moves made for it freed before they covered it. Passers can't take them, but admitted requests can, and
         #   a request admitted in order takes them first.
         # `_made` names the request whose allotment the last reservation made rather than grew.
+        # `_passers` holds the requests admitted past the first one that a drop or a move to the host sent back to
+        #   ask again. Each returns as it passed, so it takes none of `_kept`.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
@@ -713,6 +715,7 @@ class KVManager(AttentionResource):
         self._footprints: dict[str, int] = {}
         self._kept = 0
         self._made: str | None = None
+        self._passers: set[str] = set()
         # Preemption state.
         # `_earmarks`: request -> the earmark it holds until its victims have moved.
         # `_victims`: a victim not yet moved -> its earmark.
@@ -4141,6 +4144,7 @@ class KVManager(AttentionResource):
             self._settle(rid, self._room() - room, allotment)
             self._forget_earmark(rid)
             self._ran_short.pop(rid, None)
+            self._passers.discard(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -4408,8 +4412,8 @@ class KVManager(AttentionResource):
                 return None
             # read before `_need`, so that a snapshot filed between the two moves the counts past the mark
             counts = self._index_counts()
-            pages, room = self._need(rid, node_name, graph_walk, published), self._room()
-            if pages > room or not self._admit(rid, pages):
+            pages, room = self._need(rid, node_name, graph_walk, published), self._room_for(rid)
+            if pages > room or not self._admit(rid, pages, passed=rid in self._passers):
                 if self._fixed_need(rid) is not None:
                     counts = None, None
                 return RoomMark(rid, node_name, graph_walk, published, room, *counts)
@@ -4488,6 +4492,7 @@ class KVManager(AttentionResource):
             )
             self._recount(rid)
             self._made = rid
+        self._passers.discard(rid)
         earmark = self._earmarks.get(rid)
         if earmark is not None:
             earmark.granted = earmark.pages
@@ -4580,7 +4585,7 @@ class KVManager(AttentionResource):
             grew = self._grew_since(mark)
             if not grew and isinstance(mark, RoomMark) and mark.rid in self._asks:
                 pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
-                assert pages > self._room(), (
+                assert pages > self._room_for(mark.rid), (
                     f"KV {self.name}: {mark.rid} fits now, but nothing `grew_since` reads has moved "
                     "since it didn't, so nothing would admit it"
                 )
@@ -4593,8 +4598,12 @@ class KVManager(AttentionResource):
         elif mark.rid not in self._asks:
             return True
         else:
-            room = self._room()
+            room = self._room_for(mark.rid)
         return room > mark.room or (mark.filed is not None and (mark.filed, mark.taken) != self._index_counts())
+
+    def _room_for(self, rid: str) -> int:
+        """The room waiting ``rid`` may take, which leaves out `_kept` when ``rid`` returns past the first request."""
+        return self._room() - (self._kept if rid in self._passers else 0)
 
     def _need(
         self, rid: str, node_name: str, graph_walk: str, published: PublishedKVInfo | None,
@@ -4737,9 +4746,10 @@ class KVManager(AttentionResource):
             if not stalled or mark.rid not in self._asks:
                 return None
             pages = self._need(mark.rid, mark.node_name, mark.graph_walk, mark.published)
-            if pages <= self._room():
+            room = self._room_for(mark.rid)
+            if pages <= room:
                 return Victims([], [], [])
-            victims = self._choose(pages - self._room(), stalled, droppable)
+            victims = self._choose(pages - room, stalled, droppable)
             return None if victims is None else self._earmark(Earmark(mark.rid, pages, set(), mark=mark), victims)
 
     def _choose(self, pages_short: int, newer: Collection[str], droppable: Callable[[str], bool]) -> Victims | None:
@@ -4895,12 +4905,14 @@ class KVManager(AttentionResource):
                 pages = earmark.pages if mark is None else self._need(
                     mark.rid, mark.node_name, mark.graph_walk, mark.published,
                 )
-                kept = max(0, min(pages - earmark.granted, freed))
+                # A request returning past the first one takes none of `_kept`, so none is kept for it either.
+                passed = earmark.rid in self._passers
+                kept = 0 if passed else max(0, min(pages - earmark.granted, freed))
                 earmark.granted += kept
                 self._kept += kept
                 freed -= kept
-                if self._decides and pages <= self._room():
-                    self._admit(earmark.rid, pages)
+                if self._decides and pages <= self._room_for(earmark.rid):
+                    self._admit(earmark.rid, pages, passed)
             else:
                 granted = min(earmark.pages - earmark.granted, freed)
                 if granted:
@@ -4915,6 +4927,8 @@ class KVManager(AttentionResource):
         pages. ``room`` is `_room` as it was before the drop or the move."""
         allotment = self._allotments.get(rid)
         self._unreserve(rid)
+        if allotment is not None and allotment.passed:
+            self._passers.add(rid)
         self._ran_short.pop(rid, None)
         self._settle(rid, self._room() - room, allotment)
         self._forget_earmark(rid)

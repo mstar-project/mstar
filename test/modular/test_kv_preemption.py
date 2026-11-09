@@ -374,7 +374,7 @@ def test_a_passer_moved_for_an_older_request_keeps_for_the_head_what_the_earmark
     (_drop if moves == "is dropped" else _offload)(kv, "p")
     _request(kv, "q", 1, arrival=3)
 
-    assert _ready(kv, "p"), "p didn't return ahead of the queue"
+    assert not _ready(kv, "p"), "p, which passed the head, returned into the pages kept for it"
     assert not _ready(kv, "q"), "a request behind the head took what the passer's move freed past x's shortage"
     assert _step(kv, "x", 2 * PAGE_SIZE).ok, "x didn't get the page its victim freed"
     _remove(kv, "x")

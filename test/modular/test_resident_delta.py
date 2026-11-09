@@ -1517,7 +1517,7 @@ def test_a_follower_settles_a_passer_dropped_for_an_older_request_into_rank_0s_c
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert _counts(leader) == _counts(follower), "a rank settled the drop of the request that passed another way"
     assert leader._kept == 4, "rank 0 left a passer the pages p freed past r's shortage"
-    assert _returns(leader, "p"), "p, dropped, waited behind the head, though r is older than both"
+    assert not _returns(leader, "p"), "p, which passed the head, returned into the pages kept for it"
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert _counts(leader) == _counts(follower), "p's return took the kept pages into its allotment on one rank"
 
