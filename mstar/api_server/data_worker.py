@@ -67,6 +67,7 @@ from mstar.model.media_limits import (
     check_file_counts,
     check_media_limits,
 )
+from mstar.model.utils import TextOutput
 from mstar.observability.catalog import STATUS_INTERVAL_S
 from mstar.observability.recorders import EdgeTransfers
 from mstar.profile.format import InputInfo, RxInfo, TxInfo
@@ -116,6 +117,12 @@ def text_tokens(modality: str, tensor: torch.Tensor) -> int:
     """The token ids an output tensor carries to the client, as ``token_ids``
     lists them. A float text tensor (Whisper's word alignment) carries none."""
     return tensor.numel() if modality == "text" and not tensor.is_floating_point() else 0
+
+
+def ends_reply(token: int, text: TextOutput | None, request_kwargs: dict | None) -> bool:
+    """Whether a sampled text token ended its reply: one of the model's declared
+    stop ids, unless the request set ``ignore_eos``."""
+    return text is not None and token in text.stop_token_ids and not (request_kwargs or {}).get("ignore_eos")
 
 
 def _sha256(path: str) -> bytes:
@@ -1660,6 +1667,7 @@ class PreprocessWorkerThread:
         share = (time.perf_counter() - start) / len(rids) if start is not None and rids else 0.0
         postprocess_s = share
         num_tokens = 1 if item.modality == "text" else 0
+        text = self.model.text_output() if num_tokens else None
         states = self.request_output_state
         for i, request_id in enumerate(rids):
             state = states.get(request_id)
@@ -1690,6 +1698,7 @@ class PreprocessWorkerThread:
                     ResultChunk(
                         request_id=request_id, modality=item.modality, data=data, metadata=metadata,
                         postprocess_s=postprocess_s, num_tokens=num_tokens,
+                        stopped=ends_reply(values[i], text, kwargs.get(request_id)),
                     ),
                 )
             except Exception as exc:  # noqa: BLE001 — must reach the client
@@ -1812,6 +1821,10 @@ class PreprocessWorkerThread:
                     f"expected {expected_bytes} bytes, got {len(postprocessed)}"
                 )
 
+        num_tokens = text_tokens(modality, tensor)
+        stopped = num_tokens > 0 and ends_reply(
+            int(tensor.reshape(-1)[-1]), self.model.text_output(), self.request_model_kwargs.get(request_id),
+        )
         if self.enable_nvtx:
             profiler.range_push("dataworker.queue_output")
         self._queue_completed_output(
@@ -1824,7 +1837,8 @@ class PreprocessWorkerThread:
                 metadata=chunk_metadata,
                 read_time=read_time,
                 postprocess_s=postprocess_s,
-                num_tokens=text_tokens(modality, tensor),
+                num_tokens=num_tokens,
+                stopped=stopped,
             ),
         )
         if self.enable_nvtx:

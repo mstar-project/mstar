@@ -1,8 +1,8 @@
 """A chat reply's ``usage`` and ``finish_reason``.
 
 The data worker counts the prompt's positions (``Model.prompt_tokens``) and
-each text chunk's tokens, the conductor returns the prompt count and the
-output cap it resolved on
+each text chunk's tokens, and flags the chunk a stop token ended; the
+conductor returns the prompt count and the output cap it resolved on
 ``request_complete``, and the API server ends a ``report_usage`` submission
 with a ``usage`` chunk the chat handlers turn into OpenAI's ``usage`` and
 ``finish_reason``. The Rust frontend's side is in ``rust/server/src/main.rs``
@@ -35,6 +35,7 @@ from mstar.conductor.request_info import WalkStep
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import MAX_OUTPUT_TOKENS, Model
+from mstar.model.utils import TextOutput
 from mstar.utils.ipc_format import ConductorMessageType, NewRequestConductor, WorkerGraphsDone
 
 PROMPT = "the quick brown fox jumps"
@@ -161,6 +162,33 @@ def test_a_prompt_split_around_its_image_counts_the_images_positions(build, tmp_
     assert sent == text + 2 + image_tokens
 
 
+STOP_ID = 2
+
+
+class _StoppingModel(_Model):
+    """Declares its stop id, as the chat models' ``text_output`` does."""
+
+    def text_output(self):
+        return TextOutput(SimpleNamespace(token_bytes=lambda i: b"x", to_bytes=lambda ids: b"x" * len(ids)), {STOP_ID})
+
+
+def test_a_chunk_that_ends_on_a_stop_token_says_so():
+    worker = _data_worker(_StoppingModel())
+    worker.request_model_kwargs["i"] = {"ignore_eos": True}
+    worker._emit_inline_tokens(InlineTokens(["r", "s", "i"], [11, STOP_ID, STOP_ID], "text"))
+    worker._emit_inline_tokens(InlineTokens(["r"], [STOP_ID], "audio"))
+    worker.request_output_state["t"] = state = RequestOutputState()
+    worker.tensor_uuid_to_metadata_per_request["t"] = {1: {}, 2: {}}
+    for sequence, (uuid, ids) in enumerate([(1, [STOP_ID, 6]), (2, [5, STOP_ID])]):
+        state.next_sequence += 1
+        worker._postprocess_inline("t", sequence, "text", uuid, torch.tensor(ids), None)
+    chunks = [worker.out_queue.get_nowait() for _ in range(6)]
+    assert [(c.request_id, c.modality, c.stopped) for c in chunks] == [
+        ("r", "text", False), ("s", "text", True), ("i", "text", False), ("r", "audio", False),
+        ("t", "text", False), ("t", "text", True),
+    ]
+
+
 def test_each_text_chunk_carries_its_token_count():
     worker = _data_worker()
     worker._emit_inline_tokens(InlineTokens(["r", "s"], [11, 12], "text"))
@@ -260,9 +288,10 @@ class _OnePass:
         return False
 
 
-def _served(token_counts, cap, report_usage=True, error=False):
+def _served(token_counts, cap, report_usage=True, error=False, stopped=False):
     """A request run through ``submit_request`` and one pass of the message
-    thread: text chunks carrying ``token_counts`` tokens, then its completion."""
+    thread: text chunks carrying ``token_counts`` tokens, the last one ended by
+    a stop token when ``stopped``, then its completion."""
     worker = _DataWorker()
     server = make_test_api_server(preprocess_worker=worker)
     server.submit_request(
@@ -273,6 +302,7 @@ def _served(token_counts, cap, report_usage=True, error=False):
     worker.chunks = [
         ResultChunk(request_id=key, modality="text", data=b"x", num_tokens=n) for n in token_counts
     ]
+    worker.chunks[-1].stopped = stopped
     if error:
         worker.chunks.append(ResultChunk(request_id=key, modality="error", data=b"boom", metadata={"status": 500}))
     server.communicator = _OnePass([APIServerMessage(message_type="request_complete", body=RequestComplete(
@@ -296,13 +326,17 @@ def _collected(server):
     return asyncio.run(server.collect_results("r"))
 
 
-@pytest.mark.parametrize("read,token_counts,cap,completion,finish", [
-    (_collected, [1, 1, 1, 1], 4, 4, "length"),  # max_tokens hit
-    (_streamed, [1, 1, 1], 16, 3, "stop"),  # a stop token first
-    (_streamed, [1, 3], 4, 4, "length"),  # a tensor chunk of several ids
-], ids=["max-tokens-collected", "eos-streamed", "multi-token-chunk-streamed"])
-def test_a_reported_request_ends_with_its_usage(read, token_counts, cap, completion, finish):
-    chunks = read(_served(token_counts, cap))
+@pytest.mark.parametrize("read,token_counts,cap,stopped,completion,finish", [
+    (_collected, [1, 1, 1, 1], 4, False, 4, "length"),  # max_tokens hit
+    (_streamed, [1, 1, 1], 16, True, 3, "stop"),  # a stop token first
+    (_streamed, [1, 3], 4, False, 4, "length"),  # a tensor chunk of several ids
+    # a stop token in the last allowed slot, as OpenAI and vLLM report it
+    (_collected, [1, 1, 1, 1], 4, True, 4, "stop"),
+    (_streamed, [1, 3], 4, True, 4, "stop"),
+], ids=["max-tokens-collected", "eos-streamed", "multi-token-chunk-streamed",
+        "eos-in-the-last-slot-collected", "eos-in-the-last-slot-streamed"])
+def test_a_reported_request_ends_with_its_usage(read, token_counts, cap, stopped, completion, finish):
+    chunks = read(_served(token_counts, cap, stopped=stopped))
     assert [c.modality for c in chunks] == ["text"] * len(token_counts) + [USAGE]
     assert chunks[-1].request_id == "r"
     assert chunks[-1].metadata == {

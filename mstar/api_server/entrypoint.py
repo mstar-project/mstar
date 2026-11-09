@@ -339,9 +339,11 @@ class PendingRequest:
     sink: "ChunkSink | None" = None
     sink_tag: Any = None
     # submit_request's report_usage, and what usage_chunk reports: the text
-    # tokens of the chunks so far, and request_complete's counts
+    # tokens of the chunks so far, whether one was a stop token, and
+    # request_complete's counts
     report_usage: bool = False
     completion_tokens: int = 0
+    stopped: bool = False
     prompt_tokens: int | None = None
     max_output_tokens: int | None = None
 
@@ -381,13 +383,16 @@ def _set_events(wakes: list) -> None:
 def usage_chunk(request_id: str, req: PendingRequest) -> ResultChunk:
     """The chunk that ends a successful request submitted with ``report_usage``.
     Its ``finish_reason`` is ``length`` when the reply used all of the
-    ``max_output_tokens`` the conductor resolved for it, and ``stop`` otherwise,
-    as vLLM decides it: a stop token sampled as the last allowed one is ``length``."""
+    ``max_output_tokens`` the conductor resolved for it without sampling a stop
+    token, and ``stop`` otherwise. A stop token in the last allowed slot is
+    ``stop``, as OpenAI and vLLM report it. Only a model that declares
+    ``text_output`` has its stop tokens seen; any other is ``length`` at the cap."""
     cap = req.max_output_tokens
+    at_cap = cap is not None and req.completion_tokens >= cap
     return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata={
         "prompt_tokens": req.prompt_tokens or 0,
         "completion_tokens": req.completion_tokens,
-        "finish_reason": "length" if cap is not None and req.completion_tokens >= cap else "stop",
+        "finish_reason": "length" if at_cap and not req.stopped else "stop",
     })
 
 
@@ -1383,6 +1388,7 @@ class APIServer:
                             req.profile.timing.last_output_read_time = result_chunk.read_time
                         req.profile.timing.output_postprocess_s += result_chunk.postprocess_s
                         req.completion_tokens += result_chunk.num_tokens
+                        req.stopped |= result_chunk.stopped
                         if metrics is not None and result_chunk.modality != "error":
                             req.first_chunk_times.setdefault(result_chunk.modality, now)
                         if req.request_id is not None:

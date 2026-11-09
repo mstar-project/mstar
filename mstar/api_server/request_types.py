@@ -30,6 +30,8 @@ class ResultChunk:
     # The text tokens it carries, as ``token_ids`` lists them (a stop token
     # included); summed into the request's ``completion_tokens``.
     num_tokens: int = 0
+    # Its last token is one of the model's stop ids, so it ended the reply.
+    stopped: bool = False
 
 
 # The modality of the chunk that ends a request submitted with
