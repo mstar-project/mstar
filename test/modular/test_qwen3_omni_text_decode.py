@@ -102,7 +102,7 @@ def thinker():
     ))
     sub.bind_node_resources({THINKER_SAMPLER: SimpleNamespace(has_slot_masters=True)})
     sub.kv = SimpleNamespace(
-        _check_open=lambda call: None, label="main", positions=None, queried=None, _segments=(),
+        _check_open=lambda call: None, label="main", positions=None, queried=None, _segments=(), walk_reads={},
         first_read=SimpleNamespace(select_last_hidden=lambda h, label: h[-2:]),
     )
     sub.sampler = _SamplerHandle()

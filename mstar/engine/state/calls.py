@@ -632,7 +632,14 @@ def at_last_token(h: ArrayHandle, x: torch.Tensor, *, label: str | None = None) 
     if empty is not None:
         raise h._refusal(f"at_last_token on row {empty.request_id}, label {empty.label!r}, whose segment has span 0 "
                          "and so no token in this step")
-    last = h.first_read.select_last_hidden(x, label=h.label)
+    read = h.first_read
+    if h.walk_reads:
+        # a walk plans only the resources of its own reads
+        reads = h.walk_reads.get(h._walk, h.walk_reads[None])
+        if not reads:
+            raise h._refusal(f"at_last_token on walk {h._walk!r}, which runs no read of this array")
+        read = h.reads[next(iter(reads.values()))]
+    last = read.select_last_hidden(x, label=h.label)
     return last if label is None else last[first:end]
 
 
