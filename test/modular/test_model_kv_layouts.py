@@ -716,8 +716,7 @@ def test_a_token_decoder_replies_with_max_tokens_tokens(name, max_tokens):
     """The prefill samples the first token and the decode loop's cap runs the
     rest: the stop check counts no budget of its own, so the cap alone must
     leave max_tokens tokens (a budget of 1 ends at the prefill)."""
-    loop = "reasoner_decode_loop" if name == "cosmos3" else "decode_loop"
-    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)[loop] == max_tokens
+    assert 1 + _token_decoder(name).get_loop_caps(max_output_tokens=max_tokens)["decode_loop"] == max_tokens
 
 
 def _whisper():
