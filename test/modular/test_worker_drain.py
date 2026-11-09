@@ -43,11 +43,9 @@ class _StubRuntime(SimpleNamespace, PhasedPostprocess):
     supports_inline_emit = False
 
 
-
-
 def _worker(
     known_rids=("X",), in_flight=(), draining=(), reads_done=(),
-    pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(), tp_group=None, **fields,
+    pending_drains=(), inflight_reads=False, is_follower=False, tp_follow=(), sharding=None, **fields,
 ):
     sent = []
     # Identity interning: these tests use the rid string as its own handle, so
@@ -60,7 +58,7 @@ def _worker(
         # The request's TP groups: on a follower, by default, it runs on
         # leader "lead"'s group, which this worker ("w0") follows.
         get_sharding_config=lambda r: (
-            (tp_group or tp_sharding("lead", "w0")) if is_follower else tp_sharding()
+            (sharding or tp_sharding("lead", "w0")) if is_follower else tp_sharding()
         ) if r in known_rids else None,
     )
     request_state = SimpleNamespace(
@@ -381,7 +379,7 @@ def test_a_follower_takes_the_conductors_teardown_of_a_request_it_follows_no_lea
     and also runs a node of a request whose TP node runs on the other one. No
     leader forwards that request's drain and remove here, so the conductor's
     count; ignored, its abort stalls for the drain TTL and its state leaks."""
-    w = _worker(is_follower=True, tp_group=tp_sharding(*(("lead", "w0") if replica == "followed" else ("w2", "w3"))))
+    w = _worker(is_follower=True, sharding=tp_sharding(*(("lead", "w0") if replica == "followed" else ("w2", "w3"))))
     _drain(w, request_id="X")  # source=CONDUCTOR
     _remove(w, request_id="X")
     w.pipeline._teardown(w.pipeline.in_flight_rids)

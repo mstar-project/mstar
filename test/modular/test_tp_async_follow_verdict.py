@@ -40,7 +40,7 @@ from test_loop_turns import _looping_worker, _Runtime, _scheduler, _StopLoopErro
 
 from mstar.engine.resources.step import FULL_ADMIT_OK  # noqa: E402
 from mstar.model.submodule_base import StepOrder  # noqa: E402
-from mstar.testing_utils.worker import bound, make_scheduler, make_worker  # noqa: E402
+from mstar.testing_utils.worker import bound, make_scheduler, make_worker, tp_sharding  # noqa: E402
 from mstar.utils.ipc_format import ScheduleTPNode, TPNoSpeculation, WorkerMessageType  # noqa: E402
 from mstar.worker import speculation as speculation_mod  # noqa: E402
 from mstar.worker import step_pipeline as pipeline_mod  # noqa: E402
@@ -128,13 +128,10 @@ def _leader(leads: bool = True, async_nodes=None, async_sched: bool = True):
     """Rank 0 of NODE's instance, or with ``leads`` off a follower shard of it. Its
     ``Lockstep`` is real; what it sends lands in ``.sent``."""
     sent = []
-    group = types.SimpleNamespace(_workers=["w0", "w1"])
     return types.SimpleNamespace(sent=sent, lockstep=make_worker(
         parallel_nodes={NODE}, parallel_leader_nodes={NODE} if leads else set(), is_tp_follower=not leads,
         async_sched=(async_sched, async_nodes),
-        graph_runtime=types.SimpleNamespace(get_sharding_config=lambda rid: types.SimpleNamespace(
-            get_sharding_group=lambda node, walk: group,
-        )),
+        graph_runtime=types.SimpleNamespace(get_sharding_config=lambda rid: tp_sharding("w0", "w1", nodes={NODE})),
         communicator=types.SimpleNamespace(send=lambda dest, msg: sent.append((dest, msg))),
     ).lockstep)
 
