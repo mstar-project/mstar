@@ -2450,7 +2450,19 @@ class Conductor:
                     except Exception as exc:
                         step = f"handling {_message_name(message)}"
                         for request_id in _message_request_ids(message):
-                            self._fail_after_error(request_id, step, exc)
+                            if (message.message_type == ConductorMessageType.NEW_REQUEST
+                                    and request_id not in self.requests):
+                                # Never registered (or only queued), so there
+                                # is no drain barrier to fail it through.
+                                self.waiting_queue[:] = [
+                                    body for body in self.waiting_queue if body.request_id != request_id
+                                ]
+                                if self._status_interval_s is not None:
+                                    self._queued_since.pop(request_id, None)
+                                text, _ = client_error_text(exc, f"Conductor error {step}", log=logger)
+                                self._reject_request(request_id, text, status=500)
+                            else:
+                                self._fail_after_error(request_id, step, exc)
 
                 completed_requests = []
 
