@@ -729,6 +729,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.ingest_request"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.layer_delta"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.layer_delta()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.layer_ranks"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.layer_ranks()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.lean_capture"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.lean_capture</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.lean_for"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.lean_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.load_adapter()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter_async"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.load_adapter_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.plan"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.plan()</span></code></a></li>
@@ -1044,6 +1046,23 @@ adapter adds nothing there.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.lean_capture">
+<span class="sig-name descname"><span class="pre">lean_capture</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">True</span></span><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.lean_capture" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.pool.LoraAdapterPool.lean_for">
+<span class="sig-name descname"><span class="pre">lean_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/pool.html#LoraAdapterPool.lean_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.lean_for" title="Link to this definition">#</a></dt>
+<dd><p>A step runs base-only when none of its rows names an adapter with something
+for this pool (<code class="docutils literal notranslate"><span class="pre">runs_adapters</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1423,6 +1442,8 @@ once, here; a call reads only the step’s addressing.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.ingest_request"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.layer_delta"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.layer_delta()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.layer_ranks"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.layer_ranks()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.lean_capture"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.lean_capture</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.lean_for"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.lean_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.load_adapter()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter_async"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.load_adapter_async()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.pool.LoraAdapterPool.plan"><code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.plan()</span></code></a></li>

@@ -1601,30 +1601,6 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""One step's rows: a segment per request, its ``span`` the tokens that request puts</span>
 <span class="sd">    through the LoRA'd linears this step, in the order they are packed."""</span></div>
 
-
-
-<div class="viewcode-block" id="LoraBaseOnly">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.LoraBaseOnly">[docs]</a>
-<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">LoraBaseOnly</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""The capture key of a step none of whose rows names an adapter: the node's own</span>
-<span class="sd">    ``cg_key_info`` (``key``), wrapped. A node serving adapters captures each bucket under</span>
-<span class="sd">    both keys, and the base-only graph records no LoRA kernel: at decode width the</span>
-<span class="sd">    launches of a delta that adds zero cost about what the work does."""</span>
-
-    <span class="n">key</span><span class="p">:</span> <span class="n">Any</span> <span class="o">=</span> <span class="kc">None</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
-        <span class="k">return</span> <span class="s2">"lora-base-only"</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">key</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">"lora-base-only:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">key</span><span class="si">}</span><span class="s2">"</span></div>
-
-
-
-<div class="viewcode-block" id="node_capture_key">
-<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.node_capture_key">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">node_capture_key</span><span class="p">(</span><span class="n">key</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Any</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""The node's own ``cg_key_info`` in a capture key, without its ``LoraBaseOnly``."""</span>
-    <span class="k">return</span> <span class="n">key</span><span class="o">.</span><span class="n">key</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="n">LoraBaseOnly</span><span class="p">)</span> <span class="k">else</span> <span class="n">key</span></div>
-
 </pre></div>
 
                 </article>

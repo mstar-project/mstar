@@ -814,6 +814,9 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.journals_resident_moves"><code class="docutils literal notranslate"><span class="pre">Resource.journals_resident_moves()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.keys_prefix_chains"><code class="docutils literal notranslate"><span class="pre">Resource.keys_prefix_chains</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.land_rebuild"><code class="docutils literal notranslate"><span class="pre">Resource.land_rebuild()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.lean_capture"><code class="docutils literal notranslate"><span class="pre">Resource.lean_capture</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.lean_captures"><code class="docutils literal notranslate"><span class="pre">Resource.lean_captures()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.lean_for"><code class="docutils literal notranslate"><span class="pre">Resource.lean_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.lease_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.lease_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.offload"><code class="docutils literal notranslate"><span class="pre">Resource.offload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.page_trail"><code class="docutils literal notranslate"><span class="pre">Resource.page_trail()</span></code></a></li>
@@ -835,6 +838,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.reset_request"><code class="docutils literal notranslate"><span class="pre">Resource.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.residency"><code class="docutils literal notranslate"><span class="pre">Resource.residency()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.resolve_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.resource_key"><code class="docutils literal notranslate"><span class="pre">Resource.resource_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.rollback_admit"><code class="docutils literal notranslate"><span class="pre">Resource.rollback_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.seal_capture_buffers"><code class="docutils literal notranslate"><span class="pre">Resource.seal_capture_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.step_host_rows"><code class="docutils literal notranslate"><span class="pre">Resource.step_host_rows()</span></code></a></li>
@@ -1781,6 +1785,38 @@ every step.</p>
 </dl>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.lean_capture">
+<span class="sig-name descname"><span class="pre">lean_capture</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.base.Resource.lean_capture" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.lean_captures">
+<span class="sig-name descname"><span class="pre">lean_captures</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">config_type</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.lean_captures"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.lean_captures" title="Link to this definition">#</a></dt>
+<dd><p>Whether a capture of <code class="docutils literal notranslate"><span class="pre">config_type</span></code> gets this resource’s lean twin.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>config_type</strong> (<a class="reference internal" href="mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.AcceleratorGraphConfigType" title="mstar.engine.accelerator_graph_config.AcceleratorGraphConfigType"><em>AcceleratorGraphConfigType</em></a><em> | </em><a class="reference internal" href="mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PiecewiseConfigType" title="mstar.engine.accelerator_graph_config.PiecewiseConfigType"><em>PiecewiseConfigType</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.lean_for">
+<span class="sig-name descname"><span class="pre">lean_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_ids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.lean_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.lean_for" title="Link to this definition">#</a></dt>
+<dd><p>Whether every one of <code class="docutils literal notranslate"><span class="pre">request_ids</span></code> lets this <code class="docutils literal notranslate"><span class="pre">lean_capture</span></code> resource
+run lean. Read from state every rank of a lockstep instance sets alike (its
+ingests), on the thread that leases the step’s graph.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.lease_cached_prefix">
 <span class="sig-name descname"><span class="pre">lease_cached_prefix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.lease_cached_prefix"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.lease_cached_prefix" title="Link to this definition">#</a></dt>
@@ -2113,6 +2149,11 @@ against for <cite>grew_since</cite>.</p>
 </dl>
 </dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.resource_key">
+<span class="sig-name descname"><span class="pre">resource_key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.base.Resource.resource_key" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.Resource.rollback_admit">
 <span class="sig-name descname"><span class="pre">rollback_admit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ctx</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#Resource.rollback_admit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.Resource.rollback_admit" title="Link to this definition">#</a></dt>
@@ -2352,6 +2393,9 @@ the stop buffers. Read right after the forward and not cloned.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.journals_resident_moves"><code class="docutils literal notranslate"><span class="pre">Resource.journals_resident_moves()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.keys_prefix_chains"><code class="docutils literal notranslate"><span class="pre">Resource.keys_prefix_chains</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.land_rebuild"><code class="docutils literal notranslate"><span class="pre">Resource.land_rebuild()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.lean_capture"><code class="docutils literal notranslate"><span class="pre">Resource.lean_capture</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.lean_captures"><code class="docutils literal notranslate"><span class="pre">Resource.lean_captures()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.lean_for"><code class="docutils literal notranslate"><span class="pre">Resource.lean_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.lease_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.lease_cached_prefix()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.offload"><code class="docutils literal notranslate"><span class="pre">Resource.offload()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.page_trail"><code class="docutils literal notranslate"><span class="pre">Resource.page_trail()</span></code></a></li>
@@ -2373,6 +2417,7 @@ the stop buffers. Read right after the forward and not cloned.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.reset_request"><code class="docutils literal notranslate"><span class="pre">Resource.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.residency"><code class="docutils literal notranslate"><span class="pre">Resource.residency()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.resolve_cached_prefix"><code class="docutils literal notranslate"><span class="pre">Resource.resolve_cached_prefix()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.resource_key"><code class="docutils literal notranslate"><span class="pre">Resource.resource_key</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.rollback_admit"><code class="docutils literal notranslate"><span class="pre">Resource.rollback_admit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.seal_capture_buffers"><code class="docutils literal notranslate"><span class="pre">Resource.seal_capture_buffers()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.base.Resource.step_host_rows"><code class="docutils literal notranslate"><span class="pre">Resource.step_host_rows()</span></code></a></li>

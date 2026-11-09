@@ -1127,12 +1127,22 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Allows ``logprobs_mode: "processed"``; the captured sampler then also</span>
     <span class="c1"># renorms every step's distribution again (CUDA only).</span>
     <span class="n">enable_processed_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># Whether a step whose rows all sample greedily may take each row's argmax</span>
+    <span class="c1"># (`SamplerResource.lean_for`), in a twin of each batched capture: None</span>
+    <span class="c1"># decides by the vocabulary (past the one-kernel draw), False never, True</span>
+    <span class="c1"># always. The twins cost capture memory and time, so a deployment that never</span>
+    <span class="c1"># samples greedily turns them off in its ``resources:`` block.</span>
+    <span class="n">greedy_capture</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
 <div class="viewcode-block" id="SamplerSpec.apply_yaml_overrides">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.sampler.config.html#mstar.engine.resources.SamplerSpec.apply_yaml_overrides">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">apply_yaml_overrides</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span> <span class="n">enable_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">enable_processed_logprobs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">greedy_capture</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">greedy_capture</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">check_bool_knob</span><span class="p">(</span><span class="s2">"greedy_capture"</span><span class="p">,</span> <span class="n">greedy_capture</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">greedy_capture</span> <span class="o">=</span> <span class="n">greedy_capture</span>
         <span class="k">if</span> <span class="n">enable_logprobs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">check_bool_knob</span><span class="p">(</span><span class="s2">"enable_logprobs"</span><span class="p">,</span> <span class="n">enable_logprobs</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">enable_logprobs</span> <span class="o">=</span> <span class="n">enable_logprobs</span>

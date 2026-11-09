@@ -1320,6 +1320,8 @@ them by that name:</p>
 <span class="w">  </span><span class="nt">vit_attn</span><span class="p">:</span><span class="w">                  </span><span class="c1"># a cacheless (ragged) attention resource</span>
 <span class="w">    </span><span class="nt">max_segments_per_request</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span><span class="w">  </span><span class="c1"># also: max_segments_per_step, max_tokens_per_request,</span>
 <span class="w">                                 </span><span class="c1"># flashinfer_backend</span>
+<span class="w">  </span><span class="nt">sampler</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">greedy_capture</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">    </span><span class="c1"># also: enable_logprobs, enable_processed_logprobs</span>
 </pre></div>
 </div>
 <p>Use one block per resource. A model with two caches, such as Whisper’s decoder cache and
@@ -1327,6 +1329,11 @@ its encoder context, can therefore size each one separately. If a block names a 
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level <code class="docutils literal notranslate"><span class="pre">kv_cache:</span></code> block is
 no longer read. It raises an error with a message describing the migration.</p>
+<p><code class="docutils literal notranslate"><span class="pre">greedy_capture:</span> <span class="pre">false</span></code> on a sampler stops all-greedy steps from taking each row’s
+argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
+whose vocabulary is past 4096 has them by default (see <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> in
+<a class="reference internal" href="adding_models.html"><span class="doc">Adding a New Model</span></a>), so a deployment that never samples greedily can save their capture
+memory and time this way.</p>
 <p><code class="docutils literal notranslate"><span class="pre">prefix_cache:</span> <span class="pre">false</span></code> turns cross-request prefix reuse off for that cache, and
 <code class="docutils literal notranslate"><span class="pre">prefix_cache_salt</span></code> keeps two otherwise identical deployments off each other’s
 cached pages. A single request opts out by sending <code class="docutils literal notranslate"><span class="pre">prefix_cache=False</span></code>, which

@@ -1011,6 +1011,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span><span class="p">,</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">KeysView</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">itertools</span><span class="w"> </span><span class="kn">import</span> <span class="n">combinations</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">ClassVar</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="c1"># The graph walk on a piecewise region's step context: the region declares, plans and</span>
@@ -1054,10 +1055,26 @@ window.runMermaid = runMermaid;</script>
     <span class="n">num_tokens</span><span class="p">:</span> <span class="nb">int</span>
     <span class="c1"># Matches additional_key_info in CudaGraphConfig</span>
     <span class="n">cg_key_info</span><span class="p">:</span> <span class="n">Any</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="c1"># the keys of the resources this capture leaves running lean</span>
+    <span class="c1"># (`Resource.lean_capture`); empty for the plain bucket every step can replay</span>
+    <span class="n">lean</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__str__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
         <span class="n">key</span> <span class="o">=</span> <span class="s2">""</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cg_key_info</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="sa">f</span><span class="s2">",key=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">cg_key_info</span><span class="si">}</span><span class="s2">"</span>
-        <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">graph_walk</span><span class="si">}</span><span class="s2">[bs=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2">,tokens=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="si">}{</span><span class="n">key</span><span class="si">}</span><span class="s2">]"</span></div>
+        <span class="n">lean</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">",lean=</span><span class="si">{</span><span class="s1">'+'</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="nb">sorted</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">lean</span><span class="p">))</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">lean</span> <span class="k">else</span> <span class="s2">""</span>
+        <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">graph_walk</span><span class="si">}</span><span class="s2">[bs=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">bs</span><span class="si">}</span><span class="s2">,tokens=</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_tokens</span><span class="si">}{</span><span class="n">key</span><span class="si">}{</span><span class="n">lean</span><span class="si">}</span><span class="s2">]"</span></div>
+
+
+
+<div class="viewcode-block" id="lean_subsets">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.lean_subsets">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">lean_subsets</span><span class="p">(</span><span class="n">keys</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="o">...</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The non-empty subsets of ``keys``, largest first, those of one size in the</span>
+<span class="sd">    order of ``keys``: the lean twins a step that leaves all of ``keys`` lean may</span>
+<span class="sd">    replay, in the order it tries them."""</span>
+    <span class="k">return</span> <span class="nb">tuple</span><span class="p">(</span>
+        <span class="nb">frozenset</span><span class="p">(</span><span class="n">subset</span><span class="p">)</span> <span class="k">for</span> <span class="n">size</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">keys</span><span class="p">),</span> <span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="k">for</span> <span class="n">subset</span> <span class="ow">in</span> <span class="n">combinations</span><span class="p">(</span><span class="n">keys</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
+    <span class="p">)</span></div>
 
 
 
@@ -1170,6 +1187,10 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># rows that recompute KV their request already had: the step throws their</span>
     <span class="c1"># samples away, and they change no per-request state but the KV</span>
     <span class="n">rebuild_rids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
+    <span class="c1"># the keys of the resources that run lean this step: its lease's</span>
+    <span class="c1"># (`BucketKey.lean`), or for an eager step those whose `lean_for` holds for</span>
+    <span class="c1"># every row. Set by the engine; a piecewise region's step takes its bucket's.</span>
+    <span class="n">lean</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
 
 <div class="viewcode-block" id="StepContext.walk_of">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.step.html#mstar.engine.resources.StepContext.walk_of">[docs]</a>

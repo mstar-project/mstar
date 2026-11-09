@@ -722,10 +722,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.AdapterInfo.unmapped"><code class="docutils literal notranslate"><span class="pre">AdapterInfo.unmapped</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraBaseOnly"><code class="docutils literal notranslate"><span class="pre">LoraBaseOnly</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraBaseOnly.key"><code class="docutils literal notranslate"><span class="pre">LoraBaseOnly.key</span></code></a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraModuleRef"><code class="docutils literal notranslate"><span class="pre">LoraModuleRef</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraModuleRef.layer"><code class="docutils literal notranslate"><span class="pre">LoraModuleRef.layer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraModuleRef.shard_id"><code class="docutils literal notranslate"><span class="pre">LoraModuleRef.shard_id</span></code></a></li>
@@ -790,7 +786,6 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.describe_load_error"><code class="docutils literal notranslate"><span class="pre">describe_load_error()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.lora_enabled"><code class="docutils literal notranslate"><span class="pre">lora_enabled()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.node_capture_key"><code class="docutils literal notranslate"><span class="pre">node_capture_key()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.resolve_adapter_path"><code class="docutils literal notranslate"><span class="pre">resolve_adapter_path()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.served_lora_adapters"><code class="docutils literal notranslate"><span class="pre">served_lora_adapters()</span></code></a></li>
 </ul>
@@ -820,13 +815,10 @@ adapters, or none.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.lora_enabled" title="mstar.engine.resources.lora.config.lora_enabled"><code class="xref py py-obj docutils literal notranslate"><span class="pre">lora_enabled</span></code></a>(model_config)</p></td>
 <td><p>Whether a deployment's YAML turns LoRA on (a <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block), with or without adapters named in it: adapters may also be loaded at runtime.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.node_capture_key" title="mstar.engine.resources.lora.config.node_capture_key"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_capture_key</span></code></a>(key)</p></td>
-<td><p>The node's own <code class="docutils literal notranslate"><span class="pre">cg_key_info</span></code> in a capture key, without its <code class="docutils literal notranslate"><span class="pre">LoraBaseOnly</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.resolve_adapter_path" title="mstar.engine.resources.lora.config.resolve_adapter_path"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_adapter_path</span></code></a>(path)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.resolve_adapter_path" title="mstar.engine.resources.lora.config.resolve_adapter_path"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_adapter_path</span></code></a>(path)</p></td>
 <td><p>The safetensors file an adapter path names: the path itself, or a PEFT directory's <code class="docutils literal notranslate"><span class="pre">adapter_model.safetensors</span></code> (what vLLM's <code class="docutils literal notranslate"><span class="pre">lora_path</span></code> names).</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.served_lora_adapters" title="mstar.engine.resources.lora.config.served_lora_adapters"><code class="xref py py-obj docutils literal notranslate"><span class="pre">served_lora_adapters</span></code></a>(model_config)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.served_lora_adapters" title="mstar.engine.resources.lora.config.served_lora_adapters"><code class="xref py py-obj docutils literal notranslate"><span class="pre">served_lora_adapters</span></code></a>(model_config)</p></td>
 <td><p>The adapter names a deployment's YAML serves; empty when it does not turn LoRA on.</p></td>
 </tr>
 </tbody>
@@ -838,22 +830,19 @@ adapters, or none.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.AdapterInfo" title="mstar.engine.resources.lora.config.AdapterInfo"><code class="xref py py-obj docutils literal notranslate"><span class="pre">AdapterInfo</span></code></a>(rank, unmapped[, misfits])</p></td>
 <td><p>What validation needs to know about an adapter checkpoint, read without its weights.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraBaseOnly" title="mstar.engine.resources.lora.config.LoraBaseOnly"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraBaseOnly</span></code></a>([key])</p></td>
-<td><p>The capture key of a step none of whose rows names an adapter: the node's own <code class="docutils literal notranslate"><span class="pre">cg_key_info</span></code> (<code class="docutils literal notranslate"><span class="pre">key</span></code>), wrapped.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraModuleRef" title="mstar.engine.resources.lora.config.LoraModuleRef"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraModuleRef</span></code></a>(target, layer[, shard_id])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraModuleRef" title="mstar.engine.resources.lora.config.LoraModuleRef"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraModuleRef</span></code></a>(target, layer[, shard_id])</p></td>
 <td><p>Where one checkpoint module's adapter lands: a target, a stack layer, and the stacked-shard id of its slice (None for a single-slice target).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraReqConfig" title="mstar.engine.resources.lora.config.LoraReqConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraReqConfig</span></code></a>([adapter])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraReqConfig" title="mstar.engine.resources.lora.config.LoraReqConfig"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraReqConfig</span></code></a>([adapter])</p></td>
 <td><p>The adapter a request runs under; None runs the base model.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraSpec" title="mstar.engine.resources.lora.config.LoraSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraSpec</span></code></a>(resource_key, nodes, num_layers, ...)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraSpec" title="mstar.engine.resources.lora.config.LoraSpec"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraSpec</span></code></a>(resource_key, nodes, num_layers, ...)</p></td>
 <td><p>Per-request LoRA adapters for the linears named in <code class="docutils literal notranslate"><span class="pre">targets</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraStep" title="mstar.engine.resources.lora.config.LoraStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraStep</span></code></a>([segments])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraStep" title="mstar.engine.resources.lora.config.LoraStep"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraStep</span></code></a>([segments])</p></td>
 <td><p>One step's rows: a segment per request, its <code class="docutils literal notranslate"><span class="pre">span</span></code> the tokens that request puts through the LoRA'd linears this step, in the order they are packed.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraTarget" title="mstar.engine.resources.lora.config.LoraTarget"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraTarget</span></code></a>(in_features, out_slices[, ...])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.config.LoraTarget" title="mstar.engine.resources.lora.config.LoraTarget"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraTarget</span></code></a>(in_features, out_slices[, ...])</p></td>
 <td><p>One family of linears an adapter may touch, e.g. every layer's fused <code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>.</p></td>
 </tr>
 </tbody>
@@ -893,26 +882,6 @@ another size of the model).</p>
 <span class="sig-name descname"><span class="pre">unmapped</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)"><span class="pre">tuple</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="p"><span class="pre">...</span></span><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.lora.config.AdapterInfo.unmapped" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 1</p>
 </dd></dl>
-
-</dd></dl>
-
-<dl class="py class">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.config.LoraBaseOnly">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.config.</span></span><span class="sig-name descname"><span class="pre">LoraBaseOnly</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/config.html#LoraBaseOnly"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.config.LoraBaseOnly" title="Link to this definition">#</a></dt>
-<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
-<p>The capture key of a step none of whose rows names an adapter: the node’s own
-<code class="docutils literal notranslate"><span class="pre">cg_key_info</span></code> (<code class="docutils literal notranslate"><span class="pre">key</span></code>), wrapped. A node serving adapters captures each bucket under
-both keys, and the base-only graph records no LoRA kernel: at decode width the
-launches of a delta that adds zero cost about what the work does.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p>
-</dd>
-</dl>
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.config.LoraBaseOnly.key">
-<span class="sig-name descname"><span class="pre">key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><span class="pre">Any</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.lora.config.LoraBaseOnly.key" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
 
 </dd></dl>
 
@@ -1521,20 +1490,6 @@ reports it with the deployment’s other problems.</p>
 </dd></dl>
 
 <dl class="py function">
-<dt class="sig sig-object py" id="mstar.engine.resources.lora.config.node_capture_key">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.config.</span></span><span class="sig-name descname"><span class="pre">node_capture_key</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/config.html#node_capture_key"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.config.node_capture_key" title="Link to this definition">#</a></dt>
-<dd><p>The node’s own <code class="docutils literal notranslate"><span class="pre">cg_key_info</span></code> in a capture key, without its <code class="docutils literal notranslate"><span class="pre">LoraBaseOnly</span></code>.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>key</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.config.resolve_adapter_path">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.config.</span></span><span class="sig-name descname"><span class="pre">resolve_adapter_path</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/config.html#resolve_adapter_path"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.config.resolve_adapter_path" title="Link to this definition">#</a></dt>
 <dd><p>The safetensors file an adapter path names: the path itself, or a PEFT directory’s
@@ -1618,10 +1573,6 @@ reports it with the deployment’s other problems.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.AdapterInfo.unmapped"><code class="docutils literal notranslate"><span class="pre">AdapterInfo.unmapped</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraBaseOnly"><code class="docutils literal notranslate"><span class="pre">LoraBaseOnly</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraBaseOnly.key"><code class="docutils literal notranslate"><span class="pre">LoraBaseOnly.key</span></code></a></li>
-</ul>
-</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraModuleRef"><code class="docutils literal notranslate"><span class="pre">LoraModuleRef</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraModuleRef.layer"><code class="docutils literal notranslate"><span class="pre">LoraModuleRef.layer</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.LoraModuleRef.shard_id"><code class="docutils literal notranslate"><span class="pre">LoraModuleRef.shard_id</span></code></a></li>
@@ -1686,7 +1637,6 @@ reports it with the deployment’s other problems.</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.describe_load_error"><code class="docutils literal notranslate"><span class="pre">describe_load_error()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.lora_enabled"><code class="docutils literal notranslate"><span class="pre">lora_enabled()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.node_capture_key"><code class="docutils literal notranslate"><span class="pre">node_capture_key()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.resolve_adapter_path"><code class="docutils literal notranslate"><span class="pre">resolve_adapter_path()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.config.served_lora_adapters"><code class="docutils literal notranslate"><span class="pre">served_lora_adapters()</span></code></a></li>
 </ul>

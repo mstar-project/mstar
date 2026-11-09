@@ -9,6 +9,12 @@ mstar.engine.resources.step
 
    
    
+   .. rubric:: Functions
+
+   .. autosummary::
+   
+      lean_subsets
+   
    
 
    

@@ -1027,7 +1027,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># import out of module exec</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.accelerator_graph_config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
         <span class="n">AcceleratorGraphConfig</span><span class="p">,</span>
+        <span class="n">AcceleratorGraphConfigType</span><span class="p">,</span>
         <span class="n">PiecewiseAcceleratorGraphConfig</span><span class="p">,</span>
+        <span class="n">PiecewiseConfigType</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.attn.workspace</span><span class="w"> </span><span class="kn">import</span> <span class="n">WorkspacePool</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.transfer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TransferEngineInfo</span>
@@ -1190,6 +1192,36 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="Resource.can_capture">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.can_capture">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">can_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">True</span></div>
+
+
+    <span class="c1"># this resource's key among the engine's resources, set by `build_resource`</span>
+    <span class="n">resource_key</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="c1"># Whether this resource's kernels can be left out of a step whose rows all allow</span>
+    <span class="c1"># it (``lean_for``). The engine then captures a lean twin of each bucket whose</span>
+    <span class="c1"># step drives the resource and whose kind it accepts (``lean_captures``), keyed</span>
+    <span class="c1"># by ``BucketKey.lean``, and names the resource in ``StepContext.lean`` for a</span>
+    <span class="c1"># step that runs it lean, eager steps included; the resource checks that at plan.</span>
+    <span class="c1"># Each rank makes the choice from its own state, so the resource's lean and</span>
+    <span class="c1"># plain kernels must issue the same collectives.</span>
+    <span class="n">lean_capture</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+
+<div class="viewcode-block" id="Resource.lean_for">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.lean_for">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">lean_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">request_ids</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether every one of ``request_ids`` lets this ``lean_capture`` resource</span>
+<span class="sd">        run lean. Read from state every rank of a lockstep instance sets alike (its</span>
+<span class="sd">        ingests), on the thread that leases the step's graph."""</span>
+        <span class="k">return</span> <span class="kc">False</span></div>
+
+
+<div class="viewcode-block" id="Resource.lean_captures">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.Resource.lean_captures">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">lean_captures</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">config_type</span><span class="p">:</span> <span class="n">AcceleratorGraphConfigType</span> <span class="o">|</span> <span class="n">PiecewiseConfigType</span><span class="p">,</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether a capture of ``config_type`` gets this resource's lean twin."""</span>
         <span class="k">return</span> <span class="kc">True</span></div>
 
 
@@ -1834,7 +1866,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="build_resource">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.build_resource">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">build_resource</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">NodeResourceSpec</span><span class="p">,</span> <span class="n">info</span><span class="p">:</span> <span class="n">EngineResourceInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Resource</span><span class="p">:</span>
-    <span class="k">return</span> <span class="n">spec</span><span class="o">.</span><span class="n">resource_class</span><span class="o">.</span><span class="n">build</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">)</span></div>
+    <span class="n">resource</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">resource_class</span><span class="o">.</span><span class="n">build</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">info</span><span class="p">)</span>
+    <span class="n">resource</span><span class="o">.</span><span class="n">resource_key</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span>
+    <span class="k">return</span> <span class="n">resource</span></div>
 
 </pre></div>
 

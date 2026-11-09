@@ -1084,7 +1084,6 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">CGSlotKey</span><span class="p">,</span> <span class="n">EngineResourceInfo</span><span class="p">,</span> <span class="n">Resource</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.backend</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraBackend</span><span class="p">,</span> <span class="n">make_backend</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.lora.config</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
-    <span class="n">LoraBaseOnly</span><span class="p">,</span>
     <span class="n">LoraReqConfig</span><span class="p">,</span>
     <span class="n">LoraSpec</span><span class="p">,</span>
     <span class="n">LoraStep</span><span class="p">,</span>
@@ -1301,6 +1300,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">prefix_skip_safe</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># a dropped request keeps its adapter and slot, and its rebuild runs under that adapter</span>
     <span class="n">supports_drop</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># a step none of whose rows names an adapter runs no delta (`lean_for`), so each</span>
+    <span class="c1"># bucket, piecewise regions' included, has a twin with no LoRA kernel</span>
+    <span class="n">lean_capture</span> <span class="o">=</span> <span class="kc">True</span>
 
 <div class="viewcode-block" id="LoraAdapterPool.build">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.build">[docs]</a>
@@ -1348,6 +1350,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        chooses batches, and so admits requests (``ask``): False on a lockstep instance's</span>
 <span class="sd">        followers."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">spec</span> <span class="o">=</span> <span class="n">spec</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_device</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">or</span> <span class="n">dtype</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">dtype</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
@@ -2061,20 +2064,24 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="nb">any</span><span class="p">((</span><span class="n">name</span> <span class="o">:=</span> <span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">))</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">empty</span> <span class="k">for</span> <span class="n">rid</span> <span class="ow">in</span> <span class="n">rids</span><span class="p">)</span></div>
 
 
+<div class="viewcode-block" id="LoraAdapterPool.lean_for">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.lean_for">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">lean_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rids</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""A step runs base-only when none of its rows names an adapter with something</span>
+<span class="sd">        for this pool (``runs_adapters``)."""</span>
+        <span class="k">return</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">runs_adapters</span><span class="p">(</span><span class="n">rids</span><span class="p">)</span></div>
+
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_adds_deltas</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">segments</span><span class="p">,</span> <span class="n">ctx</span><span class="p">:</span> <span class="n">StepContext</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Whether this step's deltas run: under a capture lease, unless its bucket is a</span>
-<span class="sd">        base-only one (``LoraBaseOnly``), whose graph records none; eagerly, when a row</span>
-<span class="sd">        names an adapter."""</span>
-        <span class="n">lease</span> <span class="o">=</span> <span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span>
-        <span class="k">if</span> <span class="n">lease</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">lease</span><span class="o">.</span><span class="n">bucket</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">runs_adapters</span><span class="p">(</span><span class="n">seg</span><span class="o">.</span><span class="n">request_id</span> <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">segments</span><span class="p">)</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="o">.</span><span class="n">cg_key_info</span><span class="p">,</span> <span class="n">LoraBaseOnly</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">"""Whether this step's deltas run: unless the step runs this pool lean</span>
+<span class="sd">        (``StepContext.lean``), a capture recording none and an eager step skipping them."""</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">ctx</span><span class="o">.</span><span class="n">lean</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">True</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="n">ctx</span><span class="o">.</span><span class="n">capture</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">runs_adapters</span><span class="p">(</span><span class="n">seg</span><span class="o">.</span><span class="n">request_id</span> <span class="k">for</span> <span class="n">seg</span> <span class="ow">in</span> <span class="n">segments</span><span class="p">):</span>
             <span class="c1"># its rows would lose their deltas silently</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">: leased base-only </span><span class="si">{</span><span class="n">lease</span><span class="o">.</span><span class="n">bucket</span><span class="si">}</span><span class="s2"> "</span>
-                <span class="s2">"for a step whose rows name an adapter"</span>
+                <span class="sa">f</span><span class="s2">"LoRA resource </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2">: a base-only step "</span>
+                <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span><span class="o">.</span><span class="n">bucket</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">ctx</span><span class="o">.</span><span class="n">slot_lease</span><span class="w"> </span><span class="ow">is</span><span class="w"> </span><span class="ow">not</span><span class="w"> </span><span class="kc">None</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">'eager'</span><span class="si">}</span><span class="s2">) has rows that name an adapter"</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="kc">False</span>
 
