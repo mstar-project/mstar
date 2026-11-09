@@ -811,8 +811,9 @@ def redact(out, runner_temp, s1="", s2="", s3="", nodes=""):
     verdict = lt / "results/result.json"
     if verdict.is_file():  # the box wrote this: unreadable counts as no verdict
         try:
-            verdict.write_text(json.dumps(bot.redact_fields(json.loads(verdict.read_text()), exact)))
-        except ValueError:
+            fields = json.loads(verdict.read_text())
+            verdict.write_text(json.dumps(bot.redact_fields(fields if isinstance(fields, dict) else {}, exact)))
+        except (ValueError, RecursionError):
             verdict.write_text("{}")
 
 

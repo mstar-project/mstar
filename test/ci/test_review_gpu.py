@@ -399,7 +399,7 @@ class TestComment(unittest.TestCase):
 
     def test_redacting_the_verdict_keeps_it_json(self):
         for text, verdict in (('{"verdict": "pass", "summary": "\\u00eeyJabcdefghijk.lmnopqrstuv.w"}', "pass"),
-                              ("not json", None)):
+                              ("not json", None), ("[1]", None)):
             with self.subTest(text), tempfile.TemporaryDirectory() as temp:
                 results = Path(temp, "lt/results")
                 results.mkdir(parents=True)
