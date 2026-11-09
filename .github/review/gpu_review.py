@@ -9,7 +9,8 @@ decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config `configure` writes: the team's
 Slurm node with the most GPUs free, else any open Eras listing under the hourly cap. The live
 test's files are in $RUNNER_TEMP/lt; `start` and `wait` exit 3, with `unavailable` set, when no GPUs
-are free or the bot has REVIEW_GPU_MAX_RUNS runs going, after writing lt/unavailable.md.
+are free, the bot has REVIEW_GPU_MAX_RUNS runs going or the box left no results, after writing
+lt/unavailable.md.
 """
 import fnmatch
 import html
@@ -451,7 +452,8 @@ def instance(lt):
 
 def wait(out, runner_temp, start_timeout="30"):
     """Until the box's session finishes; then copy its results back and let the box go. Exits 3, with
-    `unavailable` set, when a Slurm job never started."""
+    `unavailable` set, when a Slurm job never started or the box left no results (Eras refused the Pod, say):
+    the status, which carries the platform's failure code and message, goes in the comment."""
     start_timeout = int(start_timeout)
     lt = Path(runner_temp, "lt")
     key, e = instance(lt)
@@ -464,14 +466,14 @@ def wait(out, runner_temp, start_timeout="30"):
             print(f"status: {err}", flush=True)
             time.sleep(60)
             continue
-        st = st.lower()
+        state = st.lower()
         if e["provider"] == "slurm":
-            if st == "pending" and not started and time.time() - t0 > start_timeout * 60:
+            if state == "pending" and not started and time.time() - t0 > start_timeout * 60:
                 gpu("terminate", key, check=False)
                 unavailable(out, lt, f"No GPUs for the live test: the Slurm job waited {start_timeout} minutes "
                                      "without starting.")
-            started = started or st == "running"
-            if st == "ended":
+            started = started or state == "running"
+            if state == "ended":
                 break
         else:
             started = started or bool(host)
@@ -479,7 +481,7 @@ def wait(out, runner_temp, start_timeout="30"):
                 with gpu_py.ledger_txn() as d:
                     d[key].update(host=host, port=port)
                 e.update(host=host, port=port)
-            if st.startswith("run ") or st in ("ended", "releasing"):
+            if state.startswith("run ") or state in ("ended", "releasing"):
                 break  # the Pod is gone, and its results with it
             if host and gpu("ssh", key, f"test -f {ERAS_OUT}/done", check=False, timeout=120).returncode == 0:
                 break
@@ -491,6 +493,9 @@ def wait(out, runner_temp, start_timeout="30"):
         gpu("ssh", key, f"touch {ERAS_OUT}/collected", check=False, timeout=120)
     gpu("terminate", key, check=False)
     print(f"collected: {sorted(p.name for p in results.iterdir())}")
+    if not any((results / f).is_file() for f in ("result.json", "report.md", "refresh.log")):
+        unavailable(out, lt, f"The GPU box ended with no results: {render_summary.inert(st)}.\n"
+                             "Comment `/review` to retry.")
 
 
 def cleanup(out, pr, tag):

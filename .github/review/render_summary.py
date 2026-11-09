@@ -356,7 +356,7 @@ def render(review, pages, head, mode, stacked, salvaged=False):
     parts = ["### Automated review", status(review, pages, head, mode, stacked)]
     raw = judged(review, stacked)  # the saved state and the checklist; what's shown goes through `inert`
     review = inert(raw)
-    if review["since_last"]:
+    if review["since_last"].strip(" \t\r\n\"'"):  # a model sometimes returns a pair of quotes for "nothing"
         parts.append(review["since_last"])
     prior = review.get("prior_findings", [])
     outside = {f["location"] for f in review["outside_diff"]}
