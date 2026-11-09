@@ -28,6 +28,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
+from mstar.engine.resources.attn.ragged.kernels import RAGGED_ATTENTION, cudnn_rows, kernel_rows
 from mstar.engine.resources.attn.ragged.wrappers import _RaggedPrefillBase
 from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
@@ -77,14 +78,10 @@ def _build_ragged(
             "(the engine has no KV dtype to fall back on)."
         )
     if cudnn:
-        from mstar.engine.resources.attn.ragged.kernels import cudnn_rows
-
         kwargs["kernel_rows"] = cudnn_rows(
             spec.resource_key, config.num_qo_heads, config.num_kv_heads, config.head_dim, dtype, info.device,
         )
     elif kernel_table:
-        from mstar.engine.resources.attn.ragged.kernels import kernel_rows
-
         rows = kernel_rows(config.num_qo_heads, config.num_kv_heads, config.head_dim, dtype, info.device)
         if rows is not None:
             kwargs["kernel_rows"] = rows
@@ -583,9 +580,7 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     def _row_for(self, spans: list[int], layout_bound_ok: bool) -> Choice:
         """The row a layout of ``spans`` runs. ``layout_bound_ok``: its wrapper may
         bake the layout in (eager, or a captured bucket whose step fixes it)."""
-        from mstar.engine.resources.attn.ragged.kernels import choice_for
-
-        choice = choice_for(self._kernel_rows, max(spans, default=0))
+        choice = RAGGED_ATTENTION.row_for(self._kernel_rows, max(spans, default=0))
         if WRAPPER_FACTORIES[choice.impl].layout_bound and not (layout_bound_ok and uniform_lengths(spans)):
             return DEFAULT_ROW
         return choice

@@ -102,7 +102,7 @@ def test_sm_103_picks_cudnn_for_the_dit_sizes(gpu, heads, head_dim, seq_len):
     gpu(B300)
     manager = build(spec(heads, head_dim))
     assert type(manager) is FlashInferRaggedManager
-    assert kernels_module.choice_for(manager._kernel_rows, seq_len) == Choice("cudnn")
+    assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice("cudnn")
 
 
 @pytest.mark.parametrize("key", [H100, DeviceKey("NVIDIA B200", "sm_100")], ids=["sm_90", "sm_100"])

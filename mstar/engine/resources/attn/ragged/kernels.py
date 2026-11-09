@@ -104,7 +104,3 @@ def cudnn_rows(
                          f"{RAGGED_ATTENTION.format_shape(shape)} {str(dtype).removeprefix('torch.')} here: {why}")
     return ((None, Choice("cudnn")),)
 
-
-def choice_for(rows: Rows, seq_len: int) -> Choice:
-    """The row a layout whose longest query segment is ``seq_len`` tokens runs."""
-    return RAGGED_ATTENTION.row_for(rows, seq_len)
