@@ -1005,10 +1005,10 @@ environment, and so does a variable that expands to nothing (<code class="docuti
 <p>Under NVIDIA Dynamo, Dynamo’s own frontend serves HTTP and does not forward
 <code class="docutils literal notranslate"><span class="pre">Authorization</span></code> to backends, so the M* worker cannot check a key there: authenticate at
 Dynamo’s frontend or a gateway in front of it.</p>
-<p>The Dynamo worker (<code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.integrations.dynamo</span></code>) does not serve a model that
-takes live client input (<code class="docutils literal notranslate"><span class="pre">nemotron_duplex</span></code>): no Dynamo surface carries a live call’s
-appends, so it exits at startup saying so, before any GPU process starts. Serve such a
-model with <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> and call it over <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> or <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>.</p>
+<p>No Dynamo surface carries a live call’s appends: the Dynamo worker
+(<code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">mstar.integrations.dynamo</span></code>) serves one-shot calls, whose input ends with the
+request. For live input, serve the model with <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> and call it over
+<code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> or <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>.</p>
 </section>
 <section id="config-files">
 <h2>Config files<a class="headerlink" href="#config-files" title="Link to this heading">#</a></h2>

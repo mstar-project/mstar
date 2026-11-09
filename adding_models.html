@@ -3998,12 +3998,15 @@ keyed by client edge name. <code class="docutils literal notranslate"><span clas
 file names (<code class="docutils literal notranslate"><span class="pre">None</span></code> where the client named none, so the model decides);
 <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, the append’s own; and <code class="docutils literal notranslate"><span class="pre">request_kwargs</span></code>, the opening message’s.
 Raise <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for an append the model doesn’t take (the client gets a 400). An
-append of text alone that yields no item is refused rather than dropped, but the data
-worker can’t tell which items text sent with files yielded: refuse such text yourself
-if the model takes none. Keep it stateless; the
+append of text alone, or of <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> alone that ends no stream, that yields no
+item is refused rather than dropped, but the data worker can’t tell which items text
+sent with files yielded: refuse such text yourself if the model takes none. Keep it stateless; the
 consuming node keeps its own state, in its resources or <code class="docutils literal notranslate"><span class="pre">request_state</span></code>.</p></li>
 <li><p>Tensors <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns under a client edge’s name are the stream’s first
-chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.</p></li>
+chunk, so a one-shot request (one uploaded file, then nothing) is a stream of one chunk.
+<code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> gets <code class="docutils literal notranslate"><span class="pre">open_streams</span></code>, the client streams the opening leaves open; a
+model whose request settings can’t take appends on one (Qwen3-TTS text in a layout that
+streams none) raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> there, so the live opening gets a 400.</p></li>
 <li><p>A client stream may declare limits, <code class="docutils literal notranslate"><span class="pre">Connection(...,</span> <span class="pre">limits=ClientStreamLimits(...))</span></code>
 (<code class="docutils literal notranslate"><span class="pre">mstar.streaming.topology</span></code>), which the client-stream layer enforces before any of
 the model’s code runs: <code class="docutils literal notranslate"><span class="pre">max_items</span></code>, what the stream may carry over a call’s life,
@@ -4052,17 +4055,20 @@ way, such as Moshi-style PAD / EPAD runs, can’t declare them yet, and serves
 <li><p>A stream ends when the client ends it: <code class="docutils literal notranslate"><span class="pre">end_input:</span> <span class="pre">true</span></code> ends all of the call’s
 streams, a list of names only those. The consumer gets <code class="docutils literal notranslate"><span class="pre">producer_done</span></code> for that edge
 and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
-Over <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> the client appends and ends input explicitly (see
-<a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>), and a <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> conversation keeps it open for the call’s life;
-every other route ends the input as soon as the request is submitted. <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>
-and <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> are on the Python frontend only, not <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, and the
-Dynamo worker refuses a model with client streams.</p></li>
+Over <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> a client that opens with <code class="docutils literal notranslate"><span class="pre">end_input:</span> <span class="pre">false</span></code> appends and ends
+input explicitly (see <a class="reference internal" href="clients.html"><span class="doc">Using a Server</span></a>), and a <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> conversation keeps it open
+for the call’s life; every other request ends the input as soon as it is submitted. <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>
+and <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> are on the Python frontend only, not <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>.</p></li>
 <li><p>The API server’s data worker is the stream’s producer. The conductor tells it the
 consuming node and its ranks once per call, when it dispatches the request, and the data
 worker sends each append’s items to every one of those ranks itself, and then the
 stream’s end with how many items it carried. Every rank gets each item whole, so a client
 stream can’t take a <code class="docutils literal notranslate"><span class="pre">sharding_config.shard_dim</span></code> entry (startup refuses one). Once the
 consuming partition ends, later appends for its streams are answered as late.</p></li>
+<li><p>A consumer with nothing to do on the step that ends its last stream
+(<code class="docutils literal notranslate"><span class="pre">is_final_stream_chunk</span></code>; empty when the last item was taken before the end arrived)
+returns None from <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>. The row still completes its node, so its loop ends
+and its partition reports done. None on any other chunk drops the row from the step. Every rank sees the same chunk, so all decline alike.</p></li>
 </ul>
 </section>
 </section>

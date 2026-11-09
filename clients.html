@@ -886,30 +886,33 @@ the predicted rows after the state, in the robot’s values. <code class="docuti
 is a complete openpi-style client that builds the observation image and prompt the way
 NVIDIA’s RoboLab server does for the DROID policies, runs this loop at a fixed observation
 rate and reports chunks/s, actions/s and latency percentiles.</p>
-<p><strong>Live input.</strong> A model that listens while it runs (a full-duplex speech model) keeps a
-request’s input open after the opening message, so the opening message may carry no media
-at all. An append feeds the running request more input, in order, while its output keeps
-streaming back:</p>
+<p><strong>Live input.</strong> A model that listens while it runs (a full-duplex speech model, or a TTS
+model fed text as it is written) can keep a request’s input open after the opening
+message: an opening with <code class="docutils literal notranslate"><span class="pre">&quot;end_input&quot;:</span> <span class="pre">false</span></code> opens a live call, and may then carry no
+media at all. An append feeds the running request more input, in order, while its output
+keeps streaming back:</p>
 <div class="highlight-text notranslate"><div class="highlight"><pre><span></span>{"request_id": ..., "append": {"text": ..., "files": [{"name": ..., "data": ..., "stream": ...}],
                                "model_kwargs": {...}}}
 </pre></div>
 </div>
-<p>Every field of the record is optional, but an append needs text, files or <code class="docutils literal notranslate"><span class="pre">end_input</span></code>.
+<p>Every field of the record is optional, but an append needs text, files, <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> or
+<code class="docutils literal notranslate"><span class="pre">end_input</span></code>.
 <code class="docutils literal notranslate"><span class="pre">stream</span></code> names the client stream a file is for (the model decides when it is absent; a
 name the model doesn’t have is rejected), and <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> are this append’s own: they
 reach only the model’s <code class="docutils literal notranslate"><span class="pre">process_stream_chunk</span></code> (a model whose streams all declare their
 audio has none and ignores them), so they mean what that model reads from them, and the opening message’s still hold for the request (its sampling settings, say).
 <code class="docutils literal notranslate"><span class="pre">&quot;append&quot;:</span> <span class="pre">[files]</span></code> is short for <code class="docutils literal notranslate"><span class="pre">&quot;append&quot;:</span> <span class="pre">{&quot;files&quot;:</span> <span class="pre">[files]}</span></code>. What a model takes
-in an append is its own. An append of text alone that the model turns into no stream item
-is rejected; text sent with files reaches the model, and if it ignores the text, the text
-is dropped without an error. <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;end_input&quot;:</span> <span class="pre">true}</span></code>
-ends the input, alone or on an append (or on the opening message, for a one-shot
-request). The request then finishes as usual. Such a model treats every request over the
-socket as live, so a one-shot request to it carries <code class="docutils literal notranslate"><span class="pre">end_input:</span> <span class="pre">true</span></code> on its opening
-message: without it, the request waits for appends until it times out (or, with no
-<code class="docutils literal notranslate"><span class="pre">request_id</span></code>, is refused). A model may take several client streams
+in an append is its own. An append of text alone, or of <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> alone (a game
+controller’s actions, say) that ends no stream, that the model turns into no stream item is
+rejected; text sent with files reaches the model, and if it ignores the text, the text is
+dropped without an error. An append’s <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> count toward the call’s
+<code class="docutils literal notranslate"><span class="pre">max_call_input_mb</span></code>, as JSON. <code class="docutils literal notranslate"><span class="pre">{&quot;request_id&quot;,</span> <span class="pre">&quot;end_input&quot;:</span> <span class="pre">true}</span></code>
+ends the input, alone or on an append. The request then finishes as usual. An opening
+without <code class="docutils literal notranslate"><span class="pre">end_input</span></code> is one-shot, as a request over <code class="docutils literal notranslate"><span class="pre">/generate</span></code> is: its input ends with
+the opening message. A model may take several client streams
 (audio and video, say); <code class="docutils literal notranslate"><span class="pre">end_input</span></code> may then name the ones it ends, as a list
-(<code class="docutils literal notranslate"><span class="pre">&quot;end_input&quot;:</span> <span class="pre">[&quot;video_in&quot;]</span></code>), and the call’s input has ended once every stream has.
+(<code class="docutils literal notranslate"><span class="pre">&quot;end_input&quot;:</span> <span class="pre">[&quot;video_in&quot;]</span></code>, on the opening too, which keeps the others open), and
+the call’s input has ended once every stream has.
 An append that names a stream already ended, as a file’s <code class="docutils literal notranslate"><span class="pre">stream</span></code> or in
 <code class="docutils literal notranslate"><span class="pre">end_input</span></code>, is answered as late, as one after <code class="docutils literal notranslate"><span class="pre">end_input:</span> <span class="pre">true</span></code> is (below). So is
 one whose files name no stream and that the model routes to a stream already ended:
@@ -942,7 +945,8 @@ append, or goes with the stream’s end, so appends of any size keep the call on
 Nemotron runs as one CUDA graph (see <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>). The part of a frame that waits costs
 latency: with one call, 20 ms appends put a frame’s step about 60 ms later and 100 ms
 appends about 100 ms later (H200), while 80 ms appends, whole frames, cost nothing.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span><span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"call"</span><span class="p">,</span> <span class="s2">"output_modalities"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">]}))</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span><span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"call"</span><span class="p">,</span> <span class="s2">"output_modalities"</span><span class="p">:</span> <span class="p">[</span><span class="s2">"text"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">],</span>
+                       <span class="s2">"end_input"</span><span class="p">:</span> <span class="kc">False</span><span class="p">}))</span>
 <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">microphone_chunks</span><span class="p">():</span>  <span class="c1"># e.g. 80 ms WAV files</span>
     <span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">msgpack</span><span class="o">.</span><span class="n">packb</span><span class="p">({</span><span class="s2">"request_id"</span><span class="p">:</span> <span class="s2">"call"</span><span class="p">,</span>
                            <span class="s2">"append"</span><span class="p">:</span> <span class="p">[{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"chunk.wav"</span><span class="p">,</span> <span class="s2">"data"</span><span class="p">:</span> <span class="n">chunk</span><span class="p">}]}))</span>

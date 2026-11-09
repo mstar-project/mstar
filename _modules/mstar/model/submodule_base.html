@@ -2150,8 +2150,14 @@ window.runMermaid = runMermaid;</script>
         <span class="n">fwd_info</span><span class="p">:</span> <span class="n">CurrentForwardPassInfo</span><span class="p">,</span>
         <span class="n">inputs</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span>
         <span class="o">**</span><span class="n">kwargs</span>
-    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span><span class="p">:</span>
-        <span class="k">pass</span></div>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">NodeInputs</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""One request's inputs for this step, built on the host.</span>
+
+<span class="sd">        None declines the row. On the step that takes its streams' final chunk</span>
+<span class="sd">        (``is_final_stream_chunk``) the row still completes its node: its loop</span>
+<span class="sd">        ends and its partition reports done. On any other step it is dropped.</span>
+<span class="sd">        Every rank sees the same chunk, so all of them decline alike.</span>
+<span class="sd">        """</span></div>
 
 
 <div class="viewcode-block" id="NodeSubmodule.split_inputs">
