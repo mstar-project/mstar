@@ -77,7 +77,7 @@ from mstar.communication.rust_communicator import (
 )
 from mstar.graph.runtime.utils import CHECKOUT_RUST, is_mstar_rust_crate, require_rust_extension
 from mstar.model.multimodal import PromptPart
-from mstar.utils.client_errors import client_error_text
+from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.threads import ThreadPool
 
 logger = logging.getLogger(__name__)
@@ -203,7 +203,10 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     if api_key:
         env[API_KEY_ENV] = api_key
     if timeout_s is not None:
-        env[REQUEST_TIMEOUT_ENV] = repr(float(timeout_s))
+        # inf and nan never time out on the Python frontend, so they get a deadline past
+        # any request (~31 years); a negative one times every request out there, as 0 does
+        timeout_s = float(timeout_s)
+        env[REQUEST_TIMEOUT_ENV] = repr(max(timeout_s, 0.0) if timeout_s < 1e9 else 1e9)
     if sample_rate is not None:
         env[SAMPLE_RATE_ENV] = str(int(sample_rate))
     env.pop(LIBSNDFILE_ENV, None)
@@ -281,11 +284,17 @@ class RustFrontendBridge:
                 request_id=rid,
             )
         except (ValueError, TypeError) as e:
-            # a refused input: an in-band error chunk carries its 400 to the client
-            logger.info("submit %s refused: %s", rid, e)
+            # a refused input: an in-band error chunk carries its 400 to the client.
+            # A TypeError may be a bug here instead (the two sides' PromptPart
+            # drifting), so it keeps its traceback, as on the router.
+            if isinstance(e, ValueError):
+                logger.info("submit %s refused: %s", rid, e)
+                text = scrub_paths(str(e))
+            else:
+                text, _ = client_error_text(e, f"submit {rid} failed", log=logger, type_name=False)
             self._send({
                 "t": "chunk", "rid": rid, "sub": sub, "modality": "error",
-                "data": str(e).encode("utf-8"), "metadata": {"status": 400},
+                "data": text.encode("utf-8"), "metadata": {"status": 400},
             })
             return
         except Exception as e:  # noqa: BLE001 — one bad request must not kill the loop

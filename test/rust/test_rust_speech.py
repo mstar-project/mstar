@@ -486,7 +486,7 @@ def test_split_sentences_matches_python_on_random_long_inputs(tmp_path, monkeypa
         for text in texts:
             stub.submitted.clear()
             status, data = _post(port, "/v1/audio/speech", {"input": text, "sentence_chunking": True})
-            want = split_sentences(text, max_chars=400)
+            want = split_sentences(text, max_chars=ADAPTER_REGISTRY["orpheus"].speech_chunk_max_chars)
             if len(want) > 32:
                 assert (status, json.loads(data)["error"]["message"]) == (
                     400, f"input splits into {len(want)} sentence chunks; at most 32 are allowed")

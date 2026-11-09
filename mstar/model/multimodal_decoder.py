@@ -374,6 +374,10 @@ class MultimodalDecoderModel(Model):
             enable_min_p=bool(self.sampling_defaults.get("min_p")),
         )
 
+    def request_kwargs(self) -> frozenset[str]:
+        # enable_thinking: what each subclass's chat template reads
+        return frozenset(SAMPLING_KEYS) | {"enable_thinking"}
+
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:

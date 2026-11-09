@@ -176,6 +176,25 @@ pub(super) fn text_chat(
     })
 }
 
+/// A chat whose `chat_template_kwargs` keys are read as flat ones, as
+/// `_flatten_template_kwargs` reads them (Qwen3.5, Cosmos3-Edge): how vLLM-style
+/// clients send template variables. A flat key wins, except one the refusal
+/// dropped as off. Read before the attachments are saved, since a malformed
+/// value refuses the request.
+pub(super) fn template_kwargs_chat(req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+    let mut req = req.clone();
+    let template_kwargs = match req.extra.remove("chat_template_kwargs") {
+        Some(Value::Object(m)) => m,
+        Some(v) if truthy(&v) => return Err("chat_template_kwargs must be an object".to_string()),
+        _ => Map::new(),
+    };
+    let mut args = text_chat(&req, upload_dir, allow_remote)?;
+    for (key, value) in template_kwargs {
+        set_default(&mut args.model_kwargs, &key, value);
+    }
+    Ok(args)
+}
+
 /// `TextChatAdapter.chat_to_request`: text-only LLMs, which refuse what they
 /// cannot serve rather than dropping it. Remote media is never fetched.
 pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> Result<SubmitArgs, String> {
@@ -201,27 +220,8 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
             return refuse(format!("{name} must be at least 1, got {v}"));
         }
     }
-    if let Some(n) = req.n.filter(|n| *n != 1) {
-        return refuse(format!("n={n}: this model returns one choice"));
-    }
-    if req.stop.as_ref().is_some_and(truthy) {
-        return refuse(
-            "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
-        );
-    }
+    // n, stop and the unserved fields were refused, or dropped, by refuse_unserved_chat
     let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-    for name in ["logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"] {
-        if let Some(v) = mk.get(name).filter(|v| truthy(v)) {
-            return refuse(format!("{name} is not supported; got {}", py_value_repr(v)));
-        }
-        mk.remove(name);
-    }
-    if mk.remove("best_of").is_some_and(|v| !(v.is_null() || v == 1)) {
-        return refuse("best_of is not supported; this model returns one choice".to_string());
-    }
-    if mk.remove("response_format").is_some_and(|v| !(v.is_null() || v == serde_json::json!({"type": "text"}))) {
-        return refuse("response_format needs constrained decoding; only {'type': 'text'} is served".to_string());
-    }
     apply_sampling(
         &mut mk,
         Sampling {
@@ -245,21 +245,59 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
     })
 }
 
-/// Refuse a chat that asks the model to call a tool. The rules are
-/// `_refuse_tool_calls` in `api_server/openai/adapters.py`.
-pub(super) fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), String> {
-    let listed = |field: &str| match req.extra.get(field) {
+/// Fields no chat adapter serves, refused when on (`best_of` and
+/// `response_format` have their own off values).
+const UNSERVED_CHAT_FIELDS: [&str; 6] =
+    ["logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"];
+
+/// OpenAI request bookkeeping that changes no reply, dropped from a chat's
+/// passthrough: `CHAT_ENVELOPE_KEYS` in `api_server/openai/adapters.py`.
+const CHAT_ENVELOPE_FIELDS: [&str; 6] =
+    ["stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier"];
+
+/// Refuse a chat that asks for more than one plain reply: more choices, stop
+/// sequences, log probs, sampling penalties, a response format, or a tool
+/// call. The rules are `_refuse_unserved_chat` in
+/// `api_server/openai/adapters.py`. `mk` is the request's passthrough; an off
+/// value of one of these fields (`logprobs: false`, `tools: []`) is dropped
+/// from it, before any `chat_template_kwargs` key is merged in.
+pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMap<String, Value>) -> Result<(), String> {
+    if let Some(n) = req.n.filter(|&n| n != 1) {
+        return Err(format!("n={n}: this model returns one choice"));
+    }
+    if req.stop.as_ref().is_some_and(truthy) {
+        return Err(
+            "stop sequences are not supported; the reply ends at a stop token or max_tokens".to_string(),
+        );
+    }
+    if let Some(name) = UNSERVED_CHAT_FIELDS.iter().find(|&&f| mk.get(f).is_some_and(truthy)) {
+        return Err(format!("{name} is not supported"));
+    }
+    // Python's `not in (None, 1)`, where 1.0 and True equal 1
+    if let Some(v) = mk.get("best_of") {
+        if !(v.is_null() || v.as_f64() == Some(1.0) || *v == Value::Bool(true)) {
+            return Err("best_of is not supported; this model returns one choice".to_string());
+        }
+    }
+    if let Some(v) = mk.get("response_format") {
+        if !(v.is_null() || *v == serde_json::json!({"type": "text"})) {
+            return Err(
+                "response_format needs constrained decoding; only {'type': 'text'} is served".to_string(),
+            );
+        }
+    }
+    let listed = |field: &str| match mk.get(field) {
         None | Some(Value::Null) => false,
         Some(Value::Array(t)) => !t.is_empty(),
         Some(_) => true,
     };
-    let says_none = |field: &str| req.extra.get(field).and_then(Value::as_str) == Some("none");
-    let choice = match req.extra.get("tool_choice") {
+    let says_none = |field: &str| mk.get(field).and_then(Value::as_str) == Some("none");
+    let choice = match mk.get("tool_choice") {
         Some(Value::String(c)) => c == "required",
         Some(Value::Object(_)) => true,
         _ => false,
     };
-    let function_call = match req.extra.get("function_call") {
+    let function_call = match mk.get("function_call") {
         None | Some(Value::Null) => false,
         Some(Value::String(c)) => c != "none" && c != "auto",
         Some(_) => true,
@@ -270,6 +308,10 @@ pub(super) fn refuse_tool_calls(req: &ChatCompletionRequest) -> Result<(), Strin
         || function_call
     {
         return Err("tool calling is not supported for this model".to_string());
+    }
+    let off = ["best_of", "response_format", "tools", "tool_choice", "functions", "function_call"];
+    for name in UNSERVED_CHAT_FIELDS.iter().chain(&off).chain(&CHAT_ENVELOPE_FIELDS) {
+        mk.remove(*name);
     }
     Ok(())
 }
