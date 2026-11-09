@@ -789,12 +789,12 @@ def publish(out, pr, head_sha, tag, runner_temp, media_repo, media_token, owner)
                    media_url=f"https://{owner.lower()}.github.io/{media_repo}/pr-{pr}/{tag}")
 
 
-def redact(out, runner_temp, s1="", s2="", s3=""):
+def redact(out, runner_temp, s2="", s3=""):
     """What the box and the providers wrote, redacted in place before anything reads it, so the comment,
     the kept report and the artifact all get the redacted copy: the exact values of the secrets this job
-    holds (S1..S3), then bot.redact's credential patterns."""
+    holds (S2, S3), then bot.redact's credential patterns, which also strip the box's own Anthropic key."""
     lt = Path(runner_temp, "lt")
-    exact = (s1, s2, s3)
+    exact = (s2, s3)
     for f in (lt / "results/report.md", lt / "unavailable.md"):
         if f.is_file():
             f.write_text(bot.redact(f.read_text(), exact=exact))

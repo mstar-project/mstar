@@ -602,7 +602,6 @@ jobs:
         id: redact
         continue-on-error: true
         env:
-          S1: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
         run: python3 .github/review/gpu_review.py redact

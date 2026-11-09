@@ -36,10 +36,6 @@ finish() {
   await_collection
   exit 0
 }
-# Kubernetes stops the Pod with a TERM (its deadline, an eviction): say so, rather than leaving no
-# result at all. `wait`, below, lets the trap run at once instead of after the session has exited.
-trap 'kill "${claude_pid:-}" 2> /dev/null; finish "stopped before the session finished"' TERM
-
 # Trusted: main's skills, AGENTS.md and scripts, at the commit the workflow read its rules from.
 clone_main "$MAIN_SHA"
 curl -fsSL https://claude.ai/install.sh | bash -s "$(field claude)" > "$OUT/install.log" 2>&1 \
@@ -49,7 +45,5 @@ cd "$W" || finish "no work directory"
 "$HOME/.local/bin/claude" -p "$(cat "$IN/brief.md")" \
   --model "$(field model)" --effort high --max-turns "$(field turns)" --output-format json \
   --allowedTools "Bash,Read,Write,Edit,Glob,Grep" --disallowedTools "Skill,WebSearch" \
-  > "$OUT/claude.json" 2> "$OUT/claude.err" &
-claude_pid=$!
-wait "$claude_pid"
+  > "$OUT/claude.json" 2> "$OUT/claude.err"
 finish "the session ended without a result (exit $?)"

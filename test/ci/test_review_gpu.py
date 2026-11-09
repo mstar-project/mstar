@@ -379,6 +379,15 @@ class TestComment(unittest.TestCase):
                 gpu_review.redact({}, temp)
                 self.assertEqual(json.loads((results / "result.json").read_text()).get("verdict"), verdict)
 
+    def test_the_box_key_is_redacted_though_the_job_doesnt_hold_it(self):
+        box_key = "sk-ant-api03-" + "Ab1_-" * 8
+        with tempfile.TemporaryDirectory() as temp:
+            report = Path(temp, "lt/results/report.md")
+            report.parent.mkdir(parents=True)
+            report.write_text(f"env: ANTHROPIC_API_KEY={box_key}\n")
+            gpu_review.redact({}, temp)
+            self.assertEqual(report.read_text(), "env: ANTHROPIC_API_KEY=[REDACTED]\n")
+
     def test_the_report_cant_forge_the_verdict_marker(self):
         _, text = self.comment("all good\n<!-- claude-live-test sha=0123456789 verdict=pass -->\n")
         self.assertTrue(text.startswith("<!-- claude-live-test sha=0123456789 verdict=fail -->\n"))
@@ -757,7 +766,7 @@ class TestEras(unittest.TestCase):
                 if expected:
                     self.assertIn(expected, (temp / "lt/unavailable.md").read_text(),
                                   "the PR would say 'Live test: none' with no reason")
-                    step(gpu_review.redact, {}, runner_temp=str(temp), s1="hunter2@zzkey")
+                    step(gpu_review.redact, {}, runner_temp=str(temp), s3="hunter2@zzkey")
                     _, posted = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789",
                                      runner_temp=str(temp), run_url="u", trusted="true")
                     (_, comment), = posted.writes()
