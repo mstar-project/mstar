@@ -96,7 +96,8 @@ def _captured_engine(monkeypatch, root):
         "architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5",
         "vision_start_token_id": 90, "vision_end_token_id": 91, "text_config": _TEXT,
     }))
-    model = qwen3_5_model.Qwen3_5DenseModel(model_path_hf=str(root), prefill_token_buckets=[64, 256])
+    monkeypatch.setattr(LLMSubmodule, "PREFILL_TOKEN_BUCKETS", [64, 256])
+    model = qwen3_5_model.Qwen3_5DenseModel(model_path_hf=str(root))
 
     lm = model._build(lambda: Qwen3_5ForCausalLM(model.config, None), torch.float32, "cpu")
     gen = torch.Generator().manual_seed(0)
@@ -109,9 +110,7 @@ def _captured_engine(monkeypatch, root):
             if name.endswith(("A_log", "dt_bias")):
                 p.mul_(0.3)
     lm = lm.eval().to(device="cuda", dtype=torch.bfloat16)
-    sub = LLMSubmodule(
-        lm, model.config, model.vision_config, model.encoders, prefill_token_buckets=model.prefill_token_buckets,
-    )
+    sub = LLMSubmodule(lm, model.config, model.vision_config, model.encoders)
 
     specs = model.get_node_resources()
     for spec in specs:

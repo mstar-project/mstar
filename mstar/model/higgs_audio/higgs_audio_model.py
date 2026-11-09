@@ -164,6 +164,9 @@ class HiggsAudioModel(MultimodalDecoderModel):
             None if prompt_parts is None else [p for p in prompt_parts if p.modality in keep], **kwargs,
         )
 
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"temperature", "top_p", "ignore_eos", "enable_thinking"})
+
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:

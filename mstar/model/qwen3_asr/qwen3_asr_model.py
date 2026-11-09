@@ -169,6 +169,10 @@ class Qwen3ASRModel(MultimodalDecoderModel):
             ),
         ]
 
+    def request_kwargs(self) -> frozenset[str]:
+        # the scaffold's sampler knobs are not this model's: it reads these alone
+        return frozenset({"temperature", "top_p", "ignore_eos", "language", "initial_prompt", "assistant_prefix"})
+
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:

@@ -711,3 +711,13 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     # without slot masters (or MSTAR_DEVICE_LOOPBACK=0) the tensor path stays
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset()
+
+
+def test_the_transcription_route_sees_the_keys_qwen3_asr_reads():
+    """The long-form route carries earlier windows' text only to a model that reads
+    ``initial_prompt``, and logs any key a model doesn't declare as ignored."""
+    from mstar.api_server.openai.serving_transcriptions import _reads
+
+    api = SimpleNamespace(model=_make_model())
+    assert all(_reads(api, key) for key in ("initial_prompt", "language", "assistant_prefix"))
+    assert not _reads(api, "top_k")
