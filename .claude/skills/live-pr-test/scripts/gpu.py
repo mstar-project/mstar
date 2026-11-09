@@ -550,6 +550,12 @@ def provider_of(cfg: dict, record: dict) -> Provider:
     return PROVIDERS[record["provider"]](cfg, record.get("region"))
 
 
+def known(e: dict) -> bool:
+    """Whether a ledger entry's provider is one gpu.py has. One it no longer has (a removed provider's
+    entry) has nothing gpu.py can reach or release, so it counts toward no cap and `terminate` drops it."""
+    return e["provider"] in PROVIDERS
+
+
 def job_name(pr: int, tag: str) -> str:
     return f"{JOB_PREFIX}{pr}-{tag}"
 
@@ -624,10 +630,13 @@ def committed_usd(e: dict) -> float:
     return e["usd_per_hour"] * (e["deadline"] - e["launched_at"]) / 3600
 
 
-def entry(key: str) -> dict:
+def entry(key: str, unknown_provider_ok: bool = False) -> dict:
     d = ledger()
     if key not in d:
         die(f"unknown instance {key!r}; known: {', '.join(d) or 'none'}")
+    if not (unknown_provider_ok or known(d[key])):
+        die(f"{key} is a {d[key]['provider']!r} instance, a provider gpu.py doesn't have, so there is nothing to "
+            f"reach, extend or release; `gpu.py terminate {key}` drops it from the ledger")
     return d[key]
 
 
@@ -678,18 +687,21 @@ def cmd_launch(args, cfg):
     pending, lost = f"pending:{name}", None
     with contextlib.nullcontext({}) if args.dry_run else ledger_txn() as d:
         if not args.dry_run:
-            if len(d) >= max_instances and not args.allow_over_budget:
-                die(f"{len(d)} instance(s) already up ({', '.join(d)}); budget.max_concurrent_instances is "
+            live = {k: e for k, e in d.items() if known(e)}
+            if len(live) >= max_instances and not args.allow_over_budget:
+                die(f"{len(live)} instance(s) already up ({', '.join(live)}); budget.max_concurrent_instances is "
                     f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
             if max_running is not None and not args.allow_over_budget:
                 try:
                     up = running(cfg)
                 except ApiError as err:
-                    die(f"can't count this tool's Eras instances for budget.max_running: {err}")
+                    if isinstance(p, Eras):
+                        die(f"can't count this tool's Eras instances for budget.max_running: {err}")
+                    up = []  # an Eras outage doesn't stop a launch elsewhere
                 if len(up) >= max_running:
                     die(f"{len(up)} of this tool's instances are up, from every session; budget.max_running is "
                         f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget", code=4)
-            check_total(cfg, sum(committed_usd(e) for e in d.values()) + o["usd_per_hour"] * hours,
+            check_total(cfg, sum(committed_usd(e) for e in live.values()) + o["usd_per_hour"] * hours,
                         args.allow_over_budget)
         body, create = p.plan(o, name, pubkey, hours, args)
         if args.dry_run:
@@ -876,6 +888,8 @@ def eras_create(body: dict) -> str:
 
 def status(e: dict, cfg: dict) -> tuple[str, str | None, int]:
     """(status, host, ssh port)."""
+    if not known(e):
+        return f"{e['provider']!r} is not a provider gpu.py has; nothing to release, terminate drops it", None, 0
     if not e["instance_id"]:
         return f"create's answer lost; terminate it to end {e['name']}", None, 0
     return provider_of(cfg, e).status(e)
@@ -948,6 +962,11 @@ def cmd_copy(args, cfg):
 # ---------------------------------------------------------------- list / extend / terminate
 
 def terminate(key: str, e: dict) -> None:
+    if not known(e):
+        with ledger_txn() as d:
+            d.pop(key, None)
+        print(f"dropped {key} from the ledger: gpu.py has no {e['provider']!r} provider, so nothing was released")
+        return
     p = provider_of({}, e)  # releasing needs only the API key
     for iid in p.release_ids(e):
         try:
@@ -972,7 +991,7 @@ def eras_items(path: str, page_size: int) -> list[dict]:
 
 
 def cmd_terminate(args, cfg):
-    terminate(args.instance, entry(args.instance))
+    terminate(args.instance, entry(args.instance, unknown_provider_ok=True))
 
 
 def cmd_extend(args, cfg):
@@ -986,7 +1005,7 @@ def cmd_extend(args, cfg):
                 die(f"{args.instance} can't run later than its current deadline: the Eras Pod's deadline was fixed "
                     "at launch, so it would still end then. Launch a new one for more time")
             check_hours(cfg, (deadline - e["launched_at"]) / 3600, args.allow_over_budget)
-            check_total(cfg, sum(committed_usd(x) for k, x in d.items() if k != args.instance)
+            check_total(cfg, sum(committed_usd(x) for k, x in d.items() if k != args.instance and known(x))
                         + committed_usd({**e, "deadline": deadline}), args.allow_over_budget)
         e["deadline"] = deadline
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
@@ -1036,6 +1055,9 @@ def cmd_watchdog(args, cfg):
         e = ledger().get(args.instance)
         if e is None:
             return  # terminated normally
+        if not known(e):
+            print(f"{time.ctime()}: gpu.py has no {e['provider']!r} provider; nothing to terminate", flush=True)
+            return
         if time.time() >= e["deadline"]:
             print(f"{time.ctime()}: deadline reached for {args.instance}; terminating", flush=True)
             try:
@@ -1081,7 +1103,7 @@ def main():
     p.add_argument("offer")
     p.add_argument("--pr", type=int, required=True)
     p.add_argument("--hours", type=float)
-    p.add_argument("--tag", help="names the instance <prefix>-<pr>-<tag> (and makes an Eras launch idempotent); "
+    p.add_argument("--tag", help="names the instance live-pr-<pr>-<tag> (and makes an Eras launch idempotent); "
                                 "by default the time and 4 hex digits")
     p.add_argument("--run", help="Eras: a script that is the work itself; the GPUs go when it ends")
     p.add_argument("--input", action="append", default=[],
