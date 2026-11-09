@@ -32,7 +32,6 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-from safetensors import safe_open
 
 from mstar.utils.threads import ThreadPool
 
@@ -115,6 +114,10 @@ def _read_tensor(fd: int, rd: _Read) -> torch.Tensor:
 
 def _read_with_safetensors(path: Path, key: str, spec: TensorSlice | None) -> torch.Tensor:
     """For dtypes the byte reader has no torch view for (packed fp4, ...)."""
+    # imported here: safetensors is an optional dependency, and the conductor, worker and API server
+    # import this package (through mstar.quantization) whether or not they read a checkpoint
+    from safetensors import safe_open
+
     with safe_open(str(path), framework="pt", device="cpu") as f:
         if spec is None:
             return f.get_tensor(key)
