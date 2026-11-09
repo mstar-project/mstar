@@ -100,7 +100,6 @@ from mstar.utils.profiler import (
 
 if TYPE_CHECKING:
     from mstar.engine.resources.kv.manager import KVManager
-    from mstar.engine.resources.lora.pool import LoraAdapterPool
     from mstar.model.base import Model
 
 logger = logging.getLogger(__name__)
@@ -145,11 +144,11 @@ def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None
 
 @contextmanager
 def _outside_steps(submodule_mgmt) -> Iterator[None]:
-    """A node's forwards run outside any step (compile warm-ups), with each of its LoRA
-    pools as in a base-only step (``LoraAdapterPool.base_only``)."""
+    """A node's forwards run outside any step (compile warm-ups), with its lean-capable
+    resources as in a step that runs them lean (``Resource.outside_step``)."""
     with ExitStack() as stack:
-        for pool in submodule_mgmt.lora_pools:
-            stack.enter_context(pool.base_only())
+        for key in submodule_mgmt.lean_keys:
+            stack.enter_context(submodule_mgmt.resources[key].outside_step())
         yield
 
 
@@ -225,8 +224,6 @@ class SubmoduleManagement:
     piecewise_runners: dict[str, PiecewiseAcceleratorGraphRunner] = field(
         default_factory=dict
     )
-    # the LoRA pools bound to the node's modules, set at bind
-    lora_pools: tuple = ()
     # the keys of the node's resources that can run lean (`Resource.lean_capture`),
     # in declaration order
     lean_keys: tuple[str, ...] = field(init=False, default=())
@@ -763,9 +760,6 @@ class Engine:
                 region_ladders=(region_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
-            self._submodules[node_name].lora_pools = tuple(
-                resources[key] for key in getattr(submodule, "lora_keys", ())
-            )
             loopback = submodule.device_loopback if isinstance(submodule, ARNodeSubmodule) else None
             if loopback is not None:
                 # the sampler keeps its slot masters only for a node that
@@ -828,11 +822,10 @@ class Engine:
             if isinstance(resource, KVManager)
         ]
 
-    def lora_pools(self) -> list["LoraAdapterPool"]:
-        """Every LoRA adapter pool this engine built, for runtime adapter loads."""
-        from mstar.engine.resources.lora.pool import LoraAdapterPool
-
-        return [r for r in self._resources.values() if isinstance(r, LoraAdapterPool)]
+    @property
+    def resources(self) -> Mapping[str, Resource]:
+        """Every resource this engine built, by key."""
+        return self._resources
 
     def _compile_submodules(self, recompile_limits: Mapping[str, int | None] | None = None) -> None:
         """Apply torch.compile to submodule forward paths, each under its node's
@@ -1170,7 +1163,7 @@ class Engine:
                 memory_pool=memory_pool,
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
-                lora_keys=getattr(submodule_mgmt.submodule, "lora_keys", ()),
+                segment_keys=getattr(submodule_mgmt.submodule, "segment_keys", ()),
             )
             runners[label] = runner
         return runners

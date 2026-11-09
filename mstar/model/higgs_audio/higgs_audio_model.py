@@ -94,23 +94,22 @@ class HiggsAudioModel(MultimodalDecoderModel):
     # Resources
     # -------------------------------------------------------------------
 
-    def get_lora_specs(self) -> list[LoraSpec]:
+    def _lora_spec(self) -> LoraSpec:
         """Per-request adapters on the LLM: every linear of the Qwen3 stack and the text
         head (one row per request: the last token's), placed as the weight loader places
         the checkpoint's own tensors. The embedding takes none (an adapter touching it is
         refused). Adapters saved on a ``Qwen3ForCausalLM`` layout (``model.layers.*``) are
         read as the flat checkpoint's."""
-        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
-        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
 
-        return [module_lora_spec(
-            meta_root(self.build_llm), resource_key=LORA_RESOURCE_KEY, nodes={"LLM"}, root_path="model",
+        return module_lora_spec(
+            self.build_llm, nodes={"LLM"}, root_path="model",
             # Qwen3DenseLM.load_weights' rules, over the names _llm_remap gives it
             rules=CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=self._llm_remap),
             adapter_roots=[("model.", "")],
             rows={"lm_head": PER_SEGMENT},
-        )]
+        )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """LLM paged KV + attention/positions/sampler. audio_encoder is
@@ -142,6 +141,7 @@ class HiggsAudioModel(MultimodalDecoderModel):
             # ASR transcription: the reference decodes greedily and exposes
             # no penalty knob, so no seen-token buffers.
             replace(self._sampler_spec(self.config.vocab_size), enable_repetion_penalty=False),
+            self._lora_spec(),
         ]
 
     def get_max_output_tokens(self, **model_kwargs):

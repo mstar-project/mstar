@@ -38,7 +38,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
     NodeSubmodule,
     engine_step,
-    lora_rows,
+    with_segment_steps,
 )
 from mstar.platforms import current_platform
 from mstar.platforms.compile import deterministic_inductor_options, with_inductor_overrides
@@ -817,11 +817,11 @@ class AcceleratorGraphRunner:
     def _recompile_limit(self) -> int | None:
         """The dynamo recompile limit this node's compiled calls run under, None where the
         engine's holds: ``compiled_entries_per_shape`` entries per compiled bucket the runner
-        captures (each batch size, token count and key traces apart; a LoRA node's base-only
-        twin is a key), and some for the engine's compiled forward, which shares the code
-        objects. A capture past the limit would run uncompiled inside its graph."""
+        captures (each batch size, token count, key and lean twin traces apart), and some
+        for the engine's compiled forward, which shares the code objects. A capture past the
+        limit would run uncompiled inside its graph."""
         shapes = {
-            (spec.config_idx, spec.bs, spec.num_tokens, spec.bucket.cg_key_info)
+            (spec.config_idx, spec.bs, spec.num_tokens, spec.bucket.cg_key_info, spec.bucket.lean)
             for spec in self._get_slot_specs() if spec.config.compile
         }
         need = self._submodule.compiled_entries_per_shape * len(shapes) + 16
@@ -1850,13 +1850,13 @@ class PiecewiseAcceleratorGraphRunner:
         memory_pool: AcceleratorGraphPool | None = None,
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
-        lora_keys: tuple[str, ...] = (),
+        segment_keys: tuple[str, ...] = (),
     ):
         self._label = label
         self._capture_stream = capture_stream
         self._config = config
-        # the node's LoRA pools (`_region_step`)
-        self._lora_keys = lora_keys
+        # the node's resources whose step is its segments (`_region_step`)
+        self._segment_keys = segment_keys
         self._resources = resources
         # A `one_row_per_step` region replays every row as its first request's, so it
         # runs the node's lean resources lean (`_bucket`) and leases only a step whose
@@ -2299,10 +2299,11 @@ class PiecewiseAcceleratorGraphRunner:
         self, request_ids: list[int], seq_lens: list[int],
         label_seq_lens: dict[str, list[int]] | None = None,
     ):
-        """The config's step for the region, with the node's LoRA rows laid out from its
-        own segments (``lora_rows``)."""
-        return lora_rows(
-            self._config.region_step(list(request_ids), list(seq_lens), label_seq_lens), self._lora_keys,
+        """The config's step for the region, with a step of its own segments under each of
+        the node's resources that takes them (``with_segment_steps``)."""
+        return with_segment_steps(
+            self._config.region_step(list(request_ids), list(seq_lens), label_seq_lens),
+            self._segment_keys,
         )
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:

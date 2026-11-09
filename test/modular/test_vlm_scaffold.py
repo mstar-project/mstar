@@ -364,6 +364,17 @@ def test_qwen3_5_floors_a_float_images_levels():
     assert int(seen[0].max()) == 127
 
 
+def test_a_two_label_tower_refuses_a_resource_whose_step_is_its_segments():
+    """A LoRA pool reads the segments as the rows the tower's linears see; Glimmer's
+    windows and frames each cover every patch, so binding one would count them twice."""
+    from mstar.model.muse.submodules import VisionEncoderSubmodule
+
+    encoder = object.__new__(VisionEncoderSubmodule)
+    torch.nn.Module.__init__(encoder)
+    with pytest.raises(ValueError, match="one row per segment"):
+        encoder.bind_node_resources({"lora": SimpleNamespace(steps_from_segments=True)})
+
+
 def _glimmer_encoder(max_segments: int):
     from mstar.model.keys import VISION_ATTN
     from mstar.model.muse.submodules import VisionEncoderSubmodule
