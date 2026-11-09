@@ -556,6 +556,18 @@ def findings_changed(review, pr):
     return [f"deleted or retagged since the bot posted them: {', '.join(changed)}"] if changed else []
 
 
+def for_approval(review, pages):
+    """`review` as the approval reads it: a re-review's `fixed` or `moot` on a bot thread GitHub doesn't show as
+    outdated (none of its lines changed since the bot posted it) counts as `disputed`, so a person decides. The
+    summary's status line and the GPU gate keep the review's own judgement."""
+    unmoved = {str(first.get("databaseId", "")) for first, _, _, outdated in render_summary.bot_threads(pages)
+               if not outdated}
+    return {**review, "prior_findings": [
+        {**f, "status": "disputed", "why": f"none of this thread's lines changed; a review judged it {f['status']}"}
+        if f["status"] in render_summary.CLEARS and f["ref"] in unmoved else f
+        for f in review.get("prior_findings") or []]}
+
+
 def to_fix_first(review, pr, above):
     """What the review left open that stops the live test from starting, and approval too: open P0–P2
     findings (counted as the summary counts them, fixed above judged) and skipped files. Open questions
@@ -625,7 +637,7 @@ def approval_facts(pr, sha, verdict, since, review):
         runtime=bool(set(runtime) - set(blocked)),  # a gated file already has its own reason
         risk_level=(review.get("risk") or {}).get("level", "unrated"),
         questions=len(review.get("questions") or ()),
-        to_fix_first=tuple(to_fix_first(review, pr, "stacked-above.json")),
+        to_fix_first=tuple(to_fix_first(for_approval(review, review_threads(pr)), pr, "stacked-above.json")),
     )
 
 

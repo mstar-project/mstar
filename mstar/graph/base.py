@@ -235,7 +235,7 @@ class GraphNode(GraphSection):
     input_names: set[str]
     outputs: list[GraphEdge]
     consumes_stream: bool = False
-    # When False, the worker's speculation gate (``_can_speculate``) refuses to
+    # When False, the worker's speculation gate (``Speculator.can_speculate``) refuses to
     # build a speculative N+1 batch for this node. Models opt out of spec for
     # nodes whose forward pass mutates global state in ways the spec path
     # doesn't account for — e.g. BAGEL's flow-loop LLM / combine_cfg, where

@@ -105,7 +105,12 @@ class TestReviewSummary(unittest.TestCase):
         self.assertEqual(r["risk"]["level"], "medium", "a small fix commit could rate a medium PR low and approve it")
         self.assertEqual(r["questions"], earlier["questions"], "a re-review could drop a question nobody answered")
         self.assertEqual(read_state(render(r, [], "0123456789", "full", []))["questions"], earlier["questions"])
-        self.assertEqual(carried(review(), earlier, True)["questions"], [], "a person's answer would change nothing")
+        self.assertEqual(carried(review(), earlier, True)["questions"], earlier["questions"],
+                         "a comment about anything else would drop every question")
+        answered = {**review(), "answered_questions": ["Should this be a resource?"]}
+        self.assertEqual(carried(answered, earlier, True)["questions"], [], "a person's answer would change nothing")
+        self.assertEqual(carried(answered, earlier, False)["questions"], earlier["questions"],
+                         "the model could say a question was answered when nobody commented")
         self.assertEqual(carried(review(), earlier, True)["risk"]["level"], "low",
                          "a maintainer's answer would leave the earlier risk standing")
         decision = {"location": "a.py:1", "why": "new lifecycle state"}
@@ -144,6 +149,14 @@ class TestReviewSummary(unittest.TestCase):
         r["outside_diff"][0]["detail"] = "d Said to be fixed in #12, not checked."
         text = render(r, threads(thread("P1", comment_id=7)), "0123456789", "light", [13])
         self.assertEqual(text.count("Said to be fixed in #\u200b12, not checked."), 2, "each run would repeat the note")
+
+    def test_a_report_is_inert_once_and_stays_so(self):
+        inert_report = SUMMARY["inert_report"]
+        self.assertIn("@a\n```\r@\u200bteam", inert_report("```\n@a\n```\r@team"),
+                      "a bare \\r ends a line, so that close is a close")
+        for twice in ("- x\n@a\n```\n@b\n```\n<details>\n@c\n", "```mermaid\n@a\n`````\n~~~~\n@b\n"):
+            once = inert_report(twice)
+            self.assertEqual(inert_report(once), once, "a second pass would change the report")
 
     def test_a_latent_bug_on_main_is_reported_but_doesnt_block(self):
         r = review()

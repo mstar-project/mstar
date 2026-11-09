@@ -322,10 +322,10 @@ class TestSlurm(unittest.TestCase):
 
 class TestEras(unittest.TestCase):
     def eras_launch(self, write=None, max_running=None, held=("v1",), refused_by="preview", dry_run=False, run=None,
-                    inputs=()):
+                    inputs=(), gone=()):
         """gpu.py launch on a fake Eras whose cache volumes, v1 and v2, look free, but the preview (or the
         create, `refused_by`) refuses those `held` (as the spec has it), as when another box took them in
-        between; the calls it made."""
+        between, and those `gone` no longer exist; the calls it made."""
         key, state, calls = Path(tempfile.mkdtemp()) / "key.pub", Path(tempfile.mkdtemp()), []
         key.write_text("ssh-ed25519 AAAA test")
         digest = hashlib.sha256(base64.b64decode("AAAA")).digest()
@@ -336,6 +336,8 @@ class TestEras(unittest.TestCase):
 
         def eras(method, path, body=None, params=None, retry=True):
             calls.append((method, path, json.loads(json.dumps(body))))  # as sent, not as changed later
+            if path.removeprefix("/volumes/") in gone:
+                raise GPU["ApiError"](404, {"code": "not_found"})
             bound = method == "POST" and path.startswith("/instances") and \
                 (body["run"]["bindings"]["volumes"].get("cache") or {}).get("volume_id") in held
             if path == "/instances" and bound and refused_by == "create":
@@ -382,6 +384,14 @@ class TestEras(unittest.TestCase):
             self.assertEqual([[v["volume_id"] for k, v in b["run"]["bindings"]["volumes"].items() if k == "cache"]
                               for b in created], [bound],
                              "a live test would give up on Eras rather than take the next free volume or start cold")
+
+    def test_a_deleted_cache_volume_starts_cold_but_stops_a_refresh(self):
+        for gone, bound in ((["v1"], ["v2"]), (["v1", "v2"], [])):
+            created = [c[2] for c in self.eras_launch(held=(), gone=gone) if c[:2] == ("POST", "/instances")]
+            self.assertEqual([[v["volume_id"] for k, v in b["run"]["bindings"]["volumes"].items() if k == "cache"]
+                              for b in created], [bound], "one stale id would fail every Eras launch")
+        with self.assertRaises(GPU["ApiError"], msg="a refresh of a missing volume would fill a box's own disk"):
+            self.eras_launch(write="v1", gone=["v1"])
 
     def test_a_box_makes_sshd_host_keys_before_starting_it(self):
         created = next(c[2] for c in self.eras_launch(held=()) if c[:2] == ("POST", "/instances"))

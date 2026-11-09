@@ -63,7 +63,7 @@ def test_a_decoder_failure_on_an_upload_reaches_the_client_as_an_error_id(tmp_pa
     with pytest.raises(OSError) as raised:
         Image.open(path)
     assert path in str(raised.value)  # the decoder names the upload
-    wt._fail_request("r1", raised.value, "preprocessing", abort=False)
+    wt._fail_request("r1", raised.value, "preprocessing", abort=False, intake=True)
 
     chunk = wt.out_queue.get_nowait()
     text = chunk.data.decode()
@@ -77,7 +77,7 @@ def test_a_deliberate_decoder_refusal_keeps_its_message_without_the_path(tmp_pat
     path = _upload(tmp_path, "3f2a9c_clip.mp4")
     wt = _data_worker()
     wt._fail_request(
-        "r1", ValueError(f"no video frames decoded from {path}"), "preprocessing", abort=False,
+        "r1", ValueError(f"no video frames decoded from {path}"), "preprocessing", abort=False, intake=True,
     )
 
     chunk = wt.out_queue.get_nowait()
@@ -112,20 +112,20 @@ def _worker(rids=("r1",)):
     scheduler = make_scheduler(request_state=request_state, graph_runtime=runtime)
     w = make_worker(
         communicator=SimpleNamespace(send=lambda entity, msg: sent.append(msg)),
-        request_state=request_state, _graph_runtime=runtime,
+        request_state=request_state, graph_runtime=runtime,
         scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
     )
     w.sent = sent
     for rid in rids:
         w.lifecycle.add(rid, rid)
-    w._hold_rows(CHAIN_LANE, rids)
+    w.pipeline._hold_rows(CHAIN_LANE, rids)
     return w
 
 
 def test_a_worker_exception_reaches_the_client_as_an_error_id(tmp_path, caplog):
     tensor_file = f"{tmp_path}/mstar_tensors_{USER}/r1_audio.pt"
     w = _worker()
-    w._handle_main_loop_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
+    w.pipeline._handle_error(FileNotFoundError(f"cannot open {tensor_file}"), (None, None), None)
 
     (message,) = w.sent
     text = message.body.errors["r1"]

@@ -18,6 +18,7 @@ import torch
 pytest.importorskip("safetensors")
 from safetensors.torch import save_file  # noqa: E402
 
+from mstar.distributed.base import PARALLEL_AXES  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, Residency, Resource  # noqa: E402
 from mstar.engine.resources.lora import LoraModuleRef, LoraReqConfig, LoraSpec, LoraStep, LoraTarget  # noqa: E402
 from mstar.engine.resources.lora.pool import ZERO_SLOT, LoraAdapterPool  # noqa: E402
@@ -492,30 +493,34 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
     assert asked and "No eviction candidate" in caplog.text
 
 
-def test_a_node_running_sequence_parallelism_refuses_lora(adapters):
-    """LoRA rows are per request, not per SP shard: the build refuses SP > 1 at startup,
-    and takes TP with SP 1."""
+@pytest.mark.parametrize("axis", [axis for axis in PARALLEL_AXES if axis != "tp"])
+def test_a_node_running_sequence_or_cfg_parallelism_refuses_lora(adapters, axis):
+    """LoRA rows are per request over the whole batch, not per SP shard or CFG branch: the
+    build refuses either axis above 1 at startup, and takes TP with both at 1."""
     from mstar.distributed.communication import CommGroup, JointGroups
 
     _, paths = adapters
 
-    def build(sp_group):
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=sp_group, instance=sp_group)
+    def build(group):
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=group)
+        setattr(groups, f"{axis}_group", group)
         return LoraAdapterPool.build(make_spec(paths), EngineResourceInfo(device=CPU, joint_comm_group=groups))
 
-    with pytest.raises(ValueError, match=r"sequence parallelism \(SP=2\)"):
+    with pytest.raises(ValueError, match=rf"at {axis}_size 2, which LoRA does not support"):
         build(CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]))
     assert build(CommGroup.trivial()).targets
 
 
 def test_served_targets_narrow_to_what_the_adapters_touch(adapters):
-    """The conductor keeps only the targets the configured adapters touch and every
-    worker builds just those."""
+    """With runtime updates off, the conductor keeps only the targets the adapters touch
+    and every worker builds just those."""
 
     from mstar.conductor.conductor import Conductor
+    from mstar.engine.resources.lora.serving import served_lora_targets
     from mstar.model.base import serving_resources
 
     _, paths = adapters
+    assert served_lora_targets([make_spec({"a3": paths["a3"]}, runtime_updates=True)]) is None
     model = make_model(get_lora_specs=lambda: [make_spec({})])
     config = {"resources": {"lora": {"adapters": {"a3": paths["a3"]}, "max_slots": 2}}}
     conductor = Conductor.__new__(Conductor)

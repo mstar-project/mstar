@@ -1069,18 +1069,25 @@ def eras_launch_body(cfg: dict, o: dict, name: str, ssh_key_id: str, hours: floa
 
 def eras_cache_volumes(cfg: dict, cache: str, write: str | None) -> list[str]:
     """The cache volumes a launch tries to bind, in order. An instance binds one volume, so
-    eras.cache_volume_ids are replicas, one per box: "ro" tries those no box holds, then none (the
-    box starts cold). `write` (a cache refresh) takes only that volume, and dies if a box holds it."""
+    eras.cache_volume_ids are replicas, one per box: "ro" tries those no box holds and that can be
+    read (a deleted id is skipped), then none (the box starts cold). `write` (a cache refresh) takes
+    only that volume, and fails if it can't be read or a box holds it."""
     ids = [write] if write else [] if cache == "none" else cfg.get("eras", {}).get("cache_volume_ids") or []
     free = []
     for vid in ids:
-        att = eras("GET", f"/volumes/{vid}").get("attachment") or {}
+        try:
+            att = eras("GET", f"/volumes/{vid}").get("attachment") or {}
+        except ApiError as err:
+            if write:
+                raise
+            print(f"gpu.py: skipping cache volume {vid}, which can't be read: {err}", file=sys.stderr)
+            continue
         if not att.get("instance_id") or att.get("detached_at"):
             free.append(vid)
         elif write:
             die(f"cache volume {vid} is held by instance {att['instance_id']}; wait for it to end")
     if ids and not free:
-        print("gpu.py: every cache volume is held by another box; launching cold", file=sys.stderr)
+        print("gpu.py: no cache volume is free; launching cold", file=sys.stderr)
     return free
 
 
@@ -1344,7 +1351,8 @@ def main():
                                 "by default the time and 4 hex digits")
     p.add_argument("--run", help="a script that is the work itself; the GPUs go when it ends")
     p.add_argument("--input", action="append", default=[],
-                   help="a file for the --run script: in its working directory on Slurm, in /run/live-pr on Eras")
+                   help="a file for the --run script: in its working directory on Slurm, in /run/live-pr on Eras. "
+                        "No secrets here on Eras: the files stay in the run's record; use eras.run_secret_id")
     cache = p.add_mutually_exclusive_group()
     cache.add_argument("--cache", choices=("ro", "none"), default="ro",
                        help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
