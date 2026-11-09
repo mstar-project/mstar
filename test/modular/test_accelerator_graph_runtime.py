@@ -11,7 +11,7 @@ from mstar.engine.resources.sampler.utils import sample_accelerator_graphable_gp
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.utils.device import DeviceCapability
-from mstar.worker.worker import Worker
+from mstar.worker.host_copies import HostCopies
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:1", "xpu:1"])
@@ -41,9 +41,7 @@ def test_engine_load_binds_capability_to_loaded_device(device, capability_source
 
 @pytest.mark.parametrize("device_type", ["cuda", "xpu"])
 def test_output_copy_uses_generic_stream_on_worker_device(monkeypatch, device_type):
-    worker = object.__new__(Worker)
-    worker.device = torch.device(device_type, 1)
-    worker._d2h_stream = None
+    device = torch.device(device_type, 1)
     side = MagicMock()
     runtime = SimpleNamespace(
         is_available=lambda: True,
@@ -52,24 +50,24 @@ def test_output_copy_uses_generic_stream_on_worker_device(monkeypatch, device_ty
         stream=Mock(),
     )
     monkeypatch.setattr(torch, device_type, runtime)
-    worker.device_capability = DeviceCapability(worker.device)
+    copies = HostCopies(device=device, device_capability=DeviceCapability(device))
     make_stream = Mock(return_value=side)
     monkeypatch.setattr(torch, "Stream", make_stream)
     tensor = SimpleNamespace(
-        device=worker.device, dtype=torch.int64, shape=(1,), numel=lambda: 1,
+        device=device, dtype=torch.int64, shape=(1,), numel=lambda: 1,
     )
     monkeypatch.setattr(torch, "is_tensor", lambda value: value is tensor)
     cpu_tensor = Mock()
-    worker._get_pinned_d2h_buffer = Mock(return_value=cpu_tensor)
+    copies._get_pinned_d2h_buffer = Mock(return_value=cpu_tensor)
     host_value = object()
     outputs = BatchedModelOutput(
         per_rid_outputs={7: {"token": [tensor, host_value], "metadata": "keep"}},
     )
     event = object()
 
-    copied, host_rows = worker._prematerialize_for_check_stop(outputs, event)
+    copied, host_rows = copies.prematerialize_for_check_stop(outputs, event)
 
-    make_stream.assert_called_once_with(device=worker.device)
+    make_stream.assert_called_once_with(device=device)
     side.wait_event.assert_called_once_with(event)
     # nothing is copied until the stop check reads a name
     side.__enter__.assert_not_called()
@@ -86,10 +84,10 @@ def test_output_copy_uses_generic_stream_on_worker_device(monkeypatch, device_ty
 
 
 def test_cpu_output_copy_needs_no_accelerator_runtime():
-    worker = object.__new__(Worker)
-    worker.device = torch.device("cpu")
+    device = torch.device("cpu")
+    copies = HostCopies(device=device, device_capability=DeviceCapability(device))
     outputs = BatchedModelOutput(per_rid_outputs={7: {"token": [torch.tensor([3])]}})
-    copied, host_rows = worker._prematerialize_for_check_stop(outputs, None)
+    copied, host_rows = copies.prematerialize_for_check_stop(outputs, None)
     assert copied is outputs.per_rid_outputs
     assert host_rows is None
 

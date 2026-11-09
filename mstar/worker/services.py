@@ -79,6 +79,10 @@ class WorkerLayout:
     # (node, walk) keys on the side lane; known once ``EngineManager.build`` has
     # validated them, so ``Worker`` fills this in after building the engines
     side_keys: frozenset[tuple[str, str]] = frozenset()
+    # nodes that verify drafts (speculative decoding), and those of them in
+    # synchronous mode, which are never speculated; filled in with side_keys
+    verifying_nodes: frozenset[str] = frozenset()
+    synchronous_verify_nodes: frozenset[str] = frozenset()
     # wg id -> its nodes, for every worker graph of the deployment
     all_wg_nodes: Mapping[int, set[str]] = field(default_factory=_no_entries)
     # (graph_walk, node) -> innermost enclosing loop

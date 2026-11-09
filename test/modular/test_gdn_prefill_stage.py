@@ -118,6 +118,45 @@ def test_run_goes_through_the_stage_with_the_plan_mask(monkeypatch):
     assert out.shape[0] == 32
 
 
+def test_the_qk_normalize_compiles_once_for_every_token_count(monkeypatch):
+    """Inside a captured forward the manager's normalize inherits the runner's
+    dynamic=False; ``compiled`` marks its token dim dynamic, so it compiles once
+    for every bucket, and the head dim stays static."""
+    from mstar.engine.resources.linear_attn import gdn
+    from mstar.platforms import compile as platform_compile
+
+    shapes = []  # each compile's input shapes
+
+    def record(gm, example_inputs):
+        values = [node.meta["example_value"] for node in gm.graph.nodes if node.op == "placeholder"]
+        shapes.append([tuple(v.shape) for v in values if isinstance(v, torch.Tensor)])
+        return gm.forward
+
+    real_compile = torch.compile
+    # ``compiled`` itself, on a backend that records what it was given
+    monkeypatch.setattr(torch, "compile", lambda fn, options=None, **kw: real_compile(fn, backend=record, **kw))
+    plan = SimpleNamespace(qk_l2norm_in_kernel=False, takes_strided_inputs=True, run=lambda q, *rest: q)
+    manager = gdn.GDNManager.__new__(gdn.GDNManager)
+    manager.config = SimpleNamespace(qk_l2norm=True)
+    manager._current, manager._default_label = {"main": plan}, "main"
+    state = torch.zeros(1)
+    torch._dynamo.reset()
+    platform_compile.compiled.cache_clear()
+    try:
+        forward = real_compile(
+            lambda q: manager.run(q * 2, q * 3, q, q, q, state, state, state) + 1, dynamic=False, backend="eager",
+        )
+        for tokens in (8, 16, 24, 40):
+            q = torch.randn(tokens, 2, 16)
+            torch.testing.assert_close(forward(q), torch.nn.functional.normalize(q, dim=-1) + 1)
+    finally:
+        platform_compile.compiled.cache_clear()
+        torch._dynamo.reset()
+    (compile_shapes,) = shapes
+    for tokens, *rest in compile_shapes:
+        assert isinstance(tokens, torch.SymInt) and rest == [2, 16]
+
+
 def _eager(q, k, v, a, b, a_log, dt_bias, mask, room):
     q = torch.nn.functional.normalize(q.float(), dim=-1).to(q.dtype)
     k = torch.nn.functional.normalize(k.float(), dim=-1).to(k.dtype)

@@ -5,10 +5,30 @@ from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout
 
 
+class _Runtime:
+    """The graph runtime's handle table, as `_add` mints it; a handle stays
+    named until a later `_add` reuses it, as the runtime frees it only at the
+    teardown's end."""
+
+    def __init__(self):
+        self.names: dict[int, str] = {}
+
+    def get_rid_string(self, handle):
+        return self.names.get(handle)
+
+    def get_rid_handle(self, wire_rid):
+        return next((h for h, w in self.names.items() if w == wire_rid), None)
+
+
+def _add(lifecycle: RequestLifecycle, rid: int, wire_rid: str) -> None:
+    lifecycle._runtime.names[rid] = wire_rid
+    lifecycle.add(rid, wire_rid)
+
+
 def _lifecycle(*rids, follower=False) -> RequestLifecycle:
-    lifecycle = RequestLifecycle(layout=WorkerLayout(is_tp_follower=follower))
+    lifecycle = RequestLifecycle(layout=WorkerLayout(is_tp_follower=follower), graph_runtime=_Runtime())
     for rid in rids:
-        lifecycle.add(rid, f"r{rid}")
+        _add(lifecycle, rid, f"r{rid}")
     return lifecycle
 
 
@@ -78,9 +98,9 @@ def test_a_stamped_remove_is_purged_with_its_handle():
     lifecycle = _lifecycle(7, follower=True)
     lifecycle.remove(7, _rank0_remove(7, seq=9), 4)
     lifecycle.removed(7, "r7")
-    lifecycle.add(7, "next")
+    _add(lifecycle, 7, "next")
     assert lifecycle.removes_ready(set(), 9) == []
-    assert lifecycle.wire_of(7) == "next"
+    assert lifecycle.arrivals.keys() == {7}
 
 
 def test_removed_forgets_a_handle_that_may_be_recycled():
@@ -109,7 +129,7 @@ def test_a_drain_defers_behind_a_step_and_a_later_arrival_takes_no_work():
     assert lifecycle.drains_ready({1}) == ["r9"]
     assert lifecycle.begin_drain("r9") is None
     # NEW_REQUEST for an id already draining
-    lifecycle.add(9, "r9")
+    _add(lifecycle, 9, "r9")
     assert 9 in lifecycle.failed_rids
     assert lifecycle.is_tearing_down(1)
     assert lifecycle.drains_ready(set()) == ["r1"]
@@ -128,7 +148,7 @@ def test_parked_messages_come_back_once_and_a_removed_id_refuses_them():
     lifecycle = _lifecycle()
     message = _Msg("r1")
     assert lifecycle.park(message)
-    lifecycle.add(1, "r1")
+    _add(lifecycle, 1, "r1")
     assert lifecycle.take_parked("r1") == [message]
     assert lifecycle.take_parked("r1") == []
 
@@ -143,7 +163,7 @@ def test_parked_messages_stay_parked_until_the_replay_takes_them():
     lifecycle = _lifecycle()
     message = type("_Msg", (), {"body": DrainRequest(request_id="r1")})()
     assert lifecycle.park(message)
-    lifecycle.add(1, "r1")
+    _add(lifecycle, 1, "r1")
 
     assert list(lifecycle.removed(1, "r1")) == [message], "a parked message would never be ACKed"
 

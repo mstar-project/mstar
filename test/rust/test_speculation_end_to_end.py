@@ -24,8 +24,9 @@ from mstar.graph.runtime.base import ColumnarEdgeSpecs
 from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection
+from mstar.worker.executing_batch import build_executing_batch
 from mstar.worker.spec_rows import DeferredRowInputs
-from mstar.worker.worker import PendingBatch
+from mstar.worker.step_executor import PendingBatch
 
 CODES, CTX = "codes", "ctx"
 
@@ -171,9 +172,9 @@ def _run_stream(seed: int, n_rids=3, n_items=9, chunk=2):
             request_to_worker_graph=dict(zip(popped.wg_ids.keys, popped.wg_ids.values, strict=True)),
             input_edges=popped.input_edges, output_signals=list(popped.output_signals),
         )
-        w._set_in_flight_flag(batch, True)
+        w.executor._set_in_flight(batch, True)
         return PendingBatch(
-            batch=batch, node_batch=w._build_executing_batch(batch), node_name=T.NODE,
+            batch=batch, node_batch=build_executing_batch(w.speculator._services, batch), node_name=T.NODE,
             partition=T.PART, graph_walk=T.WALK, future=None,
         )
 
@@ -187,12 +188,12 @@ def _run_stream(seed: int, n_rids=3, n_items=9, chunk=2):
             if pending is not None:
                 record(pending.node_batch)
             continue
-        target = w._choose_spec_target(pending.batch)
-        spec = w._try_speculate_next(pending, target) if target else None
+        target = w.speculator._choose_spec_target(pending.batch)
+        spec = w.speculator._try_speculate_next(pending, target) if target else None
         outcome = rng.choice(["keep", "keep", "refuse", "drop"]) if spec else "none"
         if outcome in ("keep", "drop"):
             missing = (rng.choice(sorted(spec.continuing_rids)),) if outcome == "drop" else ()
-            w._thread_outputs_to_speculative(spec, T._rows_only(pending, missing))
+            w.speculator.thread_outputs(spec, T._rows_only(pending, missing))
             pending = T._advance(w, pending, spec)
             for r in missing:
                 retire(r)
@@ -203,8 +204,8 @@ def _run_stream(seed: int, n_rids=3, n_items=9, chunk=2):
                 pending = None
         else:
             if spec is not None:
-                w._settle_speculation(spec, success=False)
-            w._clear_in_flight_flag(pending.batch)
+                w.speculator.settle(spec, success=False)
+            w.executor.clear_in_flight(pending.batch)
             T._route(w, pending)
             pending = None
     for r in alive:
@@ -262,8 +263,8 @@ def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(monkeypatch):
     }
     assert T._view(rows) == T._view(general)
     outputs = T._rows_only(pending)
-    w._thread_outputs_to_speculative(general, outputs)
-    w._thread_outputs_to_speculative(rows, outputs)
+    w.speculator.thread_outputs(general, outputs)
+    w.speculator.thread_outputs(rows, outputs)
     assert T._view(rows) == T._view(general)
 
     batch, rt = rows.scheduled_batch, w._graph_runtime
@@ -274,11 +275,12 @@ def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(monkeypatch):
     engine = SimpleNamespace(
         device_loopback_signals=lambda node, walk: [T.SIG] if walk == T.WALK else [],
     )
-    w._device_loopback = {}
-    expected = w._loopback_rids(engine, batch)
-    w._device_loopback = {}
-    w._graph_runtime = _NoCalls(rt)
-    assert w._loopback_rids(engine, batch) == expected
+    body = w.executor._body
+    body._device_loopback = {}
+    expected = body._loopback_rids(engine, batch)
+    body._device_loopback = {}
+    body._graph_runtime = _NoCalls(rt)
+    assert body._loopback_rids(engine, batch) == expected
 
 
 # --- a loop-external input -------------------------------------------------------
@@ -298,8 +300,8 @@ def test_a_loop_external_input_falls_back_to_rows_and_persists(monkeypatch):
         assert not isinstance(rows.node_batch.per_request_input_tensors, DeferredRowInputs)
         assert T._view(rows) == T._view(general)
         outputs = T._rows_only(pending)
-        w._thread_outputs_to_speculative(general, outputs)
-        w._thread_outputs_to_speculative(rows, outputs)
+        w.speculator.thread_outputs(general, outputs)
+        w.speculator.thread_outputs(rows, outputs)
         assert T._view(rows) == T._view(general)
         inputs = rows.node_batch.per_request_input_tensors
         assert {r: [float(t) for t in inputs[r][CTX]] for r in rids} == {

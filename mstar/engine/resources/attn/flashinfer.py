@@ -104,7 +104,7 @@ class FlashInferManager(AttentionManager):
 
         # a verify step (speculative decoding) on FA3's paged kernel, which reads
         # lengths on the device, or on FlashInfer's prefill wrappers; decided in
-        # `bind_verify`, so a node that never verifies never loads flash_attn_3
+        # `verify_hardware_refusal`, so a node that never verifies never loads flash_attn_3
         self._verify_backend = VerifyBackend.parse(verify_backend)
         self._verify_fa3 = False
         self._verify_wrappers: dict = {}
