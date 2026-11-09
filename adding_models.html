@@ -2723,7 +2723,7 @@ the signal, so the worker routes it without a tensor and sends the client’s co
 <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> reads the tokens with <code class="docutils literal notranslate"><span class="pre">self.loopback_inputs(engine_inputs,</span> <span class="pre">inputs)</span></code>. A
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot’s.
-<code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> declares it for Qwen3.5, Muse Glimmer, Higgs Audio and Qwen3-ASR,
+<code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets <code class="docutils literal notranslate"><span class="pre">device_loopback</span> <span class="pre">=</span> <span class="pre">None</span></code>; Whisper and
 Qwen3-Omni’s Thinker declare their own.</p>
 <p>On such a node a captured step writes each row’s token and RNG offset back to the request’s
@@ -4054,8 +4054,8 @@ sets the default decode ladder, <code class="docutils literal notranslate"><span
 rows, <code class="docutils literal notranslate"><span class="pre">capture_compile_mode(walk)</span></code> names a capture’s <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> (<code class="docutils literal notranslate"><span class="pre">None</span></code>, the default,
 takes the deployment’s compile level), and <code class="docutils literal notranslate"><span class="pre">CAPTURE_PREFILL</span> <span class="pre">=</span> <span class="pre">False</span></code> captures decode
 only. A lone encoder’s <code class="docutils literal notranslate"><span class="pre">MediaEncoder.walk</span></code> names its media walk when the model’s graph
-calls it something other than <code class="docutils literal notranslate"><span class="pre">prefill_&lt;name&gt;</span></code> (the Cosmos3 reasoner’s
-<code class="docutils literal notranslate"><span class="pre">reasoner_prefill_vision</span></code>). A graph that names its other walks otherwise sets
+calls it something other than <code class="docutils literal notranslate"><span class="pre">prefill_&lt;name&gt;</span></code> (Qwen3-ASR’s and Canary-Qwen’s
+<code class="docutils literal notranslate"><span class="pre">prefill</span></code>). A graph that names its other walks otherwise sets
 <code class="docutils literal notranslate"><span class="pre">PREFILL_WALK</span></code>, <code class="docutils literal notranslate"><span class="pre">DECODE_WALK</span></code> and <code class="docutils literal notranslate"><span class="pre">DECODE_LOOP</span></code>.
 It reports a text prompt’s length and a decode row’s one token
 (<code class="docutils literal notranslate"><span class="pre">get_input_sequence_len</span></code>, <code class="docutils literal notranslate"><span class="pre">speculative_input_seq_len</span></code>), so a model chunks its text

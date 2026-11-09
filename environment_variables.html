@@ -1008,9 +1008,10 @@ captures and cannot be overridden by this variable.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH</span></code></p></td>
 <td><p>unset</p></td>
-<td><p>Cosmos3: any nonempty value disables only the DiT’s understanding-tower
-prefill capture. Denoise and reasoner captures remain eligible
-when <code class="docutils literal notranslate"><span class="pre">model_kwargs.accelerator_graph</span></code> is true.</p></td>
+<td><p>Cosmos3: any nonempty value disables only the understanding-tower
+prefill captures: the DiT’s prompt prefill and the reasoner’s text,
+mixed and vision prefills. Denoise and reasoner decode captures remain
+eligible when <code class="docutils literal notranslate"><span class="pre">model_kwargs.accelerator_graph</span></code> is true.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_OMNIVOICE_MODEL_PATH</span></code></p></td>
 <td><p>unset</p></td>
@@ -1495,9 +1496,9 @@ that holds its rows, so the ladder bounds both the rows per step and
 the graph memory; narrow it (for example
 <code class="docutils literal notranslate"><span class="pre">1,2,4,8,16,32</span></code>) on a memory-tight GPU or for an A/B against the
 former ladder. <code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN35_DECODE_BUCKETS</span></code> overrides it for
-Qwen3.5 alone; Canary, Canary-Qwen, Qwen3-ASR, Orpheus, Higgs-Audio,
-Command A+ and the Cosmos3 reasoner pin their own, so it reaches
-Qwen3.5 and Glimmer.</p></td>
+Qwen3.5 alone; Canary, Canary-Qwen, Qwen3-ASR, Orpheus, Higgs-Audio
+and Command A+ pin their own, so it reaches Qwen3.5, Glimmer and the
+Cosmos3 reasoner (which defaults to <code class="docutils literal notranslate"><span class="pre">1,2,4,8,16,24,32,48,64</span></code>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LAZY_PUBLISH</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1</span></code></p></td>
@@ -1591,7 +1592,7 @@ master and the next step reads its input ids from it, so the worker
 routes the signal with no tensor (no per-request store, hold or
 cleanup per step). Only nodes that declare the read
 (<code class="docutils literal notranslate"><span class="pre">DeviceLoopback</span></code>: the decode walks of Qwen3.5, Glimmer, Higgs Audio,
-Qwen3-ASR, Qwen3-Omni’s text-only Thinker and Whisper, which also keeps its timestamp rule state in
+Qwen3-ASR, the Cosmos3 reasoner, Qwen3-Omni’s text-only Thinker and Whisper, which also keeps its timestamp rule state in
 the sampler’s declared loop-back state; the other
 <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> nodes turn it off with
 <code class="docutils literal notranslate"><span class="pre">device_loopback</span> <span class="pre">=</span> <span class="pre">None</span></code>) and only when the sampler has graph
@@ -1620,9 +1621,9 @@ once for <code class="docutils literal notranslate"><span class="pre">MSTAR_SAMP
 when the runner admits it (<code class="docutils literal notranslate"><span class="pre">SamplerResource.reserve</span></code>): past them it
 waits, as for a recurrent state slot, until a removed request frees
 one. Only for a node that reads its tokens back on the device
-(Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
-rank: above one, where admission doesn’t decide, the masters grow and
-the scatter runs after the replay, as with <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></td>
+(Qwen3.5, Qwen3-ASR, Whisper, the Cosmos3 reasoner) with the device
+loop-back on, on one rank: above one, where admission doesn’t decide,
+the masters grow and the scatter runs after the replay, as with <code class="docutils literal notranslate"><span class="pre">0</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLER_SLOTS</span></code></p></td>
 <td><p>config’s <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_slots</span></code>, else <code class="docutils literal notranslate"><span class="pre">4096</span></code></p></td>

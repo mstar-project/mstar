@@ -1013,6 +1013,12 @@ other version they fall back to FlashInfer’s own <code class="docutils literal
 (see <a class="reference internal" href="#flash-attn-lingbot-world">flash-attn (LingBot-World)</a>).</p></li>
 <li><p><strong>flash-attn-4</strong> — Waypoint’s flex-attention <code class="docutils literal notranslate"><span class="pre">FLASH</span></code> backend. <strong>Not installed by any
 extra</strong>; install it separately (see <a class="reference internal" href="#flash-attn-4-waypoint-fa3-sm90-kernel">flash-attn-4 (Waypoint, FA3 sm90 kernel)</a>).</p></li>
+<li><p><strong>fa3-fwd</strong> — FlashAttention-3 forward, the <code class="docutils literal notranslate"><span class="pre">dense</span></code> attention backend (Cosmos3’s dense
+passes, its reasoner’s vision tower). The wheel is built against one CUDA major: 0.0.2 for a
+CUDA 12 torch (<code class="docutils literal notranslate"><span class="pre">+cu12x</span></code>), 0.0.3 for CUDA 13 (<code class="docutils literal notranslate"><span class="pre">+cu130</span></code>). The extras take the latest, so next
+to a CUDA 12 torch install <code class="docutils literal notranslate"><span class="pre">fa3-fwd==0.0.2</span></code>. A mismatched wheel fails to import, and every
+<code class="docutils literal notranslate"><span class="pre">dense</span></code> attention then runs on FlashInfer with a warning at startup; check with
+<code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-c</span> <span class="pre">&quot;import</span> <span class="pre">fa3_fwd_interface&quot;</span></code>.</p></li>
 <li><p><strong>mooncake-transfer-engine</strong> (0.3.13.post1 or newer) — RDMA tensor transport for
 multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
 (<code class="docutils literal notranslate"><span class="pre">SHM</span></code>) or <code class="docutils literal notranslate"><span class="pre">TCP</span></code> transport instead (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>, which also covers the network

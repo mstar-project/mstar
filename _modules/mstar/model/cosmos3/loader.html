@@ -1019,9 +1019,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">``layers.N.*`` keys with unfused attention projections (``to_q/to_k/to_v`` for</span>
 <span class="sd">the understanding pathway, ``add_q_proj/add_k_proj/add_v_proj`` for the</span>
 <span class="sd">generation pathway) and ``_moe_gen``-suffixed GEN MLP/norms. Our backbone</span>
-<span class="sd">module mirrors that layout one-to-one, so loading needs no key remapping and</span>
-<span class="sd">no stacked-parameter fusion. The text ``lm_head`` is dropped for generators</span>
-<span class="sd">that never decode text and loaded for checkpoints served as a reasoner.</span>
+<span class="sd">module mirrors that layout one-to-one, except that the understanding</span>
+<span class="sd">pathway's q, k and v load into one fused ``to_qkv`` (``TRANSFORMER_STACKED``).</span>
+<span class="sd">The text ``lm_head`` is dropped for generators that never decode text and</span>
+<span class="sd">loaded for checkpoints served as a reasoner.</span>
 
 <span class="sd">Edge checkpoints add ``vision_encoder/model.safetensors`` (the SigLIP2-style</span>
 <span class="sd">tower under ``model.visual.*`` and the patch-merger projector under</span>
@@ -1037,12 +1038,64 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">StackedParamRule</span>
+
 <span class="c1"># Checkpoint keys deliberately not loaded into a generator-only backbone. The</span>
 <span class="c1"># text ``lm_head`` exists in every checkpoint (the understanding tower</span>
 <span class="c1"># descends from a text LM) but generation emits flow velocity via</span>
 <span class="c1"># ``proj_out``; only a backbone that also serves the reasoner builds and loads</span>
 <span class="c1"># it (see ``cosmos3_name_remapper``).</span>
 <span class="n">DROP_KEYS</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="s2">"lm_head.weight"</span><span class="p">})</span>
+
+<span class="c1"># The understanding pathway's projections, fused into one GEMM.</span>
+<span class="n">TRANSFORMER_STACKED</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">StackedParamRule</span><span class="p">(</span><span class="s2">".to_qkv"</span><span class="p">,</span> <span class="s2">".to_q"</span><span class="p">,</span> <span class="s2">"q"</span><span class="p">),</span>
+    <span class="n">StackedParamRule</span><span class="p">(</span><span class="s2">".to_qkv"</span><span class="p">,</span> <span class="s2">".to_k"</span><span class="p">,</span> <span class="s2">"k"</span><span class="p">),</span>
+    <span class="n">StackedParamRule</span><span class="p">(</span><span class="s2">".to_qkv"</span><span class="p">,</span> <span class="s2">".to_v"</span><span class="p">,</span> <span class="s2">"v"</span><span class="p">),</span>
+<span class="p">]</span>
+
+
+<span class="c1"># The vision tower's q / k / v load into one fused ``qkv_proj`` a layer, as</span>
+<span class="c1"># the transformer's do.</span>
+<span class="n">VISION_STACKED</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">StackedParamRule</span><span class="p">(</span><span class="s2">".qkv_proj"</span><span class="p">,</span> <span class="s2">".q_proj"</span><span class="p">,</span> <span class="s2">"q"</span><span class="p">),</span>
+    <span class="n">StackedParamRule</span><span class="p">(</span><span class="s2">".qkv_proj"</span><span class="p">,</span> <span class="s2">".k_proj"</span><span class="p">,</span> <span class="s2">"k"</span><span class="p">),</span>
+    <span class="n">StackedParamRule</span><span class="p">(</span><span class="s2">".qkv_proj"</span><span class="p">,</span> <span class="s2">".v_proj"</span><span class="p">,</span> <span class="s2">"v"</span><span class="p">),</span>
+<span class="p">]</span>
+
+
+<div class="viewcode-block" id="stacked_param_name">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.stacked_param_name">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">stacked_param_name</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">rules</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">StackedParamRule</span><span class="p">]</span> <span class="o">=</span> <span class="n">TRANSFORMER_STACKED</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The parameter a checkpoint key loads into: its fused one for a q / k /</span>
+<span class="sd">    v projection, else the key itself."""</span>
+    <span class="k">for</span> <span class="n">rule</span> <span class="ow">in</span> <span class="n">rules</span><span class="p">:</span>
+        <span class="n">marker</span> <span class="o">=</span> <span class="n">rule</span><span class="o">.</span><span class="n">source_suffix</span> <span class="o">+</span> <span class="s2">"."</span>
+        <span class="k">if</span> <span class="n">marker</span> <span class="ow">in</span> <span class="n">name</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">name</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="n">marker</span><span class="p">,</span> <span class="n">rule</span><span class="o">.</span><span class="n">target_suffix</span> <span class="o">+</span> <span class="s2">"."</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">name</span></div>
+
+
+
+<div class="viewcode-block" id="stacked_param_shapes">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.stacked_param_shapes">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">stacked_param_shapes</span><span class="p">(</span>
+    <span class="n">shapes</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]],</span> <span class="n">rules</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">StackedParamRule</span><span class="p">]</span> <span class="o">=</span> <span class="n">TRANSFORMER_STACKED</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""Checkpoint tensor shapes as the module's parameters hold them: a fused</span>
+<span class="sd">    projection's rows are its shards' rows together."""</span>
+    <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">name</span><span class="p">,</span> <span class="n">shape</span> <span class="ow">in</span> <span class="n">shapes</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">target</span> <span class="o">=</span> <span class="n">stacked_param_name</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">rules</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">target</span> <span class="o">==</span> <span class="n">name</span><span class="p">:</span>
+            <span class="n">out</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">target</span> <span class="ow">in</span> <span class="n">out</span><span class="p">:</span>
+            <span class="n">out</span><span class="p">[</span><span class="n">target</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">out</span><span class="p">[</span><span class="n">target</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span> <span class="o">+</span> <span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="o">*</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">out</span><span class="p">[</span><span class="n">target</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">out</span></div>
+
+
 
 <span class="c1"># The Edge ``vision_encoder/`` shard's key prefix; the reasoner's vision</span>
 <span class="c1"># module keeps the ``visual`` / ``projector`` names below it.</span>
@@ -1147,9 +1200,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Mirrors the meta-device + ``load_hf_weights`` path the other model packages</span>
 <span class="sd">    use, but resolves the shard list from the diffusers ``diffusion_pytorch_model``</span>
-<span class="sd">    index (the generic iterator only knows the ``model.safetensors`` name). No</span>
-<span class="sd">    stacked-parameter rules: the checkpoint's projections are unfused and match</span>
-<span class="sd">    the backbone parameter names directly. Raises if any backbone parameter is</span>
+<span class="sd">    index (the generic iterator only knows the ``model.safetensors`` name). The</span>
+<span class="sd">    checkpoint's q / k / v projections load into the fused ``to_qkv``</span>
+<span class="sd">    (``TRANSFORMER_STACKED``); every other key matches its backbone parameter</span>
+<span class="sd">    directly. Raises if any backbone parameter is</span>
 <span class="sd">    left unfilled — the completeness guarantee bagel's loader also enforces.</span>
 <span class="sd">    """</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader</span><span class="w"> </span><span class="kn">import</span> <span class="n">iter_safetensors_file</span><span class="p">,</span> <span class="n">load_hf_weights</span>
@@ -1163,7 +1217,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">with_lm_head</span> <span class="o">=</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="s2">"lm_head"</span><span class="p">)</span>
     <span class="n">loaded</span> <span class="o">=</span> <span class="n">load_hf_weights</span><span class="p">(</span>
-        <span class="n">model</span><span class="p">,</span> <span class="n">_weights</span><span class="p">(),</span>
+        <span class="n">model</span><span class="p">,</span> <span class="n">_weights</span><span class="p">(),</span> <span class="n">stacked_params</span><span class="o">=</span><span class="n">TRANSFORMER_STACKED</span><span class="p">,</span>
         <span class="n">name_remapper</span><span class="o">=</span><span class="k">lambda</span> <span class="n">name</span><span class="p">:</span> <span class="n">cosmos3_name_remapper</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">with_lm_head</span><span class="o">=</span><span class="n">with_lm_head</span><span class="p">),</span>
     <span class="p">)</span>
 
@@ -1183,9 +1237,9 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="read_vision_encoder_weight_shapes">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">read_vision_encoder_weight_shapes</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="n">Path</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]:</span>
-<span class="w">    </span><span class="sd">"""``{remapped key: shape}`` of ``vision_encoder/model.safetensors``, from</span>
-<span class="sd">    the safetensors header only (CPU-side shape verification of the meta-built</span>
-<span class="sd">    vision module)."""</span>
+<span class="w">    </span><span class="sd">"""``{parameter: shape}`` of ``vision_encoder/model.safetensors`` as the</span>
+<span class="sd">    vision module holds it (q / k / v fused), from the safetensors header only</span>
+<span class="sd">    (CPU-side shape verification of the meta-built vision module)."""</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">safe_open</span>
 
     <span class="n">path</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">checkpoint_dir</span><span class="p">)</span> <span class="o">/</span> <span class="s2">"vision_encoder"</span> <span class="o">/</span> <span class="s2">"model.safetensors"</span>
@@ -1195,7 +1249,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">mapped</span> <span class="o">=</span> <span class="n">vision_encoder_name_remapper</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
             <span class="k">if</span> <span class="n">mapped</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="n">shapes</span><span class="p">[</span><span class="n">mapped</span><span class="p">]</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">handle</span><span class="o">.</span><span class="n">get_slice</span><span class="p">(</span><span class="n">key</span><span class="p">)</span><span class="o">.</span><span class="n">get_shape</span><span class="p">())</span>
-    <span class="k">return</span> <span class="n">shapes</span></div>
+    <span class="k">return</span> <span class="n">stacked_param_shapes</span><span class="p">(</span><span class="n">shapes</span><span class="p">,</span> <span class="n">VISION_STACKED</span><span class="p">)</span></div>
 
 
 
@@ -1215,7 +1269,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
         <span class="k">raise</span> <span class="ne">FileNotFoundError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"no vision encoder weights under </span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
     <span class="n">loaded</span> <span class="o">=</span> <span class="n">load_hf_weights</span><span class="p">(</span>
-        <span class="n">model</span><span class="p">,</span> <span class="n">iter_safetensors_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span>
+        <span class="n">model</span><span class="p">,</span> <span class="n">iter_safetensors_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">device</span><span class="p">),</span> <span class="n">stacked_params</span><span class="o">=</span><span class="n">VISION_STACKED</span><span class="p">,</span>
         <span class="n">name_remapper</span><span class="o">=</span><span class="n">vision_encoder_name_remapper</span><span class="p">,</span>
     <span class="p">)</span>
     <span class="n">expected</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="nb">dict</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">named_parameters</span><span class="p">())</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>

@@ -2564,13 +2564,16 @@ chat template opens a <code class="docutils literal notranslate"><span class="pr
 <span class="s1">  "enable_thinking": false}'</span>
 </pre></div>
 </div>
-<p>The reasoner is a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code>: its decode steps are captured into
-CUDA graphs per batch bucket, each compiled first: the eager decode step is over
-a thousand tiny kernels, and the fused step runs at the weight-streaming floor
-(about twice the uncompiled rate at batch size 1 on an H100). Its prefills, text
-and vision (one vision prompt a step), run eagerly and uncompiled. Concurrent chat requests share
-decode steps (continuous batching over the captured decode graphs, padded to the
-next batch bucket). Requests never see each other’s data, but the batch bucket changes the
+<p>The reasoner is a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> on the VLM scaffold: its decode steps
+are captured into CUDA graphs per batch bucket, each compiled first: the eager
+decode step is over a thousand tiny kernels, and the fused step runs at the
+weight-streaming floor (about twice the uncompiled rate at batch size 1 on an
+H100). Text prefills, mixed prefill + decode steps and image or video prefills
+(up to four prompts a step, each prompt one row with its vision tokens spliced
+in) are captured too, and a prompt past the largest bucket prefills eagerly.
+Concurrent chat requests share decode steps (continuous batching over the
+captured decode graphs, padded to the next batch bucket). Requests never see
+each other’s data, but the batch bucket changes the
 bf16 arithmetic of the step, so a long greedy answer can part from its solo run
 where two candidate tokens tie: in every measured divergence the two tokens’
 logits were equal or one bf16 ulp apart, the first differing token came after

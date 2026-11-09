@@ -19,6 +19,8 @@ mstar.model.cosmos3.loader
       read_transformer_weight_keys
       read_transformer_weight_shapes
       read_vision_encoder_weight_shapes
+      stacked_param_name
+      stacked_param_shapes
       vision_encoder_name_remapper
    
    
