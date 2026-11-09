@@ -775,6 +775,10 @@ The spec types are:
      - Block-causal self-attention within each span (``AttentionStep(causal=False)``): causal
        between ``block_size``-token blocks, bidirectional within one. Same config. See
        `Block-causal attention within spans`_.
+   * - ``BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...), block_size=...)``
+     - The same mask over a paged KV cache: a row's new tokens attend its cached blocks and
+       their own, and a step runs only new tokens. FlashInfer only. See `Block-causal
+       attention over a KV cache`_.
    * - ``PositionSpec(config=PositionConfig(kv_cache=...))``
      - Position tracking and RoPE. ``scheme`` is ``PosScheme.SEQUENTIAL`` or
        ``PosScheme.BLOCK``. The RoPE parameters are set here: ``rope_theta``,
@@ -1121,6 +1125,17 @@ for the worst layout the bucket's token count allows.
    72, which the FlashInfer kernel — it supports only a few fixed head dimensions — forces
    us to zero-pad to 128. So that tower attends through the resource only when it is
    replaying a captured graph, and runs flash-attn varlen otherwise.
+
+Block-causal attention over a KV cache
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Under a block-causal mask a frame's output never depends on a later block, so what a stream
+has already computed stays valid and need not be run again. Declare a paged ``KVSpec`` and a
+``BlockCausalAttentionSpec`` on it, with the block length as ``block_size``, and step only the
+new tokens: ``KVStep(commit=True)`` and ``AttentionStep(causal=False)``, the layer writing K/V
+as usual. A step's new tokens must start on a block, and may run several blocks: the KV plan's
+rows expand into one paged request per block, each reading its row's prefix pages. CosyVoice3's
+flow solves its hops this way, one KV layer per DiT block per Euler step.
 
 Bounded (sink + window) caches
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1612,6 +1627,8 @@ methods are:
    resource's request config sets ``ignore_eos``) or when the loop's iteration count plus
    one reaches ``max_iters`` (``info.max_tokens`` unless given). ``StopKind.ITER`` checks
    only the count, and ``StopKind.EOS`` only the token, for a loop whose cap is its budget.
+   ``ignores_eos=`` replaces ``sampler`` for a node with no such resource: a callable on
+   the forward-pass info, which it reads for every partition of the request on the worker.
    The limits are computed from the request's forward-pass info whenever
    the worker receives it, not per step. Return ``{}`` for a
    walk on which ``check_stop`` never stops a loop, and ``None`` (the default) to keep
@@ -2007,6 +2024,19 @@ is built with a ``comm_group`` and ``tp_world_size > 1``, the loader slices the 
 tensor along that parameter's shard dimension before copying it. For this reason, one
 ``load_weights`` path serves both single-GPU runs and tensor-parallel runs without change.
 
+A quantized checkpoint is refused at load unless the model reads its format itself. Without this, a
+model that knows only unquantized weights would load fp8 values unscaled and drop the scales and
+packed weights, and then serve garbage. There are two checks:
+
+- The safetensors iterators refuse a checkpoint that declares a quantization: ``quantization_config``
+  in ``config.json`` (HF fp8, AWQ, GPTQ, bitsandbytes, mxfp4, compressed-tensors, ModelOpt), ModelOpt's
+  ``hf_quant_config.json``, or AutoGPTQ's or AutoAWQ's config file.
+- ``load_weights_into`` refuses a quantized weight's part, such as ``weight_scale_inv``,
+  ``weight_scale``, ``weight_packed`` or ``qweight``, when no parameter takes it.
+
+A model that loads a format itself names its ``quant_method``. GLM-5.2 and GLM-5.3-Flash, for
+example, pass ``quant_methods=("fp8",)`` to ``load_weights`` and to the iterators.
+
 .. _step-5:
 
 Step 5 — Continuous batching and CUDA graphs
@@ -2243,6 +2273,10 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   naming the buffer.
 - ``forward_kwargs`` holds static keyword arguments that are passed to ``capture_fn`` on
   every call, for example a layer count or an ``is_causal`` flag.
+- ``required`` refuses to start the worker when any of the region's shapes is left out of
+  capture, for memory or by a failure, rather than serving those shapes eagerly. Set it on a
+  region with no eager path, such as one whose per-stream state only its captures read and
+  write. The default is ``False``.
 - ``declare_step`` has signature
   ``(request_ids, seq_lens) -> SubmoduleStep | None``. It declares the region's own
   resource work over the padded batch. It is separate from the submodule's
