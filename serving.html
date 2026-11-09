@@ -1151,11 +1151,12 @@ model’s defaults. See <em>Chunked prefill budgets</em> below.</p></td>
 <td><p><em>(optional)</em> Per node, a mapping of name -&gt; ladder: the token counts a packed
 graph capture is taken at, in place of the model’s. A name is a walk the
 node runs, for its packed captures on that walk (the model’s
-<code class="docutils literal notranslate"><span class="pre">capture_token_lengths</span></code>; Orpheus’s <code class="docutils literal notranslate"><span class="pre">mixed</span></code> steps replay its <code class="docutils literal notranslate"><span class="pre">prefill</span></code>
-capture, so name <code class="docutils literal notranslate"><span class="pre">prefill</span></code>), or the label of one of its piecewise packed
-regions, for that region’s <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> (BAGEL’s <code class="docutils literal notranslate"><span class="pre">vit_block_loop</span></code>,
-OmniVoice’s <code class="docutils literal notranslate"><span class="pre">backbone_layers</span></code>). A step pads to the smallest rung that
-holds it, and a longer one runs eagerly. A walk’s ladder is a list, or a
+<code class="docutils literal notranslate"><span class="pre">capture_token_lengths</span></code>; CosyVoice3’s <code class="docutils literal notranslate"><span class="pre">prefill</span></code> steps replay its
+<code class="docutils literal notranslate"><span class="pre">prefill_voice</span></code> capture, so name <code class="docutils literal notranslate"><span class="pre">prefill_voice</span></code>), or the label of
+one of its piecewise packed regions, for that region’s <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code>
+(BAGEL’s <code class="docutils literal notranslate"><span class="pre">vit_block_loop</span></code>, OmniVoice’s <code class="docutils literal notranslate"><span class="pre">backbone_layers</span></code>). A step
+pads to the smallest rung that holds it, and a longer one runs eagerly.
+A walk’s ladder is a list, or a
 mapping of min batch size -&gt; list for a ladder per range of batch sizes:
 <code class="docutils literal notranslate"><span class="pre">{1:</span> <span class="pre">[...],</span> <span class="pre">2:</span> <span class="pre">[...]}</span></code> captures one request on the first and every larger
 batch on the second (a larger batch size’s ladder must reach at least as

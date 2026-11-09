@@ -724,8 +724,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.add_request"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.add_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.assign_consumer_walks"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.assign_consumer_walks()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.chunks_for"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.chunks_for()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.consumption()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption_batch"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.consumption_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.edge_block"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.edge_block()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.edge_specs"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.edge_specs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.input_tensors"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.input_tensors()</span></code></a></li>
@@ -842,35 +840,6 @@ so it allocates nothing per row.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference internal" href="mstar.streaming.stream_buffer.html#mstar.streaming.stream_buffer.StreamChunkInfo" title="mstar.streaming.stream_buffer.StreamChunkInfo"><em>StreamChunkInfo</em></a>] | None</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.worker.stream_buffers.StreamBufferManager.consumption">
-<span class="sig-name descname"><span class="pre">consumption</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/stream_buffers.html#StreamBufferManager.consumption"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption" title="Link to this definition">#</a></dt>
-<dd><p>Items consumed so far per stream, as the producer is told.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>request_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.worker.stream_buffers.StreamBufferManager.consumption_batch">
-<span class="sig-name descname"><span class="pre">consumption_batch</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/stream_buffers.html#StreamBufferManager.consumption_batch"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption_batch" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">consumption</span></code> for the rids that have stream buffers at all; the
-rest would report an empty dict.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>rids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]]]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1161,8 +1130,6 @@ streamed edge would be missed, and its chunks routed to <code class="docutils li
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.add_request"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.add_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.assign_consumer_walks"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.assign_consumer_walks()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.chunks_for"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.chunks_for()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.consumption()</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.consumption_batch"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.consumption_batch()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.edge_block"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.edge_block()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.edge_specs"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.edge_specs()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.stream_buffers.StreamBufferManager.input_tensors"><code class="docutils literal notranslate"><span class="pre">StreamBufferManager.input_tensors()</span></code></a></li>

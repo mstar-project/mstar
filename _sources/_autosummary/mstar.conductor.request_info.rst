@@ -23,11 +23,11 @@ mstar.conductor.request\_info
 
    .. autosummary::
    
-      CurrentForwardConductorMetadata
       CurrentForwardPassInfo
       PartitionDefinition
       PartitionState
       StreamingConnectionState
+      WalkStep
    
    
 

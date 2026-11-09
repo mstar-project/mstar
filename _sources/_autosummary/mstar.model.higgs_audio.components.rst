@@ -28,5 +28,4 @@ mstar.model.higgs\_audio.components
    :recursive:
 
    audio_tower
-   llm
 

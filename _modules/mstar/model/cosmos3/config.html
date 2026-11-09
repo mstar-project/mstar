@@ -1413,9 +1413,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># it to bf16 rounding. Costs the cache per live stream, freed when the</span>
     <span class="c1"># stream's last window is decoded or the request goes away: 1.33 GiB of</span>
     <span class="c1"># tensors at 832x480 in bf16 (the Wan2.2 VAE), growing with the frame</span>
-    <span class="c1"># area, and twice that when the decode runs in fp32 (cuDNN before 9.16,</span>
-    <span class="c1"># or COSMOS3_VAE_DECODE_FP32). Sessions still store only latents. False</span>
-    <span class="c1"># re-decodes the context ahead of every window.</span>
+    <span class="c1"># area, and twice that when the decode runs in fp32 (cuDNN before 9.16).</span>
+    <span class="c1"># Sessions still store only latents. False re-decodes the context ahead</span>
+    <span class="c1"># of every window.</span>
     <span class="n">windowed_decode_warm_cache</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="c1"># At most this many streams per decoder copy hold a warm cache (0: no cap).</span>
     <span class="c1"># A stream that starts while the cap is reached takes the stateless</span>
@@ -1590,23 +1590,6 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># compiles mid-traffic; the per-request patchify, rotary tables and</span>
     <span class="c1"># unpatchify run eager.</span>
     <span class="n">compile_denoise_batched</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="c1"># torch.compile the reasoner's captured decode step before the CUDA-graph</span>
-    <span class="c1"># capture: at bs=1 the eager step is ~1240 kernels, ~1000 of them the</span>
-    <span class="c1"># norms', rotary's and residuals' pointwise pieces; fused, the step runs</span>
-    <span class="c1"># at the weight-streaming floor (H100: 4.2 -&gt; 2.05 ms/token). Env override</span>
-    <span class="c1"># COSMOS3_REASONER_COMPILE=0/1 for A/B.</span>
-    <span class="n">compile_reasoner_decode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="c1"># torch.compile the reasoner's eager prefill (text and vision prompts; the</span>
-    <span class="c1"># decode step has its own captured graph). The eager prefill of a ~300-token</span>
-    <span class="c1"># image prompt is ~1250 kernels for ~5 ms of GPU work (24 ms wall on an</span>
-    <span class="c1"># H100, launch-bound), so the fusion would take a third of that. Off by</span>
-    <span class="c1"># default: with dynamic shapes (one compile for every prompt length) torch</span>
-    <span class="c1"># 2.11's inductor fails in its joint-graph noop pass ("'SymInt' object has</span>
-    <span class="c1"># no attribute 'size'"), and a static compile recompiles per prompt length</span>
-    <span class="c1"># until automatic dynamic shapes route it into the same failure. Env</span>
-    <span class="c1"># override COSMOS3_REASONER_PREFILL_COMPILE=0/1 for the A/B once fixed</span>
-    <span class="c1"># upstream; the padded prefill graph (like the DiT's) is the real answer.</span>
-    <span class="n">compile_reasoner_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Which attention backends the DiT node declares (see</span>
     <span class="c1"># Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the</span>
     <span class="c1"># paged FlashInfer backend the understanding prefill and the captured</span>
@@ -1690,6 +1673,11 @@ window.runMermaid = runMermaid;</script>
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">serves_reasoner</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">reasoner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stop_token_ids</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""The reasoner's stop ids: its end of turn."""</span>
+        <span class="k">return</span> <span class="nb">frozenset</span><span class="p">({</span><span class="bp">self</span><span class="o">.</span><span class="n">reasoner</span><span class="o">.</span><span class="n">eos_token_id</span><span class="p">})</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">reasoner</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="nb">frozenset</span><span class="p">()</span>
 
 <div class="viewcode-block" id="Cosmos3Config.from_transformer_dict">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.cosmos3.config.html#mstar.model.cosmos3.Cosmos3Config.from_transformer_dict">[docs]</a>

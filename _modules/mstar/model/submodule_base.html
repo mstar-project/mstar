@@ -2691,10 +2691,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        ``END_PARTITION`` ends the request's partition after this pass, so</span>
 <span class="sd">        the conductor starts no further walk: e.g. a prefill whose sampled</span>
 <span class="sd">        token is a stop token, before its decode loop exists. Return it only</span>
-<span class="sd">        from a row outside any loop: from inside one, the request fails with</span>
-<span class="sd">        an internal error. Use it only when nothing else must run for the</span>
-<span class="sd">        partition (a later walk, a loop's final-only publication); the</span>
-<span class="sd">        model's transition still decides those.</span>
+<span class="sd">        from a row outside any loop, a chunked prefill's included (its chunk</span>
+<span class="sd">        Loop ends on the final chunk's pass, and a row mid-prefill decides no</span>
+<span class="sd">        stop): from inside another loop, the request fails with an internal</span>
+<span class="sd">        error. Use it only when nothing else must run for the</span>
+<span class="sd">        partition (a later step of its walk plan, a loop's final-only</span>
+<span class="sd">        publication): it ends the partition whatever the plan has left.</span>
 
 <span class="sd">        A ``StopCheck`` also names outputs of this step that are not routed</span>
 <span class="sd">        (``StopCheck.withheld``), decided off the same read; it may withhold</span>

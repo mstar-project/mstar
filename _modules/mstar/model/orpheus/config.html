@@ -1013,13 +1013,14 @@ window.runMermaid = runMermaid;</script>
   <h1>Source code for mstar.model.orpheus.config</h1><div class="highlight"><pre>
 <span></span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model</span><span class="w"> </span><span class="kn">import</span> <span class="n">keys</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.streaming.chunk_policy</span><span class="w"> </span><span class="kn">import</span> <span class="n">ScheduledLeftContextChunkPolicy</span>
 
-<span class="c1"># Constants</span>
-<span class="n">KV_CACHE</span> <span class="o">=</span> <span class="s2">"kv_cache"</span>
+<span class="c1"># resource keys this model declares; the shared scaffolds read `keys`' ones</span>
+<span class="n">KV_CACHE</span> <span class="o">=</span> <span class="n">keys</span><span class="o">.</span><span class="n">KV_CACHE</span>
 <span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
-<span class="n">SAMPLER</span> <span class="o">=</span> <span class="s2">"sampler"</span>
-<span class="n">ROPE</span> <span class="o">=</span> <span class="s2">"rope"</span>
+<span class="n">SAMPLER</span> <span class="o">=</span> <span class="n">keys</span><span class="o">.</span><span class="n">SAMPLER</span>
+<span class="n">ROPE</span> <span class="o">=</span> <span class="n">keys</span><span class="o">.</span><span class="n">ROPE</span>
 
 <span class="c1"># SNAC captures one CUDA graph per window size ``snac_window_frames`` lists, at</span>
 <span class="c1"># every capture batch size, so the widest window (left + right context +</span>
@@ -1061,7 +1062,8 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Special token IDs</span>
     <span class="n">start_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128259</span>
     <span class="n">end_token_ids</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="mi">128009</span><span class="p">,</span> <span class="mi">128260</span><span class="p">,</span> <span class="mi">128261</span><span class="p">,</span> <span class="mi">128257</span><span class="p">])</span>
-    <span class="n">stop_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128258</span>
+    <span class="c1"># end of speech</span>
+    <span class="n">stop_token_ids</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">({</span><span class="mi">128258</span><span class="p">})</span>
     <span class="n">pad_token_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128263</span>
     <span class="n">custom_token_base_id</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">128256</span>  <span class="c1"># vocab_id of &lt;custom_token_0&gt;</span>
 
@@ -1104,6 +1106,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">default_voice</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"tara"</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># The LM head computes the custom-token rows alone and reads -inf for</span>
+        <span class="c1"># the text rows (``output_start``), so a stop token must be one of them.</span>
+        <span class="k">if</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">stop_token_ids</span><span class="p">)</span> <span class="o">&lt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">custom_token_base_id</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"Orpheus's stop tokens must be custom tokens"</span><span class="p">)</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">default_voice</span> <span class="ow">not</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">available_voices</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">"default_voice </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">default_voice</span><span class="si">!r}</span><span class="s2"> is not in available_voices"</span>
@@ -1146,26 +1152,17 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="OrpheusModelConfig.snac_window_frames">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.model.orpheus.config.html#mstar.model.orpheus.config.OrpheusModelConfig.snac_window_frames">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">snac_window_frames</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">"""Every window size, in frames, a stream can hand the decoder.</span>
+<span class="w">        </span><span class="sd">"""Every window size, in frames, a stream can hand the decoder: every</span>
+<span class="sd">        width from one frame to the widest window the schedule pops.</span>
 
-<span class="sd">        The schedule's windows and every final flush: the policy runs over</span>
-<span class="sd">        each stream length until the windows repeat. The windows do not depend</span>
-<span class="sd">        on when tokens arrive, only on how many there are. A window shorter</span>
-<span class="sd">        than a frame (a stream shorter than a frame, or a final flush holding</span>
-<span class="sd">        only the EOS token) decodes one silent frame, as in ``prepare_inputs``.</span>
+<span class="sd">        A final flush can stop anywhere inside a chunk's window, and each</span>
+<span class="sd">        chunk's context is at most the previous window, so the flushes fill</span>
+<span class="sd">        every width below the widest. A window shorter than a frame (a stream</span>
+<span class="sd">        shorter than a frame, or a final flush holding only the EOS token)</span>
+<span class="sd">        decodes one silent frame, as in ``prepare_inputs``.</span>
 <span class="sd">        """</span>
-        <span class="n">tpf</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_frame</span>
-        <span class="n">steady</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_left_context_frames</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_right_context_frames</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_frames</span>
-        <span class="n">sizes</span> <span class="o">=</span> <span class="p">{</span><span class="mi">1</span><span class="p">}</span>
-        <span class="k">for</span> <span class="n">frames</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">sum</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_schedule</span><span class="p">)</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">steady</span> <span class="o">+</span> <span class="mi">1</span><span class="p">):</span>
-            <span class="n">policy</span><span class="p">,</span> <span class="n">left</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_policy</span><span class="p">(),</span> <span class="n">frames</span> <span class="o">*</span> <span class="n">tpf</span> <span class="o">+</span> <span class="mi">1</span>  <span class="c1"># the EOS token streams last</span>
-            <span class="k">while</span> <span class="n">policy</span><span class="o">.</span><span class="n">is_ready</span><span class="p">(</span><span class="n">left</span><span class="p">):</span>
-                <span class="n">sizes</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">policy</span><span class="o">.</span><span class="n">window_size</span><span class="p">()</span> <span class="o">//</span> <span class="n">tpf</span><span class="p">)</span>
-                <span class="n">stride</span> <span class="o">=</span> <span class="n">policy</span><span class="o">.</span><span class="n">next_chunk_size</span><span class="p">(</span><span class="n">left</span><span class="p">)</span>
-                <span class="n">policy</span><span class="o">.</span><span class="n">register_chunk</span><span class="p">(</span><span class="n">stride</span><span class="p">)</span>
-                <span class="n">left</span> <span class="o">-=</span> <span class="n">stride</span>
-            <span class="n">sizes</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">left</span> <span class="o">//</span> <span class="n">tpf</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>
-        <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">sizes</span><span class="p">)</span></div>
+        <span class="n">widest</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">snac_chunk_policy</span><span class="p">()</span><span class="o">.</span><span class="n">window_sizes</span><span class="p">())</span> <span class="o">//</span> <span class="bp">self</span><span class="o">.</span><span class="n">tokens_per_frame</span>
+        <span class="k">return</span> <span class="nb">list</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">widest</span> <span class="o">+</span> <span class="mi">1</span><span class="p">))</span></div>
 </div>
 
 </pre></div>

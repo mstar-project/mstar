@@ -744,8 +744,8 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.SentencePieceDetokenizer"><code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.SentencePieceDetokenizer.piece_bytes"><code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer.piece_bytes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.SentencePieceDetokenizer.to_bytes"><code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer.to_bytes()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.SentencePieceDetokenizer.token_bytes"><code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer.token_bytes()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.TextChunkDetokenizer"><code class="docutils literal notranslate"><span class="pre">TextChunkDetokenizer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1038,11 +1038,11 @@ per token, so a character split across byte pieces reassembles client-side.</p>
 </dd>
 </dl>
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.utils.SentencePieceDetokenizer.piece_bytes">
-<span class="sig-name descname"><span class="pre">piece_bytes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">token_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#SentencePieceDetokenizer.piece_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.SentencePieceDetokenizer.piece_bytes" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.model.utils.SentencePieceDetokenizer.to_bytes">
+<span class="sig-name descname"><span class="pre">to_bytes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">token_ids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#SentencePieceDetokenizer.to_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.SentencePieceDetokenizer.to_bytes" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>token_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+<dd class="field-odd"><p><strong>token_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
@@ -1051,11 +1051,11 @@ per token, so a character split across byte pieces reassembles client-side.</p>
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.utils.SentencePieceDetokenizer.to_bytes">
-<span class="sig-name descname"><span class="pre">to_bytes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">token_ids</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#SentencePieceDetokenizer.to_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.SentencePieceDetokenizer.to_bytes" title="Link to this definition">#</a></dt>
+<dt class="sig sig-object py" id="mstar.model.utils.SentencePieceDetokenizer.token_bytes">
+<span class="sig-name descname"><span class="pre">token_bytes</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">token_id</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#SentencePieceDetokenizer.token_bytes"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.SentencePieceDetokenizer.token_bytes" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>token_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p>
+<dd class="field-odd"><p><strong>token_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#bytes" title="(in Python v3.12)">bytes</a></p>
@@ -1119,14 +1119,14 @@ derive their text paths from it.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
-<li><p><strong>detokenizer</strong> (<a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><em>ByteLevelDetokenizer</em></a><em> | </em><a class="reference internal" href="#mstar.model.utils.TextChunkDetokenizer" title="mstar.model.utils.TextChunkDetokenizer"><em>TextChunkDetokenizer</em></a>)</p></li>
+<li><p><strong>detokenizer</strong> (<a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><em>ByteLevelDetokenizer</em></a><em> | </em><a class="reference internal" href="#mstar.model.utils.TextChunkDetokenizer" title="mstar.model.utils.TextChunkDetokenizer"><em>TextChunkDetokenizer</em></a><em> | </em><a class="reference internal" href="#mstar.model.utils.SentencePieceDetokenizer" title="mstar.model.utils.SentencePieceDetokenizer"><em>SentencePieceDetokenizer</em></a>)</p></li>
 <li><p><strong>stop_token_ids</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Container" title="(in Python v3.12)"><em>Container</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.utils.TextOutput.detokenizer">
-<span class="sig-name descname"><span class="pre">detokenizer</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><span class="pre">ByteLevelDetokenizer</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.TextChunkDetokenizer" title="mstar.model.utils.TextChunkDetokenizer"><span class="pre">TextChunkDetokenizer</span></a></span><a class="headerlink" href="#mstar.model.utils.TextOutput.detokenizer" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">detokenizer</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.ByteLevelDetokenizer" title="mstar.model.utils.ByteLevelDetokenizer"><span class="pre">ByteLevelDetokenizer</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.TextChunkDetokenizer" title="mstar.model.utils.TextChunkDetokenizer"><span class="pre">TextChunkDetokenizer</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.model.utils.SentencePieceDetokenizer" title="mstar.model.utils.SentencePieceDetokenizer"><span class="pre">SentencePieceDetokenizer</span></a></span><a class="headerlink" href="#mstar.model.utils.TextOutput.detokenizer" title="Link to this definition">#</a></dt>
 <dd><p>Alias for field number 0</p>
 </dd></dl>
 
@@ -1521,8 +1521,8 @@ serving config entry that sets it.</p>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.SentencePieceDetokenizer"><code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.SentencePieceDetokenizer.piece_bytes"><code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer.piece_bytes()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.SentencePieceDetokenizer.to_bytes"><code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer.to_bytes()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.SentencePieceDetokenizer.token_bytes"><code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer.token_bytes()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.TextChunkDetokenizer"><code class="docutils literal notranslate"><span class="pre">TextChunkDetokenizer</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

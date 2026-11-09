@@ -1011,28 +1011,18 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.conductor.request_info</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">types</span><span class="w"> </span><span class="kn">import</span> <span class="n">MappingProxyType</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">PublishedInfo</span><span class="p">,</span> <span class="n">ResourceReqConfig</span>
 
-
-<div class="viewcode-block" id="CurrentForwardConductorMetadata">
-<a class="viewcode-back" href="../../../_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardConductorMetadata">[docs]</a>
-<span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">CurrentForwardConductorMetadata</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""</span>
-<span class="sd">    Full-model forward pass-level metadata for running the current</span>
-<span class="sd">    forward pass. On the conductor/model level.</span>
-<span class="sd">    """</span>
-    <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">is_prefill</span><span class="p">:</span> <span class="nb">bool</span>
-    <span class="n">input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
-    <span class="n">output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
-    <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
-
-
-
 <span class="n">DEFAULT_PARTITION</span> <span class="o">=</span> <span class="s2">"default"</span>
+
+<span class="c1"># Step metadata a walk plan sets on the step that samples the reply's first</span>
+<span class="c1"># token, the last prefill before decode (`TokenStop.last_prefill_flag`).</span>
+<span class="n">FINAL_PREFILL</span> <span class="o">=</span> <span class="s2">"final_prefill"</span>
 
 
 <div class="viewcode-block" id="CurrentForwardPassInfo">
@@ -1120,13 +1110,30 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">PartitionDefinition</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Defines a partition within a model's computation graph.</span>
 
-<span class="sd">    Each partition has its own set of graph walks and transition logic,</span>
-<span class="sd">    and can run asynchronously relative to other partitions.</span>
+<span class="sd">    Each partition has its own set of graph walks and its own walk plan</span>
+<span class="sd">    (`Model.walk_plan`), and can run asynchronously relative to other</span>
+<span class="sd">    partitions.</span>
 <span class="sd">    """</span>
     <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>                                                   <span class="c1"># e.g., "LLM", "SNAC"</span>
-    <span class="n">graph_walks</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>                                       <span class="c1"># walks this partition uses</span>
-    <span class="n">initial_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>                             <span class="c1"># first walk, or None = triggered later</span>
-    <span class="n">producer_partitions</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>  <span class="c1"># partitions feeding tokens to this one</span></div>
+    <span class="n">graph_walks</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>                                       <span class="c1"># walks this partition uses</span></div>
+
+
+
+<div class="viewcode-block" id="WalkStep">
+<a class="viewcode-back" href="../../../_autosummary/mstar.conductor.request_info.html#mstar.conductor.request_info.WalkStep">[docs]</a>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">WalkStep</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""One step of a partition's plan (`Model.walk_plan`): a walk to run.</span>
+
+<span class="sd">    The conductor sends each input of the walk, other than a streamed one, the</span>
+<span class="sd">    persisted signal of the same name, or an empty edge when there is none.</span>
+<span class="sd">    ``bind`` renames: ``{"text_inputs": "new_token"}`` feeds a decode loop's</span>
+<span class="sd">    ``text_inputs`` the prefill's ``new_token``. ``step_metadata`` reaches</span>
+<span class="sd">    every node of the walk.</span>
+<span class="sd">    """</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">bind</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">MappingProxyType</span><span class="p">({})</span>
+    <span class="n">step_metadata</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">MappingProxyType</span><span class="p">({})</span></div>
 
 
 
@@ -1140,8 +1147,6 @@ window.runMermaid = runMermaid;</script>
     <span class="n">from_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">to_partition</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">edge_name</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">token_count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="n">consumed_count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">producer_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># destination worker -&gt; stream items the producer sent there, which</span>
     <span class="c1"># producer_done carries so the consumer waits for the last of them</span>
@@ -1155,7 +1160,8 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">PartitionState</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Per-partition conductor-level state for a request."""</span>
     <span class="n">partition_name</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="n">metadata</span><span class="p">:</span> <span class="n">CurrentForwardConductorMetadata</span>
+    <span class="c1"># the walk running: the plan's current step, or the walk a stream moved it to</span>
+    <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">""</span>
     <span class="n">fwd_pass_number</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">random_seed</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">is_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
@@ -1166,6 +1172,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># a report since the last advance set `partition_done` (it can be the</span>
     <span class="c1"># next pass's; see `Conductor._process_done_forward`)</span>
     <span class="n">worker_reported_done</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="c1"># the walks this request runs here (`Model.walk_plan`), and the step running</span>
+    <span class="n">plan</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">WalkStep</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">list</span><span class="p">)</span>
+    <span class="n">cursor</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="n">num_output_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span>
     <span class="c1"># resource label -&gt; PublishedInfo, accumulated across all TP ranks and</span>
     <span class="c1"># handed back out on the next forward</span>

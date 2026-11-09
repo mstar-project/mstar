@@ -1027,7 +1027,7 @@ steps.  <code class="docutils literal notranslate"><span class="pre">use_cache</
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>Per-request decoding knobs and their defaults.</p>
 <p>Every one of these is per-request: they ride <code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> and are
-resolved once in <code class="docutils literal notranslate"><span class="pre">OmniVoiceModel.get_initial_forward_pass_args</span></code>.  This is
+resolved once in <code class="docutils literal notranslate"><span class="pre">OmniVoiceModel.walk_plan</span></code>.  This is
 the reason to serve OmniVoice on a graph runtime at all — a fixed-pipeline
 port has to pick one value for the whole server.</p>
 <dl class="field-list simple">

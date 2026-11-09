@@ -1073,7 +1073,7 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Per-request decoding knobs and their defaults.</span>
 
 <span class="sd">    Every one of these is per-request: they ride ``step_metadata`` and are</span>
-<span class="sd">    resolved once in ``OmniVoiceModel.get_initial_forward_pass_args``.  This is</span>
+<span class="sd">    resolved once in ``OmniVoiceModel.walk_plan``.  This is</span>
 <span class="sd">    the reason to serve OmniVoice on a graph runtime at all — a fixed-pipeline</span>
 <span class="sd">    port has to pick one value for the whole server.</span>
 <span class="sd">    """</span>
@@ -1087,7 +1087,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">denoise</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="c1"># Ceiling for the unmask Loop's ``max_iters``.  A request's own num_step</span>
-    <span class="c1"># stops the loop early via check_stop; this only bounds the graph.</span>
+    <span class="c1"># is the loop's cap; this only bounds the graph.</span>
     <span class="n">max_num_step</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span></div>
 
 

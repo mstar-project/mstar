@@ -824,19 +824,15 @@ or on many, and only the config changes.</p></li>
 (<code class="docutils literal notranslate"><span class="pre">mstar/communication/tensors.py</span></code>). It maps an edge name to a list of tensors. The list
 usually has length 1.</p>
 <p>The diagram below shows the request flow at the conductor and model level. Its
-granularity is one graph walk. The conductor is notified when a walk completes, and only
-then asks the model what to do next. Everything that happens inside a walk is described
-in later steps and is omitted here:</p>
+granularity is one graph walk. The model decides at ingest which walks a request runs; the
+conductor runs them in order, moving on as each walk completes. Everything that happens
+inside a walk is described in later steps and is omitted here:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span>process_prompt()              # text/media -&gt; initial tensors
      │
      ▼
-get_initial_forward_pass_args()   # seed the first graph walk (e.g. prefill)
+walk_plan()                   # per partition: the walks to run (e.g. prefill, decode)
      │
-     ▼   (conductor walks the graph, the engine runs each node)
-get_partition_forward_pass_args() # asked after each graph walk completes:
-                                  #   what's next? done?
-     │
-     ▼
+     ▼   (conductor sends each walk its inputs, the engine runs each node)
 postprocess()                 # model output tensor -&gt; bytes for the client
 </pre></div>
 </div>
@@ -930,13 +926,38 @@ the text attached, and is <code class="docutils literal notranslate"><span class
 separately. <a class="reference internal" href="_autosummary/mstar.model.multimodal.html#module-mstar.model.multimodal" title="mstar.model.multimodal"><code class="xref py py-mod docutils literal notranslate"><span class="pre">mstar.model.multimodal</span></code></a> turns either into the prefill plan
 that <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> and the schedule builder both work from.</p>
 </dd>
-<dt><code class="docutils literal notranslate"><span class="pre">get_initial_forward_pass_args(self,</span> <span class="pre">partition_name,</span> <span class="pre">input_modalities,</span> <span class="pre">output_modalities,</span> <span class="pre">input_signals,</span> <span class="pre">model_kwargs=None)</span> <span class="pre">-&gt;</span> <span class="pre">ForwardPassArgs</span></code></dt><dd><p>Build the first <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.base.ForwardPassArgs</span></code> for a partition. It names
-the graph walk to start on and the input edges that feed it.</p>
-</dd>
-<dt><code class="docutils literal notranslate"><span class="pre">get_partition_forward_pass_args(self,</span> <span class="pre">partition_name,</span> <span class="pre">partition_metadata,</span> <span class="pre">persist_signals,</span> <span class="pre">incoming_connections=None)</span> <span class="pre">-&gt;</span> <span class="pre">ForwardPassArgs</span></code></dt><dd><p>The conductor calls this after each graph walk completes. It returns the next walk,
-the inputs for that walk, and whether the request is finished
-(<code class="docutils literal notranslate"><span class="pre">request_done=True</span></code>). A simple prefill-decode model sets <code class="docutils literal notranslate"><span class="pre">is_prefill</span></code> to false
-once, then repeats the decode walk until EOS.</p>
+<dt><code class="docutils literal notranslate"><span class="pre">walk_plan(self,</span> <span class="pre">partition_name,</span> <span class="pre">input_modalities,</span> <span class="pre">output_modalities,</span> <span class="pre">input_signals,</span> <span class="pre">model_kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">list[WalkStep]</span></code></dt><dd><p>The walks a partition runs for this request, in order, as
+<code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.model.base.WalkStep</span></code> s; <code class="docutils literal notranslate"><span class="pre">[]</span></code> when the request doesn’t use the
+partition. A prefill-decode model returns
+<code class="docutils literal notranslate"><span class="pre">[WalkStep(&quot;prefill&quot;),</span> <span class="pre">WalkStep(&quot;decode&quot;,</span> <span class="pre">bind={&quot;text_inputs&quot;:</span> <span class="pre">&quot;new_token&quot;})]</span></code>.
+The conductor derives each step’s input edges from the walk’s graph: every external
+and loop-back input that no stream feeds gets the persisted signal of its own name,
+the one <code class="docutils literal notranslate"><span class="pre">bind</span></code> names, or an empty edge (a denoise loop’s seed, a chunk loop’s tick).
+A persisted tensor a step reads is released when the step is sent, unless a later step
+of some partition reads it with no walk of that partition persisting the name in
+between; anything else stays held until the request ends. <code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> carries
+request constants to every node of the step’s walk. The step that samples the reply’s
+first token, the last prefill before decode, sets <code class="docutils literal notranslate"><span class="pre">FINAL_PREFILL</span></code> (from
+<code class="docutils literal notranslate"><span class="pre">mstar.conductor.request_info</span></code>) in its step metadata; <code class="docutils literal notranslate"><span class="pre">media_prefill_step</span></code> does
+this for a <code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code>.
+A step whose walk a stream feeds and that runs no Loop but chunk loops runs once per
+chunk until the worker reports the stream’s final chunk, its inputs’ tensors sent with
+the first chunk only; any other step advances when its walk reports, and the partition
+is done after its last step. A <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> here refuses the request with a 400, and
+so does a plan of <code class="docutils literal notranslate"><span class="pre">[]</span></code> for every partition (nothing would ever run). A plan the
+conductor can’t run is a model bug, refused with a 500: a step whose walk is not one of
+its partition’s, a <code class="docutils literal notranslate"><span class="pre">bind</span></code> key that is not an input of the step’s walk, a step after
+one that runs once per chunk (only the stream’s end, which ends the partition, moves
+past it), or a later step whose walk takes no input the conductor sends (it moves a
+worker onto a step only by sending it inputs).
+In a partition a stream moves (<code class="docutils literal notranslate"><span class="pre">Connection.consumer_walk</span></code>), the stream decides how
+many passes each step runs, but the conductor moves past a step on its first report
+when it is the last step (the partition ends) or the next step takes inputs it sends,
+so such a step must run once (a <code class="docutils literal notranslate"><span class="pre">Loop</span></code>, say). Such a partition’s plan must list every
+walk the stream can move it to: before the partition’s last pass, a report of a walk
+the plan doesn’t run fails the request.
+Qwen3.5 (through <code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code>), Z-Image, Orpheus and Chatterbox are
+references.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">get_submodule(self,</span> <span class="pre">node_name,</span> <span class="pre">device=&quot;cpu&quot;,</span> <span class="pre">tp_group=None,</span> <span class="pre">autocast_dtype=None,</span> <span class="pre">sp_group=None,</span> <span class="pre">moe_parallel=None,</span> <span class="pre">cfg_group=None)</span> <span class="pre">-&gt;</span> <span class="pre">NodeSubmodule</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Build and return the <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> for <code class="docutils literal notranslate"><span class="pre">node_name</span></code>, and cache the result. Load
 weights here, on <code class="docutils literal notranslate"><span class="pre">device</span></code>. Return <code class="docutils literal notranslate"><span class="pre">None</span></code> for dummy mode.</p>
@@ -978,50 +999,58 @@ with an error that names the kwarg.</p>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>The metadata <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> returns is laid over the request’s own
-<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, so a key the model reads back there (a prompt layout, a
-stream lead) must be set in every mode and listed in <code class="docutils literal notranslate"><span class="pre">INTERNAL_KWARGS</span></code>: the
-data worker drops a client’s value for it before <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code>. Qwen3-TTS
-lists its prompt layout, speaker, language, clip digest and codec stream lead.</p>
+<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, so a key the model reads back there (a prompt layout) must be
+set in every mode and listed in <code class="docutils literal notranslate"><span class="pre">INTERNAL_KWARGS</span></code>: the data worker drops a
+client’s value for it before <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code>. Qwen3-TTS lists its prompt
+layout, speaker, language and clip digest.</p>
 </div>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
-<p>The conductor merges each walk’s <code class="docutils literal notranslate"><span class="pre">ForwardPassArgs.step_metadata</span></code> into the
-request’s <code class="docutils literal notranslate"><span class="pre">metadata.kwargs</span></code>, so a request fact stored under a key that a
-later walk’s step metadata also uses is overwritten by that walk’s value. Keep
-such facts under their own key: LTX-2.5 nests the request’s geometry under
-<code class="docutils literal notranslate"><span class="pre">kwargs[&quot;request&quot;]</span></code>, since its stage-1 walk sends a half-size <code class="docutils literal notranslate"><span class="pre">height</span></code>.</p>
+<p>A stream that starts with context-only items (a voice clone’s reference frames)
+says so in the metadata as <code class="docutils literal notranslate"><span class="pre">&quot;stream_lead_items&quot;:</span> <span class="pre">{edge:</span> <span class="pre">n}</span></code>: <code class="docutils literal notranslate"><span class="pre">edge</span></code> names a
+streaming <code class="docutils literal notranslate"><span class="pre">Connection</span></code>, and <code class="docutils literal notranslate"><span class="pre">n</span></code>, at most that edge’s policy’s left context,
+leads the first window as context and is never output. Leave the key out when
+<code class="docutils literal notranslate"><span class="pre">n</span></code> is 0. The data worker drops a client’s value, and the consumer partition’s
+workers prime the stream with it (Qwen3-TTS, VoxCPM2).</p>
 </div>
 <p>The following methods have defaults and are optional to override:
 <code class="docutils literal notranslate"><span class="pre">text_output</span></code>, <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> and <code class="docutils literal notranslate"><span class="pre">postprocess_inline</span></code> (described next),
 <code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code> (described below), <code class="docutils literal notranslate"><span class="pre">get_sampling_config</span></code>,
 <code class="docutils literal notranslate"><span class="pre">get_max_output_tokens</span></code>, <code class="docutils literal notranslate"><span class="pre">get_autocast_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">load_image</span></code>, <code class="docutils literal notranslate"><span class="pre">load_audio</span></code>,
 <code class="docutils literal notranslate"><span class="pre">load_video</span></code>, <code class="docutils literal notranslate"><span class="pre">load_decoded_image</span></code>, and the partition methods described at the end
-of this page. <code class="docutils literal notranslate"><span class="pre">load_decoded_image</span></code> takes an image the API server already holds decoded
-(RGB uint8 <code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, from the openpi WebSocket) and must return what <code class="docutils literal notranslate"><span class="pre">load_image</span></code>
-returns for the same pixels in a file. The default refuses, so a model takes images only as
-files until it overrides this. pi0.5’s <code class="docutils literal notranslate"><span class="pre">load_image</span></code> calls it, so the two paths cannot
-drift apart. A robot policy also overrides <code class="docutils literal notranslate"><span class="pre">robot_io</span></code>, returning a <code class="docutils literal notranslate"><span class="pre">RobotIO</span></code>: the
-<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> key its robot state goes under, and the <code class="docutils literal notranslate"><span class="pre">[action_horizon,</span> <span class="pre">action_dim]</span></code>
-shape of the float32 actions its <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> returns. The openpi WebSocket serves a
-model by these two hooks alone, so a new policy needs no change to the API server.</p>
+of this page. The default <code class="docutils literal notranslate"><span class="pre">load_audio</span></code> decodes an upload to mono at the class attribute
+<code class="docutils literal notranslate"><span class="pre">AUDIO_INPUT_RATE</span></code> (16 kHz) and refuses one longer than <code class="docutils literal notranslate"><span class="pre">MAX_AUDIO_SECONDS</span></code> (30
+minutes); set those rather than overriding it. <code class="docutils literal notranslate"><span class="pre">load_decoded_image</span></code> takes an image the
+API server already holds decoded (RGB uint8 <code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">H,</span> <span class="pre">W]</span></code>, from the openpi WebSocket) and
+must return what <code class="docutils literal notranslate"><span class="pre">load_image</span></code> returns for the same pixels in a file. The default refuses,
+so a model takes images only as files until it overrides this. pi0.5’s <code class="docutils literal notranslate"><span class="pre">load_image</span></code> calls
+it, so the two paths cannot drift apart. A robot policy also overrides <code class="docutils literal notranslate"><span class="pre">robot_io</span></code>,
+returning a <code class="docutils literal notranslate"><span class="pre">RobotIO</span></code>: the <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code> key its robot state goes under, and the
+<code class="docutils literal notranslate"><span class="pre">[action_horizon,</span> <span class="pre">action_dim]</span></code> shape of the float32 actions its <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> returns.
+The openpi WebSocket serves a model by these two hooks alone, so a new policy needs no
+change to the API server.</p>
 <dl class="simple">
 <dt><code class="docutils literal notranslate"><span class="pre">text_output(self)</span> <span class="pre">-&gt;</span> <span class="pre">TextOutput</span> <span class="pre">|</span> <span class="pre">None</span></code></dt><dd><p>Declare how text output (token ids) becomes bytes: a detokenizer, and the ids that
 end a reply, which are dropped unless the request sets <code class="docutils literal notranslate"><span class="pre">ignore_eos</span></code>.
 <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> and <code class="docutils literal notranslate"><span class="pre">postprocess_inline</span></code> derive their text paths from it. A text
 chunk may end inside a character, since the API server joins a request’s text
-chunks before decoding them, so a byte-level BPE model should declare
-<code class="docutils literal notranslate"><span class="pre">mstar.model.utils.TextChunkDetokenizer</span></code> (or <code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer</span></code>), which
-emits each token’s raw bytes, rather than <code class="docutils literal notranslate"><span class="pre">tokenizer.decode([id])</span></code>, which turns
-a split character into U+FFFD.</p>
+chunks before decoding them, so declare a detokenizer from <code class="docutils literal notranslate"><span class="pre">mstar.model.utils</span></code>
+that emits each token’s raw bytes (<code class="docutils literal notranslate"><span class="pre">TextChunkDetokenizer</span></code> or
+<code class="docutils literal notranslate"><span class="pre">ByteLevelDetokenizer</span></code> for byte-level BPE, <code class="docutils literal notranslate"><span class="pre">SentencePieceDetokenizer</span></code> for a
+SentencePiece vocabulary) rather than <code class="docutils literal notranslate"><span class="pre">tokenizer.decode([id])</span></code>, which turns a
+split character into U+FFFD.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">postprocess(self,</span> <span class="pre">output,</span> <span class="pre">modality,</span> <span class="pre">request_kwargs=None)</span> <span class="pre">-&gt;</span> <span class="pre">bytes</span></code></dt><dd><p>Encode a finished output tensor to bytes for the client: <code class="docutils literal notranslate"><span class="pre">utf-8</span></code> for text, PNG for
-images, raw PCM for audio, and so on. Override it for any modality other than
-text, and hand text to <code class="docutils literal notranslate"><span class="pre">super().postprocess</span></code>.</p>
+images, and so on. The default encodes text through <code class="docutils literal notranslate"><span class="pre">text_output</span></code> and mono audio
+as headerless 16-bit PCM (a float waveform in [-1, 1] is scaled and truncated;
+integer samples are cast), and raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> for any other modality. Override
+it for those, or for audio with more than one channel, and hand the rest to
+<code class="docutils literal notranslate"><span class="pre">super().postprocess</span></code>.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">postprocess_inline(self,</span> <span class="pre">values,</span> <span class="pre">modality,</span> <span class="pre">request_kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">list[bytes]</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">postprocess</span></code> for one decode step’s inline values (one sampled token id per
 request), called once per step. With <code class="docutils literal notranslate"><span class="pre">text_output</span></code> declared, each id maps to
-its memoized bytes; otherwise each value goes through <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> as a
-one-element tensor.</p>
+its bytes (the detokenizer’s <code class="docutils literal notranslate"><span class="pre">token_bytes</span></code>); otherwise each value goes through
+<code class="docutils literal notranslate"><span class="pre">postprocess</span></code> as a one-element tensor.</p>
 </dd>
 </dl>
 <p><code class="docutils literal notranslate"><span class="pre">Model.nodes</span></code> is a read-only property. It returns the sorted set of node names that
@@ -1032,13 +1061,13 @@ appear in any graph walk.</p>
 differ per request, such as sampling parameters and the set of cache labels a request
 uses, come from a separate method:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">get_request_resource_configs</span><span class="p">(</span>
-    <span class="bp">self</span><span class="p">,</span> <span class="n">partition_fwd_args</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ForwardPassArgs</span><span class="p">],</span>
-    <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+    <span class="bp">self</span><span class="p">,</span> <span class="n">input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">ResourceReqConfig</span><span class="p">]</span>
 </pre></div>
 </div>
 <p>The returned dict is keyed by <code class="docutils literal notranslate"><span class="pre">resource_key</span></code>. The conductor calls this method once per
-request, and the engine passes each config to its resource when the request is ingested.
+request, with the request’s modalities and kwargs as <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> gets them, and the
+engine passes each config to its resource when the request is ingested.
 There are two <code class="docutils literal notranslate"><span class="pre">ResourceReqConfig</span></code> subclasses:</p>
 <ul>
 <li><p><code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code> holds <code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span></code>,
@@ -1089,8 +1118,7 @@ streams.</p></li>
 </ul>
 <p>Orpheus shows the simple case. It has one sampler, and reads the parameters from
 <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_request_resource_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">partition_fwd_args</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
-    <span class="n">model_kwargs</span> <span class="o">=</span> <span class="n">model_kwargs</span> <span class="ow">or</span> <span class="p">{}</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">get_request_resource_configs</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_modalities</span><span class="p">,</span> <span class="n">output_modalities</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">):</span>
     <span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"temperature"</span><span class="p">,</span> <span class="s2">"top_p"</span><span class="p">,</span> <span class="s2">"repetition_penalty"</span><span class="p">,</span> <span class="s2">"ignore_eos"</span><span class="p">]</span>
     <span class="k">return</span> <span class="p">{</span>
         <span class="n">SAMPLER</span><span class="p">:</span> <span class="n">SamplingReqConfig</span><span class="p">(</span>
@@ -1177,15 +1205,20 @@ BAGEL lays out its prompt:</p>
 </div>
 <dl class="simple">
 <dt><code class="docutils literal notranslate"><span class="pre">get_loop_caps(self,</span> <span class="pre">**model_kwargs)</span> <span class="pre">-&gt;</span> <span class="pre">dict[str,</span> <span class="pre">int]</span></code></dt><dd><p>The iterations each named loop may run for this request. The conductor refuses a request
-whose cap is past its loop’s graph <code class="docutils literal notranslate"><span class="pre">max_iters</span></code>, or whose layout at its caps holds more
+whose cap is below 1 or past its loop’s graph <code class="docutils literal notranslate"><span class="pre">max_iters</span></code>, or whose layout at its caps holds more
 positions than its pool’s <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, with a 400. A request that sets no length has
-the default <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> cut to the context its prompt leaves, and a stop check
-reads that length from <code class="docutils literal notranslate"><span class="pre">request_info.max_tokens</span></code>, which carries the cut. A model that
-reads a length from another key lists it in <code class="docutils literal notranslate"><span class="pre">LENGTH_KWARGS</span></code>. Speculation never runs past a
-cap. A model whose stop
-check ends a loop at a count returns that count, so the cap and the stop check end the
-loop on the same iteration; <code class="docutils literal notranslate"><span class="pre">test/modular/test_model_kv_layouts.py</span></code> checks this for
-every model. Growth on an uncapped loop is counted to its graph <code class="docutils literal notranslate"><span class="pre">max_iters</span></code>.</p>
+the default <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> cut to the context its prompt leaves, and
+<code class="docutils literal notranslate"><span class="pre">request_info.max_tokens</span></code> carries the cut. A model that reads a length from another key
+lists it in <code class="docutils literal notranslate"><span class="pre">LENGTH_KWARGS</span></code>. Speculation never runs past a cap, so the cap is the
+loop’s budget. A model with an AR decode loop names it in the class attribute
+<code class="docutils literal notranslate"><span class="pre">DECODE_LOOP</span></code>, and the default <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code> caps it at <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1</span></code>,
+the prefill having sampled the first token; its stop check counts nothing. A model with
+other loops whose count each request knows up front (denoise steps, rollout frames)
+overrides <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code> to add them, calling <code class="docutils literal notranslate"><span class="pre">super()</span></code> for the decode loop, and its
+stop check counts nothing either. A model whose own stop check still ends a loop at a
+count returns that count, so the two end the loop on the same iteration;
+<code class="docutils literal notranslate"><span class="pre">test/modular/test_model_kv_layouts.py</span></code> checks caps per model. Growth on an uncapped
+loop is counted to its graph <code class="docutils literal notranslate"><span class="pre">max_iters</span></code>.</p>
 </dd>
 </dl>
 <p>Where <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> computes a length that a walk computes another way, such as a
@@ -1645,8 +1678,9 @@ steps none of whose rows names an adapter, in every kind of capture; and a sampl
 model declares nothing for these.</p>
 <p>Orpheus declares four specs for its one autoregressive node. Its <code class="docutils literal notranslate"><span class="pre">snac_decoder</span></code> node
 appears in no spec, so it receives no resources:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># mstar/model/orpheus/config.py</span>
-<span class="n">KV_CACHE</span><span class="p">,</span> <span class="n">ATTN</span><span class="p">,</span> <span class="n">SAMPLER</span><span class="p">,</span> <span class="n">ROPE</span> <span class="o">=</span> <span class="s2">"kv_cache"</span><span class="p">,</span> <span class="s2">"attn"</span><span class="p">,</span> <span class="s2">"sampler"</span><span class="p">,</span> <span class="s2">"rope"</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># mstar/model/orpheus/config.py: the keys its SampledTokenDecoder reads, and its attention's</span>
+<span class="n">KV_CACHE</span><span class="p">,</span> <span class="n">SAMPLER</span><span class="p">,</span> <span class="n">ROPE</span> <span class="o">=</span> <span class="n">keys</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span> <span class="n">keys</span><span class="o">.</span><span class="n">SAMPLER</span><span class="p">,</span> <span class="n">keys</span><span class="o">.</span><span class="n">ROPE</span>
+<span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
 
 <span class="c1"># mstar/model/orpheus/orpheus_model.py</span>
 <span class="k">def</span><span class="w"> </span><span class="nf">get_node_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">]:</span>
@@ -1984,7 +2018,7 @@ serving YAML has a <code class="docutils literal notranslate"><span class="pre">
             <span class="c1"># a `lora:` block never does</span>
             <span class="k">lambda</span> <span class="n">group</span><span class="p">:</span> <span class="n">OrpheusForCausalLM</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">comm_group</span><span class="o">=</span><span class="n">group</span><span class="p">),</span>
             <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
-            <span class="n">root_path</span><span class="o">=</span><span class="s2">"language_model"</span><span class="p">,</span>      <span class="c1"># the root's attribute path in the node submodule</span>
+            <span class="n">root_path</span><span class="o">=</span><span class="s2">"model"</span><span class="p">,</span>               <span class="c1"># the root's attribute path in the node submodule</span>
             <span class="n">adapter_roots</span><span class="o">=</span><span class="p">[(</span><span class="s2">""</span><span class="p">,</span> <span class="s2">"model."</span><span class="p">)],</span>  <span class="c1"># adapters saved on the bare LlamaModel</span>
             <span class="n">rows</span><span class="o">=</span><span class="p">{</span><span class="s2">"lm_head"</span><span class="p">:</span> <span class="n">PER_SEGMENT</span><span class="p">},</span>    <span class="c1"># rows that are not the step's tokens</span>
             <span class="n">embeddings</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>                  <span class="c1"># every embedding call is in the forward</span>
@@ -2366,12 +2400,13 @@ returned as <code class="docutils literal notranslate"><span class="pre">END_PAR
 reports the partition done with that pass, and the conductor ends it rather than start
 decode. Return it only from a row outside any loop; from inside one the request fails.
 <code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> does this for the walks in its <code class="docutils literal notranslate"><span class="pre">prefill_walks</span></code>, whose token counts toward
-the budget, so <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code> gives the loop <code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>. A
-model that prefills a prompt over several passes sets <code class="docutils literal notranslate"><span class="pre">last_prefill_flag</span></code> to the
-<code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> flag of its last pass, or a stop id sampled on its first pass ends
-the request. It suits a partition with nothing left to run once generation stops: a model that runs
-another walk after its loop (an <code class="docutils literal notranslate"><span class="pre">align</span></code> walk, or image generation after thinking) or
-publishes final-only state at the loop’s stop needs its own transition instead. Keep
+the budget, so <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code> gives the loop <code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>. Its
+<code class="docutils literal notranslate"><span class="pre">last_prefill_flag</span></code> names the <code class="docutils literal notranslate"><span class="pre">step_metadata</span></code> flag of the pass whose token is the
+reply’s first, so a stop id sampled on an earlier pass ends nothing. <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code>
+names <code class="docutils literal notranslate"><span class="pre">FINAL_PREFILL</span></code>, which the model’s walk plan sets on that step. It suits a partition with nothing left to run once
+generation stops: <code class="docutils literal notranslate"><span class="pre">END_PARTITION</span></code> ends the partition whatever its plan has left, so a
+model that runs another walk after its loop (an <code class="docutils literal notranslate"><span class="pre">align</span></code> walk, or image generation after
+thinking) or publishes final-only state at the loop’s stop must not return it there. Keep
 <code class="docutils literal notranslate"><span class="pre">check_stop_batched</span></code>, if you write one, in agreement.
 To also keep some of this step’s outputs from being routed, return
 <code class="docutils literal notranslate"><span class="pre">StopCheck(stops,</span> <span class="pre">withheld=(names...))</span></code>, for example a frame streamed alongside the
@@ -2686,8 +2721,10 @@ the signal, so the worker routes it without a tensor and sends the client’s co
 <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> returns <code class="docutils literal notranslate"><span class="pre">self.uniform_row_inputs(...)</span></code> for such a row, and
 <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> reads the tokens with <code class="docutils literal notranslate"><span class="pre">self.loopback_inputs(engine_inputs,</span> <span class="pre">inputs)</span></code>. A
 row whose last step did not keep its value on the device (its first decode step, after
-the prefill) still brings it routed, and that read puts it over the slot’s. Qwen3.5,
-Higgs Audio, Qwen3-ASR and Whisper declare it.</p>
+the prefill) still brings it routed, and that read puts it over the slot’s.
+<code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> declares it for Qwen3.5, Muse Glimmer, Higgs Audio and Qwen3-ASR,
+and a node on it that reads the routed token sets <code class="docutils literal notranslate"><span class="pre">device_loopback</span> <span class="pre">=</span> <span class="pre">None</span></code>; Whisper and
+Qwen3-Omni’s Thinker declare their own.</p>
 <p>On such a node a captured step writes each row’s token and RNG offset back to the request’s
 row inside the graph (<code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_ingraph_scatter</span></code>, on by default). Those rows are
 allocated once, <code class="docutils literal notranslate"><span class="pre">knobs:</span> <span class="pre">sampler_slots</span></code> of them, so a request takes its row when the runner
@@ -2914,6 +2951,11 @@ options from <code class="docutils literal notranslate"><span class="pre">accele
 scaffold’s <code class="docutils literal notranslate"><span class="pre">compile_blocks</span></code> and Cosmos3’s denoise step do. Building the config refuses
 an unknown mode, and one that turns on Inductor’s own CUDA graphs (<code class="docutils literal notranslate"><span class="pre">reduce-overhead</span></code>,
 <code class="docutils literal notranslate"><span class="pre">max-autotune</span></code>), which fail inside the runner’s capture.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inductor_options</span></code> are Inductor config entries the compile runs under, over the mode’s
+or the compile level’s own, e.g. <code class="docutils literal notranslate"><span class="pre">{&quot;max_autotune_gemm_backends&quot;:</span> <span class="pre">&quot;ATEN&quot;}</span></code> to keep
+max-autotune’s fusion choices but cuBLAS for the GEMMs (autotune’s timings of decode-width
+GEMMs can vary between processes). Building the config
+refuses an entry Inductor doesn’t have, and <code class="docutils literal notranslate"><span class="pre">triton.cudagraphs</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">required</span></code> makes every bucket in the config mandatory. If capture fails locally or
 on another participating rank, warmup raises after rank-wide agreement instead of
 dropping the bucket and falling back to eager execution. The default is <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>
@@ -2923,8 +2965,9 @@ request’s step commits KV across several labels that are combined into a singl
 in batched guidance that packs the conditional and unconditional sequences together. The
 static buffer must hold all of them, and this field scales the buffer independently of the
 per-label span.</p>
-<p>For example, the Orpheus LLM submodule captures a batched <code class="docutils literal notranslate"><span class="pre">decode</span></code> graph and a packed
-<code class="docutils literal notranslate"><span class="pre">prefill</span></code> graph:</p>
+<p>For example, a token decoder that captures a batched <code class="docutils literal notranslate"><span class="pre">decode</span></code> graph and a packed
+<code class="docutils literal notranslate"><span class="pre">prefill</span></code> graph declares the following (<code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> builds these, and a
+mixed one, for its subclasses):</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">PREFILL_TOKEN_BUCKETS</span> <span class="o">=</span> <span class="p">[</span><span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">1024</span><span class="p">]</span>
 <span class="n">PREFILL_CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">]</span>
 
@@ -3572,9 +3615,10 @@ using two class attributes on the submodule:</p>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> formats the string <code class="docutils literal notranslate"><span class="pre">&quot;{voice}:</span> <span class="pre">{text}&quot;</span></code>, tokenizes it, wraps the ids in
 the model’s start and end tokens, and returns <code class="docutils literal notranslate"><span class="pre">{&quot;text_inputs&quot;:</span> <span class="pre">[ids]}</span></code>.
-<code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> builds either the Llama LLM submodule, which is an <code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code>,
-or the SNAC decoder submodule, and caches the result. <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> returns the raw
-bytes of the audio tensor for the <code class="docutils literal notranslate"><span class="pre">audio</span></code> modality.</p>
+<code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> builds either the Llama LLM submodule, a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> that
+declares little beyond its walk names, resource steps and capture buckets, or the SNAC
+decoder submodule, and caches the result. The SNAC submodule emits int16
+PCM, which the default <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> passes through as raw bytes.</p>
 <p>Orpheus also demonstrates the async partition API, described in the next section. The LLM
 and the SNAC decoder run as two partitions connected by a streaming edge. Audio is
 therefore decoded in a sliding window while the LLM is still generating.</p>
@@ -3622,9 +3666,10 @@ config never routes requests to them.</p>
 <p><strong>Per-request resources.</strong> Whether a request uses classifier-free guidance determines
 which cache labels it reads. This is a property of the request, not of the deployment.
 BAGEL’s <code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code> therefore returns a <code class="docutils literal notranslate"><span class="pre">KVReqConfig</span></code> that names
-the active labels per node and walk, together with a <code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code>. A request with
-guidance disabled names only <code class="docutils literal notranslate"><span class="pre">&quot;main&quot;</span></code>, so a PD-disaggregated transfer copies only that
-stream.</p>
+the active labels per node and walk, together with a <code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code>. It settles
+guidance from the request’s modalities and kwargs as its <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> does (an edit, image
+in and image out, defaults to image guidance). A request with guidance disabled names only
+<code class="docutils literal notranslate"><span class="pre">&quot;main&quot;</span></code>, so a PD-disaggregated transfer copies only that stream.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">LLM</span></code> node is deliberately coarse. It contains the text embedding, the lm_head and
 the flow projection. These always run on the same GPU, so splitting them into separate
 graph nodes would only add IPC overhead. This is a general modeling rule: make a node as
@@ -3701,15 +3746,18 @@ step. On the image-generation and editing paths, the same node still runs and wr
 KV cache, but samples no token, so it does not produce <code class="docutils literal notranslate"><span class="pre">new_token</span></code>. The edge is present
 in the graph because understanding requests need it. Treat declared edges as the possible
 outputs, and let the submodule decide which of them are produced on each step.</p>
-<p><strong>Choosing the walk per request.</strong> BAGEL’s transitions are driven by a schedule, unlike
-those of Orpheus. The output modality is known in advance from the request’s
-<code class="docutils literal notranslate"><span class="pre">output_modalities</span></code>. <code class="docutils literal notranslate"><span class="pre">get_initial_forward_pass_args</span></code> therefore builds a prefill
-schedule, by iterating over the interleaved text and image inputs, and
-<code class="docutils literal notranslate"><span class="pre">get_partition_forward_pass_args</span></code> advances through that schedule. It then transitions to
-<code class="docutils literal notranslate"><span class="pre">decode</span></code> for text output, or to <code class="docutils literal notranslate"><span class="pre">image_gen</span></code> for image output. In <code class="docutils literal notranslate"><span class="pre">think_mode</span></code>, the
-model first decodes a reasoning trace, and the EOS token then triggers the transition to
-<code class="docutils literal notranslate"><span class="pre">image_gen</span></code>. These are the same two methods that Orpheus implements. BAGEL only encodes
-a more complex state machine in them.</p>
+<p><strong>Choosing the walks per request.</strong> BAGEL’s plan follows a schedule, unlike Orpheus’s two
+fixed steps. The output modality is known in advance from the request’s
+<code class="docutils literal notranslate"><span class="pre">output_modalities</span></code>, so <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> builds the prefill schedule by iterating over the
+interleaved text and image inputs, one walk per text span or image, and then adds
+<code class="docutils literal notranslate"><span class="pre">decode</span></code> for text output or <code class="docutils literal notranslate"><span class="pre">image_gen</span></code> for image output. In <code class="docutils literal notranslate"><span class="pre">think_mode</span></code> the model
+first decodes a reasoning trace, so the plan runs <code class="docutils literal notranslate"><span class="pre">decode</span></code> and then <code class="docutils literal notranslate"><span class="pre">image_gen</span></code>.</p>
+<p>Each prefill walk reads one span, so <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> hands every span over as a signal
+of its own with <a class="reference internal" href="_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.split_spans" title="mstar.model.multimodal.split_spans"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.model.multimodal.split_spans()</span></code></a> (<code class="docutils literal notranslate"><span class="pre">text_inputs.0</span></code>,
+<code class="docutils literal notranslate"><span class="pre">image_inputs.0</span></code>, …), and each step binds its walk’s input to one:
+<code class="docutils literal notranslate"><span class="pre">WalkStep(&quot;prefill_text&quot;,</span> <span class="pre">bind={&quot;text_inputs&quot;:</span> <span class="pre">&quot;text_inputs.1&quot;})</span></code>. An ids span keys the
+entry its <code class="docutils literal notranslate"><span class="pre">source</span></code> names, so <code class="docutils literal notranslate"><span class="pre">split_spans</span></code> renames the KV layout’s ids-span sources to
+match. This is the same method Orpheus implements; BAGEL’s plan is only longer.</p>
 <p><strong>Step 4 — Submodules.</strong> Each node maps to a <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> in <code class="docutils literal notranslate"><span class="pre">bagel/submodules.py</span></code>:
 <code class="docutils literal notranslate"><span class="pre">ViTEncoderSubmodule</span></code>, <code class="docutils literal notranslate"><span class="pre">VAEEncoderSubmodule</span></code>, <code class="docutils literal notranslate"><span class="pre">LLMSubmodule</span></code> and
 <code class="docutils literal notranslate"><span class="pre">VAEDecoderSubmodule</span></code>. <code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> builds them on demand, so a worker that runs
@@ -3799,11 +3847,13 @@ refuses at startup a cap that either cache cannot hold after the YAML’s <code 
 overrides, through <code class="docutils literal notranslate"><span class="pre">mstar.model.utils.check_kv_pools_fit</span></code>, which any model with KV caches
 can call the same way.</p>
 <p>The decoder node’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> shows how a write-once context is expressed with spans.
-Canary’s comes from <code class="docutils literal notranslate"><span class="pre">EncoderDecoderNode</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/encoder_decoder.py</span></code>);
-Whisper’s declares its own, since it writes the context eagerly and captures prefill. The
-context segments have a non-zero span in the prefill step that writes them, and a span of
-0 in every later step. The <code class="docutils literal notranslate"><span class="pre">commit</span></code> in the prefill step converts the reservation into
-resident pages that the later steps read.</p>
+Canary’s comes from <code class="docutils literal notranslate"><span class="pre">EncoderDecoderNode</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/encoder_decoder.py</span></code>),
+a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> that adds only the cross-attention part: the context segments,
+and the encoder output on the prefill row, which its decoder writes into the context
+before its layers read it. Whisper’s declares its own, since it writes the context eagerly
+and captures prefill. The context segments have a non-zero span in the prefill step that
+writes them, and a span of 0 in every later step. The <code class="docutils literal notranslate"><span class="pre">commit</span></code> in the prefill step
+converts the reservation into resident pages that the later steps read.</p>
 </section>
 <section id="worked-example-an-image-dit-on-the-diffusion-scaffold">
 <h2>Worked example: an image DiT on the diffusion scaffold<a class="headerlink" href="#worked-example-an-image-dit-on-the-diffusion-scaffold" title="Link to this heading">#</a></h2>
@@ -3826,9 +3876,13 @@ iteration. The step index is the engine’s loop counter
 (<code class="docutils literal notranslate"><span class="pre">fwd_info.dynamic_loop_iter_counts</span></code>), so there is no host sync per step.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">dit</span></code> node subclasses <code class="docutils literal notranslate"><span class="pre">DenoiseLoopSubmodule</span></code> (<code class="docutils literal notranslate"><span class="pre">denoise_loop.py</span></code>), which owns
 the engine contract — seeded initial noise, per-request schedules, equal-key request
-batching (<code class="docutils literal notranslate"><span class="pre">can_batch</span></code>), stacked <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>, <code class="docutils literal notranslate"><span class="pre">check_stop</span></code> at the request’s own
-step count, the ragged-attention <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> and one CUDA-graph bucket per
-<code class="docutils literal notranslate"><span class="pre">bucket_key</span></code> with the Euler update inside the graph — and asks the model for:</p>
+batching (<code class="docutils literal notranslate"><span class="pre">can_batch</span></code>), stacked <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>, the ragged-attention
+<code class="docutils literal notranslate"><span class="pre">declare_step</span></code> and one CUDA-graph bucket per <code class="docutils literal notranslate"><span class="pre">bucket_key</span></code> with the Euler update inside
+the graph — and asks the model for the hooks below. The loop ends on its iteration count:
+a model whose request picks its step count returns it from <code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>
+(<code class="docutils literal notranslate"><span class="pre">{&quot;denoise_loop&quot;:</span> <span class="pre">steps}</span></code>), resolved exactly as <code class="docutils literal notranslate"><span class="pre">schedule_for</span></code> resolves it, and a
+stage that always runs its graph <code class="docutils literal notranslate"><span class="pre">max_iters</span></code> declares nothing. The scaffold refuses an
+iteration past the schedule. The hooks:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">MyDenoise</span><span class="p">(</span><span class="n">DenoiseLoopSubmodule</span><span class="p">):</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">bucket_key_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">):</span> <span class="o">...</span>       <span class="c1"># hashable: latent grid, text length, ...</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">schedule_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">fwd_info</span><span class="p">,</span> <span class="n">key</span><span class="p">):</span> <span class="o">...</span>    <span class="c1"># FlowMatchSchedule (flow_match.py)</span>
@@ -3906,8 +3960,8 @@ and BAGEL onto the scaffold is tracked as a follow-up.</p>
 </div>
 <p>The <code class="docutils literal notranslate"><span class="pre">Model</span></code> subclasses <code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/multimodal_decoder.py</span></code>),
 which declares the walks (<code class="docutils literal notranslate"><span class="pre">media_walks(max_iters,</span> <span class="pre">encoders)</span></code> and
-<code class="docutils literal notranslate"><span class="pre">text_combined_walks()</span></code>), runs the one prefill walk <code class="docutils literal notranslate"><span class="pre">media_prefill_step</span></code> picks
-through <code class="docutils literal notranslate"><span class="pre">initial_prefill_args</span></code> / <code class="docutils literal notranslate"><span class="pre">next_prefill_args</span></code>, decodes text output, and owns
+<code class="docutils literal notranslate"><span class="pre">text_combined_walks()</span></code>), plans the one prefill walk <code class="docutils literal notranslate"><span class="pre">media_prefill_step</span></code> picks
+and then decode (<code class="docutils literal notranslate"><span class="pre">walk_plan</span></code>), decodes text output, and owns
 media intake (<code class="docutils literal notranslate"><span class="pre">process_prompt</span></code>), the decode loop’s cap (<code class="docutils literal notranslate"><span class="pre">get_loop_caps</span></code>, the
 request’s output budget less the prefill’s token), the KV label and its one-span layout (<code class="docutils literal notranslate"><span class="pre">kv_labels</span></code>,
 <code class="docutils literal notranslate"><span class="pre">kv_layout</span></code>), the sampler’s per-request config (<code class="docutils literal notranslate"><span class="pre">get_request_resource_configs</span></code>:
@@ -3923,7 +3977,8 @@ submodule cache and where the files come from. A model sets <code class="docutil
 <code class="docutils literal notranslate"><span class="pre">rebuild_policies</span></code> lets the KV cache drop a text request and reprefill its ids on
 <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>. A model whose LLM node holds a resource that can’t drop returns <code class="docutils literal notranslate"><span class="pre">{}</span></code>,
 or the engine refuses to start; Muse Glimmer and Ripple-65B return <code class="docutils literal notranslate"><span class="pre">{}</span></code> until a drop has run
-through a sliding-window pool. <code class="docutils literal notranslate"><span class="pre">media</span></code> holds a
+through a sliding-window pool. A model without text prompts (<code class="docutils literal notranslate"><span class="pre">TEXT_PROMPTS</span> <span class="pre">=</span> <span class="pre">False</span></code>) has no
+<code class="docutils literal notranslate"><span class="pre">prefill_text</span></code> walk, so the scaffold returns <code class="docutils literal notranslate"><span class="pre">{}</span></code> for it. <code class="docutils literal notranslate"><span class="pre">media</span></code> holds a
 <code class="docutils literal notranslate"><span class="pre">MediaIntake</span></code> per attachment modality: its <code class="docutils literal notranslate"><span class="pre">MediaEncoder</span></code> (modalities may share one),
 its placeholder <code class="docutils literal notranslate"><span class="pre">pad</span></code> id, the sentinels a template leaves to its processor, how many
 placeholders an attachment fills (<code class="docutils literal notranslate"><span class="pre">runs</span></code>, one by default; a Qwen3.5 video fills one per
@@ -3952,9 +4007,9 @@ the encoders’ outputs into the prompt’s embeddings inside the forward
 (<code class="docutils literal notranslate"><span class="pre">where(pad,</span> <span class="pre">media[cumsum(pad)</span> <span class="pre">-</span> <span class="pre">1],</span> <span class="pre">embed(ids))</span></code>), the step declaration around the
 sampler and the position resource, the forward through the sampler, and the stop: a
 <code class="docutils literal notranslate"><span class="pre">TokenStop</span></code> over the prefill walks and decode. A stop id on a decode row ends the
-loop; a stop id on the prefill row, or a one-token budget, ends the partition before
-decode runs. The loop’s cap, <code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>, is the only budget.
-A media row’s tensor holds exactly the pads in its
+loop; a stop id on the prefill row (the step the walk plan marks <code class="docutils literal notranslate"><span class="pre">FINAL_PREFILL</span></code>), or
+a one-token budget, ends the partition before decode runs. The loop’s cap,
+<code class="docutils literal notranslate"><span class="pre">max(1,</span> <span class="pre">max_output_tokens</span> <span class="pre">-</span> <span class="pre">1)</span></code>, is the only budget. A media row’s tensor holds exactly the pads in its
 ids, checked against the layout in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code>. A prompt’s ids, pads and
 sentinels included, feed the repetition penalty, as in transformers and vLLM. A model
 writes:</p>
@@ -3971,10 +4026,19 @@ writes:</p>
 </div>
 <p>Its decoder module provides <code class="docutils literal notranslate"><span class="pre">embed(ids)</span></code>, <code class="docutils literal notranslate"><span class="pre">forward(input_embeds,</span> <span class="pre">*,</span> <span class="pre">label,</span> <span class="pre">**kw)</span></code>
 (the stack through its final norm), <code class="docutils literal notranslate"><span class="pre">logits(hidden)</span></code> and <code class="docutils literal notranslate"><span class="pre">embed_dtype</span></code>, as
-<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForCausalLM</span></code> does (<code class="docutils literal notranslate"><span class="pre">Qwen3DenseLM</span></code> has the first three). The sampler and
-position resources are declared under <code class="docutils literal notranslate"><span class="pre">mstar.model.keys</span></code>’ <code class="docutils literal notranslate"><span class="pre">SAMPLER</span></code> and <code class="docutils literal notranslate"><span class="pre">ROPE</span></code>.
-<code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code> sets the default decode ladder, and <code class="docutils literal notranslate"><span class="pre">MIXED_MAX_PREFILL_ROWS</span></code>
-caps a mixed step’s prompt rows.</p>
+<code class="docutils literal notranslate"><span class="pre">Qwen3_5ForCausalLM</span></code> and <code class="docutils literal notranslate"><span class="pre">Qwen3DenseLM</span></code> do. The sampler is declared under
+<code class="docutils literal notranslate"><span class="pre">mstar.model.keys</span></code>’ <code class="docutils literal notranslate"><span class="pre">SAMPLER</span></code>, and the positions under the node’s <code class="docutils literal notranslate"><span class="pre">POS_KEY</span></code>
+(<code class="docutils literal notranslate"><span class="pre">ROPE</span></code> unless the model’s layers name another <code class="docutils literal notranslate"><span class="pre">pos_key</span></code>). <code class="docutils literal notranslate"><span class="pre">MSTAR_DECODE_BUCKETS</span></code>
+sets the default decode ladder, <code class="docutils literal notranslate"><span class="pre">MIXED_MAX_PREFILL_ROWS</span></code> caps a mixed step’s prompt
+rows, <code class="docutils literal notranslate"><span class="pre">capture_compile_mode(walk)</span></code> names a capture’s <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code> (<code class="docutils literal notranslate"><span class="pre">None</span></code>, the default,
+takes the deployment’s compile level), and <code class="docutils literal notranslate"><span class="pre">CAPTURE_PREFILL</span> <span class="pre">=</span> <span class="pre">False</span></code> captures decode
+only. A lone encoder’s <code class="docutils literal notranslate"><span class="pre">MediaEncoder.walk</span></code> names its media walk when the model’s graph
+calls it something other than <code class="docutils literal notranslate"><span class="pre">prefill_&lt;name&gt;</span></code> (the Cosmos3 reasoner’s
+<code class="docutils literal notranslate"><span class="pre">reasoner_prefill_vision</span></code>). A graph that names its other walks otherwise sets
+<code class="docutils literal notranslate"><span class="pre">PREFILL_WALK</span></code>, <code class="docutils literal notranslate"><span class="pre">DECODE_WALK</span></code> and <code class="docutils literal notranslate"><span class="pre">DECODE_LOOP</span></code>.
+It reports a text prompt’s length and a decode row’s one token
+(<code class="docutils literal notranslate"><span class="pre">get_input_sequence_len</span></code>, <code class="docutils literal notranslate"><span class="pre">speculative_input_seq_len</span></code>), so a model chunks its text
+prefill by declaring <code class="docutils literal notranslate"><span class="pre">get_chunking_policies</span></code> alone, as Qwen3.5 does.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">vision_encoder</span></code> node subclasses <code class="docutils literal notranslate"><span class="pre">PackedBlockLoopEncoder</span></code>
 (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/block_loop_encoder.py</span></code>): up to <code class="docutils literal notranslate"><span class="pre">MAX_BATCH_SIZE</span></code> requests per
 step, every image packed into one call, and the tower’s block loop replayed as a piecewise
@@ -3999,7 +4063,14 @@ A tower builds on the pieces in <code class="docutils literal notranslate"><span
 through the node’s dtype cast) and <code class="docutils literal notranslate"><span class="pre">VisionBlock</span></code>, whose attention runs over the packed
 patches through the ragged resource under the block’s <code class="docutils literal notranslate"><span class="pre">label</span></code> (Qwen3.5’s frames;
 Muse Glimmer’s windows and frames), q, k and v as one projection a split checkpoint
-loads by stacked-param rules.</p>
+loads by stacked-param rules. An encoder of another medium need only send its <code class="docutils literal notranslate"><span class="pre">MediaEncoder.output</span></code>,
+a row per pad in prompt order: Higgs-Audio’s audio tower and Qwen3-ASR’s packed AuT
+encoder are plain <code class="docutils literal notranslate"><span class="pre">NodeSubmodule</span></code> s on the audio walk. That walk is <code class="docutils literal notranslate"><span class="pre">prefill_audio</span></code>
+unless the lone encoder’s <code class="docutils literal notranslate"><span class="pre">MediaEncoder.walk</span></code> names it: Qwen3-ASR’s keeps <code class="docutils literal notranslate"><span class="pre">prefill</span></code>,
+the name its configs and metrics read. A model whose graph is not
+<code class="docutils literal notranslate"><span class="pre">MultimodalDecoderModel</span></code>’s (Canary-Qwen’s LLM node is <code class="docutils literal notranslate"><span class="pre">llm</span></code>) writes its own walks and
+hands its LLM node its <code class="docutils literal notranslate"><span class="pre">MediaEncoder</span></code> s and <code class="docutils literal notranslate"><span class="pre">text_prompts</span></code> itself, with
+<code class="docutils literal notranslate"><span class="pre">MEDIA_LAYOUT</span></code> on the prefill step.</p>
 </section>
 <section id="advanced-async-partitions-and-streaming">
 <h2>Advanced: async partitions and streaming<a class="headerlink" href="#advanced-async-partitions-and-streaming" title="Link to this heading">#</a></h2>
@@ -4012,16 +4083,17 @@ Override these methods:</p>
 <li><p><code class="docutils literal notranslate"><span class="pre">get_partition_topology()</span></code> declares the partitions and the streaming <code class="docutils literal notranslate"><span class="pre">Connection</span></code>
 objects between them, including a <code class="docutils literal notranslate"><span class="pre">chunk_policy_factory</span></code> such as
 <code class="docutils literal notranslate"><span class="pre">SlidingWindowChunkPolicy(window=...,</span> <span class="pre">stride=...)</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">get_partitions()</span></code> declares each <code class="docutils literal notranslate"><span class="pre">PartitionDefinition</span></code>: its walks, its initial walk,
-and the partitions that produce data into it. Every walk belongs to exactly one
-partition.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">get_partitions()</span></code> declares each <code class="docutils literal notranslate"><span class="pre">PartitionDefinition</span></code>: its name and its walks.
+Every walk belongs to exactly one partition.</p></li>
 <li><p>Route cross-partition tensors with <code class="docutils literal notranslate"><span class="pre">StreamingGraphEdge(next_node=...,</span> <span class="pre">name=...,</span>
 <span class="pre">target_partition=...)</span></code> instead of a plain <code class="docutils literal notranslate"><span class="pre">GraphEdge</span></code>.</p></li>
 </ul>
-<p>The consuming partition’s <code class="docutils literal notranslate"><span class="pre">get_partition_forward_pass_args</span></code> reads
-<code class="docutils literal notranslate"><span class="pre">incoming_connections</span></code>, which provides token counts and a <code class="docutils literal notranslate"><span class="pre">producer_done</span></code> flag for
-each stream from another partition, and uses them to decide when to run. A stream from the
-client (below) has no entry there.</p>
+<p>A consuming partition’s plan needs nothing about the stream. A step whose walk a stream
+feeds, and that runs no Loop but chunk loops, runs once per chunk the stream brings,
+and the partition ends when the worker reports the pass that consumed the stream’s final
+chunk. For a stream from another partition, the conductor tells the consumer
+<code class="docutils literal notranslate"><span class="pre">producer_done</span></code> once the producer partition is done; the data worker ends a stream from
+the client (below) itself.</p>
 <p>The consumer receives each chunk as its items stacked along a new leading dimension, or as
 the item itself when the chunk holds one. Don’t write into a streamed input in place: a
 one-item chunk is the stored tensor, which the producer may also have routed to other
@@ -4056,8 +4128,9 @@ before it.</p></li>
 </ul>
 <p>Qwen3-Omni’s Talker (<code class="docutils literal notranslate"><span class="pre">_talker_walk</span></code>) is the reference: Thinker prefill passes run
 <code class="docutils literal notranslate"><span class="pre">talker_prefill</span></code>, the first decode iteration runs <code class="docutils literal notranslate"><span class="pre">talker_last_prefill</span></code>, and later
-ones run <code class="docutils literal notranslate"><span class="pre">talker_decode</span></code>; the conductor feeds <code class="docutils literal notranslate"><span class="pre">talker_decode</span></code> its first input once
-<code class="docutils literal notranslate"><span class="pre">talker_last_prefill</span></code> has run.</p>
+ones run <code class="docutils literal notranslate"><span class="pre">talker_decode</span></code>. Its plan lists the three walks. The conductor follows the walk
+each pass reports and enters the next step only to send it something, so it feeds
+<code class="docutils literal notranslate"><span class="pre">talker_decode</span></code> its first input once <code class="docutils literal notranslate"><span class="pre">talker_last_prefill</span></code> has run.</p>
 <section id="streams-from-the-client">
 <h3>Streams from the client<a class="headerlink" href="#streams-from-the-client" title="Link to this heading">#</a></h3>
 <p>A model that listens while it runs (a full-duplex speech model, say) takes its live input
@@ -4073,7 +4146,8 @@ producer <code class="docutils literal notranslate"><span class="pre">CLIENT</sp
 <code class="docutils literal notranslate"><span class="pre">partitions</span></code>. The node that lists <code class="docutils literal notranslate"><span class="pre">audio_in</span></code> in its <code class="docutils literal notranslate"><span class="pre">input_names</span></code> (with
 <code class="docutils literal notranslate"><span class="pre">consumes_stream=True</span></code>) consumes it through a <code class="docutils literal notranslate"><span class="pre">StreamBuffer</span></code> and the connection’s
 chunk policy, exactly as it would a stream from another partition. Its partition
-self-triggers from the stream, so its forward-pass args send no inputs. That node must be
+self-triggers from the stream, and the conductor sends its walk none of the streamed
+input. That node must be
 the only one, in any walk, that takes the edge; the conductor checks this at startup, and
 that the model implements <code class="docutils literal notranslate"><span class="pre">process_stream_chunk</span></code> unless each client stream declares
 <code class="docutils literal notranslate"><span class="pre">ClientAudio</span></code> (below). A partition may take several client
@@ -4173,8 +4247,7 @@ and its partition reports done. None on any other chunk drops the row from the s
       [ ] get_node_resources
       [ ] get_graph_walk_graphs
       [ ] process_prompt
-      [ ] get_initial_forward_pass_args
-      [ ] get_partition_forward_pass_args
+      [ ] walk_plan
       [ ] postprocess
       [ ] get_submodule
       [ ] (optional) get_request_resource_configs

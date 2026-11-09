@@ -808,8 +808,9 @@ to coordinate multi-engine pipelines, including async producer/consumer partitio
 <ol class="arabic simple">
 <li><p>The API server receives a request, loads media, and calls the model’s
 <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> to produce the initial tensors.</p></li>
-<li><p>The conductor seeds the initial graph walk (e.g. <code class="docutils literal notranslate"><span class="pre">prefill</span></code>) and asks the model for
-the next forward-pass arguments after each graph walk completes.</p></li>
+<li><p>The conductor asks the model once, at ingest, for each partition’s walk plan
+(<code class="docutils literal notranslate"><span class="pre">walk_plan</span></code>: e.g. <code class="docutils literal notranslate"><span class="pre">prefill</span></code> then <code class="docutils literal notranslate"><span class="pre">decode</span></code>), and runs it: it sends each walk its
+inputs and moves to the next walk as each one completes.</p></li>
 <li><p>Workers execute the ready graph nodes on GPU through the engine. The engine declares
 and admits each step’s resource work around the forward pass. Workers then route the
 output tensors to downstream nodes and workers.</p></li>

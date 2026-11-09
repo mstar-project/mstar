@@ -1119,7 +1119,7 @@ served; set <code class="docutils literal notranslate"><span class="pre">max_ran
 <tr class="row-even"><td><p>Higgs Audio (<code class="docutils literal notranslate"><span class="pre">LLM</span></code>)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> (the
 checkpoint’s <code class="docutils literal notranslate"><span class="pre">audio_decoder_proj.text_lm_head</span></code>)</p></td>
-<td><p>No embedding target: text prefill embeds before the step.</p></td>
+<td><p>No embedding target.</p></td>
 </tr>
 <tr class="row-odd"><td><p>Qwen3-Omni (<code class="docutils literal notranslate"><span class="pre">Thinker</span></code>), <em>not validated</em></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">qkv_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">o_proj</span></code>, dense-layer <code class="docutils literal notranslate"><span class="pre">gate_up_proj</span></code> / <code class="docutils literal notranslate"><span class="pre">down_proj</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_head</span></code></p></td>
@@ -2511,8 +2511,9 @@ paged backend explicitly.</p></li>
 conditioning clip with <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code>; environments without it reject those
 requests at preprocessing (other modes are unaffected).</p></li>
 <li><p>Generated video containers are written with <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code>’s <code class="docutils literal notranslate"><span class="pre">VideoEncoder</span></code>
-when available (torchcodec &gt;= 0.9), otherwise with <code class="docutils literal notranslate"><span class="pre">torchvision</span></code>’s
-<code class="docutils literal notranslate"><span class="pre">write_video</span></code>, which needs the PyAV (<code class="docutils literal notranslate"><span class="pre">av</span></code>) package.</p></li>
+when available (torchcodec &gt;= 0.9), otherwise directly with PyAV (<code class="docutils literal notranslate"><span class="pre">av</span></code>,
+<code class="docutils literal notranslate"><span class="pre">video_encode.encode_mp4</span></code>), whose wheel bundles FFmpeg with libx264; that also
+covers a torchcodec that cannot load FFmpeg.</p></li>
 <li><p>Sound-enabled video responses mux the AAC track with the <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code> and
 <code class="docutils literal notranslate"><span class="pre">ffprobe</span></code> binaries, which must be on <code class="docutils literal notranslate"><span class="pre">PATH</span></code> (system packages, not
 pip-installable).</p></li>
@@ -2559,13 +2560,13 @@ chat template opens a <code class="docutils literal notranslate"><span class="pr
 <span class="s1">  "enable_thinking": false}'</span>
 </pre></div>
 </div>
-<p>The decode step is captured into CUDA graphs per batch bucket and, by default,
-compiled first (<code class="docutils literal notranslate"><span class="pre">compile_reasoner_decode:</span> <span class="pre">true</span></code>; <code class="docutils literal notranslate"><span class="pre">COSMOS3_REASONER_COMPILE=0</span></code>
-turns it off): the eager step is over a thousand tiny kernels, and the fused
-step runs at the weight-streaming floor (about twice the uncompiled rate at
-batch size 1 on an H100). Concurrent chat requests share decode steps
-(continuous batching over the captured decode graphs, padded to the next batch
-bucket). Requests never see each other’s data, but the batch bucket changes the
+<p>The reasoner is a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code>: its decode steps are captured into
+CUDA graphs per batch bucket, each compiled first: the eager decode step is over
+a thousand tiny kernels, and the fused step runs at the weight-streaming floor
+(about twice the uncompiled rate at batch size 1 on an H100). Its prefills, text
+and vision (one vision prompt a step), run eagerly and uncompiled. Concurrent chat requests share
+decode steps (continuous batching over the captured decode graphs, padded to the
+next batch bucket). Requests never see each other’s data, but the batch bucket changes the
 bf16 arithmetic of the step, so a long greedy answer can part from its solo run
 where two candidate tokens tie: in every measured divergence the two tokens’
 logits were equal or one bf16 ulp apart, the first differing token came after
@@ -3159,8 +3160,8 @@ startup.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">async_scheduling</span></code></dt><dd><p>The engine’s speculative scheduling of the image nodes: the worker assembles a batch’s
 next denoise step while the current one runs and merges requests that became ready
-meanwhile, so requests at different steps share a forward. On by default; a step a
-request speculates past its schedule is vetoed before any forward, and <code class="docutils literal notranslate"><span class="pre">false</span></code>
+meanwhile, so requests at different steps share a forward. On by default; the loop’s cap
+(the request’s step count) keeps speculation from running past its schedule, and <code class="docutils literal notranslate"><span class="pre">false</span></code>
 restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
 to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
 concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the

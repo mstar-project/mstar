@@ -769,11 +769,13 @@ decoder, and samples the first transcript token.</p>
 sampling restricted to the language tokens; <code class="docutils literal notranslate"><span class="pre">prefill_prompt</span></code> then
 appends <code class="docutils literal notranslate"><span class="pre">&lt;|task|&gt;[&lt;|notimestamps|&gt;]</span></code> after the detected token.</p>
 </dd>
-<dt><code class="docutils literal notranslate"><span class="pre">decode</span></code></dt><dd><p>a dynamic loop, one token per step, until <code class="docutils literal notranslate"><span class="pre">&lt;|endoftext|&gt;</span></code> or the
-448-position table is full. The Whisper timestamp rules (first token a
-timestamp, timestamps in monotonic pairs, timestamp-vs-text
-log-probability test) are applied inside the captured forward from a
-four-integer state that travels with the token, so the worker’s
+<dt><code class="docutils literal notranslate"><span class="pre">decode</span></code></dt><dd><p>a dynamic loop, one token per step, until <code class="docutils literal notranslate"><span class="pre">&lt;|endoftext|&gt;</span></code>, the
+request’s <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> or the end of the 448-position table.
+<code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> counts the prompt walk’s token, so a budget of one, or an
+<code class="docutils literal notranslate"><span class="pre">&lt;|endoftext|&gt;</span></code> sampled there, runs no decode step. The Whisper
+timestamp rules (first token a timestamp, timestamps in monotonic pairs,
+timestamp-vs-text log-probability test) are applied inside the captured
+forward from a four-integer state that travels with the token, so the worker’s
 speculative next-step launch never sees a stale history.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">align</span></code></dt><dd><p>only when word timestamps were asked for: one teacher-forced pass over

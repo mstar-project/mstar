@@ -1102,8 +1102,7 @@ window.runMermaid = runMermaid;</script>
 
     <span class="c1"># Rollout.  ``max_rollout_horizon`` caps the Loop's</span>
     <span class="c1"># ``max_iters`` at graph-build time; per-request ``rollout_horizon`` is</span>
-    <span class="c1"># enforced by early-exit (``check_stop``) from inside the</span>
-    <span class="c1"># rollout submodule.</span>
+    <span class="c1"># the loop's cap (``VJepa2Model.get_loop_caps``).</span>
     <span class="n">max_rollout_horizon</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">16</span>
     <span class="c1"># AnticipativeWrapper-parity rollout geometry.  Per-request tuning is a</span>
     <span class="c1"># later extension — for now these are set once from config and baked</span>

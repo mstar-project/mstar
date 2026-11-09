@@ -1032,19 +1032,19 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">FINAL_PREFILL</span><span class="p">,</span> <span class="n">WalkStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">GraphEdge</span><span class="p">,</span> <span class="n">GraphNode</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">,</span> <span class="n">Loop</span><span class="p">,</span> <span class="n">Parallel</span><span class="p">,</span> <span class="n">Sequential</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.special_destinations</span><span class="w"> </span><span class="kn">import</span> <span class="n">EMIT_TO_CLIENT</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">MIXED</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.keys</span><span class="w"> </span><span class="kn">import</span> <span class="n">MIXED</span><span class="p">,</span> <span class="n">PREFILL_TEXT</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardConductorMetadata</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.communication.tensors</span><span class="w"> </span><span class="kn">import</span> <span class="n">NameToTensorList</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.graph.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">TensorPointerInfo</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ForwardPassArgs</span>
 
 <span class="n">TEXT</span> <span class="o">=</span> <span class="s2">"text"</span>
 <span class="n">VIDEO</span> <span class="o">=</span> <span class="s2">"video"</span>
@@ -1214,6 +1214,51 @@ window.runMermaid = runMermaid;</script>
         <span class="n">plan</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">part</span><span class="p">)</span>
     <span class="n">flush</span><span class="p">()</span>
     <span class="k">return</span> <span class="n">plan</span></div>
+
+
+
+<div class="viewcode-block" id="span_name">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.span_name">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">span_name</span><span class="p">(</span><span class="n">name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">index</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The signal that carries slot ``index`` of a prompt's ``name`` list on its own: an</span>
+<span class="sd">    entry (`split_spans`), or Qwen3-Omni's Thinker step, which holds zero to two."""</span>
+    <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">.</span><span class="si">{</span><span class="n">index</span><span class="si">}</span><span class="s2">"</span></div>
+
+
+
+<div class="viewcode-block" id="split_spans">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.split_spans">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">split_spans</span><span class="p">(</span>
+    <span class="n">tensors</span><span class="p">:</span> <span class="n">NameToTensorList</span><span class="p">,</span> <span class="n">names</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">kv_layout</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">NameToTensorList</span><span class="p">,</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``tensors`` with each list in ``names`` split into one signal per entry,</span>
+<span class="sd">    named by `span_name`, for a model that prefills each entry in a walk of its</span>
+<span class="sd">    own: its plan binds the walk's input to the entry (``WalkStep.bind``). The</span>
+<span class="sd">    list itself is left empty.</span>
+
+<span class="sd">    An ids span keys the next entry of its source (``Span.source``), so in each</span>
+<span class="sd">    label of ``kv_layout`` the ``k``-th ids span of a split list now names</span>
+<span class="sd">    entry ``k``'s signal.</span>
+<span class="sd">    """</span>
+    <span class="n">names</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">names</span><span class="p">)</span>
+    <span class="n">out</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="n">tensors</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">names</span> <span class="o">&amp;</span> <span class="nb">set</span><span class="p">(</span><span class="n">tensors</span><span class="p">):</span>
+        <span class="n">out</span><span class="p">[</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">out</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="n">span_name</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">i</span><span class="p">):</span> <span class="p">[</span><span class="n">entry</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">entry</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">tensors</span><span class="p">[</span><span class="n">name</span><span class="p">])})</span>
+    <span class="k">if</span> <span class="n">kv_layout</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">out</span><span class="p">,</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">split</span><span class="p">(</span><span class="n">layout</span><span class="p">):</span>
+        <span class="n">seen</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="n">spans</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">span</span> <span class="ow">in</span> <span class="n">layout</span><span class="o">.</span><span class="n">spans</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">span</span><span class="o">.</span><span class="n">kind</span> <span class="o">==</span> <span class="s2">"ids"</span> <span class="ow">and</span> <span class="n">span</span><span class="o">.</span><span class="n">source</span> <span class="ow">in</span> <span class="n">names</span><span class="p">:</span>
+                <span class="n">seen</span><span class="p">[</span><span class="n">span</span><span class="o">.</span><span class="n">source</span><span class="p">]</span> <span class="o">=</span> <span class="n">seen</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">source</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span>
+                <span class="n">span</span> <span class="o">=</span> <span class="n">span</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">source</span><span class="o">=</span><span class="n">span_name</span><span class="p">(</span><span class="n">span</span><span class="o">.</span><span class="n">source</span><span class="p">,</span> <span class="n">seen</span><span class="p">[</span><span class="n">span</span><span class="o">.</span><span class="n">source</span><span class="p">]))</span>
+            <span class="n">spans</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">span</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">layout</span><span class="o">.</span><span class="n">_replace</span><span class="p">(</span><span class="n">spans</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="n">spans</span><span class="p">))</span>
+
+    <span class="k">return</span> <span class="n">out</span><span class="p">,</span> <span class="p">{</span><span class="n">key</span><span class="p">:</span> <span class="p">{</span><span class="n">label</span><span class="p">:</span> <span class="n">split</span><span class="p">(</span><span class="n">layout</span><span class="p">)</span> <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">labels</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">labels</span> <span class="ow">in</span> <span class="n">kv_layout</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span></div>
 
 
 
@@ -1445,7 +1490,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    ``name`` names the walks (``prefill_vision``, ``prefill_vision_audio``);</span>
 <span class="sd">    ``node`` reads ``inputs`` and sends the LLM ``output``, one row per pad</span>
-<span class="sd">    of ``pad_ids`` in the prompt, in prompt order.</span>
+<span class="sd">    of ``pad_ids`` in the prompt, in prompt order. ``walk`` names the walk a</span>
+<span class="sd">    prompt carrying this medium alone prefills on, for a model whose graph</span>
+<span class="sd">    already calls it something else (walk names are read by configs and</span>
+<span class="sd">    metrics).</span>
 <span class="sd">    """</span>
 
     <span class="n">name</span><span class="p">:</span> <span class="nb">str</span>
@@ -1453,6 +1501,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">inputs</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
     <span class="n">output</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">pad_ids</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_ids</span><span class="p">:</span>
@@ -1493,6 +1542,8 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="media_walk_name">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_walk_name">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">media_walk_name</span><span class="p">(</span><span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">encoders</span><span class="p">)</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">encoders</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">walk</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">encoders</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">walk</span>
     <span class="k">return</span> <span class="s2">"prefill_"</span> <span class="o">+</span> <span class="s2">"_"</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">encoders</span><span class="p">)</span></div>
 
 
@@ -1517,7 +1568,7 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""A media walk's ``MEDIA_LAYOUT`` step metadata, columnar: each run's</span>
 <span class="sd">    ``offset`` and ``tokens``, the encoder ``output`` it is read from, and</span>
-<span class="sd">    its patch ``grid`` (``[]`` for media without one). Plain lists: it rides</span>
+<span class="sd">    its ``grid`` (``PreparedMedia.grids``; ``[]`` for media without one). Plain lists: it rides</span>
 <span class="sd">    the step's control message, so every node of the walk reads it on the</span>
 <span class="sd">    host (`media_grids`)."""</span>
     <span class="n">grids</span> <span class="o">=</span> <span class="n">grids</span> <span class="ow">or</span> <span class="p">{}</span>
@@ -1535,8 +1586,8 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="media_grids">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_grids">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">media_grids</span><span class="p">(</span><span class="n">layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">output</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]:</span>
-<span class="w">    </span><span class="sd">"""The patch grid of each run a ``MEDIA_LAYOUT`` fills from encoder output</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">media_grids</span><span class="p">(</span><span class="n">layout</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">output</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="o">...</span><span class="p">]]:</span>
+<span class="w">    </span><span class="sd">"""The grid of each run a ``MEDIA_LAYOUT`` fills from encoder output</span>
 <span class="sd">    ``output``, in prompt order."""</span>
     <span class="k">return</span> <span class="p">[</span>
         <span class="nb">tuple</span><span class="p">(</span><span class="n">grid</span><span class="p">)</span> <span class="k">for</span> <span class="n">grid</span><span class="p">,</span> <span class="n">out</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"grid"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">layout</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"output"</span><span class="p">,</span> <span class="p">()),</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -1559,20 +1610,21 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="media_walks">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.media_walks">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">media_walks</span><span class="p">(</span>
-    <span class="n">max_iters</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"LLM"</span><span class="p">,</span>
+    <span class="n">max_iters</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">encoders</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">MediaEncoder</span><span class="p">]</span> <span class="o">=</span> <span class="p">(),</span> <span class="n">text</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"LLM"</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""``prefill_text``, one media walk per subset of ``encoders``, and</span>
-<span class="sd">    ``decode``, over the decoder ``node`` and the encoders. ``max_iters`` bounds</span>
-<span class="sd">    the decode loop; it is a safety bound, not the per-request budget."""</span>
+<span class="w">    </span><span class="sd">"""``prefill_text`` (unless ``text`` is False), one media walk per subset</span>
+<span class="sd">    of ``encoders``, and ``decode``, over the decoder ``node`` and the</span>
+<span class="sd">    encoders. ``max_iters`` bounds the decode loop; it is a safety bound, not</span>
+<span class="sd">    the per-request budget."""</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">emit_first_token</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="n">GraphEdge</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">GraphEdge</span><span class="p">(</span>
             <span class="n">next_node</span><span class="o">=</span><span class="n">EMIT_TO_CLIENT</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"new_token"</span><span class="p">,</span> <span class="n">persist</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">output_modality</span><span class="o">=</span><span class="s2">"text"</span><span class="p">,</span>
         <span class="p">)</span>
 
-    <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
-        <span class="s2">"prefill_text"</span><span class="p">:</span> <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="n">node</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_inputs"</span><span class="p">],</span> <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">emit_first_token</span><span class="p">()]),</span>
-    <span class="p">}</span>
+    <span class="n">walks</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">GraphSection</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="n">text</span><span class="p">:</span>
+        <span class="n">walks</span><span class="p">[</span><span class="n">PREFILL_TEXT</span><span class="p">]</span> <span class="o">=</span> <span class="n">GraphNode</span><span class="p">(</span><span class="n">name</span><span class="o">=</span><span class="n">node</span><span class="p">,</span> <span class="n">input_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"text_inputs"</span><span class="p">],</span> <span class="n">outputs</span><span class="o">=</span><span class="p">[</span><span class="n">emit_first_token</span><span class="p">()])</span>
     <span class="k">for</span> <span class="n">mask</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span> <span class="o">&lt;&lt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">encoders</span><span class="p">)):</span>
         <span class="n">present</span> <span class="o">=</span> <span class="p">[</span><span class="n">e</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">e</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">encoders</span><span class="p">)</span> <span class="k">if</span> <span class="n">mask</span> <span class="o">&gt;&gt;</span> <span class="n">i</span> <span class="o">&amp;</span> <span class="mi">1</span><span class="p">]</span>
         <span class="n">nodes</span> <span class="o">=</span> <span class="p">[</span>
@@ -1611,19 +1663,7 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.text_combined_walks">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">text_combined_walks</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"LLM"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]]]:</span>
 <span class="w">    </span><span class="sd">"""Text prefill and decode rows of the decoder ``node`` share a step."""</span>
-    <span class="k">return</span> <span class="p">{</span><span class="n">node</span><span class="p">:</span> <span class="p">{</span><span class="n">MIXED</span><span class="p">:</span> <span class="p">{</span><span class="s2">"prefill_text"</span><span class="p">,</span> <span class="s2">"decode"</span><span class="p">}}}</span></div>
-
-
-
-<div class="viewcode-block" id="PrefillStep">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.PrefillStep">[docs]</a>
-<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">PrefillStep</span><span class="p">:</span>
-    <span class="n">walk</span><span class="p">:</span> <span class="nb">str</span>
-    <span class="c1"># (node, input name) -&gt; the tensors that input carries</span>
-    <span class="n">input_tensors</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]]</span>
-    <span class="c1"># merged into the walk's step metadata</span>
-    <span class="n">metadata</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span></div>
+    <span class="k">return</span> <span class="p">{</span><span class="n">node</span><span class="p">:</span> <span class="p">{</span><span class="n">MIXED</span><span class="p">:</span> <span class="p">{</span><span class="n">PREFILL_TEXT</span><span class="p">,</span> <span class="s2">"decode"</span><span class="p">}}}</span></div>
 
 
 
@@ -1635,11 +1675,13 @@ window.runMermaid = runMermaid;</script>
     <span class="n">layout</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
     <span class="o">*</span><span class="p">,</span>
     <span class="n">model_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-    <span class="n">node</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"LLM"</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">PrefillStep</span><span class="p">:</span>
+    <span class="n">text</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">WalkStep</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The one prefill walk a request runs over its whole prompt</span>
-<span class="sd">    (``text_inputs``, one tensor): with media in its ``layout``, the walk over</span>
-<span class="sd">    the encoders it runs (`media_encoders`); without, ``prefill_text``."""</span>
+<span class="sd">    (``text_inputs``, one tensor), marked `FINAL_PREFILL`: with media in its</span>
+<span class="sd">    ``layout``, the walk over the encoders it runs (`media_encoders`), which</span>
+<span class="sd">    carries the layout; without, ``prefill_text``, which a graph built with</span>
+<span class="sd">    ``text`` False (`media_walks`) does not have."""</span>
     <span class="n">texts</span> <span class="o">=</span> <span class="n">signals</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"text_inputs"</span><span class="p">,</span> <span class="p">[])</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">texts</span><span class="p">:</span>
         <span class="c1"># the conductor answers this with a 400</span>
@@ -1656,80 +1698,11 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">sent</span><span class="p">:</span>
             <span class="c1"># a text prefill would drop them</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model_name</span><span class="si">}</span><span class="s2"> got </span><span class="si">{</span><span class="n">sent</span><span class="si">}</span><span class="s2"> with no media layout to place them by"</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">PrefillStep</span><span class="p">(</span><span class="s2">"prefill_text"</span><span class="p">,</span> <span class="p">{(</span><span class="n">node</span><span class="p">,</span> <span class="s2">"text_inputs"</span><span class="p">):</span> <span class="n">texts</span><span class="p">})</span>
-    <span class="n">inputs</span> <span class="o">=</span> <span class="p">{(</span><span class="n">node</span><span class="p">,</span> <span class="s2">"text_inputs"</span><span class="p">):</span> <span class="n">texts</span><span class="p">}</span>
-    <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">present</span><span class="p">:</span>
-        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="n">e</span><span class="o">.</span><span class="n">inputs</span><span class="p">:</span>
-            <span class="n">inputs</span><span class="p">[(</span><span class="n">e</span><span class="o">.</span><span class="n">node</span><span class="p">,</span> <span class="n">name</span><span class="p">)]</span> <span class="o">=</span> <span class="n">signals</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="p">[])</span>
-    <span class="k">return</span> <span class="n">PrefillStep</span><span class="p">(</span><span class="n">media_walk_name</span><span class="p">(</span><span class="n">present</span><span class="p">),</span> <span class="n">inputs</span><span class="p">,</span> <span class="p">{</span><span class="n">MEDIA_LAYOUT</span><span class="p">:</span> <span class="n">layout</span> <span class="ow">or</span> <span class="p">{}})</span></div>
-
-
-
-<div class="viewcode-block" id="walk_input_edges">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.walk_input_edges">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">walk_input_edges</span><span class="p">(</span><span class="n">step</span><span class="p">:</span> <span class="n">PrefillStep</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">"""One edge per (node, input) the step's walk reads."""</span>
-    <span class="n">edges</span> <span class="o">=</span> <span class="p">[]</span>
-    <span class="k">for</span> <span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">name</span><span class="p">),</span> <span class="n">tensors</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">input_tensors</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-        <span class="n">edge</span> <span class="o">=</span> <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">node</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="n">name</span><span class="p">)</span>
-        <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">tensors</span><span class="p">)</span>
-        <span class="n">edges</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">edge</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">edges</span></div>
-
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_prefill_args</span><span class="p">(</span>
-    <span class="n">metadata</span><span class="p">:</span> <span class="n">CurrentForwardConductorMetadata</span><span class="p">,</span> <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">GraphEdge</span><span class="p">],</span> <span class="n">step_metadata</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ForwardPassArgs</span><span class="p">:</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ForwardPassArgs</span>
-
-    <span class="k">return</span> <span class="n">ForwardPassArgs</span><span class="p">(</span>
-        <span class="n">full_metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">,</span>
-        <span class="n">inputs</span><span class="o">=</span><span class="n">inputs</span><span class="p">,</span>
-        <span class="n">unpersist_tensors</span><span class="o">=</span><span class="nb">sum</span><span class="p">((</span><span class="n">inp</span><span class="o">.</span><span class="n">tensor_info</span> <span class="k">for</span> <span class="n">inp</span> <span class="ow">in</span> <span class="n">inputs</span><span class="p">),</span> <span class="n">start</span><span class="o">=</span><span class="p">[]),</span>
-        <span class="n">step_metadata</span><span class="o">=</span><span class="p">{</span><span class="s2">"is_prefill"</span><span class="p">:</span> <span class="n">metadata</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">,</span> <span class="o">**</span><span class="n">step_metadata</span><span class="p">},</span>
-    <span class="p">)</span>
-
-
-<div class="viewcode-block" id="initial_prefill_args">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.initial_prefill_args">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">initial_prefill_args</span><span class="p">(</span>
-    <span class="n">step</span><span class="p">:</span> <span class="n">PrefillStep</span><span class="p">,</span> <span class="n">input_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">output_modalities</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ForwardPassArgs</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""The prefill walk; `next_prefill_args` takes it from there."""</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.conductor.request_info</span><span class="w"> </span><span class="kn">import</span> <span class="n">CurrentForwardConductorMetadata</span>
-
-    <span class="n">metadata</span> <span class="o">=</span> <span class="n">CurrentForwardConductorMetadata</span><span class="p">(</span>
-        <span class="n">input_modalities</span><span class="o">=</span><span class="n">input_modalities</span><span class="p">,</span>
-        <span class="n">output_modalities</span><span class="o">=</span><span class="n">output_modalities</span><span class="p">,</span>
-        <span class="n">graph_walk</span><span class="o">=</span><span class="n">step</span><span class="o">.</span><span class="n">walk</span><span class="p">,</span>
-        <span class="n">is_prefill</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="p">)</span>
-    <span class="k">return</span> <span class="n">_prefill_args</span><span class="p">(</span><span class="n">metadata</span><span class="p">,</span> <span class="n">walk_input_edges</span><span class="p">(</span><span class="n">step</span><span class="p">),</span> <span class="n">step</span><span class="o">.</span><span class="n">metadata</span><span class="p">)</span></div>
-
-
-
-<div class="viewcode-block" id="next_prefill_args">
-<a class="viewcode-back" href="../../../_autosummary/mstar.model.multimodal.html#mstar.model.multimodal.next_prefill_args">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">next_prefill_args</span><span class="p">(</span>
-    <span class="n">metadata</span><span class="p">:</span> <span class="n">CurrentForwardConductorMetadata</span><span class="p">,</span>
-    <span class="n">persist_signals</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="n">TensorPointerInfo</span><span class="p">]],</span>
-    <span class="n">node</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"LLM"</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ForwardPassArgs</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""After the prefill, loop in decode until the decoder ``node``'s stop check ends it."""</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ForwardPassArgs</span>
-
-    <span class="k">if</span> <span class="n">metadata</span><span class="o">.</span><span class="n">is_prefill</span><span class="p">:</span>
-        <span class="n">metadata</span><span class="o">.</span><span class="n">is_prefill</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="n">metadata</span><span class="o">.</span><span class="n">graph_walk</span> <span class="o">=</span> <span class="s2">"decode"</span>
-        <span class="n">edge</span> <span class="o">=</span> <span class="n">GraphEdge</span><span class="p">(</span><span class="n">next_node</span><span class="o">=</span><span class="n">node</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"text_inputs"</span><span class="p">)</span>
-        <span class="n">edge</span><span class="o">.</span><span class="n">tensor_info</span> <span class="o">=</span> <span class="n">persist_signals</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"new_token"</span><span class="p">,</span> <span class="p">[])</span>
-        <span class="k">return</span> <span class="n">_prefill_args</span><span class="p">(</span><span class="n">metadata</span><span class="p">,</span> <span class="p">[</span><span class="n">edge</span><span class="p">],</span> <span class="p">{})</span>
-    <span class="c1"># reaching here again after decode stopped means the request is finished</span>
-    <span class="n">metadata</span><span class="o">.</span><span class="n">kwargs</span><span class="p">[</span><span class="s2">"decode_finished"</span><span class="p">]</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="k">return</span> <span class="n">ForwardPassArgs</span><span class="p">(</span>
-        <span class="n">full_metadata</span><span class="o">=</span><span class="n">metadata</span><span class="p">,</span> <span class="n">inputs</span><span class="o">=</span><span class="p">[],</span> <span class="n">unpersist_tensors</span><span class="o">=</span><span class="p">[],</span> <span class="n">request_done</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-    <span class="p">)</span></div>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">text</span><span class="p">:</span>
+            <span class="n">needs</span> <span class="o">=</span> <span class="s2">" or "</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">name</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">encoders</span><span class="p">)</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">model_name</span><span class="si">}</span><span class="s2"> needs </span><span class="si">{</span><span class="n">needs</span><span class="si">}</span><span class="s2">; it takes no text-only prompt"</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">WalkStep</span><span class="p">(</span><span class="n">PREFILL_TEXT</span><span class="p">,</span> <span class="n">step_metadata</span><span class="o">=</span><span class="p">{</span><span class="n">FINAL_PREFILL</span><span class="p">:</span> <span class="kc">True</span><span class="p">})</span>
+    <span class="k">return</span> <span class="n">WalkStep</span><span class="p">(</span><span class="n">media_walk_name</span><span class="p">(</span><span class="n">present</span><span class="p">),</span> <span class="n">step_metadata</span><span class="o">=</span><span class="p">{</span><span class="n">MEDIA_LAYOUT</span><span class="p">:</span> <span class="n">layout</span> <span class="ow">or</span> <span class="p">{},</span> <span class="n">FINAL_PREFILL</span><span class="p">:</span> <span class="kc">True</span><span class="p">})</span></div>
 
 </pre></div>
 
