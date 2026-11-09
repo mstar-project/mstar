@@ -516,6 +516,9 @@ class RealtimeTranscription:
             request=TranscriptionRequest(model=model_name),
             max_item_seconds=min(MAX_ITEM_SECONDS, getattr(adapter, "max_audio_seconds", None) or math.inf),
         )
+        # The running step runner's end, or None. Set by ``run`` before any event.
+        self._steps_end: asyncio.Event | None = None
+        self._group = None
 
     async def send(self, event: dict) -> None:
         await self.ws.send_text(json.dumps(event))
@@ -587,6 +590,8 @@ class RealtimeTranscription:
                 await self.handle(event)
 
         async with anyio.create_task_group() as group:
+            self._group = group
+
             async def drive(operation):
                 try:
                     await operation()
@@ -600,6 +605,9 @@ class RealtimeTranscription:
 
     async def handle(self, event: dict) -> None:
         kind = event.get("type")
+        if kind != "input_audio_buffer.append":
+            # these act on the whole item, so a running step has to finish first
+            await self._steps_settled()
         if kind == "transcription_session.update":
             try:
                 self.update(_object(event.get("session"), "session"))
@@ -673,14 +681,40 @@ class RealtimeTranscription:
         for i, op in enumerate(ops):
             if op[0] == "audio":
                 s.add(op[1])
-                if i == len(ops) - 1 and (chunk := s.take_chunk()) is not None:
-                    await self.step(chunk)
+                if i == len(ops) - 1:
+                    self._start_steps()
             elif op[0] == "commit":
+                await self._steps_settled()
                 await self.commit()
             elif op[0] == "speech_started":
                 await self.send(_event("input_audio_buffer.speech_started", audio_start_ms=op[1], item_id=s.item_id))
             else:
                 await self.send(_event("input_audio_buffer.speech_stopped", audio_end_ms=op[1], item_id=s.item_id))
+
+    def _start_steps(self) -> None:
+        """Decode the pending chunks, off the consumer: a step can wait on the
+        engine for tens of seconds, and appends must keep landing meanwhile.
+        One runner at a time, so steps stay ordered; ``take_chunk`` coalesces
+        what arrived during the last one."""
+        if self._steps_end is None:
+            self._steps_end = asyncio.Event()
+            self._group.start_soon(self._run_steps)
+
+    async def _run_steps(self) -> None:
+        s = self.session
+        try:
+            while (chunk := s.take_chunk()) is not None:
+                await self.step(chunk)
+        except WebSocketDisconnect:
+            self._group.cancel_scope.cancel()
+        finally:
+            end, self._steps_end = self._steps_end, None
+            end.set()
+
+    async def _steps_settled(self) -> None:
+        """Wait out the running step, if any, for an event that needs the whole item."""
+        if self._steps_end is not None:
+            await self._steps_end.wait()
 
     async def _end_of_turn_failed(self, exc: Exception) -> None:
         """semantic_vad's end-of-turn model raised: the segmenter no longer

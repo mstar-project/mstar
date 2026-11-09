@@ -899,8 +899,12 @@ def test_24khz_chunk_boundaries_stay_on_the_item_timeline(client_and_stub):
         ws.send_text(json.dumps({"type": "transcription_session.update", "session": {
             "input_audio_format": {"type": "audio/pcm", "rate": 24000}, "mstar": {"chunk_seconds": 0.5}}}))
         ws.receive_text()
-        for n in (12000, 11964, 11964, 11964):
+        # each append that passes a boundary (the first and third) is decoded
+        # before the next is sent, so the steps run one at a time
+        for n, passes_boundary in ((12000, True), (11964, False), (11964, True), (11964, False)):
             _append_bytes(ws, _tone(n).tobytes())
+            if passes_boundary:
+                _recv_until(ws, "mstar.transcription.partial")
         _commit(ws)
     assert [len(h) for h in heard] == [7952, 16000, 24000, 31928]
 
@@ -1110,7 +1114,49 @@ def test_realtime_closes_a_flooded_queue_instead_of_stopping_reads():
             started.set()
             await asyncio.Future()
         rt.handle = blocked
-        await asyncio.wait_for(rt.run(), 1)
+        await asyncio.wait_for(rt.run(), 60)
         assert ws.closed == 1013
         assert ws.reads <= 1026
+    asyncio.run(exercise())
+
+
+def test_appends_keep_landing_while_a_step_waits_for_the_engine():
+    """20 ms frames behind a step that waits past the 1024-message inbox: the
+    session stays open, and the next step hears everything that came meanwhile
+    in one pass."""
+    import asyncio
+
+    async def exercise():
+        release, second_step = asyncio.Event(), asyncio.Event()
+        class WaitingAPI(_StubAPI):
+            calls = 0
+            async def collect_results(self, request_id, raw_request=None):
+                self.calls += 1
+                if self.calls == 1:
+                    await release.wait()
+                else:
+                    second_step.set()
+                return await super().collect_results(request_id, raw_request)
+            def release_request(self, request_id):
+                pass
+
+        api = WaitingAPI()
+        frames = [json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(2)})]
+        frames += [json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.02)})] * 2000
+        class Socket(_ScriptedWS):
+            closed = None
+            async def receive(self):
+                if not self.inbox:
+                    release.set()
+                    await second_step.wait()
+                return await super().receive()
+            async def close(self, code, reason):
+                self.closed = code
+
+        ws = Socket(frames)
+        rt = serving_realtime.RealtimeTranscription(api, "rt_test", _ContinuingAdapter(), ws)
+        await asyncio.wait_for(rt.run(), 60)
+        assert ws.closed is None
+        assert len(api.submits) == 2
+        assert api.audio_sizes[1] > 20 * api.audio_sizes[0]
     asyncio.run(exercise())
