@@ -6,7 +6,7 @@ Earlier PR (#400) proposed admission control that reserves each request's worst 
 
 This design adds slim version of admission control by default (A1). A request reserves only its prompt's pages and waits in a queue until they fit. On top of it, the requests are classified as either:
 
-1. **Guaranteed.** A request that streams an output that can't pause, such as audio, or whose pages nothing could take back, also reserves pages for the most it can generate, and is never preempted.
+1. **Guaranteed.** A request that streams an output that can't pause, such as audio, or whose pages nothing could take back, also reserves pages for the most it can generate, and is never preempted once it starts.
 2. **Preemptible.** When a request runs out of pages, newer preemptible requests free pages for it. Each moves to the host when the host pool can hold all of its pages, and is otherwise dropped and later rebuilds its KV from token ids. A request that can't be rebuilt moves only to the host, into room the host set aside for it.
 
 A host tier for the prefix cache, which was on the roadmap regardless, is built alongside, and aims to cut that recompute by copying pages between host and device asynchronously, hiding the offload and reload cost.
@@ -33,7 +33,7 @@ class KVReqConfig(ResourceReqConfig):
 
 A dropped request keeps only its token ids, so a request can be dropped only if its node can rebuild all of its KV from them. One that can't be dropped can still move to the host.
 
-A request that nothing can take pages back from must never run short. From the moment it is guaranteed, it reserves its whole footprint, its prompt plus its growth bound, and is never preempted. That is what guaranteed means.
+A request that nothing can take pages back from must never run short. From the moment it is guaranteed, it reserves its whole footprint, its prompt plus its growth bound, and is never preempted once it starts. That is what guaranteed means.
 
 The model declares the footprint as KV spans (#832). A span's kind says what its KV is made from:
 
@@ -312,13 +312,13 @@ In 24 cases on Qwen3.5, Bagel, Orpheus and the Qwen3-Omni Thinker, greedy and se
 
 ### 5.5 Why every request finishes
 
-A guaranteed request reserves its whole footprint and is never preempted, so once it is admitted and guaranteed it finishes.
+A guaranteed request reserves its whole footprint and is never preempted once it starts, so it then finishes.
 
 Take the oldest request O, once every older request has finished:
 
 1. No request chooses O as a victim, since a victim is newer than the request it is chosen for.
 2. When O runs short, newer requests move to the host or are dropped first. When their moves can't cover the shortage, O moves to the host if the host holds it whole, and otherwise waits.
-3. While O waits, on the host or holding its pages, every other request that holds pages is newer, and no newer prompt starts in O's pools except one already allotted its room, which takes nothing more. Each one that runs either finishes, which grows the room, or runs short and, with nothing newer to cover its shortage, moves to the host or waits too. O then moves the newer requests that wait, chosen together as one set, and takes the room as their moves land. None of them is guaranteed, since a guaranteed request never runs short, and one no drop can free moves into the room the host set aside for it (§1). O's footprint fits the pool, so those pages and the room cover it once every newer request has finished or waits.
+3. While O waits, on the host or holding its pages, every other request that holds pages is newer, and no newer prompt starts in O's pools except one already allotted its room, which takes nothing more. Each one that runs either finishes, which grows the room, or runs short and, with nothing newer to cover its shortage, moves to the host or waits too. O then moves the newer requests that wait, chosen together as one set, and takes the room as their moves land. A guaranteed request never runs short, so one among them waits only because the moves it chose admitted it before it could start, and with no page written its move only undoes that admission. One no drop can free moves into the room the host set aside for it (§1). O's footprint fits the pool, so those pages and the room cover it once every newer request has finished or waits.
 4. So O runs again each time it waits, and each time it has grown by at least a page. From the host it returns with every page its grant needed, so that grant can't fail again. Its footprint fits the pool, so it finishes.
 
 The next oldest request then takes its place in the argument. Two requests that hold pages and wait can't wait on each other for good, since the older one, or an older request still, moves the newer one. A dropped request returns with its whole history and one more page reserved, so each time it is preempted again it has grown by at least a page, and once it is the oldest no newer prompt passes it. Until every older request has finished, newer prompts, guaranteed ones included, can start in O's pools. After that none does, so the argument holds while new requests keep arriving. `admit_waiting` tries every return that fits, oldest first, so it can admit returns newer than O ahead of O, and the argument survives that because each newer return grows by a page each time it is preempted, up to its footprint.
@@ -358,7 +358,7 @@ Why this shape:
 
 Always on:
 
-- A victim is preemptible, can move to the host or be dropped, and is never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.
+- A victim is preemptible, or guaranteed and not yet started, and is never older than the request whose grant failed. A breach raises, and so does a forced drop of a guaranteed request.
 - A grant that a reservation covers and that can't take its pages raises.
 - Counters per node: preemptions, drops, tokens rebuilt, and requests dropped more than once.
 
