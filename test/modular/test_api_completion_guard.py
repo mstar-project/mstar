@@ -157,6 +157,7 @@ MODELS = {
         config=SimpleNamespace(audio_vae=SimpleNamespace(sample_rate=16_000)),
     ),
     "nemotron_duplex": lambda: _bare("nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
+    "omnilingual_asr": lambda: _bare("omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel"),
 }
 
 
@@ -241,6 +242,7 @@ def _path(tmp_path, name):
     ("qwen3_tts", "audio", "garbage.wav"),
     ("voxcpm2", "audio", "garbage.wav"),
     ("nemotron_duplex", "audio", "garbage.wav"),
+    ("omnilingual_asr", "audio", "garbage.wav"),  # libsndfile, its own WAV reader, then torchcodec
     ("base", "video", "garbage.mp4"),  # torchcodec
     ("vjepa2", "video", "garbage.mp4"),
 ])
@@ -250,6 +252,8 @@ def test_an_upload_that_will_not_decode_is_a_400(tmp_path, monkeypatch, model, m
     chunk, cleaned = _preprocess_failure(loader, {modality: [_path(tmp_path, name)]})
     assert chunk.metadata["status"] == 400, chunk.data
     assert b"could not decode" in chunk.data.lower() and str(tmp_path).encode() not in chunk.data
+    # installing a decoder is the server's fix, not the client's
+    assert b"install" not in chunk.data
     assert cleaned == ["r1"]
 
 
@@ -258,9 +262,11 @@ def test_an_upload_that_will_not_decode_is_a_400(tmp_path, monkeypatch, model, m
     ("chatterbox", "audio", "garbage.m4a", _no_ffmpeg_at_import),
     ("base", "audio", "garbage.m4a", _no_ffmpeg_at_decode),
     ("vjepa2", "video", "garbage.mp4", _no_ffmpeg_at_decode),
+    ("omnilingual_asr", "audio", "garbage.wav", _no_ffmpeg_at_decode),
     ("base", "image", "image.png", _allocation_fails),
     ("base", "audio", "garbage.m4a", _allocation_fails),
     ("chatterbox", "audio", "garbage.m4a", _allocation_fails),
+    ("omnilingual_asr", "audio", "garbage.wav", _allocation_fails),
     ("base", "video", "garbage.mp4", _allocation_fails),
     ("base", "video", "removed.mp4", _upload_removed),
     ("voxcpm2", "audio", "removed.wav", _upload_removed),
