@@ -228,9 +228,10 @@ model, so they are named for it.
        captures and cannot be overridden by this variable.
    * - ``COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH``
      - unset
-     - Cosmos3: any nonempty value disables only the DiT's understanding-tower
-       prefill capture. Denoise and reasoner captures remain eligible
-       when ``model_kwargs.accelerator_graph`` is true.
+     - Cosmos3: any nonempty value disables only the understanding-tower
+       prefill captures: the DiT's prompt prefill and the reasoner's text,
+       mixed and vision prefills. Denoise and reasoner decode captures remain
+       eligible when ``model_kwargs.accelerator_graph`` is true.
    * - ``MSTAR_OMNIVOICE_MODEL_PATH``
      - unset
      - OmniVoice: load weights from this local directory instead of the
@@ -650,9 +651,9 @@ Worker scheduling
        the graph memory; narrow it (for example
        ``1,2,4,8,16,32``) on a memory-tight GPU or for an A/B against the
        former ladder. ``MSTAR_QWEN35_DECODE_BUCKETS`` overrides it for
-       Qwen3.5 alone; Canary, Canary-Qwen, Qwen3-ASR, Orpheus, Higgs-Audio,
-       Command A+ and the Cosmos3 reasoner pin their own, so it reaches
-       Qwen3.5 and Glimmer.
+       Qwen3.5 alone; Canary, Canary-Qwen, Qwen3-ASR, Orpheus, Higgs-Audio
+       and Command A+ pin their own, so it reaches Qwen3.5, Glimmer and the
+       Cosmos3 reasoner (which defaults to ``1,2,4,8,16,24,32,48,64``).
    * - ``MSTAR_LAZY_PUBLISH``
      - ``1``
      - Publish resource state (KV pages, positions) only for the requests
@@ -737,7 +738,7 @@ Worker scheduling
        routes the signal with no tensor (no per-request store, hold or
        cleanup per step). Only nodes that declare the read
        (``DeviceLoopback``: the decode walks of Qwen3.5, Glimmer, Higgs Audio,
-       Qwen3-ASR, Qwen3-Omni's text-only Thinker and Whisper, which also keeps its timestamp rule state in
+       Qwen3-ASR, the Cosmos3 reasoner, Qwen3-Omni's text-only Thinker and Whisper, which also keeps its timestamp rule state in
        the sampler's declared loop-back state; the other
        ``SampledTokenDecoder`` nodes turn it off with
        ``device_loopback = None``) and only when the sampler has graph
@@ -764,9 +765,9 @@ Worker scheduling
        when the runner admits it (``SamplerResource.reserve``): past them it
        waits, as for a recurrent state slot, until a removed request frees
        one. Only for a node that reads its tokens back on the device
-       (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
-       rank: above one, where admission doesn't decide, the masters grow and
-       the scatter runs after the replay, as with ``0``.
+       (Qwen3.5, Qwen3-ASR, Whisper, the Cosmos3 reasoner) with the device
+       loop-back on, on one rank: above one, where admission doesn't decide,
+       the masters grow and the scatter runs after the replay, as with ``0``.
    * - ``MSTAR_SAMPLER_SLOTS``
      - config's ``knobs: sampler_slots``, else ``4096``
      - Request rows of the sampler masters a captured graph indexes when
