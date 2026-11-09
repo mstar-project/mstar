@@ -29,7 +29,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from mstar.engine.resources.kv.cache import PageAllocator  # noqa: E402
-from mstar.testing_utils.worker import make_worker
+from mstar.testing_utils.worker import make_worker, tp_sharding
 from mstar.utils.ipc_format import (  # noqa: E402
     MessageSource,
     RemoveRequest,
@@ -111,7 +111,7 @@ def _rank(
     ))
     log: list[tuple] = []
     torn_down = threading.Event()
-    group = SimpleNamespace(tp_size=2, _tp_rank=tp_rank, _workers=["rank0", "rank1"])
+    sharding = tp_sharding("rank0", "rank1", tp_rank=tp_rank)
     wire = {handle: rid for rid, handle in HANDLES.items()}
 
     def _tear_down(handle):
@@ -132,7 +132,7 @@ def _rank(
         profile_info=SimpleNamespace(pop_request=lambda rid: None),
         graph_runtime=SimpleNamespace(
             get_rid_handle=HANDLES.get, get_rid_string=wire.get,
-            get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
+            get_sharding_config=lambda rid: sharding,
             remove_request=lambda rid: None,
         ),
         engine_manager=SimpleNamespace(warmup_all=lambda: None, remove_request=_tear_down),

@@ -42,7 +42,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources.step import StepContext
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, SpeculationPrepOutput
-from mstar.testing_utils.worker import make_scheduler, make_worker
+from mstar.testing_utils.worker import make_scheduler, make_worker, tp_sharding
 from mstar.utils.ipc_format import OffloadDelta, ScheduleTPNode, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.speculation import Speculation
@@ -578,8 +578,7 @@ def _leader(tmp_path, streamed=(), nodes=(NODE,), consumed=None, leads=True):
     consumed = consumed or {}
     tm, _ = _shm_manager(tmp_path)
     sent = []
-    group = SimpleNamespace(nodes={NODE}, tp_size=2, _tp_rank=0, _workers=FOLLOWERS)
-    sharding = SimpleNamespace(groups=[group], get_sharding_group=lambda n, g: group)
+    sharding = tp_sharding(*FOLLOWERS, tp_rank=0, nodes={NODE})
     engine_manager = SimpleNamespace(get_engine=lambda n: SimpleNamespace(
         take_resident_delta=lambda n: OffloadDelta.new(),
         decide_cached_prefix=lambda b: {}, page_trails=lambda n: {},

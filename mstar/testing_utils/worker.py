@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import torch
 
+from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.profile.worker import WorkerProfileInfo
 from mstar.worker.admission import Admission
 from mstar.worker.chunk_loops import ChunkLoops
@@ -31,6 +32,17 @@ from mstar.worker.worker import Worker
 _COLLABORATORS = ("communicator", "tensor_manager", "engine_manager", "request_state", "streams", "parallel_groups")
 _COMPONENTS = ("lifecycle", "admission", "lockstep", "scheduler", "ingest", "executor", "speculator", "pipeline")
 _LAYOUT = frozenset(WorkerLayout.__dataclass_fields__)
+
+
+def tp_sharding(*workers: str, tp_rank: int | None = None, nodes=frozenset({"node"})) -> ShardingConfig:
+    """A request's sharding config whose one TP group, of ``workers`` in rank
+    order, serves every node and walk; no group when no worker is named."""
+    group = ShardingGroup(nodes=set(nodes), tp_size=max(len(workers), 1), _tp_rank=tp_rank)
+    if workers:
+        group.register_workers(list(workers))
+    config = ShardingConfig(groups=[group] if workers else [], tp_enabled_nodes=set(), shard_dim={})
+    config.get_sharding_group = lambda node, walk: group
+    return config
 
 
 def make_services(**overrides) -> WorkerServices:

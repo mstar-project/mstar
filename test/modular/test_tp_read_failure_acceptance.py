@@ -434,10 +434,9 @@ class _Graph(PhasedPostprocess):
         return rid
 
     def get_sharding_config(self, rid):
-        group = SimpleNamespace(
-            nodes={NODE}, tp_size=2, _tp_rank=self.rank, _workers=list(WORKERS),
-        )
-        return SimpleNamespace(groups=[group], get_sharding_group=lambda node, walk: group)
+        from mstar.testing_utils.worker import tp_sharding
+
+        return tp_sharding(*WORKERS, tp_rank=self.rank, nodes={NODE})
 
     # inputs
     def ingest_inputs_batch(self, block, can_buffer):

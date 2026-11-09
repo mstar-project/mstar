@@ -20,7 +20,7 @@ from mstar.model.submodule_base import BatchedModelOutput
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.streaming.topology import CLIENT
-from mstar.testing_utils.worker import deliver, make_worker
+from mstar.testing_utils.worker import deliver, make_worker, tp_sharding
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -43,8 +43,6 @@ class _StubRuntime(SimpleNamespace, PhasedPostprocess):
     supports_inline_emit = False
 
 
-def _tp_group(*workers):
-    return SimpleNamespace(tp_size=len(workers), _workers=list(workers))
 
 
 def _worker(
@@ -62,9 +60,8 @@ def _worker(
         # The request's TP groups: on a follower, by default, it runs on
         # leader "lead"'s group, which this worker ("w0") follows.
         get_sharding_config=lambda r: (
-            SimpleNamespace(groups=[tp_group or _tp_group("lead", "w0")] if is_follower else [])
-            if r in known_rids else None
-        ),
+            (tp_group or tp_sharding("lead", "w0")) if is_follower else tp_sharding()
+        ) if r in known_rids else None,
     )
     request_state = SimpleNamespace(
         per_request_info={
@@ -384,7 +381,7 @@ def test_a_follower_takes_the_conductors_teardown_of_a_request_it_follows_no_lea
     and also runs a node of a request whose TP node runs on the other one. No
     leader forwards that request's drain and remove here, so the conductor's
     count; ignored, its abort stalls for the drain TTL and its state leaks."""
-    w = _worker(is_follower=True, tp_group=_tp_group("lead", "w0") if replica == "followed" else _tp_group("w2", "w3"))
+    w = _worker(is_follower=True, tp_group=tp_sharding(*(("lead", "w0") if replica == "followed" else ("w2", "w3"))))
     _drain(w, request_id="X")  # source=CONDUCTOR
     _remove(w, request_id="X")
     w.pipeline._teardown(w.pipeline.in_flight_rids)

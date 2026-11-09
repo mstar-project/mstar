@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 
 from torch.distributed import ReduceOp
 
-from mstar.distributed.base import tp_groups_of
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RequestWalks
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
@@ -405,7 +404,7 @@ class Lockstep:
         if sharding is None:
             return
         followers = {
-            worker for workers in tp_groups_of(sharding, self._worker_id) if workers[0] == self._worker_id
+            worker for workers in sharding.tp_groups_of(self._worker_id) if workers[0] == self._worker_id
             for worker in workers[1:]
         }
         for worker in followers:

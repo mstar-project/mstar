@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Collection, Iterable, Set
 
-from mstar.distributed.base import follows_leader
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
     DrainRequest,
@@ -118,7 +117,7 @@ class RequestLifecycle:
         if not self._is_tp_follower:
             return False
         sharding = self._runtime.get_sharding_config(rid)
-        return sharding is not None and follows_leader(sharding, self._worker_id)
+        return sharding is not None and sharding.follows_leader(self._worker_id)
 
     # -- failure -------------------------------------------------------------
 

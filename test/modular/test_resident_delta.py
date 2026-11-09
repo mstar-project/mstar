@@ -31,7 +31,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.resources import Residency
 from mstar.engine.resources.step import FULL_ADMIT_OK, AllocationFailed, StepContext
 from mstar.testing_utils.engine import make_engine, make_mgmt
-from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
+from mstar.testing_utils.worker import deliver, make_scheduler, make_worker, tp_sharding
 from mstar.utils.ipc_format import (
     MessageSource,
     OffloadDelta,
@@ -595,7 +595,7 @@ def test_the_roles_are_per_node():
 def _leader(followers=("rank1", "rank2")) -> Worker:
     """Rank 0's real ``Lockstep``, over a stub engine and communicator."""
     engine = _Engine("leader")
-    group = SimpleNamespace(_workers=["rank0", *followers])
+    sharding = tp_sharding("rank0", *followers)
     sent: list = []
     leader = make_worker(
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
@@ -603,9 +603,7 @@ def _leader(followers=("rank1", "rank2")) -> Worker:
         # Its ``get_rid_string`` is the same prefixing stub ``_Engine`` uses, so a
         # broadcast that shipped local handles instead of wire ids is visible.
         graph_runtime=SimpleNamespace(
-            get_sharding_config=lambda rid: SimpleNamespace(
-                get_sharding_group=lambda n, w: group
-            ),
+            get_sharding_config=lambda rid: sharding,
             get_rid_string=_Rids().get_rid_string,
         ),
         communicator=SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg))),
@@ -850,8 +848,7 @@ def _consume(rank, seq: int) -> None:
 def _remove_rank(consumed: int, *, follower: bool = True) -> Worker:
     """A rank whose lifecycle orders a forwarded removal against the step stream."""
     # each request runs on the TP group a follower follows
-    group = SimpleNamespace(tp_size=2, _workers=["rank0", "w0"])
-    runtime = SimpleNamespace(get_sharding_config=lambda rid: SimpleNamespace(groups=[group]))
+    runtime = SimpleNamespace(get_sharding_config=lambda rid: tp_sharding("rank0", "w0"))
     rank = make_worker(engine_manager=SimpleNamespace(), is_tp_follower=follower, graph_runtime=runtime)
     if consumed >= 0:
         _consume(rank, consumed)
@@ -920,7 +917,6 @@ def test_held_removals_land_in_step_order():
 
 def _forwarding_leader(broadcast_seq: int) -> Worker:
     """Rank 0's real removal, over stubs, to pin what it forwards."""
-    group = SimpleNamespace(tp_size=2, _tp_rank=0, _workers=["rank0", "rank1"])
     sent: list = []
     request_state = SimpleNamespace(remove_request=lambda rid: None)
     tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
@@ -930,7 +926,7 @@ def _forwarding_leader(broadcast_seq: int) -> Worker:
         graph_runtime=SimpleNamespace(
             get_rid_handle=lambda rid: 0 if rid == "gone" else None,
             get_rid_string=lambda handle: "gone" if handle == 0 else None,
-            get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
+            get_sharding_config=lambda rid: tp_sharding("rank0", "rank1", tp_rank=0),
             remove_request=lambda rid: None,
         ),
         request_state=request_state,

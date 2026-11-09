@@ -42,6 +42,8 @@ class ShardingGroup:
     _tp_rank: int | None = None  # set by the conductor
     # rank-ordered, once ``register_workers`` names them
     _workers: list[str] = field(default_factory=list)
+    _workers_set: set[str] = field(default_factory=set)
+    _worker_to_tp_rank: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self):
         self.nodes = set(self.nodes)
@@ -83,19 +85,6 @@ class ShardDestination:
     end_idxs: list[int] | None = None
 
 
-def tp_groups_of(sharding: "ShardingConfig", worker: str) -> list[list[str]]:
-    """The workers, rank-ordered, of each of ``sharding``'s TP groups ``worker``
-    is in. In a request's config, a group of the worker's layout can hold
-    another replica's workers, on a deployment data-parallel over that group."""
-    return [group._workers for group in sharding.groups if group.tp_size > 1 and worker in group._workers]
-
-
-def follows_leader(sharding: "ShardingConfig", worker: str) -> bool:
-    """Whether a leader fans the request's teardown out to ``worker``
-    (``Lockstep.forward_teardown``), which then takes only the leader's."""
-    return any(workers[0] != worker for workers in tp_groups_of(sharding, worker))
-
-
 @dataclass
 class ShardingConfig:
     groups: list[ShardingGroup]
@@ -125,6 +114,17 @@ class ShardingConfig:
             ep_enabled_nodes=self.ep_enabled_nodes,
             cfg_enabled_nodes=self.cfg_enabled_nodes,
         )
+
+    def tp_groups_of(self, worker: str) -> list[list[str]]:
+        """The workers, rank-ordered, of each TP group ``worker`` is in. In a
+        request's config, a group of the worker's layout can hold another
+        replica's workers, on a deployment data-parallel over that group."""
+        return [group._workers for group in self.groups if group.tp_size > 1 and worker in group._workers_set]
+
+    def follows_leader(self, worker: str) -> bool:
+        """Whether a leader fans the request's teardown out to ``worker``
+        (``Lockstep.forward_teardown``), which then takes only the leader's."""
+        return any(workers[0] != worker for workers in self.tp_groups_of(worker))
 
     def get_sharding_group(
         self, node: str, graph_walk: str,

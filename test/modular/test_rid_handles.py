@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mstar.testing_utils.worker import deliver, make_scheduler, make_worker
+from mstar.testing_utils.worker import deliver, make_scheduler, make_worker, tp_sharding
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     MessageSource,
@@ -148,7 +148,7 @@ def _worker(
     runtime.add_request = lambda request_id, **kw: t.intern(request_id)
     runtime.register_stop_limits = lambda rid, info: None
     runtime.get_rid_handle, runtime.get_rid_string = t.handle, t.name
-    runtime.get_sharding_config = lambda h: SimpleNamespace(groups=[])
+    runtime.get_sharding_config = lambda h: tp_sharding()
     runtime.remove_request = _runtime_remove
     request_state.per_request_info = {t.intern(r): SimpleNamespace() for r in rids}
     for r in rids:
