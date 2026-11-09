@@ -380,7 +380,6 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     assert stops(Cosmos3Model.REASONER_PREFILL_VISION_WALK, 12, max_tokens=2) == set()
 
 
-
 def test_reasoner_rotary_tables_come_from_the_layout_and_the_counter(tmp_path) -> None:
     """The tower takes rotary tables, built by the DiT transformer's own rotary:
     an eager vision prefill's from the positions its layout places, based at
@@ -428,6 +427,7 @@ def test_reasoner_rotary_tables_come_from_the_layout_and_the_counter(tmp_path) -
     cos, sin = sub.decoder_kwargs(Cosmos3Model.REASONER_DECODE_WALK, types.SimpleNamespace(captured=True), 2)["cos_sin"]
     want = tower.build_cos_sin(planned.expand(3, -1), torch.float32)
     assert torch.equal(cos, want[0]) and torch.equal(sin, want[1])
+
 
 def test_edge_chat_adapter(tmp_path) -> None:
     from mstar.api_server.openai.adapters import get_adapter
