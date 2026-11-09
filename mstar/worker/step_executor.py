@@ -136,15 +136,6 @@ class GpuStepBody:
             node_batch.rows_only = self.all_on_device(
                 engine, batch.node_name, batch.graph_walk, batch.output_signals,
             )
-            if (
-                not node_batch.rows_only and not batch.request_walks
-                and (batch.node_name, batch.graph_walk) in self.engine_manager.partial_loopback_keys
-            ):
-                # the loop-back stays on the device, the streamed outputs route as tensors
-                node_batch.device_loopback = bool(
-                    self.device_signals(engine, batch.node_name, batch.graph_walk)
-                    & set(batch.output_signals)
-                )
             if batch.request_walks:
                 node_batch.loopback_rids = self._loopback_rids(engine, batch)
             if logger.isEnabledFor(logging.DEBUG):
@@ -247,24 +238,19 @@ class GpuStepBody:
             if self.enable_nvtx:
                 range_pop(synchronize=False)
 
-    def device_signals(self, engine, node_name: str, graph_walk: str) -> frozenset[str]:
-        """The output signals the node keeps on the device in this walk (cached
-        per node and walk: they depend on the node's resources, not on the step)."""
+    def all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
+        """Whether every output signal of this step is one the node keeps on
+        the device (cached per node and walk: it depends on the node's
+        resources, not on the step)."""
+        # without inline emit, a rows-only step has no path for the client's tokens
+        if not signals or not self._graph_runtime.supports_inline_emit:
+            return False
         key = (node_name, graph_walk)
         on_device = self._device_loopback.get(key)
         if on_device is None:
             on_device = self._device_loopback[key] = frozenset(
                 engine.device_loopback_signals(node_name, graph_walk)
             )
-        return on_device
-
-    def all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
-        """Whether every output signal of this step is one the node keeps on
-        the device."""
-        # without inline emit, a rows-only step has no path for the client's tokens
-        if not signals or not self._graph_runtime.supports_inline_emit:
-            return False
-        on_device = self.device_signals(engine, node_name, graph_walk)
         return all(s in on_device for s in signals)
 
     def walk_signals(self, batch: ScheduledBatch, walk: str):
@@ -892,8 +878,6 @@ class StepExecutor:
                         if rid_outputs:
                             for name in names:
                                 rid_outputs.pop(name, None)
-                if batch_N.node_batch.device_loopback:
-                    self._drop_device_kept(batch_N, outputs, step.wg_ids.keys, engine)
                 stored, route_tensors = self._store_outputs(
                     batch_N, outputs, request, step, cpu_outputs, host_rows, engine,
                 )
@@ -1102,17 +1086,6 @@ class StepExecutor:
                 self.request_state.buffer_publish_info(rid, batch_N.partition, published)
                 buffered.add(rid)
         return buffered
-
-    def _drop_device_kept(self, batch_N: PendingBatch, outputs: BatchedModelOutput, rids, engine) -> None:
-        """Leave out of the store the outputs of ``rids`` that the node keeps on the
-        device (``device_loopback_signals``): they route with no tensor, and the
-        rows' next step reads them off the device."""
-        kept = self._body.device_signals(engine, batch_N.node_name, batch_N.graph_walk)
-        for rid in rids:
-            rid_outputs = outputs.get(rid)
-            if rid_outputs:
-                for name in kept:
-                    rid_outputs.pop(name, None)
 
     def _store_outputs(
         self, batch_N: PendingBatch, outputs: BatchedModelOutput,

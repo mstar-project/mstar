@@ -182,25 +182,6 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                     )
 
 
-def _partial_loopback_keys(submodules: dict, model: Model) -> frozenset[tuple[str, str]]:
-    """The (node, walk) pairs whose step keeps its loop-back signal on the device
-    (``ARNodeSubmodule.device_loopback``) while every other output leaves by a
-    streaming edge: a token that loops back and also streams to another node
-    (``ExecutingBatch.device_loopback``). Only that shape: another routed output
-    could loop back into the node, and the slot-master read of the loop-back
-    rows would leave it out."""
-    keys = set()
-    for walk, section in model.get_graph_walk_graphs().items():
-        for name, node in section.get_nodes().items():
-            loopback = getattr(submodules.get(name), "device_loopback", None)
-            if loopback is None or loopback.walk != walk:
-                continue
-            others = [edge for edge in node.outputs if edge.name != loopback.signal]
-            if others and all(edge.is_streaming for edge in others):
-                keys.add((name, walk))
-    return frozenset(keys)
-
-
 def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
     """The nodes whose node groups set ``side_stream: true``. A node listed by
     several groups, one per graph walk, must get the same answer from each."""
@@ -326,8 +307,6 @@ class EngineManager:
     # (node, walk) keys that run beside the chain, as ``build`` decided from
     # the config's ``side_stream`` (see ``_side_lane_keys``)
     side_keys: tuple[tuple[str, str], ...] = ()
-    # (node, walk) pairs a step of which may keep only its loop-back on the device
-    partial_loopback_keys: frozenset[tuple[str, str]] = frozenset()
 
     @classmethod
     def build(
@@ -441,10 +420,7 @@ class EngineManager:
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(
-            engine=engine, node_names=set(node_names), side_keys=side_keys,
-            partial_loopback_keys=_partial_loopback_keys(submodules, model),
-        )
+        return cls(engine=engine, node_names=set(node_names), side_keys=side_keys)
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

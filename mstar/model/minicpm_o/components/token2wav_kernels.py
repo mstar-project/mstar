@@ -204,16 +204,21 @@ def _mlp(mlp, h: torch.Tensor) -> torch.Tensor:
     return _linear(mlp.fc2, a).reshape(n, t, -1)
 
 
-def dit_forward(dit, x, mu, mods, final_mod, spks, cond, cnn_cache, kv, dtype=None) -> torch.Tensor:
+def dit_forward(dit, x, mu, mods, final_mod, spks, cond, cnn_cache, kv) -> torch.Tensor:
     """``DiT.forward`` over bounded KV caches on CUDA: the same blocks, with each residual
     add fused into the next adaLN (the MLP's into the next block's), the attention over the
     cache, channels-last causal convs, and bias + GELU in the fc1 GEMM's epilogue.
 
-    ``dtype`` (default ``x``'s) is what the GEMMs, convolutions and attention take; the
-    residual stream, the norms' arithmetic and the returned velocity stay in ``x``'s dtype.
-    The attention caches must hold ``dtype``."""
+    The caches' dtype is what the GEMMs, convolutions and attention take, so it is set in
+    one place, where the caches are declared; the residual stream, the norms' arithmetic
+    and the returned velocity stay in ``x``'s dtype."""
     t = x.shape[-1]
-    low = dtype or x.dtype
+    low = cnn_cache.dtype
+    if kv[0].source.dtype != low:
+        raise ValueError(
+            f"the DiT's voice sources are {kv[0].source.dtype} but its caches are {low}: "
+            "build the VoiceBank in the caches' dtype"
+        )
     h = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, t), cond], dim=1).to(low)
     x = _linear(dit.in_proj, h.transpose(1, 2)).to(x.dtype).contiguous()
     pending = (None, None)

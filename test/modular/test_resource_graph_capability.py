@@ -115,7 +115,8 @@ def test_empty_capture_batch_sizes_capture_nothing(piecewise):
         runner = AcceleratorGraphRunner(
             submodule_name="llm",
             submodule=SimpleNamespace(
-                get_accelerator_graph_configs=lambda *args: [config], declare_step=declare, compiled_entries_per_shape=1,
+                get_accelerator_graph_configs=lambda *args: [config], declare_step=declare,
+                compiled_entries_per_shape=1,
             ),
             resources={"attention": resource}, step_runner=Mock(), device=torch.device("cpu"),
             autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,

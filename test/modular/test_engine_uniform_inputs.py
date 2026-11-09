@@ -29,7 +29,6 @@ class _Batch:
         self.per_request_input_metadata = {}
         self.final_stream_rids = set()
         self.skipped_rids = set()
-        self.device_loopback = False
         self.failed_requests = {}
         self.inputs = None
         self.uniform_inputs = None

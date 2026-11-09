@@ -450,12 +450,6 @@ class ExecutingBatch:
     # the inline emit and the speculation splice read the rows instead.
     rows_only: bool = False
 
-    # The step keeps its walk's loop-back signals on the device while its
-    # other outputs route as tensors (a token that loops back and also streams
-    # to another worker): those signals route with no tensor, and the rows'
-    # next step reads them in ``preprocess``, as after a rows-only step.
-    device_loopback: bool = False
-
     # A mixed step's rows whose own walk keeps every output signal on the
     # device: such a row loops back as it would in a step of its walk alone,
     # while the step's other rows route tensors.
@@ -1425,7 +1419,7 @@ class Engine:
         # a rebuild row leaves its request's entry for the decode step it resumes
         rebuild = batch.step_context.rebuild_rids
         rids = [rid for rid in batch.request_ids if rid not in rebuild] if rebuild else batch.request_ids
-        if batch.rows_only or batch.device_loopback:
+        if batch.rows_only:
             steps.update(dict.fromkeys(
                 rids, (batch.node_name, batch.step_context.graph_walk),
             ))
@@ -1739,7 +1733,6 @@ class Engine:
                 if not batch.running_batched and lease is None:
                     # the unbatched forward has per-request outputs: no rows to stay on
                     batch.rows_only = False
-                    batch.device_loopback = False
                     batch.loopback_rids = frozenset()
                 if not batch.running_batched and len(batch.request_ids) > 1 and lease is None:
                     batch.outputs = self._exec_per_request(batch)

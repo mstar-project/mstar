@@ -2042,10 +2042,7 @@ row whose last step did not keep its value on the device (its first decode step,
 the prefill) still brings it routed, and that read puts it over the slot's.
 ``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio and Qwen3-ASR,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
-Qwen3-Omni's Thinker declare their own. A decode step whose token also streams to
-another node keeps only the loop-back on the device: give the loop-back its own signal
-(MiniCPM-o's TTS loops back ``tts_next`` and streams ``tts_code`` to the vocoder), and the
-worker routes that signal without a tensor while the step's other outputs go as tensors.
+Qwen3-Omni's Thinker declare their own.
 
 On such a node a captured step writes each row's token and RNG offset back to the request's
 row inside the graph (``knobs: sampler_ingraph_scatter``, on by default). Those rows are

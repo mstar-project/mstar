@@ -339,17 +339,6 @@ def _step(rids=(R, A), walk=PREFILL, node=NODE, rebuild=R, **fields) -> Executin
                           step_context=ctx, **fields)
 
 
-def test_a_step_keeping_its_loopback_on_the_device_records_its_rows():
-    """Some outputs on the device and the rest routed as tensors: the rows'
-    next step reads the loop-back value off the device, as after a rows-only step."""
-    engine = make_engine(_loopback_steps={})
-    batch = _step(walk=DECODE, rebuild=-1, device_loopback=True)
-
-    engine._record_loopback(batch)
-
-    assert engine._loopback_steps == {R: (NODE, DECODE), A: (NODE, DECODE)}
-
-
 @pytest.mark.parametrize("branch", ["rows_only", "mixed", "tensor"])
 def test_a_rebuild_row_leaves_its_requests_loopback_entry(branch):
     engine = make_engine(_loopback_steps={R: (NODE, DECODE), A: (NODE, DECODE)})
