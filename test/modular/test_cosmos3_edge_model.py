@@ -144,6 +144,9 @@ def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
     assert specs[SAMPLER].vocab_size == 131072
     # the reasoner's position counter is its own; mixed steps split the shared attention
     assert specs[ROPE].nodes == {REASONER_NODE}
+    # the vision tower's attention: a segment per frame, down to the smallest video frame (16 patches)
+    assert specs["vision_attn"].nodes == {VISION_ENCODER_NODE}
+    assert specs["vision_attn"].config.max_segments_per_step == 16384 // 16
     assert [split.combined_walk for split in specs[ATTN].config.splits] == ["mixed"]
     assert model.get_combined_graph_walks() == {REASONER_NODE: {"mixed": {"prefill_text", "decode"}}}
     # Nano-shaped defaults declare no reasoner resources.
@@ -181,7 +184,7 @@ def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
 @pytest.mark.parametrize("vision", [True, False])
 def test_reasoner_plan_prefills_then_decodes_the_first_token(tmp_path, vision) -> None:
     model = _model(tmp_path)
-    names = ("text_inputs",) + (("pixel_values", "vision_grid_thw") if vision else ())
+    names = ("text_inputs",) + (("pixel_values",) if vision else ())
     # as process_prompt sets it: a text-only prompt's layout places no media
     layout = {"offset": [3], "tokens": [8], "output": ["vision_embeds"], "grid": [[1, 4, 8]]} if vision else {
         "offset": [], "tokens": [], "output": [], "grid": []}

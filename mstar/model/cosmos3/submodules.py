@@ -48,12 +48,15 @@ import logging
 import math
 import os
 import time
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 import torch
 from torch.fx.experimental import _config as fx_config
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
@@ -64,6 +67,7 @@ from mstar.engine.resources import AttentionStep, KVStep, Segment, SlotLease, Su
 from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.step import ResourceStep
 from mstar.engine.windowing import WindowSchedule
+from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.unipc import (
     LAST_SAMPLE,
@@ -3109,37 +3113,105 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         return self._to_uint8(decoded)
 
 
-class Cosmos3VisionEncoderSubmodule(NodeSubmodule):
-    """The Edge reasoner's vision tower + projector (STATELESS): the request's
-    packed image/video patches -> one text-space token per merged 2x2 block,
-    in prompt order, for the reasoner prefill to scatter over its
-    ``<|image_pad|>`` / ``<|video_pad|>`` tokens.
+class _VisionNodeConfig(NamedTuple):
+    """What `PackedBlockLoopEncoder` reads of its config."""
 
-    The pixel patches and their grids are computed CPU-side in
-    ``Cosmos3Model.process_prompt`` (the token count must be known when the
-    prompt is rendered), so this node only runs the encoder.
+    hidden_size: int
+    head_dim: int
+    spatial_merge_size: int
+
+
+class Cosmos3VisionEncoderSubmodule(PackedBlockLoopEncoder):
+    """The Edge reasoner's vision tower + projector (STATELESS): a step's
+    requests' packed image / video patches -> one text-space token per merged
+    2x2 block, in prompt order, for the reasoner's media walk to splice in at
+    its pads.
+
+    The pixel patches are computed CPU-side in ``Cosmos3Model.process_prompt``
+    and the grids ride the walk's ``MEDIA_LAYOUT`` (one run per image or video
+    frame), so no device tensor is read for them. Each frame attends to
+    itself alone, a segment of the ragged attention resource, and the encoder
+    blocks replay as one captured region per patch bucket, a step's requests
+    together. A request too large for a replay runs the blocks eagerly, in a
+    step of its own (`cg_key_info`).
     """
 
-    # One packed forward per request at request-specific patch counts.
+    # A 512x341 image is ~700 patches; a step past the top bucket runs the
+    # block loop eagerly.
+    BLOCK_LOOP_PATCH_BUCKETS = [256, 512, 1024, 2048, 4096, 8192, 16384]
+    # A burst of image requests shares one replay and pays the per-step host
+    # cost once per this many.
+    MAX_BATCH_SIZE = 8
+    # Per-request shapes vary; the block loop's capture is the accelerator.
     disable_torch_compile = True
+    # The tower is bf16 already. Under autocast each LayerNorm upcasts its input
+    # and its fp32 output is cast back once per projection reading it, ~18% of
+    # the block loop's GPU time for the same rounding (the norm accumulates in
+    # fp32 either way).
+    disable_autocast = True
+    BLOCK_LOOP_DTYPE = torch.bfloat16
+    # Resized position tables kept on the device, least recently used dropped
+    # first, within a byte budget: one is h*w x hidden, ~151 MB at the processor's
+    # largest frame, so a count alone could hold gigabytes. A table over an
+    # eighth of the budget is built per call and not kept.
+    POSITION_TABLE_BYTES = 256 << 20
 
     def __init__(self, vision_model, config):
-        super().__init__()
-        self.vision_model = vision_model
-        self.config = config
+        vision = config.reasoner.vision if config.reasoner is not None else None
+        node_config = None if vision is None else _VisionNodeConfig(
+            vision.hidden_size, vision.hidden_size // vision.num_attention_heads, vision.spatial_merge_size,
+        )
+        super().__init__(vision_model, node_config, output="vision_embeds")
+        self.model_config = config
+        self._position_tables: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+        self._position_table_bytes = 0
+
+    def _position_table(self, h: int, w: int) -> torch.Tensor:
+        """The frame's resized position grid, built on the device once per (h, w)."""
+        table = self._position_tables.get((h, w))
+        if table is not None:
+            self._position_tables.move_to_end((h, w))
+            return table
+        table = self.model.position_table(h, w)
+        size = table.numel() * table.element_size()
+        if size > self.POSITION_TABLE_BYTES // 8:
+            return table
+        self._position_tables[h, w] = table
+        self._position_table_bytes += size
+        while self._position_table_bytes > self.POSITION_TABLE_BYTES:
+            _, dropped = self._position_tables.popitem(last=False)
+            self._position_table_bytes -= dropped.numel() * dropped.element_size()
+        return table
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+        frames = [(h, w) for t, h, w in self.grids(fwd_info) for _ in range(t)]
         pixel_values = inputs["pixel_values"][0]
-        grid_thw = inputs["vision_grid_thw"][0]
+        patches = sum(h * w for h, w in frames)
+        if pixel_values.shape[0] != patches:
+            raise ValueError(f"{pixel_values.shape[0]} pixel patches for the layout's {patches}")
         return NodeInputs(
-            tensor_inputs={"pixel_values": pixel_values, "vision_grid_thw": grid_thw},
-            input_seq_len=int(pixel_values.shape[0]),
+            # what the engine leases the captured block loop's bucket by
+            input_seq_len=patches,
+            tensor_inputs={
+                "pixel_values": pixel_values,
+                "pos_embeds": torch.cat([self._position_table(h, w) for h, w in frames]),
+            },
+            # one segment per frame: a frame attends to itself alone
+            resource_step_info={"main": [h * w for h, w in frames]},
         )
 
-    def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, pixel_values, vision_grid_thw, **kwargs):
-        grids = [tuple(int(x) for x in row) for row in vision_grid_thw.tolist()]
-        embeds = self.vision_model(pixel_values, grids)
-        return {"vision_embeds": [embeds]}
+    def split_batches_by_capture_key(self, graph_walk: str) -> bool:
+        return True
+
+    def cg_key_info(self, graph_walk: str, per_request_info: dict, **kwargs) -> Any:
+        """Requests that each fit a replay pack together (None); one too large
+        for a replay is a group of its own, so it doesn't hold the others'
+        embeddings, and their prefills, until it is encoded."""
+        def too_large(info: CurrentForwardPassInfo) -> bool:
+            grid = self.grids(info)
+            return not self._fits_replay(sum(t * h * w for t, h, w in grid), sum(t for t, _, _ in grid))
+
+        return tuple(rid for rid, info in per_request_info.items() if too_large(info)) or None
 
 
 class Cosmos3TextTower(torch.nn.Module):

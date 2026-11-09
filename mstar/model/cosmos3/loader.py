@@ -41,22 +41,33 @@ TRANSFORMER_STACKED = [
 ]
 
 
-def stacked_param_name(name: str) -> str:
-    """The backbone parameter a checkpoint key loads into: its fused one for
-    a q / k / v projection, else the key itself."""
-    for rule in TRANSFORMER_STACKED:
+# The vision tower's q / k / v load into one fused ``qkv_proj`` a layer, as
+# the transformer's do.
+VISION_STACKED = [
+    StackedParamRule(".qkv_proj", ".q_proj", "q"),
+    StackedParamRule(".qkv_proj", ".k_proj", "k"),
+    StackedParamRule(".qkv_proj", ".v_proj", "v"),
+]
+
+
+def stacked_param_name(name: str, rules: list[StackedParamRule] = TRANSFORMER_STACKED) -> str:
+    """The parameter a checkpoint key loads into: its fused one for a q / k /
+    v projection, else the key itself."""
+    for rule in rules:
         marker = rule.source_suffix + "."
         if marker in name:
             return name.replace(marker, rule.target_suffix + ".")
     return name
 
 
-def stacked_param_shapes(shapes: dict[str, tuple[int, ...]]) -> dict[str, tuple[int, ...]]:
-    """Checkpoint tensor shapes as the backbone's parameters hold them: a fused
+def stacked_param_shapes(
+    shapes: dict[str, tuple[int, ...]], rules: list[StackedParamRule] = TRANSFORMER_STACKED,
+) -> dict[str, tuple[int, ...]]:
+    """Checkpoint tensor shapes as the module's parameters hold them: a fused
     projection's rows are its shards' rows together."""
     out: dict[str, tuple[int, ...]] = {}
     for name, shape in shapes.items():
-        target = stacked_param_name(name)
+        target = stacked_param_name(name, rules)
         if target == name:
             out[name] = tuple(shape)
         elif target in out:
@@ -189,9 +200,9 @@ def load_transformer_weights(
 
 
 def read_vision_encoder_weight_shapes(checkpoint_dir: str | Path) -> dict[str, tuple[int, ...]]:
-    """``{remapped key: shape}`` of ``vision_encoder/model.safetensors``, from
-    the safetensors header only (CPU-side shape verification of the meta-built
-    vision module)."""
+    """``{parameter: shape}`` of ``vision_encoder/model.safetensors`` as the
+    vision module holds it (q / k / v fused), from the safetensors header only
+    (CPU-side shape verification of the meta-built vision module)."""
     from safetensors import safe_open
 
     path = Path(checkpoint_dir) / "vision_encoder" / "model.safetensors"
@@ -201,7 +212,7 @@ def read_vision_encoder_weight_shapes(checkpoint_dir: str | Path) -> dict[str, t
             mapped = vision_encoder_name_remapper(key)
             if mapped is not None:
                 shapes[mapped] = tuple(handle.get_slice(key).get_shape())
-    return shapes
+    return stacked_param_shapes(shapes, VISION_STACKED)
 
 
 def load_vision_encoder_weights(
@@ -218,7 +229,7 @@ def load_vision_encoder_weights(
     if not path.exists():
         raise FileNotFoundError(f"no vision encoder weights under {path}")
     loaded = load_hf_weights(
-        model, iter_safetensors_file(path, device=device),
+        model, iter_safetensors_file(path, device=device), stacked_params=VISION_STACKED,
         name_remapper=vision_encoder_name_remapper,
     )
     expected = set(dict(model.named_parameters()).keys())

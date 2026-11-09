@@ -509,7 +509,8 @@ def test_edge_vision_encoder_key_and_shape_coverage() -> None:
     unexpected = sorted(set(ckpt) - set(model_shapes))[:5]
     assert set(model_shapes) == set(ckpt), (missing, unexpected)
     assert {k for k, s in model_shapes.items() if s != ckpt[k]} == set()
-    assert len(ckpt) == 443
+    # 443 checkpoint tensors, each layer's q / k / v weight and bias fused into one pair
+    assert len(ckpt) == 443 - 27 * 2 * 2
 
 
 @needs_edge
@@ -579,13 +580,16 @@ def test_edge_reasoner_video_prompt() -> None:
     )
     out = prompt.new_input_tensors
     ids = out["text_inputs"][0]
-    grid = out["vision_grid_thw"][0]
-    assert grid.shape == (1, 3) and int(grid[0, 0]) == 6
-    per_frame = int(grid[0, 1] * grid[0, 2]) // 4
+    # one layout run per frame, each with its (1, h, w) patch grid
+    layout = prompt.metadata[MEDIA_LAYOUT]
+    assert len(layout["grid"]) == 6 and len({tuple(g) for g in layout["grid"]}) == 1
+    _, h, w = layout["grid"][0]
+    per_frame = h * w // 4
+    assert layout["tokens"] == [per_frame] * 6
     assert int((ids == r.video_token_id).sum()) == 6 * per_frame
     assert int((ids == r.vision_start_token_id).sum()) == 6
-    assert out["pixel_values"][0].shape[0] == int(grid[0].prod())
-    pos, _ = layout_position_ids(prompt.metadata[MEDIA_LAYOUT], r.vision.spatial_merge_size, len(ids))
+    assert out["pixel_values"][0].shape[0] == 6 * h * w
+    pos, _ = layout_position_ids(layout, r.vision.spatial_merge_size, len(ids))
     starts = (ids == r.vision_start_token_id).nonzero().flatten().tolist()
     # Frame k's tokens sit at one temporal position; successive frames are
     # separated by the timestamp text plus the merged grid's longer side.
@@ -598,8 +602,8 @@ def test_edge_reasoner_video_prompt() -> None:
         None, ["video", "text"], ["text"], tensors={"video_inputs": [video]},
         prompt_parts=[PromptPart("video", None, 0), PromptPart("text", "What happens?")],
         input_metadata={"video_inputs": [{"average_fps": 10.0}]}, video_num_frames=4,
-    ).new_input_tensors
-    assert int(out2["vision_grid_thw"][0][0, 0]) == 4
+    )
+    assert len(out2.metadata[MEDIA_LAYOUT]["grid"]) == 4
 
 
 @needs_edge
