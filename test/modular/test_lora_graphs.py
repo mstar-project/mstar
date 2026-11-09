@@ -463,12 +463,12 @@ def test_each_nodes_pool_reads_the_config_the_conductor_opens_a_request_with():
     spec.nodes = {"LLM", "vision"}
     spec.targets = {"qkv": dataclasses.replace(P.QKV, node="LLM"), "o": dataclasses.replace(P.O, node="vision")}
     conductor = object.__new__(Conductor)
-    conductor.model = make_model(get_node_resources=lambda: [spec], get_request_resource_configs=lambda **kw: {})
+    conductor.model = make_model(get_node_resources=lambda: [spec], get_request_resource_configs=lambda *a, **kw: {})
     conductor.model_config = {"resources": {LORA_RESOURCE_KEY: {}}}
     conductor._kv_labels = {}
-    configs = conductor._get_resource_configs({LORA_ADAPTER_KWARG: "a1"}, {})
+    configs = conductor._get_resource_configs([], [], {LORA_ADAPTER_KWARG: "a1"})
     assert configs == {"lora@LLM": LoraReqConfig("a1"), "lora@vision": LoraReqConfig("a1")}
-    assert conductor._get_resource_configs({}, {}) == {}
+    assert conductor._get_resource_configs([], [], {}) == {}
 
 
 def test_the_recompile_limit_counts_each_lean_twin(monkeypatch):

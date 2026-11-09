@@ -52,9 +52,9 @@ def _model(topology=True, combined=None):
     return SimpleNamespace(
         get_graph_walk_graphs=_walks,
         get_partitions=lambda: [
-            PartitionDefinition(name="A", graph_walks={"produce"}, initial_walk="produce"),
-            PartitionDefinition(name="B", graph_walks={"consume"}, initial_walk="consume"),
-            PartitionDefinition(name="C", graph_walks={"decode_audio"}, initial_walk="decode_audio"),
+            PartitionDefinition(name="A", graph_walks={"produce"}),
+            PartitionDefinition(name="B", graph_walks={"consume"}),
+            PartitionDefinition(name="C", graph_walks={"decode_audio"}),
         ],
         get_partition_topology=lambda: PartitionTopology(
             partitions=["A", "B", "C"],

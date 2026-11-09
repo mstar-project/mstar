@@ -57,9 +57,10 @@ attention features), Maya (one interposed process per device, symmetric collecti
 
 ## Emulator tests and upstream compatibility
 
-CPU Core runs `mstar_sim/tests`, including emulator behavior regressions and the planner
-port against its pinned golden. Updating mstar's FlashInfer dependency does not require
-regenerating that golden; updating the emulator's planner port does.
+CI does not run the emulator's tests. Run `python -m pytest mstar_sim/tests` when changing the
+emulator; they cover its behavior and the planner port against its pinned golden. Updating
+mstar's FlashInfer dependency does not require regenerating that golden; updating the
+emulator's planner port does.
 
 Run the upstream compatibility audit separately when maintaining the emulator:
 

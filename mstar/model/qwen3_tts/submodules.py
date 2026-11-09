@@ -59,14 +59,12 @@ from mstar.engine.resources import AttentionStep, KVStep, PositionStep, SamplerS
 from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
 from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.audio_watermark import AudioSealWatermarker, WatermarkStream
+from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
 from mstar.model.qwen3_tts.components import depth_frame
 from mstar.model.qwen3_tts.components.incremental_codec import IncrementalDecoder, codec_state_blocks
 from mstar.model.qwen3_tts.components.snake import fuse_snake_activations
-from mstar.model.qwen3_tts.components.speaker_encoder import (
-    Qwen3TTSMelFrontEnd,
-    Qwen3TTSSpeakerEncoder,
-)
+from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder
 from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
@@ -1399,7 +1397,7 @@ class RefEncoderSubmodule(NodeSubmodule):
     def __init__(
         self,
         speaker_encoder: Qwen3TTSSpeakerEncoder,
-        mel_front_end: Qwen3TTSMelFrontEnd,
+        mel_front_end: MatchaLogMel,
         codec_encoder: torch.nn.Module,
         config: Qwen3TTSModelConfig,
     ) -> None:
@@ -1446,7 +1444,7 @@ class RefEncoderSubmodule(NodeSubmodule):
             return {"speaker_embed": [speaker_embed], "ref_codes": [codes]}
         device_type = waveform.device.type
         with torch.autocast(device_type=device_type, enabled=False):
-            mels = self.mel_front_end(waveform.unsqueeze(0))
+            mels = self.mel_front_end(waveform.unsqueeze(0)).transpose(1, 2)  # [1, frames, mel]
         encoder_dtype = next(self.speaker_encoder.parameters()).dtype
         speaker_embed = self.speaker_encoder(mels.to(encoder_dtype))[0]
 
