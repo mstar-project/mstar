@@ -804,9 +804,16 @@ def redact(out, runner_temp, s1="", s2="", s3="", nodes=""):
     it, then bot.redact's credential patterns."""
     hosts = [x for n in json.loads(nodes or "[]") if n.get("host") for x in (n["host"], n["host"].split("@")[-1])]
     lt = Path(runner_temp, "lt")
-    for f in (lt / "results/report.md", lt / "results/result.json", lt / "unavailable.md"):
+    exact = (s1, s2, s3, *hosts)
+    for f in (lt / "results/report.md", lt / "unavailable.md"):
         if f.is_file():
-            f.write_text(bot.redact(f.read_text(), exact=(s1, s2, s3, *hosts)))
+            f.write_text(bot.redact(f.read_text(), exact=exact))
+    verdict = lt / "results/result.json"
+    if verdict.is_file():  # the box wrote this: unreadable counts as no verdict
+        try:
+            verdict.write_text(json.dumps(bot.redact_fields(json.loads(verdict.read_text()), exact)))
+        except ValueError:
+            verdict.write_text("{}")
 
 
 def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_outcome=""):

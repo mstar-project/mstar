@@ -745,6 +745,7 @@ class TestAfterTheReview(unittest.TestCase):
         self.assertEqual(json.loads(out["result"])["inline"], {"4": "P1"},
                          "a later step couldn't tell an edited finding")
         self.assertTrue(any("pr=7" in argv for argv, _ in fake.calls), "the threads query needs the PR's number")
+
     def test_an_escaped_character_before_a_token_shape_cant_break_the_post(self):
         fields = {"outside_diff": [], "since_last": "\x0eyJabcdefghijk.lmnopqrstuv.w \u00eeyJabcdefghijk.lmnopqrstuv.w",
                   "description_problems": [],
