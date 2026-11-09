@@ -105,6 +105,8 @@ class ParakeetModel(Model):
             tokenizer, extra_skip_ids={self.config.transducer.blank_token_id},
         )
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        # modules two nodes share, by (name, device)
+        self._modules: dict[tuple[str, str], torch.nn.Module] = {}
 
     @property
     def live(self) -> bool:
@@ -342,21 +344,53 @@ class ParakeetModel(Model):
 
     def _create_submodule(self, node_name: str, device: str, autocast_dtype: torch.dtype | None):
         if node_name == "audio_encoder":
-            from mstar.model.components.fastconformer import FastConformerEncoder
             from mstar.model.components.fastconformer_submodule import FastConformerEncoderSubmodule
 
-            encoder = FastConformerEncoder.load(
-                self.config.encoder, ((k.removeprefix("encoder."), v) for k, v in self._weights(device, "encoder.")),
-                device=device, dtype=autocast_dtype,
+            return FastConformerEncoderSubmodule(
+                self._encoder(device, autocast_dtype), normalize_features=self.config.normalize_features,
             )
-            return FastConformerEncoderSubmodule(encoder, normalize_features=self.config.normalize_features)
         if node_name == "stream_encoder":
-            return self._stream_encoder(device, autocast_dtype)
+            from mstar.model.components.audio_features import NemoLogMel
+            from mstar.model.components.fastconformer_stream import FastConformerStreamSubmodule
+
+            return FastConformerStreamSubmodule(
+                self._encoder(device, autocast_dtype),
+                NemoLogMel(num_mel_bins=self.config.encoder.num_mel_bins, normalize=False, device=device), None,
+                input_edge=AUDIO_IN, output_edge=ENCODER_FRAMES, front_key=STREAM_FRONT,
+                batch_sizes=[1, 2, 4, 8, 16, 32], item_per_step=True,
+            )
         if node_name in ("transducer", "transducer_stream"):
-            from mstar.model.components.transducer import TransducerHead
             from mstar.model.parakeet.submodules import TransducerSubmodule
 
-            # fp32: the submodule opts out of the engine's cast
+            return TransducerSubmodule(
+                self._head(device), compile_step=self.compile_step, encoder_dtype=autocast_dtype or torch.float32,
+                live_frames=self.chunk_frames if node_name == "transducer_stream" else None,
+            )
+        return None
+
+    def _encoder(self, device: str, autocast_dtype: torch.dtype | None):
+        """The encoder, once a device: a clip's node and a live stream's node run
+        the same layers (``forward`` and ``forward_stream``), so one copy of the
+        weights; the stream state binds only on the stream's node."""
+        key = ("encoder", str(device))
+        if key not in self._modules:
+            from mstar.model.components.fastconformer import FastConformerEncoder
+
+            stream = {"kv_key": STREAM_KV, "conv_key": STREAM_CONV} if self.live else {}
+            self._modules[key] = FastConformerEncoder.load(
+                self.config.encoder,
+                ((k.removeprefix("encoder."), v) for k, v in self._weights(device, "encoder.")),
+                device=device, dtype=autocast_dtype, **stream,
+            )
+        return self._modules[key]
+
+    def _head(self, device: str):
+        """The transducer head (fp32: its submodule opts out of the engine's
+        cast), once a device, for the clip's and the live call's decoder nodes."""
+        key = ("head", str(device))
+        if key not in self._modules:
+            from mstar.model.components.transducer import TransducerHead
+
             head = TransducerHead(self.config.transducer).to(device)
             state = {
                 k: v for prefix in ("encoder_projector.", "decoder.", "joint.", "prompt_projector.")
@@ -365,24 +399,5 @@ class ParakeetModel(Model):
             missing, unexpected = head.load_state_dict(state, strict=False)
             if missing or unexpected:
                 raise KeyError(f"transducer weights: missing {missing[:4]}, unexpected {unexpected[:4]}")
-            return TransducerSubmodule(
-                head.eval(), compile_step=self.compile_step, encoder_dtype=autocast_dtype or torch.float32,
-                live_frames=self.chunk_frames if node_name == "transducer_stream" else None,
-            )
-        return None
-
-    def _stream_encoder(self, device: str, autocast_dtype: torch.dtype | None) -> NodeSubmodule:
-        from mstar.model.components.audio_features import NemoLogMel
-        from mstar.model.components.fastconformer import FastConformerEncoder
-        from mstar.model.components.fastconformer_stream import FastConformerStreamSubmodule
-
-        cfg = self.config.encoder
-        encoder = FastConformerEncoder.load(
-            cfg, ((k.removeprefix("encoder."), v) for k, v in self._weights(device, "encoder.")),
-            device=device, dtype=autocast_dtype, kv_key=STREAM_KV, conv_key=STREAM_CONV,
-        )
-        return FastConformerStreamSubmodule(
-            encoder, NemoLogMel(num_mel_bins=cfg.num_mel_bins, normalize=False, device=device), None,
-            input_edge=AUDIO_IN, output_edge=ENCODER_FRAMES, front_key=STREAM_FRONT,
-            batch_sizes=[1, 2, 4, 8, 16, 32], item_per_step=True,
-        )
+            self._modules[key] = head.eval()
+        return self._modules[key]

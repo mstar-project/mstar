@@ -264,7 +264,10 @@ class RelPositionAttention(nn.Module):
         self.bias_v = nn.Parameter(torch.zeros(h, d))
 
     def bind_resources(self, resources: dict) -> None:
-        if self._kv_key is not None:
+        # One layer serves an offline node and a stream node at once (one copy of
+        # the weights); only the stream node has the KV, and the stream submodule
+        # checks it is there (`FastConformerStreamSubmodule.bind_node_resources`).
+        if self._kv_key in resources:
             self.kv = resources[self._kv_key]
             # every distance a stream's frame sees, ascending, projected in the
             # weights' dtype, which is what autocast computes it in: fixed weights,
@@ -356,7 +359,8 @@ class ConvModule(nn.Module):
         self.pointwise_conv2 = nn.Linear(c, c, bias=config.convolution_bias)
 
     def bind_resources(self, resources: dict) -> None:
-        if self._conv_key is not None:
+        # only a stream node has it, as for the attention's KV
+        if self._conv_key in resources:
             self.state = resources[self._conv_key]
 
     def forward(self, x: torch.Tensor, valid: torch.Tensor | None) -> torch.Tensor:

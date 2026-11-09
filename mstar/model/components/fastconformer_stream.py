@@ -267,6 +267,11 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 and st.samples >= 2 * self.frame_samples and st.samples % cs == 0)
 
     def bind_node_resources(self, resources: dict) -> None:
+        # the layers bind their stream state only where it exists, as the encoder
+        # may serve an offline node too: this node must have it
+        missing = [k for k in (self.encoder.kv_key, self.encoder.conv_key, self.front_key) if k not in resources]
+        if missing:
+            raise ValueError(f"the stream encoder's node has no resources {missing}")
         super().bind_node_resources(resources)
         self.front = resources[self.front_key]
 

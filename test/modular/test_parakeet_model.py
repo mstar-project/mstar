@@ -212,6 +212,20 @@ def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
     assert out.new_input_tensors == {} and out.metadata == {PROMPT_ID: 2}
 
 
+
+def test_a_live_checkpoint_loads_its_encoder_once(tmp_path, monkeypatch):
+    """The clip's and the live call's encoder nodes run the same layers
+    (``forward`` / ``forward_stream``): one copy of the weights, not two."""
+    from mstar.model.components.fastconformer import FastConformerEncoder
+
+    monkeypatch.setattr(
+        FastConformerEncoder, "load",
+        classmethod(lambda cls, config, weights, *, device, dtype=None, **keys: cls(config, **keys)),
+    )
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)))
+    clip, live = (model.get_submodule(node) for node in ("audio_encoder", "stream_encoder"))
+    assert clip.encoder is live.encoder
+
 def test_startup_refuses_more_requests_than_slots(tmp_path):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron=False)))
     model.validate_config_yaml({"max_concurrent_requests": 128}, "a.yaml")
