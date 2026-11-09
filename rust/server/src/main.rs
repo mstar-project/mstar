@@ -1024,6 +1024,10 @@ async fn audio_speech(
         Ok(fmt) => fmt,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
+    // "inf" / "nan" parse but have no JSON number; refused as the server's normalizer does
+    if let Some(x) = req.speed.flatten().filter(|x| !x.is_finite()) {
+        return error(400, &format!("speed must be a finite number > 0; got {x}"), "invalid_request_error");
+    }
     // Blocking: a data URL decoded, a clip saved, a remote fetch of up to 30 s.
     let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
     let (req, translated) = blocking(move || {
@@ -1035,6 +1039,11 @@ async fn audio_speech(
         Ok(s) => s,
         Err((status, e)) => return error(status, &e, error_type(status)),
     };
+    // only a sent speed (an explicit null too), as Python's speech_request; an adapter-set one wins
+    if let Some(speed) = req.speed {
+        let value = speed.and_then(serde_json::Number::from_f64).map_or(Value::Null, Value::Number);
+        args.model_kwargs.entry("speed").or_insert(value);
+    }
     // Every piece reads the reference clip, and a stream submits the later ones
     // while it plays, so the clip goes when the last piece is done with it.
     let uploads = DeferredCleanup { upload_dir: st.upload_dir.clone(), args: args.clone() };

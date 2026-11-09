@@ -98,9 +98,12 @@ def _positive_int(model_kwargs: dict, name: str, default: int | None) -> int | N
     if raw is None:
         return default
     try:
+        # a bool, a string, or a float int() would truncate (768.5, inf), is not an integer;
+        # the API normalizes the knobs it knows before this
+        if isinstance(raw, (bool, str)):
+            raise ValueError
         value = int(raw)
-        # a bool, or a float int() would truncate (768.5, inf), is not an integer
-        if isinstance(raw, bool) or (isinstance(raw, float) and raw != value):
+        if isinstance(raw, float) and raw != value:
             raise ValueError
     except (TypeError, ValueError, OverflowError):
         raise ValueError(f"MiniMax-H3 {name} must be an integer; got {raw!r}") from None
@@ -112,7 +115,8 @@ def _positive_int(model_kwargs: dict, name: str, default: int | None) -> int | N
 def _positive_float(model_kwargs: dict, name: str, default: float) -> float:
     raw = model_kwargs.get(name)
     try:
-        if isinstance(raw, bool):
+        # a string is refused, not parsed: the API normalizes the knobs it knows before this
+        if isinstance(raw, (bool, str)):
             raise ValueError
         value = float(default if raw is None else raw)
     except (TypeError, ValueError, OverflowError):
@@ -497,6 +501,13 @@ class H3Model(Model):
     def _requested_canvas(model_kwargs: dict) -> tuple[int | None, int | None]:
         height, width = model_kwargs.get("height"), model_kwargs.get("width")
         return (None, None) if height is None and width is None else (int(height), int(width))
+
+    def request_kwargs(self) -> frozenset[str]:
+        # the adapter's ``audio`` and ``last_image`` become output modalities and an image input
+        return frozenset({
+            "height", "width", "num_frames", "num_inference_steps", "flow_shift", "audio_flow_shift",
+            "keyframe_anchors",
+        })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {DENOISE_LOOP: h3_schedule(*self.resolve_schedule(model_kwargs)).num_steps}
