@@ -1735,7 +1735,7 @@ def test_request_kwargs_are_the_keys_the_model_and_its_adapter_read(model, tmp_p
         _speech(voice="anna", instructions="slowly", temperature=0.7, top_p=0.9, seed=5), tmp_path
     )
     assert set(sa.model_kwargs) <= model.request_kwargs()
-    # the adapter drops speed rather than forwarding it, and the model has none
+    # speech_request forwards a sent speed, which the model has none of and logs as ignored
     assert "speed" not in model.request_kwargs()
 
 

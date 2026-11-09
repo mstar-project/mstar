@@ -73,7 +73,7 @@ def sampler_capabilities(defaults: Mapping[str, object]) -> dict:
     """``SamplerSpec`` capability flags: on only when the defaults use them, so a
     request ``min_p`` or penalty on a greedy model is refused at admission."""
     return {
-        "enable_repetion_penalty": defaults.get("repetition_penalty", 1) != 1,
+        "enable_repetition_penalty": defaults.get("repetition_penalty", 1) != 1,
         "enable_min_p": bool(defaults.get("min_p")),
     }
 

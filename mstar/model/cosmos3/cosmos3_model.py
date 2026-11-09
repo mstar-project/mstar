@@ -389,7 +389,7 @@ class Cosmos3Model(Model):
         return SamplerSpec(
             resource_key=SAMPLER, nodes={REASONER_NODE},
             vocab_size=self.config.vocab_size,
-            enable_repetion_penalty=True,
+            enable_repetition_penalty=True,
             enable_min_p=bool(getattr(self, "_generation_defaults", {}).get("min_p")),
         )
 

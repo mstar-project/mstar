@@ -140,7 +140,7 @@ class VoxCPM2Model(Model):
     INTERNAL_KWARGS = TALKER_STEP_METADATA
     LENGTH_KWARGS = ("max_new_tokens", "max_output_tokens", "max_len")
     # Every model_kwargs key a request may carry; the speech adapter maps
-    # ``instructions`` onto ``instruct`` and drops ``voice`` and ``speed``
+    # ``instructions`` onto ``instruct`` and drops ``voice``; a sent ``speed`` is logged as ignored
     REQUEST_KWARGS = frozenset({
         "instruct", "instructions", "ref_text", "cfg_value", "min_len", "inference_timesteps", *LENGTH_KWARGS,
     })

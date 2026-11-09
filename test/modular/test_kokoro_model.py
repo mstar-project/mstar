@@ -642,7 +642,7 @@ def test_openai_adapter_maps_speech_request():
     adapter = get_adapter("kokoro")
     assert adapter is not None and adapter.supports_speech
     req = SpeechRequest(input="Hello", voice="af_bella+af_sky", speed=1.2, lang_code="b", temperature=0.7)
-    args = adapter.speech_to_request(req, Path("/tmp"))
+    args = adapter.speech_request(req, Path("/tmp"))
     assert args.text == "Hello" and args.output_modalities == ["audio"] and args.input_modalities == ["text"]
     assert args.model_kwargs["voice"] == "af_bella+af_sky" and args.model_kwargs["speed"] == 1.2
     assert args.model_kwargs["lang_code"] == "b" and "temperature" not in args.model_kwargs

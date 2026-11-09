@@ -1534,7 +1534,8 @@ def test_request_kwargs_are_the_keys_the_model_and_its_adapter_read(model, tmp_p
     req = SpeechRequest(model="voxcpm2", input="hi", voice="alloy", speed=1.2, seed=7, instructions="calm",
                         cfg_value=2.5, min_len=2, max_new_tokens=9)
     sa = adapters.VoxCPM2Adapter().speech_to_request(req, tmp_path)
-    # seed is the conductor's; voice and speed are dropped by the adapter, and the model reads neither
+    # seed is the conductor's; the adapter drops voice, speech_request forwards a sent speed to be
+    # logged as ignored, and the model reads neither
     assert set(sa.model_kwargs) - {"seed"} <= model.request_kwargs()
     assert not {"voice", "speed"} & model.request_kwargs()
 

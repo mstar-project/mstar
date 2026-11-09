@@ -168,8 +168,8 @@ pub struct SpeechRequest {
     #[serde(default = "default_wav")]
     pub response_format: String,
     /// Kept out of `extra`. `None` when the request did not send it,
-    /// `Some(None)` for an explicit `null`: an adapter forwards a sent speed
-    /// (pydantic's `model_fields_set`) and leaves an unsent one out.
+    /// `Some(None)` for an explicit `null`: `audio_speech` forwards a sent
+    /// speed (pydantic's `model_fields_set`) and leaves an unsent one out.
     #[serde(default, deserialize_with = "flex::sent_f64")]
     pub speed: Option<Option<f64>>,
     /// `bool | None` in Python (default False); accept an explicit `null`
