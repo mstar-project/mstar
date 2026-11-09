@@ -232,6 +232,16 @@ def test_a_request_whose_last_prompt_chunk_the_pool_couldnt_hold_keeps_no_ids_fr
     assert leader.keep_prompts(a) == [] and leader.kept(A, NODE) is None
 
 
+def test_a_prompt_refused_at_its_first_chunk_keeps_no_ids_at_a_speculated_last_chunk():
+    """A speculated chunk has no inputs. Rank 0 refused a's prompt at its first chunk and skipped its last chunk, so
+    it never journaled that a keeps no ids, and a follower kept its copy of a's prompt until a's teardown."""
+    leader, (r, a) = _rebuilds(32), _prompts()
+    leader.keep_prompts(r)
+    assert leader.keep_prompts(a, mid_prefill={A}) == []
+
+    assert leader.keep_prompts(_ran(PREFILL, {A: {}})) == [A], "rank 0 never journaled that a keeps no ids"
+
+
 @pytest.mark.parametrize("why", ["its output can't pause", "its pool can't be rebuilt"])
 def test_a_request_no_drop_can_free_keeps_no_ids(why):
     """A guaranteed request kept a host copy of its prompt and appended every sample, each step, though no drop
