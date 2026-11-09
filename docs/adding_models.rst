@@ -838,6 +838,19 @@ The spec types are:
        when the serving YAML has a ``resources: lora:`` block. See `Per-request LoRA
        adapters`_.
 
+**Lean captures.** A resource whose kernels can be left out of a step whose rows all
+allow it sets ``Resource.lean_capture``, answers ``lean_for(request_ids)`` from state
+every rank of a lockstep instance sets alike (its ingests), and says which kinds of capture
+get its twin (``lean_captures``). Beside each bucket whose step drives such resources, the
+engine captures a twin for each set of them, keyed by that set (``BucketKey.lean``). A step
+replays the twin of every resource its rows let run lean, else one with fewer of them
+(largest set first, ties in declaration order), else the plain bucket; the engine names the
+set in ``StepContext.lean``, eager steps included, and each resource checks its rows again
+at plan. Twins are sized, planned and captured after every plain bucket, and a twin left
+out (under the capture budget, say) is logged at INFO and is not a dropped bucket: its
+steps replay the plain bucket. Lean resources: the LoRA pool, for steps none of whose rows
+names an adapter, in every kind of capture. A model declares nothing for these.
+
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
 
@@ -1239,9 +1252,9 @@ placed exactly as weights are.
   node's does, from its own segments (an ``attn_key`` region's: one per row), planned
   per replay and handing the enclosing step's plan back at its commit. A region
   replayed as one row per step (``one_row_per_step``) addresses every row to the first
-  request's adapter, so the engine captures it base-only (``LoraBaseOnly``) and leases it
-  only for a step none of whose rows runs an adapter; a step with one runs the region
-  eagerly under the node's step.
+  request's adapter, so the engine captures it with the pool lean (``BucketKey.lean``
+  names the pool) and leases it only for a step none of whose rows runs an adapter; a
+  step with one runs the region eagerly under the node's step.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
@@ -1288,13 +1301,13 @@ placed exactly as weights are.
   kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
   latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
   without a graph break. Under Triton the launch grid depends on the token count and
-  the slot count alone. The engine captures every bucket of a node serving adapters a
-  second time, keyed ``LoraBaseOnly(<the node's own key>)``, with no LoRA kernel in it: a
-  step none of whose rows names an adapter replays that one (or runs its deltas as
-  ``y`` untouched, eagerly), and falls back to the LoRA capture when its twin was not
-  captured. The choice reads only which adapter each request named, the same on every
-  rank, and the pool checks it again at plan; ``cg_key_info`` and ``declare_step`` still
-  state only the node's own key.
+  the slot count alone. The pool is a lean resource (``Resource.lean_capture``; see
+  **Lean captures** under the resources table), so the engine captures every bucket whose
+  step drives it a second time with no LoRA kernel in it: a step none of whose rows names
+  an adapter replays that twin (or runs its deltas as ``y`` untouched, eagerly), and the
+  LoRA capture when the twin was not captured. The choice reads only which adapter each
+  request named, the same on every rank, and the pool checks it again at plan;
+  ``cg_key_info`` and ``declare_step`` still state only the node's own key.
 - **dtype.** The slot weights take the nodes' compute dtype (the serving config's
   ``autocast_dtype``, e.g. ``float16``). A node that runs outside autocast sets
   ``LoraSpec.dtype`` to its weights' dtype.

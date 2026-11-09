@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 import torch
 
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
-from mstar.engine.resources.step import CaptureVariant, ResourceStep, node_capture_key  # noqa: F401
+from mstar.engine.resources.step import ResourceStep
 from mstar.utils.client_errors import scrub_paths
 
 if TYPE_CHECKING:
@@ -520,14 +520,3 @@ class LoraReqConfig(ResourceReqConfig):
 class LoraStep(ResourceStep):
     """One step's rows: a segment per request, its ``span`` the tokens that request puts
     through the LoRA'd linears this step, in the order they are packed."""
-
-
-@dataclass(frozen=True)
-class LoraBaseOnly(CaptureVariant):
-    """The capture key of a step none of whose rows names an adapter: the node's own
-    ``cg_key_info`` (``key``), wrapped. A node serving adapters captures each bucket under
-    both keys, and the base-only graph records no LoRA kernel: at decode width the
-    launches of a delta that adds zero cost about what the work does."""
-
-    def __str__(self) -> str:
-        return "lora-base-only" if self.key is None else f"lora-base-only:{self.key}"

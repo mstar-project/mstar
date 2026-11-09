@@ -28,7 +28,6 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.engine.resources.lora.config import LoraBaseOnly
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK, lean_subsets
 from mstar.model.submodule_base import (
@@ -1821,9 +1820,16 @@ class PiecewiseAcceleratorGraphRunner:
         self._label = label
         self._capture_stream = capture_stream
         self._config = config
-        # the node's LoRA pools (`_region_step`, `can_lease`)
+        # the node's LoRA pools (`_region_step`)
         self._lora_keys = lora_keys
         self._resources = resources
+        # A `one_row_per_step` region replays every row as its first request's, so it
+        # runs the node's lean resources lean (`_bucket`) and leases only a step whose
+        # rows all let them (`can_lease`).
+        self._lean = frozenset(
+            key for key, resource in resources.items()
+            if resource.lean_capture and resource.lean_captures(config.get_config_type())
+        ) if config.one_row_per_step else frozenset()
         self._step_runner = step_runner
         self._device = device
         self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
@@ -1895,16 +1901,14 @@ class PiecewiseAcceleratorGraphRunner:
         return f"{shape.bs}_{shape.total_tokens}_slot{slot}"
 
     def _bucket(self, shape: PiecewiseCaptureShape) -> BucketKey:
-        """A ``one_row_per_step`` region on a LoRA node replays only base-only steps
-        (``can_lease``), so it is captured under ``LoraBaseOnly``, recording no LoRA kernel."""
-        key = self._label
-        if self._config.one_row_per_step and self._lora_keys:
-            key = LoraBaseOnly(key)
+        """Captured with the region's lean resources lean (``_lean``), recording none of
+        their kernels, and with no plain twin beside it."""
         return BucketKey(
             graph_walk=PIECEWISE_WALK,
             bs=shape.bs,
             num_tokens=shape.total_tokens,
-            cg_key_info=key,
+            cg_key_info=self._label,
+            lean=self._lean,
         )
 
     # ── Capture ─────────────────────────────────────────────────────────
@@ -2246,6 +2250,7 @@ class PiecewiseAcceleratorGraphRunner:
             capture=capture,
             slot_lease=SlotLease(slot=slot, bucket=bucket),
             force_prefill=self._config.get_config_type() == PiecewiseConfigType.PACKED,
+            lean=self._lean,
         )
         ctx.set_padded_rids(tuple(request_ids))
         step.set_ctx(ctx)
@@ -2333,16 +2338,16 @@ class PiecewiseAcceleratorGraphRunner:
         return self._config.lease_before_step
 
     def can_lease(self, inputs: list[NodeInputs], request_ids: Sequence) -> bool:
-        """The config's ``can_lease`` for this batch; True when it sets none. A
-        ``one_row_per_step`` region on a LoRA node is captured base-only (``_bucket``),
-        so it is refused a batch any of whose rows runs an adapter (the pool's answer is
-        the same on every rank), which runs the region eagerly under the node's step."""
-        if self._config.one_row_per_step and self._runs_adapters(request_ids):
+        """The config's ``can_lease`` for this batch; True when it sets none. A region
+        captured lean (``_lean``) is refused a batch some row of which doesn't let its
+        resources run lean (each answers the same on every rank), which runs the region
+        eagerly under the node's step."""
+        if self._config.one_row_per_step and not self._rows_lean(request_ids):
             return False
         return self._config.can_lease is None or self._config.can_lease(inputs)
 
-    def _runs_adapters(self, request_ids: Sequence) -> bool:
-        return any(self._resources[key].runs_adapters(request_ids) for key in self._lora_keys)
+    def _rows_lean(self, request_ids: Sequence) -> bool:
+        return all(self._resources[key].lean_for(request_ids) for key in self._lean)
 
     def lease_slot(
         self, batch_size: int, total_tokens: int | None = None,
@@ -2377,8 +2382,8 @@ class PiecewiseAcceleratorGraphRunner:
         is baked into the graph.
 
         A ``one_row_per_step`` region replays the step as one row named by its
-        first request, however many requests or segments it is passed, and base-only
-        on a LoRA node (``can_lease``): no row may run an adapter.
+        first request, however many requests or segments it is passed, with its lean
+        resources lean (``can_lease``): every row must let them.
 
         ``label_seq_lens`` is for a region whose step plans several ragged
         layouts over the same tokens (windows and whole frames): label ->
@@ -2386,10 +2391,10 @@ class PiecewiseAcceleratorGraphRunner:
         every label, so the bucket is the one ``seq_lens`` picked.
         """
         if self._config.one_row_per_step:
-            if request_ids is not None and self._runs_adapters(request_ids):
+            if request_ids is not None and not self._rows_lean(request_ids):
                 raise RuntimeError(
-                    f"piecewise {self._label!r} replays one row per step, base-only, but a "
-                    "row of this step runs a LoRA adapter (can_lease refuses such a step)"
+                    f"piecewise {self._label!r} replays one row per step with {sorted(self._lean)} lean, "
+                    "but a row of this step doesn't let them run lean (can_lease refuses such a step)"
                 )
             real_bs = 1
             if request_ids is not None:
