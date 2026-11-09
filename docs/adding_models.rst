@@ -2040,7 +2040,7 @@ the signal, so the worker routes it without a tensor and sends the client's copy
 ``preprocess`` reads the tokens with ``self.loopback_inputs(engine_inputs, inputs)``. A
 row whose last step did not keep its value on the device (its first decode step, after
 the prefill) still brings it routed, and that read puts it over the slot's.
-``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio and Qwen3-ASR,
+``SampledTokenDecoder`` declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets ``device_loopback = None``; Whisper and
 Qwen3-Omni's Thinker declare their own.
 
@@ -3449,8 +3449,8 @@ sets the default decode ladder, ``MIXED_MAX_PREFILL_ROWS`` caps a mixed step's p
 rows, ``capture_compile_mode(walk)`` names a capture's ``compile_mode`` (``None``, the default,
 takes the deployment's compile level), and ``CAPTURE_PREFILL = False`` captures decode
 only. A lone encoder's ``MediaEncoder.walk`` names its media walk when the model's graph
-calls it something other than ``prefill_<name>`` (the Cosmos3 reasoner's
-``reasoner_prefill_vision``). A graph that names its other walks otherwise sets
+calls it something other than ``prefill_<name>`` (Qwen3-ASR's and Canary-Qwen's
+``prefill``). A graph that names its other walks otherwise sets
 ``PREFILL_WALK``, ``DECODE_WALK`` and ``DECODE_LOOP``.
 It reports a text prompt's length and a decode row's one token
 (``get_input_sequence_len``, ``speculative_input_seq_len``), so a model chunks its text

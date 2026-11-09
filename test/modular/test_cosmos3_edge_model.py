@@ -29,6 +29,7 @@ from mstar.model.cosmos3.cosmos3_model import (
     Cosmos3Model,
 )
 from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, REASONER_DECODE_LOOP, SAMPLER
+from mstar.model.keys import ROPE
 from mstar.model.multimodal import MEDIA_LAYOUT
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
@@ -93,7 +94,10 @@ def test_edge_dummy_model_parses_family_and_reasoner(tmp_path) -> None:
     assert isinstance(decode, Loop) and decode.name == REASONER_DECODE_LOOP
     body = decode.section
     assert body.name == REASONER_NODE and set(body.input_names) == {"text_inputs"}
-    assert {e.name for e in body.outputs} == {"new_token", "text_inputs"}
+    # the VLM scaffold's loop: the token loops back and goes to the client as text_inputs
+    assert {(e.next_node, e.name) for e in body.outputs} == {
+        (REASONER_NODE, "text_inputs"), (EMIT_TO_CLIENT, "text_inputs"),
+    }
 
 
 def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:
@@ -104,7 +108,7 @@ def test_text_request_idles_the_window_decoder_partition(tmp_path) -> None:
     from mstar.model.cosmos3 import constants as C
 
     model = _model(tmp_path, enable_windowed_video=True)
-    signals = {"text_inputs": []}
+    signals = {"text_inputs": [object()]}
     mk = {"max_output_tokens": 8}
     (dec,) = model.walk_plan(C.WINDOW_DECODER_PARTITION, ["text"], ["text"], signals, mk)
     assert (dec.walk, dict(dec.step_metadata)) == (C.VIDEO_DECODE_AR_WALK, {})
@@ -138,9 +142,18 @@ def test_edge_resources_shared_between_dit_and_reasoner(tmp_path) -> None:
     assert specs[ATTN].nodes == {DIT_NODE, REASONER_NODE}
     assert specs[SAMPLER].nodes == {REASONER_NODE}
     assert specs[SAMPLER].vocab_size == 131072
+    # the reasoner's position counter is its own; mixed steps split the shared attention
+    assert specs[ROPE].nodes == {REASONER_NODE}
+    # the vision tower's attention: a segment per frame, down to the smallest video frame (16 patches)
+    assert specs["vision_attn"].nodes == {VISION_ENCODER_NODE}
+    assert specs["vision_attn"].config.max_segments_per_step == 16384 // 16
+    assert [split.combined_walk for split in specs[ATTN].config.splits] == ["mixed"]
+    assert model.get_combined_graph_walks() == {REASONER_NODE: {"mixed": {"prefill_text", "decode"}}}
     # Nano-shaped defaults declare no reasoner resources.
     nano = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
-    assert SAMPLER not in {s.resource_key for s in nano.get_node_resources()}
+    nano_keys = {s.resource_key for s in nano.get_node_resources()}
+    assert SAMPLER not in nano_keys and ROPE not in nano_keys
+    assert nano.get_combined_graph_walks() == {}
     assert Cosmos3Model.REASONER_DECODE_WALK not in nano.get_graph_walk_graphs()
 
 
@@ -171,8 +184,10 @@ def test_edge_yaml_splits_worker_graphs(tmp_path) -> None:
 @pytest.mark.parametrize("vision", [True, False])
 def test_reasoner_plan_prefills_then_decodes_the_first_token(tmp_path, vision) -> None:
     model = _model(tmp_path)
-    names = ("text_inputs",) + (("pixel_values", "vision_grid_thw") if vision else ())
-    layout = {"offset": [3], "tokens": [8], "output": ["vision_embeds"], "grid": [[1, 4, 8]]}
+    names = ("text_inputs",) + (("pixel_values",) if vision else ())
+    # as process_prompt sets it: a text-only prompt's layout places no media
+    layout = {"offset": [3], "tokens": [8], "output": ["vision_embeds"], "grid": [[1, 4, 8]]} if vision else {
+        "offset": [], "tokens": [], "output": [], "grid": []}
     knobs = {"max_output_tokens": 32, "enable_thinking": True}
     plan = model.walk_plan("default", ["image", "text"] if vision else ["text"], ["text"],
                            {k: [object()] for k in names}, {**knobs, MEDIA_LAYOUT: layout})
@@ -184,6 +199,10 @@ def test_reasoner_plan_prefills_then_decodes_the_first_token(tmp_path, vision) -
         (prefill[0], {}, prefill[1]),
         (Cosmos3Model.REASONER_DECODE_WALK, {"text_inputs": "new_token"}, knobs),
     ]
+    if vision:
+        # media without a layout to place them by is refused
+        with pytest.raises(ValueError, match="no media layout"):
+            model.walk_plan("default", ["image", "text"], ["text"], {k: [object()] for k in names}, knobs)
 
 
 def test_reasoner_opens_its_label_and_sampler_and_media_the_guidance_labels(tmp_path) -> None:
@@ -304,8 +323,7 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     from mstar.model.components.mrope import layout_position_ids
     from mstar.model.cosmos3.components.reasoner import MediaGrid, vision_layout
     from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
-    from mstar.model.keys import ROPE
-    from mstar.model.submodule_base import END_PARTITION
+    from mstar.model.submodule_base import END_PARTITION, StopKind
 
     model = _model(tmp_path)
     r = model.config.reasoner
@@ -325,6 +343,9 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("r", "main", 13)]
     assert step.steps[ROPE].advance == (advance,)
     assert torch.equal(step.steps[SAMPLER].prefill_tracked_tokens["r"], ids)
+    # a replay would otherwise splice the previous step's rows
+    with pytest.raises(ValueError, match="rows for the prompt's 8 pads"):
+        sub.prepare_inputs(walk, fwd, {"text_inputs": [ids], "vision_embeds": [torch.zeros(7, 4)]})
 
     text = sub.prepare_inputs(Cosmos3Model.REASONER_PREFILL_WALK, fwd, {"text_inputs": [ids[:3]]})
     assert text.custom_pos_ids is None
@@ -336,6 +357,10 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     rows = [sub.prepare_inputs(Cosmos3Model.REASONER_DECODE_WALK, fwd, {"text_inputs": [torch.tensor([42])]})
             for _ in range(2)]
     assert all(row.custom_pos_ids is None for row in rows) and rope.position(rid="r", label="main") == before
+    # decode rows read their token off the sampler, and the graph runtime checks their stop id
+    assert sub.device_loopback.walk == Cosmos3Model.REASONER_DECODE_WALK
+    policy = sub.get_stop_policies(Cosmos3Model.REASONER_DECODE_WALK)[REASONER_DECODE_LOOP]
+    assert policy.kind == StopKind.EOS and set(policy.eos_tokens) == {r.eos_token_id}
 
     def stops(walk, token, ignore_eos=False, max_tokens=100):
         info = types.SimpleNamespace(
@@ -353,6 +378,55 @@ def test_reasoner_submodule_places_positions_and_stops(tmp_path) -> None:
     assert stops(Cosmos3Model.REASONER_PREFILL_WALK, eos) == {END_PARTITION}
     assert stops(Cosmos3Model.REASONER_PREFILL_VISION_WALK, 12, max_tokens=1) == {END_PARTITION}
     assert stops(Cosmos3Model.REASONER_PREFILL_VISION_WALK, 12, max_tokens=2) == set()
+
+
+def test_reasoner_rotary_tables_come_from_the_layout_and_the_counter(tmp_path) -> None:
+    """The tower takes rotary tables, built by the DiT transformer's own rotary:
+    an eager vision prefill's from the positions its layout places, based at
+    the counter; a captured decode step's from the counter's planned positions
+    on all three axes, inside the graph."""
+    import types
+
+    from torch import nn
+
+    from mstar.model.components.mrope import layout_position_ids
+    from mstar.model.cosmos3.components.reasoner import MediaGrid, vision_layout
+    from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer, Cosmos3RotaryEmbedding
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+    model = _model(tmp_path)
+    r, cfg = model.config.reasoner, model.config
+
+    class Tower(nn.Module):
+        _rotary = Cosmos3OmniTransformer._rotary
+        build_cos_sin = Cosmos3OmniTransformer.build_cos_sin
+
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(32, 4)
+            self.rotary_emb = Cosmos3RotaryEmbedding(cfg.head_dim, cfg.rope_theta, cfg.rope_axes_dim)
+
+    tower = Tower()
+    sub = Cosmos3ReasonerSubmodule(transformer=tower, config=cfg, encoders=(model._vision_encoder(),))
+    sub.get_device = lambda: torch.device("cpu")
+    planned = torch.tensor([40, 41])
+    sub.node_resources = {ROPE: types.SimpleNamespace(position=lambda rid, label: 17, pos_ids=lambda label: planned)}
+
+    ids = torch.tensor([5, 6, 7] + [r.image_token_id] * 8 + [8, 9])
+    layout = vision_layout(ids, r, [MediaGrid(1, 4, 8)], [], "vision_embeds")
+    fwd = types.SimpleNamespace(request_id="r", rid_handle="r", step_metadata={MEDIA_LAYOUT: layout})
+    walk = Cosmos3Model.REASONER_PREFILL_VISION_WALK
+    row = sub.prepare_inputs(walk, fwd, {"text_inputs": [ids], "vision_embeds": [torch.zeros(8, 4)]})
+    eager = types.SimpleNamespace(captured=False)
+    tensors = sub.preprocess(walk, eager, [row])
+    pos, _ = layout_position_ids(layout, r.vision.spatial_merge_size, len(ids), start=17)
+    cos, sin = sub.decoder_kwargs(walk, eager, len(ids), **tensors)["cos_sin"]
+    want = tower.build_cos_sin(pos, torch.float32)
+    assert torch.equal(cos, want[0]) and torch.equal(sin, want[1])
+
+    cos, sin = sub.decoder_kwargs(Cosmos3Model.REASONER_DECODE_WALK, types.SimpleNamespace(captured=True), 2)["cos_sin"]
+    want = tower.build_cos_sin(planned.expand(3, -1), torch.float32)
+    assert torch.equal(cos, want[0]) and torch.equal(sin, want[1])
 
 
 def test_edge_chat_adapter(tmp_path) -> None:

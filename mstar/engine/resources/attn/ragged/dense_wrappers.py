@@ -13,6 +13,7 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     _RaggedPrefillBase,
     zero_unplanned_rows,
 )
+from mstar.platforms import current_platform
 
 
 def _max_span(cu_seqlens: torch.Tensor) -> int:
@@ -59,7 +60,13 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
     def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False) -> torch.Tensor:
         if return_lse:
             raise NotImplementedError("the DENSE ragged backend does not return the log-sum-exp; use FLASHINFER")
-        q, k, v = (t.to(self.q_data_type).contiguous() for t in (q, k, v))
+        # FA3 reads rows by stride, so q / k / v sliced out of a fused projection
+        # go in as they are; AITER's varlen is handed contiguous ones
+        strided = not current_platform.is_rocm()
+        q, k, v = (
+            t if strided and t.stride(-1) == 1 else t.contiguous()
+            for t in (t.to(self.q_data_type) for t in (q, k, v))
+        )
         out = flash_attn_varlen_func(
             q, k, v, self._cu_q, self._cu_k, self._max_q, self._max_k,
             causal=self._causal, softmax_scale=self.sm_scale,
