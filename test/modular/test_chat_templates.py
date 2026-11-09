@@ -16,6 +16,7 @@ import os
 
 import pytest
 
+from mstar.api_server.openai import adapters
 from mstar.api_server.openai.adapters import flatten_messages
 
 CHAT = [
@@ -94,3 +95,12 @@ def test_omni_rejects_unknown_voice_before_preprocessing(voice):
     model.config = SimpleNamespace(talker=SimpleNamespace(speaker_id={"ethan": 1}))
     with pytest.raises(ValueError, match="voice"):
         model.process_prompt("hi", ["text"], ["text", "audio"], voice=voice)
+
+
+@pytest.mark.parametrize("ptype, modality", [
+    ("image_url", "image"), ("video_url", "video"), ("audio_url", "audio"),
+])
+def test_a_remote_file_of_unstated_type_takes_the_parts_modality(monkeypatch, tmp_path, ptype, modality):
+    monkeypatch.setattr(adapters.media_io, "resolve_media_ref", lambda url, d, allow_remote: ("unknown", "f"))
+    chat = [{"role": "user", "content": [{"type": ptype, ptype: {"url": "https://h/blob"}}]}]
+    assert flatten_messages(chat, tmp_path, allow_remote=True)[2] == [modality]

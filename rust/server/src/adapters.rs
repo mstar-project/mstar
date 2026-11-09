@@ -137,6 +137,8 @@ pub fn flatten_messages(
                         return Err(format!("{ptype} must contain a non-empty url string"));
                     }
                     let (m, p) = media::resolve_media_ref(&url, upload_dir, allow_remote)?;
+                    // a remote server may not say what it sent; the part's type does
+                    let m = if m == "unknown" { ptype.trim_end_matches("_url").to_string() } else { m };
                     add_file(&mut parts, &mut saved.paths, m, p);
                 }
                 "input_audio" => {
