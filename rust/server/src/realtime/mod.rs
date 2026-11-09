@@ -1,12 +1,15 @@
-//! `/v1/realtime` (transcription intent): streaming speech-to-text over a
-//! WebSocket, a port of `openai/serving_realtime.py` (see its docstring for the
-//! events). Every `chunk_seconds` of new audio, the audio heard so far is
+//! `/v1/realtime`: OpenAI's Realtime API over a WebSocket, a port of
+//! `openai/serving_realtime.py` (see its docstring for the events). A
+//! full-duplex model serves a conversation ([`conversation`]); the
+//! transcription intent (`?intent=transcription`), here, streams speech-to-text
+//! with partial results. Every `chunk_seconds` of new audio, the audio heard so far is
 //! transcribed again as one engine request whose assistant turn is prefilled
 //! with the previous hypothesis minus its last `unfixed_tokens` tokens (the
 //! Qwen3-ASR SDK's streaming algorithm); the tail can still change, the head
 //! is fixed. Turn detection (`server_vad`, `semantic_vad`) is [`vad`].
 
 mod audio;
+mod conversation;
 mod resample;
 mod vad;
 
@@ -903,15 +906,31 @@ pub async fn realtime(
         Ok(ws) => ws,
         Err(not_found) => return not_found,
     };
-    let refusal = match crate::resolve_message(&st, crate::Surface::RealtimeTranscription) {
-        Err(message) => Some(message),
-        Ok(_) => match query.get("intent").map(String::as_str).unwrap_or("transcription") {
-            "transcription" => None,
-            other => Some(format!("unsupported intent {}; use intent=transcription", crate::media::py_repr(other))),
-        },
-    };
+    // As the Python router decides: a model with a ClientAudio stream converses
+    // when it can and no intent is named; otherwise the transcription intent.
+    let intent = query.get("intent").map(String::as_str);
+    let audio = conversation::facts();
+    let no_conversation = audio.and_then(conversation::Facts::problem);
+    let converses = audio.is_some() && no_conversation.is_none();
     let limit = crate::ws::max_message_bytes();
     let ws = ws.max_message_size(limit).max_frame_size(limit);
+    if converses && intent.is_none() {
+        let facts = audio.unwrap();
+        return ws.on_upgrade(move |socket| conversation::Conversation::new(st, socket, facts).run());
+    }
+    let refusal = match intent {
+        None | Some("transcription") => match crate::resolve_message(&st, crate::Surface::RealtimeTranscription) {
+            Ok(_) => None,
+            Err(_) if converses => Some("this model serves /v1/realtime conversations; omit intent".to_string()),
+            Err(_) if audio.is_some() => Some(format!("{}; use /generate/ws", no_conversation.unwrap())),
+            Err(message) => Some(message),
+        },
+        Some(other) => Some(format!(
+            "unsupported intent {}; {}",
+            crate::media::py_repr(other),
+            if converses { "omit intent for a conversation" } else { "use intent=transcription" }
+        )),
+    };
     if let Some(reason) = refusal {
         return ws.on_upgrade(move |mut socket| async move {
             let _ = socket.send(Message::Close(Some(CloseFrame { code: 1008, reason: reason.into() }))).await;

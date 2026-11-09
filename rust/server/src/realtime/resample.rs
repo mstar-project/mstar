@@ -7,8 +7,10 @@
 //!
 //! The arithmetic follows numpy's: the kernel from `np.sinc` and `np.kaiser`
 //! (Cephes' `i0`), each output a float64 dot product in the order `np.einsum`
-//! adds it, cast to float32. Only `sin`, from the platform's libm, can differ
-//! from numpy's.
+//! adds it, cast to float32. `exp` and `sin` are the platform libm's. numpy's
+//! own `exp` takes an AVX512F path on a CPU that has one, which is an ulp off
+//! glibc's on about 6% of the window's taps; an output then differs only
+//! where its sum cancels to about zero (by under 1e-18).
 
 /// Cephes' Chebyshev series, as numpy's `_chbevl`.
 fn chbevl(x: f64, vals: &[f64]) -> f64 {

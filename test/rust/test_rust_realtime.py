@@ -356,8 +356,8 @@ def test_an_append_or_item_past_the_cap_is_refused_alike(stack, monkeypatch):
     long = base64.b64encode(np.full(8000 * 301, 0xFF, np.uint8).tobytes()).decode()
     half = _pcm(np.zeros(16000 * 160, dtype=np.float32))
     events = [_session(input_audio_format="g711_ulaw"), {"type": "input_audio_buffer.append", "audio": long},
-              _session(input_audio_format="pcm16"),
-              {"type": "input_audio_buffer.append", "audio": half}, {"type": "input_audio_buffer.append", "audio": half}]
+              _session(input_audio_format="pcm16"), {"type": "input_audio_buffer.append", "audio": half},
+              {"type": "input_audio_buffer.append", "audio": half}]
     py, rust = _both(stack, monkeypatch, events)
     _assert_same(py, rust)
     errors = [e["error"]["message"] for e in py[0] if e["type"] == "error"]

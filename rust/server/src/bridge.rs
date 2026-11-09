@@ -136,7 +136,7 @@ struct ProbeMsg<'a> {
     /// A `windows` or `live` request's operation and its arguments.
     #[serde(flatten)]
     windows: Option<&'a serde_json::Map<String, Value>>,
-    /// An `end_of_turn` request's audio, float32 little-endian.
+    /// An `end_of_turn` request's or a conversation append's audio, float32 little-endian.
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<&'a serde_bytes::Bytes>,
 }
@@ -432,14 +432,27 @@ impl Bridge {
         }
     }
 
-    /// One operation on a `/generate/ws` live call, the submission `call`:
-    /// `taking` (`taking_input`), `append` (`stream_input`) or `reject`
+    /// One operation on a live call, the submission `call`: `taking`
+    /// (`taking_input`), `append` (`stream_input`) or `reject`
     /// (`reject_input`), with its arguments. The reply's `metadata`, or `None`
     /// on timeout.
-    pub async fn live(&self, call: u64, op: &str, mut args: serde_json::Map<String, Value>, timeout: Duration) -> Option<Value> {
+    pub async fn live(&self, call: u64, op: &str, args: serde_json::Map<String, Value>, timeout: Duration) -> Option<Value> {
+        self.live_op(call, op, args, None, timeout).await
+    }
+
+    /// A `/v1/realtime` conversation's append: `samples` for the `ClientAudio`
+    /// stream `stream`, at its rate, as `stream_input(samples=...)` takes them.
+    pub async fn live_audio(&self, call: u64, stream: &str, samples: &[f32], timeout: Duration) -> Option<Value> {
+        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut args = serde_json::Map::new();
+        args.insert("stream".into(), Value::from(stream));
+        self.live_op(call, "append", args, Some(&bytes), timeout).await
+    }
+
+    async fn live_op(&self, call: u64, op: &str, mut args: serde_json::Map<String, Value>, audio: Option<&[u8]>, timeout: Duration) -> Option<Value> {
         args.insert("op".into(), Value::from(op));
         args.insert("call".into(), Value::from(call));
-        match self.round_trip("live", Extras { op: Some(&args), ..Extras::default() }, timeout).await? {
+        match self.round_trip("live", Extras { op: Some(&args), audio, ..Extras::default() }, timeout).await? {
             StreamItem::Chunk(chunk) => Some(chunk.metadata),
             _ => None,
         }

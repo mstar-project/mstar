@@ -99,3 +99,32 @@ def test_mstar_server_gets_the_api_servers_served_models(launched, monkeypatch):
     import json
     assert json.loads(launched["env"]["MSTAR_SERVED_MODELS"]) == {
         "base": ["Qwen/Qwen3.5-0.8B", "qwen3_5_0.8b"], "adapters": ["sql"], "lora": True}
+
+
+def test_realtime_facts_carry_what_a_conversation_reads_off_the_model(tmp_path):
+    """A model with a ClientAudio stream gets ``conversation`` facts; only one
+    that can converse (turn tokens, one audio stream, mono output) gets its
+    stream and reply settings, which only a conversation reads."""
+    from types import SimpleNamespace
+
+    from mstar.model.base import Model
+    from mstar.streaming.topology import CLIENT, ClientAudio, Connection
+
+    class _Duplex:
+        turn_tokens, turn_idle_steps, turn_silence_rms = (1, 2), 25, 0.01
+        get_output_sample_rate = Model.get_output_sample_rate
+        get_output_audio_channels = Model.get_output_audio_channels
+
+        def get_default_voice(self):
+            return "Aria"
+
+    ear = Connection(CLIENT, "Encoder", "audio_in", chunk_policy_factory=lambda: None, audio=ClientAudio(16000, 1280))
+    server = SimpleNamespace(model=_Duplex(), client_audio=[ear])
+    assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {"conversation": {
+        "streams": 1, "turn_tokens": True, "channels": 1, "stream": "audio_in", "rate": 16000, "frame_samples": 1280,
+        "output_rate": 24000, "voice": "Aria", "idle_steps": 25, "silence_rms": 0.01,
+    }}
+    server.model.turn_tokens = None
+    assert rust_frontend.realtime_facts(server, None, str(tmp_path)) == {
+        "conversation": {"streams": 1, "turn_tokens": False, "channels": 1}}
+    assert rust_frontend.realtime_facts(SimpleNamespace(model=_Duplex(), client_audio=[]), None, str(tmp_path)) is None
