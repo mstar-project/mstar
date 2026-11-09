@@ -32,6 +32,7 @@ mod media;
 mod protocol;
 mod refusals;
 mod serving;
+mod sndfile;
 mod speech_chunking;
 mod tokenizer;
 mod unicode_marks;
@@ -45,7 +46,7 @@ use std::sync::Arc;
 use axum::{
     body::{Body, Bytes},
     extract::{multipart::MultipartError, rejection::JsonRejection, DefaultBodyLimit, FromRequest, Multipart, State},
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{header::CONTENT_TYPE, Request, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
@@ -57,7 +58,7 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-use adapters::{Adapter, SubmitArgs};
+use adapters::{OpenAIAdapter, Part, SubmitArgs};
 use bridge::{Bridge, ResultChunk};
 use protocol::{
     ChatCompletionRequest, ImageGenerationRequest, ModelCard, ModelList, SpeechRequest,
@@ -111,11 +112,12 @@ async fn main() {
         .unwrap_or(24000);
     let allow_remote = std::env::var("MSTAR_ALLOW_REMOTE").as_deref() == Ok("1");
     // Total per-request budget (mstar's APIServer timeout_seconds default).
-    let request_timeout = std::time::Duration::from_secs(
+    let request_timeout = std::time::Duration::from_secs_f64(
         std::env::var("MSTAR_REQUEST_TIMEOUT_S")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(600),
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(600.0),
     );
     // Same variable and default as serving_images.max_images_per_request.
     let max_images_per_request =
@@ -140,12 +142,14 @@ async fn main() {
     });
 
     let python_adapter = std::env::var("MSTAR_OPENAI_ADAPTER").unwrap_or_default();
-    if !python_adapter.is_empty() && Adapter::from_python(&python_adapter).is_none() {
+    if !python_adapter.is_empty() && adapters::from_python(&python_adapter).is_none() {
         eprintln!(
             "WARNING: {model_name}'s OpenAI adapter {python_adapter} has no port in this \
              frontend: /v1/* answers 404 here, /generate is served"
         );
     }
+
+    sndfile::init();
 
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
@@ -174,7 +178,7 @@ async fn main() {
     let max_concurrent: usize = std::env::var("MSTAR_MAX_CONCURRENT_REQUESTS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(512);
     let permits = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     // Uploads (audio/video multipart) routinely exceed axum's 2 MB default.
     let body_limit_mb = body_limit_mb();
@@ -200,6 +204,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
+        .route("/v1/audio/voices", get(audio_voices))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(
@@ -223,9 +228,15 @@ async fn main() {
             auth::API_KEY_ENV
         );
     }
+    // MSTAR_ROOT_PATH: routed before the router sees the path, as Starlette's
+    // root_path is, so the prefixed and the bare path both reach a route.
+    let root_path = std::env::var("MSTAR_ROOT_PATH").unwrap_or_default();
+    let app = tower::Layer::layer(&tower::util::MapRequestLayer::new(move |req: Request<Body>| {
+        strip_root_path(&root_path, req)
+    }), app);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     eprintln!("mstar-server (Rust frontend) for model {model_name:?} on http://{addr}");
-    axum::serve(listener, app)
+    axum::serve(listener, axum::ServiceExt::<Request<Body>>::into_make_service(app))
         // Disable Nagle: SSE/NDJSON streams write many small chunks, and
         // Nagle + delayed ACK turns each flush into a ~40 ms stall.
         .tcp_nodelay(true)
@@ -313,6 +324,42 @@ fn error_type(status: u16) -> &'static str {
     }
 }
 
+/// The path a route sees under `MSTAR_ROOT_PATH`, by Starlette's
+/// `get_route_path`: a path under `root` loses it, and any other path is
+/// routed as sent. `root` is taken as set, so `/proj/job/` leaves
+/// `/proj/job/v1/models` whole, as Starlette does.
+fn route_path<'a>(root: &str, path: &'a str) -> &'a str {
+    if root.is_empty() {
+        return path;
+    }
+    match path.strip_prefix(root) {
+        // Starlette's "" matches no route; neither does "/"
+        Some("") => "/",
+        Some(rest) if rest.starts_with('/') => rest,
+        _ => path,
+    }
+}
+
+fn strip_root_path(root: &str, mut req: Request<Body>) -> Request<Body> {
+    let path = req.uri().path();
+    let routed = route_path(root, path);
+    if routed.len() != path.len() {
+        let mut target = routed.to_string();
+        if let Some(q) = req.uri().query() {
+            target.push('?');
+            target.push_str(q);
+        }
+        if let Ok(pq) = target.parse::<axum::http::uri::PathAndQuery>() {
+            let mut parts = req.uri().clone().into_parts();
+            parts.path_and_query = Some(pq);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *req.uri_mut() = uri;
+            }
+        }
+    }
+    req
+}
+
 /// `MSTAR_MAX_BODY_MB`, default 128. The Python frontend parses it the same
 /// way (`mstar/api_server/body_limit.py`).
 fn body_limit_mb() -> usize {
@@ -327,11 +374,37 @@ fn body_limit_mb() -> usize {
 /// 400 with `fallback`.
 fn multipart_failure(e: &MultipartError, fallback: String) -> (u16, String) {
     if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
-        let mb = body_limit_mb();
-        (413, format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)"))
+        (413, body_too_large())
     } else {
         (400, fallback)
     }
+}
+
+/// Blocking work off the async workers: decoding a data URL, writing an
+/// upload, a remote fetch of up to 30 s. On a worker it stalls every
+/// connection that worker drives; the Python routes run it in a thread too.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
+fn body_too_large() -> String {
+    let mb = body_limit_mb();
+    format!("request body is larger than the {mb} MiB limit (MSTAR_MAX_BODY_MB)")
+}
+
+/// A body read that stopped at its limit (`to_bytes` wraps `LengthLimitError`).
+fn is_length_limit(e: &axum::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = source {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 fn error(status: u16, message: &str, type_: &str) -> Response {
@@ -399,7 +472,7 @@ fn check_request_id(id: &str) -> Result<(), String> {
 
 /// Resolve the loaded model's adapter and check it serves `surface`; otherwise
 /// an OpenAI-shaped error response (404), matching router.py `_resolve`.
-fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
+fn resolve(st: &AppState, surface: Surface) -> Result<&'static dyn OpenAIAdapter, Response> {
     let message = if st.python_adapter.is_empty() {
         format!("Model '{}' has no OpenAI-compatible adapter; use POST /generate", st.model_name)
     } else {
@@ -409,7 +482,7 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
             st.model_name, st.python_adapter
         )
     };
-    let adapter = Adapter::from_python(&st.python_adapter)
+    let adapter = adapters::from_python(&st.python_adapter)
         .ok_or_else(|| error(404, &message, "model_not_found"))?;
     let ok = match surface {
         Surface::Chat => adapter.supports_chat(),
@@ -425,6 +498,21 @@ fn resolve(st: &AppState, surface: Surface) -> Result<Adapter, Response> {
         ));
     }
     Ok(adapter)
+}
+
+/// A request's uploads, scheduled for removal ([`schedule_upload_cleanup`])
+/// when this drops: when whatever it moved into is done with them.
+struct DeferredCleanup {
+    upload_dir: PathBuf,
+    args: SubmitArgs,
+}
+
+impl Drop for DeferredCleanup {
+    fn drop(&mut self) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            schedule_upload_cleanup(&self.upload_dir, &self.args);
+        }
+    }
 }
 
 /// Delete a request's persisted media 60 s after translation, matching
@@ -500,6 +588,26 @@ async fn list_models(State(st): State<AppState>) -> Json<ModelList> {
     Json(ModelList::new(vec![ModelCard::new(st.model_name, now())]))
 }
 
+/// `GET /v1/audio/voices`, as router.py's `audio_voices`: the model's list,
+/// asked over the bridge (none in mock mode).
+async fn audio_voices(State(st): State<AppState>) -> Response {
+    if let Err(r) = resolve(&st, Surface::Speech) {
+        return r;
+    }
+    let voices = match &st.bridge {
+        Some(bridge) => bridge.voices(BRIDGE_PROBE_TIMEOUT).await,
+        None => Ok(None),
+    };
+    match voices {
+        Ok(Some(list)) => Json(list).into_response(),
+        Ok(None) => {
+            let message = format!("Model '{}' does not publish a voice list", st.model_name);
+            error(404, &message, error_type(404))
+        }
+        Err((status, message)) => error(status, &message, error_type(status)),
+    }
+}
+
 // ---- POST /v1/chat/completions -------------------------------------------
 
 async fn chat_completions(
@@ -514,7 +622,13 @@ async fn chat_completions(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let mut args = match adapter.chat_to_request(&req, &st.upload_dir, st.allow_remote) {
+    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let (req, translated) = blocking(move || {
+        let args = adapter.chat_to_request(&req, &dir, remote);
+        (req, args)
+    })
+    .await;
+    let mut args = match translated {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
@@ -851,14 +965,30 @@ async fn audio_speech(
     let as_sse = stream && stream_format == Some(StreamFormat::Sse);
     // Before the request is translated, as in `create_speech`: a format this
     // frontend cannot produce is the client's error.
-    let fmt = match media::check_audio_format(&req.response_format, stream) {
+    let fmt = match media::check_audio_format(&req.response_format, stream, st.sample_rate) {
         Ok(fmt) => fmt,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
-    let args = match adapter.speech_to_request(&req) {
-        Ok(a) => a,
-        Err(e) => return error(400, &e, "invalid_request_error"),
+    // Blocking: a data URL decoded, a clip saved, a remote fetch of up to 30 s.
+    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let (req, translated) = blocking(move || {
+        let speech = adapter.speech_to_request(&req, &dir, remote);
+        (req, speech)
+    })
+    .await;
+    let adapters::Speech { args, ref_audio } = match translated {
+        Ok(s) => s,
+        Err((status, e)) => return error(status, &e, error_type(status)),
     };
+    // Every piece reads the reference clip, and a stream submits the later ones
+    // while it plays, so the clip goes when the last piece is done with it.
+    let uploads = DeferredCleanup { upload_dir: st.upload_dir.clone(), args: args.clone() };
+    // The model's own loader judges the clip, before any piece is submitted.
+    if let (Some(check), Some(bridge)) = (&ref_audio, &st.bridge) {
+        if let Err((status, e)) = bridge.check_ref_audio(check, st.request_timeout).await {
+            return error(status, &e, error_type(status));
+        }
+    }
     let chunking = adapter.speech_chunking();
     let pieces =
         match speech_chunking::plan_chunks(req.extra.get("sentence_chunking"), &chunking, &req.input) {
@@ -866,7 +996,7 @@ async fn audio_speech(
             Err(e) => return error(400, &e, "invalid_request_error"),
         };
     let n = pieces.len();
-    let submit = piece_submitter(st.clone(), args, pieces, rid("speech"), stream);
+    let submit = piece_submitter(st.clone(), args, pieces, rid("speech"), stream, uploads);
     // Pieces in flight ahead of the one being read; dropping one unread aborts it.
     let mut pending: std::collections::VecDeque<OutStream> =
         (0..chunking.lookahead.clamp(1, n)).map(&*submit).collect();
@@ -954,7 +1084,11 @@ async fn audio_speech(
             }
         }
     }
-    let (bytes, mime) = media::pcm16_to_container(&pcm, st.sample_rate, &fmt);
+    let sample_rate = st.sample_rate;
+    let (bytes, mime) = match blocking(move || media::pcm16_to_container(&pcm, sample_rate, &fmt)).await {
+        Ok(encoded) => encoded,
+        Err(e) => return error(500, &e, "server_error"),
+    };
     Response::builder()
         .header("content-type", mime)
         .body(Body::from(bytes))
@@ -970,8 +1104,10 @@ fn piece_submitter(
     pieces: Vec<String>,
     request_id: String,
     stream: bool,
+    uploads: DeferredCleanup,
 ) -> Arc<dyn Fn(usize) -> OutStream + Send + Sync> {
     Arc::new(move |i| {
+        let _ = &uploads; // dropped with the last submitter, which schedules the cleanup
         let piece = SubmitArgs {
             text: Some(pieces[i].clone()),
             model_kwargs: speech_chunking::chunk_kwargs(&args.model_kwargs, i),
@@ -1067,7 +1203,9 @@ async fn videos_generations(
         Ok(a) => a,
         Err(r) => return r,
     };
-    let args = match adapter.video_to_request(&req, &st.upload_dir, st.allow_remote) {
+    let (dir, remote) = (st.upload_dir.clone(), st.allow_remote);
+    let translated = blocking(move || adapter.video_to_request(&req, &dir, remote)).await;
+    let args = match translated {
         Ok(a) => a,
         Err(e) => return error(400, &e, "invalid_request_error"),
     };
@@ -1155,7 +1293,8 @@ async fn images_edits(State(st): State<AppState>, mut mp: Multipart) -> Response
         .and_then(|f| PathBuf::from(f).extension().map(|e| format!(".{}", e.to_string_lossy())))
         .unwrap_or_else(|| ".png".to_string());
     let image_path = st.upload_dir.join(format!("{}{}", Uuid::new_v4().simple(), ext));
-    if let Err(e) = std::fs::write(&image_path, &image_bytes) {
+    let path = image_path.clone();
+    if let Err(e) = blocking(move || std::fs::write(&path, &image_bytes)).await {
         return error(500, &e.to_string(), "server_error");
     }
 
@@ -1220,6 +1359,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
     let mut mk_raw: Option<String> = None;
     let mut request_id: Option<String> = None;
     let mut uploads = SavedUploads::new(&st.upload_dir);
+    let mut parts: Vec<Part> = Vec::new();
 
     // The FastAPI endpoint this replaces uses `Form(...)` fields, which
     // Starlette parses from EITHER `multipart/form-data` (with file uploads)
@@ -1232,12 +1372,34 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // A substring match, as Python's: the vendor type is in no other range.
+    let binary = req
+        .headers()
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains(BINARY_STREAM_MEDIA_TYPE));
 
-    if content_type.starts_with("application/x-www-form-urlencoded") {
+    // Every field is a form field, as in Python: another body (JSON, say) would
+    // parse as an empty form and be submitted as an empty request.
+    let base_type = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if !base_type.is_empty()
+        && base_type != "multipart/form-data"
+        && base_type != "application/x-www-form-urlencoded"
+    {
+        return detail_error(
+            400,
+            &format!("/generate takes multipart/form-data or urlencoded fields, not {content_type}"),
+        );
+    }
+    // Starlette reads a body with no content type as an empty form.
+    if base_type != "multipart/form-data" {
         // No file uploads on this path (files force multipart), matching how
         // these clients already behave.
-        let body = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+        // Bounded here: `DefaultBodyLimit` binds only the extractors, and this
+        // path reads the body itself.
+        let body = match axum::body::to_bytes(req.into_body(), body_limit_mb() << 20).await {
             Ok(b) => b,
+            Err(e) if is_length_limit(&e) => return detail_error(413, &body_too_large()),
             Err(e) => return detail_error(400, &format!("reading form body: {e}")),
         };
         for (k, v) in form_urlencoded::parse(&body) {
@@ -1260,7 +1422,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
         }
         return generate_finish(
             st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
-            request_id, uploads,
+            request_id, uploads, Vec::new(), binary,
         )
         .await;
     }
@@ -1315,14 +1477,13 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
                 .filter(|s| !s.is_empty())
                 .unwrap_or("upload");
             let save_path = st.upload_dir.join(format!("{}_{}", Uuid::new_v4().simple(), safe));
-            if let Err(e) = std::fs::write(&save_path, &bytes) {
+            let path = save_path.clone();
+            if let Err(e) = blocking(move || std::fs::write(&path, &bytes)).await {
                 return detail_error(500, &e.to_string());
             }
-            uploads
-                .paths
-                .entry(modality.to_string())
-                .or_default()
-                .push(save_path.to_string_lossy().into_owned());
+            let paths = uploads.paths.entry(modality.to_string()).or_default();
+            parts.push(Part { modality: modality.to_string(), text: None, index: paths.len(), role: None });
+            paths.push(save_path.to_string_lossy().into_owned());
         } else {
             // Propagate a field read failure (body-limit overrun, mid-upload
             // disconnect, non-UTF-8) as a 400 rather than silently treating it
@@ -1355,7 +1516,7 @@ async fn generate(State(st): State<AppState>, req: axum::extract::Request) -> Re
 
     generate_finish(
         st, text, in_mods_raw, out_mods_raw, streaming, tokenize, mk_raw,
-        request_id, uploads,
+        request_id, uploads, parts, binary,
     )
     .await
 }
@@ -1398,9 +1559,14 @@ async fn generate_finish(
     mk_raw: Option<String>,
     request_id: Option<String>,
     uploads: SavedUploads,
+    mut parts: Vec<Part>,
+    binary: bool,
 ) -> Response {
-    // An empty id means none, as the Python /generate's form parsing reads it.
+    // An empty field means none, as the Python /generate's form parsing reads
+    // its optional fields.
     let request_id = request_id.filter(|id| !id.is_empty());
+    text = text.filter(|t| !t.is_empty());
+    let in_mods_raw = in_mods_raw.filter(|m| !m.is_empty());
     if let Err(msg) = request_id.as_deref().map_or(Ok(()), check_request_id) {
         // `uploads` drops unkept here, which deletes the saved files.
         return detail_error(400, &msg);
@@ -1411,20 +1577,34 @@ async fn generate_finish(
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect();
+    // The prompt in request order: each file, then the text, as Python's
+    // /generate lays it out.
+    let has_text = text.is_some();
+    if has_text {
+        parts.push(Part { modality: "text".to_string(), text: text.clone(), index: 0, role: None });
+    }
     let input_modalities: Vec<String> = match in_mods_raw {
-        Some(raw) => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => {
-            let mut m: Vec<String> = uploads.paths.keys().cloned().collect();
-            if text.as_ref().map(|t| !t.is_empty()).unwrap_or(false) {
+        // An explicit list is then the layout on its own, so the derived
+        // parts go rather than disagree with it.
+        Some(raw) => {
+            parts.clear();
+            let mut m: Vec<String> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            // A layout without a text slot would drop the prompt, and a text
+            // slot with no text renders to nothing.
+            if has_text && !m.iter().any(|x| x == "text") {
                 m.push("text".to_string());
+            }
+            if !has_text {
+                m.retain(|x| x != "text");
             }
             m
         }
+        None => parts.iter().map(|p| p.modality.clone()).collect(),
     };
     if let Some(message) = video_frame_refusal(&input_modalities, &output_modalities, streaming) {
         return detail_error(400, message);
@@ -1432,8 +1612,10 @@ async fn generate_finish(
     let model_kwargs: Map<String, Value> = match mk_raw {
         Some(raw) if !raw.is_empty() => match serde_json::from_str::<Value>(&raw) {
             Ok(Value::Object(m)) => m,
+            // `null` is no kwargs, as `json.loads` gives None
+            Ok(Value::Null) => Map::new(),
             Ok(_) => return detail_error(400, "model_kwargs must be a JSON object"),
-            Err(e) => return detail_error(400, &format!("model_kwargs JSON: {e}")),
+            Err(_) => return detail_error(400, "model_kwargs must be valid JSON"),
         },
         _ => Map::new(),
     };
@@ -1449,6 +1631,7 @@ async fn generate_finish(
         };
         tokens = Some(tok.encode(text.as_deref().unwrap_or("")));
         text = None; // the model side must use the ids, not re-tokenize
+        parts.clear();
     }
 
     let args = SubmitArgs {
@@ -1458,7 +1641,7 @@ async fn generate_finish(
         input_modalities,
         output_modalities,
         model_kwargs,
-        parts: Vec::new(),
+        parts,
     };
 
     schedule_upload_cleanup(&st.upload_dir, &args);
@@ -1474,20 +1657,30 @@ async fn generate_finish(
             Ok(base) => base,
             Err((status, message)) => return detail_error(status, &message),
         };
-        let body = base.map(|item| {
-            Ok::<Bytes, Infallible>(Bytes::from(match item {
-                Out::Chunk(c) => ndjson_line(&c),
-                // after the 200 is committed the status travels in-band
-                Out::Error { status, message } => {
-                    let mut s = json!({"error": message, "status": status}).to_string();
-                    s.push('\n');
-                    s.into_bytes()
-                }
-            }))
+        let body = base.flat_map(move |item| {
+            let chunk = match item {
+                Out::Chunk(c) => c,
+                // After the 200 the status travels in-band, as the error chunk
+                // Python's `errors_in_band` ends the stream with.
+                Out::Error { status, message } => ResultChunk {
+                    modality: "error".to_string(),
+                    data: message.into_bytes(),
+                    metadata: json!({"status": status}),
+                },
+            };
+            let pieces = if binary {
+                let (header, payload) = binary_frame(chunk);
+                vec![header, payload]
+            } else {
+                vec![Bytes::from(ndjson_line(&chunk))]
+            };
+            futures::stream::iter(pieces.into_iter().map(Ok::<Bytes, Infallible>))
         });
+        let media_type = if binary { BINARY_STREAM_MEDIA_TYPE } else { "application/x-ndjson" };
         return Response::builder()
-            .header("content-type", "application/x-ndjson")
+            .header("content-type", media_type)
             .header("cache-control", "no-cache")
+            .header("vary", "Accept")
             .body(Body::from_stream(body))
             .unwrap();
     }
@@ -1531,6 +1724,25 @@ fn remove_uploads(upload_dir: &std::path::Path, file_paths: &BTreeMap<String, Ve
     }
 }
 
+/// `Accept`ed on `/generate` for length-framed chunks (Python's
+/// `BINARY_STREAM_MEDIA_TYPE`).
+const BINARY_STREAM_MEDIA_TYPE: &str = "application/vnd.mstar.frames";
+
+/// One chunk as Python's `_chunk_to_binary_frame` writes it: a JSON header
+/// line naming the payload's length, then the payload as is, which spares a
+/// video frame the base64 and JSON passes of the NDJSON form.
+fn binary_frame(c: ResultChunk) -> (Bytes, Bytes) {
+    let mut header = json!({
+        "modality": c.modality,
+        "nbytes": c.data.len(),
+        "metadata": c.metadata,
+    })
+    .to_string()
+    .into_bytes();
+    header.push(b'\n');
+    (Bytes::from(header), Bytes::from(c.data))
+}
+
 fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
     let mut s = json!({
         "modality": c.modality,
@@ -1544,6 +1756,54 @@ fn ndjson_line(c: &ResultChunk) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn a_speech_clip_is_removed_once_the_last_piece_is_done_with_it() {
+        let dir = std::env::temp_dir().join(format!("mstar_cleanup_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("ref.wav");
+        std::fs::write(&clip, b"RIFF").unwrap();
+        let mut args = super::SubmitArgs::default();
+        args.file_paths.insert("audio".into(), vec![clip.to_string_lossy().into_owned()]);
+        let uploads = super::DeferredCleanup { upload_dir: dir.clone(), args };
+        let held = std::sync::Arc::new(uploads); // as the speech's piece submitter holds it
+        let second = held.clone();
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert!(clip.exists(), "removed while a piece still held it");
+        drop(second);
+        tokio::time::sleep(std::time::Duration::from_secs(59)).await;
+        assert!(clip.exists(), "removed before its 60 s grace");
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(!clip.exists(), "never removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_root_path_is_stripped_as_starlette_strips_it() {
+        use super::route_path;
+        // unset: every path as sent
+        assert_eq!(route_path("", "/v1/models"), "/v1/models");
+        // a path under the prefix loses it; the bare path still routes
+        assert_eq!(route_path("/proj/job", "/proj/job/v1/models"), "/v1/models");
+        // the prefix as set: a trailing slash leaves the path whole, as Starlette does
+        assert_eq!(route_path("/proj/job/", "/proj/job/v1/models"), "/proj/job/v1/models");
+        assert_eq!(route_path("/proj/job", "/v1/models"), "/v1/models");
+        // a sibling that only shares the prefix's characters is not under it
+        assert_eq!(route_path("/proj/job", "/proj/jobs/v1/models"), "/proj/jobs/v1/models");
+        assert_eq!(route_path("/proj/job", "/proj/job"), "/");
+    }
+
+    #[test]
+    fn the_rewrite_keeps_the_query() {
+        let req = axum::http::Request::builder()
+            .uri("/p/generate?tokenize=true")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let req = super::strip_root_path("/p", req);
+        assert_eq!(req.uri().path_and_query().unwrap().as_str(), "/generate?tokenize=true");
+    }
+
     use super::*;
     use mstar_rust::communicator::RawZmqCommunicator;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1701,6 +1961,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[tokio::test]
+    async fn voices_are_503_when_the_bridge_does_not_answer() {
+        let dir = socket_dir();
+        let bridge = Arc::new(Bridge::new(dir.to_str().unwrap()).unwrap());
+        let st = AppState { python_adapter: "OrpheusAdapter".into(), ..state(Some(bridge)) };
+
+        let (status, _, _) = body(audio_voices(State(st)).await).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn image_count_refuses_n_outside_one_to_limit() {
         assert_eq!(image_count(None, 10), Ok(1));
@@ -1723,7 +1995,7 @@ mod tests {
         uploads.paths = file_paths;
         let resp = generate_finish(
             st, Some("hi".into()), input.map(str::to_string), output.into(), streaming,
-            false, None, None, uploads,
+            false, None, None, uploads, Vec::new(), false,
         )
         .await;
         let (status, _, data) = body(resp).await;
@@ -1836,7 +2108,7 @@ mod tests {
         let long_id = "a".repeat(MAX_REQUEST_ID_LEN + 1);
         for (field, value, detail) in [
             ("model_kwargs", "[1]", "model_kwargs must be a JSON object"),
-            ("model_kwargs", "{", "model_kwargs JSON: EOF while parsing an object at line 1 column 1"),
+            ("model_kwargs", "{", "model_kwargs must be valid JSON"),
             ("tokenize", "true", "tokenize=true requires the server to be started with MSTAR_TOKENIZER"),
             ("input_modalities", "video_frame", "'video_frame' is an output-only modality"),
             ("request_id", "a/b", "request_id must be at most 128 characters from [A-Za-z0-9._:-]"),
