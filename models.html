@@ -1165,8 +1165,9 @@ the reference’s fused weights: q/k norms read the fused QKV output in place
 and each residual add folds into the next RMSNorm (flashinfer
 <code class="docutils literal notranslate"><span class="pre">fused_add_rmsnorm</span></code>), so logits match the reference to half-precision
 rounding rather than bit for bit. <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{backbone_graphs:</span> <span class="pre">false}</span></code>
-runs the same layer loop eagerly, and <code class="docutils literal notranslate"><span class="pre">backbone_token_buckets</span></code> sets the
-packed-token buckets (256 to 4096 by default).</p></li>
+runs the same layer loop eagerly, and the serving config’s
+<code class="docutils literal notranslate"><span class="pre">prefill_token_buckets:</span> <span class="pre">{backbone:</span> <span class="pre">{backbone_layers:</span> <span class="pre">[...]}}</span></code> sets the
+packed-token buckets (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>).</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">configs/omnivoice_split.yaml</span></code> runs code2wav (the codec decode) on a
 second worker sharing GPU 0, so the unmask loop no longer stops for each
 finished request’s decode; the silence trim and the rest of the output
@@ -1412,24 +1413,23 @@ not the 256-slot default. The state defaults to the checkpoint’s
 <code class="docutils literal notranslate"><span class="pre">gdn_state.state_dtype:</span> <span class="pre">bfloat16</span></code> halves state traffic at some precision and
 needs FlashInfer’s fused bf16 decode kernel (K = V = 128).</p>
 <p>Text prefill and mixed steps replay captured graphs by total tokens, on the
-ladder <code class="docutils literal notranslate"><span class="pre">32</span> <span class="pre">...</span> <span class="pre">8192</span></code> (powers of two, plus 2176 as slack for a step a few
-tokens over the 2048-token step budget); a step pads to its bucket and a longer
-one runs eagerly. A text-prefill step, one with no decode rows beside it, also
-has 1152, 1280, 1536 and 1792, so a prompt a little past 1024 tokens doesn’t
-pad to 2048; a mixed step captures only the ladder’s powers of two and 2176, on
-a deployment’s own ladder too, so a ladder needs at least one of those.
-<code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">prefill_token_buckets:</span> <span class="pre">[...]</span></code> sets a deployment’s own ladder
-(distinct positive token counts, checked when the worker loads):
-<code class="docutils literal notranslate"><span class="pre">configs/qwen3_5_9b*.yaml</span></code> take the powers of two to 2048,
-1152-1792, and 2176 as slack, since the LLM’s 2048-token step budget
-(<code class="docutils literal notranslate"><span class="pre">MAX_BATCH_TOKENS</span></code>) caps prefill and mixed steps and no bucket past 2176 is
-reached. Each bucket adds captures and startup time. 4096 and 8192 stay in the
-default ladder for a deployment that raises <code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code> or turns
-chunking off, which fills them exactly. The ladder leaves out slack rungs above
-them (4352, 8704): such a deployment adds them to its own ladder, and without
-them a step just past a power of two pads to the next one and a step past 8192
-runs eagerly. Added rungs serve text-prefill steps only; a mixed step’s slack
-stays 2176.</p>
+ladder <code class="docutils literal notranslate"><span class="pre">32</span> <span class="pre">...</span> <span class="pre">8192</span></code> (powers of two, plus 2176 as a mixed step’s slack: a
+step passes its budget only when its decode rows leave its next prompt less
+than <code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code> of it, and then by at most its decode rows); a step
+pads to its bucket and a longer one runs eagerly. A text-prefill step, one with
+no decode rows beside it, also has 1152, 1280, 1536 and 1792, so a prompt a
+little past 1024 tokens doesn’t pad to 2048; a mixed step captures only the
+ladder’s powers of two and 2176. 4096 and 8192 stay in the default ladder for a
+deployment that raises <code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code> or turns chunking off, which fills
+them exactly. The ladder leaves out slack rungs above them (4352, 8704): such a
+deployment adds them to its own ladder, and without them a step just past a
+power of two pads to the next one and a step past 8192 runs eagerly. The
+serving config’s <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> sets a deployment’s own ladder per
+walk (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>): <code class="docutils literal notranslate"><span class="pre">configs/qwen3_5_9b*.yaml</span></code> take the powers of two
+to 2048 for <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code> and <code class="docutils literal notranslate"><span class="pre">mixed</span></code>, and 1152-1792 for <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>,
+since the LLM’s 2048-token step budget (<code class="docutils literal notranslate"><span class="pre">MAX_BATCH_TOKENS</span></code>) caps both and at
+the default <code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code> no step passes it. Each bucket adds captures
+and startup time.</p>
 <p>A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
 (that build sat on the per-step critical path: +13% output tok/s at c=32 on
@@ -1767,9 +1767,10 @@ attention as another (<code class="docutils literal notranslate"><span class="pr
 ops. Its 15 depth steps feed each sampled code into the next, so small
 differences can change later codes at near-ties.</p></li>
 <li><p>The Thinker’s text and audio prefill replay captured graphs on the ladder
-<code class="docutils literal notranslate"><span class="pre">128</span> <span class="pre">...</span> <span class="pre">2048</span></code> tokens, and a longer step runs eagerly.
-<code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">prefill_token_buckets:</span> <span class="pre">[...]</span></code> sets a deployment’s own
-ladder. Each bucket adds captures, graph memory and startup time.</p></li>
+<code class="docutils literal notranslate"><span class="pre">128</span> <span class="pre">...</span> <span class="pre">2048</span></code> tokens, and a longer step runs eagerly. The serving
+config’s <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets:</span> <span class="pre">{Thinker:</span> <span class="pre">{prefill_text:</span> <span class="pre">[...]}}</span></code> sets a
+deployment’s own ladder (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). Each bucket adds captures,
+graph memory and startup time.</p></li>
 <li><p>The MoE layers route through the fused softmax-top-k kernel
 (<code class="docutils literal notranslate"><span class="pre">TopKRouter(fused_softmax_topk=True)</span></code>), which gives equal probabilities to
 the lower expert id where <code class="docutils literal notranslate"><span class="pre">torch.topk</span></code> may pick another. On one GPU a
@@ -1841,9 +1842,11 @@ the <code class="docutils literal notranslate"><span class="pre">hift_state</spa
 runs as several steps. <code class="docutils literal notranslate"><span class="pre">hift_capture_frame_buckets:</span> <span class="pre">[]</span></code> runs the vocoder
 eagerly.</p></li>
 <li><p>The LM’s prefill is captured with its decode, per prompt token bucket and
-batch size (<code class="docutils literal notranslate"><span class="pre">lm_prefill_token_buckets</span></code>, <code class="docutils literal notranslate"><span class="pre">lm_prefill_batch_sizes</span></code>; the LM’s
-graphs take about 130 MB together). A prompt past the largest bucket runs
-eagerly, and <code class="docutils literal notranslate"><span class="pre">lm_prefill_token_buckets:</span> <span class="pre">[]</span></code> captures no prefill.</p></li>
+batch size (the serving config’s <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets:</span> <span class="pre">{llm:</span> <span class="pre">{prefill_voice:</span>
+<span class="pre">[...]}}</span></code>, see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>, and <code class="docutils literal notranslate"><span class="pre">lm_prefill_batch_sizes</span></code>; the LM’s graphs
+take about 130 MB together). A prompt past the largest bucket runs eagerly, and
+<code class="docutils literal notranslate"><span class="pre">lm_prefill_batch_sizes:</span> <span class="pre">[]</span></code> captures no prefill. The flow’s new-frame region
+keeps <code class="docutils literal notranslate"><span class="pre">model_kwargs.flow_new_frame_buckets</span></code>, which the key can’t set.</p></li>
 </ul>
 </section>
 <section id="qwen3-tts-notes">

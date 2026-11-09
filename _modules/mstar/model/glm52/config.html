@@ -1161,10 +1161,6 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># would otherwise fail every capture and serve eager.</span>
     <span class="n">graph_compile</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 
-    <span class="n">prefill_token_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
-    <span class="c1"># Token buckets for the prefill batch sizes above 1; None captures them at</span>
-    <span class="c1"># prefill_token_buckets too.</span>
-    <span class="n">prefill_batched_token_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">prefill_capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># Derived MLA cache geometry: the paged cache stores one 576-dim latent</span>
@@ -1330,7 +1326,6 @@ window.runMermaid = runMermaid;</script>
             <span class="n">max_seq_len</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
             <span class="n">eos_token_ids</span><span class="o">=</span><span class="p">(</span><span class="mi">250</span><span class="p">,</span> <span class="mi">251</span><span class="p">,</span> <span class="mi">252</span><span class="p">),</span>
             <span class="n">pad_token_id</span><span class="o">=</span><span class="mi">250</span><span class="p">,</span>
-            <span class="n">prefill_token_buckets</span><span class="o">=</span><span class="p">[</span><span class="mi">64</span><span class="p">],</span>
             <span class="n">prefill_capture_batch_sizes</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
         <span class="p">)</span></div>
 

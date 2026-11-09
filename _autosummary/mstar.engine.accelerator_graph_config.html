@@ -792,10 +792,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.total_tokens"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.total_tokens</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.apply_region_ladders"><code class="docutils literal notranslate"><span class="pre">apply_region_ladders()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.apply_token_ladders"><code class="docutils literal notranslate"><span class="pre">apply_token_ladders()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.check_compile_mode"><code class="docutils literal notranslate"><span class="pre">check_compile_mode()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.check_token_ladder"><code class="docutils literal notranslate"><span class="pre">check_token_ladder()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.decode_rows_then_prompt"><code class="docutils literal notranslate"><span class="pre">decode_rows_then_prompt()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.distribute_tokens"><code class="docutils literal notranslate"><span class="pre">distribute_tokens()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.geometric_batch_sizes"><code class="docutils literal notranslate"><span class="pre">geometric_batch_sizes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.ladders_by_batch_size"><code class="docutils literal notranslate"><span class="pre">ladders_by_batch_size()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -812,17 +816,29 @@
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.apply_region_ladders" title="mstar.engine.accelerator_graph_config.apply_region_ladders"><code class="xref py py-obj docutils literal notranslate"><span class="pre">apply_region_ladders</span></code></a>(node, configs, ladders, ...)</p></td>
+<td><p>Take a serving config's <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> for <code class="docutils literal notranslate"><span class="pre">node</span></code> that name no walk of it (<cite>EngineManager</cite> split them off) as the <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> of its piecewise packed regions, by label.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.apply_token_ladders" title="mstar.engine.accelerator_graph_config.apply_token_ladders"><code class="xref py py-obj docutils literal notranslate"><span class="pre">apply_token_ladders</span></code></a>(node, configs, ladders, ...)</p></td>
+<td><p>Take a serving config's <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> for <code class="docutils literal notranslate"><span class="pre">node</span></code> (capture walk -&gt; ladder or <code class="docutils literal notranslate"><span class="pre">{min</span> <span class="pre">batch</span> <span class="pre">size:</span> <span class="pre">ladder}</span></code>, which <cite>EngineManager</cite> checked) as the <code class="docutils literal notranslate"><span class="pre">capture_token_lengths</span></code> of the node's packed captures of that walk.</p></td>
+</tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.check_compile_mode" title="mstar.engine.accelerator_graph_config.check_compile_mode"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_compile_mode</span></code></a>(mode)</p></td>
 <td><p>A capture config's <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code>, refused at build rather than at capture, where the per-capture fallback would serve the bucket eager.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.decode_rows_then_prompt" title="mstar.engine.accelerator_graph_config.decode_rows_then_prompt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_rows_then_prompt</span></code></a>(total_tokens, bs)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.check_token_ladder" title="mstar.engine.accelerator_graph_config.check_token_ladder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_token_ladder</span></code></a>(where, ladder)</p></td>
+<td><p>Refuse a <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> value that is not a ladder (a non-empty list of distinct positive ints) or <code class="docutils literal notranslate"><span class="pre">{min</span> <span class="pre">batch</span> <span class="pre">size:</span> <span class="pre">ladder}</span></code> whose top rungs rise with the batch size: a capture's static buffers are sized by its first, largest-batch bucket, so a smaller batch's ladder must not reach past it.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.decode_rows_then_prompt" title="mstar.engine.accelerator_graph_config.decode_rows_then_prompt"><code class="xref py py-obj docutils literal notranslate"><span class="pre">decode_rows_then_prompt</span></code></a>(total_tokens, bs)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bs</span> <span class="pre">-</span> <span class="pre">1</span></code> one-token rows and a prompt row of the rest: a mixed step's layout, for kernels that split rows by span.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.distribute_tokens" title="mstar.engine.accelerator_graph_config.distribute_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distribute_tokens</span></code></a>(total_tokens, bs)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.distribute_tokens" title="mstar.engine.accelerator_graph_config.distribute_tokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">distribute_tokens</span></code></a>(total_tokens, bs)</p></td>
 <td><p>Split <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> across <code class="docutils literal notranslate"><span class="pre">bs</span></code> requests, remainder on the first.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.geometric_batch_sizes" title="mstar.engine.accelerator_graph_config.geometric_batch_sizes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">geometric_batch_sizes</span></code></a>(max_batch_size)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.geometric_batch_sizes" title="mstar.engine.accelerator_graph_config.geometric_batch_sizes"><code class="xref py py-obj docutils literal notranslate"><span class="pre">geometric_batch_sizes</span></code></a>(max_batch_size)</p></td>
 <td><p>Powers of two below <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>, then <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> itself.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.accelerator_graph_config.ladders_by_batch_size" title="mstar.engine.accelerator_graph_config.ladders_by_batch_size"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ladders_by_batch_size</span></code></a>(ladder)</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">capture_token_lengths</span></code> or <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> value as <code class="docutils literal notranslate"><span class="pre">{min</span> <span class="pre">batch</span> <span class="pre">size:</span> <span class="pre">ladder}</span></code>: a plain ladder serves every batch size.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1006,7 +1022,7 @@
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>capture_graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>capture_token_lengths</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
+<li><p><strong>capture_token_lengths</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>)</p></li>
 <li><p><strong>make_node_input</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference internal" href="mstar.model.submodule_base.html#mstar.model.submodule_base.NodeInputs" title="mstar.model.submodule_base.NodeInputs"><em>NodeInputs</em></a><em>]</em>)</p></li>
 <li><p><strong>replay_graph_walks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 <li><p><strong>additional_key_info</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em> | </em><em>None</em>)</p></li>
@@ -1470,6 +1486,71 @@ for a region that declares none.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.apply_region_ladders">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_config.</span></span><span class="sig-name descname"><span class="pre">apply_region_ladders</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">configs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ladders</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walk_ladders</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">submodule_cls</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#apply_region_ladders"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.apply_region_ladders" title="Link to this definition">#</a></dt>
+<dd><p>Take a serving config’s <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> for <code class="docutils literal notranslate"><span class="pre">node</span></code> that name
+no walk of it (<cite>EngineManager</cite> split them off) as the <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> of
+its piecewise packed regions, by label.</p>
+<p>A name that is neither a walk nor a region of the node is refused, as is a
+region the config also names as a walk, or one captured by batch size
+alone. A node whose <code class="docutils literal notranslate"><span class="pre">submodule_cls</span></code> declares regions (overrides
+<cite>NodeSubmodule.get_piecewise_accelerator_graph_configs</cite>) but returned none
+at this deployment logs and skips. The node’s <code class="docutils literal notranslate"><span class="pre">walk_ladders</span></code> are refused
+here, naming its regions, where its class captures no walk at all (doesn’t
+override <cite>NodeSubmodule.get_accelerator_graph_configs</cite>);
+<cite>apply_token_ladders</cite> takes them otherwise.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>configs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig" title="mstar.engine.accelerator_graph_config.PiecewiseAcceleratorGraphConfig"><em>PiecewiseAcceleratorGraphConfig</em></a><em>]</em>)</p></li>
+<li><p><strong>ladders</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>)</p></li>
+<li><p><strong>walk_ladders</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
+<li><p><strong>submodule_cls</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><em>type</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.apply_token_ladders">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_config.</span></span><span class="sig-name descname"><span class="pre">apply_token_ladders</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">configs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ladders</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">step_tokens</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">batch_sizes</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#apply_token_ladders"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.apply_token_ladders" title="Link to this definition">#</a></dt>
+<dd><p>Take a serving config’s <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> for <code class="docutils literal notranslate"><span class="pre">node</span></code> (capture
+walk -&gt; ladder or <code class="docutils literal notranslate"><span class="pre">{min</span> <span class="pre">batch</span> <span class="pre">size:</span> <span class="pre">ladder}</span></code>, which <cite>EngineManager</cite>
+checked) as the <code class="docutils literal notranslate"><span class="pre">capture_token_lengths</span></code> of the node’s packed captures of
+that walk.</p>
+<p>A ladder runs to the first rung that holds the most tokens the scheduler
+gives a step its capture replays (<code class="docutils literal notranslate"><span class="pre">step_tokens</span></code> of each replay walk and
+the capture’s widest batch, of the <code class="docutils literal notranslate"><span class="pre">batch_sizes</span></code> the runner captures it
+at: its token budget, or a little past it beside
+decode rows; none where any walk’s steps have no bound): a rung beyond
+would never replay. A larger batch size’s ladder also runs at least as far
+as a smaller one’s, which share its static buffers.</p>
+<p>A walk whose steps only replay another walk’s capture is refused, naming
+that walk, as is one the node captures by batch size alone. A walk the
+node captures nothing for here, as a model that turns
+its captures off at runtime does, is logged and skipped: its steps run
+eagerly whatever the ladder.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>configs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig" title="mstar.engine.accelerator_graph_config.AcceleratorGraphConfig"><em>AcceleratorGraphConfig</em></a><em>]</em>)</p></li>
+<li><p><strong>ladders</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a><em>]</em>)</p></li>
+<li><p><strong>step_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em><em>]</em>)</p></li>
+<li><p><strong>batch_sizes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Callable" title="(in Python v3.12)"><em>Callable</em></a><em>[</em><em>[</em><a class="reference internal" href="#mstar.engine.accelerator_graph_config.AcceleratorGraphConfig" title="mstar.engine.accelerator_graph_config.AcceleratorGraphConfig"><em>AcceleratorGraphConfig</em></a><em>]</em><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.check_compile_mode">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_config.</span></span><span class="sig-name descname"><span class="pre">check_compile_mode</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mode</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#check_compile_mode"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.check_compile_mode" title="Link to this definition">#</a></dt>
 <dd><p>A capture config’s <code class="docutils literal notranslate"><span class="pre">compile_mode</span></code>, refused at build rather than at capture,
@@ -1480,6 +1561,27 @@ where the per-capture fallback would serve the bucket eager.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.check_token_ladder">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_config.</span></span><span class="sig-name descname"><span class="pre">check_token_ladder</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">where</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ladder</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#check_token_ladder"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.check_token_ladder" title="Link to this definition">#</a></dt>
+<dd><p>Refuse a <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> value that is not a ladder (a
+non-empty list of distinct positive ints) or <code class="docutils literal notranslate"><span class="pre">{min</span> <span class="pre">batch</span> <span class="pre">size:</span> <span class="pre">ladder}</span></code>
+whose top rungs rise with the batch size: a capture’s static buffers are
+sized by its first, largest-batch bucket, so a smaller batch’s ladder must
+not reach past it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>where</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>ladder</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1532,6 +1634,21 @@ pads up to the next (or splits into these sizes), and a full batch fits one.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.accelerator_graph_config.ladders_by_batch_size">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.accelerator_graph_config.</span></span><span class="sig-name descname"><span class="pre">ladders_by_batch_size</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ladder</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/accelerator_graph_config.html#ladders_by_batch_size"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.accelerator_graph_config.ladders_by_batch_size" title="Link to this definition">#</a></dt>
+<dd><p>A <code class="docutils literal notranslate"><span class="pre">capture_token_lengths</span></code> or <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> value as
+<code class="docutils literal notranslate"><span class="pre">{min</span> <span class="pre">batch</span> <span class="pre">size:</span> <span class="pre">ladder}</span></code>: a plain ladder serves every batch size.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>ladder</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>, <a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Any" title="(in Python v3.12)"><em>Any</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1660,10 +1777,14 @@ pads up to the next (or splits into these sizes), and a full batch fits one.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.PiecewisePackedConfig.total_tokens"><code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig.total_tokens</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.apply_region_ladders"><code class="docutils literal notranslate"><span class="pre">apply_region_ladders()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.apply_token_ladders"><code class="docutils literal notranslate"><span class="pre">apply_token_ladders()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.check_compile_mode"><code class="docutils literal notranslate"><span class="pre">check_compile_mode()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.check_token_ladder"><code class="docutils literal notranslate"><span class="pre">check_token_ladder()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.decode_rows_then_prompt"><code class="docutils literal notranslate"><span class="pre">decode_rows_then_prompt()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.distribute_tokens"><code class="docutils literal notranslate"><span class="pre">distribute_tokens()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.geometric_batch_sizes"><code class="docutils literal notranslate"><span class="pre">geometric_batch_sizes()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.accelerator_graph_config.ladders_by_batch_size"><code class="docutils literal notranslate"><span class="pre">ladders_by_batch_size()</span></code></a></li>
 </ul>
   </nav></div>
 

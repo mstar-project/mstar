@@ -746,8 +746,8 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.recompile_limit" title="mstar.engine.recompile_limit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">recompile_limit</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.with_recompile_limit" title="mstar.engine.with_recompile_limit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">with_recompile_limit</span></code></a>(fn, submodule)</p></td>
-<td><p>Wrap <code class="docutils literal notranslate"><span class="pre">fn</span></code>, one of <code class="docutils literal notranslate"><span class="pre">submodule</span></code>'s torch.compile'd callables, so dynamo compiles it under the submodule's <code class="docutils literal notranslate"><span class="pre">dynamo_recompile_limit()</span></code> where that is above the current limit, for the call's duration.</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.with_recompile_limit" title="mstar.engine.with_recompile_limit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">with_recompile_limit</span></code></a>(fn, limit)</p></td>
+<td><p>Wrap <code class="docutils literal notranslate"><span class="pre">fn</span></code>, a torch.compile'd callable, so dynamo compiles it under <code class="docutils literal notranslate"><span class="pre">limit</span></code> where that is above the current limit, for the call's duration (<cite>AcceleratorGraphRunner.recompile_limit</cite> gives a node's).</p></td>
 </tr>
 </tbody>
 </table>
@@ -784,14 +784,19 @@
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.with_recompile_limit">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.</span></span><span class="sig-name descname"><span class="pre">with_recompile_limit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">fn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">submodule</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine.html#with_recompile_limit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.with_recompile_limit" title="Link to this definition">#</a></dt>
-<dd><p>Wrap <code class="docutils literal notranslate"><span class="pre">fn</span></code>, one of <code class="docutils literal notranslate"><span class="pre">submodule</span></code>’s torch.compile’d callables, so dynamo compiles it under
-the submodule’s <code class="docutils literal notranslate"><span class="pre">dynamo_recompile_limit()</span></code> where that is above the current limit, for
-the call’s duration. A submodule that doesn’t override the hook gets <code class="docutils literal notranslate"><span class="pre">fn</span></code> back as is.</p>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.</span></span><span class="sig-name descname"><span class="pre">with_recompile_limit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">fn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">limit</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine.html#with_recompile_limit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.with_recompile_limit" title="Link to this definition">#</a></dt>
+<dd><p>Wrap <code class="docutils literal notranslate"><span class="pre">fn</span></code>, a torch.compile’d callable, so dynamo compiles it under <code class="docutils literal notranslate"><span class="pre">limit</span></code> where that
+is above the current limit, for the call’s duration (<cite>AcceleratorGraphRunner.recompile_limit</cite>
+gives a node’s). None gets <code class="docutils literal notranslate"><span class="pre">fn</span></code> back as is.</p>
 <p>From torch 2.12 dynamo’s config is per thread. Before it the patch is process-wide while
 the call runs, so other nodes keep the engine’s limit only because a worker runs one
 compiled call at a time (capture before its loop, then its one GPU thread), and its GPU and
 plan threads set the engine’s config before the loop (<code class="docutils literal notranslate"><span class="pre">StepExecutor._engine_thread_pool</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>limit</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p>
+</dd>
+</dl>
 </dd></dl>
 
 <p class="rubric">Modules</p>

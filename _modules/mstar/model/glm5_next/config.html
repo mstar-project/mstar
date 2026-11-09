@@ -1198,9 +1198,8 @@ window.runMermaid = runMermaid;</script>
     <span class="n">moe_quant_kernel</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">"reference"</span>
 
     <span class="c1"># Capture the prefill per (rows, token bucket); off keeps it eager. The</span>
-    <span class="c1"># two lists override the submodule's default buckets.</span>
+    <span class="c1"># list overrides the submodule's default batch sizes.</span>
     <span class="n">prefill_graphs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="n">prefill_token_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">prefill_capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="c1"># the latent width, kv_lora_rank + qk_rope_head_dim (0 here)</span>
@@ -1560,7 +1559,6 @@ window.runMermaid = runMermaid;</script>
             <span class="n">max_seq_len</span><span class="o">=</span><span class="mi">512</span><span class="p">,</span>
             <span class="n">eos_token_ids</span><span class="o">=</span><span class="p">(</span><span class="mi">250</span><span class="p">,</span> <span class="mi">251</span><span class="p">,</span> <span class="mi">252</span><span class="p">),</span>
             <span class="n">pad_token_id</span><span class="o">=</span><span class="mi">250</span><span class="p">,</span>
-            <span class="n">prefill_token_buckets</span><span class="o">=</span><span class="p">[</span><span class="mi">64</span><span class="p">],</span>
             <span class="n">prefill_capture_batch_sizes</span><span class="o">=</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span>
         <span class="p">)</span></div>
 

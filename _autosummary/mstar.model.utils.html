@@ -777,6 +777,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.process_weights_after_loading"><code class="docutils literal notranslate"><span class="pre">process_weights_after_loading()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.read_fp8_block_quant_config"><code class="docutils literal notranslate"><span class="pre">read_fp8_block_quant_config()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.resolve_checkpoint"><code class="docutils literal notranslate"><span class="pre">resolve_checkpoint()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.warn_retired_ladder_env"><code class="docutils literal notranslate"><span class="pre">warn_retired_ladder_env()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -837,6 +838,9 @@
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.resolve_checkpoint" title="mstar.model.utils.resolve_checkpoint"><code class="xref py py-obj docutils literal notranslate"><span class="pre">resolve_checkpoint</span></code></a>(model_path_hf[, cache_dir])</p></td>
 <td><p>A local checkpoint directory as given, a Hub id as its snapshot (fetched if not cached), None for no path.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.warn_retired_ladder_env" title="mstar.model.utils.warn_retired_ladder_env"><code class="xref py py-obj docutils literal notranslate"><span class="pre">warn_retired_ladder_env</span></code></a>(name, setting)</p></td>
+<td><p>Warn that the environment variable <code class="docutils literal notranslate"><span class="pre">name</span></code>, a capture ladder the serving config's <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> replaced, is set but no longer read; <code class="docutils literal notranslate"><span class="pre">setting</span></code> is the serving config entry that sets it.</p></td>
 </tr>
 </tbody>
 </table>
@@ -1422,6 +1426,25 @@ None for no path.</p>
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.utils.warn_retired_ladder_env">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">warn_retired_ladder_env</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">setting</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#warn_retired_ladder_env"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.warn_retired_ladder_env" title="Link to this definition">#</a></dt>
+<dd><p>Warn that the environment variable <code class="docutils literal notranslate"><span class="pre">name</span></code>, a capture ladder the serving config’s
+<code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> replaced, is set but no longer read; <code class="docutils literal notranslate"><span class="pre">setting</span></code> is the
+serving config entry that sets it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>setting</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -1531,6 +1554,7 @@ None for no path.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.process_weights_after_loading"><code class="docutils literal notranslate"><span class="pre">process_weights_after_loading()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.read_fp8_block_quant_config"><code class="docutils literal notranslate"><span class="pre">read_fp8_block_quant_config()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.resolve_checkpoint"><code class="docutils literal notranslate"><span class="pre">resolve_checkpoint()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.utils.warn_retired_ladder_env"><code class="docutils literal notranslate"><span class="pre">warn_retired_ladder_env()</span></code></a></li>
 </ul>
   </nav></div>
 

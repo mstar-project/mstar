@@ -725,7 +725,6 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.PREFILL_TOKEN_BUCKETS"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.PREFILL_TOKEN_BUCKETS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.check_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.cuts_tensor_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.cuts_tensor_inputs</span></code></a></li>
@@ -842,12 +841,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.compile_regions"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.compile_regions()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.compiled_entries_per_shape"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.compiled_entries_per_shape</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cudnn_allow_tf32"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cudnn_allow_tf32</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.declare_step"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.declare_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_autocast</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_torch_compile</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.dynamo_recompile_limit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.filter_batched_output()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.float32_matmul_precision"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.float32_matmul_precision</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.forward()</span></code></a></li>
@@ -985,7 +984,7 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ARNodeInputs</span></code></a>([tensor_inputs, kwargs, ...])</p></td>
 <td><p>Unlike in regular ModelInputs, for LLMInputs we expect either input_ids or input_embeds to be set (but typically not both), and we require input_seq_len to be set (for cache planning).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ARNodeSubmodule" title="mstar.model.submodule_base.ARNodeSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a>([prefill_token_buckets])</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.ARNodeSubmodule" title="mstar.model.submodule_base.ARNodeSubmodule"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.BatchedModelOutput" title="mstar.model.submodule_base.BatchedModelOutput"><code class="xref py py-obj docutils literal notranslate"><span class="pre">BatchedModelOutput</span></code></a>([per_rid_outputs, ...])</p></td>
@@ -1103,18 +1102,8 @@ dedicated fields.</p>
 
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">ARNodeSubmodule</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">prefill_token_buckets</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">ARNodeSubmodule</span></span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.model.submodule_base.NodeSubmodule" title="mstar.model.submodule_base.NodeSubmodule"><code class="xref py py-class docutils literal notranslate"><span class="pre">NodeSubmodule</span></code></a></p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>prefill_token_buckets</strong> (<em>Sequence</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p>
-</dd>
-</dl>
-<dl class="py attribute">
-<dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.PREFILL_TOKEN_BUCKETS">
-<span class="sig-name descname"><span class="pre">PREFILL_TOKEN_BUCKETS</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.PREFILL_TOKEN_BUCKETS" title="Link to this definition">#</a></dt>
-<dd></dd></dl>
-
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.ARNodeSubmodule.check_stop">
 <span class="sig-name descname"><span class="pre">check_stop</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_info</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">outputs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#ARNodeSubmodule.check_stop"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop" title="Link to this definition">#</a></dt>
@@ -1589,6 +1578,14 @@ Disjoint from <code class="docutils literal notranslate"><span class="pre">accum
 whole prefill needs, so a part-done row cannot wedge on a full arena.
 Counted in tokens, so a walk whose KV grows by something else sets False
 and reserves per chunk.</p>
+<p><code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code>: a combined walk’s step may pass it beside a
+speculation chain’s rows, since a prompt they leave less than
+<code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code> still runs that many. The engine bounds such a step
+assuming each chain row is a one-token decode row
+(<code class="docutils literal notranslate"><span class="pre">ChunkingManagement.max_step_tokens</span></code>) and trims a serving config’s
+<code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> to that bound. A walk whose decode rows run more
+(an MTP verify row’s k+1) passes it, and its steps past a trimmed ladder’s
+top run eagerly.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -2227,6 +2224,11 @@ call.</p>
 </dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.compiled_entries_per_shape">
+<span class="sig-name descname"><span class="pre">compiled_entries_per_shape</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">1</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.compiled_entries_per_shape" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.cudnn_allow_tf32">
 <span class="sig-name descname"><span class="pre">cudnn_allow_tf32</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.cudnn_allow_tf32" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -2306,19 +2308,6 @@ speculation read the step’s rows instead. Empty by default;
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.disable_torch_compile">
 <span class="sig-name descname"><span class="pre">disable_torch_compile</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
-
-<dl class="py method">
-<dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit">
-<span class="sig-name descname"><span class="pre">dynamo_recompile_limit</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.dynamo_recompile_limit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit" title="Link to this definition">#</a></dt>
-<dd><p>Entries dynamo may keep per code object of this submodule’s compiled forwards, when
-its captures need more than the engine’s <code class="docutils literal notranslate"><span class="pre">MSTAR_RECOMPILE_LIMIT</span></code>. The engine applies
-it around this submodule’s compiled calls only. None keeps the engine’s.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a> | None</p>
-</dd>
-</dl>
-</dd></dl>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.NodeSubmodule.filter_batched_output">
@@ -3409,7 +3398,6 @@ refuses for want of a plan (<code class="docutils literal notranslate"><span cla
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.PREFILL_TOKEN_BUCKETS"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.PREFILL_TOKEN_BUCKETS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.check_stop()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.ARNodeSubmodule.cuts_tensor_inputs"><code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule.cuts_tensor_inputs</span></code></a></li>
@@ -3526,12 +3514,12 @@ refuses for want of a plan (<code class="docutils literal notranslate"><span cla
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.check_stop_batched"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.check_stop_batched()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cleanup_request"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cleanup_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.compile_regions"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.compile_regions()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.compiled_entries_per_shape"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.compiled_entries_per_shape</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.cudnn_allow_tf32"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.cudnn_allow_tf32</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.declare_step"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.declare_step()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.device_loopback_signals"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.device_loopback_signals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_autocast"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_autocast</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.disable_torch_compile"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.disable_torch_compile</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.dynamo_recompile_limit"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.dynamo_recompile_limit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.filter_batched_output"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.filter_batched_output()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.float32_matmul_precision"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.float32_matmul_precision</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.NodeSubmodule.forward"><code class="docutils literal notranslate"><span class="pre">NodeSubmodule.forward()</span></code></a></li>

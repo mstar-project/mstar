@@ -1008,7 +1008,9 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.engine.accelerator_graph_config</h1><div class="highlight"><pre>
-<span></span><span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+<span></span><span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Callable</span>
@@ -1017,6 +1019,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionStep</span><span class="p">,</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">SubmoduleStep</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">ModelInputsFromEngine</span><span class="p">,</span> <span class="n">NodeInputs</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">capture_ladder</span>
+
+<span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
 <span class="c1"># A compile mode of the engine's own rather than torch.compile's: Inductor's</span>
 <span class="c1"># defaults in its deterministic mode, which picks each kernel's config by rule</span>
@@ -1024,6 +1029,9 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># same kernels and one input gives one output from any server. See</span>
 <span class="c1"># ``accelerator_graph_runner.compile_kwargs``.</span>
 <span class="n">DETERMINISTIC_COMPILE_MODE</span> <span class="o">=</span> <span class="s2">"deterministic"</span>
+
+<span class="c1"># The batch sizes a capture takes when its config names none.</span>
+<span class="n">DEFAULT_CAPTURE_BATCH_SIZES</span> <span class="o">=</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">]</span>
 
 
 <div class="viewcode-block" id="check_compile_mode">
@@ -1238,7 +1246,10 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
         <span class="n">capture_graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-        <span class="n">capture_token_lengths</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span>
+        <span class="c1"># a ladder, or ``{min batch size: ladder}``: a batch size takes the</span>
+        <span class="c1"># ladder of the largest key at or below it, and none if every key is above</span>
+        <span class="c1"># (a plain ladder is kept as ``{1: ladder}``)</span>
+        <span class="n">capture_token_lengths</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
         <span class="c1"># seq len -&gt; NodeInputs</span>
         <span class="n">make_node_input</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">int</span><span class="p">],</span> <span class="n">NodeInputs</span><span class="p">],</span>
         <span class="n">replay_graph_walks</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
@@ -1273,7 +1284,7 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="n">total_tokens_multiplier</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"total_tokens_multiplier must be at least 1"</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">make_node_input</span> <span class="o">=</span> <span class="n">make_node_input</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span> <span class="o">=</span> <span class="n">capture_token_lengths</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span> <span class="o">=</span> <span class="n">ladders_by_batch_size</span><span class="p">(</span><span class="n">capture_token_lengths</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="o">=</span> <span class="n">total_tokens_multiplier</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">token_layout</span> <span class="o">=</span> <span class="n">token_layout</span> <span class="ow">or</span> <span class="n">distribute_tokens</span>
 
@@ -1286,12 +1297,10 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="PackedAcceleratorGraphConfig.get_total_tokens">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.PackedAcceleratorGraphConfig.get_total_tokens">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_total_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bs</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+        <span class="n">ladder</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(((</span><span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">)</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="o">&lt;=</span> <span class="n">bs</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="p">[]))[</span><span class="mi">1</span><span class="p">]</span>
         <span class="c1"># every real row carries a token, so a bucket with fewer tokens than</span>
         <span class="c1"># rows could never serve a step; capturing it would give rows of none</span>
-        <span class="k">return</span> <span class="p">[</span>
-            <span class="n">n</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">capture_token_lengths</span>
-            <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="n">bs</span>
-        <span class="p">]</span></div>
+        <span class="k">return</span> <span class="p">[</span><span class="n">n</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">total_tokens_multiplier</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">ladder</span> <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="n">bs</span><span class="p">]</span></div>
 
 
 <div class="viewcode-block" id="PackedAcceleratorGraphConfig.get_node_inputs">
@@ -1303,6 +1312,173 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">make_node_input</span><span class="p">(</span><span class="n">n</span><span class="p">)</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">seq_lens</span>
         <span class="p">]</span></div>
 </div>
+
+
+
+<div class="viewcode-block" id="ladders_by_batch_size">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.ladders_by_batch_size">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">ladders_by_batch_size</span><span class="p">(</span><span class="n">ladder</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""A ``capture_token_lengths`` or ``prefill_token_buckets`` value as</span>
+<span class="sd">    ``{min batch size: ladder}``: a plain ladder serves every batch size."""</span>
+    <span class="k">return</span> <span class="nb">dict</span><span class="p">(</span><span class="n">ladder</span><span class="p">)</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">ladder</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">)</span> <span class="k">else</span> <span class="p">{</span><span class="mi">1</span><span class="p">:</span> <span class="n">ladder</span><span class="p">}</span></div>
+
+
+
+<div class="viewcode-block" id="check_token_ladder">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.check_token_ladder">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_token_ladder</span><span class="p">(</span><span class="n">where</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">ladder</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Refuse a ``prefill_token_buckets`` value that is not a ladder (a</span>
+<span class="sd">    non-empty list of distinct positive ints) or ``{min batch size: ladder}``</span>
+<span class="sd">    whose top rungs rise with the batch size: a capture's static buffers are</span>
+<span class="sd">    sized by its first, largest-batch bucket, so a smaller batch's ladder must</span>
+<span class="sd">    not reach past it."""</span>
+    <span class="n">by_bs</span> <span class="o">=</span> <span class="n">ladders_by_batch_size</span><span class="p">(</span><span class="n">ladder</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">by_bs</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">all</span><span class="p">(</span><span class="nb">isinstance</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">k</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">and</span> <span class="n">k</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">by_bs</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"prefill_token_buckets for </span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2"> maps a min batch size (a positive int) to a "</span>
+            <span class="sa">f</span><span class="s2">"ladder, got </span><span class="si">{</span><span class="n">ladder</span><span class="si">!r}</span><span class="s2">"</span>
+        <span class="p">)</span>
+    <span class="n">tops</span> <span class="o">=</span> <span class="p">[</span><span class="nb">max</span><span class="p">(</span><span class="n">capture_ladder</span><span class="p">(</span><span class="sa">f</span><span class="s2">"prefill_token_buckets for </span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span> <span class="n">by_bs</span><span class="p">[</span><span class="n">k</span><span class="p">]))</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">by_bs</span><span class="p">)]</span>
+    <span class="k">if</span> <span class="n">tops</span> <span class="o">!=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">tops</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"prefill_token_buckets for </span><span class="si">{</span><span class="n">where</span><span class="si">}</span><span class="s2">: a larger batch size's ladder must reach at least as "</span>
+            <span class="sa">f</span><span class="s2">"far as a smaller one's, got </span><span class="si">{</span><span class="n">ladder</span><span class="si">!r}</span><span class="s2">"</span>
+        <span class="p">)</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_trim</span><span class="p">(</span><span class="n">ladder</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">],</span> <span class="n">tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">at_least</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""``ladder`` up to its first rung that holds ``tokens`` and ``at_least``."""</span>
+    <span class="n">rungs</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">ladder</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">tokens</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">rungs</span>
+    <span class="n">bound</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">tokens</span><span class="p">,</span> <span class="n">at_least</span><span class="p">)</span>
+    <span class="n">held</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">rungs</span><span class="p">)</span> <span class="k">if</span> <span class="n">n</span> <span class="o">&gt;=</span> <span class="n">bound</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">rungs</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">rungs</span><span class="p">[:</span><span class="n">held</span> <span class="o">+</span> <span class="mi">1</span><span class="p">]</span>
+
+
+<div class="viewcode-block" id="apply_token_ladders">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.apply_token_ladders">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">apply_token_ladders</span><span class="p">(</span>
+    <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">configs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">AcceleratorGraphConfig</span><span class="p">],</span> <span class="n">ladders</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">],</span>
+    <span class="n">step_tokens</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">],</span>
+    <span class="n">batch_sizes</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">AcceleratorGraphConfig</span><span class="p">],</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Take a serving config's ``prefill_token_buckets`` for ``node`` (capture</span>
+<span class="sd">    walk -&gt; ladder or ``{min batch size: ladder}``, which `EngineManager`</span>
+<span class="sd">    checked) as the ``capture_token_lengths`` of the node's packed captures of</span>
+<span class="sd">    that walk.</span>
+
+<span class="sd">    A ladder runs to the first rung that holds the most tokens the scheduler</span>
+<span class="sd">    gives a step its capture replays (``step_tokens`` of each replay walk and</span>
+<span class="sd">    the capture's widest batch, of the ``batch_sizes`` the runner captures it</span>
+<span class="sd">    at: its token budget, or a little past it beside</span>
+<span class="sd">    decode rows; none where any walk's steps have no bound): a rung beyond</span>
+<span class="sd">    would never replay. A larger batch size's ladder also runs at least as far</span>
+<span class="sd">    as a smaller one's, which share its static buffers.</span>
+
+<span class="sd">    A walk whose steps only replay another walk's capture is refused, naming</span>
+<span class="sd">    that walk, as is one the node captures by batch size alone. A walk the</span>
+<span class="sd">    node captures nothing for here, as a model that turns</span>
+<span class="sd">    its captures off at runtime does, is logged and skipped: its steps run</span>
+<span class="sd">    eagerly whatever the ladder.</span>
+<span class="sd">    """</span>
+    <span class="n">packed</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">configs</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">PackedAcceleratorGraphConfig</span><span class="p">)]</span>
+    <span class="k">for</span> <span class="n">walk</span><span class="p">,</span> <span class="n">ladder</span> <span class="ow">in</span> <span class="n">ladders</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">targets</span> <span class="o">=</span> <span class="p">[</span><span class="n">c</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">packed</span> <span class="k">if</span> <span class="n">c</span><span class="o">.</span><span class="n">capture_graph_walk</span> <span class="o">==</span> <span class="n">walk</span><span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">targets</span><span class="p">:</span>
+            <span class="n">replayed_on</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">({</span><span class="n">c</span><span class="o">.</span><span class="n">capture_graph_walk</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">packed</span> <span class="k">if</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">c</span><span class="o">.</span><span class="n">replay_graph_walks</span><span class="p">})</span>
+            <span class="k">if</span> <span class="n">replayed_on</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"prefill_token_buckets names walk </span><span class="si">{</span><span class="n">walk</span><span class="si">!r}</span><span class="s2"> of </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">, whose steps replay the "</span>
+                    <span class="sa">f</span><span class="s2">"captures of </span><span class="si">{</span><span class="n">replayed_on</span><span class="si">}</span><span class="s2">; name that walk"</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">walk</span> <span class="o">==</span> <span class="n">c</span><span class="o">.</span><span class="n">capture_graph_walk</span> <span class="ow">or</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">c</span><span class="o">.</span><span class="n">replay_graph_walks</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">configs</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"prefill_token_buckets names walk </span><span class="si">{</span><span class="n">walk</span><span class="si">!r}</span><span class="s2"> of </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">, whose capture captures by "</span>
+                    <span class="s2">"batch size, not tokens"</span>
+                <span class="p">)</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"</span><span class="si">%s</span><span class="s2">: no packed capture of walk </span><span class="si">%r</span><span class="s2"> at this deployment, so prefill_token_buckets "</span>
+                <span class="s2">"for it does nothing"</span><span class="p">,</span> <span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">,</span>
+            <span class="p">)</span>
+            <span class="k">continue</span>
+        <span class="k">for</span> <span class="n">config</span> <span class="ow">in</span> <span class="n">targets</span><span class="p">:</span>
+            <span class="n">rows</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">batch_sizes</span><span class="p">(</span><span class="n">config</span><span class="p">))</span>
+            <span class="n">bounds</span> <span class="o">=</span> <span class="p">[</span><span class="n">step_tokens</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="n">rows</span><span class="p">)</span> <span class="k">for</span> <span class="n">w</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">replay_graph_walks</span><span class="p">]</span>
+            <span class="n">bound</span> <span class="o">=</span> <span class="kc">None</span> <span class="k">if</span> <span class="kc">None</span> <span class="ow">in</span> <span class="n">bounds</span> <span class="k">else</span> <span class="nb">max</span><span class="p">(</span><span class="n">bounds</span><span class="p">)</span>
+            <span class="n">trimmed</span><span class="p">,</span> <span class="n">top</span><span class="p">,</span> <span class="n">dropped</span> <span class="o">=</span> <span class="p">{},</span> <span class="mi">0</span><span class="p">,</span> <span class="p">[]</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">rungs</span> <span class="ow">in</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">ladders_by_batch_size</span><span class="p">(</span><span class="n">ladder</span><span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">()):</span>
+                <span class="n">trimmed</span><span class="p">[</span><span class="n">k</span><span class="p">]</span> <span class="o">=</span> <span class="n">_trim</span><span class="p">(</span><span class="n">rungs</span><span class="p">,</span> <span class="n">bound</span><span class="p">,</span> <span class="n">top</span><span class="p">)</span>
+                <span class="n">top</span> <span class="o">=</span> <span class="n">trimmed</span><span class="p">[</span><span class="n">k</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+                <span class="n">dropped</span> <span class="o">+=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">rungs</span><span class="p">)</span> <span class="o">-</span> <span class="nb">set</span><span class="p">(</span><span class="n">trimmed</span><span class="p">[</span><span class="n">k</span><span class="p">]))</span>
+            <span class="k">if</span> <span class="n">dropped</span><span class="p">:</span>
+                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                    <span class="s2">"</span><span class="si">%s</span><span class="s2">/</span><span class="si">%s</span><span class="s2">: drops prefill_token_buckets </span><span class="si">%s</span><span class="s2">, past the first that holds the "</span>
+                    <span class="s2">"</span><span class="si">%d</span><span class="s2"> tokens its steps run at most"</span><span class="p">,</span> <span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">,</span> <span class="n">dropped</span><span class="p">,</span> <span class="n">bound</span><span class="p">,</span>
+                <span class="p">)</span>
+            <span class="n">config</span><span class="o">.</span><span class="n">capture_token_lengths</span> <span class="o">=</span> <span class="n">trimmed</span></div>
+
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_overrides</span><span class="p">(</span><span class="bp">cls</span><span class="p">:</span> <span class="nb">type</span><span class="p">,</span> <span class="n">hook</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Whether a submodule class declares its own ``hook``, which the base leaves empty."""</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.submodule_base</span><span class="w"> </span><span class="kn">import</span> <span class="n">NodeSubmodule</span>
+
+    <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">hook</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">NodeSubmodule</span><span class="p">,</span> <span class="n">hook</span><span class="p">)</span>
+
+
+<div class="viewcode-block" id="apply_region_ladders">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.accelerator_graph_config.html#mstar.engine.accelerator_graph_config.apply_region_ladders">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">apply_region_ladders</span><span class="p">(</span>
+    <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">configs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"PiecewiseAcceleratorGraphConfig"</span><span class="p">],</span>
+    <span class="n">ladders</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]],</span> <span class="n">walk_ladders</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">],</span> <span class="n">submodule_cls</span><span class="p">:</span> <span class="nb">type</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Take a serving config's ``prefill_token_buckets`` for ``node`` that name</span>
+<span class="sd">    no walk of it (`EngineManager` split them off) as the ``total_tokens`` of</span>
+<span class="sd">    its piecewise packed regions, by label.</span>
+
+<span class="sd">    A name that is neither a walk nor a region of the node is refused, as is a</span>
+<span class="sd">    region the config also names as a walk, or one captured by batch size</span>
+<span class="sd">    alone. A node whose ``submodule_cls`` declares regions (overrides</span>
+<span class="sd">    `NodeSubmodule.get_piecewise_accelerator_graph_configs`) but returned none</span>
+<span class="sd">    at this deployment logs and skips. The node's ``walk_ladders`` are refused</span>
+<span class="sd">    here, naming its regions, where its class captures no walk at all (doesn't</span>
+<span class="sd">    override `NodeSubmodule.get_accelerator_graph_configs`);</span>
+<span class="sd">    `apply_token_ladders` takes them otherwise.</span>
+<span class="sd">    """</span>
+    <span class="k">if</span> <span class="n">walk_ladders</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">_overrides</span><span class="p">(</span><span class="n">submodule_cls</span><span class="p">,</span> <span class="s2">"get_accelerator_graph_configs"</span><span class="p">):</span>
+        <span class="n">regions</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">"; its piecewise regions are </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">configs</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span> <span class="k">if</span> <span class="n">configs</span> <span class="k">else</span> <span class="s2">""</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"prefill_token_buckets names walks </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">walk_ladders</span><span class="p">)</span><span class="si">}</span><span class="s2"> of </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">, which captures no "</span>
+            <span class="sa">f</span><span class="s2">"walk</span><span class="si">{</span><span class="n">regions</span><span class="si">}</span><span class="s2">"</span>
+        <span class="p">)</span>
+    <span class="n">both</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">configs</span><span class="p">)</span> <span class="o">&amp;</span> <span class="nb">set</span><span class="p">(</span><span class="n">walk_ladders</span><span class="p">))</span>
+    <span class="k">if</span> <span class="n">both</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"prefill_token_buckets names </span><span class="si">{</span><span class="n">both</span><span class="si">}</span><span class="s2"> for </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">, each both a walk and a piecewise "</span>
+            <span class="s2">"region of it"</span>
+        <span class="p">)</span>
+    <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">ladder</span> <span class="ow">in</span> <span class="n">ladders</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">config</span> <span class="o">=</span> <span class="n">configs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">label</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">config</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">configs</span> <span class="ow">and</span> <span class="n">_overrides</span><span class="p">(</span><span class="n">submodule_cls</span><span class="p">,</span> <span class="s2">"get_piecewise_accelerator_graph_configs"</span><span class="p">):</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">"</span><span class="si">%s</span><span class="s2">: no piecewise region at this deployment, so prefill_token_buckets for </span><span class="si">%r</span><span class="s2"> "</span>
+                <span class="s2">"does nothing"</span><span class="p">,</span> <span class="n">node</span><span class="p">,</span> <span class="n">label</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">elif</span> <span class="n">config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"prefill_token_buckets names </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2"> for </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">, neither one of its walks nor "</span>
+                <span class="sa">f</span><span class="s2">"one of its piecewise regions </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">configs</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span>
+            <span class="p">)</span>
+        <span class="k">elif</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="n">PiecewisePackedConfig</span><span class="p">):</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">"prefill_token_buckets names piecewise region </span><span class="si">{</span><span class="n">label</span><span class="si">!r}</span><span class="s2"> of </span><span class="si">{</span><span class="n">node</span><span class="si">}</span><span class="s2">, which "</span>
+                <span class="s2">"captures by batch size, not tokens"</span>
+            <span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">config</span><span class="o">.</span><span class="n">total_tokens</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">ladder</span><span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="PiecewiseConfigType">
@@ -1521,7 +1697,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    requests for the capture-time plan; real per-request lengths arrive at</span>
 <span class="sd">    replay.</span>
 <span class="sd">    """</span>
-    <span class="n">total_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>  <span class="c1"># token-count buckets to capture</span>
+    <span class="c1"># The token-count buckets to capture. Before capture the engine replaces</span>
+    <span class="c1"># it, on this same config object, with the serving config's</span>
+    <span class="c1"># ``prefill_token_buckets`` for the region's label where one is named</span>
+    <span class="c1"># (`apply_region_ladders`), so a submodule that keeps the config it</span>
+    <span class="c1"># returned may read back the ladder its region was captured on.</span>
+    <span class="n">total_tokens</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span>
     <span class="c1"># The attention resource of a region whose rows each attend within</span>
     <span class="c1"># themselves. Set with `declare_step` left None, the region declares one</span>
     <span class="c1"># non-causal "main" segment per row on it; a `one_row_per_step` region's</span>

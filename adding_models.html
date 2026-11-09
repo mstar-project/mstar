@@ -2231,10 +2231,11 @@ configs (see <a class="reference internal" href="#step-5"><span class="std std-r
 class attribute <code class="docutils literal notranslate"><span class="pre">disable_torch_compile</span> <span class="pre">=</span> <span class="pre">True</span></code>. An encoder whose output feeds a
 prefix cache layout walk compiles with dynamic shapes instead. One that marks every
 dimension that varies with <code class="docutils literal notranslate"><span class="pre">torch._dynamo.mark_dynamic</span></code> in <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> sets
-<code class="docutils literal notranslate"><span class="pre">marks_dynamic_dims</span> <span class="pre">=</span> <span class="pre">True</span></code> and compiles as any other submodule. A submodule whose
-captures keep more compiled entries per frame than <code class="docutils literal notranslate"><span class="pre">MSTAR_RECOMPILE_LIMIT</span></code> allows
-returns the number from <code class="docutils literal notranslate"><span class="pre">dynamo_recompile_limit()</span></code>; the engine raises the limit
-around that submodule’s compiled calls only. Keep the compiled
+<code class="docutils literal notranslate"><span class="pre">marks_dynamic_dims</span> <span class="pre">=</span> <span class="pre">True</span></code> and compiles as any other submodule. The engine raises
+the recompile limit around a node’s compiled calls, past <code class="docutils literal notranslate"><span class="pre">MSTAR_RECOMPILE_LIMIT</span></code>, to
+hold an entry per bucket its compiled captures take (each batch size and token count);
+a submodule whose frames keep several entries per bucket (GLM-5.2’s decoder layers are
+traced once per layer kind) declares how many as <code class="docutils literal notranslate"><span class="pre">compiled_entries_per_shape</span></code>. Keep the compiled
 paths compile-friendly. If a helper must not be traced, because it uses
 data-dependent Python control flow or forces a host synchronization, exclude it
 explicitly with <code class="docutils literal notranslate"><span class="pre">&#64;torch.compiler.disable</span></code>. A submodule that disables the
@@ -2378,7 +2379,11 @@ the graph build reads it: <code class="docutils literal notranslate"><span class
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">chunkable=True</span></code> lets the walk’s rows be cut.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">max_batch_tokens</span></code>: the most tokens a step runs. A combined walk that carries
-chunked rows sets one too, since its steps run under it.</p></li>
+chunked rows sets one too, since its steps run under it. Its step may pass it
+beside a speculation chain’s decode rows, by at most those rows’ tokens, and the
+engine trims a serving config’s <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> assuming each such row
+runs one token. A walk whose decode rows run more (an MTP verify row’s k+1)
+passes that bound, and its steps past a trimmed ladder’s top run eagerly.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">accumulated_outputs</span></code>: output edges a consumer needs every chunk of. They arrive as
 one item per chunk, all when the prompt finishes.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">per_chunk_outputs</span></code>: streaming edges sent on every chunk as it runs, for a consumer
@@ -2869,11 +2874,11 @@ per-label span.</p>
     <span class="p">]</span>
 </pre></div>
 </div>
-<p>An <code class="docutils literal notranslate"><span class="pre">ARNodeSubmodule</span></code> takes a <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> constructor argument, which
-replaces its class’s <code class="docutils literal notranslate"><span class="pre">PREFILL_TOKEN_BUCKETS</span></code> for that instance: a model passes a
-deployment’s <code class="docutils literal notranslate"><span class="pre">model_kwargs.prefill_token_buckets</span></code> through to it (Qwen3.5, Muse
-Glimmer, Qwen3-Omni and GLM-5.2 do). It must be a non-empty list of distinct positive
-token counts, or the submodule raises <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> when it is built.</p>
+<p>A deployment replaces a packed capture’s <code class="docutils literal notranslate"><span class="pre">capture_token_lengths</span></code> with the serving
+config’s <code class="docutils literal notranslate"><span class="pre">prefill_token_buckets</span></code> (node -&gt; capture walk -&gt; ladder, see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>).
+The engine applies it to the configs <code class="docutils literal notranslate"><span class="pre">get_accelerator_graph_configs</span></code> returns, so a
+model plumbs nothing. A <code class="docutils literal notranslate"><span class="pre">PiecewisePackedConfig</span></code> region’s <code class="docutils literal notranslate"><span class="pre">total_tokens</span></code> takes the
+ladder its label names the same way.</p>
 <p>BAGEL shows the case of two captures for one walk. It captures <code class="docutils literal notranslate"><span class="pre">decode</span></code> twice, once with
 <code class="docutils literal notranslate"><span class="pre">additional_key_info=False</span></code> and once with <code class="docutils literal notranslate"><span class="pre">additional_key_info=True</span></code>. A decode step
 with guidance enabled and a decode step with guidance disabled declare different segments
@@ -3827,8 +3832,7 @@ submodule cache and where the files come from. A model sets <code class="docutil
 <code class="docutils literal notranslate"><span class="pre">METADATA_FILES</span></code> and writes <code class="docutils literal notranslate"><span class="pre">__init__</span></code> (setting
 <code class="docutils literal notranslate"><span class="pre">config</span></code>, <code class="docutils literal notranslate"><span class="pre">tokenizer</span></code> and <code class="docutils literal notranslate"><span class="pre">media</span></code>), its resources (the sampler from
 <code class="docutils literal notranslate"><span class="pre">_sampler_spec</span></code>; <code class="docutils literal notranslate"><span class="pre">MIXED_SPLIT</span></code> is the attention resources’ split of a mixed step),
-<code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">_create_submodule</span></code>, which hands the LLM node
-<code class="docutils literal notranslate"><span class="pre">self.prefill_token_buckets</span></code> (<code class="docutils literal notranslate"><span class="pre">model_kwargs.prefill_token_buckets</span></code>). The scaffold’s
+<code class="docutils literal notranslate"><span class="pre">_prompt_ids</span></code> and <code class="docutils literal notranslate"><span class="pre">_create_submodule</span></code>. The scaffold’s
 <code class="docutils literal notranslate"><span class="pre">rebuild_policies</span></code> lets the KV cache drop a text request and reprefill its ids on
 <code class="docutils literal notranslate"><span class="pre">prefill_text</span></code>. A model whose LLM node holds a resource that can’t drop returns <code class="docutils literal notranslate"><span class="pre">{}</span></code>,
 or the engine refuses to start; Muse Glimmer returns <code class="docutils literal notranslate"><span class="pre">{}</span></code> until a drop has run through

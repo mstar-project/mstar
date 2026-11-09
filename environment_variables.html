@@ -986,58 +986,53 @@ deployment option <code class="docutils literal notranslate"><span class="pre">m
 BAGEL defaults this option to true (see <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>).
 Off by default: capture costs one graph per (batch size, token bucket)
 and the eager flash-attn path is already fast. The win is removing
-per-layer launch overhead on small images.</p></td>
+per-layer launch overhead on small images. The serving config’s
+<code class="docutils literal notranslate"><span class="pre">prefill_token_buckets:</span> <span class="pre">{vit_encoder:</span> <span class="pre">{vit_block_loop:</span> <span class="pre">[...]}}</span></code> sets
+the token buckets (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>).</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">512,1024,2048,4096,4900</span></code></p></td>
-<td><p>Comma-separated token-count buckets to capture, when
-<code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_ACCELERATOR_GRAPH=1</span></code>. A batch longer than the largest bucket runs
-eagerly. <code class="docutils literal notranslate"><span class="pre">4900</span></code> is <code class="docutils literal notranslate"><span class="pre">70*70</span></code>, the exact length the <code class="docutils literal notranslate"><span class="pre">vllm</span></code>
-preprocess option emits.</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">1,2,4</span></code></p></td>
 <td><p>Comma-separated batch sizes to capture. Read only when
 <code class="docutils literal notranslate"><span class="pre">MSTAR_VIT_BATCHING=1</span></code>; otherwise only batch size 1 is captured.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">COSMOS3_DISABLE_ACCELERATOR_GRAPH</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">COSMOS3_DISABLE_ACCELERATOR_GRAPH</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>Cosmos3: any nonempty value disables denoise, prefill and reasoner
 decode capture. The deployment option
 <code class="docutils literal notranslate"><span class="pre">model_kwargs.accelerator_graph:</span> <span class="pre">false</span></code> also disables all these
 captures and cannot be overridden by this variable.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>Cosmos3: any nonempty value disables only the understanding-tower
 prefill capture. Denoise and reasoner decode captures remain eligible
 when <code class="docutils literal notranslate"><span class="pre">model_kwargs.accelerator_graph</span></code> is true.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_OMNIVOICE_MODEL_PATH</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_OMNIVOICE_MODEL_PATH</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>OmniVoice: load weights from this local directory instead of the
 checkpoint the registry names. For serving a fine-tune of the same
 architecture off a mounted volume, where the registry entry would
 otherwise pull the public weights from the Hub.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ASR_DATA</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ASR_DATA</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">data/asr</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">test/asr</span></code> (GPU parity tests): the set <code class="docutils literal notranslate"><span class="pre">benchmark.asr_data</span></code> built.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WHISPER_REPO</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_WHISPER_REPO</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">openai/whisper-large-v3-turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">test/asr/test_whisper_parity.py</span></code>: the Whisper checkpoint to compare.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REPO</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REPO</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-ASR-1.7B</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">test/asr/test_qwen3_asr_parity.py</span></code>: the Qwen3-ASR checkpoint to compare.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REF</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REF</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">refs/Qwen3-ASR</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">test/asr/test_qwen3_asr_parity.py</span></code>: a checkout of the qwen-asr SDK,
 the reference transcripts come from.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REF_SITE</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_QWEN_ASR_REF_SITE</span></code></p></td>
 <td><p>unset</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">test/asr/test_qwen3_asr_parity.py</span></code>: a directory holding transformers
 4.57, put first on the path of the subprocess that runs the SDK (whose

@@ -1142,17 +1142,6 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># runs the same layer loop eagerly.</span>
     <span class="n">backbone_graphs</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">backbone_capture_batch_sizes</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">])</span>
-    <span class="c1"># Packed tokens per step (both CFG documents of every request); a step</span>
-    <span class="c1"># above the largest bucket runs eagerly. Eager steps stay launch-bound well</span>
-    <span class="c1"># past 4096 tokens: at 16 requests (~5-9k tokens) the eager layer loop took</span>
-    <span class="c1"># ~12 ms of host time for ~10 ms of GPU work on an H100. 8192 covers 16</span>
-    <span class="c1"># requests of up to ~10 s of speech each.</span>
-    <span class="n">backbone_token_buckets</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span>
-        <span class="n">default_factory</span><span class="o">=</span><span class="k">lambda</span><span class="p">:</span> <span class="p">[</span>
-            <span class="mi">256</span><span class="p">,</span> <span class="mi">512</span><span class="p">,</span> <span class="mi">768</span><span class="p">,</span> <span class="mi">1024</span><span class="p">,</span> <span class="mi">1536</span><span class="p">,</span> <span class="mi">2048</span><span class="p">,</span> <span class="mi">2560</span><span class="p">,</span> <span class="mi">3072</span><span class="p">,</span> <span class="mi">3584</span><span class="p">,</span> <span class="mi">4096</span><span class="p">,</span>
-            <span class="mi">4608</span><span class="p">,</span> <span class="mi">5120</span><span class="p">,</span> <span class="mi">5632</span><span class="p">,</span> <span class="mi">6144</span><span class="p">,</span> <span class="mi">6656</span><span class="p">,</span> <span class="mi">7168</span><span class="p">,</span> <span class="mi">7680</span><span class="p">,</span> <span class="mi">8192</span><span class="p">,</span>
-        <span class="p">]</span>
-    <span class="p">)</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">audio_embedding_rows</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>

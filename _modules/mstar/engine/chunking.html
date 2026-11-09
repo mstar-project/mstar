@@ -1130,6 +1130,43 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">budget</span></div>
 
 
+<div class="viewcode-block" id="ChunkingManagement.max_step_tokens">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.chunking.html#mstar.engine.chunking.ChunkingManagement.max_step_tokens">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">max_step_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">max_rows</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The most tokens the scheduler gives a step of ``graph_walk`` of at</span>
+<span class="sd">        most ``max_rows`` rows, None where it runs under no budget.</span>
+
+<span class="sd">        That is the budget it was scheduled under: that of the combined walk</span>
+<span class="sd">        it runs in, if any (a combined batch whose rows share one real walk</span>
+<span class="sd">        runs relabelled to it, `ScheduledBatch.relabel_if_uniform`, and still</span>
+<span class="sd">        ran under the combined walk's budget). For a combined walk's step, or</span>
+<span class="sd">        more, by what a speculation chain's rows, one-token decode rows, take</span>
+<span class="sd">        of ``min_chunk_tokens``. A real walk's step carries no chain rows of</span>
+<span class="sd">        its own node: decode rows beside a prompt make the step the combined</span>
+<span class="sd">        walk's (`MicroScheduler.label_for`), and a same-node chain on a prompt</span>
+<span class="sd">        walk continues no row, its rows mid-prefill being the step's own.</span>
+
+<span class="sd">        None too where the step may hold a prompt of a walk whose chunking</span>
+<span class="sd">        the serving config turned off: it runs whole, however long."""</span>
+        <span class="n">members</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">walk</span> <span class="k">for</span> <span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">),</span> <span class="n">combined</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_combined_walk_of</span><span class="o">.</span><span class="n">items</span><span class="p">()</span>
+            <span class="k">if</span> <span class="n">node</span> <span class="o">==</span> <span class="n">node_name</span> <span class="ow">and</span> <span class="n">combined</span> <span class="o">==</span> <span class="n">graph_walk</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="nb">any</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">policy</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span><span class="o">.</span><span class="n">chunkable</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunkable</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">walk</span> <span class="ow">in</span> <span class="n">members</span> <span class="ow">or</span> <span class="p">[</span><span class="n">graph_walk</span><span class="p">]</span>
+        <span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="n">walk</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_combined_walk_of</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="n">node_name</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">),</span> <span class="n">graph_walk</span><span class="p">)</span>
+        <span class="n">budget</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_tokens</span><span class="p">(</span><span class="n">node_name</span><span class="p">,</span> <span class="n">walk</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">budget</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">members</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">budget</span>
+        <span class="c1"># the chain's rows come off the budget first (`MicroScheduler._build_step`),</span>
+        <span class="c1"># and `batch_builder._run_head` still runs a prompt `min_chunk_tokens` where</span>
+        <span class="c1"># they leave it less</span>
+        <span class="k">return</span> <span class="nb">max</span><span class="p">(</span><span class="n">budget</span><span class="p">,</span> <span class="n">max_rows</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">min_chunk_tokens</span><span class="p">(</span><span class="n">budget</span><span class="p">))</span></div>
+
+
 <div class="viewcode-block" id="ChunkingManagement.set_budgets">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.chunking.html#mstar.engine.chunking.ChunkingManagement.set_budgets">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">set_budgets</span><span class="p">(</span>

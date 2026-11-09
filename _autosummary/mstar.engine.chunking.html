@@ -732,6 +732,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.cut_budgets"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.cut_budgets()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.forget_request"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.forget_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.max_batch_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.max_batch_tokens()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.max_step_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.max_step_tokens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.min_chunk_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.min_chunk_tokens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.policy"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.policy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.prepared"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.prepared</span></code></a></li>
@@ -916,6 +917,36 @@ worker chunks nothing on the node.</p>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.max_step_tokens">
+<span class="sig-name descname"><span class="pre">max_step_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_rows</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.max_step_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.max_step_tokens" title="Link to this definition">#</a></dt>
+<dd><p>The most tokens the scheduler gives a step of <code class="docutils literal notranslate"><span class="pre">graph_walk</span></code> of at
+most <code class="docutils literal notranslate"><span class="pre">max_rows</span></code> rows, None where it runs under no budget.</p>
+<p>That is the budget it was scheduled under: that of the combined walk
+it runs in, if any (a combined batch whose rows share one real walk
+runs relabelled to it, <cite>ScheduledBatch.relabel_if_uniform</cite>, and still
+ran under the combined walk’s budget). For a combined walk’s step, or
+more, by what a speculation chain’s rows, one-token decode rows, take
+of <code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code>. A real walk’s step carries no chain rows of
+its own node: decode rows beside a prompt make the step the combined
+walk’s (<cite>MicroScheduler.label_for</cite>), and a same-node chain on a prompt
+walk continues no row, its rows mid-prefill being the step’s own.</p>
+<p>None too where the step may hold a prompt of a walk whose chunking
+the serving config turned off: it runs whole, however long.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>max_rows</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -1125,6 +1156,7 @@ walks with a budget of their own. None otherwise.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.cut_budgets"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.cut_budgets()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.forget_request"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.forget_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.max_batch_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.max_batch_tokens()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.max_step_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.max_step_tokens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.min_chunk_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.min_chunk_tokens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.policy"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.policy()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.prepared"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.prepared</span></code></a></li>
