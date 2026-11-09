@@ -517,7 +517,9 @@ class StepPipeline:
         """Fail a side step's rows alone: the chain's rows in flight have nothing
         to do with it, so this doesn't go through ``_handle_error``."""
         self.executor.clear_in_flight(batch)
-        err = RequestError.from_exception(exc, f"Worker {self.worker_id} error in a side step", log=logger)
+        err = RequestError.from_exception(
+            exc, f"Worker {self.worker_id} error in a side step", log=logger, whole_step=True,
+        )
         self._fail_requests(dict.fromkeys(batch.request_to_worker_graph, err))
 
     def _launch_side(self) -> None:
@@ -707,7 +709,7 @@ class StepPipeline:
                 ) from exc
             err = RequestError.from_exception(
                 exc, f"Worker {self.worker_id} step {pending.node_name}/{pending.graph_walk} failed",
-                log=logger,
+                log=logger, whole_step=True,
             )
             traceback.clear_frames(exc.__traceback__)
             failed = pending.node_batch.failed_requests
@@ -799,7 +801,7 @@ class StepPipeline:
         # Report the leaf exception to the client and keep the full chain in
         # the log. A forward's own raise doesn't come here (``_step_result``).
         err = RequestError.from_exception(
-            exc, f"Worker {self.worker_id} error in main loop", log=logger,
+            exc, f"Worker {self.worker_id} error in main loop", log=logger, whole_step=True,
         )
 
         # the chain's rows: a side lane's step fails on its own (``_fail_side``)

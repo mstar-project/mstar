@@ -21,10 +21,12 @@ The neighbouring pieces are covered elsewhere:
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
 from api_server_helpers import StandInSocket, make_test_api_server
+from fastapi import HTTPException
 
 from mstar.api_server.entrypoint import PendingRequest
 from mstar.api_server.request_types import (
@@ -115,6 +117,23 @@ def _pending_batch(rids, future=None):
         node_batch=None, node_name="node",
         partition="default", graph_walk="walk", future=future,
     )
+
+
+@pytest.mark.parametrize("exc, status", [
+    (TypeError("not iterable"), 500),
+    (HTTPException(status_code=404, detail="gone"), 404),
+])
+def test_a_raised_step_does_not_blame_the_requests_in_it(exc, status):
+    """A ``TypeError`` out of a whole forward can't be pinned on a request, so
+    the rows of the batch report it as a server error, not as their own 400."""
+    w = _worker()
+    future = Future()
+    future.set_exception(exc)
+    pending = _pending_batch(["r1", "r2"], future=future)
+    pending.node_batch = SimpleNamespace(failed_requests={})
+    w.pipeline._step_result(pending)
+    assert {err.status for err in pending.node_batch.failed_requests.values()} == {status}
+    assert set(pending.node_batch.failed_requests) == {"r1", "r2"}
 
 
 def test_crashed_forward_fails_the_whole_batch():

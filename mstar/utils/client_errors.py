@@ -66,7 +66,15 @@ class RequestError:
     status: int = 500
 
     @classmethod
-    def from_exception(cls, exc: BaseException, what: str, *, log=logger, traceback=True):
+    def from_exception(
+        cls, exc: BaseException, what: str, *,
+        log=logger, traceback=True, whole_step=False,
+    ):
+        """The failure for ``exc``. A ``ValueError`` or ``TypeError`` is the
+        request's fault (400) when one request's own stage raised it. With
+        ``whole_step`` (a step or the main loop failed, so the origin is
+        unknown) it keeps its message but is a 500. An ``HTTPException`` keeps
+        its status either way."""
         from torch import AcceleratorError
 
         # Device-runtime faults poison subsequent work. Ordinary OOM is a
@@ -82,7 +90,10 @@ class RequestError:
             log.error("%s: fatal device error", what, exc_info=exc)
             raise SystemExit(f"{what}: fatal device error ({exc})") from exc
         message, _ = client_error_text(exc, what, log=log, traceback=traceback)
-        status = exc.status_code if isinstance(exc, HTTPException) else (
-            400 if isinstance(exc, (ValueError, TypeError)) else 500
-        )
+        if isinstance(exc, HTTPException):
+            status = exc.status_code
+        elif isinstance(exc, (ValueError, TypeError)) and not whole_step:
+            status = 400
+        else:
+            status = 500
         return cls(message, status)
