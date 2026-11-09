@@ -15,13 +15,7 @@ from __future__ import annotations
 
 import torch
 
-from mstar.model.components.mrope import (  # noqa: F401
-    compute_3d_cos_sin,
-    compute_inv_freq,
-    text_position_ids,
-)
-from mstar.model.components.mrope import image_position_advance as vision_position_advance  # noqa: F401
-from mstar.model.components.mrope import image_position_ids as vision_position_ids  # noqa: F401
+from mstar.model.components.mrope import compute_3d_cos_sin, compute_inv_freq  # noqa: F401
 
 
 def compute_text_cos_sin(

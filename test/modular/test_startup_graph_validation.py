@@ -209,9 +209,8 @@ def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=(), producer=No
     return _ToyModel(
         walks,
         partitions=lambda: [
-            PartitionDefinition(name="P", graph_walks={"gen"}, initial_walk="gen"),
-            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})},
-                                initial_walk="chunk", producer_partitions=["P"]),
+            PartitionDefinition(name="P", graph_walks={"gen"}),
+            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})}),
         ],
         topology=lambda: PartitionTopology(partitions=["P", "C"], connections=[
             Connection(from_partition="P", to_partition="C", edge_name="codes",
@@ -701,8 +700,11 @@ def _z_image(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _higgs(name, model_kwargs, tmp_path, monkeypatch):
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig
-    return _bare(HiggsAudioModel, config=HiggsAudioModelConfig())
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig, audio_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    config = HiggsAudioModelConfig()
+    pad = config.audio_in_token_idx
+    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
 
 
 def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
@@ -830,9 +832,12 @@ def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal_decoder import MediaIntake
     from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
-    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
-    return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
+    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder
+    config = Qwen3ASRModelConfig()
+    pad = config.audio_token_id
+    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(pad), pad, None),))
 
 
 def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):

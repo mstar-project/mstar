@@ -23,24 +23,19 @@ from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.step import ResourceStep
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
-from mstar.model.components.mrope import mrope_position_ids
+from mstar.model.components.mrope import layout_position_ids, mrope_position_ids
 from mstar.model.components.qwen3_vit import (
     vision_interpolation,
     vision_seq_lengths,
 )
 from mstar.model.components.qwen3_vit import (
-    # the tower's 2D patch grid, not `rope`'s 3D MRoPE ids of the same name
+    # the tower's 2D patch grid, not the 3D MRoPE ids `mrope` places
     vision_position_ids as vision_grid_position_ids,
 )
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
 from mstar.model.keys import MIXED
 from mstar.model.multimodal import MediaEncoder
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
-from mstar.model.qwen3_5.components.rope import (
-    text_position_ids,
-    vision_position_advance,
-    vision_position_ids,
-)
 from mstar.model.qwen3_5.config import (
     ATTN,
     GDN_STATE,
@@ -167,31 +162,14 @@ class LLMSubmodule(SampledTokenDecoder):
         ``t * h' * w'`` tokens, so the cursor advances by the real amount and
         the position resource is handed the total.
         """
-        device = self.get_device()
-        merge = self._merge_size
-        pos = start
-        pos_ids: list[torch.Tensor] = []
-        cursor = 0
-        for offset, tokens, grid in zip(
-            layout.get("offset", ()), layout.get("tokens", ()), layout.get("grid", ()), strict=True,
-        ):
-            # built on the host, copied once below
-            if offset > cursor:
-                pos_ids.append(text_position_ids(offset - cursor, pos))
-                pos += offset - cursor
-            grid = torch.tensor(grid)
-            pos_ids.append(vision_position_ids(grid, merge, pos))
-            pos += vision_position_advance(grid, merge)
-            cursor = offset + tokens
-        if num_tokens > cursor:
-            pos_ids.append(text_position_ids(num_tokens - cursor, pos))
-            pos += num_tokens - cursor
-        return to_device_nonblocking(torch.cat(pos_ids, dim=1), device), pos - start
+        # built on the host, copied once
+        pos_ids, advance = layout_position_ids(layout, self._merge_size, num_tokens, start)
+        return to_device_nonblocking(pos_ids, self.get_device()), advance
 
     def resident_walks(self) -> frozenset[str]:
         # a captured decode step builds its rope inside the graph on every config
         # (`_rope_in_graph`), so its `preprocess` reads nothing the tables fill
-        return frozenset({"decode"})
+        return frozenset({self.DECODE_WALK})
 
     @staticmethod
     def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:

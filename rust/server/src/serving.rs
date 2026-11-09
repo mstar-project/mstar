@@ -50,6 +50,8 @@ pub struct AppState {
     pub bridge: Option<Arc<Bridge>>,
     /// Requests refused before submission; sent with each `/metrics` request.
     pub refusals: Arc<Refusals>,
+    /// The names a request's `model` may carry, and the LoRA adapters among them.
+    pub served: Arc<crate::served_models::ServedModels>,
 }
 
 /// One item of a request's result stream.

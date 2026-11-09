@@ -20,8 +20,8 @@ def _model(**kwargs) -> Glm5NextModel:
 ])
 def test_a_null_kwarg_is_unset(kwargs):
     m = _model()
-    sampling = m.get_request_resource_configs({}, kwargs)[SAMPLER]
-    assert sampling == m.get_request_resource_configs({}, {})[SAMPLER]
+    sampling = m.get_request_resource_configs([], [], kwargs)[SAMPLER]
+    assert sampling == m.get_request_resource_configs([], [], {})[SAMPLER]
     assert m.get_max_output_tokens(**kwargs) == m.get_max_output_tokens()
     out = m.process_prompt("Hi", ["text"], ["text"], **kwargs)
     assert out.new_input_tensors["text_inputs"][0].tolist() == [72, 105]
@@ -30,7 +30,7 @@ def test_a_null_kwarg_is_unset(kwargs):
 def test_a_null_temperature_under_mtp_is_greedy():
     m = _model(mtp_num_draft_tokens=3)
     assert m.process_prompt("Hi", ["text"], ["text"], temperature=None).new_input_tensors["text_inputs"][0].numel() == 2
-    assert m.get_request_resource_configs({}, {"temperature": None})[SAMPLER].temperature == 0
+    assert m.get_request_resource_configs([], [], {"temperature": None})[SAMPLER].temperature == 0
 
 
 @pytest.mark.parametrize("knob", [*REAL_KNOB_RULES, *INT_KNOB_RULES, *BOOL_KNOBS])
@@ -43,7 +43,7 @@ def test_a_sampler_knob_is_honored_or_refused(knob):
         m.process_prompt("Hi", ["text"], ["text"], **{knob: value})
     except ValueError:
         return
-    assert getattr(m.get_request_resource_configs({}, {knob: value})[SAMPLER], knob) == value
+    assert getattr(m.get_request_resource_configs([], [], {knob: value})[SAMPLER], knob) == value
 
 
 @pytest.mark.parametrize("kwargs", [

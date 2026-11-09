@@ -112,6 +112,7 @@ def test_prefill_environment_switch_leaves_other_captures_enabled(monkeypatch):
     assert {config.capture_graph_walk for config in dit.get_accelerator_graph_configs("cpu")} == {
         C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK,
     }
-    assert {config.capture_graph_walk for config in reasoner.get_accelerator_graph_configs("cpu")} == {
+    # the reasoner's prefill captures go with the DiT's; its decode stays
+    assert [config.capture_graph_walk for config in reasoner.get_accelerator_graph_configs("cpu")] == [
         C.REASONER_DECODE_WALK,
-    }
+    ]

@@ -15,10 +15,10 @@ byte-for-byte:
 * ``expand_placeholders``: one ``<|image_pad|>`` per merged block for images;
   videos become one timestamped ``<t seconds><|vision_start|>...<|vision_end|>``
   span per frame.
-* ``mrope_position_ids``: text tokens advance all three axes together; a
-  vision span puts ``t`` on the temporal axis and the merged ``(h, w)`` grid on
-  the spatial ones, all offset by the current position, and advances the
-  cursor by ``max(h, w)`` merged patches.
+* ``vision_layout``: the rendered prompt's ``MEDIA_LAYOUT``, one run per image
+  and per video frame, checked against the media.
+  The worker places the prompt's 3D mRoPE ids from that layout
+  (``components/mrope.layout_position_ids``).
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from torchvision.transforms.v2 import InterpolationMode
 from torchvision.transforms.v2 import functional as tvF
 
 from mstar.model.cosmos3.config import Cosmos3MediaProcessorConfig, Cosmos3ReasonerConfig
-from mstar.model.multimodal import MediaPads, messages_from_parts
+from mstar.model.multimodal import messages_from_parts
 
 IMAGE = "image"
 VIDEO = "video"
@@ -228,131 +228,50 @@ def expand_placeholders(
     return "".join(out)
 
 
-def mrope_position_ids(
+def vision_layout(
     input_ids: torch.Tensor, cfg: Cosmos3ReasonerConfig,
-    image_grids: list[MediaGrid], video_grids: list[MediaGrid],
-) -> tuple[torch.Tensor, int]:
-    """3D mRoPE ids ``[3, N]`` (temporal, height, width) of a rendered prompt
-    and the position the first generated token takes.
-
-    Text runs put the same increasing ids on all three axes. Each run of
-    ``<|image_pad|>`` / ``<|video_pad|>`` tokens is one frame of its media
-    (videos are rendered one span per frame): temporal = the cursor, height /
-    width = the cursor plus the merged-grid coordinates; the cursor then
-    advances by ``max(h, w)`` merged patches. Decoding continues at
-    ``max(position) + 1`` on all axes."""
+    image_grids: list[MediaGrid], video_grids: list[MediaGrid], output: str,
+) -> dict[str, list]:
+    """The rendered prompt's ``MEDIA_LAYOUT``: one run per run of
+    ``<|image_pad|>`` / ``<|video_pad|>`` tokens, which is one image or one
+    video frame (videos are rendered one span per frame), with its
+    ``[1, h, w]`` patch grid, every run filled from the encoder's ``output``.
+    ``ValueError`` when the runs and the media disagree."""
     ids = input_ids.tolist()
     merge = cfg.vision.spatial_merge_size
-    frames: dict[int, list[tuple[int, int]]] = {
-        cfg.image_token_id: [(g.h // merge, g.w // merge) for g in image_grids],
-        cfg.video_token_id: [(g.h // merge, g.w // merge) for g in video_grids for _ in range(g.t)],
+    frames: dict[int, list[MediaGrid]] = {
+        cfg.image_token_id: list(image_grids),
+        cfg.video_token_id: [g for g in video_grids for _ in range(g.t)],
     }
-    cursors = {cfg.image_token_id: 0, cfg.video_token_id: 0}
-    pos = torch.empty(3, len(ids), dtype=torch.long)
-    cur = 0
-    i = 0
-    n = len(ids)
-    while i < n:
-        tok = ids[i]
-        if tok in frames:
-            j = i
-            while j < n and ids[j] == tok:
-                j += 1
-            k = cursors[tok]
-            if k >= len(frames[tok]):
-                raise ValueError("prompt has more media placeholder runs than media frames")
-            h, w = frames[tok][k]
-            cursors[tok] += 1
-            if j - i != h * w:
-                raise ValueError(f"placeholder run of {j - i} tokens does not match a {h}x{w} merged grid")
-            hh = torch.arange(h).view(h, 1).expand(h, w).reshape(-1)
-            ww = torch.arange(w).view(1, w).expand(h, w).reshape(-1)
-            pos[0, i:j] = cur
-            pos[1, i:j] = cur + hh
-            pos[2, i:j] = cur + ww
-            cur += max(h, w)
-            i = j
-        else:
-            j = i
-            while j < n and ids[j] not in frames:
-                j += 1
-            pos[:, i:j] = torch.arange(cur, cur + (j - i)).view(1, -1)
-            cur += j - i
-            i = j
-    for tok, k in cursors.items():
-        if k != len(frames[tok]):
-            raise ValueError("prompt has fewer media placeholder runs than media frames")
-    next_pos = int(pos.max().item()) + 1 if n else 0
-    return pos, next_pos
-
-
-def media_runs(
-    input_ids: torch.Tensor, cfg: Cosmos3ReasonerConfig,
-    image_grids: list[MediaGrid], video_grids: list[MediaGrid],
-) -> tuple[MediaPads, dict[int, list[tuple[int, int, int]]]]:
-    """The expanded prompt's pad runs, for its ``MEDIA_LAYOUT``: one run per
-    image and per video frame, in prompt order, and each run's patch grid
-    ``(1, h, w)`` by pad id. Checks every run against its grid, as
-    `mrope_position_ids` does."""
-    ids = input_ids.tolist()
-    merge = cfg.vision.spatial_merge_size
-    grids = {
-        cfg.image_token_id: [(1, g.h, g.w) for g in image_grids],
-        cfg.video_token_id: [(1, g.h, g.w) for g in video_grids for _ in range(g.t)],
-    }
-    pad, index, offset, tokens = [], [], [], []
-    seen = dict.fromkeys(grids, 0)
+    seen = dict.fromkeys(frames, 0)
+    layout: dict[str, list] = {"offset": [], "tokens": [], "output": [], "grid": []}
     i, n = 0, len(ids)
     while i < n:
         tok = ids[i]
-        if tok not in grids:
+        if tok not in frames:
             i += 1
             continue
         j = i
         while j < n and ids[j] == tok:
             j += 1
         k = seen[tok]
-        if k >= len(grids[tok]):
+        if k >= len(frames[tok]):
             raise ValueError("prompt has more media placeholder runs than media frames")
-        _, h, w = grids[tok][k]
-        if j - i != (h // merge) * (w // merge):
-            raise ValueError(f"placeholder run of {j - i} tokens does not match a {h}x{w} patch grid")
-        pad.append(tok)
-        index.append(k)
-        offset.append(i)
-        tokens.append(j - i)
         seen[tok] = k + 1
+        grid = frames[tok][k]
+        if j - i != grid.tokens_per_frame(merge):
+            raise ValueError(
+                f"placeholder run of {j - i} tokens does not match a "
+                f"{grid.h // merge}x{grid.w // merge} merged grid"
+            )
+        layout["offset"].append(i)
+        layout["tokens"].append(j - i)
+        layout["output"].append(output)
+        layout["grid"].append([1, grid.h, grid.w])
         i = j
-    if any(seen[tok] != len(grids[tok]) for tok in grids):
+    if any(seen[tok] != len(f) for tok, f in frames.items()):
         raise ValueError("prompt has fewer media placeholder runs than media frames")
-    return MediaPads(input_ids, pad, index, offset, tokens), grids
-
-
-def layout_position_ids(
-    start: int, layout: dict, num_tokens: int, spatial_merge_size: int,
-) -> tuple[torch.Tensor, int]:
-    """`mrope_position_ids` of a prompt from its ``MEDIA_LAYOUT`` (each run's
-    offset, tokens and ``(1, h, w)`` grid), with no read of the ids, based at
-    the position counter ``start``; and how far the prompt moves the counter,
-    which is where decoding continues on all three axes."""
-    pos = torch.empty(3, num_tokens, dtype=torch.long)
-    cur, cursor = start, 0
-    for off, tokens, grid in zip(
-        layout.get("offset", ()), layout.get("tokens", ()), layout.get("grid", ()), strict=True,
-    ):
-        if off > cursor:
-            pos[:, cursor:off] = torch.arange(cur, cur + off - cursor)
-            cur += off - cursor
-        h, w = grid[1] // spatial_merge_size, grid[2] // spatial_merge_size
-        pos[0, off:off + tokens] = cur
-        pos[1, off:off + tokens] = cur + torch.arange(h).repeat_interleave(w)
-        pos[2, off:off + tokens] = cur + torch.arange(w).repeat(h)
-        cur += max(h, w)
-        cursor = off + tokens
-    if num_tokens > cursor:
-        pos[:, cursor:] = torch.arange(cur, cur + num_tokens - cursor)
-        cur += num_tokens - cursor
-    return pos, cur - start
+    return layout
 
 
 def render_chat(

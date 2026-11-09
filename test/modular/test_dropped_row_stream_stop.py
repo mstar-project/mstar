@@ -157,7 +157,7 @@ def _worker(eng, runtime, rids, in_loop=True, through_send=False, loop=LOOP, chu
             drop_host_copies=lambda: None,
             dereference_batch_uniform=lambda uuids: None,
         ),
-        streams=SimpleNamespace(consumption_batch=lambda rids: [], assign_consumer_walks=lambda batch: None),
+        streams=SimpleNamespace(assign_consumer_walks=lambda batch: None),
         engine_manager=SimpleNamespace(get_engine=lambda n: eng),
         request_state=SimpleNamespace(
             buffer_publish_info=lambda *a: None, flush_publish_info=lambda *a: None,
