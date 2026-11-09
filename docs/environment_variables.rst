@@ -314,7 +314,7 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - Silero VAD ONNX file (``silero_vad.onnx``) for ``/v1/realtime``
        ``server_vad`` turn detection, read by
        ``realtime_vad.silero_weights``. Unset, the copy bundled with the
-       ``silero-vad`` package (``mstar[vad]``) is used; with neither, or
+       ``silero-vad`` package (``mstar-ai[vad]``) is used; with neither, or
        with a file whose inputs or outputs differ (the package's other
        exports), ``server_vad`` sessions are refused. Never downloaded.
    * - ``MSTAR_SMART_TURN_PATH``

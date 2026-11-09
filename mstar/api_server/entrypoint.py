@@ -3089,7 +3089,7 @@ def main(argv: list[str] | None = None):
     )
     parser.add_argument(
         "--enable-metrics", action="store_true",
-        help="Serve Prometheus metrics at /metrics (needs mstar[metrics])",
+        help="Serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     parser.add_argument(
         "--rust-frontend", action="store_true",
