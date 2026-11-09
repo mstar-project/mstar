@@ -660,11 +660,16 @@ class TestAfterTheReview(unittest.TestCase):
                              "live_test": {"run": "full", "reason": "r", "gpus": 8, "untestable": ""}})
         with workspace():
             out, fake = step(bot.post, {
-                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+                "POST graphql": {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+                    {"comments": {"nodes": [{"databaseId": 4, "author": {"login": "mstar-review"},
+                                             "body": "**[P1]** x"}]}},
+                ]}}}}},
                 "pr comment": "https://github.com/o/r/pull/7#issuecomment-99",
                 "GET repos/o/r/issues/7/comments": [],
             }, repo="o/r", pr="7", output=output, head_sha=HEAD, mode="full", salvaged="false", max_gpus="4")
         self.assertEqual(json.loads(out["result"])["live_test"]["untestable"], "needs 8 GPUs, runs get 4")
+        self.assertEqual(json.loads(out["result"])["inline"], {"4": "P1"},
+                         "a later step couldn't tell an edited finding")
         self.assertTrue(any("pr=7" in argv for argv, _ in fake.calls), "the threads query needs the PR's number")
 
     def test_the_summary_is_redacted_posted_from_stdin_and_resolves_a_stopped_review(self):

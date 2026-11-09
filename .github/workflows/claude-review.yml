@@ -181,7 +181,8 @@ jobs:
         id: pre
         env:
           KEY_SET: ${{ secrets.ANTHROPIC_API_KEY != '' }}
-          ACTOR: ${{ github.actor }}
+          # Who pressed the button on a re-run; `github.actor` stays the original commenter.
+          ACTOR: ${{ github.triggering_actor }}
           AUTHOR: ${{ github.event.issue.user.login }}
           # The commenter's association; a self-serve run also requires commenter == author.
           ASSOC: ${{ github.event.comment.author_association }}
@@ -216,7 +217,7 @@ jobs:
       mode: ${{ steps.pr.outputs.mode }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
       main_sha: ${{ steps.base.outputs.commit }}
-      # The summary's fields as `post` rendered them, with what it carried over from the earlier review.
+      # The summary's fields as `post` rendered them, with what it carried over and this run's inline findings.
       result: ${{ steps.post.outputs.result }}
       # Built on an earlier review: the live test's `targeted`, or its `none` on runtime code, needs a live test before it.
       rereview: ${{ steps.diff.outputs.rereview }}
@@ -533,7 +534,7 @@ jobs:
           SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
           SLURM_NODES: ${{ secrets.REVIEW_SLURM_NODES }}
           SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
-          COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENTER: ${{ github.triggering_actor }}
           MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
