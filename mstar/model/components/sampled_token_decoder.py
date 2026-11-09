@@ -83,8 +83,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size); a longer step prefills eagerly. Static buffers are
-    # sized by the largest bucket. `prefill_token_buckets` replaces it per
-    # instance.
+    # sized by the largest bucket. A deployment sets its own per walk with the
+    # serving config's `prefill_token_buckets`.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
@@ -123,11 +123,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         model: torch.nn.Module,
         config: Any,
         encoders: Sequence[MediaEncoder] = (),
-        prefill_token_buckets: Sequence[int] | None = None,
     ):
         """``encoders`` are the model's media encoders, as its walks declare
         them; a text-only node passes none."""
-        super().__init__(prefill_token_buckets)
+        super().__init__()
         self.model = model
         self.config = config
         self._encoders = tuple(encoders)
