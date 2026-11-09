@@ -1066,6 +1066,9 @@ window.runMermaid = runMermaid;</script>
 <span class="p">):</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors.torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">safe_open</span>
 
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader.quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">refuse_unserved_quantization</span>
+
+    <span class="n">refuse_unserved_quantization</span><span class="p">(</span><span class="n">safetensors_file</span><span class="p">)</span>
     <span class="c1"># Precompute expected keys for each module</span>
     <span class="n">module_key_maps</span> <span class="o">=</span> <span class="p">[]</span>
     <span class="k">for</span> <span class="n">mod</span> <span class="ow">in</span> <span class="n">modules</span><span class="p">:</span>
@@ -1287,7 +1290,10 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    """</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors.torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">safe_open</span>
 
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.loader.quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">refuse_unserved_quantization</span>
+
     <span class="n">repo_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">repo_dir</span><span class="p">)</span>
+    <span class="n">refuse_unserved_quantization</span><span class="p">(</span><span class="n">repo_dir</span><span class="p">)</span>
     <span class="n">index_path</span> <span class="o">=</span> <span class="n">repo_dir</span> <span class="o">/</span> <span class="s2">"model.safetensors.index.json"</span>
     <span class="k">if</span> <span class="n">index_path</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
         <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">index_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>

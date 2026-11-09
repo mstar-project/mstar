@@ -2678,6 +2678,18 @@ rewrites or drops checkpoint keys that do not match your parameter paths.</p></l
 is built with a <code class="docutils literal notranslate"><span class="pre">comm_group</span></code> and <code class="docutils literal notranslate"><span class="pre">tp_world_size</span> <span class="pre">&gt;</span> <span class="pre">1</span></code>, the loader slices the incoming
 tensor along that parameter’s shard dimension before copying it. For this reason, one
 <code class="docutils literal notranslate"><span class="pre">load_weights</span></code> path serves both single-GPU runs and tensor-parallel runs without change.</p>
+<p>A quantized checkpoint is refused at load unless the model reads its format itself. Without this, a
+model that knows only unquantized weights would load fp8 values unscaled and drop the scales and
+packed weights, and then serve garbage. There are two checks:</p>
+<ul class="simple">
+<li><p>The safetensors iterators refuse a checkpoint that declares a quantization: <code class="docutils literal notranslate"><span class="pre">quantization_config</span></code>
+in <code class="docutils literal notranslate"><span class="pre">config.json</span></code> (HF fp8, AWQ, GPTQ, bitsandbytes, mxfp4, compressed-tensors, ModelOpt), ModelOpt’s
+<code class="docutils literal notranslate"><span class="pre">hf_quant_config.json</span></code>, or AutoGPTQ’s or AutoAWQ’s config file.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">load_weights_into</span></code> refuses a quantized weight’s part, such as <code class="docutils literal notranslate"><span class="pre">weight_scale_inv</span></code>,
+<code class="docutils literal notranslate"><span class="pre">weight_scale</span></code>, <code class="docutils literal notranslate"><span class="pre">weight_packed</span></code> or <code class="docutils literal notranslate"><span class="pre">qweight</span></code>, when no parameter takes it.</p></li>
+</ul>
+<p>A model that loads a format itself names its <code class="docutils literal notranslate"><span class="pre">quant_method</span></code>. GLM-5.2 and GLM-5.3-Flash, for
+example, pass <code class="docutils literal notranslate"><span class="pre">quant_methods=(&quot;fp8&quot;,)</span></code> to <code class="docutils literal notranslate"><span class="pre">load_weights</span></code> and to the iterators.</p>
 </section>
 </section>
 <section id="step-5-continuous-batching-and-cuda-graphs">
