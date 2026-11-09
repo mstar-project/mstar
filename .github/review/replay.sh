@@ -69,6 +69,12 @@ else
   gh api --paginate "repos/$REPO/pulls/$PR/comments" \
     --jq '[.[] | {id, user: .user.login, path, line, side, in_reply_to_id, body}]' > "$WORK/base/pr-comments.json"
 fi
+# Numbered as the workflow's collect step numbers it: the prompt anchors comments from these.
+PYTHONPATH="$ROOT/.github/review" python3 -c '
+import pathlib, session, sys
+p = pathlib.Path(sys.argv[1])
+p.write_bytes(session.numbered(p.read_bytes().decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape"))
+' "$WORK/base/pr.diff"
 lines=$(wc -l < "$WORK/base/pr.diff")
 
 # Overlay the rules and skills you're editing, rather than the versions at the base sha.

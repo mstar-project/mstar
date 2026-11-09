@@ -22,6 +22,7 @@ ELIDED = " [...] "
 # The escapes git writes in a path it quotes: \" \\ \a \b \t \n \v \f \r, and other bytes in octal.
 C_ESCAPE = re.compile(rb"\\([0-3][0-7]{2}|.)", re.DOTALL)
 C_CHARS = dict(zip(b"abtnvfr", b"\a\b\t\n\v\f\r", strict=True))
+HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def load(paths):
@@ -213,6 +214,39 @@ def diff_paths(diff_text):
         if path.startswith("b/"):
             paths.append(path[len("b/"):])
     return paths
+
+
+def numbered(diff_text, left=True):
+    """``diff_text`` with each line of a hunk prefixed by where it is in its file, for anchoring a comment: an added or
+    kept line by ``R<n> |``, its line in the new file, a deleted one by ``L<n> |``, its line in the old file. Only the
+    hunks' bodies change, walked by the counts in each ``@@`` line, so file headers still parse and text in a hunk
+    can't pass for one; a hunk that doesn't match its counts is left as it is from there. ``left=False`` is a diff
+    whose old side isn't the PR's base: its deleted lines get no number, since GitHub wouldn't take it."""
+    out, old, new, old_left, new_left = [], 0, 0, 0, 0
+    for line in diff_text.split("\n"):  # not splitlines: a form feed in a source line isn't the end of it
+        if old_left or new_left:
+            if line.startswith("-") and old_left:
+                out.append(f"L{old} |{line}" if left else f" |{line}")
+                old, old_left = old + 1, old_left - 1
+                continue
+            if line.startswith("+") and new_left:
+                out.append(f"R{new} |{line}")
+                new, new_left = new + 1, new_left - 1
+                continue
+            if line.startswith(" ") and old_left and new_left:
+                out.append(f"R{new} |{line}")
+                old, new, old_left, new_left = old + 1, new + 1, old_left - 1, new_left - 1
+                continue
+            if line.startswith("\\"):  # "\ No newline at end of file"
+                out.append(line)
+                continue
+            old_left = new_left = 0
+        hunk = HUNK.match(line)
+        if hunk:
+            old, new = int(hunk[1]), int(hunk[3])
+            old_left, new_left = int(hunk[2] or 1), int(hunk[4] or 1)
+        out.append(line)
+    return "\n".join(out)
 
 
 def c_byte(m):
