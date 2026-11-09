@@ -22,6 +22,7 @@ from mstar.engine.accelerator_graph_runner import (
     PiecewiseAcceleratorGraphRunner,
     autocast_scope,
     fail_if_graphs_required,
+    fail_if_required_regions_dropped,
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
@@ -33,6 +34,8 @@ from mstar.engine.resources import (
     FullAdmitOutcome,
     NodeResourceSpec,
     PublishedInfo,
+    Rebuild,
+    Residency,
     Resource,
     ResourceReqConfig,
     SlotLease,
@@ -51,6 +54,7 @@ from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import (
     ADMIT_OK,
     FULL_ADMIT_NOT_READY,
+    FULL_ADMIT_REBUILD,
     AdmitOutcome,
     PerReqSetting,
 )
@@ -284,7 +288,7 @@ class SubmoduleManagement:
 class ForwardPassInfoWrapper:
     """
     Stop-gap solution: the dynamic loop iters in CurrentForwardPassInfo may
-    be used in two places at once: in _postprocess_batch (for batch N), and
+    be used in two places at once: in ``StepExecutor.postprocess`` (for batch N), and
     in the forward pass for batch N+1, which require different iterations.
     The InputMetadata is built per executing batch, so its value is guaranteed
     to be up-to-date.
@@ -399,7 +403,7 @@ class ExecutingBatch:
     withheld_outputs: dict[int, tuple[str, ...]] = field(default_factory=dict)
     # A lockstep step whose rows' input reads every rank checks before
     # preparing it: the leader's rows in its order (see
-    # ``Worker._drop_rows_whose_read_failed``); None for no check
+    # ``Lockstep.drop_rows_whose_read_failed``); None for no check
     read_check_rids: tuple[int, ...] | None = None
 
     admit_error: AdmitFailedReason | None = None
@@ -737,6 +741,30 @@ class Engine:
                 # the sampler keeps its slot masters only for a node that
                 # reads them back on the device (see DeviceLoopback)
                 resources[loopback.sampler].enable_device_loopback_reader()
+        if model is not None:
+            self._check_rebuild_policies(model)
+
+    def _check_rebuild_policies(self, model: "Model") -> None:
+        """Raise for a node here whose rebuild policy a rebuild row couldn't run under."""
+        combined = model.combined_walk_of()
+        for node, policy in model.rebuild_policies().items():
+            mgmt = self._submodules.get(node)
+            if mgmt is None:
+                continue
+            refusing = sorted(key for key, resource in mgmt.resources.items() if not resource.supports_drop)
+            if refusing:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} declares a rebuild policy, but {refusing} can't drop a "
+                    "request's state"
+                )
+            walks = {policy.walk, combined.get((node, policy.walk), policy.walk)}
+            split = sorted(walk for walk in walks if mgmt.submodule.split_batches_by_capture_key(walk))
+            if split:
+                raise ValueError(
+                    f"{type(model).__name__}: {node!r} declares a rebuild policy, but splits steps of {split} by "
+                    "capture key, which the scheduler reads from a request's forward-pass info, and that names "
+                    "the decode walk while the request is rebuilt"
+                )
 
     def _build_resident_planner(self, node_name: str, runner: AcceleratorGraphRunner) -> None:
         """Put ``node_name`` on resident tables if it can and the deployment
@@ -937,6 +965,12 @@ class Engine:
                 self._device, free / 2**20, plan.floor / 2**20,
             )
 
+        fail_if_required_regions_dropped([
+            f"{node_name} {label} bs={bs} total_tokens={tokens}"
+            for node_name, runners in piecewise.items()
+            for label, runner in runners.items() if runner.required
+            for bs, tokens in runner.dropped_shapes
+        ])
         fail_if_graphs_required([
             f"{node_name} {key}"
             for node_name, runner in ag_runners.items()
@@ -1321,9 +1355,12 @@ class Engine:
 
     def _record_loopback(self, batch: ExecutingBatch) -> None:
         steps = self._loopback_steps
+        # a rebuild row leaves its request's entry for the decode step it resumes
+        rebuild = batch.step_context.rebuild_rids
+        rids = [rid for rid in batch.request_ids if rid not in rebuild] if rebuild else batch.request_ids
         if batch.rows_only:
             steps.update(dict.fromkeys(
-                batch.request_ids, (batch.node_name, batch.step_context.graph_walk),
+                rids, (batch.node_name, batch.step_context.graph_walk),
             ))
         elif batch.loopback_rids:
             # a mixed step: a row looped back under its own walk, so the next
@@ -1331,13 +1368,13 @@ class Engine:
             keep, node, walk_of = (
                 batch.loopback_rids, batch.node_name, batch.step_context.walk_of,
             )
-            for rid in batch.request_ids:
+            for rid in rids:
                 if rid in keep:
                     steps[rid] = (node, walk_of(rid))
                 else:
                     steps.pop(rid, None)
         elif steps:
-            for rid in batch.request_ids:
+            for rid in rids:
                 steps.pop(rid, None)
 
     def inline_client_signals(
@@ -1807,6 +1844,7 @@ class Engine:
                 request_ids=(rid,),
                 graph_walk=batch.step_context.graph_walk,
                 slot=slot, capture=False,
+                rebuild_rids=batch.step_context.rebuild_rids,
                 request_walks={rid: walks[rid]} if rid in walks else {},
             )
             if i != len(batch.request_ids) - 1:
@@ -1868,7 +1906,7 @@ class Engine:
                 except Exception as error:
                     # this rid fails alone, as in prepare_inputs, and keeps its
                     # admitted state (which queued kernels may still write) until
-                    # its REMOVE. Under TP/SP the ranks stay in step only if every
+                    # its REMOVE. Under TP/SP/CFG the ranks stay in step only if every
                     # rank raises here.
                     batch.register_failure(rid, error)
                 finally:
@@ -2491,7 +2529,7 @@ class Engine:
             is NodeSubmodule.filter_batched_output
         ):
             # No clone either: the worker takes the host copy on this thread,
-            # on this stream, right behind the step (``_stage_host_rows``), so
+            # on this stream, right behind the step (``HostCopies.stage_host_rows``), so
             # a later replay cannot overwrite the rows first, and nothing else
             # reads them on the device. Padded rows past the real ones ride
             # along and are never read.
@@ -2872,11 +2910,17 @@ class Engine:
         published elsewhere — a KV transfer from a prefill worker, say — and
         reports whether that has landed.
 
+        A dropped request is not ready: the caller rebuilds it from its token
+        ids.
+
         The outcome, not a bool: a resource can report the request
         unservable (``AdmitRuntimeError``), and the caller has to fail it
         rather than scan it again forever.
         """
-        if self.is_offloaded(node_name, request_id):
+        residency = self.residency(node_name, request_id)
+        if residency is Residency.DROPPED:
+            return FULL_ADMIT_REBUILD if allow_reload else FULL_ADMIT_NOT_READY
+        if residency is Residency.ON_HOST:
             if not allow_reload:
                 return FULL_ADMIT_NOT_READY
             if not self.reload_request(node_name, request_id):
@@ -3065,7 +3109,7 @@ class Engine:
                 with stream if stream is not None else nullcontext():
                     self._order_after_pre_plans()
                     # A raise here takes what a raise from `pre_plan` below takes:
-                    # `Worker._preplan_spec` resets the pre-plan, whose reservation
+                    # `StepExecutor._preplan_spec` resets the pre-plan, whose reservation
                     # stays with its streams for exec's admit to find.
                     if ctx.resident is not None:
                         ctx.plan_phase = "res.pre_plan"
@@ -3152,11 +3196,32 @@ class Engine:
             if resources is None or key in resources
         )
 
-    def is_offloaded(self, node_name: str, request_id: str) -> bool:
-        return any(
-            resource.is_offloaded(request_id)
-            for resource in self._submodules[node_name].resources.values()
+    def residency(self, node_name: str, request_id: str) -> Residency:
+        """The furthest from the device that any of the node's resources holds the request."""
+        return max(
+            (resource.residency(request_id) for resource in self._submodules[node_name].resources.values()),
+            default=Residency.RESIDENT,
         )
+
+    def drop_request(self, node_name: str, request_id: int, tokens: int) -> int:
+        """Discard the request's state on this node that can be recomputed from
+        the ``tokens`` token ids its rebuild writes, and return the pages freed."""
+        resources = self._submodules[node_name].resources.values()
+        # check every resource before dropping any, so a refusal changes nothing,
+        # as `reload_request` checks `can_reload`
+        for resource in resources:
+            resource.check_drop(request_id, tokens)
+        return sum(resource.drop(request_id, tokens) for resource in resources)
+
+    def prepare_rebuild(self, node_name: str, request_id: int, rebuild: Rebuild) -> None:
+        """Tell each of the node's resources what the dropped request's rebuild row writes."""
+        for resource in self._submodules[node_name].resources.values():
+            resource.prepare_rebuild(request_id, rebuild)
+
+    def land_rebuild(self, node_name: str, request_id: int) -> None:
+        """Make the dropped request resident again, once its rebuild row has run."""
+        for resource in self._submodules[node_name].resources.values():
+            resource.land_rebuild(request_id)
 
     def offload_request(self, node_name: str, request_id: int) -> int:
         """Move the request off-device across this node's resources.
@@ -3200,7 +3265,7 @@ class Engine:
         offloaded = [
             resource
             for resource in self._submodules[node_name].resources.values()
-            if resource.supports_eviction and resource.is_offloaded(request_id)
+            if resource.supports_eviction and resource.residency(request_id) is Residency.ON_HOST
         ]
         # check every resource fits first, so a refusal doesn't reload and re-offload whatever did
         if not all(resource.can_reload(request_id) for resource in offloaded):
@@ -3214,7 +3279,7 @@ class Engine:
                 return False
             reloaded.append(resource)
         # Logged at the same level as the eviction in
-        # ``Worker._try_offload_cold_request`` and as a follower's replay, so
+        # ``Admission._evict`` and as a follower's replay, so
         # the two ranks' resident-set moves can be lined up side by side.
         # A reload only happens after an eviction, so this is not chatty.
         logger.info(
@@ -3290,7 +3355,7 @@ class Engine:
                 delta.pop_left()
                 continue
             if is_offload:
-                if self.is_offloaded(node_name, rid):
+                if self.residency(node_name, rid) is Residency.ON_HOST:
                     logger.debug(
                         "Replay: %s already off %s", wire_rid, node_name,
                     )
@@ -3325,14 +3390,14 @@ class Engine:
                         "Replayed rank 0's offload of request %s from %s "
                         "(%d reclaimed)", wire_rid, node_name, freed,
                     )
-            elif not self.is_offloaded(node_name, rid):
+            elif self.residency(node_name, rid) is not Residency.ON_HOST:
                 logger.debug(
                     "Replay: %s already resident on %s", wire_rid, node_name,
                 )
             elif not all(
                 resource.reload(rid)
                 for resource in resources
-                if resource.supports_eviction and resource.is_offloaded(rid)
+                if resource.supports_eviction and resource.residency(rid) is Residency.ON_HOST
             ):
                     # No room yet. Silent until now, and this is the shape of a
                     # follower that stops mid-delta and never finishes: rank 0

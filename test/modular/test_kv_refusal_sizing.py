@@ -17,24 +17,26 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 from test_admit_failure_handling import (
-    _NO_LIMITS,
     SCHED_NODE,
     SCHED_WALK,
-    _EvictingWorker,
+    _engine,
+    _evicting_worker,
+    _refused,
     _SchedEngine,
 )
 from test_micro_scheduler import _Manager, _next_batch, _scheduler
-from test_worker_drain import _worker as _teardown_worker
 
-from mstar.engine.engine import Engine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
-from mstar.utils.ipc_format import RemoveRequest
+from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.worker import bound, deliver, make_worker
+from mstar.utils.ipc_format import RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 PAGE_SIZE = 16
@@ -180,29 +182,13 @@ def test_a_window_pool_sizes_a_refusal_in_its_own_pages():
     assert "needs 8 pages of kv for this step, more than the 7" in outcome.reason.message
 
 
-class _FailingWorker(_EvictingWorker):
-    """The real admit-failure handlers and victim search, failures recorded."""
-
-    _handle_admit_failure = Worker._handle_admit_failure
-    _handle_unservable = Worker._handle_unservable
-
-    def __init__(self, holders):
-        super().__init__(holders)
-        self.held: list[str] = []
-        self.failed: dict[str, str] = {}
-        vars(self.scheduler).update(hold_requests=self.held.extend, **_NO_LIMITS)
-
-    def _fail_requests(self, errors):
-        self.failed.update(errors)
-
-
 _POOL_FILLER_ERROR = (
     "Error in worker: The request needs 64 pages of kv for this step, more than "
     "the 63 the pool holds; raise max_num_pages or shorten the request."
 )
 
 
-def _refuse_after_a_pool_filling_prefill(spans: dict[str, int]) -> _FailingWorker:
+def _refuse_after_a_pool_filling_prefill(spans: dict[str, int]) -> Worker:
     """64 pages, 63 usable: ``long``'s prefill takes all 63, then a step of
     ``spans`` is admitted and its refusal handled as the worker does."""
     mgr = _manager(64)
@@ -212,15 +198,12 @@ def _refuse_after_a_pool_filling_prefill(spans: dict[str, int]) -> _FailingWorke
     outcome = _admit(mgr, spans)
     assert not outcome.ok
 
-    worker = _FailingWorker(holders=["long"])
+    worker = _evicting_worker(["long"])
     batch = ScheduledBatch(
         node_name=SCHED_NODE, graph_walk=SCHED_WALK,
         request_to_worker_graph=dict.fromkeys(spans, "wg"),
     )
-    worker._handle_admit_failure(batch, SimpleNamespace(
-        node_name=SCHED_NODE, admit_error=outcome.reason,
-        failed_resource="kv", request_ids=list(spans), cached_rids=set(),
-    ))
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason))
     return worker
 
 
@@ -230,9 +213,10 @@ def test_a_prefill_that_fills_the_pool_fails_at_its_first_decode():
     client gave up at 180 s."""
     worker = _refuse_after_a_pool_filling_prefill({"long": 1})
 
-    assert worker.offloaded == [] and worker.held == [], "the request was offloaded to retry"
+    assert _engine(worker).offloaded == [], "the request was offloaded to retry"
     assert worker._graph_runtime.pushed_back == []
-    assert worker.failed == {"long": _POOL_FILLER_ERROR}
+    assert worker.lifecycle.take_failures() == {"long": _POOL_FILLER_ERROR}
+    assert worker.admission.held_until == {}, "the request was held to retry"
 
 
 @pytest.mark.parametrize("prompt_first", [True, False], ids=["prompt-first", "decode-first"])
@@ -243,8 +227,8 @@ def test_a_pool_filler_fails_in_a_mixed_step_whichever_row_is_refused(prompt_fir
     rows = [("short", 2 * PAGE_SIZE), ("long", 1)]
     worker = _refuse_after_a_pool_filling_prefill(dict(rows if prompt_first else rows[::-1]))
 
-    assert worker.offloaded == [], "the pool filler was offloaded to retry"
-    assert worker.failed == {"long": _POOL_FILLER_ERROR}
+    assert _engine(worker).offloaded == [], "the pool filler was offloaded to retry"
+    assert worker.lifecycle.take_failures() == {"long": _POOL_FILLER_ERROR}
     assert worker._graph_runtime.pushed_back == ["short"]
 
 
@@ -346,18 +330,18 @@ def test_a_row_the_cache_served_does_not_make_a_batch_too_big_alone():
     reason = outcome.reason
     assert isinstance(reason, AllocationFailed), reason
     assert (reason.rows_fit_alone, reason.rows_sized) == (15, 15)
-    worker = _FailingWorker(holders=["decoder"])
+    worker = _evicting_worker(["decoder"])
     batch = ScheduledBatch(
         node_name=SCHED_NODE, graph_walk=SCHED_WALK,
         request_to_worker_graph=dict.fromkeys([*spans, "cached"], "wg"),
     )
-    worker._handle_admit_failure(batch, SimpleNamespace(
+    worker.pipeline._handle_admit_failure(batch, SimpleNamespace(
         node_name=SCHED_NODE, admit_error=reason, failed_resource="kv",
         request_ids=list(spans), cached_rids={"cached"},
     ))
 
-    assert worker.offloaded == ["decoder"], "the request holding pages was not evicted"
-    assert worker.failed == {}
+    assert _engine(worker).offloaded == ["decoder"], "the request holding pages was not evicted"
+    assert worker.lifecycle.failed_rids == set()
 
 
 # --- a teardown that hands pages back lifts a cap ---------------------------
@@ -366,24 +350,39 @@ def test_a_row_the_cache_served_does_not_make_a_batch_too_big_alone():
 def _engine_manager(**pools: KVManager) -> SimpleNamespace:
     """The worker's engine manager over the real ``Engine.remove_request``,
     with these KV pools as the engine's resources."""
-    from mstar.engine.chunking import ChunkingManagement
+    engine = make_engine(_resources=pools, _runner=SimpleNamespace(
+        remove_request=lambda rid: [pool.remove_request(rid) for pool in pools.values()],
+    ))
+    return SimpleNamespace(remove_request=engine.remove_request)
 
-    engine = SimpleNamespace(
-        _loopback_steps={}, _resources=pools, _submodules={},
-        # the real remove_request purges chunk state too (rid_table.py)
-        _chunking=ChunkingManagement({}),
-        _runner=SimpleNamespace(
-            remove_request=lambda rid: [pool.remove_request(rid) for pool in pools.values()],
-        ),
+
+def _teardown_over(sched, known_rids, engine_manager):
+    """A real teardown path over ``sched``; the rid strings are their own handles."""
+    request_state = SimpleNamespace(
+        per_request_info=dict.fromkeys(known_rids), remove_request=lambda rid: None,
     )
-    return SimpleNamespace(
-        remove_request=lambda rid: Engine.remove_request(engine, rid),
+    tensor_manager = SimpleNamespace(
+        has_inflight_reads=lambda rid: False, force_cleanup_request=lambda rid: None,
     )
+    runtime = SimpleNamespace(
+        get_rid_handle=lambda rid: rid if rid in known_rids else None,
+        get_rid_string=lambda rid: rid,
+        get_sharding_config=lambda rid: SimpleNamespace(groups=[]),
+        remove_request=lambda rid: None,
+    )
+    bound(sched, runtime=runtime)
+    worker = make_worker(
+        scheduler=sched, engine_manager=engine_manager, request_state=request_state, graph_runtime=runtime,
+        tensor_manager=tensor_manager, streams=StreamBufferManager(request_state, tensor_manager, []),
+    )
+    for rid in known_rids:
+        worker.lifecycle.add(rid, rid)
+    return worker
 
 
 def _remove(worker, *rids: str) -> None:
     for rid in rids:
-        Worker._remove_request(worker, RemoveRequest(request_id=rid))
+        deliver(worker, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(request_id=rid)))
 
 
 def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under():
@@ -403,24 +402,20 @@ def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under()
     manager = _Manager([*long_rows, *(f"s{i}" for i in range(32))])
     batch = _next_batch(sched, manager)
     assert list(batch.request_to_worker_graph) == long_rows
-    refuser = _EvictingWorker(long_rows, sched)
-    refuser._graph_runtime = manager.runtime
-    refuser._handle_allocation_failure(batch, SimpleNamespace(
-        node_name=SCHED_NODE, failed_resource="kv", admit_error=outcome.reason,
-    ))
-    assert refuser.offloaded == ["d14"]  # d15 ran last, so it holds the step
+    refuser = _evicting_worker(long_rows, sched, manager.runtime)
+    refuser.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason))
+    assert _engine(refuser).offloaded == ["d14"]  # d15 ran last, so it holds the step
 
     for _ in range(4):
         step = list(_next_batch(sched, manager).request_to_worker_graph)
         assert len(step) == 15
-        sched.clear_batch_limit(SCHED_NODE, SCHED_WALK, len(step))
+        sched.admission.clear_batch_limit(SCHED_NODE, SCHED_WALK, len(step))
         manager.in_flight.clear()
         for rid in step:
             manager.ingest(rid)
     assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 15
 
-    worker = _teardown_worker(known_rids=long_rows)
-    worker.scheduler, worker.engine_manager = sched, _engine_manager(kv=pool)
+    worker = _teardown_over(sched, long_rows, _engine_manager(kv=pool))
     free = pool._arena.num_free
     _remove(worker, "d1")
     manager.queues["wg0"]._ready.pop("d1", None)
@@ -443,10 +438,8 @@ def test_a_teardown_that_frees_none_of_the_capping_pool_leaves_the_cap():
     for pool in (self_kv, cross_kv):
         pool.ingest_request("b")
     sched = _scheduler(_SchedEngine(max_bs=16))
-    sched.cap_batch(SCHED_NODE, SCHED_WALK, 15, "cross_kv")
-    worker = _teardown_worker(known_rids=("a", "b", "c"))
-    worker.scheduler = sched
-    worker.engine_manager = _engine_manager(self_kv=self_kv, cross_kv=cross_kv)
+    sched.admission.cap_batch(SCHED_NODE, SCHED_WALK, 15, "cross_kv")
+    worker = _teardown_over(sched, ("a", "b", "c"), _engine_manager(self_kv=self_kv, cross_kv=cross_kv))
 
     _remove(worker, "a", "b")
 

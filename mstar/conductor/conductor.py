@@ -20,6 +20,7 @@ from mstar.api_server.request_types import (
     RequestFailed,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.lora_ops import LoraAdapterOps
 from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -526,7 +527,7 @@ class Conductor:
         }
 
         # Set up worker graph TP ranks; validate_deployment checked each worker
-        # graph belongs to one sharding group of its tp_size.
+        # graph belongs to one sharding group of its instance size.
         self.streaming_consumers = set()
         self.node_walk_to_wg: dict[tuple[str, str], WorkerGraph] = {}
 
@@ -588,7 +589,7 @@ class Conductor:
                         continue
                     wg = self.node_walk_to_wg[(node, walk)]
                     # The instance rank is the worker's index within the
-                    # lockstep instance (0..tp*sp-1), used by the
+                    # lockstep instance (0..instance size - 1), used by the
                     # replicated-signal fanout (so exactly one rank — index 0
                     # — forwards a replicated tensor to a downstream node).
                     for ranks in wg._instance_ranks:
@@ -625,10 +626,14 @@ class Conductor:
         self._derive_worker_info()
         self._launch_workers()
 
+        # Sends never block the run loop (OutboxCommunicator): a worker blocked
+        # sending to the conductor stops reading, and a conductor blocked on
+        # that worker would stop reading too, so neither would ever drain.
         self.communicator = make_communicator(
             my_id="conductor",
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
+            nonblocking_send=True,
         )
 
     def _max_output_tokens(self, model_kwargs: dict) -> int:
@@ -775,6 +780,31 @@ class Conductor:
         if targets is not None:
             logger.info("LoRA: serving only the targets the adapters touch: %s", targets)
             block["targets"] = targets
+
+    def _lora_ops(self) -> LoraAdapterOps:
+        """Runtime LoRA loads and unloads, against the specs requests are validated with
+        and the workers hosting their nodes. Built on first use.
+
+        Each worker's ``_resource_specs`` holds its own copy of a spec, with its own
+        adapter-info cache, so a load or unload updates the copies as well."""
+        ops = getattr(self, "_lora_ops_cache", None)
+        if ops is None:
+            specs = [s for s in self._node_resources() if isinstance(s, LoraSpec)]
+            copies = [
+                s for per_worker in self._resource_specs() for s in per_worker.values()
+                if isinstance(s, LoraSpec)
+            ]
+            nodes = set().union(*(s.nodes for s in specs))
+            workers = [
+                worker_id for worker_id in self.worker_ids
+                if any(nodes & set(wg.section.get_nodes())
+                       for wg in self._per_worker_graphs[worker_id])
+            ]
+            ops = self._lora_ops_cache = LoraAdapterOps(
+                specs[0] if specs else None, workers, self.communicator.send,
+                others=[*specs[1:], *copies],
+            )
+        return ops
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
@@ -986,6 +1016,12 @@ class Conductor:
             f"worker {worker_id} (pid {p.pid}) exited with "
             f"{describe_exitcode(p.exitcode)}, so the server is shutting down"
         )
+        # The failures go out before the process does: what a full API server
+        # could not take yet is queued in the outbox. Bounded, so a peer that
+        # never reads again cannot hold the shutdown.
+        deadline = time.monotonic() + 1.0
+        while self.communicator.flush() and time.monotonic() < deadline:
+            time.sleep(0.001)
         raise DeadWorkerError(worker_id, p.pid, p.exitcode)
 
     def _fail_all_requests(self, error_message: str, status: int = 503) -> None:
@@ -1026,10 +1062,10 @@ class Conductor:
         """
         result = {}
         for wg_id, wg in self.worker_graphs.items():
-            # Route to a whole instance (the lockstep unit): every rank of a
-            # tp*sp instance runs the request together, so its TP all-reduce
-            # and SP all-to-all collectives stay in sync. Picking a single TP
-            # row here would desync the SP all-to-all across rows.
+            # Route to a whole instance (the lockstep unit): every rank of an
+            # instance runs the request together, so the collectives of each
+            # of its axes stay in sync. Picking a single TP row here would
+            # desync the SP all-to-all across rows.
             result[wg_id] = [f"worker_{r}" for r in wg.replica_ranks[replicas[wg._group_id]]]
         return result
 
@@ -1601,8 +1637,8 @@ class Conductor:
     def _send_for_teardown(self, request_id: str, entity: str, message):
         """Send one teardown message; a send that raises is logged so it can't
         skip the sends, drain record or free that follow it. A dead peer does
-        not raise (the send queues, then blocks at the high-water mark), so
-        this is only a backstop."""
+        not raise (the send queues in the outbox), so this is only a
+        backstop."""
         try:
             self.communicator.send(entity, message)
         except Exception:
@@ -1691,6 +1727,10 @@ class Conductor:
                 logger.debug(
                     "Dropping stale early READS_DONE for request %s", request_id
                 )
+        # runtime LoRA loads and unloads a worker never answered
+        lora_ops = getattr(self, "_lora_ops_cache", None)
+        if lora_ops is not None:
+            lora_ops.expire()
 
     def _fail_requests(self, body: FailRequests):
         """Tear down requests a worker reported as unservable. Routes through the
@@ -2216,6 +2256,12 @@ class Conductor:
                 self.communicator.send(worker_id, WorkerMessage(
                     message_type=WorkerMessageType.ENABLE_METRICS, body=message.body,
                 ))
+        elif message.message_type == ConductorMessageType.LOAD_LORA_ADAPTER:
+            self._lora_ops().load(message.body)
+        elif message.message_type == ConductorMessageType.UNLOAD_LORA_ADAPTER:
+            self._lora_ops().unload(message.body)
+        elif message.message_type == ConductorMessageType.LORA_ADAPTER_ACK:
+            self._lora_ops().ack(message.body)
         elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
             rid = message.body.request_id
             # Draining requests linger in self.requests (concurrency
@@ -2323,6 +2369,10 @@ class Conductor:
         ):
             if deadlines:
                 due = min(due, deadlines[0][0])
+        lora_ops = getattr(self, "_lora_ops_cache", None)
+        lora_due = None if lora_ops is None else lora_ops.next_deadline()
+        if lora_due is not None:
+            due = min(due, lora_due)
         return max(1, math.ceil((due - time.perf_counter()) * 1000))
 
     def run(self):
@@ -2393,5 +2443,9 @@ class Conductor:
             # being logged as a main-loop error and retried.
             self._poll_worker_liveness()
             # No wakeup event is registered: nothing in this process makes work
-            # outside a message, and what isn't a message is a timed check.
-            self.communicator.poll_for_messages(timeout_ms=self._ms_to_next_timed_check())
+            # outside a message, and what isn't a message is a timed check, or
+            # a queued send to a full peer, retried soon.
+            sends_pending = self.communicator.flush()
+            self.communicator.poll_for_messages(
+                timeout_ms=1 if sends_pending else self._ms_to_next_timed_check(),
+            )

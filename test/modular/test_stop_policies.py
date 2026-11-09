@@ -12,9 +12,11 @@ import numpy as np
 import pytest
 import torch
 
+from mstar.model.multimodal import vision_encoder
+from mstar.model.muse.submodules import LLMSubmodule as GlimmerLLMSubmodule
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.orpheus.submodules import token_stop as orpheus_token_stop
-from mstar.model.qwen3_5.submodules import LLMSubmodule, token_stop
+from mstar.model.qwen3_5.submodules import LLMSubmodule
 
 LOOP = "decode_loop"
 EOS = (7, 9)
@@ -22,14 +24,21 @@ EOS = (7, 9)
 MODELS = {
     # (submodule, its config, its walks, its TokenStop if it declares one)
     "qwen3_5": (LLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)),
-                ("decode", "prefill_text", "prefill_vision"), token_stop(EOS)),
+                ("decode", "prefill_text", "prefill_vision"),
+                LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
+                             encoders=(vision_encoder((5,)),)).token_stop),
     "orpheus": (OrpheusLLMSubmodule, SimpleNamespace(stop_token_id=EOS[0]), ("prefill", "decode"),
                 orpheus_token_stop(EOS[0])),
+    # the shared VLM decoder's stop, as Muse Glimmer serves it
+    "muse_glimmer": (GlimmerLLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)),
+                     ("decode", "prefill_text", "prefill_vision"),
+                     GlimmerLLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
+                                         (vision_encoder((5,)),)).token_stop),
 }
 
 
 def _sampler_key(cls):
-    return __import__(cls.__module__, fromlist=["SAMPLER"]).SAMPLER
+    return getattr(cls, "SAMPLER", None) or __import__(cls.__module__, fromlist=["SAMPLER"]).SAMPLER
 
 
 def _info(rng, walk, sampler):
@@ -89,3 +98,26 @@ def test_a_withholding_token_stop_refuses_the_runtime_check():
     with pytest.raises(ValueError, match="runtime_check"):
         TokenStop(loop=LOOP, buffer="new_token", stop_ids=frozenset(EOS), sampler="s",
                   withhold=("codes",), runtime_check=True)
+
+
+def test_a_nodes_stop_limits_come_from_its_own_partitions_info():
+    """A request's partitions arrive on a worker one by one; each sets only its own nodes'
+    limits, so a later partition's info cannot undo another's (an LM's ignore_eos)."""
+    from mstar.conductor.request_info import CurrentForwardPassInfo
+    from mstar.graph.runtime.rust import RustGraphRuntime
+    from mstar.model.submodule_base import StopKind, StopPolicy
+
+    set_calls = []
+    runtime = RustGraphRuntime.__new__(RustGraphRuntime)
+    runtime._rust = SimpleNamespace(
+        set_stop_limits=lambda node, walk, rids, iters, eos: set_calls.append((node, eos)),
+    )
+    runtime._node_to_partition = {"llm": "LM", "flow": "Token2Wav"}
+    policy = StopPolicy(StopKind.EOS, token_signal="speech_tokens", eos_tokens=(1,), ignores_eos=lambda info: True)
+    runtime._stop_policies = {("llm", "decode"): {"decode_loop": policy}, ("flow", "token2wav"): {}}
+
+    for partition in ("LM", "Token2Wav"):
+        info = CurrentForwardPassInfo.__new__(CurrentForwardPassInfo)
+        info.partition_name, info.max_tokens = partition, 100
+        runtime.register_stop_limits(7, info)
+    assert set_calls == [("llm", [[True]])]

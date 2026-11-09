@@ -4,7 +4,7 @@ The router is mounted on a FastAPI app with a stubbed APIServer, like
 ``test_openai_router.py``; the adapters are exercised directly as well.
 """
 
-import functools
+import asyncio
 import json
 import re
 import sys
@@ -319,6 +319,33 @@ def test_transcription_stream_reports_in_band_error(client_and_stub, status, err
     assert lines[-1] == "data: [DONE]"
 
 
+@pytest.mark.parametrize("raises_in", ["cutting", "results"])
+def test_transcription_stream_reports_an_unexpected_error_in_band(client_and_stub, monkeypatch, raises_in):
+    """After the 200, an error the stream did not expect still ends it with an
+    error event and [DONE]: cutting the upload (a full upload dir), or mid-way
+    through a window's results."""
+    client, stub = client_and_stub
+    if raises_in == "cutting":
+        def fixed(self):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(serving_transcriptions.WindowPlanner, "fixed", fixed)
+    else:
+        async def iter_result_chunks(request_id):
+            yield _Chunk("text", b" Hello")
+            raise RuntimeError("boom")
+
+        stub.iter_result_chunks = iter_result_chunks
+    with client.stream(
+        "POST", "/v1/audio/transcriptions",
+        data={"model": "whisper_large", "stream": "true"},
+        files={"file": ("a.wav", b"RIFF", "audio/wav")},
+    ) as r:
+        lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
+    assert json.loads(lines[-2][len("data: "):])["error"]["code"] == 500
+    assert lines[-1] == "data: [DONE]"
+
+
 def test_transcription_requires_a_file(client_and_stub):
     client, _ = client_and_stub
     r = client.post("/v1/audio/transcriptions", data={"model": "whisper_large"})
@@ -436,7 +463,7 @@ def test_sequential_long_form_carries_language_and_text(client_and_stub):
         _text("<|0.00|>", " Second window.", "<|10.00|>"),
         _text("<|0.00|>", " Tail.", "<|5.00|>"),
     ]
-    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
+    r = _post(client, {"model": "whisper_large", "long_form": "sequential", "response_format": "verbose_json"},
               filename="long.wav", content=_wav_bytes(65))
     assert r.status_code == 200, r.text
     body = r.json()
@@ -534,13 +561,16 @@ def test_client_gone_after_a_parallel_tail_releases_it_and_submits_nothing_more(
     stub.collect_results = collect_until_gone
     monkeypatch.setattr(Request, "is_disconnected", is_disconnected)
     # window 0 stopped inside a segment, so it has a tail to decode
+    # fewer than the upload's 20 windows, so some are left unsubmitted
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 8)
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off")]
     stub.queued_chunks += [_text("<|0.00|>", f" w{i}.", "<|29.00|>") for i in range(1, 30)]
     r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
                        "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(10 * 60))
     assert r.status_code == 200, r.text
-    # the first window's tail went out when that window came back, before the disconnect
-    assert len(stub.submits) == 2 + serving_transcriptions.PARALLEL_INFLIGHT
+    # the first window's tail went out when that window came back, before the disconnect;
+    # it counts against the upload's 8, so no ninth window went out
+    assert len(stub.submits) == 8 + 1
     # the tail's file is cut after every fixed window's, so it has the highest _wNNNN
     tail = max(stub.submits, key=lambda sub: sub["file_paths"]["audio"][0])["request_id"]
     assert tail in stub.released
@@ -566,7 +596,7 @@ def test_streaming_long_form_emits_every_window_in_order(client_and_stub):
     stub.queued_chunks = [_text("<|en|>", " one"), _text(" two")]
     with client.stream(
         "POST", "/v1/audio/transcriptions",
-        data={"model": "whisper_large", "stream": "true"},
+        data={"model": "whisper_large", "long_form": "sequential", "stream": "true"},
         files={"file": ("long.wav", _wav_bytes(45), "audio/wav")},
     ) as r:
         lines = [ln for ln in r.iter_lines() if ln.startswith("data:")]
@@ -654,7 +684,7 @@ def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
         _text("<|0.00|>", " Second.", "<|29.00|>"),
         _text("<|0.00|>", " Third.", "<|15.00|>"),
     ]
-    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
+    r = _post(client, {"model": "whisper_large", "long_form": "sequential", "response_format": "verbose_json"},
               filename="long.wav", content=_wav_bytes(65))
     assert r.status_code == 200, r.text
     body = r.json()
@@ -672,7 +702,8 @@ def test_sequential_seeks_to_the_last_closed_segment(client_and_stub):
 def test_sequential_json_decodes_windows_with_timestamps(client_and_stub):
     client, stub = client_and_stub
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " one", "<|29.50|>"), _text("<|0.00|>", " two", "<|15.00|>")]
-    r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(45))
+    r = _post(client, {"model": "whisper_large",
+        "long_form": "sequential"}, filename="long.wav", content=_wav_bytes(45))
     assert r.json() == {"text": "one two"}
     assert all(s["model_kwargs"]["timestamps"] == "segment" for s in stub.submits)
 
@@ -703,7 +734,7 @@ def test_repetitive_window_first_drops_the_prompt_then_warms_up(client_and_stub)
         _text("<|0.00|>", " Fine now.", "<|10.00|>"),   # 0.2 without the prompt: accepted
         _text("<|0.00|>", " The end.", "<|15.00|>"),
     ]
-    r = _post(client, {"model": "whisper_large", "response_format": "verbose_json"},
+    r = _post(client, {"model": "whisper_large", "long_form": "sequential", "response_format": "verbose_json"},
               filename="long.wav", content=_wav_bytes(75))
     body = r.json()
     assert body["text"] == "Hello there. Fine now. The end."
@@ -721,7 +752,8 @@ def test_window_accepted_hot_stops_conditioning_the_next(client_and_stub):
     stub.queued_chunks = [_text("<|en|>", "<|0.00|>", " Hello there.", "<|20.00|>")]
     stub.queued_chunks += [_text("<|0.00|>", loop, "<|29.00|>")] * 5   # prompt, no prompt, 0.2, 0.4, 0.6
     stub.queued_chunks += [_text("<|0.00|>", " Warm.", "<|10.00|>"), _text("<|0.00|>", " The end.", "<|15.00|>")]
-    r = _post(client, {"model": "whisper_large"}, filename="long.wav", content=_wav_bytes(75))
+    r = _post(client, {"model": "whisper_large",
+        "long_form": "sequential"}, filename="long.wav", content=_wav_bytes(75))
     assert r.json() == {"text": "Hello there. Warm. The end."}
     assert [s["model_kwargs"]["temperature"] for s in stub.submits] == [0.0, 0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 0.0]
     # the window accepted at 0.8 does not condition the one after it
@@ -811,6 +843,74 @@ def test_streamed_upload_files_are_deleted(client_and_stub):
 
 
 @requires_audio_duration
+@requires_audio_duration
+def test_a_finished_tail_frees_its_place_in_the_share(client_and_stub, monkeypatch):
+    """Tails are read as they land, so an upload whose windows all stop inside a
+    segment keeps its share instead of falling back to one window at a time."""
+    client, stub = client_and_stub
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 4)
+    tails, windows_out, seen = set(), [], []
+    real_tail, real_submit, collect = serving_transcriptions._tail, serving_transcriptions._submit, stub.collect_results
+
+    async def tail(*args):
+        window = await real_tail(*args)
+        if window is not None:
+            tails.add(id(window))
+        return window
+
+    def submit(api, adapter, req, window, streaming, inflight):
+        if id(window) not in tails:
+            windows_out.append(window)
+        return real_submit(api, adapter, req, window, streaming, inflight)
+
+    async def collect_window(request_id, raw_request=None):
+        # a tail comes back at once; a window lets the loop run first, as the engine would
+        if not any(w.request_id == request_id for w in windows_out):
+            return await collect(request_id, raw_request)
+        seen.append(len(windows_out))
+        await asyncio.sleep(0)
+        return await collect(request_id, raw_request)
+
+    monkeypatch.setattr(serving_transcriptions, "_tail", tail)
+    monkeypatch.setattr(serving_transcriptions, "_submit", submit)
+    stub.collect_results = collect_window
+    stub.next_chunks = _text("<|0.00|>", " Done.", "<|20.00|>", "<|20.40|>", " cut off")
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(8 * 30 + 25))
+    assert r.status_code == 200, r.text
+    assert len(tails) >= 7
+    # a window's tail holds a place until the next window is awaited, so the
+    # lookahead runs one behind 4; counted until read, it would stay at 4
+    assert seen[:6] == [4, 4, 5, 6, 7, 8]
+
+
+@requires_audio_duration
+def test_a_window_failing_while_a_tail_is_out_releases_the_tail(client_and_stub):
+    client, stub = client_and_stub
+    cut = _text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off")
+    stub.queued_chunks = [cut, [_Chunk("error", b"bad window", {"status": 400})], _text(" three")]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(85))
+    assert r.status_code == 400
+    # the tail went out after window 0 came back, and its read was cancelled with the request
+    assert len(stub.submits) == 4
+    assert stub.submits[3]["request_id"] in stub.released
+    assert not list(stub.upload_dir.iterdir())
+
+
+@requires_audio_duration
+def test_a_failed_tail_fails_the_upload(client_and_stub):
+    client, stub = client_and_stub
+    cut = _text("<|en|>", "<|0.00|>", " One.", "<|20.00|>", "<|20.40|>", " cut off")
+    stub.queued_chunks = [cut, _text("<|0.00|>", " Two.", "<|29.00|>"), _text("<|0.00|>", " Three.", "<|1.00|>"),
+                          [_Chunk("error", b"bad tail", {"status": 400})]]
+    r = _post(client, {"model": "whisper_large", "long_form": "parallel", "language": "en",
+                       "response_format": "verbose_json"}, filename="long.wav", content=_wav_bytes(61))
+    assert r.status_code == 400
+    assert "bad tail" in r.text
+    assert not list(stub.upload_dir.iterdir())
+
+
 def test_parallel_bounds_windows_in_flight(client_and_stub, monkeypatch):
     client, stub = client_and_stub
     monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 2)
@@ -827,6 +927,44 @@ def test_parallel_bounds_windows_in_flight(client_and_stub, monkeypatch):
               filename="long.wav", content=_wav_bytes(140))
     assert r.json() == {"text": "w0 w1 w2 w3 w4"}
     assert seen == [2, 3, 4, 5, 5]
+
+
+def test_uploads_split_the_concurrency_cap():
+    share = serving_transcriptions.WindowShare
+    assert share(cap=None, uploads=3).per_upload() == serving_transcriptions.PARALLEL_INFLIGHT
+    assert share(cap=64, uploads=1).per_upload() == serving_transcriptions.PARALLEL_INFLIGHT
+    assert share(cap=64, uploads=4).per_upload() == 16
+    assert share(cap=64, uploads=100).per_upload() == 1
+
+
+@requires_audio_duration
+@pytest.mark.parametrize("stream", [False, True])
+def test_an_upload_beside_another_keeps_its_half_of_the_cap(client_and_stub, stream):
+    """Windows past the cap would wait in the conductor with their audio staged,
+    so a second upload holds back the first's lookahead to its share."""
+    client, stub = client_and_stub
+    stub.window_share = serving_transcriptions.WindowShare(cap=4, uploads=1)
+    seen = []
+    collect, chunks = stub.collect_results, stub.iter_result_chunks
+
+    async def watching(request_id, raw_request=None):
+        seen.append(len(stub.submits))
+        return await collect(request_id, raw_request)
+
+    async def watching_chunks(request_id):
+        seen.append(len(stub.submits))
+        async for c in chunks(request_id):
+            yield c
+
+    stub.collect_results, stub.iter_result_chunks = watching, watching_chunks
+    stub.queued_chunks = [_text(f" w{i}") for i in range(5)]
+    data = {"model": "whisper_large", "long_form": "parallel"}
+    if stream:
+        data["stream"] = "true"
+    r = _post(client, data, filename="long.wav", content=_wav_bytes(140))
+    assert r.status_code == 200
+    assert seen == [2, 3, 4, 5, 5]
+    assert stub.window_share.uploads == 1
 
 
 def test_parallel_failure_releases_the_other_windows(client_and_stub):
@@ -874,12 +1012,6 @@ def test_undecodable_upload_is_a_400(client_and_stub, monkeypatch):
     decoders = types.SimpleNamespace(AudioDecoder=_Decoder)
     monkeypatch.setitem(sys.modules, "torchcodec", types.SimpleNamespace(decoders=decoders))
     monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
-    monkeypatch.setitem(sys.modules, "torchcodec._core.ops", types.SimpleNamespace(_FFMPEG_AVAILABLE=True))
-    # a fresh FFmpeg check, so this host's torchcodec and the fake don't answer for each other
-    from mstar.model.components import audio_features
-
-    check = audio_features._ffmpeg_decoder_loads
-    monkeypatch.setattr(audio_features, "_ffmpeg_decoder_loads", functools.cache(check.__wrapped__))
     data = {"model": "whisper_large", "long_form": "parallel"}
     r = _post(client, data, filename="long.wav", content=_wav_bytes(61))
     assert r.status_code == 400 and "could not decode" in r.text and "torchcodec" not in r.text
@@ -899,13 +1031,15 @@ def test_upload_longer_than_the_cap_is_rejected(client_and_stub, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mode, submitted", [("parallel", 1 + serving_transcriptions.PARALLEL_INFLIGHT), ("sequential", 2)],
+    "mode, submitted", [("parallel", 9), ("sequential", 2)],
 )
 def test_client_gone_mid_long_form_stops_submitting(client_and_stub, monkeypatch, mode, submitted):
     # collect_results aborts and returns [] once the client is gone; the
     # remaining windows must not be submitted after that
     from starlette.requests import Request
 
+    # fewer than the upload's 20 windows, so some are left unsubmitted
+    monkeypatch.setattr(serving_transcriptions, "PARALLEL_INFLIGHT", 8)
     client, stub = client_and_stub
     gone = False
     collect = stub.collect_results
@@ -929,3 +1063,9 @@ def test_client_gone_mid_long_form_stops_submitting(client_and_stub, monkeypatch
     assert len(stub.submits) == submitted
     assert set(stub.released) == {s["request_id"] for s in stub.submits[2:]}
     assert not list(stub.upload_dir.iterdir())
+
+
+@pytest.mark.parametrize("cls", [adapters.WhisperAdapter, adapters.Qwen3ASRAdapter])
+def test_asr_models_cut_a_long_upload_unless_asked_not_to(cls):
+    assert cls.long_form == "parallel"
+    assert (cls.window_seconds or cls.max_audio_seconds) == 30.0

@@ -1,11 +1,13 @@
 """The names an OpenAI request's ``model`` field may carry, as vLLM reads it.
 
 The base model's name runs the base model; with LoRA on (a ``resources: lora:`` block in
-the serving config), an adapter's name runs that adapter.
+the serving config), an adapter's name runs that adapter. Adapters come from the config
+and from runtime loads (``/v1/load_lora_adapter``), so the set changes while serving.
 """
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -18,13 +20,15 @@ from mstar.model.registry import model_init_kwargs
 
 
 class ServedModels:
-    """Read by request handlers."""
+    """Read by request handlers; changed by runtime loads and unloads. ``adapters`` is a
+    tuple replaced whole under a lock, so a reader always sees one consistent set."""
 
     def __init__(self, base: Iterable[str], adapters: Iterable[str] = (), lora: bool = False):
         # names that select the base model: the config's model name and its checkpoint repo
         self.base = frozenset(base)
         self._adapters: tuple[str, ...] = tuple(adapters)
         self.lora = lora or bool(self._adapters)
+        self._lock = threading.Lock()
 
     @classmethod
     def of(cls, model_name: str, model_config: Mapping[str, Any] | None) -> "ServedModels":
@@ -40,11 +44,26 @@ class ServedModels:
     def adapters(self) -> tuple[str, ...]:
         return self._adapters
 
+    def add(self, name: str) -> None:
+        with self._lock:
+            if name not in self._adapters:
+                self._adapters = (*self._adapters, name)
+
+    def remove(self, name: str) -> bool:
+        """Take ``name`` out of selection; False if it was not selectable."""
+        with self._lock:
+            if name not in self._adapters:
+                return False
+            self._adapters = tuple(a for a in self._adapters if a != name)
+            return True
+
     def adapter_for(self, requested: str | None) -> str | None:
         """The adapter a request's ``model`` names; None runs the base model.
 
         A deployment without LoRA does not read the field, as before LoRA. With LoRA on,
-        any other name that is not a selectable adapter is a ``ValueError`` (a 400).
+        any other name that is not a selectable adapter is a ``ValueError`` (a 400),
+        including one being unloaded: an unload takes the name out of selection here
+        before any worker hears of it.
         """
         if not self.lora or not requested or requested in self.base:
             return None
@@ -52,8 +71,8 @@ class ServedModels:
         return requested
 
     def check(self, adapter: object) -> None:
-        """Refuse (``ValueError``, a 400) an adapter name that is not served: how a
-        ``lora_adapter`` kwarg (``/generate``, ``extra_body``) is checked."""
+        """Refuse (``ValueError``, a 400) an adapter name that is not selectable now:
+        how a ``lora_adapter`` kwarg (``/generate``, ``extra_body``) is checked."""
         if not isinstance(adapter, str) or adapter not in self._adapters:
             raise ValueError(
                 f"unknown LoRA adapter {adapter!r}; this deployment serves "

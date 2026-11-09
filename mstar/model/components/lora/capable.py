@@ -62,14 +62,10 @@ class LoraCapable:
 
 
 class LoraBound:
-    """The delta slots of a bound (swapped) module: a forward mixin derives from this."""
+    """The delta slot of a bound (swapped) module: a forward mixin derives from this."""
 
     # set at bind (``bind_module_lora``); class-level None until then
     lora_delta: "LoraLayerDelta | None" = None
-    # a delta bound for the node to add itself (``module_lora_spec(deferred=...)``): the
-    # module's own forward never adds it, since the node also calls the module outside
-    # its planned step (e.g. embedding a prompt in ``prepare_inputs``)
-    lora_deferred: "LoraLayerDelta | None" = None
 
 
 class LoraOutputAdd(LoraBound):

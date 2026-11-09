@@ -267,11 +267,11 @@ class KVPlanOutput:
     ):
         self.cpu_indptrs = cpu_indptrs
         # packing in plan order w/h 1 view per segment covered by plan; a plan
-        # off the KV manager's cache hands a builder instead and the views are
-        # made on first use (the FlashInfer path never asks for them)
+        # built from columns hands a builder instead and the views are made on
+        # first use (the FlashInfer path never asks for them)
         self._views = views
         self._view_builder = view_builder
-        # a decode step planned off the previous one (KVManager's plan cache):
+        # a decode step's (every row one token, each with a page to write):
         # each row's write page and offset in it, so staging need not walk the views
         self.decode_pages = decode_pages
         self.decode_offsets = decode_offsets

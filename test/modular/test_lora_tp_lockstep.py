@@ -417,13 +417,13 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict, axis: st
     group.initialized = True
     group.init_all_reduce()
     if axis == "tp":
-        info = EngineResourceInfo(device=torch.device("cpu"),
-                                  joint_comm_group=JointGroups(tp_group=group, sp_group=CommGroup.trivial()))
+        joint = JointGroups(tp_group=group, sp_group=CommGroup.trivial(), instance=group)
+        info = EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint)
     else:
         # a node placing its KV positions over its 2 SP ranks: heads over TP alone (1), and every
         # SP rank runs every row
-        info = EngineResourceInfo(device=torch.device("cpu"), head_shards=1,
-                                  joint_comm_group=JointGroups(tp_group=CommGroup.trivial(), sp_group=group))
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
+        info = EngineResourceInfo(device=torch.device("cpu"), head_shards=1, joint_comm_group=joint)
     pool = LoraAdapterPool.build(make_spec(lora_paths, max_slots=2, cpu_capacity=1), info)
     if rank == 1:
         read = pool.store._read

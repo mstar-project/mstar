@@ -1,11 +1,14 @@
 """Ulysses sequence parallelism on CPU processes over gloo.
 
-``CommGroup.all_to_all`` against the layout it promises, on even and uneven
-splits, and of several tensors at once against one at a time; and
+``CommGroup.all_to_all`` and ``gather_sequence`` against the layout they promise, on
+even and uneven splits and over negative dims, and of several tensors at once against
+one at a time; and
 ``ulysses_attention`` over sharded tokens against one rank attending the whole
 sequence (with fewer key/value heads than query heads too), for the
-``[S, H, D]`` and ``[B, S, H, D]`` layouts; and ``gather_merge``, a replicated query
-over sharded keys merged by log-sum-exp, against one rank attending all the keys.
+``[S, H, D]`` and ``[B, S, H, D]`` layouts; ``gather_merge``, a replicated query over sharded
+keys merged by log-sum-exp, against one rank attending all the keys; a compiled stack over packs
+of new lengths, without recompiling; and the Wan2.2 DiT under Ulysses against the same DiT on one
+rank.
 """
 
 from __future__ import annotations
@@ -19,7 +22,12 @@ import torch.nn.functional as F
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.context_parallel import gather_merge, merge
 from mstar.model.components.diffusion.attention import sdpa_attention
-from mstar.model.components.distributed.sequence_parallel import sp_seq_split, ulysses_attention
+from mstar.model.components.distributed.sequence_parallel import (
+    gather_sequence,
+    scatter_sequence,
+    sp_seq_split,
+    ulysses_attention,
+)
 
 HEADS = 6
 
@@ -66,6 +74,7 @@ def _exchanges(rank, world, total, batched, negative):
     assert torch.equal(heads, full.narrow(head_dim, rank * per_rank, per_rank))
     back = group.all_to_all(heads, scatter_dim=seq, gather_dim=head, scatter_sizes=sizes)
     assert torch.equal(back, shard)
+    assert torch.equal(gather_sequence(group, shard, sizes, dim=seq), full)
 
 
 @pytest.mark.parametrize("negative", [False, True], ids=["dims", "negative-dims"])
@@ -152,3 +161,72 @@ def _bf16_partials(rank, world):
 def test_gather_merge_of_bf16_partials_is_the_fp32_merge_bit_for_bit(tmp_path):
     """The out travels at its own width and the lse in fp32, one byte tensor viewed back per dtype."""
     _run(_bf16_partials, 2, tmp_path / "store")
+
+
+def _compiled_packs(rank, world):
+    """The compiled stack Cosmos3's batched denoise step runs, over packs whose length varies:
+    the per-rank split comes from the dynamic length, so no new length, whatever its remainder
+    by the group size, may recompile."""
+    group = _group(rank, world)
+
+    def stack(q, k, v):
+        sizes = sp_seq_split(q.shape[0], world)
+        q, k, v = (scatter_sequence(group, t, sizes) for t in (q, k, v))
+        for _ in range(2):
+            q = ulysses_attention(group, q, k, v, _sdpa(batched=False), sizes)
+        return gather_sequence(group, q, sizes)
+
+    # Serving compiles once, at one even pack (Cosmos3's `warmup_compiles`, two equal requests),
+    # with the length dynamic; every later length, uneven split or not, reuses that compile. 30
+    # splits evenly at SP2 and SP3 into shards that match no other dimension: a warm-up pack that
+    # does match one is `warmup_compiles`'s to handle (test_denoise_compile.py).
+    compiled = torch.compile(stack, backend="eager", dynamic=True)
+    for i, total in enumerate((30, 7, 9, 22, 13, 8, 31, 10, 12)):
+        q, k, v = (_full(total, batched=False, seed=seed) for seed in range(3))
+        with torch.compiler.set_stance("fail_on_recompile" if i >= 1 else "default"):
+            out = compiled(q, k, v)
+        attend = _sdpa(batched=False)
+        torch.testing.assert_close(out, attend(attend(q, k, v), k, v))
+
+
+@pytest.mark.parametrize("world", [2, 3])
+def test_compiled_sequence_parallel_stack_takes_new_pack_lengths_without_recompiling(tmp_path, world):
+    _run(_compiled_packs, world, tmp_path / "store")
+
+
+def _wan_dit_forward(grid, sp_group=None) -> torch.Tensor:
+    from mstar.model.wan22.components.dit import Wan22DiT
+    from mstar.model.wan22.config import Wan22Config
+
+    config = Wan22Config(
+        num_attention_heads=6, attention_head_dim=12, num_layers=2, ffn_dim=32,
+        in_channels=4, out_channels=4, text_dim=8, freq_dim=16, rope_max_seq_len=16,
+    )
+    torch.manual_seed(0)
+    dit = Wan22DiT(config, sp_group=sp_group)
+    for param in dit.parameters():
+        torch.nn.init.normal_(param, std=0.2)
+    gen = torch.Generator().manual_seed(1)
+    frames, height, width = grid
+    latents = torch.randn(1, 4, frames, height, width, generator=gen)
+    timestep = torch.rand(1, frames, generator=gen) * 1000
+    text = torch.randn(1, 5, 8, generator=gen)
+    with torch.no_grad():
+        return dit(latents, timestep, text)
+
+
+def _wan_dit(rank, world, grid, out_path):
+    out = _wan_dit_forward(grid, _group(rank, world))
+    if rank == 0:
+        torch.save(out, out_path)
+
+
+@pytest.mark.parametrize("grid", [(2, 4, 4), (3, 2, 6), (3, 4, 6)], ids=["even", "uneven", "runs"])
+def test_wan_dit_under_ulysses_matches_one_rank(tmp_path, grid):
+    """Each SP rank keeps its slice of the tokens, their RoPE and their
+    frames' timesteps, and the gathered output is the one-rank DiT's. Over two
+    ranks, 8 tokens split on whole frames, 9 cut a frame (modulation per
+    token), and 18 split 9/9 cut a frame of 6 (modulation per half
+    frame)."""
+    _run(_wan_dit, 2, tmp_path / "two", grid, str(tmp_path / "two.pt"))
+    torch.testing.assert_close(torch.load(tmp_path / "two.pt"), _wan_dit_forward(grid))

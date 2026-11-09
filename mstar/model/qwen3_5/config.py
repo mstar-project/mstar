@@ -8,80 +8,31 @@ import json
 from dataclasses import dataclass, fields
 from pathlib import Path
 
+from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
+from mstar.model import keys
+from mstar.model.components.qwen_vision import QwenVisionConfig
+
 LINEAR_ATTENTION = "linear_attention"
 FULL_ATTENTION = "full_attention"
 
-# text prefill and decode rows batched in one step (Model.get_combined_graph_walks)
-LLM_MIXED = "mixed"
-# Prompt rows a mixed step may carry: its GDN runs them on the chunked kernel,
-# which gathers and scatters each one's whole state (`GDNMixedWrapper`), and
-# the decode rows on the decode kernel.
-MIXED_MAX_PREFILL_ROWS = 4
-
-# resource keys this model declares
-KV_CACHE = "kv_cache"
+# resource keys this model declares; the shared scaffolds read `keys`' ones
+KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
 GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
-ROPE = "rope"
-SAMPLER = "sampler"
+ROPE = keys.ROPE
+SAMPLER = keys.SAMPLER
+# per-request LoRA adapters, declared only when the serving YAML turns them on: the
+# LLM's, and the vision encoder's (sized by the same YAML block)
+LORA = LORA_RESOURCE_KEY
+VISION_LORA = f"vision_{LORA_RESOURCE_KEY}"
 # the ViT tower's cacheless attention, on the `vision_encoder` node
-VISION_ATTN = "vision_attn"
+VISION_ATTN = keys.VISION_ATTN
 
 
-@dataclass
-class Qwen3_5VisionConfig:
-    """The ViT tower's own config, read off ``config.json``'s ``vision_config``."""
-
-    depth: int
-    hidden_size: int
-    intermediate_size: int
-    num_heads: int
-    in_channels: int
-    patch_size: int
-    temporal_patch_size: int
-    spatial_merge_size: int
-    num_position_embeddings: int
-    out_hidden_size: int
-
-    hidden_act: str = "gelu_pytorch_tanh"
-    rope_theta: float = 10_000.0
-    # Kept only so a checkpoint that sets it fails loudly: `[]` on every
-    # released size and unread by transformers' Qwen3.5 (live in Qwen3-VL).
-    deepstack_visual_indexes: tuple[int, ...] = ()
-
-    @property
-    def head_dim(self) -> int:
-        return self.hidden_size // self.num_heads
-
-    @property
-    def num_grid_per_side(self) -> int:
-        """The learned position table is a square grid."""
-        return int(self.num_position_embeddings**0.5)
-
-    @property
-    def merge_unit(self) -> int:
-        return self.spatial_merge_size**2
-
-    @classmethod
-    def from_hf(cls, path: str | Path) -> "Qwen3_5VisionConfig":
-        config = cls.from_hf_or_none(path)
-        if config is None:
-            raise ValueError(f"{path} has no `vision_config`")
-        return config
-
-    @classmethod
-    def from_hf_or_none(cls, path: str | Path) -> "Qwen3_5VisionConfig | None":
-        """None when the checkpoint is text-only."""
-        path = Path(path)
-        if path.is_dir():
-            path = path / "config.json"
-        raw = json.loads(path.read_text()).get("vision_config")
-        if raw is None:
-            return None
-        merged = {**raw, **raw.get("rope_parameters", {})}
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in merged.items() if k in known})
+# The ViT tower's config is the shared Qwen one (read off ``config.json``'s
+# ``vision_config``); Qwen3.5 refuses deepstack in ``Qwen3_5VisionModel``.
+Qwen3_5VisionConfig = QwenVisionConfig
 
 
 @dataclass

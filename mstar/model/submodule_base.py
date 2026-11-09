@@ -212,6 +212,10 @@ class StopPolicy:
     # AR, EOS: the resource label whose request config carries ``ignore_eos``;
     # None means EOS is never ignored
     sampler: str | None = None
+    # AR, EOS: for a node with no such resource, whether the request ignores EOS,
+    # in place of ``sampler``. Evaluated with ``max_iters``, on the info of the node's
+    # partition.
+    ignores_eos: Callable[[CurrentForwardPassInfo], bool] | None = None
     # the request's iteration limit for this loop; evaluated once per request
     # and walk, not per step. None is ``info.max_tokens``.
     max_iters: Callable[[CurrentForwardPassInfo], int] | None = None
@@ -231,7 +235,9 @@ class StopPolicy:
         if self.kind is not StopKind.EOS:
             max_iters = int(info.max_tokens if self.max_iters is None else self.max_iters(info))
         ignore_eos = False
-        if self.reads_token and self.sampler is not None:
+        if self.reads_token and self.ignores_eos is not None:
+            ignore_eos = bool(self.ignores_eos(info))
+        elif self.reads_token and self.sampler is not None:
             config = info.resource_configs.get(self.sampler)
             ignore_eos = bool(getattr(config, "ignore_eos", False))
         return StopLimits(max_iters, ignore_eos)
@@ -838,10 +844,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
     # autocast, and explicitly disables any ambient one.
     disable_autocast: bool = False
     # Walks whose steps may run beside the worker's main chain, on a second
-    # stream (``mstar.worker.side_steps``); they do where the node's group in
+    # stream (``StepPipeline._launch_side``); they do where the node's group in
     # the serving config sets ``side_stream: true``. For a stream-fed walk that
     # no chain step waits on. Where the config asks, ``EngineManager.build``
-    # (``_side_lane_keys``) refuses a TP or SP node, a node alone on its
+    # (``_side_lane_keys``) refuses a TP, SP or CFG node, a node alone on its
     # worker, a device without streams, a node that also has chain walks or
     # holds resources, and a side walk that is not the node's alone, is part
     # of a combined walk, or has output spans or a stop check.
@@ -1278,9 +1284,10 @@ class NodeSubmodule(torch.nn.Module, ABC):
         """Return the piecewise CUDA graph configs this submodule opts into.
 
         ``autocast_dtype`` is this node's resolved dtype, float32 for a node with
-        ``disable_autocast`` — passed so a config's ``make_static_inputs`` can
-        allocate the hidden-state buffer in the dtype the captured region runs
-        under (avoids a copy-time upcast at replay).
+        ``disable_autocast``, passed so a config's ``make_static_inputs`` can
+        allocate each input buffer in the dtype the eager path hands the region,
+        often that one. The replay copies into the buffer and refuses a value the
+        buffer may round.
 
         A piecewise CUDA graph captures ONE inner callable of this submodule's
         forward (e.g. a transformer block loop) as a CUDA graph while the

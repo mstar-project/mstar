@@ -17,6 +17,7 @@ sys.path.insert(0, ".")
 
 import mstar.engine.engine as engine_module  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.distributed.communication import CommGroup, JointGroups  # noqa: E402
 from mstar.engine.engine import Engine, ExecutingBatch  # noqa: E402
 from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule  # noqa: E402
@@ -54,18 +55,11 @@ class _Recorder(NodeSubmodule):
         return {"y": [x @ self.weight]}
 
 
-class _Rank:
-    world_size = 1
-
-    def barrier(self):
-        pass
-
-
 class _Groups:
     """A single-rank worker: no node is sharded."""
 
     def get_joint_group_for_node(self, node):
-        return type("_Joint", (), {"world_size": 1, "tp_group": _Rank(), "sp_group": _Rank()})()
+        return JointGroups(CommGroup.trivial(), CommGroup.trivial(), CommGroup.trivial())
 
     def get_instance_world_size_for_node(self, node):
         return 1
@@ -209,6 +203,7 @@ def test_capture_runs_under_the_node_precision(monkeypatch):
     class _Region:
         any_graphs = False
         dropped_shapes = ()
+        required = False
 
         def __init__(self, node):
             self.node = node
@@ -330,14 +325,13 @@ def test_a_thread_started_during_a_forward_keeps_the_node_setting():
     initializer applies only the per-thread dynamo config."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from mstar.worker.worker import Worker
+    from mstar.testing_utils.worker import make_worker
 
-    worker = Worker.__new__(Worker)  # skips __init__, which opens sockets
-    worker.device = torch.device("cpu")
+    worker = make_worker(device=torch.device("cpu"))
 
     class _StartsAThread(_Recorder):
         def forward(self, graph_walk, engine_inputs, x, **kwargs):
-            with ThreadPoolExecutor(1, initializer=worker._init_engine_thread) as ex:
+            with ThreadPoolExecutor(1, initializer=worker.executor._init_engine_thread) as ex:
                 ex.submit(lambda: None).result()
             return super().forward(graph_walk, engine_inputs, x, **kwargs)
 

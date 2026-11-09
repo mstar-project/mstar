@@ -40,6 +40,7 @@ from mstar.engine.resources.step import (
     SubmoduleStep,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.testing_utils.engine import make_engine
 
 PAGE = 16
 
@@ -249,17 +250,13 @@ class _Sub:
 
 
 def _engine(resources: dict) -> Engine:
-    eng = Engine.__new__(Engine)
-    eng._runner = StepRunner(resources)
-    eng._enable_nvtx = False
-    eng._enable_profile = False
-    eng._device = torch.device("cpu")
-    eng._tp_follower_nodes = set()
-    eng._pre_plan_done = {}
-    eng._submodules = {"n": SubmoduleManagement(
-        submodule=_Sub(list(resources)), forward=None, forward_batched=None,
-        joint_comm_group=None, resources=resources, head_shards=1,
-    )}
+    eng = make_engine(
+        _runner=StepRunner(resources),
+        _submodules={"n": SubmoduleManagement(
+            submodule=_Sub(list(resources)), forward=None, forward_batched=None,
+            joint_comm_group=None, resources=resources, head_shards=1,
+        )},
+    )
     return eng
 
 

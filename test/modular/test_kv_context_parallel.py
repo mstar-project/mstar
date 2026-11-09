@@ -33,7 +33,13 @@ from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.engine import Engine
 from mstar.engine.resources.attn import flashinfer as fi_mod
 from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
+from mstar.engine.resources.attn.config import (
+    AttentionConfig,
+    AttentionSpec,
+    AttentionStep,
+    AttnBackend,
+    BlockCausalAttentionSpec,
+)
 from mstar.engine.resources.base import EngineResourceInfo, Resource
 from mstar.engine.resources.context_parallel import ContextParallelWrapper, merge
 from mstar.engine.resources.kv import manager as manager_mod
@@ -65,7 +71,7 @@ def _placed(rank: int) -> KVCache:
         num_layers=2, num_kv_heads=1, head_dim=2, max_seq_len=64, num_qo_heads=2, max_num_pages=4,
         page_size=8, context_parallel=True,
     )
-    joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial(), instance=_group(rank, P))
     return KVCache(config, CPU, torch.float32, config.place(joint, "kv"))
 
 
@@ -73,7 +79,8 @@ def _manager(rank: int, cfg: PagedKVConfig) -> KVManager:
     # what `KVManager.build` does first: TP placement shards heads over the TP ranks
     cfg.shard(P)
     kv = KVManager(
-        cfg=cfg, name="kv", joint_comm_group=JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial()),
+        cfg=cfg, name="kv",
+        joint_comm_group=JointGroups(tp_group=_group(rank, P), sp_group=CommGroup.trivial(), instance=_group(rank, P)),
         transfer_engine_info=None, device=CPU, dtype=torch.float32,
     )
     kv.enable_prefix_cache(ROOT, WALKS)
@@ -266,20 +273,27 @@ def test_an_sp_placed_node_shards_heads_over_tp_and_refuses_a_dependent_without_
         )
 
 
-def test_mla_attention_over_a_placed_pool_is_refused_at_load():
+@pytest.mark.parametrize("kv, attn_spec, manager", [
+    (dict(head_dim=576, layout=KVLayout.MLA, kv_lora_rank=512, qk_rope_head_dim=64),
+     lambda: AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(
+         kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=0.1,
+     )), "FlashInferMLAManager"),
+    (dict(head_dim=64),
+     lambda: BlockCausalAttentionSpec(resource_key="attn", nodes={NODE}, block_size=8, config=AttentionConfig(
+         kv_cache="kv", backend=AttnBackend.FLASHINFER,
+     )), "FlashInferBlockCausalManager"),
+], ids=["mla", "block_causal"])
+def test_attention_over_a_placed_pool_that_cant_plan_it_is_refused_at_load(kv, attn_spec, manager):
     groups = WorkerParallelGroups(num_workers=P, global_rank=0)
     groups.add_sp(NODE, _group(0, P))
-    latent = dict(head_dim=576, layout=KVLayout.MLA, kv_lora_rank=512, qk_rope_head_dim=64)
     specs = [
         KVSpec(resource_key="kv", nodes={NODE}, config=PagedKVConfig(
             num_layers=1, num_kv_heads=1, max_seq_len=256, num_qo_heads=4, max_num_pages=8, page_size=PAGE_SIZE,
-            context_parallel=True, **latent,
+            context_parallel=True, **kv,
         )),
-        AttentionSpec(resource_key="attn", nodes={NODE}, config=AttentionConfig(
-            kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=0.1,
-        )),
+        attn_spec(),
     ]
-    with pytest.raises(ValueError, match="'attn' .FlashInferMLAManager. does not support context parallelism.*'kv'"):
+    with pytest.raises(ValueError, match=f"'attn' .{manager}. does not support context parallelism.*'kv'"):
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=groups, device=CPU, transfer_engine_info=None,
         )
@@ -552,8 +566,8 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
     group.device_group, group.initialized = dist.group.WORLD, True
     graph = None
     try:
-        joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=group) if over_sp
-                 else JointGroups(tp_group=group, sp_group=CommGroup.trivial()))
+        joint = (JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group) if over_sp
+                 else JointGroups(tp_group=group, sp_group=CommGroup.trivial(), instance=group))
         dtype = torch.bfloat16 if cuda else torch.float32
         attn, placement = _cp_attention(joint, device, dtype)
         case = _Case.build(rows, device, dtype, padding)
@@ -629,7 +643,7 @@ def _over_ranks(rank, world, backend, store, over_sp, rows, captured=False, padd
     (dict(flashinfer_backend="cudnn"), "flashinfer_backend 'cudnn'"),
 ])
 def test_attention_a_placed_pool_cannot_serve_is_refused_at_build(attention, refused):
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     with pytest.raises(ValueError, match=f"'attn': {refused} is unsupported over KV pool 'kv'"):
         _cp_attention(joint, CPU, torch.float32, **attention)
 
@@ -648,7 +662,7 @@ def test_a_pool_that_keeps_a_sliding_window_is_refused_a_placement():
         context_parallel=True,
     )
     config.keep_window(16, (1,))
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     with pytest.raises(ValueError, match="context_parallel is unsupported over a pool that keeps a sliding window"):
         config.place(joint, "kv")
 
@@ -696,7 +710,7 @@ def test_a_captured_buckets_padding_merges_to_0_and_reaches_no_real_row(monkeypa
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
     context = types.SimpleNamespace(plan=lambda **kwargs: None)
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, placement = _cp_attention(joint, CPU, torch.float32)
     case = _Case.build(PREFILL_ROWS, CPU, torch.float32, padding=padding)
     n, pad = case.q.shape[0], padding[0] * padding[1] + 8
@@ -729,7 +743,7 @@ def test_a_captured_step_exchanges_with_no_stored_context(monkeypatch):
         return out[None], lse[None]
 
     monkeypatch.setattr(ContextParallelWrapper, "_exchange_partials", exchange)
-    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+    joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
     attn, placement = _cp_attention(joint, CPU, torch.float32)
     case = _Case.build(((0, 5), (0, 3)), CPU, torch.float32)
     _plan(attn, case, bucket=BucketKey("w", bs=2, num_tokens=8))
@@ -747,7 +761,7 @@ def test_a_capture_combining_labels_over_a_placed_pool_is_refused_at_load_if_it_
         capture_graph_walk="decode", single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
         capture_batch_sizes=batch_sizes, total_tokens_multiplier=multiplier,
     )
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     kv = types.SimpleNamespace(can_capture=lambda: True, placement=PagedKVConfig(
         num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=8, context_parallel=True,
     ).place(joint, "kv"))
@@ -783,7 +797,7 @@ def test_a_dropped_preplan_leaves_its_own_token_wrappers_nothing_to_skip(monkeyp
     # the captured context wrapper stages its plan through a CUDA event; this needs only the own part
     context = types.SimpleNamespace(plan=lambda **kwargs: None)
     monkeypatch.setattr(fi_mod, "FlashInferPrefillWrapper", lambda **kwargs: context)
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, _ = _cp_attention(joint, CPU, torch.float32)
     case = _Case.build(PREFILL_ROWS, CPU, torch.float32)
     lease = SlotLease(1, BucketKey(graph_walk="w", bs=len(PREFILL_ROWS), num_tokens=16))
@@ -802,7 +816,7 @@ def test_a_placed_pool_plans_on_fa2_for_auto_from_sm100(monkeypatch):
     to read right."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     monkeypatch.setattr(fi_mod, "current_platform", types.SimpleNamespace(cuda_capability=lambda device=None: (10, 0)))
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, _ = _cp_attention(joint, CPU, torch.float32)
     assert attn._wrapper_kv_kwargs["backend"] == attn._new_kwargs["backend"] == "fa2"
 
@@ -824,9 +838,9 @@ def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, ba
     platform = types.SimpleNamespace(cuda_capability=lambda device=None: capability)
     monkeypatch.setattr(fi_mod, "current_platform", platform)
     if over_sp:
-        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P))
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=_group(0, P), instance=_group(0, P))
     else:
-        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+        joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     if outcome == "refused":
         with pytest.raises(ValueError, match="'fa2' is refused over an SP-placed pool on SM90"):
             _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
@@ -841,7 +855,7 @@ def test_tp_placed_decode_runs_on_tensor_cores_whatever_decode_tensor_cores_says
     CUDA-core decode has no kernel for unless it is one of a few sizes."""
     monkeypatch.setenv("MSTAR_WORKSPACE_BUFFER_MB", "1")
     monkeypatch.setitem(sys.modules, "flashinfer", _reference_flashinfer())
-    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial())
+    joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     attn, _ = _cp_attention(joint, CPU, torch.float32, decode_tensor_cores=False)
     _plan(attn, _Case.build(DECODE_ROWS, CPU, torch.float32))
     assert attn._current_plan_states["main"].context.attn_wrapper.use_tensor_cores

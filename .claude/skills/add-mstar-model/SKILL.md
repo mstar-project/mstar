@@ -170,6 +170,8 @@ Establish CPU-bound or GPU-bound first; the benchmarking skill covers how (`even
 
 Two things that are settled: a host sync in your `prepare_inputs` hides inside that phase rather than in `event_sync`, and a host-bound step gets faster by deleting work, not by moving it to another thread. Values already known on the host travel in `step_metadata`.
 
+Phase 4's reuse note holds for tuning too, and for models already in the repo: before optimizing a layer, check `mstar/model/components/` for a shared version of it (for example `snake.py`, a codec decoder's Snake activation in one pass).
+
 If tuning pushes you into the worker or engine rather than your model, read the [async-worker skill](../async-worker/SKILL.md) first.
 
 ## Done means

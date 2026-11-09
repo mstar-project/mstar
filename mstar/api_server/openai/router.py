@@ -11,7 +11,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Request, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from mstar.api_server.body_limit import max_body_bytes
 from mstar.api_server.openai import (
@@ -22,15 +22,17 @@ from mstar.api_server.openai import (
     serving_transcriptions,
     serving_videos,
 )
-from mstar.api_server.openai._util import error_type, now
+from mstar.api_server.openai._util import MediaJSONResponse, error_type, now
 from mstar.api_server.openai.adapters import get_adapter
 from mstar.api_server.openai.protocol import (
     ChatCompletionRequest,
     ImageGenerationRequest,
+    LoadLoraAdapterRequest,
     ModelCard,
     ModelList,
     SpeechRequest,
     TranscriptionRequest,
+    UnloadLoraAdapterRequest,
     VideoGenerationRequest,
 )
 from mstar.utils.client_errors import client_error_text
@@ -113,6 +115,30 @@ async def list_models():
         for name in api.served_models.adapters
     ]
     return JSONResponse(ModelList(data=cards).model_dump(exclude_none=True))
+
+
+async def _lora_admin_call(call, route: str):
+    """A ``LoraAdmin`` call's answer, or its failure as an OpenAI error envelope
+    (:func:`_exception_error`)."""
+    api = _api()
+    if api is None:
+        return _error(503, "Server not ready")
+    try:
+        return PlainTextResponse(await call(api.lora_admin))
+    except Exception as e:  # noqa: BLE001 — surface as an OpenAI error envelope
+        return _exception_error(e, route)
+
+
+@router.post("/v1/load_lora_adapter")
+async def load_lora_adapter(request: LoadLoraAdapterRequest):
+    return await _lora_admin_call(
+        lambda admin: admin.load(request.lora_name, request.lora_path), "/v1/load_lora_adapter",
+    )
+
+
+@router.post("/v1/unload_lora_adapter")
+async def unload_lora_adapter(request: UnloadLoraAdapterRequest):
+    return await _lora_admin_call(lambda admin: admin.unload(request.lora_name), "/v1/unload_lora_adapter")
 
 
 @router.post("/v1/chat/completions")
@@ -220,7 +246,7 @@ async def images_generations(request: ImageGenerationRequest, raw_request: Reque
         result = await serving_images.create_images(api, model_name, adapter, request, raw_request)
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/images/generations")
-    return JSONResponse(result)
+    return MediaJSONResponse(result)
 
 
 @router.post("/v1/videos/generations")
@@ -234,7 +260,7 @@ async def videos_generations(request: VideoGenerationRequest, raw_request: Reque
         return _exception_error(e, "/v1/videos/generations")
     if (request.model_extra or {}).get("stream_video"):
         return result  # serving_videos builds the streaming response
-    return JSONResponse(result)
+    return MediaJSONResponse(result)
 
 
 @router.post("/v1/images/edits")
@@ -278,4 +304,4 @@ async def images_edits(request: Request):
         )
     except Exception as e:  # noqa: BLE001
         return _exception_error(e, "/v1/images/edits")
-    return JSONResponse(result)
+    return MediaJSONResponse(result)

@@ -24,6 +24,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+import pytest
 from api_server_helpers import StandInSocket, make_test_api_server
 
 from mstar.api_server.entrypoint import PendingRequest
@@ -35,9 +36,11 @@ from mstar.api_server.request_types import (
 )
 from mstar.communication.event import EventWakeup
 from mstar.profile.format import RequestProfile, RequestTiming
+from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ConductorMessageType, FailRequests
-from mstar.worker.micro_scheduler import CHAIN_LANE, MicroScheduler, ScheduledBatch
-from mstar.worker.worker import PendingBatch, Worker
+from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
+from mstar.worker.step_executor import PendingBatch
 
 # ── worker ─────────────────────────────────────────────────────────────────
 
@@ -62,35 +65,33 @@ class _Runtime:
 
 
 def _worker(known_rids=("r1", "r2")):
-    w = Worker.__new__(Worker)
-    w.worker_id = "w0"
-    w.sent = []
-    w.communicator = SimpleNamespace(
-        send=lambda entity_id, msg: w.sent.append((entity_id, msg))
-    )
-    w.request_state = SimpleNamespace(
+    sent = []
+    request_state = SimpleNamespace(
         per_request_info={rid: object() for rid in known_rids}
     )
     # Identity interning: the rid string doubles as its own handle here.
-    w._graph_runtime = _Runtime(known_rids)
-    w.scheduler = MicroScheduler.__new__(MicroScheduler)
-    w.scheduler.failed_rids = set()
-    w.scheduler.read_failed_rids = set()
-    w.scheduler.held_until = {}
-    w.scheduler.admit_errors = {}
-    w.scheduler.backlog = {}
+    runtime = _Runtime(known_rids)
+    scheduler = make_scheduler(request_state=request_state, graph_runtime=runtime)
+    w = make_worker(
+        communicator=SimpleNamespace(send=lambda entity_id, msg: sent.append((entity_id, msg))),
+        request_state=request_state, graph_runtime=runtime,
+        scheduler=scheduler, admission=scheduler.admission, lockstep=scheduler.lockstep,
+    )
+    w.sent = sent
+    for rid in known_rids:
+        w.lifecycle.add(rid, rid)
     return w
 
 
 def test_fail_requests_reports_per_rid_errors_once():
     w = _worker()
-    w._fail_requests({"r1": "boom", "r2": "bang"})
+    w.pipeline._fail_requests({"r1": "boom", "r2": "bang"})
     assert len(w.sent) == 1
     entity, msg = w.sent[0]
     assert entity == "conductor"
     assert msg.message_type == ConductorMessageType.FAIL_REQUESTS
     assert msg.body == FailRequests(errors={"r1": "boom", "r2": "bang"})
-    assert w.scheduler.failed_rids == {"r1", "r2"}
+    assert w.lifecycle.failed_rids == {"r1", "r2"}
 
 
 def test_fail_requests_ignores_rids_the_worker_already_dropped():
@@ -98,9 +99,9 @@ def test_fail_requests_ignores_rids_the_worker_already_dropped():
     start one for a request it no longer tracks, so reporting an unknown rid
     would pin it in failed_rids forever."""
     w = _worker(known_rids=("r1",))
-    w._fail_requests({"gone": "boom"})
+    w.pipeline._fail_requests({"gone": "boom"})
     assert w.sent == []
-    assert w.scheduler.failed_rids == set()
+    assert w.lifecycle.failed_rids == set()
 
 
 def _pending_batch(rids, future=None):
@@ -109,7 +110,7 @@ def _pending_batch(rids, future=None):
             node_name="node", graph_walk="walk",
             request_to_worker_graph={rid: "wg" for rid in rids},
         ),
-        # _handle_main_loop_error works off the ScheduledBatch alone; the
+        # _handle_error works off the ScheduledBatch alone; the
         # ExecutingBatch is never touched on this path.
         node_batch=None, node_name="node",
         partition="default", graph_walk="walk", future=future,
@@ -122,12 +123,12 @@ def test_crashed_forward_fails_the_whole_batch():
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         w = _worker()
-        w._hold_rows(CHAIN_LANE, {"r1"})
+        w.pipeline._hold_rows(CHAIN_LANE, {"r1"})
         pending = _pending_batch(["r1"], future=executor.submit(lambda: 1 / 0))
         try:
             pending.future.result()
         except ZeroDivisionError as exc:
-            w._handle_main_loop_error(exc, (pending, None), None)
+            w.pipeline._handle_error(exc, (pending, None), None)
 
         assert len(w.sent) == 1
         errors = w.sent[0][1].body.errors
@@ -154,11 +155,10 @@ def test_error_handler_drains_the_speculative_batch_still_on_the_gpu():
 
     try:
         w = _worker()
-        w._in_flight_rids = set()
         spec = _pending_batch(["r2"], future=executor.submit(_slow))
         started.wait(10)
         release.set()
-        w._handle_main_loop_error(RuntimeError("boom"), (None, spec), None)
+        w.pipeline._handle_error(RuntimeError("boom"), (None, spec), None)
 
         assert spec.future.done()
         assert set(w.sent[0][1].body.errors) == {"r2"}
@@ -169,12 +169,12 @@ def test_error_handler_drains_the_speculative_batch_still_on_the_gpu():
 
 def test_error_handler_also_fails_the_batch_built_this_iteration():
     w = _worker()
-    w._hold_rows(CHAIN_LANE, {"r1"})
+    w.pipeline._hold_rows(CHAIN_LANE, {"r1"})
     scheduled = ScheduledBatch(
         node_name="node", graph_walk="walk",
         request_to_worker_graph={"r2": "wg"},
     )
-    w._handle_main_loop_error(RuntimeError("boom"), (None, None), scheduled)
+    w.pipeline._handle_error(RuntimeError("boom"), (None, None), scheduled)
     assert set(w.sent[0][1].body.errors) == {"r1", "r2"}
 
 
@@ -278,13 +278,15 @@ def _preprocess_thread(model):
     return wt
 
 
-def test_output_postprocess_failure_becomes_an_error_chunk():
+# A ValueError past intake is a server bug too, not a 400
+@pytest.mark.parametrize("error", [RuntimeError, ValueError])
+def test_output_postprocess_failure_becomes_an_error_chunk(error):
     """A model that blows up postprocessing a result tensor must fail that
     request, not silently drop the chunk and leave the client hanging."""
 
-    class _BadModel:
+    class _BadModel(StubModel):
         def postprocess(self, tensor, modality, request_kwargs=None):
-            raise RuntimeError("decode failed")
+            raise error("decode failed")
 
     wt = _preprocess_thread(_BadModel())
     dereferenced = []
@@ -313,7 +315,7 @@ def test_a_failed_output_releases_the_outputs_held_behind_it():
     fails, its error chunk must take slot 0 so 1 is released in order; emitted
     around the buffer, 1 would sit in ``pending`` until the API server's TTL."""
 
-    class _BadModel:
+    class _BadModel(StubModel):
         def postprocess(self, tensor, modality, request_kwargs=None):
             raise RuntimeError("decode failed")
 

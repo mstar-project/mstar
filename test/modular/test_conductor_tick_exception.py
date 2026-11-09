@@ -20,6 +20,7 @@ from mstar.conductor.request_info import (
     PartitionState,
 )
 from mstar.model.base import ForwardPassArgs
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
@@ -37,7 +38,7 @@ class _StopLoop(BaseException):
     error handling must let it through."""
 
 
-class _Model:
+class _Model(StubModel):
     """Raises for a request whose metadata asks it to, as a model does on a
     kwarg it only reads at the second step or on a bug in its transition."""
 
@@ -100,6 +101,7 @@ def _conductor(*ticks, requests):
         send=lambda entity, msg: c.sent.append((entity, msg)),
         get_all_new_messages=lambda: batches.pop(0) if batches else [],
         poll_for_messages=lambda timeout_ms: bool(batches),
+        flush=lambda: False,
     )
     c.model = _Model()
     c.enable_nvtx = False

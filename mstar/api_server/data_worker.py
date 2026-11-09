@@ -16,6 +16,7 @@ from typing import NamedTuple
 
 import torch
 
+from mstar.api_server.media_io import remove_uploads
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 
@@ -44,6 +45,7 @@ from mstar.communication.tensors import (
     NameToTensorList,
     create_tensor_communication_manager,
 )
+from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
 from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
@@ -60,6 +62,7 @@ from mstar.model.base import (
     serving_resources,
 )
 from mstar.model.media_limits import (
+    RAW_INPUT_CHARGES,
     RequestMediaBudget,
     charge_decoded_audio,
     check_audio_duration,
@@ -211,7 +214,7 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
     YAML has been applied."""
     specs = serving_resources(model, model_config)
     groups = [
-        (group["ranks"], int(group.get("tp_size", 1)) * int(group.get("sp_size", 1)), group["node_names"])
+        (group["ranks"], math.prod(node_group_axis_sizes(group).values()), group["node_names"])
         for group in model_config.get("node_groups") or []
     ]
     opened = frozenset().union(*prefix_caches_by_rank(specs, groups, names_checkpoint(model)).values())
@@ -281,15 +284,12 @@ class PreprocessWorker:
         enable_nvtx: bool=False,
         adapter_digests: dict[str, bytes] | None = None,
         is_pending: Callable[[str], bool] | None = None,
+        upload_dir: str | os.PathLike | None = None,
     ):
         """``adapter_digests`` are the serving config's LoRA adapters' digests, as the API
-        server's startup check read them."""
+        server's startup check read them. ``upload_dir`` is where the API server saves
+        uploads: a request refused in preprocessing has its files there removed at once."""
         check_media_limits()
-        # Here, before the thread starts: the thread reads it as it starts, and
-        # a value it cannot take would end the thread with every request waiting.
-        workers = (model_config or {}).get("preprocess_workers")
-        if workers is not None and (isinstance(workers, bool) or not isinstance(workers, int) or workers < 1):
-            raise ValueError(f"preprocess_workers must be a positive integer, got {workers!r}")
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
         self.cleanup_request_queue = queue.Queue()
@@ -302,6 +302,8 @@ class PreprocessWorker:
         self.results_wakeup = EventWakeup()
         self.output_queue = ResultQueue(self.results_wakeup)
         self.profile_queue = ResultQueue(self.results_wakeup)
+        # ConductorMessages from other threads (runtime LoRA loads), sent by this one
+        self.conductor_outbox = queue.Queue()
         # Set by report_preprocess_finish(); read by the worker thread.
         self.timing_requested = threading.Event()
         # Set by enable_worker_metrics(); the worker thread tells the conductor.
@@ -321,12 +323,12 @@ class PreprocessWorker:
         # directly once a request is done (no cross-thread queue / race).
         # Sends never block the thread (OutboxCommunicator): the conductor and
         # the workers block on sends to it, so it has to keep reading.
-        self.communicator = OutboxCommunicator(make_communicator(
+        self.communicator = make_communicator(
             my_id="api_server_preprocess_worker",
             push_ids=["conductor"],
             ipc_socket_path_prefix=socket_path_prefix,
             nonblocking_send=True,
-        ))  # only used to send (from the worker thread)
+        )  # only used to send (from the worker thread)
         self.tensor_manager = create_tensor_communication_manager(
             protocol=tensor_comm_protocol,
             my_entity_id="api_server_preprocess_worker",
@@ -338,7 +340,7 @@ class PreprocessWorker:
             copy_workers=cpus.plan().copy_workers,
         )
 
-        # the serving config's adapters' prefix-cache roots
+        # registered adapters' prefix-cache roots; a runtime load or unload updates it
         self.adapter_prefix_roots = adapter_prefix_roots(model, model_config, adapter_digests)
 
         self.thread = Thread(
@@ -363,7 +365,9 @@ class PreprocessWorker:
                 model_config=model_config,
                 enable_nvtx=enable_nvtx,
                 adapter_roots=self.adapter_prefix_roots,
+                conductor_outbox=self.conductor_outbox,
                 is_pending=is_pending,
+                upload_dir=upload_dir,
             )
         )
         self.thread.start()
@@ -381,6 +385,12 @@ class PreprocessWorker:
         submission, so it reaches the conductor before any request submitted
         after this call."""
         self.worker_metrics_requested.set()
+        self._signal()
+
+    def send_to_conductor(self, message) -> None:
+        """Send ``message`` to the conductor from the thread that owns the socket, on
+        the socket every submission goes out on."""
+        self.conductor_outbox.put(message)
         self._signal()
 
     def queue_depth(self) -> int:
@@ -670,17 +680,26 @@ class PreprocessWorkerThread:
     _next_transfer_publish = 0.0
     # class-level so a thread built without __init__ never sends ENABLE_METRICS
     worker_metrics_requested: threading.Event | None = None
+    # class-level so a thread built without __init__ has nothing to send
+    conductor_outbox: queue.Queue | None = None
     # None (a thread built without __init__) postprocesses every output inline
     _encode_pool: ThreadPool | None = None
     # class-level so a thread built without __init__ stamps no read times
     enable_prof = False
     # None (no model that declares it, one CPU's worth of workers, or a thread
-    # built without __init__) prepares every request inline
+    # built without __init__) prepares every request inline.
     _prepare_pool: ThreadPool | None = None
+    # Requests prepared at once: None from __init__ until the first request
+    # sizes the pool (_size_prepare_pool); 1, inline, for a thread built
+    # without __init__, which has no model to size it from.
+    _prepare_workers: int | None = 1
     # Appends handled per pass before output delivery gets its turn again: one
     # for each of up to 32 live calls appending at once. An append costs a file
     # decode, far less than a request's preprocess, which is one per pass.
     MAX_APPENDS_PER_PASS = 32
+    # None (a thread built without __init__) leaves a refused request's uploads to the
+    # HTTP layer's deferred cleanup
+    upload_dir: str | os.PathLike | None = None
 
     def __init__(
         self,
@@ -704,9 +723,13 @@ class PreprocessWorkerThread:
         timing_requested: threading.Event | None = None,
         worker_metrics_requested: threading.Event | None = None,
         adapter_roots: AdapterPrefixRoots | None = None,
+        conductor_outbox: queue.Queue | None = None,
         is_pending: Callable[[str], bool] | None = None,
+        upload_dir: str | os.PathLike | None = None,
     ):
         self._adapter_roots = adapter_roots
+        self.conductor_outbox = conductor_outbox
+        self.upload_dir = upload_dir
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
@@ -786,27 +809,28 @@ class PreprocessWorkerThread:
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
         self._encoded: deque[EncodedOutput] = deque()
-        self._prepare_workers = self._num_prepare_workers()
-        if self._prepare_workers > 1:
-            self._prepare_pool = ThreadPool(
-                max_workers=self._prepare_workers, thread_name_prefix="mstar-prepare",
-            )
+        self._prepare_workers = None
         # Requests on the prepare pool, oldest first. They reach the conductor
         # in this order, whichever finishes first.
         self._preparing: deque[PreparingInput] = deque()
 
-    def _num_prepare_workers(self) -> int:
-        """Requests prepared at once. A model has to declare that its loaders
-        and ``process_prompt`` may overlap, and client streams need their
-        appends handled behind the request, so anything else runs inline."""
-        if not getattr(self.model, "PREPROCESS_PARALLEL", False) or self._client_edges:
-            return 1
-        workers = (self._model_config or {}).get("preprocess_workers")
-        if workers is not None:
-            return int(workers)
-        # each request runs on this process's intra-op pool, which the config
-        # or the model may size above the plan's default
-        return cpus.plan().prepare_workers(torch.get_num_threads())
+    def _size_prepare_pool(self) -> None:
+        """Size the prepare pool: requests prepared at once. A model has to
+        declare that its loaders and ``process_prompt`` may overlap, and client
+        streams need their appends handled behind the request, so anything else
+        runs inline. Run with the first request, after the conductor's
+        validate_deployment has accepted ``preprocess_workers`` (this thread
+        starts before it runs), so a bad value is reported with the rest."""
+        workers = 1
+        if getattr(self.model, "PREPROCESS_PARALLEL", False) and not self._client_edges:
+            workers = (self._model_config or {}).get("preprocess_workers")
+            if workers is None:
+                # each request runs on this process's intra-op pool, which the
+                # config or the model may size above the plan's default
+                workers = cpus.plan().prepare_workers(torch.get_num_threads())
+        self._prepare_workers = workers
+        if workers > 1:
+            self._prepare_pool = ThreadPool(max_workers=workers, thread_name_prefix="mstar-prepare")
 
     def _cleanup_request_state(self, request_id: str, *, force: bool = False) -> None:
         """Release transport and postprocessing state owned by this thread.
@@ -840,16 +864,31 @@ class PreprocessWorkerThread:
 
     def _load_media(
         self, file_paths: dict[str, list[str]] | None,
+        raw_inputs: dict[str, list[torch.Tensor]] | None = None,
     ) -> tuple[NameToTensorList, dict[str, list[dict]]]:
         """Raw modality tensors and their metadata, keyed ``{modality}_inputs``.
-        The files are held to one media budget together."""
+        The files, and ``raw_inputs`` (which stand in for their modality's
+        files), are held to one media budget together."""
         tensors: NameToTensorList = {}
         input_metadata = {}
-        if not file_paths:
+        if not file_paths and not raw_inputs:
             return tensors, input_metadata
-        counts = {modality: len(paths) for modality, paths in file_paths.items()}
+        counts = {modality: len(paths) for modality, paths in (file_paths or {}).items()}
+        for modality, items in (raw_inputs or {}).items():
+            counts[modality] = len(items)
         check_file_counts(counts, self.model.max_input_files())
         budget = RequestMediaBudget(sum(counts.values()))
+        for modality, items in (raw_inputs or {}).items():
+            key = f"{modality}_inputs"
+            charge, load = RAW_INPUT_CHARGES[modality], getattr(self.model, f"load_decoded_{modality}")
+            tensors[key], input_metadata[key] = [], []
+            for item in items:
+                with budget.file():
+                    charge(item)
+                    out = load(item, self.device)
+                tensors[key].append(out.data)
+                input_metadata[key].append(out.metadata)
+        file_paths = file_paths or {}
         for modality, paths in file_paths.items():
             key = f"{modality}_inputs"
             tensors[key] = []
@@ -894,7 +933,10 @@ class PreprocessWorkerThread:
             # is hashed, its KV would be keyed by bytes we never decoded.
             for modality, paths in input.file_paths.items():
                 file_states[modality] = [_file_state(path) for path in paths]
-        tensors, input_metadata = self._load_media(input.file_paths)
+        if input.raw_inputs and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
+            # a prefix key hashes each input's file, and these have none
+            raise ValueError("this deployment keys prompts by their media files; send the media as files")
+        tensors, input_metadata = self._load_media(input.file_paths, input.raw_inputs)
 
 
         # Then, tokenize the prompt and let the model augment/transform the
@@ -1015,6 +1057,8 @@ class PreprocessWorkerThread:
                     found.append(os.stat(path).st_size)
                 except (OSError, ValueError):
                     pass  # gone or not a valid path: its load fails, and the failure is counted
+        for modality, items in (input.raw_inputs or {}).items():
+            sizes[modality] = [item.nbytes for item in items]
         return DataWorkerProfile(
             request_id=input.request_id,
             dequeue_time=dequeue_time,
@@ -1382,11 +1426,18 @@ class PreprocessWorkerThread:
                 count=len(paths),
                 total_bytes=total_bytes,
             ))
+        for modality, items in (input.raw_inputs or {}).items():
+            infos.append(InputInfo(
+                modality=modality,
+                count=len(items),
+                total_bytes=sum(item.nbytes for item in items),
+            ))
         return infos
 
     def _fail_request(
         self, request_id: str, exc: BaseException, stage: str, count: int = 1,
         sequence: int | None = None, abort: bool = True, traceback: bool = True,
+        intake: bool = False,
     ):
         """Report a per-request data-worker failure to the API server.
 
@@ -1404,12 +1455,16 @@ class PreprocessWorkerThread:
 
         ``traceback`` False logs one line, for an error already logged where
         it happened.
+
+        ``intake`` marks a failure while taking client input in (a request or
+        an append), where a ValueError or TypeError refuses it (a 400). Past
+        intake one is a server bug like any other error (a 500).
         """
+        status = 400 if intake and isinstance(exc, (ValueError, TypeError)) else 500
         text, _ = client_error_text(
             exc, f"{stage} failed for request {request_id}", log=logger,
-            traceback=traceback,
+            traceback=traceback, refusal=status < 500,
         )
-        status = 400 if isinstance(exc, (ValueError, TypeError)) else 500
         chunks = [
             ResultChunk(
                 request_id=request_id,
@@ -1819,6 +1874,14 @@ class PreprocessWorkerThread:
                 self._hard_cleanup(body.request_id)
         return did_work
 
+    def _send_conductor_outbox(self) -> bool:
+        outbox = self.conductor_outbox
+        if outbox is None or outbox.empty():
+            return False
+        while not outbox.empty():
+            self.communicator.send("conductor", outbox.get())
+        return True
+
     def _send_enable_metrics_if_requested(self) -> None:
         requested = self.worker_metrics_requested
         if requested is not None and requested.is_set():
@@ -1952,12 +2015,14 @@ class PreprocessWorkerThread:
             try:
                 self._process_stream_input(pre_input)
             except Exception as exc:  # noqa: BLE001 — must reach the client
-                self._fail_request(pre_input.request_id, exc, "stream input")
+                self._fail_request(pre_input.request_id, exc, "stream input", intake=True)
             return
         profile = None
         try:
             if self.timing_requested.is_set():
                 profile = self._start_profile(pre_input)
+            if self._prepare_workers is None:
+                self._size_prepare_pool()
             if self._prepare_pool is not None:
                 self._submit_prepare(pre_input, profile)
             else:
@@ -1971,11 +2036,15 @@ class PreprocessWorkerThread:
         if profile is not None:
             profile.failed = True
             self.profile_queue.put(profile)
+        # Nothing reads a refused request's files again, so they go now rather than with
+        # the HTTP layer's deferred cleanup, and before the client hears of the refusal.
+        if self.upload_dir is not None:
+            remove_uploads(pre_input.file_paths, self.upload_dir)
         # A request whose media load or prompt processing fails never
         # reaches the conductor, so nothing downstream would ever complete
         # it; surface the failure as an error chunk instead of leaving the
         # client to wait out the server timeout.
-        self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False)
+        self._fail_request(pre_input.request_id, exc, "preprocessing", abort=False, intake=True)
         # Never reached the conductor, so there are no remote readers to
         # race: hard-drop the (possibly persisted) input signals directly.
         self._cleanup_request_state(pre_input.request_id, force=True)
@@ -2052,6 +2121,7 @@ class PreprocessWorkerThread:
                 sends_pending = self.communicator.flush()
                 did_work = self._process_messages()
                 self._send_enable_metrics_if_requested()
+                did_work = self._send_conductor_outbox() or did_work
                 # Output delivery is latency-sensitive: the API server holds a
                 # finished request open for its final chunks only briefly, so
                 # queued read-starts / acks / cleanups must never wait behind a

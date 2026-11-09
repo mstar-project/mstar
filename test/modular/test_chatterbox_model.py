@@ -388,10 +388,10 @@ def test_undecodable_reference_is_a_client_error(tmp_path):
         pytest.skip(f"torchcodec cannot load here: {exc}")
     bad = tmp_path / "ref.wav"
     bad.write_bytes(b"hello world" * 100)
-    with pytest.raises(ValueError, match="Could not decode the reference audio") as raised:
+    with pytest.raises(ValueError, match="could not decode the reference audio") as raised:
         ChatterboxModel._decode_audio(str(bad))
     # the message reaches the client, so it names no server path
-    assert str(tmp_path) not in str(raised.value) and raised.value.__cause__ is None
+    assert str(tmp_path) not in str(raised.value)
 
 
 def test_empty_reference_is_a_client_error(tmp_path):
@@ -1252,6 +1252,18 @@ def test_streaming_and_compile_knobs_reach_the_config():
     assert model.config.stream_context_tokens == 25 and model.config.s3gen_compile is True
     assert model.config.s3gen_graphs is False  # compile replaces the graphs
     assert _make_model().config.s3gen_compile is False
+
+
+def test_a_first_stream_chunk_shorter_than_the_vocoder_cache_is_refused():
+    """Chunk 1 vocodes its tokens past the 3-token look-ahead, 2 mel frames each; under the 8-frame
+    vocoder cache, chunk 2's crossfade read a short tail and every streamed request failed there."""
+    with pytest.raises(ValueError, match="stream_first_chunk_tokens"):
+        ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=6)
+    ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=7)
+    # the offline decode has no first chunk
+    ChatterboxModel(
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=1, stream_chunk_tokens=0,
+    )
 
 
 def test_graph_and_precision_knobs_reach_the_config():

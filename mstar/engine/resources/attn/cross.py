@@ -9,6 +9,7 @@ from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
+    captured_page_capacity,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -226,12 +227,6 @@ class FlashInferCrossManager(CrossAttentionManager):
                 if context_views is None:
                     context_views = {view.request_id: view for view in context_out.views}
                 indptrs = self._build_indptrs(packing, context_views)
-            # fork repeats pages, so batch can index more than held in cache.
-            assert len(indptrs.paged_kv_indices) <= self._kv_config.max_num_pages, (
-                f"cross attention plan {plan_label!r} indexes {len(indptrs.paged_kv_indices)} "
-                f"pages but the context cache holds {self._kv_config.max_num_pages}; "
-                "raise max_num_pages on the context cache's PagedKVConfig"
-            )
             laps.lap("indptrs" if request_ids == context_rids else "indptrs_views")
 
             # The context pages are immutable once written, so only the query
@@ -435,15 +430,19 @@ class FlashInferCrossManager(CrossAttentionManager):
             else:
                 # built on first plan for the key; see FlashInferManager._cg_wrapper
                 workspace = self._workspaces.get(plan_label, lease.slot)
+                # rows with one cached context (a prefix hit, a fork) each name its pages, so the
+                # step's index list can outgrow the pool
+                max_num_pages = captured_page_capacity(num_rows, lease.bucket.num_tokens, self._kv_config)
+                kv_kwargs = {**self._wrapper_kv_kwargs, "max_num_pages": max_num_pages}
                 if decode:
-                    wrapper = self._decode_wrapper(workspace, batch_size=num_rows, accelerator_graph=True)
+                    wrapper = self._decode_wrapper(workspace, kv_kwargs, batch_size=num_rows, accelerator_graph=True)
                 else:
                     wrapper = FlashInferPrefillWrapper(
                         workspace_buffer=workspace,
                         batch_size=num_rows,
                         max_total_tokens=lease.bucket.num_tokens,
                         accelerator_graph=True,
-                        **self._wrapper_kv_kwargs,
+                        **kv_kwargs,
                     )
                 self._cg_plan_states[key] = wrapper
             return key, wrapper
@@ -455,14 +454,13 @@ class FlashInferCrossManager(CrossAttentionManager):
         if wrapper is None:
             workspace = self._workspaces.get(plan_label, slot)
             if decode:
-                wrapper = self._decode_wrapper(workspace)
+                wrapper = self._decode_wrapper(workspace, self._wrapper_kv_kwargs)
             else:
                 wrapper = FlashInferPrefillWrapper(workspace_buffer=workspace, **self._wrapper_kv_kwargs)
             self._eager_plan_states[key] = wrapper
         return key, wrapper
 
-    def _decode_wrapper(self, workspace: Workspace, **kwargs) -> FlashInferDecodeWrapper:
-        kv = self._wrapper_kv_kwargs
+    def _decode_wrapper(self, workspace: Workspace, kv: dict, **kwargs) -> FlashInferDecodeWrapper:
         return FlashInferDecodeWrapper(
             workspace_buffer=workspace,
             num_qo_heads=kv["num_qo_heads"], num_kv_heads=kv["num_kv_heads"],

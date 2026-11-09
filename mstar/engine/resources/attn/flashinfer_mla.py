@@ -217,6 +217,8 @@ class FlashInferMLAWrapper:
 
 
 class FlashInferMLAManager(AttentionManager):
+    supports_drop = True
+
     def __init__(
         self,
         kv_cache: str,

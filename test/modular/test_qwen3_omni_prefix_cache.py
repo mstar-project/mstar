@@ -8,7 +8,6 @@ import pytest
 import torch
 from torch import nn
 
-from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv.config import PrefixSpan
@@ -20,6 +19,7 @@ from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 RID = "r0"
 NODE = "Thinker"
@@ -70,13 +70,14 @@ def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None,
     prepared = thinker.prepare_inputs(walk, info, inputs)
     if held is None:
         return prepared
-    engine = Engine.__new__(Engine)
-    engine._runner = StepRunner(
-        {THINKER_KV: _Holding(held.tokens, held.position), THINKER_POS: thinker.node_resources[THINKER_POS]},
-        node_resources={NODE: [THINKER_KV, THINKER_POS]},
+    engine = make_engine(
+        _runner=StepRunner(
+            {THINKER_KV: _Holding(held.tokens, held.position), THINKER_POS: thinker.node_resources[THINKER_POS]},
+            node_resources={NODE: [THINKER_KV, THINKER_POS]},
+        ),
+        _submodules={NODE: make_mgmt(submodule=thinker)},
+        _keyed_walks={NODE: {"prefill_text", "prefill_vision", "prefill_audio"}},
     )
-    engine._submodules = {NODE: SimpleNamespace(submodule=thinker)}
-    engine._keyed_walks = {NODE: {"prefill_text", "prefill_vision", "prefill_audio"}}
     batch = SimpleNamespace(
         node_name=NODE, cached_rids=set(), per_request_info_wrapped={rid: info},
         step_context=StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False),
@@ -258,7 +259,8 @@ class _Processor:
         return turns + "<|im_start|>assistant\n"
 
     @staticmethod
-    def image_processor(images, return_tensors):
+    def image_processor(images, return_tensors, input_data_format):
+        assert input_data_format == "channels_last"
         height, width, _ = images[0].shape
         return {"pixel_values": torch.zeros(1), "image_grid_thw": torch.tensor([[1, height // 16, width // 16]])}
 
@@ -419,10 +421,11 @@ def test_the_encoders_are_not_compiled_while_their_output_is_cached(monkeypatch,
     compiled = []
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: compiled.append(fn) or fn)
     cls = {"audio_encoder": AudioEncoderSubmodule, "vision_encoder": VisionEncoderSubmodule}[node]
-    engine = Engine.__new__(Engine)
-    engine._device = torch.device("cuda")
-    engine._item_encoders = {node}
-    engine._submodules = {node: SimpleNamespace(submodule=object.__new__(cls), forward="eager")}
+    engine = make_engine(
+        _device=torch.device("cuda"),
+        _item_encoders={node},
+        _submodules={node: make_mgmt(submodule=object.__new__(cls), forward="eager")},
+    )
 
     engine._compile_submodules()
 

@@ -26,6 +26,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import CGSlotKey
 from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper
 from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 
 
 class FlashInferManager(AttentionManager):
+    supports_drop = True
     supports_context_parallel = True
 
     def __init__(
@@ -54,6 +56,7 @@ class FlashInferManager(AttentionManager):
         sliding_window: int | None = None,
         decode_fmha: bool = False,
         layers: tuple[int, ...] | None = None,
+        sm_scale: float | None = None,
     ):
         self._kv_cache_name = kv_cache
         self._splits = {split.combined_walk: split for split in splits}
@@ -93,13 +96,15 @@ class FlashInferManager(AttentionManager):
             page_size=self._group.page_size,
             max_num_pages=kv_config.num_units,
             device=device,
-            backend=backend
+            backend=backend,
+            sm_scale=sm_scale,
         )
         self._decode_tensor_cores = decode_tensor_cores
         self._decode_fmha = (
             decode_fmha and dtype == torch.bfloat16 and sliding_window is None
             and fmha_decode_applies(device)
         )
+        self._sm_scale = sm_scale
 
         self._workspaces = WorkspacePool(device, owner=kv_cache)
 
@@ -180,6 +185,12 @@ class FlashInferManager(AttentionManager):
     def set_default_layer_idx(self, layer_idx: int) -> None:
         self._check_layer(layer_idx)
         self._default_layer_idx = layer_idx
+
+    def fingerprint(self) -> bytes:
+        if self._window_left == -1 and self._sm_scale is None:
+            return super().fingerprint()
+        # the window and scale shape every later layer's K/V
+        return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
 
     def _cg_wrapper(
         self, lease: SlotLease, label: str, num_rows: int, force_prefill: bool,
@@ -267,6 +278,7 @@ class FlashInferManager(AttentionManager):
             batch_size=num_rows,
             max_seq_len=config.max_seq_len,
             device=self._device,
+            sm_scale=self._sm_scale,
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
