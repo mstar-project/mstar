@@ -995,7 +995,7 @@ class PreprocessWorkerThread:
 
         self.request_model_kwargs[input.request_id] = model_kwargs
         prompt_tokens = None
-        usage_layout = getattr(self.model, "TOKEN_USAGE_LAYOUT", None)
+        usage_layout = self.model.TOKEN_USAGE_LAYOUT if self.model is not None else None
         if usage_layout is not None:
             resource, label = usage_layout
             row = model_kwargs.get("kv_layout", {}).get(resource, {}).get(label)
