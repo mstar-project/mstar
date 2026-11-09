@@ -631,3 +631,48 @@ def test_the_scheduler_sees_the_rows_every_lane_holds():
     assert w._in_flight_rids is shared and held == {R, A} and shared == {A}, (
         "the scheduler shares the set, and would start a rebuild for a row a step in flight holds"
     )
+
+
+def test_a_follower_worker_takes_room_past_twice_the_rebuild_pool(monkeypatch):
+    """`Worker.__init__` makes its rebuilds for the nodes the worker follows. Without them a follower set aside what
+    rank 0 does and refused a log rank 0 kept once its pool was full."""
+    monkeypatch.delenv("MSTAR_TP_ASYNC_SCHED", raising=False)
+    monkeypatch.setattr(worker_mod, "make_communicator", lambda **kw: SimpleNamespace(
+        register_event_for_poll=lambda event: None))
+    monkeypatch.setattr(worker_mod, "EventWakeup", object)
+    monkeypatch.setattr(worker_mod, "create_tensor_communication_manager", lambda **kw: SimpleNamespace(
+        transfer_engine=None, my_session_id="s", get_tensor=None))
+    monkeypatch.setattr(worker_mod, "_make_graph_runtime", lambda **kw: SimpleNamespace(
+        set_node_metadata=lambda *a, **kw: None))
+    engine = SimpleNamespace(
+        get_stop_policies=lambda node, walk: None, paged_kv_caches=list, host_allowance=StepAllowance(),
+        node_dtype=lambda node: torch.float32,
+    )
+    monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
+        build=lambda *a, **kw: SimpleNamespace(engine=engine, get_engine=lambda node: engine, side_keys=())))
+    # the worker runs with no model, so its rebuilds come from one that declares ``NODE``'s policy
+    model, make = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs), _make_rebuilds
+    monkeypatch.setattr(
+        worker_mod, "_make_rebuilds", lambda m, config, *args: make(model, {"rebuild_host_mb": 1}, *args),
+    )
+    # rank 1 of two on ``NODE``
+    groups = SimpleNamespace(
+        init_dist=lambda **kw: None, get_instance_rank_for_node=lambda node: 1,
+        get_instance_world_size_for_node=lambda node: 2,
+    )
+    section = SimpleNamespace(get_nodes=lambda: {NODE}, get_loops=dict)
+    worker = worker_mod.Worker(
+        worker_id="w1", worker_ids=["w0", "w1"], model=None,
+        my_worker_graphs=[SimpleNamespace(section=section, graph_walks={PREFILL, DECODE})],
+        model_config={}, all_worker_graph_ids_to_graph_walks={}, all_worker_graph_ids_to_nodes={},
+        all_worker_graph_ids_to_dyn_loops={}, sharding_config=None, parallel_groups=groups, device=torch.device("cpu"),
+    )
+    writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
+    # 6 MiB of ids, past the follower's 2 MiB
+    layout = StreamLayout(spans=(PrefixSpan(3 << 18, 3 << 18, PREFILL),), growth=(("loop", 1),))
+
+    assert worker.layout.followed_nodes == {NODE}
+    assert worker._rebuilds.pool.nbytes == 2 << 20, "the follower's pool is no larger than rank 0's"
+    assert worker._rebuilds.ingest_request(R, writes, {"kv": [layout]}, unpausable=False).unheld == set(), (
+        "rank 0 can drop a request the follower keeps no log of"
+    )
