@@ -1929,6 +1929,7 @@ class APIServer:
         self._wake_message_loop()
         if hasattr(self, "_msg_thread") and self._msg_thread.is_alive():
             self._msg_thread.join(timeout=2)
+        media_io.flush_upload_cleanups()
 
 
 def _resolve_warmup_path(path: str, cache_dir: str | None = None) -> str:
