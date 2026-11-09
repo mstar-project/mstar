@@ -126,6 +126,13 @@ class TestPreflight(unittest.TestCase):
         out, replies = self.preflight("nogpu", read)
         self.assertEqual(out, {"run": "false"}, "a contributor without write access could start a nogpu review")
         self.assertIn("/review light", replies[0], "the contributor wouldn't be told what they can run")
+        peer = {"a-maintainer": "write", "an-author": "read"}
+        out, replies = self.preflight("nogpu", peer, actor="a-maintainer")
+        self.assertEqual(out, {"run": "false"}, "a nogpu review could run on the PR of an author without write access")
+        self.assertIn("/review light", replies[0], "the maintainer wouldn't be told what they can run")
+        self.assertEqual(self.preflight("light", peer, actor="a-maintainer"),
+                         ({"run": "true", "mode": "light", "turns": "2000"}, []),
+                         "a maintainer's light review of a first-timer's PR would be refused")
         self.assertEqual(self.preflight("light", {"a-maintainer": "read"}, actor="a-maintainer"),
                          ({"run": "false"}, []), "someone without write access could review another author's PR")
         self.assertEqual(self.preflight("continue", read)[0]["mode"], "",
@@ -136,7 +143,7 @@ HEAD, LAST = "1" * 40, "2" * 40
 
 
 class TestRestore(unittest.TestCase):
-    def restore(self, meta, non_write="", path=".github/workflows/claude-review.yml"):
+    def restore(self, meta, non_write="", path=".github/workflows/claude-review.yml", author_permission="write"):
         """/review continue finding one stopped review whose saved handoff has `meta`."""
         def download(argv, stdin):
             saved = Path(argv[argv.index("-D") + 1])
@@ -153,7 +160,8 @@ class TestRestore(unittest.TestCase):
                     {"expired": False, "created_at": "2026-11-01", "workflow_run": {"id": 9}}]},
                 "GET repos/o/r/actions/runs/9": {"path": path, "event": "issue_comment"},
                 "run download": download,
-            }, repo="o/r", pr="7", head_sha=HEAD, runner_temp=temp, non_write=non_write)[0]
+                "GET repos/o/r/collaborators/an-author/permission": {"permission": author_permission},
+            }, repo="o/r", pr="7", head_sha=HEAD, runner_temp=temp, non_write=non_write, author="an-author")[0]
 
     def test_a_failure_nobody_expected_is_still_a_refusal(self):
         fake = FakeGh({
@@ -176,6 +184,11 @@ class TestRestore(unittest.TestCase):
                       "a fork's own workflow could plant the handoff")
         self.assertIn("write access", self.restore({"mode": "nogpu"}, non_write="an-author")["why"],
                       "a contributor could continue a nogpu review")
+        self.assertIn("write access", self.restore({"mode": "nogpu"}, author_permission="read")["why"],
+                      "a nogpu review could continue on the PR of an author without write access")
+        self.assertEqual(self.restore({"mode": "nogpu"})["mode"], "nogpu", "a writer's nogpu review couldn't continue")
+        self.assertEqual(self.restore({"mode": "light"}, author_permission="read")["mode"], "light",
+                         "continuing a light review would need more than a light review does")
 
 
 def summary(head, mode="light"):

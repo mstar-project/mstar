@@ -42,15 +42,19 @@ name: Claude Review
 #     has the `skip-ai-review` label. "Contributor" is the commenter's
 #     author_association: OWNER, MEMBER, COLLABORATOR or CONTRIBUTOR, i.e. the
 #     team plus anyone who has had a PR merged here, from a fork or not;
-#   - nogpu, when someone with write access comments `/review` or `/review nogpu`.
-#     A contributor without write access who comments either on their own PR
-#     gets a one-line reply pointing to `/review light`, and nothing runs.
+#   - nogpu, when someone with write access comments `/review` or `/review nogpu`
+#     on a PR whose author also has write access. A request that lacks either
+#     gets a one-line reply pointing to `/review light` when the commenter could
+#     run that (write access, or their own PR), and nothing runs;
+#   - /review continue follows the mode it continues: as light allows, or for
+#     nogpu both write checks again (bot.py, restore).
 # A run someone with write access starts has a turn cap high enough only to stop
 # a loop (CLAUDE_REVIEW_MAX_TURNS_TEAM, 2000); a contributor's own light review
 # keeps CLAUDE_REVIEW_MAX_TURNS (40).
 # Write access (write, maintain or admin) is checked against the user's actual
 # permission in the preflight; author_association can't tell write from read.
-# The PR can be from anyone, so a maintainer can /review a first-timer's PR.
+# The PR can be from anyone for light, so a maintainer can `/review light` a
+# first-timer's PR.
 #
 # The action refuses to run for an actor without write access unless that
 # actor is listed in allowed_non_write_users. Most contributors' PRs come from
@@ -148,9 +152,10 @@ jobs:
       # instead. Lets this land before ANTHROPIC_API_KEY exists without
       # failing a check on every PR. Then the actor needs write access, or must
       # be the PR's author, a contributor, on `/review light` or `/review
-      # continue` (see the header). A contributor's `/review` or `/review nogpu`
-      # on their own PR gets a one-line reply; anyone else exits green with a
-      # notice (bot.py, preflight).
+      # continue`; `/review` and `/review nogpu` also take an author with write
+      # access (see the header). Those two get a one-line reply when refused on
+      # a PR the commenter could run `/review light` on; anyone else exits green
+      # with a notice (bot.py, preflight).
       - name: Preflight
         id: pre
         env:
