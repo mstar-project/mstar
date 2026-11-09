@@ -699,9 +699,10 @@ class KVManager(AttentionResource):
         # `_snapshots` holds the pools that restore a hit's recurrent state. A prefill hit counts only as far as they
         #   restore it.
         # `_footprints` holds each request's `_footprint` as it was at intake.
-        # `_kept` counts the room kept for a waiting request: the pages passers freed while it waited, and the pages
-        #   moves made for it freed before they covered it. Passers can't take them, but admitted requests can, and
-        #   a request admitted in order takes them first.
+        # `_kept` counts the room kept for `_keeper`, a waiting request that isn't a passer, up to what it asks for:
+        #   the pages passers freed while it waited, and the pages moves made for it freed before they covered it.
+        #   Passers can't take them, but admitted requests can, and a request admitted in order takes them first.
+        #   They go back to the room when `_keeper` leaves.
         # `_made` names the request whose allotment the last reservation made rather than grew.
         # `_passers` holds the requests admitted past the first one that a drop or a move to the host sent back to
         #   ask again. Each returns as it passed, so it takes none of `_kept`.
@@ -714,6 +715,7 @@ class KVManager(AttentionResource):
         self._snapshots: list["RecurrentStatePool"] = []
         self._footprints: dict[str, int] = {}
         self._kept = 0
+        self._keeper: str | None = None
         self._made: str | None = None
         self._passers: set[str] = set()
         # Preemption state.
@@ -4252,6 +4254,10 @@ class KVManager(AttentionResource):
                 f"`_stalled` lists {sorted(self._stalled)}, but {sorted(stalled)} wait holding "
                 f"and {sorted(self._allotments)} hold an allotment"
             )
+            assert not self._kept or (self._keeper in self._asks and self._keeper not in self._passers), (
+                f"`_kept` keeps {self._kept} pages for {self._keeper}, which doesn't wait in order, so they can stay "
+                "kept with no request to take them"
+            )
             if self._cpu_pool is not None:
                 self._assert_host_pages_conserved()
 
@@ -4426,6 +4432,8 @@ class KVManager(AttentionResource):
             if pages > room or not self._admit(rid, pages, passed=rid in self._passers):
                 if self._fixed_need(rid) is not None:
                     counts = None, None
+                if self._keeper not in self._asks and rid not in self._passers:
+                    self._keeper = rid
                 return RoomMark(rid, node_name, graph_walk, published, room, *counts)
             return None
 
@@ -4484,8 +4492,9 @@ class KVManager(AttentionResource):
     def _reserve(self, rid: str, pages: int, passed: bool = False) -> None:
         """Allot ``rid`` ``pages``, or grow the allotment it holds by them, so the moves still to land for an
         earmark ``rid`` holds add nothing. A request on the host is allotted its reload as well, which then leaves
-        `_return_pages` on top of what it holds. A request admitted in order takes `_kept` first."""
-        kept = 0 if passed else min(self._kept, pages)
+        `_return_pages` on top of what it holds. A request admitted in order takes `_kept` first, and `_keeper` takes
+        all of it."""
+        kept = self._kept if rid == self._keeper else 0 if passed else min(self._kept, pages)
         self._kept -= kept
         if rid in self._allotments:
             del self._asks[rid]
@@ -4505,7 +4514,6 @@ class KVManager(AttentionResource):
         self._passers.discard(rid)
         earmark = self._earmarks.get(rid)
         if earmark is not None:
-            # A waiting request took the pages kept for it just now, so `_forget_earmark` gives none of them back.
             earmark.granted, earmark.mark = earmark.pages, None
 
     def unreserve(self, rid: str) -> None:
@@ -4515,8 +4523,10 @@ class KVManager(AttentionResource):
         with self._lock:
             made = self._made == rid
             allotment = self._allotments[rid]
-            # the room kept for a waiting request goes back to it
+            # the room kept for a waiting request goes back to it, or to ``rid`` once that request doesn't wait
             self._kept += allotment.kept
+            if allotment.kept and self._keeper not in self._asks:
+                self._keeper = rid
             if allotment.grown:
                 # it waits holding its allotment again, for the same shortage
                 allotment.pages = allotment.grown_from
@@ -4833,13 +4843,13 @@ class KVManager(AttentionResource):
         return rid in self._hosted
 
     def _forget_earmark(self, rid: str) -> None:
-        """Take down ``rid``'s earmark once ``rid`` is removed or gives back its allotment. A request that asks again
-        then asks for what its move recorded, not the shortage the earmark holds. Caller holds the lock."""
+        """Take down ``rid``'s earmark, and the room `_kept` keeps for it, once ``rid`` is removed or gives back its
+        allotment. A request that asks again then asks for what its move recorded, not the shortage the earmark
+        holds. Caller holds the lock."""
+        if rid == self._keeper:
+            self._keeper, self._kept = None, 0
         earmark = self._earmarks.pop(rid, None)
         if earmark is not None:
-            if earmark.mark is not None:
-                # no request waits for the pages `_kept` keeps for ``rid`` any more
-                self._kept -= min(self._kept, earmark.granted)
             # its victims run on without being dropped
             for victim in earmark.victims:
                 del self._victims[victim]
@@ -4908,7 +4918,7 @@ class KVManager(AttentionResource):
         holding that room until it starts, so an older request can move it.
 
         When ``rid``'s ``allotment`` passed the first request in the queue, `_kept` also keeps what the earmark
-        doesn't take while a request waits."""
+        doesn't take for `_keeper`."""
         self._hosted.discard(rid)
         earmark = self._victims.pop(rid, None)
         if earmark is not None:
@@ -4921,11 +4931,9 @@ class KVManager(AttentionResource):
                 pages = earmark.pages if mark is None else self._need(
                     mark.rid, mark.node_name, mark.graph_walk, mark.published,
                 )
-                # A request returning past the first one takes none of `_kept`, so none is kept for it either.
                 passed = earmark.rid in self._passers
-                kept = 0 if passed else max(0, min(pages - earmark.granted, freed))
+                kept = self._keep(earmark.rid, min(pages - earmark.granted, freed))
                 earmark.granted += kept
-                self._kept += kept
                 freed -= kept
                 # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
                 # window's commit frees pages at another point of the step. The engine journals the move ahead of the
@@ -4938,8 +4946,20 @@ class KVManager(AttentionResource):
                     earmark.granted += granted
                     self._allot(earmark.rid, granted)
                 freed -= granted
-        if allotment is not None and allotment.passed and self._asks:
-            self._kept += freed
+        if allotment is not None and allotment.passed:
+            self._keep(self._keeper, freed)
+
+    def _keep(self, rid: str | None, pages: int) -> int:
+        """Keep up to ``pages`` more of the room for waiting ``rid``, up to what it asks for, and return how many.
+        ``rid`` takes over the room kept for another request. A request returning past the first one takes none of
+        `_kept`, so none is kept for it."""
+        if pages <= 0 or rid not in self._asks or rid in self._passers:
+            return 0
+        if rid != self._keeper:
+            self._keeper, self._kept = rid, min(self._kept, self._asks[rid])
+        kept = max(0, min(pages, self._asks[rid] - self._kept))
+        self._kept += kept
+        return kept
 
     def _vacate(self, rid: str, room: int) -> None:
         """Give up ``rid``'s allotment, so that ``rid`` asks again, once a drop or a move to the host has freed its
