@@ -27,9 +27,9 @@ Graph walks (image generation):
 Edge checkpoints add the reasoner (the understanding tower served as a VLM):
     vision_encoder (stateless) - SigLIP2-style tower + 2x2 patch merger:
                                  packed image/video patches -> text-space tokens.
-    reasoner       (kv_cache, sampler) - the same transformer instance as the
-                                 DiT (one copy of the text weights, the same KV
-                                 pool), run as a causal text model.
+    reasoner       (kv_cache, sampler, rope) - the same transformer instance
+                                 as the DiT (one copy of the text weights, the
+                                 same KV pool), run as a causal text model.
     prefill_text / prefill_vision - embed the chat-templated prompt (vision
                  tokens spliced in at the media placeholders), write its K/V,
                  sample the first token.
@@ -60,11 +60,7 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    PartitionDefinition,
-    StreamingConnectionState,
-)
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
@@ -74,11 +70,12 @@ from mstar.engine.resources import (
     KVSpec,
     NodeResourceSpec,
     PagedKVConfig,
+    PositionConfig,
+    PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
 )
-from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
     GraphEdge,
@@ -90,8 +87,9 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
+from mstar.model.components.mrope import layout_extent
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import (
@@ -108,6 +106,7 @@ from mstar.model.cosmos3.submodules import (
     ATTN,
     ATTN_GEN,
     COND_LABEL,
+    DENOISE_LOOP_FOR_WALK,
     IMAGE_GEN_LOOP,
     KV_CACHE,
     REASONER_DECODE_LOOP,
@@ -136,12 +135,10 @@ from mstar.model.multimodal import (
     MediaEncoder,
     PromptPart,
     check_attachments,
-    media_layout,
     media_prefill_step,
     media_walks,
     parts_from_modalities,
     text_combined_walks,
-    walk_input_edges,
 )
 from mstar.model.multimodal_decoder import MIXED_SPLIT
 from mstar.streaming.chunk_policy import FixedChunkPolicy
@@ -158,6 +155,7 @@ VISION_ENCODER_NODE = "vision_encoder"
 REASONER_NODE = "reasoner"
 
 
+
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
@@ -166,10 +164,14 @@ class Cosmos3Model(Model):
     # state, and their work (image decode, resize, torch ops) releases the GIL.
     # Inline, a burst of image prompts queued ~10 ms each behind one another.
     PREPROCESS_PARALLEL = True
-    # What process_prompt hands the conductor rather than the model: a policy
-    # request's robot_state width and action shape (the values themselves ride
-    # the action_inputs edge), and a reasoner prompt's media layout.
-    INTERNAL_KWARGS = ("robot_state_dim", "action_shape", MEDIA_LAYOUT)
+    DECODE_LOOP = REASONER_DECODE_LOOP
+    # {denoise loop: iterations}, settled by process_prompt, which alone sees
+    # the output modality that picks the loop and its step count
+    DENOISE_CAP = "denoise_cap"
+    # and the width of a policy request's robot_state, which process_prompt
+    # hands the conductor (the values themselves ride the action_inputs edge),
+    # and a reasoner prompt's media layout
+    INTERNAL_KWARGS = (DENOISE_CAP, "robot_state_dim", "action_shape", MEDIA_LAYOUT)
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -381,13 +383,10 @@ class Cosmos3Model(Model):
         return text_combined_walks(node=REASONER_NODE) if self._reasoner_enabled() else {}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # The reasoner's stop check allows max_tokens - 1 iterations, and a loop runs at least one.
-        return {REASONER_DECODE_LOOP: max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
+        return {**super().get_loop_caps(**model_kwargs), **(model_kwargs.get(self.DENOISE_CAP) or {})}
 
     def get_request_resource_configs(
-        self,
-        partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
         """Which cache labels a request is opened with.
 
@@ -397,7 +396,8 @@ class Cosmos3Model(Model):
         writes costs nothing — labels are created on first write.
         """
         mk = model_kwargs or {}
-        if self._is_text_request(partition_fwd_args):
+        # a text request decodes on the reasoner, every other generates media
+        if "text" in output_modalities:
             sampling = self.get_sampling_config(REASONER_NODE, mk)
             return {
                 KV_CACHE: KVReqConfig(needed_labels=[REASONER_LABEL]),
@@ -427,16 +427,15 @@ class Cosmos3Model(Model):
             ignore_eos=bool(mk.get("ignore_eos", False)),
         )
 
-    @staticmethod
-    def _is_text_request(partition_fwd_args: dict[str, ForwardPassArgs] | None) -> bool:
-        """Whether a request decodes text (the reasoner) rather than
-        generating media: read off the initial forward-pass args the
-        conductor resolved for its partitions."""
-        for args in (partition_fwd_args or {}).values():
-            md = getattr(args, "full_metadata", None)
-            if md is not None and "text" in (md.output_modalities or []):
-                return True
-        return False
+    def _vision_encoder(self) -> MediaEncoder:
+        """The reasoner's one medium: the vision encoder's tokens fill the
+        prompt's image and video pads, in prompt order, on the scaffold's
+        ``prefill_vision`` walk (beside the DiT's own ``prefill*`` walks)."""
+        r = self.config.reasoner
+        return MediaEncoder(
+            "vision", VISION_ENCODER_NODE, ("pixel_values", "vision_grid_thw"), "vision_embeds",
+            (r.image_token_id, r.video_token_id),
+        )
 
     def _reasoner_enabled(self) -> bool:
         """Whether the reasoner walks (and the vision_encoder + reasoner
@@ -513,9 +512,9 @@ class Cosmos3Model(Model):
         # image_gen: denoising loop -> VAE decode -> emit image. The loop body
         # threads the latents + the scheduler's state back to itself each iteration;
         # on the final iteration the latents route to the decoder. max_iters is an
-        # upper bound — each request stops the loop at its own denoise-step count
-        # (Cosmos3DiTSubmodule.check_stop), so one graph serves image and video
-        # (and any per-request num_inference_steps) without a rebuild.
+        # upper bound — each request caps the loop at its own denoise-step count
+        # (``_denoise_cap``), so one graph serves image and video (and any
+        # per-request num_inference_steps) without a rebuild.
         # image_gen and video_gen are the same denoise loop + VAE decode; they
         # differ only in the emitted modality (one frame vs an encoded clip), so
         # the request's output modality selects between them.
@@ -765,14 +764,10 @@ class Cosmos3Model(Model):
             PartitionDefinition(
                 name="default",
                 graph_walks=walks - {self.VIDEO_DECODE_AR_WALK},
-                initial_walk=None,
-                producer_partitions=[],
             ),
             PartitionDefinition(
                 name=constants.WINDOW_DECODER_PARTITION,
                 graph_walks={self.VIDEO_DECODE_AR_WALK},
-                initial_walk=self.VIDEO_DECODE_AR_WALK,
-                producer_partitions=["default"],
             ),
         ]
 
@@ -793,21 +788,12 @@ class Cosmos3Model(Model):
             ],
         )
 
-    def _reasoner_encoders(self) -> tuple[MediaEncoder, ...]:
-        """The reasoner's one media encoder: the vision tower, over image and
-        video pads alike."""
-        reasoner = self.config.reasoner
-        return (MediaEncoder(
-            "vision", VISION_ENCODER_NODE, ("pixel_values", "vision_grid_thw"), "vision_embeds",
-            (reasoner.image_token_id, reasoner.video_token_id),
-        ),)
-
     def _reasoner_walks(self) -> dict[str, GraphSection]:
         """The VLM scaffold's walks over the reasoner: ``prefill_text``, the
         ``prefill_vision`` media walk (the vision encoder, then the whole prompt
         as one row with its vision tokens spliced in), and the ``decode`` loop."""
         return media_walks(
-            self.config.reasoner.max_position_embeddings, self._reasoner_encoders(), node=REASONER_NODE,
+            self.config.reasoner.max_position_embeddings, (self._vision_encoder(),), node=REASONER_NODE,
         )
 
     # ------------------------------------------------------------------
@@ -833,13 +819,15 @@ class Cosmos3Model(Model):
         # empty text field as None.
         if prompt is None:
             prompt = ""
+        p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
+        cap = {self.DENOISE_CAP: self._denoise_cap(output_modalities, p)}
         if self.tokenizer is None:
             # Tokenizer-less fallback used by structural unit tests.
             return self._action_prompt_output({
                 "text_inputs": [
                     torch.tensor(list(prompt.encode("utf-8")), dtype=torch.long)
                 ]
-            }, kwargs)
+            }, kwargs, cap)
         # Both the conditional (positive) and unconditional (negative) prompts are
         # tokenized up front; the denoiser reads the second only when guidance is
         # on. Image/video prompts get the chat template + resolution/duration
@@ -847,7 +835,6 @@ class Cosmos3Model(Model):
         from mstar.model.cosmos3.components.packing import tokenize_prompt
 
         negative_prompt = kwargs.get("negative_prompt")
-        p = self._resolve_gen_params(kwargs, input_modalities, output_modalities)
         video = (tensors or {}).get("video_inputs")
         if p.get("action_mode") == ACTION_MODE_INVERSE_DYNAMICS and video and video[0].shape[0] < p["num_frames"]:
             # the encoder takes the clip's first num_frames frames; a shorter one encodes too few latent frames
@@ -878,7 +865,7 @@ class Cosmos3Model(Model):
                 torch.tensor(cond_ids, dtype=torch.long),
                 torch.tensor(uncond_ids, dtype=torch.long),
             ]
-        }, kwargs, {"kv_layout": {KV_CACHE: layout}})
+        }, kwargs, {"kv_layout": {KV_CACHE: layout}, **cap})
 
     def _gen_layout(
         self, p: dict, cond_ids: list[int], uncond_ids: list[int], input_modalities: list[str], tensors: dict,
@@ -1003,18 +990,16 @@ class Cosmos3Model(Model):
 
         Returns ``text_inputs`` (the token ids) and, with attachments, the
         packed ``pixel_values`` + ``vision_grid_thw`` the vision_encoder node
-        consumes; and the prompt's ``MEDIA_LAYOUT`` (each image's or video
-        frame's pad run and patch grid), from which the reasoner places its
-        mRoPE positions."""
+        consumes, plus the ``MEDIA_LAYOUT`` the reasoner splices the encoder's
+        tokens and places its mRoPE positions by."""
         from mstar.model.cosmos3.components.reasoner import (
             IMAGE,
             VIDEO,
             expand_placeholders,
-            layout_position_ids,
-            media_runs,
             preprocess_image,
             preprocess_video,
             render_chat,
+            vision_layout,
         )
 
         if not self._reasoner_enabled():
@@ -1079,15 +1064,15 @@ class Cosmos3Model(Model):
             raise ValueError(
                 f"Cosmos3 reasoner prompt is {ids.numel()} tokens, over the {max_len}-token context."
             )
-        pads, grids = media_runs(ids, reasoner, image_grids, video_grids)
-        layout = media_layout(pads, dict.fromkeys(grids, "vision_embeds"), grids)
-        # the position counter moves to where decoding continues, max(position) + 1
-        _, advance = layout_position_ids(0, layout, ids.numel(), reasoner.vision.spatial_merge_size)
+        # always set, so a layout the client sent never reaches the reasoner
+        layout = vision_layout(ids, reasoner, image_grids, video_grids, self._vision_encoder().output)
         out: NameToTensorList = {"text_inputs": [ids]}
         if ordered_patches:
             out["pixel_values"] = [torch.cat(ordered_patches, dim=0)]
             out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
         walk = self.REASONER_PREFILL_VISION_WALK if ordered_patches else self.REASONER_PREFILL_WALK
+        # a vision run spans its merged grid's longer side in positions, not its tokens
+        advance = layout_extent(layout, reasoner.vision.spatial_merge_size, ids.numel())
         main = LabelLayout(
             # media rows fill the expanded placeholders, so the span is rows, not ids
             spans=(Span("rows", walk, ids.numel(), advance, "text_inputs"),),
@@ -1191,7 +1176,7 @@ class Cosmos3Model(Model):
             # preset and multithreading (threads=0) target the same CRF/quality
             # but encode several times faster than libx264's default "medium"
             # preset, which otherwise dominates the serving latency for a
-            # many-frame clip. Both are overridable via COSMOS3_X264_PRESET.
+            # many-frame clip. The preset is overridable via COSMOS3_X264_PRESET.
             frames = output.cpu()
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
@@ -1217,10 +1202,10 @@ class Cosmos3Model(Model):
                         "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
                         str(exc).splitlines()[0][:160],
                     )
+                # NTSC rates exactly (encode_mp4's denominator is 1001)
                 data = encode_mp4(
                     frames.permute(0, 2, 3, 1).numpy(), fps,
-                    options={"crf": "18", "preset": preset, "threads": "0"},
-                    rate_denominator=1000, pad_even=True,
+                    options={"crf": "18", "preset": preset, "threads": "0"}, pad_even=True,
                 )
             return data
         if modality == "action":
@@ -1343,9 +1328,8 @@ class Cosmos3Model(Model):
             num_frames = int(mk.get("num_frames", default_frames))
         # The cookbook step counts differ per mode (image 50, video 35, action
         # 30 — configs override the action count per checkpoint); default by
-        # mode and let the request override. The denoise loop runs this many
-        # steps and stops early (Cosmos3DiTSubmodule.check_stop), so the value
-        # is only bounded above by the loop's static max_iters.
+        # mode and let the request override. The denoise loop's cap is this
+        # many steps (``_denoise_cap``), bounded above by its static max_iters.
         if action_mode is not None:
             default_steps = self.config.num_inference_steps_action
         elif num_frames > 1:
@@ -1691,226 +1675,82 @@ class Cosmos3Model(Model):
         # video shift (Edge: 12.0) or a request flow_shift wins.
         params.setdefault("flow_shift", constants.V2V_DEFAULT_FLOW_SHIFT)
 
-    def _step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        md = {"is_prefill": metadata.is_prefill}
-        md.update(metadata.kwargs)
-        return md
-
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        # The windowed decoder partition starts idle on its decode walk for
-        # every request — text ones included, which is why this comes before
-        # the reasoner dispatch: a walk the partition does not serve would
-        # never complete there and the request would hang after its last
-        # token. The window stream self-triggers its passes, and the resolved
-        # params ride along for its per-request window bookkeeping;
-        # non-windowed requests leave it idle until the stream's terminal
-        # flush, which it skips.
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """A media request prefills, then runs its denoise walk; a text request
+        runs the reasoner's prefill, then its decode loop fed the first token.
+        Every step carries the request's resolved params.
+
+        The windowed decoder partition runs its decode walk once per window the
+        stream brings, for every request, text ones included: a walk the
+        partition does not serve would never complete there and the request
+        would hang after its last token. A non-windowed request leaves it idle
+        until the stream's terminal flush, which it skips.
+        """
+        is_text = "text" in output_modalities
         if partition_name == constants.WINDOW_DECODER_PARTITION:
-            is_text = "text" in (output_modalities or [])
             params = {} if is_text else self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
-            md = CurrentForwardConductorMetadata(
-                input_modalities=input_modalities,
-                output_modalities=output_modalities,
-                graph_walk=self.VIDEO_DECODE_AR_WALK,
-                is_prefill=False,
-                kwargs=params,
+            return [WalkStep(self.VIDEO_DECODE_AR_WALK, step_metadata=params)]
+        if is_text:
+            if not self._reasoner_enabled():
+                raise ValueError("This Cosmos3 deployment does not serve the reasoner (text output).")
+            knobs = {
+                "max_output_tokens": self.get_max_output_tokens(**model_kwargs),
+                "enable_thinking": model_kwargs.get("enable_thinking"),
+            }
+            # the vision prefill when the prompt's layout places media (the
+            # layout says where the encoder's tokens and the positions go), the
+            # text-only prefill otherwise
+            prefill = media_prefill_step(
+                input_signals, (self._vision_encoder(),), model_kwargs.get(MEDIA_LAYOUT),
+                model_name="Cosmos3 reasoner",
             )
-            return ForwardPassArgs(
-                full_metadata=md, inputs=[], unpersist_tensors=[],
-                step_metadata=self._step_metadata(md),
-            )
-        if "text" in (output_modalities or []):
-            return self._initial_reasoner_args(input_modalities, output_modalities, input_signals, model_kwargs)
+            prefill = WalkStep(prefill.walk, step_metadata={**knobs, **prefill.step_metadata})
+            decode = WalkStep(self.REASONER_DECODE_WALK, bind={"text_inputs": "new_token"}, step_metadata=knobs)
+            return [prefill, decode]
         params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
         # Visual conditioning routes through a conditioned prefill that also feeds
         # the DiT the input to VAE-encode: a video (action inverse-dynamics) or an
         # image (image-to-video, action policy/forward-dynamics). Fall back to the
         # text-only prefill if no conditioning signal actually arrived.
-        video_cond = "video" in input_modalities and "video_inputs" in input_signals
-        image_cond = params.get("has_image_condition") and "image_inputs" in input_signals
-        if video_cond:
-            walk = self.PREFILL_COND_VIDEO_WALK
-        elif image_cond:
-            walk = self.PREFILL_COND_WALK
+        if "video" in input_modalities and "video_inputs" in input_signals:
+            prefill = self.PREFILL_COND_VIDEO_WALK
+        elif params.get("has_image_condition") and "image_inputs" in input_signals:
+            prefill = self.PREFILL_COND_WALK
         else:
-            walk = self.PREFILL_WALK
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=walk,
-            is_prefill=True,
-            kwargs=params,
-        )
+            prefill = self.PREFILL_WALK
+        denoise = self._denoise_walk(output_modalities, params)
+        return [WalkStep(prefill, step_metadata=params), WalkStep(denoise, step_metadata=params)]
 
-        inputs: list[GraphEdge] = []
-        if "text_inputs" in input_signals:
-            edge = GraphEdge(next_node=DIT_NODE, name="text_inputs")
-            edge.tensor_info = input_signals["text_inputs"]
-            inputs.append(edge)
-        # Every DiT prefill declares this edge. An empty signal makes requests
-        # without action conditioning ready without allocating a tensor.
-        inputs.append(GraphEdge(
-            next_node=DIT_NODE, name="action_inputs",
-            tensor_info=input_signals.get("action_inputs", []),
-        ))
-        cond_signal = "video_inputs" if video_cond else ("image_inputs" if image_cond else None)
-        if cond_signal:
-            edge = GraphEdge(next_node=VAE_ENCODER_NODE, name=cond_signal)
-            edge.tensor_info = input_signals[cond_signal]
-            inputs.append(edge)
+    def _denoise_walk(self, output_modalities: list[str], params: dict) -> str:
+        """Forward-dynamics runs the joint denoise but decodes the predicted
+        video; inverse-dynamics / policy emit the action; image and video share
+        the loop but differ in what the VAE node emits."""
+        is_video = "video" in output_modalities
+        if params.get("action_mode") == "forward_dynamics":
+            return self.ACTION_VIDEO_GEN_WALK
+        if "action" in output_modalities:
+            return self.ACTION_GEN_WALK
+        if is_video and params.get("window_mode"):
+            return self.VIDEO_GEN_AR_WALK
+        if is_video and params.get("generate_sound"):
+            return self.VIDEO_SOUND_GEN_WALK
+        return self.VIDEO_GEN_WALK if is_video else self.IMAGE_GEN_WALK
 
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._step_metadata(full_metadata),
-        )
-
-    def _initial_reasoner_args(
-        self, input_modalities, output_modalities, input_signals, model_kwargs,
-    ) -> ForwardPassArgs:
-        """First walk of a text (reasoner) request: the vision prefill when the
-        prompt's layout places media, the text-only prefill otherwise."""
-        if not self._reasoner_enabled():
-            raise ValueError("This Cosmos3 deployment does not serve the reasoner (text output).")
-        mk = dict(model_kwargs or {})
-        step = media_prefill_step(
-            input_signals, self._reasoner_encoders(), mk.get(MEDIA_LAYOUT),
-            model_name="Cosmos3 reasoner", node=REASONER_NODE,
-        )
-        kwargs = {
-            "max_output_tokens": self.get_max_output_tokens(**mk),
-            "enable_thinking": mk.get("enable_thinking"),
-        }
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=step.walk,
-            is_prefill=True,
-            kwargs=kwargs,
-        )
-        inputs = walk_input_edges(step)
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            # the layout rides this step only, not the request's kwargs (every decode step)
-            step_metadata={**self._step_metadata(full_metadata), **step.metadata},
-        )
-
-    def _reasoner_partition_args(
-        self, metadata: CurrentForwardConductorMetadata, persist_signals,
-    ) -> ForwardPassArgs:
-        """Reasoner transitions: prefill -> decode loop (seeded with the
-        persisted first token); the loop's end (EOS / max tokens, decided by
-        the submodule's ``check_stop``) finishes the request."""
-        request_done = False
-        inputs: list[GraphEdge] = []
-        if metadata.graph_walk in (self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK):
-            metadata.is_prefill = False
-            metadata.graph_walk = self.REASONER_DECODE_WALK
-            edge = GraphEdge(next_node=REASONER_NODE, name="text_inputs")
-            edge.tensor_info = persist_signals.get("new_token", [])
-            inputs.append(edge)
-        elif metadata.graph_walk == self.REASONER_DECODE_WALK:
-            request_done = True
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._step_metadata(metadata),
-            request_done=request_done,
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        # The windowed decoder partition is self-triggered by its stream
-        # buffer; the conductor only keeps its walk pinned. Its completion is
-        # the stream's final chunk, not a conductor decision.
-        if partition_name == constants.WINDOW_DECODER_PARTITION:
-            metadata.graph_walk = self.VIDEO_DECODE_AR_WALK
-            return ForwardPassArgs(
-                full_metadata=metadata, inputs=[], unpersist_tensors=[],
-                step_metadata=self._step_metadata(metadata),
-            )
-        if metadata.graph_walk in (
-            self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK, self.REASONER_DECODE_WALK,
-        ):
-            return self._reasoner_partition_args(metadata, persist_signals)
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        # Forward-dynamics conditions on a clean action chunk and emits the
-        # predicted video; inverse-dynamics / policy emit the action.
-        is_fd = metadata.kwargs.get("action_mode") == "forward_dynamics"
-        is_action = "action" in metadata.output_modalities
-        is_video = "video" in metadata.output_modalities
-        joint_action = is_fd or is_action  # walks that also thread action latents
-        if metadata.graph_walk in (
-            self.PREFILL_WALK, self.PREFILL_COND_WALK, self.PREFILL_COND_VIDEO_WALK
-        ):
-            metadata.is_prefill = False
-            # Pick the denoise walk: forward-dynamics runs the joint denoise but
-            # decodes the predicted video; inverse-dynamics / policy emit the
-            # action; image and video share the loop but differ in what the VAE
-            # node emits.
-            if is_fd:
-                metadata.graph_walk = self.ACTION_VIDEO_GEN_WALK
-            elif is_action:
-                metadata.graph_walk = self.ACTION_GEN_WALK
-            elif is_video and metadata.kwargs.get("window_mode"):
-                metadata.graph_walk = self.VIDEO_GEN_AR_WALK
-            elif is_video and metadata.kwargs.get("generate_sound"):
-                metadata.graph_walk = self.VIDEO_SOUND_GEN_WALK
-            elif is_video:
-                metadata.graph_walk = self.VIDEO_GEN_WALK
-            else:
-                metadata.graph_walk = self.IMAGE_GEN_WALK
-            # The first denoise iteration's initial noise and scheduler state are
-            # sampled inside the DiT submodule's preprocess. Action and sound
-            # walks also thread their extra latents through the loop.
-            if joint_action:
-                inputs = self._denoise_loop_back("latents", "action_latents")
-            elif metadata.graph_walk == self.VIDEO_SOUND_GEN_WALK:
-                inputs = self._denoise_loop_back("latents", "sound_latents")
-            else:
-                inputs = self._denoise_loop_back("latents")
-            # The vae_encoder node's clean conditioning latents (persisted at
-            # the conductor during the prefill walk) seed the loop's first
-            # iteration; unconditioned requests carry an empty edge.
-            cond_edge = GraphEdge(next_node=DIT_NODE, name="cond_latents")
-            cond_edge.tensor_info = persist_signals.get("cond_latents", [])
-            inputs.append(cond_edge)
-        elif metadata.graph_walk in (
-            self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, self.VIDEO_GEN_AR_WALK,
-            self.VIDEO_SOUND_GEN_WALK, self.ACTION_GEN_WALK, self.ACTION_VIDEO_GEN_WALK,
-        ):
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._step_metadata(metadata),
-            request_done=request_done,
-        )
+    def _denoise_cap(self, output_modalities: list[str], params: dict) -> dict[str, int]:
+        """The request's denoise loop and its iterations: one per scheduler step,
+        and for a windowed request every window's, plus a commit per kv window."""
+        iters = params["num_inference_steps"]
+        if params.get("window_mode") is not None:
+            iters = params["num_windows"] * (iters + 1 if params["window_mode"] == "kv" else iters)
+        walk = self._denoise_walk(output_modalities, params)
+        return {DENOISE_LOOP_FOR_WALK.get(walk, IMAGE_GEN_LOOP): iters}
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
@@ -1972,7 +1812,7 @@ class Cosmos3Model(Model):
             return Cosmos3ReasonerSubmodule(
                 transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
                 config=self.config,
-                encoders=self._reasoner_encoders(),
+                encoders=(self._vision_encoder(),),
             )
         if node_name == VISION_ENCODER_NODE:
             return Cosmos3VisionEncoderSubmodule(

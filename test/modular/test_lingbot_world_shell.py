@@ -14,9 +14,8 @@ import torch
 
 sys.path.insert(0, ".")
 
-from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.engine.resources import RaggedCrossAttentionSpec, RaggedCrossAttentionStep, cross_label  # noqa: E402
-from mstar.graph.base import GraphNode, Loop  # noqa: E402
+from mstar.graph.base import GraphNode, Loop, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.lingbot_world.components.dit import (  # noqa: E402
     REFERENCE_ATTENTION,
@@ -110,22 +109,19 @@ def test_walks_run_text_then_a_chunk_loop_that_emits_frames(model):
     assert any(e.next_node == "dit" and e.name == "clock" for e in node.outputs)
 
 
-def _info(num_chunks: int, done: int) -> CurrentForwardPassInfo:
-    info = CurrentForwardPassInfo(
-        request_id="r", graph_walk=ROLLOUT_WALK, fwd_index=0, random_seed=0, max_tokens=0,
-        step_metadata={"num_chunks": num_chunks}, rid_handle=0,
-    )
-    info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = done
-    return info
+def _pointer(*dims: int) -> TensorPointerInfo:
+    return TensorPointerInfo(dims=list(dims), dtype=torch.float32, nbytes=0, address=0, stride=[], uuid=0,
+                             source_session_id="", source_entity="")
 
 
-def test_check_stop_fires_on_the_last_chunk_and_the_overshoot_is_vetoed(model):
-    sub = LingBotDitSubmodule.__new__(LingBotDitSubmodule)
-    torch.nn.Module.__init__(sub)
-    sub.request_states = {}
-    assert [bool(sub.check_stop("r", _info(3, k), {})) for k in range(3)] == [False, False, True]
-    sub.request_state(0).add("chunk", 3)
-    assert sub.prepare_inputs(ROLLOUT_WALK, _info(3, 3), {}) is None
+def test_the_plan_runs_both_walks_with_the_rollouts_chunk_count(model):
+    signals = {"text_inputs": [_pointer(512)], "image_inputs": [_pointer(3, 480, 832)],
+               "camera_poses": [_pointer(8, 6, 60, 104)], "intrinsics": [_pointer(4)]}
+    plan = model.walk_plan("default", ["text", "image"], ["video_frame"], signals, {})
+    assert [step.walk for step in plan] == ["encode_text", ROLLOUT_WALK] and not any(step.bind for step in plan)
+    assert all(step.step_metadata == {"guidance_scale": 1.0, "num_latent_frames": 8} for step in plan)
+    with pytest.raises(ValueError, match="intrinsics"):
+        model.walk_plan("default", ["text", "image"], ["video_frame"], {**signals, "intrinsics": []}, {})
 
 
 # The reference's sqrt gives 479.99999999999994 for an exact 480x832 image and
@@ -264,6 +260,19 @@ def test_one_chunk_needs_thirteen_poses(model, monkeypatch):
     assert out["camera_poses"][0].shape[0] == 4  # one chunk of latent frames
 
 
+@pytest.mark.parametrize("num_frames,num_poses", [(13, 13), (93, 269), (361, 269)])
+def test_the_rollout_loop_is_capped_at_the_chunks_process_prompt_lays_out(model, monkeypatch, num_frames, num_poses):
+    """The cap alone ends the rollout: one iteration per chunk of the poses the DiT reads."""
+    monkeypatch.setattr(model, "_ensure_tokenizer", lambda: None)
+    monkeypatch.setattr(model, "tokenizer", lambda text, **kwargs: type("Ids", (), {"input_ids": [0, 1]})())
+    poses = np.tile(np.eye(4), (num_poses, 1, 1))
+    req = dict(intrinsics=[415.0, 415.0, 416.0, 240.0], num_frames=num_frames, camera_poses=poses)
+    out = model.process_prompt("p", ["text", "image"], ["video_frame"],
+                               tensors={"image_inputs": [torch.zeros(3, 480, 832, dtype=torch.uint8)]}, **req)
+    chunks = out["camera_poses"][0].shape[0] // model.config.chunk_size
+    assert model.get_loop_caps(**req) == {ROLLOUT_LOOP_NAME: chunks}
+
+
 def test_mstar_serve_knows_the_model():
     from pathlib import Path
 
@@ -313,8 +322,7 @@ def test_dit_loader_takes_each_tensor_only_from_its_indexed_shard(tmp_path):
 
 
 def test_the_parity_gate_fails_on_any_differing_point():
-    """Every flag in the parity report must hold, and the rollout must stop on
-    its last chunk only; anything else fails the run."""
+    """Every flag in the parity report must hold; anything else fails the run."""
     import importlib.util
     from pathlib import Path
 
@@ -331,7 +339,7 @@ def test_the_parity_gate_fails_on_any_differing_point():
         "tokenizer_ids_equal": True, "text_embeds_tail_zero": True, "mask_equal": True,
         "image": {"bit_exact": True, "max_abs": 0.0}, "dit_calls_bit_exact": {"x_in": True, "flow": True},
         "e2e_chunks": [{"latent": {"bit_exact": True}, "frames": {"bit_exact": True}}] * 2,
-        "check_stop_flags": [False, False, True], "overshoot_vetoed": True, "dit_first_divergent_call": None,
+        "dit_first_divergent_call": None,
     }
     assert run_parity.mismatches(report) == []
     for key, value, point in [
@@ -340,8 +348,6 @@ def test_the_parity_gate_fails_on_any_differing_point():
         ("e2e_chunks", [{"latent": {"bit_exact": True}, "frames": {"bit_exact": False}}],
          ".e2e_chunks[0].frames.bit_exact"),
         ("image", {"bit_exact": False, "shape_mismatch": [[1], [2]]}, ".image.bit_exact"),
-        ("check_stop_flags", [False, True, True], ".check_stop_flags"),
-        ("check_stop_flags", [False, False, False], ".check_stop_flags"),
     ]:
         assert run_parity.mismatches({**report, key: value}) == [point]
 
