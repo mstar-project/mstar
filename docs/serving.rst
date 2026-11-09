@@ -257,10 +257,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        a 503.
    * - ``unpausable_outputs``
      - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
-       that streams one of them reserves its whole KV footprint and is never preempted (see
-       below). Defaults to the model's ``UNPAUSABLE_OUTPUTS``, which is ``[audio]`` unless the
-       model declares otherwise. ``[]`` gives a voice deployment a fast first chunk under KV
-       pressure, at the cost of a pause when its requests are preempted.
+       that streams one of them reserves its whole KV footprint and is never preempted once it
+       starts (see below). Defaults to the model's ``UNPAUSABLE_OUTPUTS``, which is ``[audio]``
+       unless the model declares otherwise. ``[]`` gives a voice deployment a fast first chunk
+       under KV pressure, at the cost of a pause when its requests are preempted.
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
@@ -576,7 +576,10 @@ no drop can free, because it holds KV made from another node's outputs or from m
 copies of, or a node that keeps no token ids writes its KV, moves only to the host: when it is
 admitted the host pool sets room aside for its prompt, and it reserves only its prompt. The room
 grows with each page the request takes after that, so its move always fits. Bagel generations, which
-write a label per guidance, and requests with media above one rank are such requests. When the host
+write a label per guidance, and requests with media above one rank are such requests. So is a
+request with images or video from the step it samples an image or video pad id, which its host
+copies have no row for: the host pool then sets room aside for the pages it holds, and with no host
+pool the request reserves its whole footprint once the device has room for it. When the host
 pool has no room for it at admission, or later once the device has room for the rest of its
 footprint, the request reserves its whole footprint in that pool, as a voice request does, and the
 host pool logs it. While the device has no room for that either, nothing is logged: newer requests

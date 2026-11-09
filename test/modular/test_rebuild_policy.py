@@ -802,6 +802,21 @@ def test_a_request_that_samples_a_pad_id_is_never_dropped():
     assert list(rebuilds._kept[NODE][A].sampled) == [5], "a request that sampled text would stop being droppable"
 
 
+def test_a_request_of_ids_alone_that_samples_a_pad_id_stays_droppable():
+    """A walk of ids alone runs with no encoder output, so a pad in its rebuild row is embedded as the decode step
+    embedded it. Forgetting its ids left a request its pool admitted as droppable with nothing that could move it."""
+    pool = HostPool(1 << 10, torch.device("cpu"))
+    rebuilds = Rebuilds({NODE: replace(MEDIA, pad_ids=frozenset({91}))}, _graphs(), pool, StepAllowance(), DTYPES)
+    assert _ingest(rebuilds, R, (PrefixSpan(3, 3, PREFILL),))
+    rebuilds.record(_ran(PREFILL, _rows(R)))
+
+    forgot = rebuilds.keep_samples(_batch((R,)), {}, HostRows((R,), {"new_token": torch.tensor([91])}))
+
+    assert not forgot and rebuilds.refusal(R, NODE, DECODE, {"decode_loop": 0}, None) is None, (
+        "a text request whose rebuild would write the KV it holds was never dropped again"
+    )
+
+
 @pytest.mark.parametrize("why, node, walk, sampled, iters", [
     ("declares no rebuild policy", "vocoder", DECODE, 1, 0),
     ("keeps no log", NODE, DECODE, None, 0),

@@ -17,12 +17,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from test_kv_preemption import _pool
+from test_kv_preemption import PAGE_SIZE, _pool, _running
+from test_kv_preemption import _step as _kv_step
 from test_kv_prefix_lease import _StubTransfer
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.chunking import ChunkRange
-from mstar.engine.engine import ExecutingBatch
+from mstar.engine.engine import ExecutingBatch, PagedKVCache
 from mstar.engine.resources import AllocationFailed, Residency, StepAllowance, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVReqConfig, PrefixSpan, StreamLayout
@@ -191,6 +192,43 @@ def test_postprocess_appends_kept_samples_and_lands_a_rebuild_row_beside_them():
         w.executor.postprocess(pending, outputs)
     assert list(w._rebuilds._kept[node][1].sampled) == [5], "a drop would find no samples and refuse"
     assert landed == [R], "the rebuilt request would never be ready to decode again"
+
+
+def test_a_request_with_images_that_samples_a_pad_id_never_leaves_an_older_one_waiting_for_good(monkeypatch):
+    """A request with images that samples an image pad keeps no ids from then on, since its rebuild row would give
+    the pad an encoder row. Its pool had admitted it as a request a drop frees and was never told otherwise, so
+    with no host pool nothing could move it. An older request that ran short beside it waited for it, and it waited
+    for the older one."""
+    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
+
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    kv = _pool()
+    # R and A hold 3 of the 10 pages each, and the 4 left are what A grows into
+    _running(kv, R, 3, arrival=1)
+    _running(kv, A, 3, arrival=2)
+    eng = _engine(_Sub())
+    w, node, walk = _worker(eng, _Runtime(), (R, A)), "vocoder", "w"
+    w.engine_manager.engine = SimpleNamespace(paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({node}), kv)])
+    preempting(w)
+    w._rebuilds._policies = {node: replace(POLICY, pad_ids=frozenset({90}))}
+    # A's prompt step read an encoder's output besides its ids
+    media = RowRecord({"text_inputs": [torch.tensor([1, 2, 3])], "embeds": [torch.zeros(1, 2)]}, {"is_prefill": True})
+    w._rebuilds._kept = {node: {A: replace(_kept(), records=[media])}}
+    w._rebuilds._keeps_ids, w._rebuilds._prefilling = {node: {}}, {node: set()}
+    batch = _step((R, A), walk, node, rebuild=None)
+    eng.prepare_inputs(batch)
+    pending = PendingBatch(ScheduledBatch(node, walk, {R: 0, A: 0}), batch, node, "p", walk, Future())
+    # A samples the image pad
+    outputs = BatchedModelOutput(per_rid_outputs={R: {"new_token": [torch.tensor([5])]},
+                                                  A: {"new_token": [torch.tensor([90])]}})
+    with pytest.raises(_ReachedRoutingError):
+        w.executor.postprocess(pending, outputs)
+
+    for _ in range(2):
+        _kv_step(kv, R, PAGE_SIZE)
+    assert all(_kv_step(kv, A, PAGE_SIZE).ok for _ in range(4)), (
+        "A ran short beside an older request that can't move it, and each waits for the other"
+    )
 
 
 @pytest.mark.parametrize("build", ["executing", "speculative"])

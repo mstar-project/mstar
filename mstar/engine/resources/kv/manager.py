@@ -662,8 +662,8 @@ class KVManager(AttentionResource):
         #   allotment is sized from.
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
-        # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their
-        #   first `ask`, or later when the host has no room to set aside for their move.
+        # `_guaranteed` holds the requests that reserve what they grow into and are never preempted once they start,
+        #   decided at their first `ask`, or later when the host has no room to set aside for their move.
         self._nodes = nodes
         self.local_loops: Collection[str] = frozenset()
         self._asks: dict[str, int] = {}
@@ -3332,7 +3332,7 @@ class KVManager(AttentionResource):
         if residency is Residency.DROPPED:
             return f"KV {self.name}: {rid} is dropped already, and its rebuild hasn't landed"
         with self._lock:
-            if not self._movable(rid):
+            if rid in self._guaranteed or not self._movable(rid):
                 return (
                     f"KV {self.name}: {rid} is guaranteed, has a step or a read in flight on its pages, or holds a "
                     "lease no walk's admit has taken over"
@@ -4390,25 +4390,37 @@ class KVManager(AttentionResource):
         if self._cpu_pool is not None and self._unwritten(rid) and not self._on_host(rid):
             self._cpu_pool.unreserve(rid)
 
+    def refuse_drops(self, rid: str) -> None:
+        """Mark ``rid``, admitted as a request a drop here can free, as one no drop can free from now on. As for a
+        request marked so at its arrival, the host sets aside room for the pages it holds, or it turns guaranteed
+        when the host has none (`_cover_move`)."""
+        with self._lock:
+            self._overrides[rid] = replace(self._overrides[rid], rebuildable=False)
+            if rid in self._allotments:
+                self._cover_move(rid, 0)
+
     def _guarantee(self, rid: str) -> None:
-        """Make ``rid`` guaranteed, since the host has no room to set aside for its move."""
+        """Make ``rid`` guaranteed, since no host has room to set aside for its move."""
         self._guaranteed.add(rid)
-        self._cpu_pool.unreserve(rid)
-        self._cpu_pool.count_guaranteed(rid)
+        if self._cpu_pool is not None:
+            self._cpu_pool.unreserve(rid)
+            self._cpu_pool.count_guaranteed(rid)
 
     def _cover_move(self, rid: str, n: int) -> int:
-        """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
-        when the host has no room for them. Returns the pages its guarantee is short of, before which ``rid`` takes
-        nothing."""
-        reserved = None if self._cpu_pool is None else self._cpu_pool.reserved.get(rid)
-        if reserved is None:
+        """Grow the room the host sets aside for ``rid``, a request no drop here can free, by the ``n`` pages it is
+        about to take, or guarantee ``rid`` when the host has no room for them. Returns the pages its guarantee is
+        short of, before which ``rid`` takes nothing."""
+        if not self._decides or self._overrides[rid].rebuildable or rid in self._guaranteed:
             return 0
         # a lease, and the pages held for a copy from the host, become a stream's pages without a grant
         held = sum(
             len(stream.pages()) + len(stream.lease or ()) + len(stream.hold or ())
             for stream in self._streams[rid].values()
         )
-        if held + n <= reserved or self._cpu_pool.reserve(rid, held + n):
+        reserved = None if self._cpu_pool is None else self._cpu_pool.reserved.get(rid)
+        if (reserved is not None and held + n <= reserved) or (
+            self._cpu_pool is not None and self._cpu_pool.reserve(rid, held + n)
+        ):
             return 0
         allotment = self._allotments[rid]
         # a lease's lent pages stay in a guaranteed allotment until `_adopt` takes them off
@@ -4631,17 +4643,17 @@ class KVManager(AttentionResource):
         )
 
     def _movable(self, rid: str) -> bool:
-        """Whether a move can take ``rid`` as soon as it is chosen: it isn't guaranteed, no step or read is in flight on
-        its pages, and it isn't dropped with a rebuild still to land, since the rebuild runs on its allotment. ``rid``
+        """Whether a move can take ``rid`` as soon as it is chosen: no step or read is in flight on its pages, it isn't
+        dropped with a rebuild still to land, since the rebuild runs on its allotment, and it isn't guaranteed, unless
+        it waits holding its allotment with no page written, when moving it only undoes its admission. ``rid``
         also stays while it holds a lease, until a walk's admit takes the lease over. The probe that took the lease
         moved the position counter, which a smaller hit after a move couldn't move back, and a walk the cache served
         keeps its KV only in the lease."""
-        return (
-            rid not in self._guaranteed and rid not in self._dropped
-            and not any(
-                stream.step_in_flight or stream.read_pending or stream.lease is not None
-                for stream in self._streams[rid].values()
-            )
+        if rid in self._guaranteed and not (rid in self._stalled and self._unwritten(rid)):
+            return False
+        return rid not in self._dropped and not any(
+            stream.step_in_flight or stream.read_pending or stream.lease is not None
+            for stream in self._streams[rid].values()
         )
 
     def _unwritten(self, rid: str) -> bool:
