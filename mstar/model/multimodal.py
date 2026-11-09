@@ -475,10 +475,10 @@ def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[Me
 
 
 def media_walks(
-    max_iters: int, encoders: Sequence[MediaEncoder] = (),
+    max_iters: int, encoders: Sequence[MediaEncoder] = (), node: str = "LLM",
 ) -> dict[str, GraphSection]:
     """``prefill_text``, one media walk per subset of ``encoders``, and
-    ``decode``, over the ``LLM`` node and the encoders. ``max_iters`` bounds
+    ``decode``, over the decoder ``node`` and the encoders. ``max_iters`` bounds
     the decode loop; it is a safety bound, not the per-request budget."""
 
     def emit_first_token() -> GraphEdge:
@@ -487,21 +487,21 @@ def media_walks(
         )
 
     walks: dict[str, GraphSection] = {
-        "prefill_text": GraphNode(name="LLM", input_names=["text_inputs"], outputs=[emit_first_token()]),
+        "prefill_text": GraphNode(name=node, input_names=["text_inputs"], outputs=[emit_first_token()]),
     }
     for mask in range(1, 1 << len(encoders)):
         present = [e for i, e in enumerate(encoders) if mask >> i & 1]
         nodes = [
             GraphNode(
                 name=e.node, input_names=list(e.inputs),
-                outputs=[GraphEdge(next_node="LLM", name=e.output)],
+                outputs=[GraphEdge(next_node=node, name=e.output)],
             )
             for e in present
         ]
         walks[media_walk_name(present)] = Sequential([
             nodes[0] if len(nodes) == 1 else Parallel(nodes),
             GraphNode(
-                name="LLM",
+                name=node,
                 input_names=["text_inputs", *(e.output for e in present)],
                 outputs=[emit_first_token()],
             ),
@@ -509,10 +509,10 @@ def media_walks(
     walks["decode"] = Loop(
         name="decode_loop",
         section=GraphNode(
-            name="LLM",
+            name=node,
             input_names=["text_inputs"],
             outputs=[
-                GraphEdge(next_node="LLM", name="text_inputs"),
+                GraphEdge(next_node=node, name="text_inputs"),
                 GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
             ],
         ),
@@ -522,9 +522,9 @@ def media_walks(
     return walks
 
 
-def text_combined_walks() -> dict[str, dict[str, set[str]]]:
-    """Text prefill and decode rows of the ``LLM`` node share a step."""
-    return {"LLM": {MIXED: {"prefill_text", "decode"}}}
+def text_combined_walks(node: str = "LLM") -> dict[str, dict[str, set[str]]]:
+    """Text prefill and decode rows of the decoder ``node`` share a step."""
+    return {node: {MIXED: {"prefill_text", "decode"}}}
 
 
 @dataclass(frozen=True)
@@ -542,6 +542,7 @@ def media_prefill_step(
     layout: dict | None = None,
     *,
     model_name: str,
+    node: str = "LLM",
 ) -> PrefillStep:
     """The one prefill walk a request runs over its whole prompt
     (``text_inputs``, one tensor): with media in its ``layout``, the walk over
@@ -562,8 +563,8 @@ def media_prefill_step(
         if sent:
             # a text prefill would drop them
             raise ValueError(f"{model_name} got {sent} with no media layout to place them by")
-        return PrefillStep("prefill_text", {("LLM", "text_inputs"): texts})
-    inputs = {("LLM", "text_inputs"): texts}
+        return PrefillStep("prefill_text", {(node, "text_inputs"): texts})
+    inputs = {(node, "text_inputs"): texts}
     for e in present:
         for name in e.inputs:
             inputs[(e.node, name)] = signals.get(name, [])
@@ -611,14 +612,15 @@ def initial_prefill_args(
 def next_prefill_args(
     metadata: CurrentForwardConductorMetadata,
     persist_signals: dict[str, list[TensorPointerInfo]],
+    node: str = "LLM",
 ) -> ForwardPassArgs:
-    """After the prefill, loop in decode until the decoder's stop check ends it."""
+    """After the prefill, loop in decode until the decoder ``node``'s stop check ends it."""
     from mstar.model.base import ForwardPassArgs
 
     if metadata.is_prefill:
         metadata.is_prefill = False
         metadata.graph_walk = "decode"
-        edge = GraphEdge(next_node="LLM", name="text_inputs")
+        edge = GraphEdge(next_node=node, name="text_inputs")
         edge.tensor_info = persist_signals.get("new_token", [])
         return _prefill_args(metadata, [edge], {})
     # reaching here again after decode stopped means the request is finished
