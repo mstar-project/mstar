@@ -187,8 +187,6 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 
 ## Testing
 
-Run `python -m pytest mstar_sim/audits` after a FlashInfer bump or changes to functions wrapped by `mstar_sim/patches.py`.
-
 ```bash
 ruff check .                          # CI enforces this
 # the CPU Core CI job's tests, no GPU or weights; see "Running the CPU suite" below
@@ -199,6 +197,8 @@ CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 pytest test/integration/              # needs GPU + weights
 cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
 ```
+
+Run `python -m pytest mstar_sim/audits` after a FlashInfer bump or changes to functions wrapped by `mstar_sim/patches.py`.
 
 ### Running the CPU suite
 
