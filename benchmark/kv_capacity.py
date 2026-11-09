@@ -81,7 +81,7 @@ def kv_configs(config, model_path=None):
     (shards,) = shards
     cfg.shard(shards)
     without.shard(shards)
-    return cfg, without, int(serving.get("max_seq_len", cfg.max_seq_len)), shards
+    return cfg, without, cfg.max_seq_len, shards
 
 
 def manager(cfg, shards=1, device="cuda"):

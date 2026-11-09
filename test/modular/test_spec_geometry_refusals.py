@@ -173,3 +173,12 @@ def test_shipped_configs_keep_the_models_context(path, context):
     spec = KVSpec(resource_key="kv", nodes={"node"}, config=_paged(max_seq_len=context))
     apply_yaml_overrides([spec], {"max_seq_len": yaml.safe_load(path.read_text())["max_seq_len"]})
     assert spec.config.max_seq_len == context
+
+
+def test_engine_comparison_reads_limits_from_a_config_that_leaves_context_null():
+    from types import SimpleNamespace
+
+    from benchmark.lora import compare_engines
+
+    context, running = compare_engines._mstar_limits(SimpleNamespace(model="qwen3_5_0.8b", context_length=32768))
+    assert context == 32768 and running > 0

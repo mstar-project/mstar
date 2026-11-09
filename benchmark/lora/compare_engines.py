@@ -171,9 +171,10 @@ def _scenarios(args) -> list[Scenario]:
 
 
 def _mstar_limits(args) -> tuple[int, int]:
-    """Context length and max running requests, from the stock config, for all engines."""
+    """The competitors' context length (``--context-length``) and max running requests, from the
+    stock config."""
     config = yaml.safe_load((REPO / "configs" / f"{args.model}.yaml").read_text())
-    return int(config["max_seq_len"]), int(config["resources"]["gdn_state"]["max_slots"]) - 1
+    return args.context_length, int(config["resources"]["gdn_state"]["max_slots"]) - 1
 
 
 def _mstar_config(args, kind: str) -> Path:
@@ -1142,6 +1143,8 @@ def main() -> int:
     p.add_argument("--vllm-python", default=str(Path.home() / "venvs/vllm/bin/python"))
     p.add_argument("--sglang-python", default=str(Path.home() / "venvs/sglang/bin/python"))
     p.add_argument("--model", default="qwen3_5_0.8b", choices=sorted(HF_REPOS))
+    p.add_argument("--context-length", type=int, default=32768,
+                   help="context length vLLM and SGLang serve; matches every earlier run of this comparison")
     p.add_argument("--adapter", action="append", default=[], metavar="NAME=REPO_OR_DIR")
     p.add_argument("--perf-adapters", default=None,
                    help="comma-separated subset for (b)-(d); (b) uses the first. Default: every adapter")

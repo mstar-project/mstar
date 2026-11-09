@@ -4,12 +4,15 @@ check FlashInfer against an explicit FP32 PyTorch attention reference."""
 import importlib.util
 import itertools
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import torch
+import yaml
 
 from mstar.engine.resources.attn import wrappers
 from mstar.engine.resources.attn.base import AttentionManager
@@ -324,6 +327,31 @@ class SlidingWindowTests(unittest.TestCase):
             return kv_capacity.fill(cfg, 64, shards=shards, decode=16, device="cpu")["requests"]
 
         self.assertEqual([requests(1), requests(2)], [2, 2])
+
+    def test_capacity_benchmark_reads_a_config_that_leaves_max_seq_len_null(self):
+        from benchmark import kv_capacity
+
+        class Model:
+            def __init__(self, **kwargs):
+                pass
+
+            def get_node_resources(self):
+                cfg = PagedKVConfig(num_layers=3, num_qo_heads=1, num_kv_heads=1, head_dim=4,
+                                    max_seq_len=64, page_size=16, max_num_pages=6)
+                return [
+                    KVSpec(resource_key="kv", nodes={"LLM"}, config=cfg),
+                    AttentionSpec(resource_key="local", nodes={"LLM"},
+                                  config=AttentionConfig("kv", sliding_window=WINDOW, layers=(1, 2))),
+                    AttentionSpec(resource_key="full", nodes={"LLM"}, config=AttentionConfig("kv")),
+                ]
+
+        serving = {"model": "m", "max_seq_len": None, "node_groups": [{"node_names": ["LLM"]}]}
+        with (tempfile.TemporaryDirectory() as tmp,
+              patch("mstar.model.registry.get_model_class", lambda name: Model),
+              patch("mstar.model.registry.model_init_kwargs", lambda name: {})):
+            path = Path(tmp) / "config.yaml"
+            path.write_text(yaml.safe_dump(serving))
+            self.assertEqual(kv_capacity.kv_configs(path)[2], 64)
 
     def test_window_pool_refusals(self):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only
