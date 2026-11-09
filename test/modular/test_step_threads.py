@@ -1669,3 +1669,50 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     # no other thread of the process landed on a step CPU, the intra-op pool
     # the plan thread just used included (looked at while it was alive)
     assert seen["plan"][2] == []
+
+
+# ── step_threads: serial ────────────────────────────────────────────────────
+
+
+def _executor(monkeypatch, step_threads, seen):
+    """A StepExecutor with only what ``start`` reads, its thread initializer
+    recorded instead of run, and pre-plan on."""
+    from mstar.utils import knobs
+    from mstar.worker.step_executor import StepExecutor
+
+    knobs.configure({"step_threads": step_threads} if step_threads else None)
+    monkeypatch.setattr(StepExecutor, "_init_engine_thread", lambda self: seen.append(threading.get_ident()))
+    monkeypatch.setattr(knobs, "pre_plan_enabled", lambda: True)
+    executor = StepExecutor.__new__(StepExecutor)
+    executor.worker_id = "w"
+    executor._gpu_pool = executor._plan_pool = None
+    executor.start()
+    return executor
+
+
+def test_serial_steps_run_on_the_caller_and_hand_back_a_finished_future(monkeypatch):
+    from mstar.utils import knobs
+
+    seen: list[int] = []
+    executor = _executor(monkeypatch, "serial", seen)
+    # both "threads" initialized, on the caller
+    assert seen == [threading.get_ident()] * 2
+    for pool in (executor._gpu_pool, executor._plan_pool):
+        done = pool.submit(threading.get_ident)
+        assert done.done() and done.result() == threading.get_ident()
+        called = []
+        done.add_done_callback(called.append)
+        assert called == [done]
+        failed = pool.submit(lambda: 1 / 0)
+        assert isinstance(failed.exception(timeout=0), ZeroDivisionError)
+    knobs.configure(None)
+
+
+def test_threaded_steps_keep_real_pools(monkeypatch):
+    seen: list[int] = []
+    executor = _executor(monkeypatch, None, seen)
+    for pool in (executor._gpu_pool, executor._plan_pool):
+        assert pool.submit(threading.get_ident).result() != threading.get_ident()
+        pool.shutdown()
+    # each pool's initializer ran on its own thread
+    assert len(seen) == 2 and threading.get_ident() not in seen
