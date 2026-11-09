@@ -929,7 +929,7 @@ def test_the_serial_follow_path_will_not_build_mid_replay():
     """A refused replay leaves moves owed, so the rids the head names do not mean
     here what they meant on the leader. Wait rather than build."""
     engine = SimpleNamespace(
-        apply_resident_delta=lambda delta, rebuilding: False,  # refuses
+        apply_resident_delta=lambda delta, rebuilding, caught_up: False,  # refuses
         residency=lambda node, rid: Residency.RESIDENT,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
         get_max_batch_size=lambda node, walk: None,
@@ -1144,7 +1144,7 @@ def _follow_spec(*, replay_refuses: bool) -> Worker:
     answers proves nothing about whether it asked.
     """
     engine = SimpleNamespace(
-        apply_resident_delta=lambda delta, rebuilding: not replay_refuses,
+        apply_resident_delta=lambda delta, rebuilding, caught_up: not replay_refuses,
         residency=lambda node, rid: Residency.RESIDENT,
         reclaimable=lambda node, rid: 0,
         check_ready=lambda *a, **kw: FULL_ADMIT_OK,
@@ -1213,6 +1213,32 @@ def test_the_async_follow_path_will_not_build_mid_replay():
     assert worker.scheduler.lockstep.follow_head() is worker.head, (
         "the head was consumed mid-replay"
     )
+
+
+class _Commit:
+    """N's ``commit_done``, which commits when the follower waits on it."""
+
+    def __init__(self):
+        self.done = self.waited = False
+
+    def is_set(self):
+        return self.done
+
+    def wait(self):
+        self.waited = self.done = True
+
+
+def test_the_async_follow_path_waits_for_ns_commit_to_replay_a_reload():
+    """A reload in the head waits for N's commit. Polling for it waited up to 20 ms past the commit, which rank 0
+    spent in its next collective."""
+    worker = _follow_spec(replay_refuses=False)
+    worker.engine_manager.get_engine("node").apply_resident_delta = lambda delta, rebuilding, caught_up: caught_up
+    worker.head.resident_delta.kinds[0] = MoveKind.RELOAD
+    parent = _SpecParent()
+    parent.node_batch.commit_done = _Commit()
+
+    assert worker._try_follow_speculation(parent) is None
+    assert parent.node_batch.commit_done.waited and parent.reads == 1, "the follower polled instead of waiting"
 
 
 def test_the_async_follow_path_proceeds_once_the_replay_lands():
@@ -1486,7 +1512,9 @@ def test_a_follower_takes_a_dropped_request_back_and_lays_it_out_as_rank_0_did(m
     assert follower._overrides["v"].kv_layout == leader._overrides["v"].kv_layout, "the rebuild writes another span"
 
 
-def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps_ahead(monkeypatch):
+@pytest.mark.parametrize("asserts", [False, True], ids=["", "under MSTAR_KV_DEBUG_ASSERTS"])
+def test_a_drop_whose_victim_is_in_a_step_here_waits_and_nothing_behind_it_jumps_ahead(monkeypatch, asserts):
+    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", asserts)
     (leader, lead), (follower, follow) = _both_short_then_drop(monkeypatch)
     # rank 0 tears r down once the step carrying the drop has gone out, and then v's history and a page fit
     delta = lead.take_resident_delta()
@@ -1894,27 +1922,30 @@ def test_a_follower_takes_rank_0s_reload_into_the_pages_its_window_gives_back_on
     the follower stopped though its counts agreed with rank 0's. It waits for its commit instead."""
     monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", asserts)
     (leader, lead), (follower, follow), (step, ctx), delta = _reload_into_the_window(monkeypatch)
+    scheduler = _follower_scheduler(follow)
+    scheduler.lockstep.enqueue_follow(ScheduleTPNode(NODE, "decode", [], spec_seq=0, resident_delta=delta))
 
-    assert not follow.apply_resident_delta(delta, _rebuilds_none), "the follower reloaded v before its commit"
-    assert delta.kinds == [MoveKind.RELOAD] and follower.residency("v") is Residency.ON_HOST
+    assert not scheduler.lockstep.settle_delta(caught_up=False), "the follower reloaded v before its commit"
+    assert scheduler.lockstep.awaits_commit() and follower.residency("v") is Residency.ON_HOST
 
     follower.commit(step, ctx)
-    assert follow.apply_resident_delta(delta, _rebuilds_none)
+    assert scheduler.lockstep.settle_delta(caught_up=True)
     assert follower.residency("v") is Residency.RESIDENT
     assert _counts(follower)[:-1] == _counts(leader)[:-1], "the follower took v back with other counts"
 
 
-def test_a_follower_short_of_pages_for_rank_0s_reload_with_no_step_in_flight_stops(monkeypatch):
-    """With every step committed nothing will give pages back, so a follower that still can't take rank 0's reload
-    holds other pages than rank 0, and waiting would leave rank 0 alone in its next collective."""
-    # the pages taken below belong to no stream, which the debug checks would stop on first
-    monkeypatch.setattr(manager_mod, "_DEBUG_ASSERTS", False)
-    (leader, lead), (follower, follow), (step, ctx), delta = _reload_into_the_window(monkeypatch)
-    follower.commit(step, ctx)
-    follower._arena.acquire(follower._arena.num_free)
+def test_a_follower_whose_step_raised_stops_on_rank_0s_reload_rather_than_wait_for_its_commit(monkeypatch):
+    """The follower's forward of the step raised, so the step never commits and its rows stay marked in it until
+    they are removed, which the follower does only after the step carrying the reload. Its exit still releases the
+    step's waiters, so the follower is caught up, can't take the reload and stops. Waiting on the marks left rank 0
+    alone in its next collective."""
+    (leader, lead), (follower, follow), _, delta = _reload_into_the_window(monkeypatch)
+    scheduler = _follower_scheduler(follow)
+    scheduler.lockstep.enqueue_follow(ScheduleTPNode(NODE, "decode", [], spec_seq=0, resident_delta=delta))
+    assert follower._streams["w"]["main"].step_in_flight
 
-    with pytest.raises(RuntimeError, match="could not take"):
-        follow.apply_resident_delta(delta, _rebuilds_none)
+    with pytest.raises(SystemExit, match="could not take"):
+        scheduler.lockstep.settle_delta(caught_up=True)
 
 
 def test_a_follower_grows_a_request_waiting_for_its_shortage_once_as_rank_0s_moves_cover_it(monkeypatch):

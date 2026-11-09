@@ -216,6 +216,48 @@ def test_a_lockstep_node_keeps_ids_and_sets_the_pool_aside():
     assert rebuilds.pool is not None and NODE in rebuilds.nodes, "a follower would have no ids to replay a drop from"
 
 
+def test_a_follower_of_a_lockstep_node_sets_aside_twice_the_pool_and_keeps_every_prompt():
+    """A follower holds the ids of requests rank 0 has torn down until it tears them down too, and has to keep every
+    prompt rank 0 keeps."""
+    model = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
+    my_walks = {(NODE, PREFILL), (NODE, DECODE)}
+    rebuilds = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, torch.device("cpu"), frozenset({NODE}))
+    writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
+    layout = StreamLayout(spans=(PrefixSpan(2, 2, PREFILL),), growth=(("loop", 1),))
+    assert rebuilds.ingest_request(R, writes, {"kv": [layout]}, unpausable=False) == {"kv": True}
+    ctx = SimpleNamespace(graph_walk=PREFILL, request_walks={})
+    prompt = torch.zeros(3 << 17, dtype=torch.long)
+
+    assert rebuilds.pool.nbytes == 2 << 20, "the follower's pool is no larger than rank 0's"
+    assert not rebuilds.keep_prompts(SimpleNamespace(
+        node_name=NODE, step_context=ctx, per_request_input_tensors={R: {"text_inputs": [prompt]}},
+        completion_event=None,
+    ))
+    assert rebuilds.kept(R, NODE) is not None, "rank 0 can drop a request the follower keeps no ids for"
+
+
+def test_postprocess_journals_a_request_whose_last_prompt_chunk_the_pool_couldnt_hold():
+    """Rank 0 journals each request whose prompt its pool couldn't hold at the prompt's last chunk, so the followers
+    give back their copies. A request mid-prefill can still keep its prompt at a later chunk."""
+    from test_dropped_row_stream_stop import _engine, _ReachedRoutingError, _Runtime, _Sub, _worker
+
+    eng, journaled = _engine(_Sub()), []
+    eng.keeps_no_ids = lambda node, rid: journaled.append(rid)
+    w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
+    w._rebuilds._policies = {node: RebuildPolicy(walk, "text_inputs", "new_token", "loop")}
+    w._rebuilds._kept, w._rebuilds._droppable = {node: {}}, {node: {1, 2}}
+    w._rebuilds._pool = HostPool(8, torch.device("cpu"))
+    batch = _step((1, 2), walk, node)
+    eng.prepare_inputs(batch)
+    batch.per_request_input_tensors = {rid: {"text_inputs": [torch.arange(4)]} for rid in (1, 2)}
+    scheduled = ScheduledBatch(node, walk, {1: 0, 2: 0}, incomplete_node_rids={1})
+    pending = PendingBatch(scheduled, batch, node, "p", walk, Future())
+
+    with pytest.raises(_ReachedRoutingError):
+        w._postprocess_batch(pending, BatchedModelOutput(per_rid_outputs={}))
+    assert journaled == [2], "the followers keep ids rank 0 never drops with, or give back ids rank 0 may keep"
+
+
 def test_a_step_of_rebuild_rows_alone_routes_nothing_and_makes_them_resident():
     w, eng, batch, node_batch = _rebuilding()
     assert node_batch.step_context.rebuild_rids == {R} and node_batch.per_request_info[R].graph_walk == PREFILL
