@@ -2,7 +2,9 @@
 
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from jinja2 import TemplateError
@@ -39,6 +41,11 @@ from mstar.engine.resources.recurrent.config import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.request_kwargs import (
+    SAMPLING_KEYS,
+    generation_config_dir,
+    sampling_defaults,
+)
 from mstar.model.glm5_next.config import (
     ATTN,
     DSA,
@@ -64,6 +71,9 @@ from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 logger = logging.getLogger(__name__)
 
+# what zai-org/GLM-5.3-Flash's generation_config.json declares, for a checkpoint whose file is
+# not at hand
+DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
 # The quantized checkpoint format this loader reads itself: fp8 block-scale (dense
 # weights dequantized on load, routed experts fp8-resident).
 QUANT_METHODS = ("fp8",)
@@ -75,6 +85,9 @@ class Glm5NextModel(Model):
     DECODE_LOOP = "decode_loop"
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # the checkpoint's sampling defaults, under whatever a request sets (set by
+    # `__init__`; a model built without it takes the published recipe)
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
 
     def __init__(
         self,
@@ -150,6 +163,8 @@ class Glm5NextModel(Model):
         self._tokenizer = None
         self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        self.sampling_defaults = sampling_defaults(
+            generation_config_dir(self.model_path_hf, cache_dir), DEFAULT_SAMPLING)
 
     @property
     def tokenizer(self):
@@ -212,11 +227,14 @@ class Glm5NextModel(Model):
                     sm_scale=self.config.qk_head_dim ** -0.5,
                 ),
             ),
+            # min-p only where the checkpoint defaults it; elsewhere a request's
+            # min_p > 0 is refused at admission
             SamplerSpec(
                 resource_key=SAMPLER,
                 nodes={"LLM"},
                 vocab_size=self.config.vocab_size,
-                enable_repetion_penalty=True,
+                enable_repetition_penalty=True,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
             RecurrentStateSpec(
                 resource_key=KDA_STATE,
@@ -260,15 +278,10 @@ class Glm5NextModel(Model):
     ) -> dict[str, ResourceReqConfig]:
         del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
-            k: model_kwargs.get(k, getattr(self.config, k))
-            for k in keys
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
-        # the sampler's own knobs with no config default
-        for k, cast in (("top_k", int), ("penalize_prompt", bool)):
-            if k in model_kwargs:
-                params[k] = cast(model_kwargs[k])
         if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
             # MTP verifies greedily: a request that names no temperature gets 0, and an
             # explicit one > 0 is refused in process_prompt
@@ -354,11 +367,8 @@ class Glm5NextModel(Model):
         # the conductor reads these kwargs; read here first, a bad one is the
         # client's 400 before the request reaches any rank
         kwargs = normalize_generation_kwargs(kwargs)
-        self.get_request_resource_configs([], [], kwargs)
+        sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER]
         self.get_max_output_tokens(**kwargs)
-        if kwargs.get("min_p", 0) > 0:
-            # the node's sampler is built without min-p, and the request configs do not pass it on
-            raise ValueError(f"GLM-5.3 is served without min_p (min_p={kwargs['min_p']}); send none")
         if kwargs.get("return_logprobs"):
             # the sampler configs carry none, which the conductor refuses too
             raise ValueError("GLM-5.3 does not report logprobs; leave return_logprobs unset")
@@ -366,12 +376,10 @@ class Glm5NextModel(Model):
         if self.config.mtp_num_draft_tokens > 0:
             # MTP verifies by argmax; refused here, it is the client's 400 rather than a
             # worker's 500
-            temperature = float(kwargs.get("temperature", 0.0))
-            penalty = float(kwargs.get("repetition_penalty", self.config.repetition_penalty))
-            if temperature > 0.0 or penalty != 1.0:
+            if sampling.temperature != 0 or sampling.repetition_penalty != 1:
                 raise ValueError(
-                    f"MTP drafting is greedy only (temperature={temperature}, "
-                    f"repetition_penalty={penalty}); serve with mtp_num_draft_tokens: 0"
+                    f"MTP drafting is greedy only (temperature={sampling.temperature}, "
+                    f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
                 )
 
         if self._tokenizer_mode == "byte":
@@ -445,13 +453,17 @@ class Glm5NextModel(Model):
         return min(cfg.context_limit - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
 
     def get_max_output_tokens(self, **model_kwargs):
-        # held to the window: a one-token prompt emits at most context_limit tokens. A request
-        # that names none runs as far as the decode loop can (under MTP the cache rows bind
-        # first), and the conductor fits it to the room its prompt leaves.
+        # A request that names none runs as far as the decode loop can (under MTP the cache
+        # rows bind first), and the conductor fits it to the room its prompt leaves. One that
+        # names more than context_limit, which a one-token prompt's window holds, is refused by
+        # the conductor: its decode loop cap is past max_iters.
         budget = normalize_generation_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
         if budget is None:
             return min(self.config.context_limit, self.max_decode_steps() + 1)
-        return min(budget, self.config.context_limit)
+        return budget
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"max_output_tokens", *SAMPLING_KEYS})
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess

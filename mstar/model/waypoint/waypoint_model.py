@@ -533,6 +533,10 @@ class WaypointModel(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
+    def request_kwargs(self) -> frozenset[str]:
+        # num_steps is read only to refuse it (one frame per action now)
+        return frozenset({"num_steps", "actions"})
+
     def walk_plan(
         self,
         partition_name: str,

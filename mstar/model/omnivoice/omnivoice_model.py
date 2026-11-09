@@ -62,19 +62,69 @@ from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
+# Every model_kwargs key a request may carry. The speech adapter maps the
+# OpenAI ``voice`` onto ``instruct``.
+REQUEST_KWARGS = frozenset({
+    "num_step", "guidance_scale", "t_shift", "layer_penalty_factor", "position_temperature",
+    "class_temperature", "postprocess_output", "pad_duration", "fade_duration",
+    "speed", "duration", "language", "instruct", "ref_text", "denoise",
+})
+
+
+def _number(kwargs: dict, key: str, default: float, rule: str = "", ok=None) -> float:
+    """``kwargs[key]`` as a finite JSON number satisfying ``ok``; ``default`` when absent."""
+    value = kwargs.get(key)
+    if value is None:
+        return float(default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{key} must be a finite number{' ' + rule if rule else ''}; got {value!r}")
+    if ok is not None and not ok(value):
+        raise ValueError(f"{key} must be {rule}; got {value!r}")
+    return float(value)
+
+
+def _flag(kwargs: dict, key: str, default: bool) -> bool:
+    value = kwargs.get(key)
+    if value is None:
+        return default
+    # 0 and 1 as well: JSON clients send them for booleans
+    if isinstance(value, str) or value not in (True, False):
+        raise ValueError(f"{key} must be true or false; got {value!r}")
+    return bool(value)
+
+
+def _text(kwargs: dict, key: str) -> str | None:
+    value = kwargs.get(key)
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+        raise ValueError(f"{key} must be a non-empty string; got {value!r}")
+    return value
+
+
+def resolve_step_knobs(kwargs: dict, defaults) -> dict:
+    """The per-request unmask knobs, validated; ValueError names the bad one
+    (``output_shaping`` checks the output knobs)."""
+    num_step = kwargs.get("num_step", defaults.num_step)
+    # past the unmask loop's max_iters, the conductor refuses it (get_loop_caps)
+    if isinstance(num_step, bool) or not isinstance(num_step, int) or num_step < 1:
+        raise ValueError(f"num_step must be an integer >= 1; got {num_step!r}")
+    return {
+        "num_step": num_step,
+        # 0 disables CFG
+        "guidance_scale": _number(kwargs, "guidance_scale", defaults.guidance_scale),
+        "t_shift": _number(kwargs, "t_shift", defaults.t_shift, "> 0", lambda v: v > 0),
+        "layer_penalty_factor": _number(kwargs, "layer_penalty_factor", defaults.layer_penalty_factor),
+        # 0 is argmax / no Gumbel noise
+        "position_temperature": _number(
+            kwargs, "position_temperature", defaults.position_temperature, ">= 0", lambda v: v >= 0
+        ),
+        "class_temperature": _number(
+            kwargs, "class_temperature", defaults.class_temperature, ">= 0", lambda v: v >= 0
+        ),
+    }
+
+
 # Request kwarg: a clone's reference RMS, the level ``postprocess`` matches
 REF_RMS_KEY = "output_ref_rms"
-
-
-def _finite_number(key: str, value) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        number = math.nan
-    if isinstance(value, bool) or not math.isfinite(number):
-        raise ValueError(f"{key} must be a finite number, not {value!r}")
-    return number
-
 
 # The longest silence pad, or fade, a request may ask for at each end, in seconds
 MAX_SHAPING_SECONDS = 10.0
@@ -84,42 +134,12 @@ def output_shaping(kwargs: dict) -> dict:
     """The request's output-shaping kwargs as ``post_process`` takes them.
     ``process_prompt`` reads them too, so a bad value fails the request before
     it generates."""
-    enabled = kwargs.get("postprocess_output", True)
-    # 0 and 1 as well: JSON clients send them for booleans
-    if enabled not in (True, False):
-        raise ValueError(f"postprocess_output must be true or false, not {enabled!r}")
-    shaping = {"enabled": bool(enabled)}
+    shaping = {"enabled": _flag(kwargs, "postprocess_output", True)}
     for key in ("pad_duration", "fade_duration"):
-        seconds = _finite_number(key, kwargs.get(key, 0.1))
-        if not 0 <= seconds <= MAX_SHAPING_SECONDS:
-            raise ValueError(f"{key} must be between 0 and {MAX_SHAPING_SECONDS:g} seconds, not {seconds!r}")
-        shaping[key] = seconds
+        shaping[key] = _number(
+            kwargs, key, 0.1, f"in [0, {MAX_SHAPING_SECONDS:g}] seconds", lambda v: 0 <= v <= MAX_SHAPING_SECONDS,
+        )
     return shaping
-
-
-# The unmask loop's float knobs a request may set (``extra_body``)
-UNMASK_KNOBS = ("guidance_scale", "t_shift", "layer_penalty_factor", "position_temperature", "class_temperature")
-
-
-def requested_num_step(kwargs: dict, defaults) -> int:
-    """The request's ``num_step``, unclamped. ``process_prompt`` reads it too,
-    so a value that is not an integer fails the request before it generates."""
-    value = kwargs.get("num_step", defaults.num_step)
-    try:
-        if isinstance(value, bool):
-            raise TypeError
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        raise ValueError(f"num_step must be an integer, not {value!r}") from None
-
-
-def unmask_knobs(kwargs: dict, defaults) -> dict[str, float]:
-    """The request's ``UNMASK_KNOBS`` over the checkpoint's ``defaults``.
-    ``process_prompt`` reads them too, so a value that is not a finite number
-    fails the request before it generates. A finite value extreme enough to
-    overflow the reveal's scores is not caught here: MASK cells it leaves on the
-    canvas fail the request in ``postprocess``, after the loop."""
-    return {key: _finite_number(key, kwargs.get(key, getattr(defaults, key))) for key in UNMASK_KNOBS}
 
 
 class OmniVoiceModel(Model):
@@ -340,7 +360,7 @@ class OmniVoiceModel(Model):
         est = self._duration_estimator.estimate_duration(
             text, ref_text, num_ref_audio_tokens
         )
-        if speed > 0 and speed != 1.0:
+        if speed != 1.0:
             est = est / speed
         return max(1, int(est))
 
@@ -354,8 +374,9 @@ class OmniVoiceModel(Model):
     ) -> ProcessPromptOutput:
         """Validate, then build the canvas prefix on the data worker.
 
-        Every malformed-request check lives here, so a malformed request is a
-        400 before it reaches the conductor; ``walk_plan`` only backstops them.
+        Every malformed-request check runs here, before the tokenizer, so a
+        bad knob is a 400 without any work; ``walk_plan`` repeats only the
+        cheap step-knob checks.
 
         The prefix is built once and shipped, not rebuilt per iteration —
         tokenizing the text 32 times would be the dominant cost for a short
@@ -365,9 +386,20 @@ class OmniVoiceModel(Model):
             raise ValueError("OmniVoice requires a non-empty text prompt")
         if set(output_modalities) != {"audio"}:
             raise ValueError("OmniVoice generates audio only")
+        resolve_step_knobs(kwargs, self.config.generation)
+        speed = _number(kwargs, "speed", 1.0, "> 0", lambda v: v > 0)
+        target_len = None
+        if kwargs.get("duration") is not None:
+            duration = _number(kwargs, "duration", 0.0, "> 0 (seconds)", lambda v: v > 0)
+            target_len = self.config.target_tokens_for_seconds(duration)
+            if target_len < 1:
+                raise ValueError(
+                    f"duration {duration}s is shorter than one codec frame ({1 / self.config.frame_rate:.3f}s)"
+                )
+        language = _text(kwargs, "language")
+        instruct = _text(kwargs, "instruct")
+        denoise = _flag(kwargs, "denoise", self.config.generation.denoise)
         output_shaping(kwargs)
-        requested_num_step(kwargs, self.config.generation)
-        unmask_knobs(kwargs, self.config.generation)
 
         self._ensure_data_worker_assets()
 
@@ -375,7 +407,7 @@ class OmniVoiceModel(Model):
         # arrives as "audio_inputs". It is re-emitted under the graph's own
         # edge name below so the node contract does not depend on that.
         ref_audio = (tensors or {}).get("audio_inputs")
-        ref_text = kwargs.get("ref_text")
+        ref_text = _text(kwargs, "ref_text")
         if ref_audio and not ref_text:
             # The reference auto-transcribes with Whisper when ref_text is
             # missing. That is a second model on the serving path and a second
@@ -404,11 +436,7 @@ class OmniVoiceModel(Model):
                     f"Reference audio is shorter than one codec hop ({hop} samples)"
                 )
 
-        speed = float(kwargs.get("speed") or 1.0)
-        duration = kwargs.get("duration")
-        if duration is not None:
-            target_len = self.config.target_tokens_for_seconds(float(duration))
-        else:
+        if target_len is None:
             target_len = self._estimate_target_tokens(
                 prompt, ref_text, num_ref_tokens, speed
             )
@@ -428,8 +456,8 @@ class OmniVoiceModel(Model):
             tokenizer=self.tokenizer,
             text=prompt,
             num_audio_codebook=self.config.num_audio_codebook,
-            language=resolve_language(kwargs.get("language")),
-            instruct=resolve_instruct(kwargs.get("instruct"), prompt),
+            language=resolve_language(language),
+            instruct=resolve_instruct(instruct, prompt),
             ref_text=ref_text,
             # The reference tokens are not available on the data worker; the
             # ref_encoder walk supplies them, and the backbone appends them to
@@ -437,7 +465,7 @@ class OmniVoiceModel(Model):
             # coming, hence the flag.
             ref_audio_tokens=None,
             has_reference=bool(ref_audio),
-            denoise=bool(kwargs.get("denoise", self.config.generation.denoise)),
+            denoise=denoise,
         )
 
         out: NameToTensorList = {
@@ -513,13 +541,6 @@ class OmniVoiceModel(Model):
         self._codec_hop = int(cfg.hop_length)
         return self._codec_hop
 
-    def _num_step(self, model_kwargs: dict) -> int:
-        defaults = self.config.generation
-        return max(1, min(requested_num_step(model_kwargs, defaults), defaults.max_num_step))
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {UNMASK_LOOP_NAME: self._num_step(model_kwargs)}
-
     def walk_plan(
         self,
         partition_name: str,
@@ -542,21 +563,11 @@ class OmniVoiceModel(Model):
         else:
             walks = [self.SPEECH_GEN_WALK]
 
-        defaults = self.config.generation
-        requested_steps = requested_num_step(model_kwargs, defaults)
-        num_step = self._num_step(model_kwargs)
-        if num_step != requested_steps:
-            logger.info(
-                "Clamped num_step from %d to %d (max_num_step=%d)",
-                requested_steps, num_step, defaults.max_num_step,
-            )
-
         # What the submodules read from ``request_info.step_metadata``.
         request = {
             # from process_prompt, which settles it on the data worker
             TARGET_LEN: int(model_kwargs[TARGET_LEN]),
-            "num_step": num_step,
-            **unmask_knobs(model_kwargs, defaults),
+            **resolve_step_knobs(model_kwargs, self.config.generation),
         }
         return [WalkStep(walk, step_metadata=request) for walk in walks]
 
@@ -568,6 +579,17 @@ class OmniVoiceModel(Model):
         numerics equal to the reference pipeline.
         """
         return None
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the loop ends on the request's own num_step, and is never speculated past it;
+        # past the loop's max_iters the conductor refuses the request
+        num_step = model_kwargs.get("num_step", self.config.generation.num_step)
+        if isinstance(num_step, int) and not isinstance(num_step, bool) and num_step >= 1:
+            return {UNMASK_LOOP_NAME: num_step}
+        return {}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
