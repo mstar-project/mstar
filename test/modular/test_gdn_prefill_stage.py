@@ -139,6 +139,7 @@ def test_the_qk_normalize_compiles_once_for_every_token_count(monkeypatch):
     manager = gdn.GDNManager.__new__(gdn.GDNManager)
     manager.config = SimpleNamespace(qk_l2norm=True)
     manager._current, manager._default_label = {"main": plan}, "main"
+    manager._verify_block = None
     state = torch.zeros(1)
     torch._dynamo.reset()
     platform_compile.compiled.cache_clear()
