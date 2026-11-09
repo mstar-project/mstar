@@ -800,7 +800,16 @@ stalls a real-time player fed by the stream would hit (<code class="docutils lit
 <code class="docutils literal notranslate"><span class="pre">--stall-min-ms</span></code>). Per repeat, optionally: round-trip WER (<code class="docutils literal notranslate"><span class="pre">--asr-judge</span></code>, Whisper
 large-v3 by default; CER for zh/ja/ko/th), speaker similarity to each item’s
 reference clip (<code class="docutils literal notranslate"><span class="pre">--clone</span></code> sends it as <code class="docutils literal notranslate"><span class="pre">ref_audio</span></code>; <code class="docutils literal notranslate"><span class="pre">--sim-judge</span></code>) and UTMOS
-(<code class="docutils literal notranslate"><span class="pre">--mos</span></code>). <code class="docutils literal notranslate"><span class="pre">--engine</span> <span class="pre">vllm-omni|sglang-omni</span></code> reads their raw PCM streams.</p>
+(<code class="docutils literal notranslate"><span class="pre">--mos</span></code>). <code class="docutils literal notranslate"><span class="pre">--engine</span> <span class="pre">vllm-omni|sglang-omni</span></code> reads their raw PCM streams.
+<code class="docutils literal notranslate"><span class="pre">--engine</span> <span class="pre">nanovllm-voxcpm</span></code> posts to Nano-vLLM-VoxCPM’s <code class="docutils literal notranslate"><span class="pre">/generate</span></code> in the mode
+M*’s VoxCPM2 runs for the same item: a clip as the reference block, and with its
+transcript also as the prompt the speech continues. Its <code class="docutils literal notranslate"><span class="pre">cfg_value</span></code> defaults to
+1.5 and M*’s VoxCPM2 to 2.0, so send <code class="docutils literal notranslate"><span class="pre">--extra</span> <span class="pre">cfg_value=2.0</span></code> to compare them.
+Its demo server decodes at most <code class="docutils literal notranslate"><span class="pre">NANOVLLM_SERVERPOOL_MAX_NUM_SEQS</span></code> rows a step
+(16 by default) and captures its decode graphs only that wide; start it with that
+set to at least the concurrency (M*’s VoxCPM2 config runs 32). A stream that is
+not PCM16 (<code class="docutils literal notranslate"><span class="pre">X-Audio-Encoding</span></code> other than <code class="docutils literal notranslate"><span class="pre">s16le</span></code>, as from a server before
+2.0.3) is an error row.</p>
 </dd>
 <dt><code class="docutils literal notranslate"><span class="pre">asr</span></code></dt><dd><p><code class="docutils literal notranslate"><span class="pre">/v1/audio/transcriptions</span></code>. Corpus WER (CER for character languages) against the
 manifest, latency percentiles, RTFx (audio seconds per wall second), and with
