@@ -343,6 +343,9 @@ class BlockCausalAttentionSpec(AttentionSpec):
         if self.config.backend not in (AttnBackend.AUTO, AttnBackend.FLASHINFER):
             raise ValueError(f"block-causal attention runs on flashinfer, not {self.config.backend!r}")
 
+    def verify_refusal(self, draft) -> str | None:
+        return "block-causal attention has no verify kernel"
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.attn.block_causal import BlockCausalAttentionManager
