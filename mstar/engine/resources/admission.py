@@ -62,7 +62,6 @@ class Admission:
         # `_refused` maps each waiting request a resource refused while it passed to that resource and the mark it
         # didn't fit against. It can't start until that mark grows, so the requests behind it may pass it.
         # `_refusals` maps each such resource and mark to the requests refused against it.
-        # `_placed` holds the waiting requests that asked again in their queues, which no request passes.
         self._arrivals = itertools.count()
         self._arrival: dict[str, tuple[bool, int]] = {}
         self._numbered: list[str] = []
@@ -76,7 +75,6 @@ class Admission:
         self._passes = {key for key in ask_order if type(resources[key]).reserve_past is not Resource.reserve_past}
         self._refused: dict[str, tuple[str, object]] = {}
         self._refusals: dict[tuple[str, object], set[str]] = {}
-        self._placed: set[str] = set()
 
     def set_arrival(self, rid: str, arrival: int) -> None:
         """Order ``rid`` by the conductor's arrival number. A worker serving two of the request's partitions
@@ -310,11 +308,9 @@ class Admission:
 
     def _blocked(self, rids: Iterable[str]) -> dict[str, str]:
         """Those of the waiting ``rids`` that can't start now and may be passed, each with the resource that refused
-        it, first in its queue or passing, and hasn't grown since. None of them asked again in its queues."""
+        it, first in its queue or passing, and hasn't grown since."""
         blocked = {}
         for rid in rids:
-            if rid in self._placed:
-                continue
             held = self._refused.get(rid) or next(
                 ((key, mark) for key, mark in self._short.items() if self._queues[key][0] == rid), None,
             )
@@ -331,7 +327,6 @@ class Admission:
         """Take ``rid`` out of the queues of ``keys``. A queue it was first in drops its mark,
         which measured ``rid``, and its next request is left for `admit_waiting` to try as a first
         request, even if a resource refused it while it passed, as are the first requests ``rid`` held back."""
-        self._placed.discard(rid)
         if rid in self._returns:
             del self._returns[rid]
             if self._numbered[:1] == [rid]:
