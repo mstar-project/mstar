@@ -479,9 +479,10 @@ Read by the ``mstar-server`` binary and its bridge
 Rust frontend limitations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The Rust frontend serves no ``/generate/ws``, so a model's live client input
-(appends to a running request, see :doc:`clients`) needs the Python frontend;
-over ``/generate`` such a model's input ends when the request is submitted.
+The Rust frontend serves every route the Python frontend serves but LoRA's
+runtime updates (``/v1/load_lora_adapter`` and ``/v1/unload_lora_adapter``, see
+:doc:`models`): ``mstar serve`` refuses ``--rust-frontend`` with
+``runtime_updates: true``.
 
 Request media
 -------------
