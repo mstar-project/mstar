@@ -322,8 +322,9 @@ class Admission:
         return nodes
 
     def _blocked(self, rids: Iterable[str]) -> dict[str, str]:
-        """Those of the waiting ``rids`` that can't start now and may be passed, each with the resource whose queue
-        a return holds back, or that refused it, first in its queue or passing, and hasn't grown since."""
+        """Those of the waiting ``rids`` that can't start now and may be passed, each with the resource that keeps it
+        waiting. That is a resource whose queue a return holds back for it, or one that refused it, as a first request
+        or while it passed, and hasn't grown since."""
         blocked = {}
         for rid in rids:
             back = self._held_back(rid)

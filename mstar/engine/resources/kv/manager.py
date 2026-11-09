@@ -4499,9 +4499,9 @@ class KVManager(AttentionResource):
             earmark.granted, earmark.mark = earmark.pages, None
 
     def unreserve(self, rid: str) -> None:
-        """`Resource.unreserve`, which also gives back the allotment the moves `make_room` chose for ``rid`` made
-        (`_settle`), though `reserve` took nothing then. That room is free again, and ``rid`` asks for it as any
-        other request does."""
+        """`Resource.unreserve`. When moves that `make_room` chose for ``rid`` admitted it (`_settle`), `reserve`
+        took nothing, but this still gives back the allotment those moves made. ``rid`` then asks for that room again,
+        as any other request does."""
         with self._lock:
             made = self._made == rid
             allotment = self._allotments[rid]
@@ -4905,9 +4905,6 @@ class KVManager(AttentionResource):
             if not earmark.victims:
                 del self._earmarks[earmark.rid]
             if earmark.rid in self._asks:
-                # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
-                # window's commit frees pages at another point of the step. The engine journals the move ahead of the
-                # admit.
                 # measured again, as a victim's move can make the pages a hit took for nothing evictable
                 mark = earmark.mark
                 pages = earmark.pages if mark is None else self._need(
@@ -4919,6 +4916,9 @@ class KVManager(AttentionResource):
                 earmark.granted += kept
                 self._kept += kept
                 freed -= kept
+                # Rank 0 alone admits it, since another rank can hold other room as the move lands there, as when a
+                # window's commit frees pages at another point of the step. The engine journals the move ahead of the
+                # admit.
                 if self._decides and pages <= self._room_for(earmark.rid):
                     self._admit(earmark.rid, pages, passed)
             else:
