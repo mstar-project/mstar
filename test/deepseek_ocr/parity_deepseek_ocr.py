@@ -7,8 +7,8 @@ views, bf16 weights under bf16 autocast, greedy, with the n-gram ban off
 remote code needs transformers 4.46.3, which is not the one mstar runs on, so
 the reference runs in a second interpreter (``--hf-python``), where this
 script calls itself with ``reference``: once with eager attention, the gate,
-and once with ``flash_attention_2``, the model card's, whose distance from
-eager is the reference's own spread and is printed beside every M* number.
+and once with ``flash_attention_2``, the model card's. The eager run also
+keeps DeepEncoder's rows in fp32.
 
 Per page, M* runs its two nodes eagerly, each driven through its resources
 the way the engine steps it (declare, admit, plan, forward, commit), and is
@@ -16,19 +16,24 @@ compared with the eager reference on:
 
 1. the prompt ids, exactly;
 2. DeepEncoder's rows, the embeddings the decoder reads at the image
-   positions: every row's cosine to the reference's at least ``ROW_COS_MIN``;
+   positions, against the reference's fp32 rows: a relative error within
+   ``ROW_ERR_SPREAD`` times the reference's own bf16 rows', and every row's
+   cosine at least ``ROW_COS_FLOOR``;
 3. the prefill's last-position logits: within ``LOGIT_ATOL`` of the
    reference's everywhere, and the same top-1 where the reference's top-2
    margin is above ``CONFIDENT_MARGIN``;
 4. the greedy ids to EOS (or ``--max-new``): the same, or the same up to a
-   step where the reference's top two logits are within ``NEAR_TIE``. With
-   ``--server`` the served path (CUDA graphs, packed prefills) is held to the
-   same.
+   step where the reference's own logits put M*'s token within
+   ``margin_spread`` of its top one: what its flash-attention run moves a
+   close margin of its eager run by, or parts from it at (``NEAR_TIE`` at
+   least). With ``--server`` the served path (CUDA graphs, packed prefills)
+   is held to the same.
 
-Exits 1 on any mismatch. The bounds are the reference's own: its eager and
-flash-attention runs differ by up to 0.97 in the prefill logits on the nine
-pages these were set on, and split on a greedy step whose top two logits
-are one bf16 step (0.125) apart.
+Exits 1 on any mismatch. The rows and greedy bounds are measured on the
+reference in the same run, so they follow its bf16 noise on the machine and
+the pages at hand: single rows of its own bf16 run fall to a cosine of 0.78
+against fp32, and its two attention paths part on margins a fixed bf16 step
+or two doesn't cover.
 
     python test/deepseek_ocr/parity_deepseek_ocr.py --hf-python <venv with transformers==4.46.3>/bin/python \\
         --pages page1.png page2.png --json parity.json [--server http://127.0.0.1:8000]
@@ -53,11 +58,17 @@ INSTRUCTION = "Free OCR."
 PROMPT = f"<image>\n{INSTRUCTION}"
 IMAGE_TOKEN_ID = 128815
 
-ROW_COS_MIN = 0.999
+# M*'s rows may sit this many times as far from the reference's fp32 rows as its bf16 rows do
+ROW_ERR_SPREAD = 2.0
+# under this a row is a different row, not bf16 noise
+ROW_COS_FLOOR = 0.5
 LOGIT_ATOL = 1.0
 CONFIDENT_MARGIN = 1.0
-# two bf16 steps at the logits' magnitude (16-32)
+# the least the greedy bound is, and all of it without a flash-attention run to
+# measure one: two bf16 steps at the logits' magnitude (16-32)
 NEAR_TIE = 0.25
+# logits the reference keeps per greedy step; a token outside them is no near-tie
+TOP_K = 8
 
 
 def resolve_snapshot(repo: str) -> str:
@@ -112,18 +123,19 @@ def run_reference(args) -> None:
     tokenizer = AutoTokenizer.from_pretrained(snapshot, trust_remote_code=True)
     model = AutoModel.from_pretrained(snapshot, _attn_implementation=args.attn, trust_remote_code=True,
                                       use_safetensors=True)
-    model = model.eval().cuda().to(torch.bfloat16)
+    model = model.eval().cuda()
     mod = sys.modules[type(model).__module__]
 
-    class Margins(LogitsProcessor):
-        """Each greedy step's top-1 minus top-2 logit; changes nothing."""
+    class TopLogits(LogitsProcessor):
+        """Each greedy step's ``TOP_K`` logits and their ids; changes nothing."""
 
         def __init__(self):
-            self.margins = []
+            self.values, self.ids = [], []
 
         def __call__(self, input_ids, scores):
-            top = scores.float().topk(2, dim=-1).values[0]
-            self.margins.append(float(top[0] - top[1]))
+            top = scores.float().topk(TOP_K, dim=-1)
+            self.values.append(top.values[0].cpu())
+            self.ids.append(top.indices[0].cpu())
             return scores
 
     # what the decoder's first layer reads: the prompt embeddings with the image rows in place
@@ -131,10 +143,20 @@ def run_reference(args) -> None:
     model.model.layers[0].register_forward_pre_hook(
         lambda _m, a, kw: seen.append((a[0] if a else kw["hidden_states"]).detach()), with_kwargs=True)
 
+    inputs = {path: reference_inputs(mod, tokenizer, mod.load_image(path).convert("RGB"), args.max_crops)
+              for path in args.pages}
+    rows_fp32 = {}
+    if args.attn == "eager":
+        # the rows in fp32, before the weights go to bf16: what both bf16 encoders round
+        for path, (ids, mask, crops, globals_, spatial) in inputs.items():
+            seen.clear()
+            model(input_ids=ids[None].cuda(), images=[(crops.float().cuda(), globals_.float().cuda())],
+                  images_seq_mask=mask[None].cuda(), images_spatial_crop=spatial, use_cache=False)
+            rows_fp32[path] = seen[0][0][mask.cuda()].float().cpu()
+    model = model.to(torch.bfloat16)
+
     records = {}
-    for path in args.pages:
-        image = mod.load_image(path).convert("RGB")
-        ids, mask, crops, globals_, spatial = reference_inputs(mod, tokenizer, image, args.max_crops)
+    for path, (ids, mask, crops, globals_, spatial) in inputs.items():
         images = [(crops.cuda(), globals_.cuda())]
         with torch.autocast("cuda", dtype=torch.bfloat16):
             seen.clear()
@@ -142,18 +164,21 @@ def run_reference(args) -> None:
                         images_spatial_crop=spatial, use_cache=False)
             rows = seen[0][0][mask.cuda()].float().cpu()
             logits = out.logits[0, -1].float().cpu()
-            margins = Margins()
+            top = TopLogits()
             t0 = time.time()
             gen = model.generate(
                 ids[None].cuda(), images=images, images_seq_mask=mask[None].cuda(), images_spatial_crop=spatial,
                 do_sample=False, num_beams=1, no_repeat_ngram_size=0, eos_token_id=tokenizer.eos_token_id,
-                max_new_tokens=args.max_new, use_cache=True, logits_processor=LogitsProcessorList([margins]),
+                max_new_tokens=args.max_new, use_cache=True, logits_processor=LogitsProcessorList([top]),
             )
         greedy = gen[0, ids.numel():].cpu()
         records[os.path.basename(path)] = {
             "ids": ids, "rows": rows, "logits": logits, "greedy": greedy,
-            "margins": torch.tensor(margins.margins), "grid": spatial[0].tolist(), "secs": time.time() - t0,
+            "top_values": torch.stack(top.values), "top_ids": torch.stack(top.ids),
+            "grid": spatial[0].tolist(), "secs": time.time() - t0,
         }
+        if path in rows_fp32:
+            records[os.path.basename(path)]["rows_fp32"] = rows_fp32[path]
         print(f"reference {args.attn} {os.path.basename(path)}: {ids.numel()} prompt ids, "
               f"{greedy.numel()} greedy ids in {time.time() - t0:.0f}s", flush=True)
     torch.save(records, args.out)
@@ -295,14 +320,20 @@ def served_greedy(url: str, path: str, max_new: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def compare_rows(ours: torch.Tensor, ref: torch.Tensor) -> dict:
+def compare_rows(ours: torch.Tensor, ref: torch.Tensor, ref_fp32: torch.Tensor) -> dict:
+    """M*'s bf16 rows and the reference's (``ref``), each against the reference's fp32 rows."""
     if ours.shape != ref.shape:
         return {"shape": [list(ours.shape), list(ref.shape)], "ok": False}
-    cos = torch.nn.functional.cosine_similarity(ours, ref, dim=-1)
-    diff = (ours - ref).abs()
-    return {"cos_min": round(float(cos.min()), 6), "max_abs": float(diff.max()),
-            "mean_abs": float(diff.mean()), "exact": float((diff == 0).float().mean()),
-            "ok": bool(cos.min() >= ROW_COS_MIN)}
+
+    def distance(rows: torch.Tensor) -> tuple[float, torch.Tensor]:
+        rel_err = float((rows - ref_fp32).norm() / ref_fp32.norm())
+        return rel_err, torch.nn.functional.cosine_similarity(rows, ref_fp32, dim=-1)
+
+    (err, cos), (ref_err, ref_cos) = distance(ours), distance(ref)
+    return {"rel_err": round(err, 5), "ref_rel_err": round(ref_err, 5),
+            "cos_min": round(float(cos.min()), 4), "ref_cos_min": round(float(ref_cos.min()), 4),
+            "cos_mean": round(float(cos.mean()), 6), "exact": float((ours == ref).float().mean()),
+            "ok": err <= ROW_ERR_SPREAD * ref_err and float(cos.min()) >= ROW_COS_FLOOR}
 
 
 def compare_logits(ours: torch.Tensor, ref: torch.Tensor) -> dict:
@@ -315,14 +346,48 @@ def compare_logits(ours: torch.Tensor, ref: torch.Tensor) -> dict:
             "ok": float(diff.max()) <= LOGIT_ATOL and (same_top1 or margin <= CONFIDENT_MARGIN)}
 
 
-def compare_greedy(ours: torch.Tensor, ref: torch.Tensor, margins: torch.Tensor | None = None) -> dict:
+def first_divergence(ours: torch.Tensor, ref: torch.Tensor) -> int | None:
     n = min(ours.numel(), ref.numel())
     differs = (ours[:n] != ref[:n]).nonzero()
-    first = int(differs[0]) if differs.numel() else (None if ours.numel() == ref.numel() else n)
-    row = {"n": int(ours.numel()), "n_ref": int(ref.numel()), "first_divergence": first, "ok": first is None}
-    if first is not None and margins is not None and first < margins.numel():
-        row["ref_margin_there"] = round(float(margins[first]), 3)
-        row["ok"] = row["ref_margin_there"] <= NEAR_TIE
+    return int(differs[0]) if differs.numel() else (None if ours.numel() == ref.numel() else n)
+
+
+def gap(run: dict, step: int, token: int) -> float | None:
+    """How far below its top logit the reference run ``run`` puts ``token``
+    at ``step``; None outside its ``TOP_K``."""
+    hit = (run["top_ids"][step] == token).nonzero()
+    return float(run["top_values"][step, 0] - run["top_values"][step, int(hit[0])]) if hit.numel() else None
+
+
+def margin_spread(eager: dict, fa2: dict) -> float:
+    """How far the reference's flash-attention run moves its eager run's
+    choice: over each page's steps while the two read the same tokens, the
+    largest change of an eager top-2 margin under ``CONFIDENT_MARGIN``, and at
+    the step they part, how far below its top the eager run puts the token
+    the other took."""
+    spread = 0.0
+    for name, e in eager.items():
+        f = fa2[name]
+        parted = first_divergence(f["greedy"], e["greedy"])
+        steps = min(e["top_values"].shape[0], f["top_values"].shape[0])
+        same = steps if parted is None else parted
+        ours, theirs = (r["top_values"][:same, 0] - r["top_values"][:same, 1] for r in (e, f))
+        moved = (ours - theirs).abs()[ours <= CONFIDENT_MARGIN]
+        if moved.numel():
+            spread = max(spread, float(moved.max()))
+        if parted is not None and parted < steps:
+            spread = max(spread, gap(e, parted, int(f["greedy"][parted])) or 0.0)
+    return spread
+
+
+def compare_greedy(ours: torch.Tensor, ref: dict, near_tie: float) -> dict:
+    """``ours`` against the run ``ref``: equal, or parting at a step for a
+    token ``ref`` puts within ``near_tie`` of its top logit."""
+    first = first_divergence(ours, ref["greedy"])
+    row = {"n": int(ours.numel()), "n_ref": int(ref["greedy"].numel()), "first_divergence": first, "ok": first is None}
+    if first is not None and first < min(ref["top_values"].shape[0], ours.numel()):
+        row["ref_gap_there"] = gap(ref, first, int(ours[first]))
+        row["ok"] = row["ref_gap_there"] is not None and row["ref_gap_there"] <= near_tie
     return row
 
 
@@ -368,6 +433,9 @@ def main() -> int:
         print(f"reference runs saved in {out_dir}", flush=True)
     eager = torch.load(paths[0])
     fa2 = torch.load(paths[1]) if len(paths) > 1 else None
+    # a short page set may never move a close margin
+    near_tie = NEAR_TIE if fa2 is None else max(NEAR_TIE, margin_spread(eager, fa2))
+    print(f"greedy may part from the eager reference for a token within {near_tie:.3f} of its top logit", flush=True)
     ours = run_mstar(args, snapshot)
 
     report, ok = {}, True
@@ -376,27 +444,27 @@ def main() -> int:
         r, m = eager[name], ours[name]
         row = {
             "ids_equal": torch.equal(m["ids"], r["ids"]),
-            "rows": compare_rows(m["rows"], r["rows"]),
+            "rows": compare_rows(m["rows"], r["rows"], r["rows_fp32"]),
             "logits": compare_logits(m["logits"], r["logits"]),
-            "greedy": compare_greedy(m["greedy"], r["greedy"], r["margins"]),
+            "greedy": compare_greedy(m["greedy"], r, near_tie),
         }
         page_ok = row["ids_equal"] and all(row[k]["ok"] for k in ("rows", "logits", "greedy"))
         if fa2 is not None:
-            # the reference's own spread: not gated
+            # the reference's own spread, for reading beside M*'s numbers: not gated
             row["fa2_vs_eager"] = {
                 "logits": compare_logits(fa2[name]["logits"], r["logits"]),
-                "greedy": compare_greedy(fa2[name]["greedy"], r["greedy"], r["margins"]),
+                "greedy": compare_greedy(fa2[name]["greedy"], r, near_tie),
             }
-            row["mstar_vs_fa2_greedy"] = compare_greedy(m["greedy"], fa2[name]["greedy"], fa2[name]["margins"])
+            row["mstar_vs_fa2_greedy"] = compare_greedy(m["greedy"], fa2[name], near_tie)
         if args.server:
-            row["served"] = compare_greedy(served_greedy(args.server, path, args.max_new), r["greedy"], r["margins"])
+            row["served"] = compare_greedy(served_greedy(args.server, path, args.max_new), r, near_tie)
             page_ok = page_ok and row["served"]["ok"]
         row["ok"] = page_ok
         ok = ok and page_ok
         report[name] = row
         print(f"{'PASS' if page_ok else 'FAIL'} {name}: {json.dumps(row)}", flush=True)
     if args.json:
-        Path(args.json).write_text(json.dumps(report, indent=1))
+        Path(args.json).write_text(json.dumps({"margin_spread": near_tie, "pages": report}, indent=1))
     print("parity", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
