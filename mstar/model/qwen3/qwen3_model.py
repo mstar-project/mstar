@@ -83,7 +83,10 @@ class Qwen3Model(Model):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
         self.local_dir = resolve_snapshot_dir(
-            model_path_hf, cache_dir=cache_dir, allow_patterns=["*.json", "*.txt", "*.model"],
+            # the tokenizer prefers chat_template.jinja to tokenizer_config.json's template,
+            # and some repos keep theirs nowhere else
+            model_path_hf, cache_dir=cache_dir,
+            allow_patterns=["*.json", "*.txt", "*.model", "chat_template.jinja"],
         )
         self.hf_config = hf = json.loads((self.local_dir / "config.json").read_text())
         self.config = qwen3_lm_config(hf)
