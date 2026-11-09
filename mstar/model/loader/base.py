@@ -20,13 +20,15 @@ no fused params) just call ``load_weights_into(module, weights)``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 
 import torch
 from torch import nn
+
+from mstar.model.loader.quantization import UnservedQuantizationError, is_quantized_part
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +216,13 @@ def load_weights_into(
 
         target, shard_id = match_stacked(name)
         if target not in params_dict:
+            if is_quantized_part(target):
+                # its values would load without it, unscaled or still packed
+                raise UnservedQuantizationError(
+                    f"{type(module).__name__}: checkpoint key {name!r} is part of a quantized "
+                    "weight, and none of this model's parameters loads it: the model holds "
+                    "unquantized weights here. Serve an unquantized checkpoint of the model."
+                )
             # Not an error unless strict: the checkpoint may carry extra
             # keys (lm_head ties, kv-scale, etc.). Caller can verify
             # completeness via the returned set.
@@ -317,6 +326,7 @@ def load_weights(
     model: nn.Module,
     source: str | Path,
     device: torch.device | str = "cpu",
+    quant_methods: Collection[str] = (),
     **kwargs,
 ) -> set[str]:
     """Top-level driver.
@@ -327,7 +337,9 @@ def load_weights(
     ``model.safetensors``).
 
     Calls ``model.load_weights(iter)`` with the resolved iterator. Extra
-    kwargs are forwarded to ``model.load_weights``.
+    kwargs are forwarded to ``model.load_weights``. ``quant_methods`` names
+    the quantized formats the model loads itself; any other quantized
+    checkpoint is refused.
     """
     from mstar.model.loader.iterators import (
         iter_safetensors_file,
@@ -336,9 +348,9 @@ def load_weights(
 
     source = Path(source)
     if source.is_file():
-        weights = iter_safetensors_file(source, device=device)
+        weights = iter_safetensors_file(source, device=device, quant_methods=quant_methods)
     elif source.is_dir():
-        weights = iter_safetensors_shards(source, device=device)
+        weights = iter_safetensors_shards(source, device=device, quant_methods=quant_methods)
     else:
         raise FileNotFoundError(source)
     return model.load_weights(weights, **kwargs)

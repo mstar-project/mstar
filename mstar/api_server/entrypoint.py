@@ -552,6 +552,7 @@ class APIServer:
             enable_prof=self.log_stats,
             enable_nvtx=self.enable_nvtx,
             is_pending=self.is_pending,
+            upload_dir=self.upload_dir,
         )
 
         # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker

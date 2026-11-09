@@ -51,6 +51,9 @@ _RETIRED_KWARGS = (
     "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
     "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
     "prefill_last_layer_rows")
+# The quantized checkpoint formats GLM-5.2's loader reads itself: fp8 block-scale
+# (weight_loader.py dequantizes the dense weights and keeps the routed experts fp8).
+QUANT_METHODS = ("fp8",)
 
 
 class Glm52Model(Model):
@@ -579,7 +582,7 @@ class Glm52Model(Model):
 
         index_file = Path(source) / "model.safetensors.index.json"
         if not index_file.is_file():
-            load_weights(language_model, source, device=device)
+            load_weights(language_model, source, device=device, quant_methods=QUANT_METHODS)
             return
 
         with open(index_file) as f:
@@ -595,7 +598,7 @@ class Glm52Model(Model):
             len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
         )
         weights = iter_safetensors_shards(
-            source, device=device, keys=keys, slice_spec=specs.get,
+            source, device=device, keys=keys, slice_spec=specs.get, quant_methods=QUANT_METHODS,
         )
         language_model.load_weights(weights)
 
