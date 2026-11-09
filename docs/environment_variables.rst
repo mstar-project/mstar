@@ -290,8 +290,11 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
      - Mount the app under a URL sub-path. Set it when an ingress routes the
        deployment at a prefix and does not strip that prefix before the
        request reaches the pod (Run:AI serves a workload at
-       ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
-       every route. Empty by default, so a direct deployment is unaffected.
+       ``/<project>/<job-name>/``, for instance); without it every route
+       404s. A path under the prefix is routed without it, and any other path
+       as sent, on both frontends (Starlette's ``root_path``; ``route_path``
+       in ``rust/server/src/main.rs``). Empty by default, so a direct
+       deployment is unaffected.
    * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
      - ``10``
      - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
@@ -355,11 +358,26 @@ Read by the ``mstar-server`` binary and its bridge
        sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
-     - Per-request budget in the Rust frontend; on expiry the client gets
-       an error and the request is aborted in the backend.
+     - Per-request budget in the Rust frontend, in seconds; on expiry the
+       client gets an error and the request is aborted in the backend.
+       ``mstar serve --rust-frontend`` sets it from ``--timeout``
+       (``launch_rust_server``).
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``
-     - Sample rate stamped on ``/v1/audio/speech`` WAV output.
+     - Sample rate stamped on the Rust frontend's WAV output.
+       ``mstar serve --rust-frontend`` sets it to the model's
+       ``get_output_sample_rate("audio")``, as the Python frontend reads it.
+   * - ``MSTAR_LIBSNDFILE``
+     - unset
+     - The libsndfile the Rust frontend opens at startup to encode ``mp3``,
+       ``flac`` and ``opus`` speech (``rust/server/src/sndfile.rs``), called as
+       ``soundfile.write`` calls it, so the files are the Python frontend's
+       byte for byte (an Ogg stream's random serial aside). Unset, only ``wav``
+       and ``pcm`` are produced, as on the Python frontend without
+       ``soundfile``. ``launch_rust_server`` sets it to the library
+       ``soundfile`` loaded (``soundfile_library``) and drops an inherited
+       value; it is opened at run time, never linked, as its LAME encoder is
+       LGPL.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
      - Allow ``http(s)`` media URLs in requests, fetched server-side by both
@@ -393,7 +411,7 @@ Read by the ``mstar-server`` binary and its bridge
        ``Content-Length`` and while streaming. Read like
        ``MSTAR_REMOTE_ALLOWED_HOSTS``.
    * - ``MSTAR_MAX_CONCURRENT_REQUESTS``
-     - ``256``
+     - ``512``
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
        ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.
@@ -412,7 +430,7 @@ Read by the ``mstar-server`` binary and its bridge
      - The class name of the model's adapter in ``ADAPTER_REGISTRY``
        (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
        picks the OpenAI translation ``mstar-server`` uses
-       (``Adapter::from_python``). ``mstar-serve --rust-frontend`` always sets it;
+       (``adapters::from_python``, which looks it up in ``ADAPTERS``). ``mstar-serve --rust-frontend`` always sets it;
        a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
@@ -428,16 +446,9 @@ The Rust frontend serves no ``/generate/ws``, so a model's live client input
 (appends to a running request, see :doc:`clients`) needs the Python frontend;
 over ``/generate`` such a model's input ends when the request is submitted.
 
-It also carries no audio encoder or media muxer (the Python frontend
-uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
+It also carries no media muxer (the Python frontend uses ``ffmpeg``), so one
+surface degrades:
 
-* ``/v1/audio/speech`` produces only ``wav`` and ``pcm``. Any other
-  ``response_format`` (``mp3``, ``opus``, ``flac``, …) is rejected with a 400
-  rather than silently returned as WAV. Run the Python frontend for compressed
-  containers.
-* ``/v1/audio/speech`` refuses ``ref_audio`` (Qwen3-TTS voice cloning) with a
-  400: the Python frontend decodes the clip and checks its length before
-  submitting it, and the Rust frontend has no decoder to do that with.
 * ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
   request sets ``generate_sound``, Cosmos3 generates a separate audio track that
   mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
@@ -534,6 +545,12 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_STEP_THREADS``
+     - config's ``knobs: step_threads``, else ``threaded``
+     - Where a worker runs a step's host work. ``threaded`` runs admit, plan and
+       the forward's launch on its GPU thread, and the pre-plan on its plan
+       thread. ``serial`` runs them on the main thread, so host work overlaps the
+       GPU but not other host work. Read by ``knobs.step_threads``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``auto``
      - Pin each worker's main, GPU and plan threads, and the API server's

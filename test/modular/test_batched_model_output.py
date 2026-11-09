@@ -16,7 +16,8 @@ import pytest
 import torch
 
 from mstar.model.submodule_base import BatchedModelOutput
-from mstar.worker.worker import Worker
+from mstar.utils.device import DeviceCapability
+from mstar.worker.host_copies import HostCopies, rows_to_per_rid
 
 
 def test_coerce_takes_integer_request_handles():
@@ -104,27 +105,13 @@ def test_check_stop_falls_back_to_per_rid():
     assert out.get_check_stop_input() is out.check_stop_buffers
 
 
-class _StubWorker:
-    """Just enough of Worker to drive the batched D2H."""
+def _host_copies(device=torch.device("cpu")) -> HostCopies:
+    return HostCopies(device=device, device_capability=DeviceCapability.of(device))
 
-    _pinned_d2h_buffers: dict = {}
 
-    def __init__(self, device):
-        from collections import defaultdict
-
-        from mstar.utils.device import DeviceCapability
-
-        self.device = device
-        self.device_capability = DeviceCapability.of(device)
-        self._pinned_d2h_buffers = defaultdict(list)
-
-    _get_pinned_d2h_buffer = Worker._get_pinned_d2h_buffer
-    _pinned_size = staticmethod(Worker._pinned_size)
-    _d2h_batched = Worker._d2h_batched
-
-    def _prematerialize_batched(self, buffers, side, request_ids):
-        """The worker's batched path: one D2H, then per-request row views."""
-        return Worker._rows_to_per_rid(self._d2h_batched(buffers, side), request_ids)
+def _prematerialize_batched(copies, buffers, side, request_ids):
+    """The batched path: one D2H, then per-request row views."""
+    return rows_to_per_rid(copies._d2h_batched(buffers, side), request_ids)
 
 
 @pytest.fixture(params=["cuda", "xpu"])
@@ -141,12 +128,12 @@ def test_batched_prematerialize_keeps_row_to_request_order(accelerator_device):
     rids = [f"r{i}" for i in range(6)]
     # a padded replay leaves rows past the real ones; they must be ignored
     tokens = torch.arange(100, 110, device=accelerator_device)
-    worker = _StubWorker(accelerator_device)
+    copies = _host_copies(accelerator_device)
     runtime = getattr(torch, accelerator_device.type)
     side = runtime.Stream(device=accelerator_device)
     side.wait_stream(runtime.current_stream(accelerator_device))
-    got = worker._prematerialize_batched(
-        {"new_token": tokens}, side, rids,
+    got = _prematerialize_batched(
+        copies, {"new_token": tokens}, side, rids,
     )
     assert list(got) == rids
     for i, rid in enumerate(rids):
@@ -156,23 +143,23 @@ def test_batched_prematerialize_keeps_row_to_request_order(accelerator_device):
 
 def test_the_side_stream_copy_lands_a_tensor_under_two_names_once(accelerator_device):
     tokens = torch.arange(3, device=accelerator_device)
-    worker = _StubWorker(accelerator_device)
+    copies = _host_copies(accelerator_device)
     runtime = getattr(torch, accelerator_device.type)
     side = runtime.Stream(device=accelerator_device)
     side.wait_stream(runtime.current_stream(accelerator_device))
-    host = worker._d2h_batched({"new_token": tokens, "text_inputs": tokens}, side)
+    host = copies._d2h_batched({"new_token": tokens, "text_inputs": tokens}, side)
     assert host["text_inputs"] is host["new_token"], "one tensor was copied to the host twice"
 
 
 def test_batched_matches_what_the_per_rid_walk_would_give(accelerator_device):
     rids = [f"r{i}" for i in range(4)]
     tokens = torch.tensor([7, 8, 9, 10], device=accelerator_device)
-    worker = _StubWorker(accelerator_device)
+    copies = _host_copies(accelerator_device)
     runtime = getattr(torch, accelerator_device.type)
     side = runtime.Stream(device=accelerator_device)
     side.wait_stream(runtime.current_stream(accelerator_device))
-    got = worker._prematerialize_batched(
-        {"new_token": tokens}, side, rids,
+    got = _prematerialize_batched(
+        copies, {"new_token": tokens}, side, rids,
     )
     want = {
         rid: {"new_token": [tokens[i : i + 1].cpu()]}
@@ -201,11 +188,11 @@ def test_rows_map_through_the_forward_order_not_the_batch_list():
     forward ran, which the engine stamps on the output."""
     host = {"new_token": torch.tensor([[248046], [53031]])}
     forward_order = ["p1", "p3"]
-    out = Worker._rows_to_per_rid(host, forward_order)
+    out = rows_to_per_rid(host, forward_order)
     assert out["p1"]["new_token"][0].item() == 248046
     assert out["p3"]["new_token"][0].item() == 53031
     # the batch list after a stop dropped p1: row 0 still belongs to p1, not p3
-    shrunk = Worker._rows_to_per_rid(host, ["p3"])
+    shrunk = rows_to_per_rid(host, ["p3"])
     assert shrunk["p3"]["new_token"][0].item() == 248046, (
         "slicing by the shrunk list is the bug: p3 would stop on p1's token"
     )
@@ -241,20 +228,6 @@ def test_merging_two_row_addressed_outputs_drops_the_buffers():
     assert merged.get_check_stop_input()["b"]["new_token"][0].item() == 2
 
 
-class _StagingWorker(_StubWorker):
-    """The gpu-thread side of the host rows: stage behind the step, hand
-    the landed rows to the stop check without a sync of its own."""
-
-    _host_rows_slot = 0
-    _d2h_stream = None
-    _stage_host_rows = Worker._stage_host_rows
-    _copy_to_pinned = Worker._copy_to_pinned
-    _prematerialize_for_check_stop = Worker._prematerialize_for_check_stop
-
-    def __init__(self, device=torch.device("cpu")):
-        super().__init__(device)
-
-
 def test_landed_host_rows_skip_the_side_stream_copy():
     """Rows staged by the gpu thread are what the stop check reads: no
     side stream, no second copy, row i still request i."""
@@ -263,30 +236,30 @@ def test_landed_host_rows_skip_the_side_stream_copy():
     out = BatchedModelOutput(
         check_stop_buffers={"new_token": tokens}, row_request_ids=rids,
     )
-    worker = _StagingWorker()
-    worker._stage_host_rows(out)
+    copies = _host_copies()
+    copies.stage_host_rows(out)
     assert out.host_rows is not None and out.host_rows.request_ids == rids
     # a host tensor is passed through as is
     assert out.host_rows.buffers["new_token"] is tokens
 
-    per_rid, host_rows = worker._prematerialize_for_check_stop(
+    per_rid, host_rows = copies.prematerialize_for_check_stop(
         out, completion_event=object(), request_ids=list(rids),
     )
     assert host_rows is out.host_rows
     assert per_rid["b"]["new_token"][0].item() == 6
-    assert worker._d2h_stream is None, "no side stream was needed"
+    assert copies._d2h_stream is None, "no side stream was needed"
 
 
 def test_nothing_to_stage_without_row_buffers():
     out = BatchedModelOutput(per_rid_outputs={"a": {"new_token": [torch.tensor([1])]}})
-    worker = _StagingWorker()
-    worker._stage_host_rows(out)
+    copies = _host_copies()
+    copies.stage_host_rows(out)
     assert out.host_rows is None
 
 
 def test_staged_rows_land_behind_the_stream_and_rotate_buffers(accelerator_device):
     rids = tuple(f"r{i}" for i in range(6))
-    worker = _StagingWorker(accelerator_device)
+    copies = _host_copies(accelerator_device)
     runtime = getattr(torch, accelerator_device.type)
     seen = set()
     for step in range(3):
@@ -294,7 +267,7 @@ def test_staged_rows_land_behind_the_stream_and_rotate_buffers(accelerator_devic
         out = BatchedModelOutput(
             check_stop_buffers={"new_token": tokens}, row_request_ids=rids,
         )
-        worker._stage_host_rows(out)
+        copies.stage_host_rows(out)
         buf = out.host_rows.buffers["new_token"]
         assert buf.device.type == "cpu" and buf.is_pinned()
         runtime.synchronize(accelerator_device)
@@ -308,7 +281,7 @@ def test_staged_rows_land_a_tensor_under_two_names_once(accelerator_device):
     out = BatchedModelOutput(
         check_stop_buffers={"new_token": tokens, "text_inputs": tokens}, row_request_ids=("a", "b", "c"),
     )
-    worker = _StagingWorker(accelerator_device)
-    worker._stage_host_rows(out)
+    copies = _host_copies(accelerator_device)
+    copies.stage_host_rows(out)
     host = out.host_rows.buffers
     assert host["text_inputs"] is host["new_token"], "one tensor was copied to the host twice"

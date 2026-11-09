@@ -19,6 +19,7 @@ the base install stays slim.
 from __future__ import annotations
 
 import base64
+import heapq
 import http.client
 import io
 import ipaddress
@@ -200,25 +201,32 @@ class RefAudioTooLongError(ValueError):
     """A clip that opens as audio but runs past ``MAX_REF_AUDIO_SECONDS``."""
 
 
-def save_base64_audio(b64: str, upload_dir: Path, decoder: str) -> str | None:
-    """Persist bare base64 that passes :func:`check_ref_audio`; return its path,
-    or None (leaving nothing behind) when it is not base64 or not loadable audio.
+#: The refusal of a bare-base64 ``ref_audio`` that is not audio the model decodes.
+BARE_REF_AUDIO_REFUSAL = (
+    "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
+    "or base64 audio the model can decode"
+)
 
-    A path such as ``/etc/passwd`` is valid base64 too, so the alphabet cannot
-    tell them apart; the decoder can. A clip that is audio but too long raises
-    :class:`RefAudioTooLongError`.
-    """
-    try:
-        _, path = save_base64(b64, "wav", "audio", upload_dir)
-    except ValueError:
-        return None
+
+def check_saved_ref_audio(path: str, decoder: str, bare: bool) -> None:
+    """:func:`check_ref_audio` for a request's reference clip, saved at ``path``;
+    on failure the clip is deleted and ValueError says why. ``bare`` is a clip sent
+    as bare base64: a path such as ``/etc/passwd`` is valid base64 too, so the
+    alphabet cannot tell them apart and the decoder decides, and one that does not
+    open gets :data:`BARE_REF_AUDIO_REFUSAL`. A clip that opens but runs too long
+    raises :class:`RefAudioTooLongError` either way.
+
+    Both frontends call it: the Python adapters after saving the clip, and the Rust
+    frontend's bridge for a clip ``mstar-server`` saved, so the model's own loader
+    is the judge on both."""
     try:
         check_ref_audio(path, decoder)
     except RefAudioTooLongError:
         raise
     except ValueError:
-        return None
-    return path
+        if bare:
+            raise ValueError(BARE_REF_AUDIO_REFUSAL) from None
+        raise
 
 
 def check_ref_audio(path: str, decoder: str) -> None:
@@ -597,17 +605,46 @@ def remove_uploads(file_paths: dict[str, list[str]] | None, upload_dir: Path) ->
                 pass
 
 
+class _UploadReaper:
+    """One thread runs every deferred cleanup at its deadline: a thread per
+    request, each asleep for the delay, came to thousands under image load."""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._due: list[tuple[float, int, dict[str, list[str]], Path]] = []
+        self._order = 0
+        self._thread: Thread | None = None
+
+    def schedule(self, file_paths: dict[str, list[str]], upload_dir: Path, delay_s: float) -> None:
+        with self._cv:
+            self._order += 1  # a tiebreak: the dicts don't compare
+            heapq.heappush(self._due, (time.monotonic() + delay_s, self._order, file_paths, upload_dir))
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = Thread(target=self._run, name="upload-cleanup", daemon=True)
+                self._thread.start()
+            self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._due or (wait := self._due[0][0] - time.monotonic()) > 0:
+                    self._cv.wait(wait if self._due else None)
+                _, _, file_paths, upload_dir = heapq.heappop(self._due)
+            try:
+                remove_uploads(file_paths, upload_dir)
+            except Exception:  # noqa: BLE001 — the other requests' cleanups still run
+                logger.exception("Deleting a request's uploads failed")
+
+
+_REAPER = _UploadReaper()
+
+
 def schedule_upload_cleanup(file_paths: dict[str, list[str]] | None, upload_dir: Path) -> None:
     """:func:`remove_uploads` after :data:`UPLOAD_CLEANUP_DELAY_S`, for a
     request that was submitted and may not have been read yet."""
     if not file_paths:
         return
-
-    def _cleanup() -> None:
-        time.sleep(UPLOAD_CLEANUP_DELAY_S)
-        remove_uploads(file_paths, upload_dir)
-
-    Thread(target=_cleanup, daemon=True).start()
+    _REAPER.schedule(file_paths, upload_dir, UPLOAD_CLEANUP_DELAY_S)
 
 
 # ---------------------------------------------------------------------------

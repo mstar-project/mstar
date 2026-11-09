@@ -98,7 +98,7 @@ def _start(rt, n, limits=True):
             worker_graph_to_workers=ParallelList([0], [[ME]]), loop_caps={})
         if limits:
             # a limit no step reaches: EOS and the loop's cap end the rows
-            rt.register_stop_limits(rid, SimpleNamespace(max_tokens=1 << 20, resource_configs={}))
+            rt.register_stop_limits(rid, SimpleNamespace(max_tokens=1 << 20, resource_configs={}, partition_name=PART))
         rids.append(rid)
     block = ColumnarEdgeSpecs.empty()
     for rid in rids:

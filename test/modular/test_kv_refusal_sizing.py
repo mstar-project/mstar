@@ -25,7 +25,6 @@ from test_admit_failure_handling import (
     _SchedEngine,
 )
 from test_micro_scheduler import _Manager, _next_batch, _scheduler
-from test_worker_drain import _worker as _teardown_worker
 
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.kv import manager as manager_mod
@@ -34,9 +33,10 @@ from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
 from mstar.testing_utils.engine import make_engine
-from mstar.testing_utils.worker import deliver
+from mstar.testing_utils.worker import bound, deliver, make_worker
 from mstar.utils.ipc_format import RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
 
 PAGE_SIZE = 16
@@ -203,7 +203,7 @@ def _refuse_after_a_pool_filling_prefill(spans: dict[str, int]) -> Worker:
         node_name=SCHED_NODE, graph_walk=SCHED_WALK,
         request_to_worker_graph=dict.fromkeys(spans, "wg"),
     )
-    worker._handle_admit_failure(batch, _refused(batch, outcome.reason))
+    worker.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason))
     return worker
 
 
@@ -215,7 +215,7 @@ def test_a_prefill_that_fills_the_pool_fails_at_its_first_decode():
 
     assert _engine(worker).offloaded == [], "the request was offloaded to retry"
     assert worker._graph_runtime.pushed_back == []
-    assert worker.admission.take_admit_errors() == {"long": _POOL_FILLER_ERROR}
+    assert worker.lifecycle.take_failures() == {"long": _POOL_FILLER_ERROR}
     assert worker.admission.held_until == {}, "the request was held to retry"
 
 
@@ -228,7 +228,7 @@ def test_a_pool_filler_fails_in_a_mixed_step_whichever_row_is_refused(prompt_fir
     worker = _refuse_after_a_pool_filling_prefill(dict(rows if prompt_first else rows[::-1]))
 
     assert _engine(worker).offloaded == [], "the pool filler was offloaded to retry"
-    assert worker.admission.admit_errors == {"long": _POOL_FILLER_ERROR}
+    assert worker.lifecycle.take_failures() == {"long": _POOL_FILLER_ERROR}
     assert worker._graph_runtime.pushed_back == ["short"]
 
 
@@ -335,13 +335,13 @@ def test_a_row_the_cache_served_does_not_make_a_batch_too_big_alone():
         node_name=SCHED_NODE, graph_walk=SCHED_WALK,
         request_to_worker_graph=dict.fromkeys([*spans, "cached"], "wg"),
     )
-    worker._handle_admit_failure(batch, SimpleNamespace(
+    worker.pipeline._handle_admit_failure(batch, SimpleNamespace(
         node_name=SCHED_NODE, admit_error=reason, failed_resource="kv",
         request_ids=list(spans), no_forward_rids={"cached"},
     ))
 
     assert _engine(worker).offloaded == ["decoder"], "the request holding pages was not evicted"
-    assert worker.admission.admit_errors == {}
+    assert worker.lifecycle.failed_rids == set()
 
 
 # --- a teardown that hands pages back lifts a cap ---------------------------
@@ -357,9 +357,26 @@ def _engine_manager(**pools: KVManager) -> SimpleNamespace:
 
 
 def _teardown_over(sched, known_rids, engine_manager):
-    worker = _teardown_worker(known_rids=known_rids)
-    worker.scheduler, worker.admission = sched, sched.admission
-    worker.engine_manager = engine_manager
+    """A real teardown path over ``sched``; the rid strings are their own handles."""
+    request_state = SimpleNamespace(
+        per_request_info=dict.fromkeys(known_rids), remove_request=lambda rid: None,
+    )
+    tensor_manager = SimpleNamespace(
+        has_inflight_reads=lambda rid: False, force_cleanup_request=lambda rid: None,
+    )
+    runtime = SimpleNamespace(
+        get_rid_handle=lambda rid: rid if rid in known_rids else None,
+        get_rid_string=lambda rid: rid,
+        get_sharding_config=lambda rid: SimpleNamespace(groups=[]),
+        remove_request=lambda rid: None,
+    )
+    bound(sched, runtime=runtime)
+    worker = make_worker(
+        scheduler=sched, engine_manager=engine_manager, request_state=request_state, graph_runtime=runtime,
+        tensor_manager=tensor_manager, streams=StreamBufferManager(request_state, tensor_manager, []),
+    )
+    for rid in known_rids:
+        worker.lifecycle.add(rid, rid)
     return worker
 
 
@@ -386,7 +403,7 @@ def test_a_teardown_that_frees_pages_lifts_a_cap_a_busy_walk_never_steps_under()
     batch = _next_batch(sched, manager)
     assert list(batch.request_to_worker_graph) == long_rows
     refuser = _evicting_worker(long_rows, sched, manager.runtime)
-    refuser._handle_admit_failure(batch, _refused(batch, outcome.reason))
+    refuser.pipeline._handle_admit_failure(batch, _refused(batch, outcome.reason))
     assert _engine(refuser).offloaded == ["d14"]  # d15 ran last, so it holds the step
 
     for _ in range(4):
