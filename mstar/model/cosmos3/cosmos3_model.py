@@ -30,10 +30,10 @@ Edge checkpoints add the reasoner (the understanding tower served as a VLM):
     reasoner       (kv_cache, sampler, rope) - the same transformer instance
                                  as the DiT (one copy of the text weights, the
                                  same KV pool), run as a causal text model.
-    reasoner_prefill / reasoner_prefill_vision - embed the chat-templated
-                 prompt (vision tokens scattered over the media placeholders),
-                 write its K/V, sample the first token.
-    reasoner_decode - one token per loop iteration until EOS / max tokens.
+    prefill_text / prefill_vision - embed the chat-templated prompt (vision
+                 tokens spliced in at the media placeholders), write its K/V,
+                 sample the first token.
+    decode - one token per iteration of decode_loop until EOS / max tokens.
 
 Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
     video_gen_ar - the denoise loop run window by window over a long clip.
@@ -60,7 +60,7 @@ from pathlib import Path
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
+from mstar.conductor.request_info import PartitionDefinition
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources import (
     AttentionConfig,
@@ -76,6 +76,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec, RaggedAttnBackend
 from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
     GraphEdge,
@@ -127,7 +128,7 @@ from mstar.model.cosmos3.submodules import (
     latent_frames,
     sound_frames,
 )
-from mstar.model.keys import ROPE
+from mstar.model.keys import ROPE, VISION_ATTN
 from mstar.model.media_limits import UndecodableMediaError, VideoBudget
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -135,8 +136,12 @@ from mstar.model.multimodal import (
     MediaEncoder,
     PromptPart,
     check_attachments,
+    media_prefill_step,
+    media_walks,
     parts_from_modalities,
+    text_combined_walks,
 )
+from mstar.model.multimodal_decoder import MIXED_SPLIT
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -149,7 +154,6 @@ AUDIO_DECODER_NODE = "audio_decoder"
 VAE_DECODER_AR_NODE = "vae_decoder_ar"
 VISION_ENCODER_NODE = "vision_encoder"
 REASONER_NODE = "reasoner"
-
 
 
 class Cosmos3Model(Model):
@@ -165,8 +169,9 @@ class Cosmos3Model(Model):
     # the output modality that picks the loop and its step count
     DENOISE_CAP = "denoise_cap"
     # and the width of a policy request's robot_state, which process_prompt
-    # hands the conductor (the values themselves ride the action_inputs edge)
-    INTERNAL_KWARGS = (DENOISE_CAP, "robot_state_dim", "action_shape")
+    # hands the conductor (the values themselves ride the action_inputs edge),
+    # and a reasoner prompt's media layout
+    INTERNAL_KWARGS = (DENOISE_CAP, "robot_state_dim", "action_shape", MEDIA_LAYOUT)
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -334,6 +339,8 @@ class Cosmos3Model(Model):
                 nodes=kv_nodes,
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.AUTO,
+                    # only the reasoner runs mixed (text prefill + decode) steps
+                    splits=(MIXED_SPLIT,) if self._reasoner_enabled() else (),
                 ),
             ),
         ]
@@ -343,10 +350,12 @@ class Cosmos3Model(Model):
                 vocab_size=self.config.vocab_size,
                 enable_repetion_penalty=True,
             ))
-            # only the counter: the tower builds its mRoPE tables from the ids
+            # The reasoner's position counter. Its layers apply the 3D mRoPE
+            # themselves, from these positions or a media prompt's own.
             specs.append(PositionSpec(
                 resource_key=ROPE, nodes={REASONER_NODE}, config=PositionConfig(kv_cache=KV_CACHE),
             ))
+            specs.append(self._vision_attention_spec())
         if self.config.attention_backend == "dense_gen":
             specs.append(AttentionSpec(
                 resource_key=ATTN_GEN,
@@ -369,6 +378,34 @@ class Cosmos3Model(Model):
             return {KV_CACHE: {COND_LABEL: uncond, UNCOND_LABEL: uncond}}
         main = KVLabel(growth=((self.REASONER_DECODE_WALK, REASONER_DECODE_LOOP),))
         return {KV_CACHE: {COND_LABEL: main, UNCOND_LABEL: uncond}}
+
+    def _vision_attention_spec(self) -> RaggedAttentionSpec:
+        """The vision tower's attention, a segment per image or video frame."""
+        from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
+
+        reasoner = self.config.reasoner
+        vision = reasoner.vision
+        # the smallest frame the processors make bounds a replay's segments
+        min_patches = min(
+            reasoner.image_processor.min_pixels, reasoner.video_processor.min_pixels,
+        ) // vision.patch_size ** 2
+        return RaggedAttentionSpec(
+            resource_key=VISION_ATTN, nodes={VISION_ENCODER_NODE},
+            config=RaggedAttentionConfig(
+                num_qo_heads=vision.num_attention_heads,
+                num_kv_heads=vision.num_attention_heads,
+                head_dim=vision.hidden_size // vision.num_attention_heads,
+                max_segments_per_step=Cosmos3VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // max(min_patches, 1),
+                # FA3 varlen takes head_dim 72 as it is; FlashInfer pads it to 128
+                # (three pads, a zero fill and a slice a layer). Falls back to
+                # FlashInfer where FA3 can't load.
+                backend=RaggedAttnBackend.DENSE,
+            ),
+        )
+
+    def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
+        # the reasoner's text prefill and decode rows share a step
+        return text_combined_walks(node=REASONER_NODE) if self._reasoner_enabled() else {}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {**super().get_loop_caps(**model_kwargs), **(model_kwargs.get(self.DENOISE_CAP) or {})}
@@ -417,12 +454,12 @@ class Cosmos3Model(Model):
 
     def _vision_encoder(self) -> MediaEncoder:
         """The reasoner's one medium: the vision encoder's tokens fill the
-        prompt's image and video pads, in prompt order, on the reasoner's
-        vision prefill walk (beside the DiT's own ``prefill*`` walks)."""
+        prompt's image and video pads, in prompt order, on the scaffold's
+        ``prefill_vision`` walk (beside the DiT's own ``prefill*`` walks)."""
         r = self.config.reasoner
         return MediaEncoder(
-            "vision", VISION_ENCODER_NODE, ("pixel_values", "vision_grid_thw"), "vision_embeds",
-            (r.image_token_id, r.video_token_id), walk=self.REASONER_PREFILL_VISION_WALK,
+            "vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds",
+            (r.image_token_id, r.video_token_id),
         )
 
     def _reasoner_enabled(self) -> bool:
@@ -777,57 +814,12 @@ class Cosmos3Model(Model):
         )
 
     def _reasoner_walks(self) -> dict[str, GraphSection]:
-        """The VLM walks. ``reasoner_prefill`` embeds a text-only prompt;
-        ``reasoner_prefill_vision`` first runs the vision encoder over the
-        request's packed patches and hands the projected tokens to the
-        reasoner, which scatters them over the media placeholders. Both
-        sample the first token, which persists into the decode loop; each
-        decode iteration emits its token and feeds it back."""
-        first_token = GraphEdge(
-            next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text", persist=True,
+        """The VLM scaffold's walks over the reasoner: ``prefill_text``, the
+        ``prefill_vision`` media walk (the vision encoder, then the whole prompt
+        as one row with its vision tokens spliced in), and the ``decode`` loop."""
+        return media_walks(
+            self.config.reasoner.max_position_embeddings, (self._vision_encoder(),), node=REASONER_NODE,
         )
-        prefill = GraphNode(
-            name=REASONER_NODE,
-            input_names=["text_inputs"],
-            outputs=[first_token],
-        )
-        prefill_vision = Sequential(
-            [
-                GraphNode(
-                    name=VISION_ENCODER_NODE,
-                    input_names=["pixel_values", "vision_grid_thw"],
-                    outputs=[GraphEdge(next_node=REASONER_NODE, name="vision_embeds")],
-                ),
-                GraphNode(
-                    name=REASONER_NODE,
-                    input_names=["text_inputs", "vision_embeds"],
-                    outputs=[
-                        GraphEdge(
-                            next_node=EMIT_TO_CLIENT, name="new_token",
-                            output_modality="text", persist=True,
-                        ),
-                    ],
-                ),
-            ]
-        )
-        decode = Loop(
-            name=REASONER_DECODE_LOOP,
-            section=GraphNode(
-                name=REASONER_NODE,
-                input_names=["text_inputs"],
-                outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
-                    GraphEdge(next_node=REASONER_NODE, name="text_inputs"),
-                ],
-            ),
-            max_iters=self.config.reasoner.max_position_embeddings,
-            outputs=[],
-        )
-        return {
-            self.REASONER_PREFILL_WALK: prefill,
-            self.REASONER_PREFILL_VISION_WALK: prefill_vision,
-            self.REASONER_DECODE_WALK: decode,
-        }
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -1022,9 +1014,10 @@ class Cosmos3Model(Model):
         encoder pass.
 
         Returns ``text_inputs`` (the token ids) and, with attachments, the
-        packed ``pixel_values`` + ``vision_grid_thw`` the vision_encoder node
-        consumes, plus the ``MEDIA_LAYOUT`` the reasoner splices the encoder's
-        tokens and places its mRoPE positions by."""
+        packed ``pixel_values`` the vision_encoder node consumes, plus the
+        ``MEDIA_LAYOUT`` the vision encoder plans its frames by and the
+        reasoner splices the encoder's tokens and places its mRoPE positions
+        by."""
         from mstar.model.cosmos3.components.reasoner import (
             IMAGE,
             VIDEO,
@@ -1069,20 +1062,17 @@ class Cosmos3Model(Model):
             )
             patches.append(pv)
             video_grids.append(grid)
-        # Media patches are packed in prompt order (images, then videos, as
-        # the parts list them); the vision encoder returns tokens in that
-        # order and the placeholders are expanded in the same order.
+        # Media patches are packed in prompt order (images and videos as the
+        # parts list them), the order the placeholders are expanded in: the
+        # layout's runs, which the vision encoder plans its frames by, follow it.
         ordered_patches: list[torch.Tensor] = []
-        ordered_grids: list[tuple[int, int, int]] = []
         img_i = vid_i = 0
         for part in parts:
             if part.modality == IMAGE:
                 ordered_patches.append(patches[img_i])
-                ordered_grids.append(image_grids[img_i].thw)
                 img_i += 1
             elif part.modality == VIDEO:
                 ordered_patches.append(patches[len(image_grids) + vid_i])
-                ordered_grids.append(video_grids[vid_i].thw)
                 vid_i += 1
 
         text = render_chat(
@@ -1102,7 +1092,6 @@ class Cosmos3Model(Model):
         out: NameToTensorList = {"text_inputs": [ids]}
         if ordered_patches:
             out["pixel_values"] = [torch.cat(ordered_patches, dim=0)]
-            out["vision_grid_thw"] = [torch.tensor(ordered_grids, dtype=torch.long)]
         walk = self.REASONER_PREFILL_VISION_WALK if ordered_patches else self.REASONER_PREFILL_WALK
         # a vision run spans its merged grid's longer side in positions, not its tokens
         advance = layout_extent(layout, reasoner.vision.spatial_merge_size, ids.numel())
@@ -1733,18 +1722,18 @@ class Cosmos3Model(Model):
         if is_text:
             if not self._reasoner_enabled():
                 raise ValueError("This Cosmos3 deployment does not serve the reasoner (text output).")
-            has_vision = "pixel_values" in input_signals and "vision_grid_thw" in input_signals
             knobs = {
                 "max_output_tokens": self.get_max_output_tokens(**model_kwargs),
                 "enable_thinking": model_kwargs.get("enable_thinking"),
             }
-            if has_vision:
-                # where the encoder's tokens and the prompt's positions go
-                prefill = WalkStep(self.REASONER_PREFILL_VISION_WALK, step_metadata={
-                    **knobs, MEDIA_LAYOUT: model_kwargs.get(MEDIA_LAYOUT) or {}, FINAL_PREFILL: True,
-                })
-            else:
-                prefill = WalkStep(self.REASONER_PREFILL_WALK, step_metadata={**knobs, FINAL_PREFILL: True})
+            # the vision prefill when the prompt's layout places media (the
+            # layout says where the encoder's tokens and the positions go), the
+            # text-only prefill otherwise
+            prefill = media_prefill_step(
+                input_signals, (self._vision_encoder(),), model_kwargs.get(MEDIA_LAYOUT),
+                model_name="Cosmos3 reasoner",
+            )
+            prefill = WalkStep(prefill.walk, step_metadata={**knobs, **prefill.step_metadata})
             decode = WalkStep(self.REASONER_DECODE_WALK, bind={"text_inputs": "new_token"}, step_metadata=knobs)
             return [prefill, decode]
         params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
