@@ -270,6 +270,7 @@ def test_completion_that_overtakes_the_last_chunks_waits_for_them(inline, tmp_pa
     worker.result_tensor_input_queue = SimpleNamespace(put=complete_at_once)
 
     server = object.__new__(APIServer)
+    server.reads_turns = False
     server.running = True
     server._liveness_interval_s = 3600.0
     server._conductor_exited = lambda: None

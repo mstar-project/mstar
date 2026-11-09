@@ -111,10 +111,10 @@ class Glm5NextModel(Model):
             if not isinstance(kwargs["prefill_graphs"], bool):
                 raise ValueError(f"prefill_graphs must be true or false, got {kwargs['prefill_graphs']!r}")
             self.config.prefill_graphs = kwargs["prefill_graphs"]
-        # overrides of the submodule's buckets, which **kwargs would otherwise swallow
-        for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
-            if kwargs.get(key) is not None:
-                setattr(self.config, key, capture_ladder(key, kwargs[key]))
+        # an override of the submodule's batch sizes, which **kwargs would otherwise swallow
+        if kwargs.get("prefill_capture_batch_sizes") is not None:
+            self.config.prefill_capture_batch_sizes = capture_ladder(
+                "prefill_capture_batch_sizes", kwargs["prefill_capture_batch_sizes"])
         # Requests that may hold KDA state at once (the decode batch cap). The
         # pool holds one more slot, its sink; a serve YAML sets the pool's
         # size, sink included, under ``resources: kda_state: {max_slots: N}``.

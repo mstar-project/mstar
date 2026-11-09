@@ -714,23 +714,22 @@ def _resolve_ref_audio(ref: str, upload_dir: Path, decoder: str) -> str:
     if not isinstance(ref, str):
         raise ValueError(f"ref_audio must be a data URL or base64 string, got {type(ref).__name__}")
     try:
-        if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+        bare = not (ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"))
+        if not bare:
             try:
                 path = media_io.resolve_media_ref(ref, upload_dir)[1]
             except _REF_AUDIO_FETCH_ERRORS as exc:
                 raise ValueError(f"could not fetch ref_audio ({_ref_audio_fetch_failure(exc)})") from exc
-            media_io.check_ref_audio(path, decoder)
-            return path
-        path = media_io.save_base64_audio(ref, upload_dir, decoder)
+        else:
+            try:
+                _, path = media_io.save_base64(ref, "wav", "audio", upload_dir)
+            except ValueError:
+                raise ValueError(media_io.BARE_REF_AUDIO_REFUSAL) from None
+        media_io.check_saved_ref_audio(path, decoder, bare)
     except OSError as exc:
         logger.error("could not store a ref_audio upload under %s: %r", upload_dir, exc)
         raise RuntimeError("the server could not store ref_audio") from None
-    if path:
-        return path
-    raise ValueError(
-        "server file paths are refused; ref_audio must be a data URL, an http(s) URL "
-        "or base64 audio the model can decode"
-    )
+    return path
 
 
 class ChatterboxAdapter(OpenAIAdapter):

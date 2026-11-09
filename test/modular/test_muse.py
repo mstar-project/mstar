@@ -623,16 +623,6 @@ def test_a_checkpoint_intake_would_misread_is_refused(model_dir, monkeypatch, pr
         glimmer_model.MuseGlimmerModel(str(model_dir))
 
 
-def test_a_deployment_s_prefill_ladder_reaches_the_llm(model_dir, monkeypatch):
-    """``model_kwargs.prefill_token_buckets`` is the LLM node's captured
-    ladder, not dropped in ``**kwargs``."""
-    from mstar.model.muse import glimmer_model, weight_loader
-
-    monkeypatch.setattr(weight_loader, "load_text_weights", lambda *args, **kwargs: None)
-    model = glimmer_model.MuseGlimmerModel(str(model_dir), prefill_token_buckets=[64, 32])
-    assert model._create_submodule("LLM", "cpu", torch.float32, None).PREFILL_TOKEN_BUCKETS == [32, 64]
-
-
 def test_the_tokenizer_s_eot_stops_without_a_generation_config(model_dir):
     from mstar.model.muse import glimmer_model
 

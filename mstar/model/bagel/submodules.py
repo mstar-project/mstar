@@ -58,6 +58,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StackingMethod,
 )
+from mstar.model.utils import warn_retired_ladder_env
 from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
@@ -367,6 +368,11 @@ class ViTEncoderSubmodule(NodeSubmodule):
     handled by the graph edge's next_node field.
     """
 
+    # The captured block loop's token buckets; 4900 == 70*70, the exact length
+    # the "vllm" preprocess option emits. A deployment sets its own with the
+    # serving config's `prefill_token_buckets: {vit_encoder: {vit_block_loop: [...]}}`.
+    VIT_TOKEN_BUCKETS = [512, 1024, 2048, 4096, 4900]
+
     def __init__(
         self,
         vit_model: nn.Module,
@@ -387,6 +393,10 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self.vae_transform = _VAE_TRANSFORM
 
         self._vit_batching = os.environ.get("MSTAR_VIT_BATCHING", "0") == "1"
+        warn_retired_ladder_env(
+            "MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS",
+            "prefill_token_buckets: {vit_encoder: {vit_block_loop: [...]}}",
+        )
         # CUDA-graph capture of the ViT block loop, over the engine's ragged
         # attention resource. Off by default: capture costs one graph per
         # (bs, token bucket) and the eager flash-attn path is already fast;
@@ -394,11 +404,6 @@ class ViTEncoderSubmodule(NodeSubmodule):
         self._accelerator_graph_enabled = (
             accelerator_graph and os.environ.get("MSTAR_VIT_ACCELERATOR_GRAPH", "0") == "1"
         )
-        self._accelerator_graph_token_buckets = [
-            int(t) for t in os.environ.get(
-                "MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS", "512,1024,2048,4096,4900"
-            ).split(",") if t.strip()
-        ]  # 4900 == 70*70, the exact length the "vllm" preprocess option emits
         self._accelerator_graph_batch_sizes = [
             int(b) for b in
             os.environ.get("MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES", "1,2,4").split(",")
@@ -524,7 +529,7 @@ class ViTEncoderSubmodule(NodeSubmodule):
                 # one segment per row: `_max_images_per_request` is 1, so a
                 # request's tokens are one independently-attending image
                 attn_key=VIT_ATTN,
-                total_tokens=sorted(self._accelerator_graph_token_buckets),
+                total_tokens=list(self.VIT_TOKEN_BUCKETS),
                 capture_batch_sizes=sorted(self._accelerator_graph_batch_sizes),
             )
         }

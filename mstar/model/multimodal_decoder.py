@@ -137,15 +137,9 @@ class MultimodalDecoderModel(Model):
     # by `__init__`; a model built without it reads none)
     sampling_defaults: Mapping[str, object] = MappingProxyType({})
 
-    def __init__(
-        self, model_path_hf: str, cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
-    ):
+    def __init__(self, model_path_hf: str, cache_dir: str | None = None):
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
-        # a deployment's captured text-prefill ladder for the LLM node
-        # (`model_kwargs.prefill_token_buckets`; None keeps the node's own)
-        self.prefill_token_buckets = prefill_token_buckets
         self.local_dir = self._resolve_model_metadata()
         # so weights are materialized at most once per node
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}

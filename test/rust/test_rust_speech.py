@@ -15,6 +15,7 @@ import json
 import random
 import re
 import socket
+from pathlib import Path
 
 import pytest
 
@@ -31,6 +32,7 @@ from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai import _util, serving_speech
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.openai.protocol import SpeechRequest
+from mstar.api_server.rust_frontend import LIBSNDFILE_ENV, soundfile_library
 from mstar.api_server.served_models import ServedModels
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
@@ -40,7 +42,11 @@ SPEECH_CLASSES = sorted(c for c, a in _classes().items()
 
 
 def test_the_speech_classes_are_the_ported_ones():
-    assert SPEECH_CLASSES == ["OrpheusAdapter", "Qwen3OmniAdapter", "Qwen3TTSAdapter"]
+    # every speech class the registry has
+    assert SPEECH_CLASSES == sorted(c for c, a in _classes().items() if a.supports_speech) == [
+        "ChatterboxAdapter", "CosyVoice3Adapter", "FishS2ProAdapter", "KokoroAdapter", "OmniVoiceAdapter",
+        "OrpheusAdapter", "Qwen3OmniAdapter", "Qwen3TTSAdapter", "VoxCPM2Adapter",
+    ]
 
 
 def _audio(text: str) -> list[_Chunk]:
@@ -299,16 +305,50 @@ def test_both_frontends_refuse_a_speech_with_the_same_status_and_text(case, tmp_
     assert (rust[0], json.loads(rust[1])) == (python[0], json.loads(python[3]))
 
 
-def test_what_only_the_rust_frontend_refuses():
-    """It has no audio decoder and no compressed-audio encoder, so a clip to
-    clone and a non-streamed mp3 are 400s that point at the Python frontend."""
+def test_without_libsndfile_a_compressed_format_is_refused_as_python_refuses_it_without_soundfile():
     stub = _RustSpeechStub()
-    with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
-        clone = _post(port, "/v1/audio/speech", {"input": "Hi.", "ref_audio": "data:audio/wav;base64,UklGRg=="})
+    with _model_stack("qwen3_tts_1p7b", stub, env={LIBSNDFILE_ENV: ""}) as (port, _upload):
         mp3 = _post(port, "/v1/audio/speech", {"input": "Hi.", "response_format": "mp3"})
-    assert clone[0] == 400 and "serve without --rust-frontend" in json.loads(clone[1])["error"]["message"]
-    assert mp3[0] == 400 and "run the Python frontend" in json.loads(mp3[1])["error"]["message"]
+    message = "response_format 'mp3' cannot be produced by this server; use one of: wav, pcm"
+    assert (mp3[0], json.loads(mp3[1])["error"]["message"]) == (400, message)
     assert stub.submitted == []
+
+
+def _without_ogg_serial(data: bytes) -> bytes:
+    """An Ogg file with each page's stream serial and CRC zeroed. libsndfile
+    picks the serial at random, so two Python encodes of one clip differ there
+    and nowhere else."""
+    pages, i = [], 0
+    while i < len(data):
+        assert data[i:i + 4] == b"OggS", f"no Ogg page at byte {i}"
+        segments = data[i + 27:i + 27 + data[i + 26]]
+        page = bytearray(data[i:i + 27 + len(segments) + sum(segments)])
+        page[14:18] = page[22:26] = b"\0\0\0\0"
+        pages.append(bytes(page))
+        i += len(page)
+    return b"".join(pages)
+
+
+@pytest.mark.parametrize("fmt", ["mp3", "flac", "opus", "MP3"])
+@pytest.mark.parametrize("case", ["benchmark", "chunked"])
+def test_a_compressed_speech_is_the_python_routes_bytes(case, fmt, tmp_path, monkeypatch):
+    """mstar-server encodes with the libsndfile soundfile loaded, called as
+    ``soundfile.write`` calls it, so the file is byte for byte the Python
+    route's, headers and submits included; an Ogg stream's random serial aside."""
+    libsndfile = soundfile_library()
+    if libsndfile is None:
+        pytest.skip("soundfile is not installed")
+    model = "qwen3_tts_1p7b"
+    body = {**SPEECH_CASES[case], "response_format": fmt, "stream": False}
+    stub = _RustSpeechStub()
+    with _model_stack(model, stub, env={LIBSNDFILE_ENV: libsndfile}) as (port, _upload):
+        rust = _rust_answer(port, stub, body)
+    python = _python_answer(model, body, tmp_path, monkeypatch)
+    assert rust[0] == 200, rust
+    if fmt == "opus":
+        rust = (*rust[:3], _without_ogg_serial(rust[3]), *rust[4:])
+        python = (*python[:3], _without_ogg_serial(python[3]), *python[4:])
+    assert rust == python
 
 
 async def _python_pieces(model, body, tmp_path):
@@ -453,3 +493,112 @@ def test_split_sentences_matches_python_on_random_long_inputs(tmp_path, monkeypa
                 continue
             assert status == 200
             assert [s["text"] for s in stub.submitted] == want, text
+
+
+@pytest.mark.parametrize("script", ["chinese", "other"])
+def test_cosyvoice3_cuts_long_text_as_its_python_adapter_does(script, tmp_path, monkeypatch):
+    """CosyVoice3 splits by its own rules (``split_speech_text``): Chinese as the
+    reference's ``split_paragraph``, re-cut at commas past 300 characters, and
+    other text by an estimate of its tokens. Random inputs over those rules'
+    edges, with every piece text compared."""
+    model = _model_of("CosyVoice3Adapter")
+    adapter = ADAPTER_REGISTRY[model]
+    chinese = ["今天天气很好。", "我们去公园吧！", "你觉得呢？", "第一；第二：", "苹果、香蕉、", "他说：“好的。”",
+               "价格是3.5元。", "没有标点的长句子" * 9, "这是一个逗号，", "Hello world. ", "数字123，", "\n\n", " ",
+               "”", "。。", "a" * 90]
+    other = ["안녕하세요. ", "こんにちは。", "Привет, мир! ", "The price is 3.5 dollars. ", "Really?", "end; ",
+             "ok, ", "x" * 130, "é" * 200, "Done.” ", "\n\n", "  "]
+    words = chinese if script == "chinese" else other
+    rng = random.Random(7 if script == "chinese" else 8)
+    texts = []
+    while len(texts) < 80:
+        text = "".join(rng.choice(words) for _ in range(rng.randint(10, 80)))
+        if len(text) >= 81 and (script == "other" or any("\u4e00" <= c <= "\u9fff" for c in text)):
+            texts.append(text)
+    stub = _RustSpeechStub()
+    with _model_stack(model, stub) as (port, _upload):
+        for text in texts:
+            stub.submitted.clear()
+            status, data = _post(port, "/v1/audio/speech", {"input": text})
+            want = adapter.split_speech_text(text) or [text]
+            if len(want) > 32:
+                assert (status, json.loads(data)["error"]["message"]) == (
+                    400, f"input splits into {len(want)} sentence chunks; at most 32 are allowed")
+                continue
+            assert status == 200, data
+            assert [s["text"] for s in stub.submitted] == want, text
+
+
+# ── voice cloning: ref_audio ────────────────────────────────────────────────
+
+def _wav(seconds: float, rate: int = 16000) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"\x01\x00" * int(seconds * rate))
+    return buf.getvalue()
+
+
+def _b64(data: bytes) -> str:
+    import base64
+
+    return base64.b64encode(data).decode()
+
+
+CLONES = {
+    "data-url": lambda: f"data:audio/wav;base64,{_b64(_wav(2))}",
+    "bare": lambda: _b64(_wav(2)),
+    "bare-unpadded": lambda: _b64(_wav(2.0001)).rstrip("="),
+    "not-audio": lambda: f"data:audio/wav;base64,{_b64(b'no audio here')}",
+    "bare-server-path": lambda: _b64(b"/etc/passwd"),
+    "too-long": lambda: f"data:audio/wav;base64,{_b64(_wav(61))}",
+    "below-8-khz": lambda: f"data:audio/wav;base64,{_b64(_wav(2, rate=4000))}",
+    "not-a-string": lambda: 7,
+}
+
+
+def _with_bytes(submits: list[dict]) -> list[dict]:
+    """Submits with each uploaded file's bytes in place of its path."""
+    return [{**s, "files": {m: [Path(p).read_bytes() for p in ps] for m, ps in (s["files"] or {}).items()}}
+            for s in submits]
+
+
+CLONING = ["ChatterboxAdapter", "CosyVoice3Adapter", "FishS2ProAdapter", "OmniVoiceAdapter",
+           "Qwen3TTSAdapter", "VoxCPM2Adapter"]
+
+
+@pytest.mark.parametrize("case", sorted(CLONES))
+@pytest.mark.parametrize("cls", CLONING)
+def test_both_frontends_take_or_refuse_a_voice_clip_alike(cls, case, tmp_path, monkeypatch):
+    """mstar-server saves the clip and the API server checks it with the model's
+    loader (``check_saved_ref_audio``) before anything is submitted, so a clip
+    either frontend takes reaches the backend as the same audio input, and one
+    it refuses gets the same status and text."""
+    pytest.importorskip("soundfile")
+    if cls in ("ChatterboxAdapter", "OmniVoiceAdapter"):
+        pytest.importorskip("torchcodec")  # their loader falls back to FFmpeg
+    model = _model_of(cls)
+    body = {"input": "Hi.", "voice": "ryan", "ref_audio": CLONES[case]()}
+    stub = _RustSpeechStub()
+    with _model_stack(model, stub) as (port, upload):
+        stub.upload_dir = upload
+        status, headers, data = _http(port, body)
+        rust_submits = _with_bytes(_rust_submits(stub.submitted))
+    api = _PythonSpeechServer(model, tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", api)
+    py = TestClient(entrypoint.app).post("/v1/audio/speech", json=body)
+    python_submits = _with_bytes(_python_submits(api.submitted))
+    rust_body = b"".join(data)
+    if py.status_code != 200:
+        assert (status, json.loads(rust_body)) == (py.status_code, py.json())
+        assert rust_submits == python_submits == []
+        return
+    assert status == 200, rust_body
+    assert (headers.get("content-type"), rust_body) == (py.headers.get("content-type"), py.content)
+    assert rust_submits == python_submits
+    assert "audio" in rust_submits[0]["in"]

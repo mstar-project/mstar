@@ -649,9 +649,10 @@ class MicroScheduler:
                     chunkable |= chunks
             if continuing is not None:
                 row_tokens.update(self._measure_unstarted(continuing, taken.difference(starts)))
-        min_chunk = 1
+        min_chunk = align = 1
         if max_tokens is not None and row_tokens:
-            min_chunk = engine.min_chunk_tokens(max_tokens)
+            align = engine.chunk_alignment(node_walk[0])
+            min_chunk = engine.min_chunk_tokens(max_tokens, align)
             seq_lens = pre_existing_seq_lens() if pre_existing_seq_lens is not None else ()
             max_tokens -= _pre_existing_tokens(seq_lens, pre_existing_batch_size)
         budgeted = max_tokens is not None and bool(row_tokens)
@@ -663,6 +664,7 @@ class MicroScheduler:
             row_tokens=row_tokens,
             chunkable=chunkable,
             min_chunk_tokens=min_chunk,
+            chunk_alignment=align,
             start_order=started,
         ), starts, resumed)
 

@@ -1193,7 +1193,7 @@ def test_qwen3_tts_talker_batches_and_captures_decode():
     # Prefill replays a packed capture: token buckets, padding rows shaped like
     # a prepared prefill (embeds + the dynamic EOS-suppression key).
     prefill_config = configs["talker_prefill"]
-    assert prefill_config.capture_token_lengths == [32, 64, 128, 256, 512, 1024]
+    assert prefill_config.capture_token_lengths == {1: [32, 64, 128, 256, 512, 1024]}
     assert prefill_config.capture_batch_sizes == [1, 2, 4, 8]
     padding = prefill_config.make_node_input(7)
     assert padding.input_embeds.shape == (7, 16) and padding.input_seq_len == 7

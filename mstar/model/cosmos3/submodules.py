@@ -104,6 +104,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StepOrder,
 )
+from mstar.model.utils import warn_retired_ladder_env
 from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
@@ -400,13 +401,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     gen_capture_batch_sizes: tuple[int, ...] = (1,)
 
     # Understanding-tower prefill capture: combined cond+uncond token buckets,
-    # rounded up at replay; prompts past the largest bucket run eager. Override
-    # with COSMOS3_PREFILL_CAPTURE_TOKENS / COSMOS3_PREFILL_CAPTURE_BS.
+    # rounded up at replay; prompts past the largest bucket run eager. The
+    # serving config's `prefill_token_buckets` sets the token buckets, and
+    # COSMOS3_PREFILL_CAPTURE_BS the batch sizes.
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
     def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
         super().__init__()
+        warn_retired_ladder_env("COSMOS3_PREFILL_CAPTURE_TOKENS", "prefill_token_buckets: {dit: {prefill: [...]}}")
         self.transformer = transformer
         self.config = config
         # The loop-back edges of this deployment's scheduler, beside the latents.
@@ -2407,11 +2410,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # sequence (batched CFG). The dummy zeros are placeholders — the real
         # input_ids / mrope ids are copied into the static buffers at replay.
         if not os.environ.get("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH"):
-            tok_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_TOKENS")
-            prefill_tokens = (
-                [int(x) for x in tok_env.split(",")] if tok_env
-                else list(self.prefill_capture_token_buckets)
-            )
             bs_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_BS")
             prefill_bs = (
                 [int(x) for x in bs_env.split(",")] if bs_env
@@ -2422,7 +2420,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(PREFILL_WALKS),
-                capture_token_lengths=prefill_tokens,
+                capture_token_lengths=list(self.prefill_capture_token_buckets),
                 make_node_input=lambda n: self._prefill_capture_input(
                     n, device, mrope_dtype,
                 ),

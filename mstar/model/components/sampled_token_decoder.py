@@ -85,8 +85,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     PREFILL_WALK = PREFILL_TEXT
     # Total tokens of a packed text-prefill step, one captured graph per
     # (bucket, batch size); a longer step prefills eagerly. Static buffers are
-    # sized by the largest bucket. `prefill_token_buckets` replaces it per
-    # instance.
+    # sized by the largest bucket. A deployment sets its own per walk with the
+    # serving config's `prefill_token_buckets`.
     PREFILL_TOKEN_BUCKETS = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16]
     # A mixed step carries the decode batch beside its prompt rows, so its
@@ -132,14 +132,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         config: Any,
         encoders: Sequence[MediaEncoder] = (),
         text_prompts: bool = True,
-        *,
-        prefill_token_buckets: Sequence[int] | None = None,
     ):
         """``encoders`` are the model's media encoders, as its walks declare
         them; a text-only node passes none. ``text_prompts`` is the model's
         `MultimodalDecoderModel.TEXT_PROMPTS`: without it there is no text-only
         prefill walk, so nothing captures one or a mixed step."""
-        super().__init__(prefill_token_buckets)
+        super().__init__()
         self._text_prompts = text_prompts
         self.model = model
         self.config = config
