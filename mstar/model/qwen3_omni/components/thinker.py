@@ -4,7 +4,7 @@ Architecture: embed_tokens -> N decoder layers -> final RMSNorm -> lm_head
 Each decoder layer: input_layernorm -> attention -> residual -> post_attention_layernorm -> MLP/MoE -> residual
 
 Key differences from Orpheus:
-- MoE (SparseMoeBlock) on most layers, dense MLP on ``mlp_only_layers``
+- MoE (``instantiate_moe_block``) on most layers, dense MLP on ``mlp_only_layers``
 - QK-norm in attention (handled by ``Qwen3OmniAttention``)
 - 3D MRoPE (passed through as ``cos_sin_3d``)
 - Captures layer-0 embeddings and layer-N hidden states for Talker conditioning
