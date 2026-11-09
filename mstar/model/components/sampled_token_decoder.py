@@ -425,7 +425,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             if PHASE_PERIOD:
                 phase_record("engine.preprocess.loopback", perf_counter() - t0)
             out = {"input_ids": ids}
-            if not decode:
+            if not decode and self._mixes_media:
                 # a mixed step's media prompt rows
                 self._pack_media(out, inputs)
                 self._mask_prompt_tokens(out, graph_walk, inputs)
