@@ -494,7 +494,7 @@ def wait(out, runner_temp, start_timeout="30"):
     gpu("terminate", key, check=False)
     print(f"collected: {sorted(p.name for p in results.iterdir())}")
     if not any((results / f).is_file() for f in ("result.json", "report.md", "refresh.log")):
-        unavailable(out, lt, f"The GPU box ended with no results: {render_summary.inert(st)}.\n"
+        unavailable(out, lt, f"The GPU box ended with no results: {st}.\n"
                              "Comment `/review` to retry.")
 
 
@@ -844,7 +844,8 @@ def redact(out, runner_temp, s1="", s2="", s3="", nodes=""):
 def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_outcome=""):
     """Post the live test's outcome and the approval decision, from the redacted copies: why nothing ran,
     the report, the providers' answer when no GPUs were free, or the review's `none`. Model text (the
-    gate's reasons, the review's reason) is inert, so it can't forge a marker."""
+    gate's reasons, the review's reason) and the providers' answer are inert, so they can't forge a marker;
+    the answer only here, after the redact step, so inert can't split a secret it echoes."""
     lt = Path(runner_temp, "lt")
 
     def text(path):
@@ -861,7 +862,8 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
     elif text(lt / "comment.md"):
         body = text(lt / "comment.md")
     elif text(lt / "unavailable.md"):
-        body = f"<!-- claude-live-test sha={head_sha} verdict=unavailable -->\n" + text(lt / "unavailable.md")
+        body = (f"<!-- claude-live-test sha={head_sha} verdict=unavailable -->\n"
+                + render_summary.inert(text(lt / "unavailable.md")))
     else:  # the review chose `none` and it stood
         reason = (json.loads(Path("review.json").read_text()).get("live_test") or {}).get("reason")
         reason = render_summary.inert(str("" if reason is None else reason)).rstrip("\n")

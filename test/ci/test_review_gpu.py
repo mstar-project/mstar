@@ -609,10 +609,12 @@ class TestEras(unittest.TestCase):
         self.assertIn(str(Path("~/.ssh/live_pr").expanduser()), ssh, "ssh would not offer the run's key")
 
     def test_a_box_that_left_no_results_reports_the_platforms_reason(self):
-        run = {"status": "failed", "failure": {"code": "launch_refused", "message": "The cluster refused the Pod."}}
+        run = {"status": "failed", "failure": {"code": "launch_refused",
+                                               "message": "Refused @team <!-- x -->, key hunter2@zzkey."}}
         instance = {"status": "active", "standalone": {"current_run": run}}
         e = {"provider": "eras", "instance_id": "i-1", "run": True}
-        for files, expected in (((), "launch_refused"), (("result.json",), None), (("refresh.log",), None)):
+        for files, expected in (((), "launch_refused"), (("result.json",), None), (("report.md",), None),
+                                (("refresh.log",), None)):
             with self.subTest(files=files):
                 temp = Path(tempfile.mkdtemp())
                 (temp / "lt/results").mkdir(parents=True)
@@ -628,6 +630,12 @@ class TestEras(unittest.TestCase):
                 if expected:
                     self.assertIn(expected, (temp / "lt/unavailable.md").read_text(),
                                   "the PR would say 'Live test: none' with no reason")
+                    step(gpu_review.redact, {}, runner_temp=str(temp), s1="hunter2@zzkey")
+                    _, posted = step(gpu_review.post, {"pr comment": ""}, pr="7", head_sha="0123456789",
+                                     runner_temp=str(temp), run_url="u", trusted="true")
+                    (_, comment), = posted.writes()
+                    self.assertIn("@\u200bteam <\u200b!-- x", comment, "the platform's text could ping or forge")
+                    self.assertNotIn("zzkey", comment, "a secret made inert first would slip past the redaction")
 
 
 if __name__ == "__main__":

@@ -242,15 +242,19 @@ def comment_on_issue(repo, number, body):
 
 # ---------------------------------------------------------------- preflight job
 
+AUTHOR_NEEDS_WRITE = ("`/review` and `/review nogpu` take a PR author with write access; "
+                      "comment `/review light` instead.")
+
+
 def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label, team_turns="2000",
               self_turns="40"):
     """Whether a comment starts a review, in which mode (`command`, one of the workflow's fixed words)
     and with which turn cap; a request it turns down for a reason the commenter can act on gets a
     one-line reply. Write access is checked against the actor's permission; a contributor may run
-    `/review light` or `/review continue` on their own PR, and only then is `non_write_user` set. A
-    full review runs the PR's code, so it also takes an author with write access (author_association
-    can't tell write from read) and a head repository head_trusted accepts; a PR that can't be read
-    means no."""
+    `/review light` or `/review continue` on their own PR, and only then is `non_write_user` set. A nogpu
+    or full review also takes an author with write access (author_association can't tell write from read);
+    a full one runs the PR's code, so also a head repository head_trusted accepts, and a PR that can't be
+    read means no. A /review continue is held to its mode's rule in restore."""
     if key_set != "true":
         print("::warning::ANTHROPIC_API_KEY is not set; skipping the review.")
         out["run"] = "false"
@@ -262,13 +266,17 @@ def preflight(out, repo, pr, key_set, command, actor, author, assoc, skip_label,
 
     perm = permission(repo, actor)
     if perm in WRITE:
-        if command == "full" and not (permission(repo, author) in WRITE
-                                      and head_trusted(repo, read(api, f"repos/{repo}/pulls/{pr}") or {})):
-            print(f"::notice::{author} or the PR's head repository lacks write access; a full review runs its code.")
+        if command in ("nogpu", "full") and permission(repo, author) not in WRITE:
+            print(f"::notice::{author} lacks write access; this review needs it.")
             out["run"] = "false"
-            reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes an author with write access and a "
-                            "head branch on this repository or a fork owned by someone with write access; comment "
-                            "`/review nogpu` for the review without the live test.")
+            reply(repo, pr, AUTHOR_NEEDS_WRITE)
+            return
+        if command == "full" and not head_trusted(repo, read(api, f"repos/{repo}/pulls/{pr}") or {}):
+            print("::notice::The PR's head repository lacks write access; a full review runs its code.")
+            out["run"] = "false"
+            reply(repo, pr, "`/review` runs this PR's code on GPUs, so it takes a head branch on this repository or "
+                            "a fork owned by someone with write access; comment `/review nogpu` for the review "
+                            "without the live test.")
             return
         out.update(run="true", mode=mode, turns=team_turns)
         return
@@ -319,7 +327,8 @@ def resolve(out, repo, pr, mode, runner_temp, non_write=""):
     out["timeout"] = 25 if non_write else 300
     if mode == "":
         try:
-            restore(out, repo, pr, pull["head"]["sha"], runner_temp, non_write)
+            restore(out, repo, pr, pull["head"]["sha"], runner_temp, non_write,
+                    (pull.get("user") or {}).get("login", ""))
         except Exception:  # a refusal too, so it can't overwrite the stopped review's comment
             out.update(why="the saved handoff couldn't be read; try `/review continue` again", refused="true")
             raise
@@ -327,13 +336,14 @@ def resolve(out, repo, pr, mode, runner_temp, non_write=""):
         out["mode"] = mode if mode in ("nogpu", "full") else "light"  # sets the prompt's reporting bar
 
 
-def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
+def restore(out, repo, pr, head_sha, runner_temp, non_write="", author=""):
     """/review continue: fetch the handoff a stopped review saved (handoff) into $RUNNER_TEMP/prev, and
     that review's mode. The newest unexpired artifact for this PR wins, and only
     from this workflow on issue_comment, a trigger that runs the base repository's copy of it: a fork's
     own workflow can upload an artifact with any name. Only while the stopped review's "didn't
     complete" comment is still open, since any later run that finishes rewrites it as resolved. The
-    handoff's values are checked before use; a nogpu one needs write access to continue."""
+    handoff's values are checked before use; a nogpu one takes what `/review nogpu` takes: a commenter
+    and an author with write access."""
     name = f"claude-review-handoff-{pr}"
 
     def fail(why):
@@ -383,8 +393,9 @@ def restore(out, repo, pr, head_sha, runner_temp, non_write=""):
         fail("a `/review` that stopped can't be continued (its live test never started); comment `/review` again")
     if mode not in ("light", "nogpu"):
         fail("the saved handoff is malformed")
-    if mode == "nogpu" and non_write:
-        fail("continuing a nogpu review takes write access, like `/review nogpu`")
+    if mode == "nogpu" and (non_write or permission(repo, author) not in WRITE):
+        fail("continuing a nogpu review takes write access for the commenter and the PR's author, like "
+             "`/review nogpu`; ask for a new review with `/review light`")
     out.update(dir=str(saved), mode=mode)
 
 
