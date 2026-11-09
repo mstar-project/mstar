@@ -2951,6 +2951,11 @@ options from <code class="docutils literal notranslate"><span class="pre">accele
 scaffold’s <code class="docutils literal notranslate"><span class="pre">compile_blocks</span></code> and Cosmos3’s denoise step do. Building the config refuses
 an unknown mode, and one that turns on Inductor’s own CUDA graphs (<code class="docutils literal notranslate"><span class="pre">reduce-overhead</span></code>,
 <code class="docutils literal notranslate"><span class="pre">max-autotune</span></code>), which fail inside the runner’s capture.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">inductor_options</span></code> are Inductor config entries the compile runs under, over the mode’s
+or the compile level’s own, e.g. <code class="docutils literal notranslate"><span class="pre">{&quot;max_autotune_gemm_backends&quot;:</span> <span class="pre">&quot;ATEN&quot;}</span></code> to keep
+max-autotune’s fusion choices but cuBLAS for the GEMMs (autotune’s timings of decode-width
+GEMMs can vary between processes). Building the config
+refuses an entry Inductor doesn’t have, and <code class="docutils literal notranslate"><span class="pre">triton.cudagraphs</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">required</span></code> makes every bucket in the config mandatory. If capture fails locally or
 on another participating rank, warmup raises after rank-wide agreement instead of
 dropping the bucket and falling back to eager execution. The default is <code class="docutils literal notranslate"><span class="pre">False</span></code>.</p></li>

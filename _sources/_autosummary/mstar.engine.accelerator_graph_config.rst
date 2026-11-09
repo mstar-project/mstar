@@ -16,6 +16,7 @@ mstar.engine.accelerator\_graph\_config
       apply_region_ladders
       apply_token_ladders
       check_compile_mode
+      check_inductor_options
       check_token_ladder
       decode_rows_then_prompt
       distribute_tokens

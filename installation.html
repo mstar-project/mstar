@@ -1302,9 +1302,9 @@ sources a build was made from.</p>
 <p>The OpenAI routes take the model’s adapter from the same registry as the Python
 frontend (<code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>):
 <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> ports adapter classes, not model names, so every model of a
-ported class is served. Chat, speech and images are served for every model the
-Python frontend serves them for. The Wan2.2 and LTX-2.5 video adapters, and the
-transcription and realtime routes, are not ported yet (<code class="docutils literal notranslate"><span class="pre">NOT_PORTED</span></code> in
+ported class is served. Chat, speech, images and videos are served for every
+model the Python frontend serves them for. The transcription and realtime
+routes are not ported yet (<code class="docutils literal notranslate"><span class="pre">NOT_PORTED</span></code> in
 <code class="docutils literal notranslate"><span class="pre">test/rust/test_rust_openai_adapters.py</span></code>); there <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> answers 404,
 logs a warning at startup, and <code class="docutils literal notranslate"><span class="pre">/generate</span></code> still works.</p>
 </section>

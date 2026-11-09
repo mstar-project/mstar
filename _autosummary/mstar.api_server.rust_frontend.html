@@ -731,9 +731,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.stop"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.stop()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.SERVED_MODELS_ENV"><code class="docutils literal notranslate"><span class="pre">SERVED_MODELS_ENV</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.find_server_binary"><code class="docutils literal notranslate"><span class="pre">find_server_binary()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.launch_rust_server"><code class="docutils literal notranslate"><span class="pre">launch_rust_server()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.openai_adapter_class"><code class="docutils literal notranslate"><span class="pre">openai_adapter_class()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.served_models_json"><code class="docutils literal notranslate"><span class="pre">served_models_json()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.soundfile_library"><code class="docutils literal notranslate"><span class="pre">soundfile_library()</span></code></a></li>
 </ul>
             </nav>
@@ -824,6 +826,9 @@ bridge socket is private to the pair.</p>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.LIBSNDFILE_ENV" title="mstar.api_server.rust_frontend.LIBSNDFILE_ENV"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LIBSNDFILE_ENV</span></code></a></p></td>
 <td><p>The libsndfile <code class="docutils literal notranslate"><span class="pre">soundfile</span></code> loaded, which mstar-server opens for mp3/flac/opus.</p></td>
 </tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.SERVED_MODELS_ENV" title="mstar.api_server.rust_frontend.SERVED_MODELS_ENV"><code class="xref py py-obj docutils literal notranslate"><span class="pre">SERVED_MODELS_ENV</span></code></a></p></td>
+<td><p>the names that select the base model, and the LoRA adapters.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -839,7 +844,10 @@ bridge socket is private to the pair.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.openai_adapter_class" title="mstar.api_server.rust_frontend.openai_adapter_class"><code class="xref py py-obj docutils literal notranslate"><span class="pre">openai_adapter_class</span></code></a>(model_name)</p></td>
 <td><p>The class name of <code class="docutils literal notranslate"><span class="pre">model_name</span></code>'s OpenAI adapter, &quot;&quot; when it has none.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.soundfile_library" title="mstar.api_server.rust_frontend.soundfile_library"><code class="xref py py-obj docutils literal notranslate"><span class="pre">soundfile_library</span></code></a>()</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.served_models_json" title="mstar.api_server.rust_frontend.served_models_json"><code class="xref py py-obj docutils literal notranslate"><span class="pre">served_models_json</span></code></a>(served_models)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">SERVED_MODELS_ENV</span></code>'s value for a <code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.rust_frontend.soundfile_library" title="mstar.api_server.rust_frontend.soundfile_library"><code class="xref py py-obj docutils literal notranslate"><span class="pre">soundfile_library</span></code></a>()</p></td>
 <td><p>The libsndfile that <code class="docutils literal notranslate"><span class="pre">soundfile</span></code> loaded (the copy its wheel bundles, else the system one it found), for <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> to encode the compressed speech formats with the same library; <code class="docutils literal notranslate"><span class="pre">None</span></code> without soundfile, which leaves only wav and pcm on both frontends (<code class="docutils literal notranslate"><span class="pre">media_io.audio_formats</span></code>).</p></td>
 </tr>
 </tbody>
@@ -937,6 +945,17 @@ launcher’s resolved values win over inherited ones, as the API key’s does.</
 
 </dd></dl>
 
+<dl class="py data">
+<dt class="sig sig-object py" id="mstar.api_server.rust_frontend.SERVED_MODELS_ENV">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">SERVED_MODELS_ENV</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'MSTAR_SERVED_MODELS'</span></span><a class="headerlink" href="#mstar.api_server.rust_frontend.SERVED_MODELS_ENV" title="Link to this definition">#</a></dt>
+<dd><p>the names that select the base model, and the LoRA adapters.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><code class="docutils literal notranslate"><span class="pre">ServedModels</span></code> as JSON</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.rust_frontend.find_server_binary">
 <span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">find_server_binary</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">explicit</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rust_dir</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">CHECKOUT_RUST</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#find_server_binary"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.find_server_binary" title="Link to this definition">#</a></dt>
@@ -964,9 +983,11 @@ stale.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.api_server.rust_frontend.launch_rust_server">
-<span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">launch_rust_server</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">binary</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">port</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bridge_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">api_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timeout_s</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#launch_rust_server"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.launch_rust_server" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">launch_rust_server</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">binary</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">model_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">port</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bridge_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">upload_dir</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">api_key</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timeout_s</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sample_rate</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">served_models</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#launch_rust_server"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.launch_rust_server" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">timeout_s</span></code> is <code class="docutils literal notranslate"><span class="pre">--timeout</span></code> and <code class="docutils literal notranslate"><span class="pre">sample_rate</span></code> the model’s audio output rate
-(<code class="docutils literal notranslate"><span class="pre">get_output_sample_rate</span></code>); <code class="docutils literal notranslate"><span class="pre">None</span></code> leaves the frontend’s own default.</p>
+(<code class="docutils literal notranslate"><span class="pre">get_output_sample_rate</span></code>); <code class="docutils literal notranslate"><span class="pre">None</span></code> leaves the frontend’s own default.
+<code class="docutils literal notranslate"><span class="pre">served_models</span></code> is the API server’s <code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>, whose LoRA adapters a
+request’s <code class="docutils literal notranslate"><span class="pre">model</span></code> selects; <code class="docutils literal notranslate"><span class="pre">None</span></code> serves the base model alone.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -996,6 +1017,17 @@ stale.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.api_server.rust_frontend.served_models_json">
+<span class="sig-prename descclassname"><span class="pre">mstar.api_server.rust_frontend.</span></span><span class="sig-name descname"><span class="pre">served_models_json</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">served_models</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#served_models_json"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.served_models_json" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">SERVED_MODELS_ENV</span></code>’s value for a <code class="docutils literal notranslate"><span class="pre">ServedModels</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1075,9 +1107,11 @@ attributes, which it sets as it loads the library.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.RustFrontendBridge.stop"><code class="docutils literal notranslate"><span class="pre">RustFrontendBridge.stop()</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.SERVED_MODELS_ENV"><code class="docutils literal notranslate"><span class="pre">SERVED_MODELS_ENV</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.find_server_binary"><code class="docutils literal notranslate"><span class="pre">find_server_binary()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.launch_rust_server"><code class="docutils literal notranslate"><span class="pre">launch_rust_server()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.openai_adapter_class"><code class="docutils literal notranslate"><span class="pre">openai_adapter_class()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.served_models_json"><code class="docutils literal notranslate"><span class="pre">served_models_json()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.rust_frontend.soundfile_library"><code class="docutils literal notranslate"><span class="pre">soundfile_library()</span></code></a></li>
 </ul>
   </nav></div>

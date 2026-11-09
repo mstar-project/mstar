@@ -13,6 +13,7 @@ mstar.api\_server.rust\_frontend
       OPENAI_ADAPTER_ENV
       REQUEST_TIMEOUT_ENV
       LIBSNDFILE_ENV
+      SERVED_MODELS_ENV
    
    
 
@@ -25,6 +26,7 @@ mstar.api\_server.rust\_frontend
       find_server_binary
       launch_rust_server
       openai_adapter_class
+      served_models_json
       soundfile_library
    
    
