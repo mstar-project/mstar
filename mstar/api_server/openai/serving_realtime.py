@@ -144,6 +144,15 @@ def _new_item_id() -> str:
 
 
 @dataclass
+class CutItem:
+    """An item a commit ended, which the step runner still has to finish."""
+    tail: np.ndarray | None  # the rest of ``pending`` at the commit
+    next_id: str             # the id of the item after it
+    # events about audio past the cut, sent once this item's own are out
+    events_after: list[dict] = field(default_factory=list)
+
+
+@dataclass
 class RealtimeSession:
     """One WebSocket's transcription state (the SDK's ``ASRStreamingState``)."""
     session_id: str
@@ -159,9 +168,8 @@ class RealtimeSession:
     raw_hypothesis: str = ""   # the model's raw output for the audio so far
     emitted: str = ""          # clean text already sent as deltas
     item_id: str = field(default_factory=_new_item_id)
-    # items cut by a commit and not finished yet: their last audio (the rest of
-    # ``pending`` at the commit) and the id of the item after each
-    commits: deque[tuple[np.ndarray | None, str]] = field(default_factory=deque)
+    # items cut by a commit and not finished yet, oldest first
+    commits: deque[CutItem] = field(default_factory=deque)
     # error ids of this item's distinct step failures (at most
     # MAX_FAILURES_PER_ITEM), so a failure that repeats is logged once per item
     failures: tuple[str, dict] = ("", {})
@@ -276,11 +284,11 @@ class RealtimeSession:
     @property
     def intake_item_id(self) -> str:
         """The item arriving audio belongs to: past any commit still finishing."""
-        return self.commits[-1][1] if self.commits else self.item_id
+        return self.commits[-1].next_id if self.commits else self.item_id
 
     def cut_item(self) -> None:
         """A commit: what is pending ends this item, and audio after it is the next one's."""
-        self.commits.append((self.flush(), _new_item_id()))
+        self.commits.append(CutItem(self.flush(), _new_item_id()))
         self.short = 0
 
     def finish_item(self, next_id: str) -> None:
@@ -711,13 +719,21 @@ class RealtimeTranscription:
             elif op[0] == "commit":
                 await self._commit()
             elif op[0] == "speech_started":
-                await self.send(_event(
+                await self._send_past_cuts(_event(
                     "input_audio_buffer.speech_started", audio_start_ms=op[1], item_id=s.intake_item_id,
                 ))
             else:
-                await self.send(_event(
+                await self._send_past_cuts(_event(
                     "input_audio_buffer.speech_stopped", audio_end_ms=op[1], item_id=s.intake_item_id,
                 ))
+
+    async def _send_past_cuts(self, event: dict) -> None:
+        """Send an event about the audio arriving now, after any cut item's own."""
+        s = self.session
+        if s.commits:
+            s.commits[-1].events_after.append(event)
+        else:
+            await self.send(event)
 
     def _start_steps(self) -> None:
         """Decode the pending chunks and finish the cut items, off the consumer:
@@ -734,7 +750,11 @@ class RealtimeTranscription:
             while True:
                 # commits first: anything pending is past the oldest cut
                 if s.commits:
-                    await self._finish_commit(*s.commits[0])
+                    cut = s.commits[0]
+                    await self._finish_commit(cut.tail, cut.next_id)
+                    # by index: the consumer can add to it during a send
+                    for event in cut.events_after:
+                        await self.send(event)
                     s.commits.popleft()
                 elif (chunk := s.take_chunk()) is not None:
                     await self.step(chunk)
@@ -772,7 +792,7 @@ class RealtimeTranscription:
         full item's worth of cut audio this waits, so a client that outruns the
         engine backs up into the inbox and its bound."""
         s = self.session
-        queued = sum(int(tail.size) if tail is not None else 0 for tail, _ in s.commits)
+        queued = sum(int(cut.tail.size) if cut.tail is not None else 0 for cut in s.commits)
         if queued + len(s.commits) * s.chunk_samples > s.max_item_seconds * SAMPLE_RATE:
             await self._steps_settled()
         s.cut_item()
