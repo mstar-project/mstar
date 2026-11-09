@@ -475,21 +475,21 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache: true`` on it is refused.
 
 On a single rank, a request waits at the head of its pool's queue until its reservation fits beside
-the reservations already admitted, and no request behind it starts first. A cache hit on a page
-only the prefix index holds counts as a page the request takes. A request that can't fit in its
-pool at its full output length gets a 400 if it asked for that length, and otherwise has the
-model's default length cut until it fits. A request that can be rebuilt reserves only its prompt,
-so a decode step can find no page outside the reservations. The worker then takes pages from the
-newest requests, those that arrived after the request that ran short, until they cover its
-shortage. Each moves to the host when the host pool (``cpu_offload_pages``) can hold all of its
-pages, and is otherwise dropped if it can be rebuilt from its token ids. The request that ran short
-gets the pages freed, up to its shortage. When the newer requests can't cover it, it moves to the
-host if the host pool can hold all of its pages, and otherwise waits holding its pages. A request
-on the host, a dropped one and one waiting for pages wait outside the queue, so a new prompt that
-fits still starts, unless one of them is the oldest request in its pool, which no newer prompt
-passes. They are tried oldest first, before the queue. The oldest refused request that moves can let
-in moves newer requests that wait holding pages, to the host or by a drop as above. A request on the
-host returns once its pages and one more page fit, or every page its grant needed when it moved
+the reservations already admitted, and no request behind it starts first. A cache hit on a page only
+the prefix index holds counts as a page the request takes. A request that can't fit in its pool at
+its full output length gets a 400 if it asked for that length, and otherwise has the model's default
+length cut until it fits. A request that can be rebuilt reserves only its prompt, so a decode step
+can find no page outside the reservations. The worker then takes pages from the newest requests,
+those that arrived after the request that ran short, until they cover its shortage. Each moves to
+the host when the host pool (``cpu_offload_pages``) can hold all of its pages, and is otherwise
+dropped if it can be rebuilt from its token ids. The request that ran short gets the pages freed, up
+to its shortage. When the newer requests can't cover it, it moves to the host if the host pool can
+hold all of its pages, and otherwise waits holding its pages. A request on the host, a dropped one
+and one waiting for pages wait outside the queue, so a new prompt that fits still starts, unless one
+of them is the oldest request in its pool, which no newer prompt passes unless its room is already
+allotted. They are tried oldest first, before the queue. The oldest refused request that moves can
+let in moves newer requests that wait holding pages, to the host or by a drop as above. A request on
+the host returns once its pages and one more page fit, or every page its grant needed when it moved
 itself, and its pages are then copied back. A dropped request returns once its prompt, or its
 history and one more page if that is larger, fits, counting no prompt page another request holds,
 then recomputes its KV in prefill chunks cut by its walk's chunk budget. A request that streams an
