@@ -75,6 +75,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``meta-models/Muse-Glimmer-30B``
      - Meta's 30B dense agentic VLM (text + image in, text out): sliding-window and
        NoPE global attention layers 3:1, plus a windowed ViT perception encoder.
+   * - ``ripple_65b`` *(Experimental)*
+     - ``ricursiveAI/Ripple-65B-Preview``
+     - Ricursive's 65B dense text LLM: sliding-window and NoPE global attention layers
+       4:1, with a value residual from the token embeddings. BF16, TP2 or TP4.
    * - ``nemotron_duplex`` *(Beta)*
      - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
      - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
@@ -434,6 +438,32 @@ Omnilingual ASR notes
 - Parity scripts against Meta's pipeline live in ``test/omnilingual_asr/``
   (``record_oracle.py`` runs the reference in its own venv, as it pins torch 2.8 and
   fairseq2).
+
+Ripple-65B (``ripple_65b``)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: bash
+
+    mstar serve ripple_65b --gpus 0,1,2,3
+    mstar serve ripple_65b --config configs/ripple_65b_tp2.yaml --gpus 0,1
+
+- ``configs/ripple_65b_tp4.yaml``, the default, needs four 80 GB GPUs and
+  ``configs/ripple_65b_tp2.yaml`` two 141 GB ones. TP can't pass the model's 8 KV heads. Both
+  serve 131072 tokens a request.
+  For more, raise ``resources.kv_cache.max_seq_len`` and ``max_num_pages`` together: a prompt
+  holds all 80 layers' K/V until its prefill commits, so the shipped pool runs out near 260K
+  tokens and two 128K prompts can't prefill at once.
+- A chat with no ``temperature`` samples at 1.0, as Ricursive's server does, and one with no
+  ``max_tokens`` stops at 2048 tokens, which a long reasoning reply can reach inside
+  ``<think>``. Set ``max_tokens`` for hard problems.
+- Text in, text out, on ``/generate`` and ``/v1/chat/completions``. A reply's reasoning stays
+  inline as ``<think>...</think>``, and a chat that asks for tool calls is refused.
+- Not supported yet: the NVFP4 checkpoint, prefix caching (a pool that keeps a sliding window
+  doesn't prefix cache) and DP replicas (a window pool can't span instances).
+- The GPU parity scripts live in ``test/ripple/``: ``run_parity.py`` drives a server and gates
+  the result, and ``record_oracle.py`` teacher-forces its replies through the checkpoint's own
+  ``modeling_ricursive.py``, in its own venv, with the attention gate and the value residual
+  each turned off as controls.
 
 FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) notes
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -2009,7 +2039,9 @@ each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
-resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
+resource (FlashInfer, FA3 on Hopper; on a B300 the ``ragged_attention`` kernel table
+picks torch's cuDNN SDPA, the kernel ``attention_backend: sdpa`` runs, and the two
+configs give the same videos at the same step time) as an opaque op inside the compiled graph,
 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
 an earlier version of the DiT block, before the adaLN was computed in one pass
 and the q/k norm and RoPE were fused
@@ -2239,9 +2271,13 @@ conditioning tokens, in order).
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``attention_backend``
-   ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``flashinfer`` runs the
-   DiT's joint attention on the engine's ragged FlashInfer resource; both are CUDA-graph
-   replayable.
+   ``sdpa`` (the shipped configs) is the reference kernel: torch's SDPA called by the model,
+   cuDNN on an H100 and a B300. ``flashinfer`` (the model's default when a config names none)
+   runs the DiT's joint attention on the engine's ragged attention resource, whose kernel the
+   GPU's ``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's
+   ragged prefill (FA3 on Hopper) where no table covers the GPU. ``resources: dit_attn:
+   backend: flashinfer`` keeps FlashInfer. Both are CUDA-graph replayable. Z-Image takes the
+   same knob.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.

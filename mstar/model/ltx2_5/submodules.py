@@ -28,7 +28,6 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import (
-    AttentionStep,
     RaggedCrossAttentionStep,
     Segment,
     SlotLease,
@@ -378,8 +377,8 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             text.append(Segment(request_id=rid, label=TEXT_SPAN, span=shape.text_len))
         return SubmoduleStep(
             steps={
-                VIDEO_ATTN: AttentionStep(segments=tuple(video), causal=False),
-                AUDIO_ATTN: AttentionStep(segments=tuple(audio), causal=False),
+                VIDEO_ATTN: self.attention_step(video),
+                AUDIO_ATTN: self.attention_step(audio),
                 VIDEO_XATTN: RaggedCrossAttentionStep(
                     segments=tuple(video_shard + text), pairs=VIDEO_XATTN_PAIRS,
                 ),
