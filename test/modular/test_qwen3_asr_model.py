@@ -402,7 +402,11 @@ def test_encoder_replays_exactly_when_leased():
 def test_encoder_packs_a_step_only_up_to_its_largest_capture():
     """Past the largest captured token count a step runs its clips one by one,
     so an eager step's activations are one clip's, not the whole batch's."""
-    sub = _encoder_submodule(_tiny_config())
+    model = _make_model()
+    sub = _encoder_submodule(model.config)
+    # the windows a row holds, as the model sizes its resource (a step's windows gate it too)
+    (ragged,) = (s for s in model.get_node_resources() if isinstance(s, RaggedAttentionSpec))
+    sub.node_resources = {AUT_ATTN: ragged.config}
     top = sub.ENCODE_TOKEN_BUCKETS[-1]
 
     def rows(*lens):
@@ -443,7 +447,7 @@ def test_llm_prefill_splices_audio_embeddings_and_decode_carries_ids():
     assert [(s.label, s.span) for s in step.segments] == [("main", 8)] and KV_CACHE in step.steps
     (decode, prefill) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode.capture_batch_sizes == sub.DECODE_CAPTURE_BATCH_SIZES
-    assert prefill.capture_token_lengths == sub.PREFILL_TOKEN_BUCKETS
+    assert prefill.capture_token_lengths == {1: sub.PREFILL_TOKEN_BUCKETS}
     assert prefill.make_node_input(7).input_embeds.shape == (7, cfg.text.hidden_size)
 
 

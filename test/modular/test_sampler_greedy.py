@@ -241,7 +241,8 @@ def _listed(resources, steps=None):
         keys = resources.keys() if steps is None else steps[graph_walk]
         return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None)
 
-    submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step)
+    submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step,
+                                compiled_entries_per_shape=1)
     for resource in resources.values():
         # a CPU sampler can't capture; what is listed is the question here
         resource.can_capture = lambda: True

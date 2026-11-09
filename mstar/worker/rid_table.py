@@ -19,8 +19,8 @@ tensor manager's per-request state (including ChunkingManagement.prepared,
 Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and
 the tensor store's rid -> uuids ownership, held in the Rust bookkeeper under
 RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
-_leases, _restores, _snap_writes, _decode, _unkeyed, _admit_restores,
-_admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying
+_leases, _restores, _snap_writes, _decode, _unkeyed, _chunk_ends,
+_admit_restores, _admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
 release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the
 sampler's remove_request), and WorkerProfileInfo.

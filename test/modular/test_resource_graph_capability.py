@@ -65,6 +65,7 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
         )
         submodule = SimpleNamespace(
             get_accelerator_graph_configs=lambda *args: [config], declare_step=declare,
+            compiled_entries_per_shape=1,
         )
         runner = AcceleratorGraphRunner(
             submodule_name="llm", submodule=submodule, resources={"attention": resource},

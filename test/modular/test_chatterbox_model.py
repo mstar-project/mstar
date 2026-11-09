@@ -869,7 +869,7 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
     for cfg in packed:
         assert cfg.capture_graph_walk == "prefill"
         assert cfg.replay_graph_walks == ["prefill", "prefill_voice"]
-        assert cfg.capture_token_lengths == T3Submodule.PREFILL_TOKEN_BUCKETS
+        assert cfg.capture_token_lengths == {1: T3Submodule.PREFILL_TOKEN_BUCKETS}
         assert cfg.capture_batch_sizes == T3Submodule.PREFILL_CAPTURE_BATCH_SIZES == [1, 2, 4, 8]
         assert cfg.caps_eager_batch_size is False and cfg.compile is False
         # the combined cond + uncond plan carries twice the input tokens

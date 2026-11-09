@@ -148,6 +148,31 @@ def test_realtime_surface_flags():
     assert not ADAPTER_REGISTRY["bagel"].supports_realtime
 
 
+def test_worker_refuses_a_model_with_client_streams(tmp_path, monkeypatch):
+    """A duplex model's live call appends to a running request, which Dynamo
+    cannot carry: the worker stops with why, before any GPU process starts."""
+    from mstar.integrations.dynamo import worker
+    from mstar.model import registry
+    from mstar.streaming.topology import CLIENT, Connection, PartitionTopology
+
+    class _Duplex:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_partition_topology(self):
+            return PartitionTopology(partitions=["Encoder"], connections=[
+                Connection(CLIENT, "Encoder", "audio_in", chunk_policy_factory=lambda: None)])
+
+    # build_server pops an exported key before the refusal; monkeypatch puts it back
+    monkeypatch.delenv("MSTAR_API_KEY", raising=False)
+    monkeypatch.setattr(registry, "get_model_class", lambda name: _Duplex)
+    monkeypatch.setattr(registry, "model_init_kwargs", lambda name: {})
+    config = tmp_path / "duplex.yaml"
+    config.write_text("model: duplex_test\n")
+    with pytest.raises(SystemExit, match="live client input.*mstar serve"):
+        worker.build_server(SimpleNamespace(config=str(config), cache_dir=None))
+
+
 # ----------------------------------------------------------------------
 # realtime bridge (seam double; no engine)
 # ----------------------------------------------------------------------

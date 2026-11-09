@@ -218,7 +218,8 @@ def _capture_runner(resources, steps=None, blocked=()):
     for key in blocked:
         resources[key].can_capture = lambda: False
     configs = _configs()
-    submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step)
+    submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step,
+                                compiled_entries_per_shape=1)
     return AcceleratorGraphRunner(
         submodule_name="N", submodule=submodule, resources=resources, step_runner=Mock(),
         device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
