@@ -628,7 +628,11 @@ def test_windowed_stream_video_gen_params() -> None:
 def test_video_streaming_ndjson_lines() -> None:
     """stream_video turns the video handler into an NDJSON generator: indexed
     video lines closed by a done line, an in-band error line terminal instead
-    on failure, and the non-streaming path collecting as before."""
+    on a failure after the first window, a refusal before it raised with its
+    status, and the non-streaming path collecting as before."""
+    from fastapi import HTTPException
+
+    from mstar.api_server.entrypoint import APIServer
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import VideoGenerationRequest
     from mstar.api_server.openai.serving_videos import create_videos
@@ -636,6 +640,7 @@ def test_video_streaming_ndjson_lines() -> None:
 
     class _Api:
         upload_dir = "/tmp"
+        open_result_stream = APIServer.open_result_stream
 
         def __init__(self, chunks):
             self._chunks = chunks
@@ -679,6 +684,11 @@ def test_video_streaming_ndjson_lines() -> None:
     lines = asyncio.run(_lines(api))
     assert [ln["modality"] for ln in lines] == ["video", "error"]
     assert base64.b64decode(lines[1]["data"]) == b"boom"
+
+    api = _Api([ResultChunk(request_id="r", modality="error", data=b"bad image", metadata={"status": 400})])
+    with pytest.raises(HTTPException) as refused:
+        asyncio.run(_lines(api))
+    assert (refused.value.status_code, refused.value.detail) == (400, "bad image")
 
     api = _Api([ResultChunk(request_id="r", modality="video", data=b"v")])
     out = asyncio.run(create_videos(api, "cosmos3", adapter, VideoGenerationRequest(prompt="x", num_frames=57)))
