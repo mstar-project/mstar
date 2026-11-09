@@ -158,6 +158,12 @@ impl OpenAIAdapter for FishS2Pro {
     fn speech_args(&self, req: &SpeechRequest) -> Result<SubmitArgs, String> {
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
         sampling(&mut mk, req, "temperature", "top_p");
+        // neither is an S2-Pro control; a sent one is forwarded, as the Python adapter does,
+        // so it is logged as ignored
+        if let Some(voice) = &req.voice {
+            set_default(&mut mk, "voice", Value::from(voice.clone()));
+        }
+        forward_sent_speed(&mut mk, req);
         // a transcript without its clip
         if !mk.get("ref_audio").is_some_and(truthy) {
             mk.remove("ref_text");

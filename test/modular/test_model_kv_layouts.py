@@ -48,6 +48,7 @@ def _bagel():
     model.boi_token_id = _StubTokenizer.SPECIALS["<|vision_start|>"]
     model.eoi_token_id = _StubTokenizer.SPECIALS["<|vision_end|>"]
     model._has_cfg_parallel = model._has_llm_disaggregation = False
+    model.sampling_defaults = {"temperature": 0.0, "top_k": 0, "top_p": 1.0}
     return model
 
 
@@ -711,6 +712,7 @@ def _whisper():
 
     model = object.__new__(WhisperModel)
     model.config = WhisperModelConfig(lang_to_id={"<|en|>": 50259}, task_to_id={"transcribe": 50360})
+    model.sampling_defaults = {}
     model.log_mel = LogMelSpectrogram(
         num_mel_bins=model.config.num_mel_bins, sampling_rate=model.config.sampling_rate,
         n_fft=model.config.n_fft, hop_length=model.config.hop_length, chunk_length=model.config.chunk_length,

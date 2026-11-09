@@ -125,7 +125,8 @@ def test_adapter(detects_language):
     # greedy decoding: a retry at a higher temperature would repeat the text
     assert adapter.compression_ratio_threshold is None
     args = adapter.transcription_to_request(TranscriptionRequest(model="parakeet", language="en", prompt="x"), "a")
-    assert args.model_kwargs == {"language": "en", "temperature": 0.0}
+    # an unsent temperature stays out: this greedy model would log it as ignored
+    assert args.model_kwargs == {"language": "en"}
     with pytest.raises(ValueError):
         adapter.transcription_to_request(TranscriptionRequest(model="parakeet", timestamp_granularities=["word"]), "")
     # Whisper's task: a translation would come back as a same-language transcript

@@ -823,7 +823,7 @@ class FishS2ProAdapter(OpenAIAdapter):
     data URL, bare base64, or, when the server allows remote fetch, an http(s)
     URL; paths on the server are refused) with its transcript in ``ref_text``. Without
     one the model picks a voice. ``voice`` and ``speed`` are not S2-Pro
-    controls and are dropped; inline ``[tag]`` prosody control is part of
+    controls and are reported as ignored; inline ``[tag]`` prosody control is part of
     the input text. ``temperature`` / ``top_p`` / ``seed`` are the standard
     fields; ``top_k``, ``repetition_penalty``, ``do_sample`` and
     ``max_new_tokens`` pass through ``extra_body``. Long inputs are
@@ -837,6 +837,10 @@ class FishS2ProAdapter(OpenAIAdapter):
     def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         mk = _passthrough(req)
         _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        # neither is an S2-Pro control; a sent one is forwarded so it is logged as ignored
+        if getattr(req, "voice", None) is not None:
+            mk.setdefault("voice", req.voice)
+        _forward_sent_speed(req, mk)
         ref_audio = mk.pop("ref_audio", None)
         if ref_audio:
             path = _resolve_ref_audio(ref_audio, upload_dir, decoder="soundfile")
@@ -1319,15 +1323,16 @@ def _transcription_kwargs(req: TranscriptionRequest) -> dict:
     under their own names; ``prompt`` becomes ``initial_prompt`` (the
     conditioning text, named as faster-whisper does — ``prompt`` itself is
     the request's text argument); a timestamped ``response_format`` or an
-    explicit granularity asks the model for timestamps. Neither served ASR
-    model reads ``initial_prompt`` or ``timestamps`` yet (and Higgs-Audio not
-    ``language``), so those are logged as ignored."""
+    explicit granularity asks the model for timestamps. A model that does not
+    read one of them logs it as ignored. ``temperature`` goes only when sent:
+    its 0.0 default would be logged on every request to a model without a
+    sampler."""
     mk = _passthrough(req)
     if req.language:
         mk.setdefault("language", req.language)
     if req.prompt:
         mk.setdefault("initial_prompt", req.prompt)
-    if req.temperature is not None:
+    if "temperature" in req.model_fields_set and req.temperature is not None:
         mk.setdefault("temperature", req.temperature)
     if req.seed is not None:
         mk.setdefault("seed", req.seed)
@@ -1449,6 +1454,8 @@ class Qwen3ASRAdapter(OpenAIAdapter):
 
     def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
         kwargs = _transcription_kwargs(req)
+        # the model writes no timestamps; the route's segments come from the windows
+        kwargs.pop("timestamps", None)
         # checked here too so a streaming request gets a 400 before it starts
         if "<|audio_pad|>" in str(kwargs.get("initial_prompt") or ""):
             raise ValueError("the prompt must not contain <|audio_pad|>")

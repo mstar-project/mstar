@@ -284,6 +284,8 @@ def model():
     model.tokenizer = _Tokenizer()
     model._processor = _Processor()
     model.config = Qwen3OmniModelConfig()
+    # the released checkpoint's speakers: walk_plan refuses a voice outside them
+    model.config.talker.speaker_id = {"chelsie": 2301, "ethan": 2302, "aiden": 2303}
     return model
 
 
