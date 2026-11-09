@@ -44,7 +44,7 @@ def test_resource_owns_kernel_capture_support(device_type):
 def test_resource_capability_filters_recipes_and_preserves_strict_mode(
     monkeypatch, caplog, piecewise, can_capture,
 ):
-    resource = SimpleNamespace(can_capture=lambda: can_capture, force_double_buffer=False)
+    resource = SimpleNamespace(can_capture=lambda: can_capture, force_double_buffer=False, lean_capture=False)
     step = SimpleNamespace(steps={"attention": object()})
     declare = Mock(return_value=step)
     step_runner = Mock()
@@ -65,6 +65,7 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
         )
         submodule = SimpleNamespace(
             get_accelerator_graph_configs=lambda *args: [config], declare_step=declare,
+            compiled_entries_per_shape=1,
         )
         runner = AcceleratorGraphRunner(
             submodule_name="llm", submodule=submodule, resources={"attention": resource},

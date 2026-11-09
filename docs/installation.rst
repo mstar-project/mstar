@@ -59,7 +59,9 @@ extension (see `Rust extension`_).
 .. important::
 
    **For CUDA installs, always pass** ``--torch-backend=auto``. ``mstar`` floors
-   PyTorch at 2.10 (``torch>=2.10.0`` / ``torchvision>=0.25.0`` / ``torchaudio>=2.10.0``).
+   PyTorch at 2.10 (``torch>=2.10.0`` / ``torchvision>=0.25.0`` /
+   ``torchaudio>=2.10.0,!=2.11.1``; torchaudio 2.11.1 needs a newer torch than its
+   metadata says and fails to load next to torch 2.11 or 2.12).
    The flag tells
    ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
    — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
@@ -153,7 +155,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
        see `omnivoice (OmniVoice)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``. Its tokenizer
+       ``huggingface-hub``, ``mooncake-transfer-engine``. Its tokenizer
        comes from the gated ``google/paligemma-3b-pt-224``: accept its license on
        Hugging Face and set ``HF_TOKEN``, or the server refuses to start.
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
@@ -161,7 +163,7 @@ Model families and some output formats need extra packages, exposed as pip *extr
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
    * - ``.[glm]``
      - GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
+       ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
        (speeds up the JIT build of the vendored MoE align kernel).
    * - ``.[waypoint]``
      - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
@@ -466,8 +468,8 @@ https://pytorch.org/get-started/locally/. Keep all three packages on the same ``
 ``torchcodec`` doesn't declare its ``torch`` version, so the resolver otherwise picks the
 newest release (0.17 at the time of writing), which fails to load next to torch 2.10; 0.10
 is the release built against it.
-The ``[asr]`` extra pins that pair itself (``torch`` 2.10 with ``torchcodec`` 0.10, as in the
-Docker images), so installing it puts ``torch`` on 2.10.
+The ``[asr]`` extra pins that set itself (``torch`` 2.10 with ``torchaudio`` 2.10 and
+``torchcodec`` 0.10, as in the Docker images), so installing it puts ``torch`` on 2.10.
 
 Verify the install
 ------------------
@@ -493,10 +495,11 @@ The extension carries (see :doc:`environment_variables` for the flags):
   messages on. Each process logs it at startup (``control mesh transport:
   rust <version> from <path>``) and refuses an extension of another version
   than the one its ``mstar`` expects.
-* **SHM tensor arena** — ``MSTAR_SHM_ARENA``: replaces the per-tensor file
-  transport; requires the extension, interoperates on the same descriptor
-  wire (and depends on the transport above only in the sense that both ship
-  in the same extension).
+* **SHM tensor arena**: the SHM tensor transport on CUDA and CPU. Each
+  process stages its tensors in ``/dev/shm`` segments sized from its free
+  space (the ``MSTAR_SHM_ARENA_*`` knobs), and a tensor that does not fit
+  spills to a per-tensor file. Other accelerators use the per-tensor files
+  until the arena is measured there.
 * **Message encoding** — ``MSTAR_WIRE_CODEC``: typed msgpack rather than
   pickle, which is what lets one end of an edge be Rust. On by default,
   extension or not. The legacy ``pickle`` codec is no longer supported.
@@ -561,7 +564,11 @@ Optional: the Rust HTTP frontend
 
 ``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. A Linux wheel that carries
+keeping preprocessing and the conductor protocol. It is replacing the Python
+HTTP frontend, which is being retired: new routes and adapters land in both
+(see "API surfaces land in the Rust frontend" in ``AGENTS.md``), and
+``mstar serve`` will use the Rust frontend for every model once it serves
+everything the Python one does. A Linux wheel that carries
 the extension also installs the binary next to ``mstar-serve``; otherwise build
 it. Then opt in:
 
@@ -587,9 +594,9 @@ sources a build was made from.
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ``mstar-server`` ports adapter classes, not model names, so every model of a
-ported class is served. Chat is served for every model the Python frontend serves
-it for. Some speech, image and video adapters, and the transcription and realtime
-routes, are not ported yet (``NOT_PORTED`` in
+ported class is served. Chat, speech and images are served for every model the
+Python frontend serves them for. The Wan2.2 and LTX-2.5 video adapters, and the
+transcription and realtime routes, are not ported yet (``NOT_PORTED`` in
 ``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
 logs a warning at startup, and ``/generate`` still works.
 

@@ -40,10 +40,12 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span
 from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
 
@@ -128,6 +130,10 @@ class OrpheusModel(Model):
             # carries the budget for the steps that mix a chunk with decode rows
             ChunkingPolicy(walks=("mixed",), max_batch_tokens=budget),
         )}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        return {"LLM": RebuildPolicy(walk="prefill", ids_input="text_inputs", sample_output="new_token",
+                                     loop="decode_loop")}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = GraphNode(
@@ -413,6 +419,21 @@ class OrpheusModel(Model):
             self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=LLM_FILES,
         )
 
+    def _lora_spec(self) -> LoraSpec:
+        """Per-request adapters on the LLM (opt-in): every linear of the Llama stack, the
+        LM head (one row per request: the last token's) and the token embedding, placed as
+        the weight loader places the checkpoint's own tensors. Adapters saved on the bare
+        ``LlamaModel`` (``layers.*``) are read under ``model.``."""
+        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+        from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
+        return module_lora_spec(
+            lambda group: OrpheusForCausalLM(self.config, comm_group=group),
+            nodes={"LLM"}, root_path="language_model",
+            adapter_roots=[("", "model.")],
+            rows={"lm_head": PER_SEGMENT},
+            embeddings=True,
+        )
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         kv_config = PagedKVConfig(
             num_layers=self.config.num_hidden_layers,
@@ -451,7 +472,8 @@ class OrpheusModel(Model):
                     high_freq_factor=self.config.rope_scaling["high_freq_factor"],
                     old_context_len=self.config.rope_scaling["original_max_position_embeddings"],
                 )
-            )
+            ),
+            self._lora_spec(),
         ]
 
     def get_request_resource_configs(

@@ -11,9 +11,8 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
-from mstar.engine.accelerator_graph_runner import DEFAULT_CAPTURE_BATCH_SIZES, AcceleratorGraphRunner
-from mstar.engine.engine import Engine
+from mstar.engine.accelerator_graph_config import DEFAULT_CAPTURE_BATCH_SIZES, BatchedAcceleratorGraphConfig
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 from mstar.engine.resources import (
     SamplingReqConfig,
     Segment,
@@ -42,6 +41,7 @@ from mstar.model.glm5_next.config import (
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, ModelInputsFromEngine
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 MAX_SLOTS = 4
 DEVICE = torch.device("cpu")
@@ -418,8 +418,7 @@ class TestCudaGraphs:
         def engine_cap(walk: str) -> int | None:
             runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
             runner._capture_configs = sub.get_accelerator_graph_configs(DEVICE)
-            engine = Engine.__new__(Engine)
-            engine._submodules = {"LLM": types.SimpleNamespace(submodule=sub, capture_runner=runner)}
+            engine = make_engine(_submodules={"LLM": make_mgmt(submodule=sub, capture_runner=runner)})
             return engine.get_max_batch_size("LLM", walk)
 
         walks = [c.capture_graph_walk for c in sub.get_accelerator_graph_configs(DEVICE)]

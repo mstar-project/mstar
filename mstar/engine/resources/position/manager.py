@@ -235,6 +235,13 @@ class RopeManager(PositionManager):
                         f"{segment.request_id!r} reaches position {end}; RoPE covers {self._max_seq_len}"))
         return ADMIT_OK
 
+    supports_drop = True
+
+    def drop(self, rid: str, tokens: int) -> int:
+        # Recomputing the KV starts positions from zero, and `apply_cached_prefix` never moves a counter back.
+        self.reset_request(rid)
+        return 0
+
     def correct_len(self, rid: str, label: str, delta: int) -> None:
         """Move a stream's position by ``delta``, as ``KVManager.correct_len`` moves its KV
         length after a speculative verify step."""
@@ -559,7 +566,8 @@ class RopeManager(PositionManager):
 
 
     def position(self, rid: str, label: str) -> int:
-        return self._counters.get(rid, {}).get(label, 0)
+        # by the worker's handle (AGENTS.md invariant 14): the wire id raises
+        return self._counters[rid].get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:
         return self._current_pos_ids.get(label)

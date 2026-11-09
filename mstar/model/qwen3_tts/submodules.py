@@ -103,6 +103,8 @@ if TYPE_CHECKING:
 
 # the CodePredictor depth loop, as a piecewise capture region
 DEPTH_LOOP_REGION = "code_predictor_loop"
+# Talker request state: TTS EOS has conditioned one decode step (PAD from then on)
+TTS_EOS_FED = "tts_eos_fed"
 
 
 def prefill_rows(prompt_layout: Sequence[int], language_id: int, speaker: bool) -> int:
@@ -119,6 +121,26 @@ def prefill_rows(prompt_layout: Sequence[int], language_id: int, speaker: bool) 
     # a streamed prompt adds its first text token over codec BOS. Any other adds its text and TTS EOS,
     # then TTS PAD over codec BOS
     return rows + (1 if stream_text else text_len + 2)
+
+
+def text_stream_start(prompt_layout: Sequence[int]) -> int | None:
+    """Where the text the decode feeds one token per frame (the ``text_in``
+    stream) starts in the prompt's transcript + text tokens, or None when the
+    prefill takes all of it and TTS EOS too.
+
+    ``TalkerSubmodule._build_prefill`` cuts its prefill here: a streamed
+    prompt takes its first text token; an in-context clone pairs transcript +
+    text + TTS EOS with codec BOS and the reference frames, so only what runs
+    past them is streamed.
+    """
+    _, text_len, stream_text, ref_text_len, ref_frames = prompt_layout
+    if not stream_text:
+        return None
+    if not ref_frames:
+        return 1
+    transcript = ref_text_len - len(CHATML_ASSISTANT_PREFIX_TOKEN_IDS) - 2
+    paired = ref_frames + 1
+    return paired if transcript + text_len + 1 > paired else None
 
 
 # ===========================================================================
@@ -329,13 +351,12 @@ class TalkerSubmodule(ARNodeSubmodule):
           the prefill over codec PADs, closed by TTS PAD + codec BOS; decode
           then adds TTS PAD to each frame;
         * ``stream_text == 1`` (the reference default for Base): only the first
-          text token enters the prefill over codec BOS; the remaining tokens
-          plus TTS EOS are kept in per-request state and added one per frame.
+          text token enters the prefill over codec BOS; the decode adds the
+          remaining tokens, then TTS EOS, one per frame (``text_in``).
         """
         text_ids = text_ids.to(device=self.get_device(), dtype=torch.long).view(1, -1)
         layout = [int(v) for v in prompt_layout]
-        instruct_len, text_len, stream_text = layout[:3]
-        ref_text_len, ref_frames = (layout[3], layout[4]) if len(layout) >= 5 else (0, 0)
+        instruct_len, text_len, stream_text, ref_text_len, ref_frames = layout
         instruct_ids = text_ids[:, :instruct_len]
         assistant_end = text_ids.shape[1] - ref_text_len
         assistant_ids = text_ids[:, instruct_len:assistant_end]
@@ -396,8 +417,9 @@ class TalkerSubmodule(ARNodeSubmodule):
         pieces = [role_embed, tag_text + codec_embeds[:, :-1]]
         if instruct_len:
             pieces.insert(0, project(instruct_ids))
-        empty_trailing = eos_embed[:, :0]
 
+        # where the text the decode streams starts: the prefill takes what is before it
+        start = text_stream_start(layout)
         if ref_frames > 0:
             # ``<|im_start|>assistant\n{ref}<|im_end|>\n`` -> transcript tokens only.
             ref_tokens = ref_text_ids[:, prefix_len:ref_text_ids.shape[1] - 2]
@@ -409,36 +431,26 @@ class TalkerSubmodule(ARNodeSubmodule):
             if not stream_text:
                 codec_pads = codec_embeds[:, -2:-1].expand(-1, text_embed.shape[1], -1)
                 pieces += [text_embed + codec_pads, codec_embed + pad_embed]
-                trailing = empty_trailing
-            elif text_embed.shape[1] > codec_embed.shape[1]:
-                pieces.append(text_embed[:, :codec_embed.shape[1]] + codec_embed)
-                trailing = text_embed[:, codec_embed.shape[1]:]
+            elif start is not None:
+                pieces.append(text_embed[:, :start] + codec_embed)
             else:
                 padded = torch.cat([
                     text_embed,
                     pad_embed.expand(-1, codec_embed.shape[1] - text_embed.shape[1], -1),
                 ], dim=1)
                 pieces.append(padded + codec_embed)
-                trailing = empty_trailing
-        elif stream_text:
-            pieces.append(project(text_tokens[:, :1]) + codec_embeds[:, -1:])
-            trailing = torch.cat([project(text_tokens[:, 1:]), eos_embed], dim=1)
+        elif start is not None:
+            pieces.append(project(text_tokens[:, :start]) + codec_embeds[:, -1:])
         else:
             text_embed = torch.cat([project(text_tokens), eos_embed], dim=1)
             # the codec PAD tag's embedding, the second-to-last of the tags
             codec_pads = codec_embeds[:, -2:-1].expand(-1, text_embed.shape[1], -1)
             pieces.append(text_embed + codec_pads)
             pieces.append(pad_embed + codec_embeds[:, -1:])
-            # Nothing left to feed: every frame adds TTS PAD (empty stream).
-            trailing = empty_trailing
         prefill = torch.cat(pieces, dim=1)
 
         state = self.request_state(request_id)
-        state.add_all(
-            trailing_text_hidden=trailing.squeeze(0),
-            tts_pad_embed=pad_embed[0, 0],
-            generated_frames=0,
-        )
+        state.add("generated_frames", 0)
         if ref_frames > 0:
             # The codec warms up on the tail of the reference clip ahead of
             # the generated frames (their audio is trimmed); see
@@ -451,17 +463,17 @@ class TalkerSubmodule(ARNodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
-        input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
     ) -> ARNodeInputs:
         """Convert routed request tensors into one Talker sequence fragment.
 
-        Prefill creates the mixed conditioning sequence. Decode combines the
-        previous frame's summed codec embedding with the next projected text
-        condition. This method performs no transformer compute; the engine can
-        therefore prepare requests before admitting them to a micro-batch, and
-        prepares them again when the admit is refused, so it changes no state
-        a step's position depends on.
+        Prefill creates the mixed conditioning sequence. Decode takes the
+        previous frame's summed codec embedding and the text token this frame
+        adds (``text_in``), which the forward projects for the whole batch
+        (``preprocess`` for a mixed step). This method performs no transformer compute; the engine
+        can therefore prepare requests before admitting them to a micro-batch,
+        and prepares them again when the admit is refused, so it changes no
+        state a step's position depends on.
         """
         del kwargs
         if graph_walk in ("talker_prefill", "talker_prefill_clone"):
@@ -482,22 +494,9 @@ class TalkerSubmodule(ARNodeSubmodule):
             state = self.request_state(fwd_info.rid_handle)
         elif graph_walk == "talker_decode":
             state = self.request_state(fwd_info.rid_handle)
-            # the step's own iteration, so a step prepared again feeds the same text token
-            step = input_metadata.dynamic_loop_iter_counts.get("talker_decode_loop", 0)
-            trailing = state["trailing_text_hidden"]
-            text_condition = (
-                trailing[step]
-                if step < trailing.shape[0]
-                else state["tts_pad_embed"]
-            )
             # ``talker_input_embeds`` is the recurrent graph edge emitted by
             # the previous frame, not a token ID that needs another lookup.
-            # The text condition is added for the whole batch in
-            # ``preprocess`` (one kernel instead of one per row).
-            input_embeds = inputs["talker_input_embeds"][0].to(
-                device=text_condition.device,
-                dtype=text_condition.dtype,
-            ).reshape(1, -1)
+            input_embeds = inputs["talker_input_embeds"][0].to(device=self.get_device()).reshape(1, -1)
         else:
             raise ValueError(f"Unknown Qwen3-TTS Talker walk: {graph_walk!r}")
 
@@ -507,12 +506,29 @@ class TalkerSubmodule(ARNodeSubmodule):
         )
         kwargs = {"suppress_eos": suppress_eos}
         if graph_walk == "talker_decode":
-            kwargs["text_condition"] = text_condition
+            kwargs["text_id"] = self._text_id(fwd_info, inputs)
         return ARNodeInputs(
             input_embeds=input_embeds,
             input_seq_len=input_embeds.shape[0],
             kwargs=kwargs,
         )
+
+    def _text_id(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList) -> torch.Tensor:
+        """The ``(1,)`` text token a decode frame adds: the stream's next one,
+        then TTS EOS once past its end (unless the prefill took it), then TTS
+        PAD. Read, never set, here: a refused admit prepares the step again,
+        and ``postprocess`` marks TTS EOS fed once its step has run."""
+        fed = inputs.get("text_in")
+        if fed:
+            return fed[0].reshape(1)
+        streams = text_stream_start(fwd_info.step_metadata[PROMPT_LAYOUT_KEY]) is not None
+        eos = streams and not self.request_state(fwd_info.rid_handle).get(TTS_EOS_FED, False)
+        return self._special_id(self.config.tts_eos_token_id if eos else self.config.tts_pad_token_id)
+
+    def _special_id(self, token: int) -> torch.Tensor:
+        """TTS EOS or PAD as a ``(1,)`` device id, one tensor per token, so
+        ``postprocess`` tells the EOS step by identity, without a sync."""
+        return self._fixed_embed(("text_id", token), lambda: self._device_ids((token,))[0])
 
     def preprocess(
         self,
@@ -537,11 +553,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             if any(seq_len != 1 for seq_len in seq_lens):
                 raise ValueError("Qwen3-TTS decode expects one token per request")
             # one token per request, so the indices are a fixed arange
-            conditions = [item.kwargs["text_condition"] for item in inputs]
-            if len(input_embeds) == 1:
-                packed_embeds = input_embeds[0] + conditions[0]
-            else:
-                packed_embeds = torch.cat(input_embeds, dim=0) + torch.stack(conditions)
+            packed_embeds = torch.cat(input_embeds, dim=0)
             last_token_indices = self._get_decode_last_token_indices(len(inputs))
         else:
             packed_embeds = torch.cat(input_embeds, dim=0)
@@ -553,11 +565,19 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Materialize the persistent base mask before CUDA Graph capture. Only
         # the per-request EOS flags need to cross the replay input boundary.
         self._get_suppress_mask()
-        return {
+        packed = {
             "input_embeds": packed_embeds,
             "last_token_indices": last_token_indices,
             "suppress_eos": self._get_batch_suppress_eos(inputs),
         }
+        if graph_walk == "talker_decode":
+            # the forward projects them, inside the step's graph; the ids are already on the device
+            packed["text_ids"] = torch.cat([item.kwargs["text_id"] for item in inputs])
+        return packed
+
+    def _text_conditions(self, text_ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        """Decode rows' text conditions ``[rows, D]``: their ``text_in`` tokens, projected in one call."""
+        return self._project_text(text_ids).to(dtype)
 
     def _mixed_text_conditions(
         self, inputs: list[ARNodeInputs], packed_embeds: torch.Tensor,
@@ -569,11 +589,19 @@ class TalkerSubmodule(ARNodeSubmodule):
             rows = max(longest, self.MIXED_TOKEN_BUCKETS[-1])
             self._zero_rows = packed_embeds.new_zeros(rows, packed_embeds.shape[1])
         zeros = self._zero_rows
+        decode_rows = [item for item in inputs if item.graph_walk == "talker_decode"]
+        conditions = iter(self._text_conditions(
+            torch.cat([item.kwargs["text_id"] for item in decode_rows]), packed_embeds.dtype,
+        ) if decode_rows else ())
         return torch.cat([
-            item.kwargs["text_condition"].view(1, -1) if item.graph_walk == "talker_decode"
+            next(conditions).view(1, -1) if item.graph_walk == "talker_decode"
             else zeros[:item.input_seq_len]
             for item in inputs
         ], dim=0)
+
+    def resident_walks(self) -> frozenset[str]:
+        # one token a row in the main stream; `preprocess` reads no planned position or KV location
+        return frozenset({"talker_decode"})
 
     def declare_step(
         self,
@@ -615,6 +643,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
         suppress_eos: torch.Tensor,
+        text_ids: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Produce one complete codec frame for every request in the batch.
 
@@ -624,7 +653,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         engine-owned static buffers, so this single path serves eager execution
         and CUDA-graph capture alike (mirrors the Qwen3-Omni Talker).
         """
-        hidden = self.model(input_embeds, label="main")
+        hidden = self._main_hidden(input_embeds, text_ids)
         last_hidden = hidden.index_select(0, last_token_indices)
         logits = self.model.codec_head(last_hidden)
         logits = self._mask_invalid_logits(logits, suppress_eos)
@@ -650,6 +679,13 @@ class TalkerSubmodule(ARNodeSubmodule):
             "codec_tokens": all_codes,
             "layer0_codes": layer0_codes,
         }
+
+    def _main_hidden(self, input_embeds: torch.Tensor, text_ids: torch.Tensor | None) -> torch.Tensor:
+        """The main Talker over ``input_embeds``; ``text_ids`` are a decode
+        step's text tokens, whose conditions join the codec embeddings here."""
+        if text_ids is not None:
+            input_embeds = input_embeds + self._text_conditions(text_ids, input_embeds.dtype)
+        return self.model(input_embeds, label="main")
 
     def _run_depth(
         self, last_hidden: torch.Tensor, layer0_codes: torch.Tensor, sampler: SamplerResource, request_ids: list[str],
@@ -759,11 +795,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
         suppress_eos: torch.Tensor,
+        text_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> NameToTensorList:
         del kwargs
         output = self._run_frame(
-            engine_inputs, input_embeds, last_token_indices, suppress_eos
+            engine_inputs, input_embeds, last_token_indices, suppress_eos, text_ids
         )
         del graph_walk
         return {
@@ -779,11 +816,12 @@ class TalkerSubmodule(ARNodeSubmodule):
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor,
         suppress_eos: torch.Tensor,
+        text_ids: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> dict[str, NameToTensorList] | BatchedModelOutput:
         del kwargs
         output = self._run_frame(
-            engine_inputs, input_embeds, last_token_indices, suppress_eos
+            engine_inputs, input_embeds, last_token_indices, suppress_eos, text_ids
         )
         del graph_walk
         # One frame per row: the engine clones each batch tensor once and the
@@ -801,6 +839,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
+        inputs: ARNodeInputs | None = None,
         **kwargs: Any,
     ) -> None:
         """Expose the stop token and advance metadata without a GPU sync.
@@ -811,6 +850,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         path filters the sampler-only output before slow-path ``check_stop``.
         """
         del kwargs
+        if inputs is not None and inputs.kwargs.get("text_id") is self._special_id(self.config.tts_eos_token_id):
+            self.request_state(request_id).add(TTS_EOS_FED, True)
         if request_info.graph_walk == "talker_prefill_clone" and "codec_tokens" in outputs:
             outputs["codec_tokens"] = self._codec_stream_items(
                 request_info.graph_walk, request_id, outputs["codec_tokens"][-1],
@@ -902,9 +943,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 # declare the same dynamic keys as a real prepared request.
                 kwargs={
                     "suppress_eos": True,
-                    "text_condition": torch.zeros(
-                        self.talker_config.hidden_size, dtype=dtype, device=device,
-                    ),
+                    "text_id": torch.zeros(1, dtype=torch.long, device=device),
                 },
             ),
             capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
@@ -1064,7 +1103,7 @@ class CodecSubmodule(ARNodeSubmodule):
         inputs: NameToTensorList,
         input_metadata: InputMetadata = EMPTY_INPUT_METADATA,
         **kwargs: Any,
-    ) -> ARNodeInputs:
+    ) -> ARNodeInputs | None:
         """The chunk's ``[frames, quantizers]`` codes and its capture bucket.
 
         Every item is a frame: the Talker withholds its EOS frame from the
@@ -1073,14 +1112,14 @@ class CodecSubmodule(ARNodeSubmodule):
         """
         del graph_walk, kwargs
         chunk = self._codec_chunk(input_metadata)
+        if chunk is not None and chunk.is_final and chunk.num_items <= chunk.context_items:
+            # A final chunk with no new frame (the producer-done flush of a
+            # drained stream, or a clone's stream whose first frame was the
+            # withheld EOS, which holds only its reference context): nothing to
+            # decode, and declined it still ends the stream.
+            return None
         state = self.request_state(fwd_info.rid_handle)
-        received = inputs.get("codec_tokens")
-        if received:
-            codes = received[0].to(device=self.get_device(), dtype=torch.long)
-        else:
-            # A frameless chunk only ends the stream: the producer-done flush of a
-            # drained stream, or one whose first frame was the withheld EOS.
-            codes = torch.zeros(0, self.config.num_code_groups, dtype=torch.long, device=self.get_device())
+        codes = inputs["codec_tokens"][0].to(device=self.get_device(), dtype=torch.long)
         # Items are one frame each, ``[groups]`` or ``[1, groups]`` (a row
         # view of the Talker's batch output), so the chunk flattens to frames.
         if codes.shape[-1] != self.config.num_code_groups:
@@ -1088,7 +1127,7 @@ class CodecSubmodule(ARNodeSubmodule):
         codes = codes.reshape(-1, self.config.num_code_groups)[:, :self.config.codec.num_quantizers]
         frames = codes.shape[0]
         context = min(chunk.context_items if chunk is not None else 0, frames)
-        bucket = self._bucket(max(frames, 1))
+        bucket = self._bucket(frames)
         state.add("codec_bucket", bucket)   # graph-key fallback when a caller has no stream chunk info
         # The chunk's geometry rides with this pass: under speculative
         # scheduling the next chunk of the same request is prepared before
@@ -1297,7 +1336,7 @@ class CodecSubmodule(ARNodeSubmodule):
         for request_id in per_request_info:
             chunk = self._codec_chunk(per_request_input_metadata.get(request_id))
             if chunk is not None:
-                buckets.add(self._bucket(max(chunk.num_items, 1)))
+                buckets.add(self._bucket(chunk.num_items))
             else:
                 buckets.add(self.request_state(request_id).get("codec_bucket"))
         buckets.discard(None)

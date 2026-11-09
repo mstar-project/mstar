@@ -79,7 +79,7 @@ pub(super) struct Stored {
     pub tensors: Vec<u64>,
     pub num_tensors: Vec<usize>,
     pub inline_signal: Option<String>,
-    pub inline_values: Vec<i64>,
+    pub inline_values: Vec<Option<i64>>,
     pub logprobs: Vec<Option<f64>>,
 }
 
@@ -460,7 +460,7 @@ impl GraphRuntime {
         let sent = py.detach(|| -> PyResult<Result<Vec<u32>, RouteOut>> {
             let route = self.complete_and_route_batch(pp.route_arg(Stored {
                 tensors: Vec::new(), num_tensors: vec![0; n], inline_signal: signal,
-                inline_values: values, logprobs: Vec::new(),
+                inline_values: values.into_iter().map(Some).collect(), logprobs: Vec::new(),
             }))?;
             pp.completion_id = route.completion_id;
             if pp.send_needs_python(&route) {

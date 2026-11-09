@@ -51,6 +51,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
+from torch.fx.experimental import _config as fx_config
 
 from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
@@ -97,6 +98,7 @@ from mstar.model.submodule_base import (
     NodeSubmodule,
     StepOrder,
 )
+from mstar.model.utils import warn_retired_ladder_env
 from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
@@ -394,13 +396,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     gen_capture_batch_sizes: tuple[int, ...] = (1,)
 
     # Understanding-tower prefill capture: combined cond+uncond token buckets,
-    # rounded up at replay; prompts past the largest bucket run eager. Override
-    # with COSMOS3_PREFILL_CAPTURE_TOKENS / COSMOS3_PREFILL_CAPTURE_BS.
+    # rounded up at replay; prompts past the largest bucket run eager. The
+    # serving config's `prefill_token_buckets` sets the token buckets, and
+    # COSMOS3_PREFILL_CAPTURE_BS the batch sizes.
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
     def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
         super().__init__()
+        warn_retired_ladder_env("COSMOS3_PREFILL_CAPTURE_TOKENS", "prefill_token_buckets: {dit: {prefill: [...]}}")
         self.transformer = transformer
         self.config = config
         # The loop-back edges of this deployment's scheduler, beside the latents.
@@ -470,8 +474,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             static["rotary"],
         )
         t0 = time.perf_counter()
-        # as `forward_batched` runs it: native dtype, no autocast
-        with torch.autocast(device_type=device.type, enabled=False):
+        # as `forward_batched` runs it: native dtype, no autocast. Without duck sizing, which would
+        # tie a pack as long as the hidden size (Nano's default, 4096) to that static size and
+        # compile again at the first other length.
+        with torch.autocast(device_type=device.type, enabled=False), fx_config.patch(use_duck_shape=False):
             self.transformer.denoise_step_batched([row, row], CFG_BATCHED_LABEL, _WarmupAttention())
         logger.info(
             "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two requests)",
@@ -517,13 +523,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         contradicts. ``Engine.exec`` checks the two against each other.
 
         The guidance interval is the fact this deliberately does not consult:
-        a captured step always runs both branches, so an out-of-interval step
-        gets the guidance combine where the eager path would run the
-        conditional branch alone (``postprocess`` combines unconditionally).
-        That predates the v1 migration and matches the fused reference
-        pipeline, which applies guidance on every step; honoring the interval
-        here instead would make the key step-dependent, which is exactly what
-        the pre-plan path cannot support.
+        a captured step always runs both branches, and ``postprocess`` keeps
+        the conditional one outside the interval, as the eager path does.
+        Honoring the interval here instead would make the key step-dependent,
+        which is exactly what the pre-plan path cannot support.
         """
         del per_request_input_metadata, kwargs
         rids = list(per_request_info)
@@ -1553,7 +1556,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if captured:
             # The captured denoise graph has a fixed shape and always runs both
             # guidance branches — including outside a request's guidance
-            # interval, which the eager path below honors. See `cg_key_info`.
+            # interval, where postprocess keeps the conditional one. See `cg_key_info`.
             return self._gen_step(
                 request_ids, spans, (COND_LABEL, UNCOND_LABEL),
                 combined=True, attn_key=attn_key, cg_key_info=capture_key,
@@ -1562,7 +1565,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if len(infos) > 1:
             # Cross-request batch: one combined plan over every request's
             # guidance branches (a single branch when guidance is off). The
-            # image and sound batched forwards apply guidance whenever the
+            # image and sound batched forwards run both branches whenever the
             # branch exists. The action one runs the conditional branch alone
             # when no row is inside its guidance interval, as a single request
             # does (rows outside it in a guided batch drop the other branch).
@@ -1772,11 +1775,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ``_forward_action_gen`` call this for the same step, so the declared
         attention (batched vs cond-only) matches the forward that runs.
 
-        The captured path does not consult it at all: its graph is fixed at
-        both branches and ``postprocess`` combines unconditionally, so an
-        out-of-interval step that lands on a capture slot gets guidance where
-        the eager one would not. See ``cg_key_info`` for why the interval
-        cannot be folded into the capture key."""
+        The captured path and the cross-request batch always run both
+        branches; ``postprocess`` and ``forward_batched`` call this to keep
+        the conditional one outside the interval. See ``cg_key_info`` for why
+        the interval is not folded into the capture key."""
         if st["uncond"] is None:
             return False
         gi = st.get("guidance_interval")
@@ -2091,8 +2093,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         output comes at the end of its loop."""
         return StepOrder.TURNS if graph_walk == VIDEO_GEN_AR_WALK else StepOrder.ARRIVAL
 
-    # Native bf16, not the engine autocast — see the note on forward(). The
-    # cross-request batched denoise must match the per-request path exactly.
+    # Native bf16, not the engine autocast, as forward() runs: the same dtypes as
+    # the per-request path, so batching (and the compiled layer stack) changes
+    # only kernel-level rounding.
     @torch.autocast(device_type="cuda", enabled=False)
     def forward_batched(
         self, graph_walk, engine_inputs: ModelInputsFromEngine,
@@ -2139,7 +2142,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, k, local), (cond_v, uncond_v) in zip(meta, results, strict=True):
-            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
+            if self._cfg_active(st, local):
+                velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
+            else:  # outside the guidance_interval, as in _forward_image_gen
+                velocity = cond_v.to(lat.dtype)
             solver = {name: kwargs[name][rid] for name in self._solver_state}
             new_latents, solver = self._scheduler_step(st, velocity, lat, local, solver)
             if st.get("vmask") is not None:
@@ -2192,8 +2198,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
         out = {}
         for (rid, st, lat, snd, k), ((cond_v, s_c), (uncond_v, s_u)) in zip(meta, results, strict=True):
-            velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
-            sound_v = _guided(s_c, s_u, st["gs"], snd.dtype)
+            if self._cfg_active(st, k):
+                velocity = _guided(cond_v, uncond_v, st["gs"], lat.dtype)
+                sound_v = _guided(s_c, s_u, st["gs"], snd.dtype)
+            else:  # outside the guidance_interval, as in _forward_image_gen
+                velocity, sound_v = cond_v.to(lat.dtype), s_c.to(snd.dtype)
             solver = {name: solvers[name][rid] for name in self._solver_state}
             new_latents, new_sound, solver = self._sound_scheduler_step(st, lat, snd, velocity, sound_v, k, solver)
             if st.get("vmask") is not None:
@@ -2423,11 +2432,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # sequence (batched CFG). The dummy zeros are placeholders — the real
         # input_ids / mrope ids are copied into the static buffers at replay.
         if not os.environ.get("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH"):
-            tok_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_TOKENS")
-            prefill_tokens = (
-                [int(x) for x in tok_env.split(",")] if tok_env
-                else list(self.prefill_capture_token_buckets)
-            )
             bs_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_BS")
             prefill_bs = (
                 [int(x) for x in bs_env.split(",")] if bs_env
@@ -2438,7 +2442,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(PREFILL_WALKS),
-                capture_token_lengths=prefill_tokens,
+                capture_token_lengths=list(self.prefill_capture_token_buckets),
                 make_node_input=lambda n: self._prefill_capture_input(
                     n, device, mrope_dtype,
                 ),
@@ -2540,9 +2544,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             return
         st = self.request_states[request_id]
         latents = inputs.tensor_inputs["latents"]
-        velocity = _guided(outputs["cond_v"][0], outputs["uncond_v"][0], st["gs"], latents.dtype)
-        solver = {name: inputs.tensor_inputs[name] for name in self._solver_state}
-        outputs.clear()
         # step_index is in range here: prepare_inputs vetoes the loop's extra
         # dispatched step and the engine prunes vetoed requests before postprocess.
         step_index = _loop_step(request_info, request_info.graph_walk)
@@ -2553,6 +2554,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # counter is global, the schedule index is the within-window step.
             window_index, local, _ = self._window_step(st, step_index)
             step_index = local
+        # the graph runs both branches; a step outside the guidance_interval keeps the conditional one
+        if self._cfg_active(st, step_index):
+            velocity = _guided(outputs["cond_v"][0], outputs["uncond_v"][0], st["gs"], latents.dtype)
+        else:
+            velocity = outputs["cond_v"][0].to(latents.dtype)
+        solver = {name: inputs.tensor_inputs[name] for name in self._solver_state}
+        outputs.clear()
         # The graph predicts every frame; clean frames (i2v anchor, chained
         # overlap) get the zero velocity the eager unpatchify gives them.
         velocity = velocity * self._noisy_masks(st, velocity.device)[1].to(velocity.dtype)
@@ -2997,9 +3005,8 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
 
     The chunk count is the completion signal — it is known per request up
     front — so the stream's terminal flush (an empty pass, and the only pass
-    a non-windowed request's idle stream ever delivers) runs as a no-op
-    forward: the pass must complete normally for the partition to report
-    done, so it is not vetoed.
+    a non-windowed request's idle stream ever delivers) is declined; the
+    partition still reports done.
     """
 
     def __init__(self, vae, config):
@@ -3024,15 +3031,16 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         del graph_walk
         return StepOrder.TURNS
 
-    def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
+    def prepare_inputs(
+        self, graph_walk, fwd_info, inputs, is_final_stream_chunk=False, **kwargs,
+    ) -> NodeInputs | None:
         chunks = (inputs or {}).get("window_latents") or []
         if not chunks:
-            return NodeInputs(tensor_inputs={"latents": torch.empty(0)})
+            assert is_final_stream_chunk, "an empty chunk before the end of the stream"
+            return None
         return NodeInputs(tensor_inputs={"latents": chunks[0]})
 
     def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
-        if latents.numel() == 0:
-            return {}
         rid = engine_inputs.request_ids[0]
         st = self.request_state(rid)
         if "ar_chunks" not in st:

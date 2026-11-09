@@ -161,7 +161,7 @@ def test_nemotron_tokenizer_needing_repo_code_fails_without_running_it(monkeypat
 # the constructor reads this file and loads the tokenizer, and touches no weights.
 # hidden_size >= 128: the resampler has hidden_size // 128 heads
 MINICPM_O_CONFIG = {
-    "version": "4.5", "hidden_size": 128, "num_attention_heads": 4, "query_num": 64,
+    "version": "4.5", "hidden_size": 128, "num_attention_heads": 4, "num_key_value_heads": 4, "query_num": 64,
     "vision_config": {}, "audio_chunk_length": 1.0, "audio_pool_step": 5,
     "audio_config": {
         "d_model": 32, "encoder_layers": 1, "encoder_attention_heads": 2, "encoder_ffn_dim": 64,

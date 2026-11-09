@@ -16,7 +16,14 @@ General questions are welcome too — a plain issue or an email to <atindra@cs.s
 1. Fork and create a branch.
 2. Make a focused change.
 3. Run `ruff check .` (CI enforces it).
-4. Open a PR against `main`. It runs CI and gets a review before merging.
+4. Open a PR against `main`. It runs CI and gets a review before merging. To merge, add it to the
+   merge queue ("Merge when ready"): the queue runs CI on your PR merged with `main` and with every
+   PR queued ahead of it, and lands it only if that passes, so two PRs that are each green alone
+   can't break `main` together.
+
+### HTTP routes and OpenAI adapters
+
+The Python HTTP frontend is being retired in favor of the Rust one (`rust/server/`). A new route, request field, response format or model OpenAI adapter goes into both in the same PR, with a test in `test/rust/` comparing the two; see invariant 15 in [AGENTS.md](AGENTS.md).
 
 ### Documentation
 
@@ -169,9 +176,9 @@ selected. Within the selected directories:
 
 Run the new file with CI's installation before opening the PR. Check ARM
 compatibility before extending the Mac exclusion list. CI prints the slowest
-tests and retains JUnit reports for seven days. Making
-**CPU Core** a required merge check is a separate repository ruleset or branch
-protection setting.
+tests and retains JUnit reports for seven days. Which checks
+must pass before a PR merges, in the queue or not, is set in `main`'s branch protection rule;
+every required check has to run on the `merge_group` event too.
 
 The randomized tests in `test/modular/test_kv_page_ownership.py` add their seed
 and recent operations to a failure; rerun one with the node id pytest prints.

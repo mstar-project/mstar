@@ -14,7 +14,7 @@ from mstar.api_server import entrypoint
 from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.request_types import ResultChunk
 from mstar.conductor.conductor import Conductor
-from mstar.model.base import Model
+from mstar.testing_utils.model import StubModel, make_model
 from mstar.utils.generation_kwargs import check_seed, normalize_generation_kwargs
 
 
@@ -56,6 +56,7 @@ def test_in_contract_values_pass(kwargs):
     ({"seed": 1e20}, "seed"),
     ({"ignore_eos": "false"}, "ignore_eos"),
     ({"return_token_ids": 1}, "return_token_ids"),
+    ({"enable_thinking": "false"}, "enable_thinking"),  # a chat template thinks on "false"
     ({"talker_top_p": 0}, "talker_top_p"),
     ({"thinker_temperature": -0.1}, "thinker_temperature"),
 ])
@@ -97,10 +98,7 @@ def test_length_aliases_fold_into_max_output_tokens_in_order():
         normalize_generation_kwargs({"max_tokens": 0})
 
 
-class _Model:
-    ENGINE_KWARGS = Model.ENGINE_KWARGS
-    LENGTH_KWARGS = Model.LENGTH_KWARGS
-
+class _Model(StubModel):
     def request_kwargs(self):
         return frozenset({"temperature"})
 
@@ -190,8 +188,8 @@ def test_an_unread_key_warns_on_every_request(caplog):
         for _ in range(3):
             server._report_ignored_params({"initial_prompt": "x"})
         server._report_ignored_params(
-            {"seed": 1, "prefix_cache": True, "lora_adapter": "a", "max_output_tokens": 4,
-             "return_token_ids": True},
+            {"seed": 1, "prefix_cache": True, "lora_adapter": "a", "lora_digest": "d", "max_output_tokens": 4,
+             "return_token_ids": True, "return_logprobs": True},
         )
     levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]
     # keys the conductor reads are never reported
@@ -223,7 +221,7 @@ def test_a_client_gone_before_the_first_chunk_is_aborted():
 
 def _conductor(default=64):
     c = Conductor.__new__(Conductor)
-    c.model = types.SimpleNamespace(
+    c.model = make_model(
         get_max_output_tokens=lambda **kw: kw.get("max_output_tokens", default),
     )
     return c

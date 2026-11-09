@@ -402,7 +402,11 @@ def test_encoder_replays_exactly_when_leased():
 def test_encoder_packs_a_step_only_up_to_its_largest_capture():
     """Past the largest captured token count a step runs its clips one by one,
     so an eager step's activations are one clip's, not the whole batch's."""
-    sub = _encoder_submodule(_tiny_config())
+    model = _make_model()
+    sub = _encoder_submodule(model.config)
+    # the windows a row holds, as the model sizes its resource (a step's windows gate it too)
+    (ragged,) = (s for s in model.get_node_resources() if isinstance(s, RaggedAttentionSpec))
+    sub.node_resources = {AUT_ATTN: ragged.config}
     top = sub.ENCODE_TOKEN_BUCKETS[-1]
 
     def rows(*lens):
@@ -443,7 +447,7 @@ def test_llm_prefill_splices_audio_embeddings_and_decode_carries_ids():
     assert [(s.label, s.span) for s in step.segments] == [("main", 8)] and KV_CACHE in step.steps
     (decode, prefill) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert decode.capture_batch_sizes == sub.DECODE_CAPTURE_BATCH_SIZES
-    assert prefill.capture_token_lengths == sub.PREFILL_TOKEN_BUCKETS
+    assert prefill.capture_token_lengths == {1: sub.PREFILL_TOKEN_BUCKETS}
     assert prefill.make_node_input(7).input_embeds.shape == (7, cfg.text.hidden_size)
 
 
@@ -512,7 +516,7 @@ def test_engine_stop_check_takes_the_batched_path():
     back to one ``check_stop`` per row."""
     from types import SimpleNamespace
 
-    from mstar.engine.engine import Engine
+    from mstar.testing_utils.engine import make_engine, make_mgmt
 
     sub = _llm_submodule(_tiny_config())
 
@@ -533,10 +537,9 @@ def test_engine_stop_check_takes_the_batched_path():
         node_name="llm", request_ids=["end", "word"], per_request_info_wrapped=infos,
         register_failure=failures.setdefault,
     )
-    engine = SimpleNamespace(_submodules={"llm": SimpleNamespace(submodule=sub)})
+    engine = make_engine(_submodules={"llm": make_mgmt(submodule=sub)})
     tokens = torch.tensor([[IM_END], [1234]])
-    stops = Engine.check_stop_for_batch(
-        engine, batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
+    stops = engine.check_stop_for_batch(batch, {}, host_rows=HostRows(("end", "word"), {"new_token": tokens}),
     )
     assert stops == {"end": {"decode_loop"}} and not failures
 
@@ -718,9 +721,3 @@ def test_decode_loop_emits_its_one_signal_inline_and_loops_it_back_on_the_device
     # without slot masters (or MSTAR_DEVICE_LOOPBACK=0) the tensor path stays
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset()
-    # the per-request stop check reads the decode signal
-    info = type("I", (), {
-        "graph_walk": DECODE_WALK, "dynamic_loop_iter_counts": {}, "max_tokens": 100,
-        "resource_configs": {SAMPLER: type("C", (), {"ignore_eos": False})()},
-    })()
-    assert sub.check_stop("a", info, {"text_inputs": [torch.tensor([next(iter(cfg.stop_token_ids))])]})

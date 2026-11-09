@@ -34,7 +34,7 @@ import functools
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 import torch
@@ -45,10 +45,12 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
     AcceleratorGraphConfig,
     BatchedAcceleratorGraphConfig,
+    PackedAcceleratorGraphConfig,
     PiecewiseAcceleratorGraphConfig,
     PiecewiseBatchedConfig,
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
+    PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
@@ -59,13 +61,39 @@ from mstar.engine.resources import (
     SlotLease,
     SubmoduleStep,
 )
+from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.chatterbox.components.audio import kaldi_fbank_80
 from mstar.model.chatterbox.components.audio_frontend import resample
 from mstar.model.chatterbox.submodules import VoiceCache
-from mstar.model.cosyvoice3.components.flow import CosyVoice3FlowRow, ReferenceVoice, SolveInputs
-from mstar.model.cosyvoice3.components.hift import HiftStreamState, stream_vocode
+from mstar.model.cosyvoice3.components.dit import PackedRows
+from mstar.model.cosyvoice3.components.flow import (
+    CosyVoice3FlowRow,
+    NewFramesInputs,
+    ReferenceVoice,
+    SolveInputs,
+    native_convolutions,
+)
+from mstar.model.cosyvoice3.components.hift import (
+    CapturedStream,
+    HiftStreamState,
+    StreamRow,
+    VocodeInputs,
+    finish_stream_row,
+    plan_stream_row,
+    stream_vocode,
+)
 from mstar.model.cosyvoice3.components.sampling import ras_sample
 from mstar.model.cosyvoice3.config import (
+    FLOW_ATTN,
+    FLOW_CFG_LABEL,
+    FLOW_COND_LABEL,
+    FLOW_KV,
+    FLOW_TAILS,
+    FLOW_TAILS_LABEL,
+    FLOW_UNCOND_LABEL,
+    HIFT_STATE,
+    HIFT_STATE_LABEL,
     LM_ATTN,
     LM_KV,
     LM_LABEL,
@@ -77,8 +105,11 @@ from mstar.model.cosyvoice3.config import (
 from mstar.model.submodule_base import (
     ARNodeInputs,
     ARNodeSubmodule,
+    BatchedModelOutput,
     NodeInputs,
     NodeSubmodule,
+    StopKind,
+    StopPolicy,
 )
 from mstar.utils.h2d import PinnedStager
 
@@ -94,7 +125,6 @@ MEL = "mel"  # newly settled mel frames
 MEL_FINAL = "mel_final"  # [1] bool: the stream has ended
 AUDIO_CHUNK = "audio_chunk"
 DECODE_LOOP = "decode_loop"
-STEP_INDEX = "lm_step"  # [1] the LM step that produced the token, for check_stop
 
 # Request facts process_prompt settles, carried in step_metadata
 MIN_SPEECH_TOKENS = "min_speech_tokens"
@@ -141,7 +171,10 @@ class ReferenceEncoder:
     @torch.no_grad()
     def tokens(self, wav24: torch.Tensor) -> torch.Tensor:
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
-        tokens, lens = self.tokenizer([wav16])
+        # Clips vary in length, and cuDNN plans anew per shape: native convolutions
+        # hold CAMPPlus to about 14 ms a clip, against 37 to 119 ms.
+        with native_convolutions():
+            tokens, lens = self.tokenizer([wav16])
         tokens = tokens[0, : int(lens[0])]
         frames = self._mel_frames(wav24.numel())
         return tokens[: min(int(tokens.numel()), frames // 2)]
@@ -160,7 +193,8 @@ class ReferenceEncoder:
         feat = feat[: 2 * tokens.numel()]
         wav16 = resample(wav24.float(), SAMPLE_RATE, TOKENIZER_SR)
         fbank = kaldi_fbank_80(wav16)
-        embedding = self.campplus(fbank[None])[0]
+        with native_convolutions():
+            embedding = self.campplus(fbank[None])[0]
         return ReferenceVoice(prompt_tokens=tokens, prompt_feat=feat, embedding=embedding)
 
 
@@ -231,6 +265,10 @@ CAPTURE_KNOBS = LMRequestKnobs(
 )
 
 
+def _ignores_eos(fwd_info: CurrentForwardPassInfo) -> bool:
+    return bool((fwd_info.step_metadata or {}).get("ignore_eos", False))
+
+
 class LMSubmodule(ARNodeSubmodule):
     """One LM step for a continuous batch: prefill packs
     ``[sos | prompt text + text | task_id | prompt speech]`` per request, decode
@@ -244,6 +282,11 @@ class LMSubmodule(ARNodeSubmodule):
     disable_torch_compile = True
     MAX_BATCH_SIZE = 32
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32]
+    # Captured LM prefills, packed, by total tokens. A prefill they don't hold
+    # runs eagerly, about 30 ms of launches stalling its worker's decode. A
+    # deployment sets its own with the serving config's `prefill_token_buckets`
+    # (`{llm: {prefill_voice: [...]}}`).
+    LM_PREFILL_TOKEN_BUCKETS = [64, 128, 192, 256, 384, 512, 768, 1024]
 
     def __init__(self, model: nn.Module, config: CosyVoice3Config):
         super().__init__()
@@ -442,17 +485,12 @@ class LMSubmodule(ARNodeSubmodule):
         )
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
-        tokens = self._forward(graph_walk, engine_inputs, **kwargs)
-        return {SPEECH_TOKENS: [tokens.reshape(-1)[:1]], STEP_INDEX: [kwargs["step"].reshape(-1)[:1].clone()]}
+        return {SPEECH_TOKENS: [self._forward(graph_walk, engine_inputs, **kwargs).reshape(-1)[:1]]}
 
-    def forward_batched(self, graph_walk, engine_inputs, **kwargs) -> dict[str, NameToTensorList]:
-        tokens = self._forward(graph_walk, engine_inputs, **kwargs).reshape(-1)
-        # a copy: under graph replay ``step`` is the static input the next step overwrites
-        steps = kwargs["step"].reshape(-1).clone()
-        return {
-            rid: {SPEECH_TOKENS: [tokens[i : i + 1]], STEP_INDEX: [steps[i : i + 1]]}
-            for i, rid in enumerate(engine_inputs.request_ids)
-        }
+    def forward_batched(self, graph_walk, engine_inputs, **kwargs) -> BatchedModelOutput:
+        # row i is request i, and one host copy of the rows serves the stop check
+        tokens = self._forward(graph_walk, engine_inputs, **kwargs).reshape(-1, 1)
+        return BatchedModelOutput(row_outputs={SPEECH_TOKENS: tokens}, check_stop_buffers={SPEECH_TOKENS: tokens})
 
     def postprocess(self, request_id, request_info, outputs, inputs: NodeInputs | None = None, **kwargs) -> None:
         del request_info, kwargs
@@ -464,17 +502,28 @@ class LMSubmodule(ARNodeSubmodule):
         if inputs is not None and HISTORY in inputs.tensor_inputs:
             state.add(HISTORY, inputs.tensor_inputs[HISTORY])
 
+    def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
+        if graph_walk != "decode":
+            return None  # the prefill's token can spend a one-token budget
+        # the budget is the loop's cap (``get_loop_caps``), which the runtime enforces
+        return {
+            DECODE_LOOP: StopPolicy(
+                StopKind.EOS,
+                token_signal=SPEECH_TOKENS,
+                eos_tokens=range(self.lm.speech_token_size, self.lm.speech_vocab_size),
+                ignores_eos=_ignores_eos,
+            )
+        }
+
     def check_stop(self, request_id, request_info, outputs) -> set[str]:
-        del request_info
         if SPEECH_TOKENS not in outputs:
             return set()
         token = int(outputs[SPEECH_TOKENS][0].reshape(-1)[0].item())
-        # this step's own index, not ``generated``: a speculative next step may
-        # already have been postprocessed
-        generated = int(outputs[STEP_INDEX][0].reshape(-1)[0].item()) + 1
         knobs: LMRequestKnobs = self.request_state(request_id)[KNOBS]
-        stopped = not knobs.ignore_eos and token >= self.lm.speech_token_size
-        if stopped or generated >= knobs.max_len:
+        if not knobs.ignore_eos and token >= self.lm.speech_token_size:
+            return {DECODE_LOOP}
+        # the prefill's token is the first of the budget; decode's cap covers the rest
+        if request_info.graph_walk in PREFILL_WALKS and knobs.max_len <= 1:
             return {DECODE_LOOP}
         return set()
 
@@ -494,19 +543,42 @@ class LMSubmodule(ARNodeSubmodule):
         dtype = self.model.speech_embedding.weight.dtype
         width = max(self.window, 1)
         tensor_inputs = {HISTORY: torch.full((width,), -1, dtype=torch.long, device=device)}
-        return [
+        kwargs = {KNOBS: CAPTURE_KNOBS, STEP: 0, EOS_FLAG: None}
+        configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
                 capture_graph_walk="decode",
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(1, self.lm.hidden_size, dtype=dtype, device=device),
                     input_seq_len=1,
                     tensor_inputs=tensor_inputs,
-                    kwargs={KNOBS: CAPTURE_KNOBS, STEP: 0, EOS_FLAG: None},
+                    kwargs=kwargs,
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
                 compile=False,
             )
         ]
+        if self.config.lm_prefill_batch_sizes:
+            configs.append(
+                PackedAcceleratorGraphConfig(
+                    capture_graph_walk="prefill_voice",
+                    replay_graph_walks=list(PREFILL_WALKS),
+                    capture_token_lengths=list(self.LM_PREFILL_TOKEN_BUCKETS),
+                    make_node_input=lambda n: ARNodeInputs(
+                        input_embeds=torch.zeros(n, self.lm.hidden_size, dtype=dtype, device=device),
+                        input_seq_len=n,
+                        tensor_inputs=tensor_inputs,
+                        kwargs=kwargs,
+                    ),
+                    capture_batch_sizes=list(self.config.lm_prefill_batch_sizes),
+                    compile=False,
+                    # a longer or wider prefill runs eagerly
+                    caps_eager_batch_size=False,
+                )
+            )
+        return configs
+
+    def resident_walks(self) -> frozenset[str]:
+        return frozenset({"decode"})
 
     def can_use_accelerator_graphs(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return self.can_batch(batch, model_inputs) and super().can_use_accelerator_graphs(batch, model_inputs)
@@ -553,6 +625,19 @@ def flow_region(frames: int) -> str:
     return f"solve_F{frames}"
 
 
+FLOW_NEW_FRAMES_REGION = "solve_new_frames"
+TAILS_BLOCK = "tails"
+
+
+class _NewFramesRow(NamedTuple):
+    """A row of an incremental solve: its ``solve_rows`` index and frames ``first`` to ``end``."""
+
+    index: int
+    row: CosyVoice3FlowRow
+    first: int
+    end: int
+
+
 class FlowSubmodule(NodeSubmodule):
     """Settles the stream's tokens in whole attention chunks and emits their mel.
 
@@ -562,11 +647,16 @@ class FlowSubmodule(NodeSubmodule):
     conditioned from the clip that rides with its first chunk (per-voice cache)
     and kept in its state for the chunks that follow.
 
-    The Euler solve (10 DiT steps with guidance) is a piecewise CUDA graph per
-    frame bucket and batch size: a batch pads to the smallest bucket holding
-    its longest row, which changes no row's frames (``prepare_solve``). A
-    longer solve, a batch size not captured for its bucket, or another step
-    count runs the same code eagerly.
+    Attention is block-causal, so frames a row has solved never change. A row
+    keeps their K/V (``FLOW_KV``) and conv tails (``FLOW_TAILS``) and each hop
+    solves only its new frames, a captured packed region by total new frames and
+    batch size, until the row passes ``flow_cache_frames``.
+
+    Past that, or with incremental solves off, a hop re-solves all of the row's
+    frames: a piecewise CUDA graph per frame bucket and batch size, a batch
+    padding to the smallest bucket holding its longest row, which changes no
+    row's frames (``prepare_solve``). A longer solve, a batch size not captured
+    for its bucket, or another step count runs the same code eagerly.
     """
 
     disable_torch_compile = True
@@ -576,6 +666,7 @@ class FlowSubmodule(NodeSubmodule):
         super().__init__()
         self.flow = flow
         self.encoder = encoder
+        self._attend: AttentionCallable | None = None
         self.config = config
         self.cache = VoiceCache(config.voice_cache_size)
         self.ratio = config.flow.token_mel_ratio
@@ -585,6 +676,9 @@ class FlowSubmodule(NodeSubmodule):
         self._token_stager = PinnedStager(
             torch.long, numel=config.max_speech_tokens, depth=2 * config.flow_max_batch_size
         )
+        # a step's packed positions and indices, in one copy: two a frame, and each row's tails
+        frames, rows = max(config.flow_new_frame_buckets, default=0), config.flow_max_batch_size
+        self._index_stager = PinnedStager(torch.long, numel=2 * frames + 2 * config.flow.dit.conv_pos_kernel * rows)
 
     def _voice(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, state) -> ReferenceVoice:
         if inputs.get(REF_AUDIO):
@@ -600,6 +694,11 @@ class FlowSubmodule(NodeSubmodule):
         if state.get("voice") is None:
             raise ValueError("CosyVoice3 needs a reference voice; none reached the flow node")
         return state["voice"]
+
+    def bind_node_resources(self, resources: dict) -> None:
+        super().bind_node_resources(resources)
+        kv, attn = resources.get(FLOW_KV), resources.get(FLOW_ATTN)
+        self._attend = None if kv is None or attn is None else AttentionCallable(kv=kv, attn=attn)
 
     def hop_size(self, k: int, prompt_tokens: int) -> int:
         """Tokens hop ``k`` settles: 25, 50, 100, 100, ... (reference
@@ -678,7 +777,92 @@ class FlowSubmodule(NodeSubmodule):
         mel = runner.run(static_inputs=inputs._asdict(), real_bs=len(rows))["mel"]
         return self.flow.row_mels(rows, mel)
 
+    def _new_frames_row(self, i: int, rid: int, row: CosyVoice3FlowRow, steps: int, runner) -> _NewFramesRow | None:
+        """``row`` as an incremental solve, or None to re-solve all of it."""
+        if runner is None or steps != self.config.flow.cfm.n_timesteps or not row.streaming:
+            return None
+        state = self.request_state(rid)
+        end = self.flow.valid_frames(row)
+        if state.get("resolving") or end > self.config.flow_cache_frames:
+            # for good: its K/V stops short of the frames it now solves
+            state.add("resolving", True)
+            return None
+        return _NewFramesRow(i, row, int(state.get("cached_frames", 0)), end)
+
+    def _pack_new_frames(self, batch: list[_NewFramesRow]) -> NewFramesInputs:
+        """The batch's new frames, packed in row order; see ``PackedRows``."""
+        device = self.get_device()
+        ratio_rows = [item.row for item in batch]
+        solve = self.flow.prepare_solve(ratio_rows)
+        width = self.config.flow.dit.conv_pos_kernel - 1
+        news = [item.end - item.first for item in batch]
+        total = sum(news)
+        positions = np.empty(total, dtype=np.int64)
+        seq_at = np.empty(total, dtype=np.int64)
+        tail_at = np.empty((len(batch), width), dtype=np.int64)
+        last_at = np.empty((len(batch), width), dtype=np.int64)
+        at, cursor = 0, 1  # sequence position 0 is scratch
+        for r, (item, n) in enumerate(zip(batch, news, strict=True)):
+            positions[at : at + n] = np.arange(item.first, item.end)
+            tail_at[r] = np.arange(cursor, cursor + width)
+            seq_at[at : at + n] = np.arange(cursor + width, cursor + width + n)
+            last_at[r] = np.arange(cursor + n, cursor + n + width)
+            at += n
+            cursor += width + n
+        indices = np.concatenate([positions, seq_at, tail_at.ravel(), last_at.ravel()])
+        at_device = torch.empty(indices.shape[0], dtype=torch.long, device=device)
+        self._index_stager.copy_(at_device, indices)
+        rows = PackedRows(
+            positions=at_device[:total],
+            seq_at=at_device[total : 2 * total],
+            tail_at=at_device[2 * total : 2 * total + len(batch) * width].view(len(batch), width),
+            last_at=at_device[2 * total + len(batch) * width :].view(len(batch), width),
+            real=torch.ones(total, dtype=torch.bool, device=device),
+        )
+        noise = self.flow.noise[0].to(self.flow.dtype)
+        return NewFramesInputs(
+            noise=torch.cat([noise[:, i.first : i.end] for i in batch], dim=1).t(),
+            mu=torch.cat([solve.mu[r, :, i.first : i.end] for r, i in enumerate(batch)], dim=1).t(),
+            cond=torch.cat([solve.cond[r, :, i.first : i.end] for r, i in enumerate(batch)], dim=1).t(),
+            spks=torch.cat([solve.spks[r, None].expand(n, -1) for r, n in enumerate(news)]),
+            rows=rows,
+        )
+
+    def _solve_new_frames(self, batch: list[_NewFramesRow], rids: list[int], runner) -> list[torch.Tensor]:
+        """Each row's frames from ``first`` on, ``[80, end - first]``."""
+        inputs = self._pack_new_frames(batch)
+        statics = {**inputs._asdict(), **inputs.rows._asdict()}
+        del statics["rows"]
+        request_ids = [rids[item.index] for item in batch]
+        # counted in the twin rows' tokens: the KV plan's, a step's bucket's
+        seq_lens = [2 * (item.end - item.first) for item in batch]
+        total = sum(seq_lens) // 2
+        mel = runner.run(
+            static_inputs=statics, request_ids=request_ids, seq_lens=seq_lens, real_bs=len(batch),
+        ).get_view("mel")[:total].clone()
+        out, at = [], 0
+        for item in batch:
+            n = item.end - item.first
+            out.append(mel[at : at + n].t())
+            at += n
+        return out
+
+    def _new_frames_batches(self, rows: list[_NewFramesRow]) -> list[list[_NewFramesRow]]:
+        """``rows`` in the fewest in-order batches a capture holds."""
+        cap = max(self.config.flow_new_frame_buckets)
+        max_rows = max(self.config.flow_new_batch_sizes)
+        batches, current, frames = [], [], 0
+        for item in rows:
+            n = item.end - item.first
+            if current and (frames + n > cap or len(current) == max_rows):
+                batches.append(current)
+                current, frames = [], 0
+            current.append(item)
+            frames += n
+        return [*batches, current] if current else batches
+
     def _run(self, rids, tokens_list, voices, finals, n_timesteps, runners=None) -> list[NameToTensorList]:
+        runners = runners or {}
         rows: list[tuple[int, CosyVoice3FlowRow]] = []
         for i, (rid, tokens, voice, final) in enumerate(zip(rids, tokens_list, voices, finals, strict=True)):
             state = self.request_state(rid)
@@ -686,10 +870,27 @@ class FlowSubmodule(NodeSubmodule):
             if row is not None:
                 rows.append((i, row))
         mels: dict[int, torch.Tensor] = {}
+        new_frames = {}
+        region = runners.get(FLOW_NEW_FRAMES_REGION)
         with _without_tf32():
+            incremental = []
+            for i, row in rows:
+                item = self._new_frames_row(i, rids[i], row, n_timesteps[i], region)
+                if item is not None:
+                    incremental.append(item)
+            for batch in self._new_frames_batches(incremental):
+                if not region.can_run(len(batch), 2 * sum(item.end - item.first for item in batch)):
+                    # a capture left out for memory: re-solving needs no K/V
+                    for item in batch:
+                        self.request_state(rids[item.index]).add("resolving", True)
+                    continue
+                for item, mel in zip(batch, self._solve_new_frames(batch, rids, region), strict=True):
+                    new_frames[item.index] = (item, mel)
+                    self.request_state(rids[item.index]).add("cached_frames", item.end)
+            rows = [(i, row) for i, row in rows if i not in new_frames]
             for steps in sorted({n_timesteps[i] for i, _ in rows}):
                 group = [(i, row) for i, row in rows if n_timesteps[i] == steps]
-                solved = self._solve([row for _, row in group], steps, runners or {})
+                solved = self._solve([row for _, row in group], steps, runners)
                 for (i, _), mel in zip(group, solved, strict=True):
                     mels[i] = mel
         out = []
@@ -697,10 +898,16 @@ class FlowSubmodule(NodeSubmodule):
         for i, (rid, final) in enumerate(zip(rids, finals, strict=True)):
             state = self.request_state(rid)
             new = torch.zeros(n_mel, 0, device=self.get_device())
+            offset = int(state.get("settled", 0))
             if i in mels:
-                offset = int(state.get("settled", 0))
                 new = mels[i][:, offset * self.ratio :].float()
                 state.add("settled", dict(rows)[i].settle)
+            elif i in new_frames:
+                item, mel = new_frames[i]
+                # the first solve's frames start at the prompt's
+                first_generated = (item.row.voice.num_prompt_tokens + offset) * self.ratio
+                new = mel[:, first_generated - item.first :].float()
+                state.add("settled", item.row.settle)
             if final:
                 state.add("done", True)
             # on the host: HiFT reads it to plan its emit, and a colocated HiFT
@@ -767,15 +974,82 @@ class FlowSubmodule(NodeSubmodule):
             "streaming": torch.zeros(shape.bs, dtype=torch.bool, device=device),
         }
 
+    # -- captured incremental solve ---------------------------------------------
+
+    def _new_frames_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        si = inp.static_inputs
+        rows = PackedRows(*(si[name] for name in PackedRows._fields))
+        inputs = NewFramesInputs(noise=si["noise"], mu=si["mu"], cond=si["cond"], spks=si["spks"], rows=rows)
+        attend = self._attend
+        attend.bind_step(FLOW_CFG_LABEL)
+        pool = inp.resources[FLOW_TAILS]
+        tails = pool.gather(TAILS_BLOCK, None, label=FLOW_TAILS_LABEL)
+        with _without_tf32():
+            mel, tails = self.flow.solve_new_frames(inputs, tails, attend, self.config.flow.cfm.n_timesteps)
+        pool.scatter_(TAILS_BLOCK, tails, None, label=FLOW_TAILS_LABEL)
+        return {"mel": mel}
+
+    def _new_frames_static_inputs(self, shape: PiecewiseCaptureShape, device) -> dict[str, torch.Tensor]:
+        # the region's tokens are the twin rows', a row's frames half of them
+        total = shape.total_tokens // 2
+        width = self.config.flow.dit.conv_pos_kernel - 1
+        n_mel, dtype = self.config.flow.output_size, self.flow.dtype
+        tokens = {
+            name: torch.zeros(total, n_mel, dtype=dtype, device=device) for name in ("noise", "mu", "cond", "spks")
+        }
+        return {
+            **tokens,
+            "positions": torch.zeros(total, dtype=torch.long, device=device),
+            "seq_at": torch.zeros(total, dtype=torch.long, device=device),
+            "tail_at": torch.zeros(shape.bs, width, dtype=torch.long, device=device),
+            "last_at": torch.zeros(shape.bs, width, dtype=torch.long, device=device),
+            "real": torch.zeros(total, dtype=torch.bool, device=device),
+        }
+
+    @staticmethod
+    def _new_frames_step(request_ids, seq_lens) -> SubmoduleStep:
+        """Two KV streams a row, conditional rows first as the forward packs them; a
+        padding row's zero span reads the sink and adds nothing."""
+        spans = [n // 2 for n in seq_lens]
+        labels = (FLOW_COND_LABEL, FLOW_UNCOND_LABEL)
+        kv_segments = tuple(
+            Segment(rid, label, span)
+            for label in labels
+            for rid, span in zip(request_ids, spans, strict=True)
+        )
+        return SubmoduleStep(
+            steps={
+                FLOW_KV: KVStep(segments=kv_segments, commit=True, combined_labels={labels: FLOW_CFG_LABEL}),
+                FLOW_ATTN: AttentionStep(segments=kv_segments, causal=False),
+                FLOW_TAILS: RecurrentStep(
+                    segments=tuple(
+                        Segment(rid, FLOW_TAILS_LABEL, span) for rid, span in zip(request_ids, spans, strict=True)
+                    )
+                ),
+            },
+        )
+
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any
     ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
-        """One region per frame bucket. The flow holds no engine resources, so
-        the regions declare no step. The largest bucket comes first: regions
-        capture in this order into one shared pool, and a smaller capture
-        reuses the blocks a larger one freed, where the reverse grows the pool."""
+        """One region per frame bucket, and the incremental solve. The largest
+        bucket comes first: regions capture in this order into one shared pool,
+        and a smaller capture reuses the blocks a larger one freed, where the
+        reverse grows the pool."""
         del autocast_dtype, tp_world_size, kwargs
         regions: dict[str, PiecewiseAcceleratorGraphConfig] = {}
+        if self.config.flow_cache_frames > 0:
+            if device.type == "cuda":
+                self.flow.decoder.estimator.prepare_fused(
+                    self.flow.decoder.time_grid(self.config.flow.cfm.n_timesteps, device, torch.float32, meanflow=False)
+                )
+            regions[FLOW_NEW_FRAMES_REGION] = PiecewisePackedConfig(
+                capture_fn=self._new_frames_capture,
+                make_static_inputs=functools.partial(self._new_frames_static_inputs, device=device),
+                declare_step=self._new_frames_step,
+                total_tokens=[2 * frames for frames in self.config.flow_new_frame_buckets],
+                capture_batch_sizes=list(self.config.flow_new_batch_sizes),
+            )
         for frames in sorted(self.config.flow_capture_frame_buckets, reverse=True):
             sizes = self.capture_batch_sizes(frames)
             if not sizes:
@@ -794,11 +1068,24 @@ class FlowSubmodule(NodeSubmodule):
 # ===========================================================================
 
 
+def vocode_region(frames: int) -> str:
+    return f"vocode_F{frames}"
+
+
+MEL_TAIL_BLOCK = "mel_tail"
+PHASE_CARRY_BLOCK = "phase_carry"
+_VOCODE_COUNTS = ("new_frames", "skip", "history", "frames", "start", "carry_at", "advance")
+
+
 class HiFTSubmodule(NodeSubmodule):
     """Vocodes each request's new mel frames behind a bounded window of its
     history (``hift_context_frames``) and emits only samples no later frame can
     change; the final call flushes the rest, so a stream has exactly the length
-    of a whole-utterance call."""
+    of a whole-utterance call.
+
+    Captured (``hift_captured``), a step's rows run as one padded batch, a piecewise
+    CUDA graph per frame bucket and batch size, with each stream's mel tail and phase
+    carry in the ``HIFT_STATE`` pool. Otherwise each row runs ``stream_vocode`` eagerly."""
 
     disable_torch_compile = True
     disable_autocast = True
@@ -807,6 +1094,8 @@ class HiFTSubmodule(NodeSubmodule):
         super().__init__()
         self.hift = hift
         self.config = config
+        batch = config.hift_max_batch_size
+        self._counts = PinnedStager(torch.long, numel=len(_VOCODE_COUNTS) * batch)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         del graph_walk, kwargs
@@ -816,6 +1105,10 @@ class HiFTSubmodule(NodeSubmodule):
         # only when the two are placed apart
         final = bool(inputs[MEL_FINAL][0].reshape(-1)[0])
         return NodeInputs(tensor_inputs={MEL: mel}, kwargs={"rid": _rid(fwd_info), "final": final})
+
+    @staticmethod
+    def _pcm(wav: torch.Tensor) -> torch.Tensor:
+        return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
 
     def _vocode(self, rid: int, mel: torch.Tensor, final: bool) -> torch.Tensor:
         state = self.request_state(rid)
@@ -827,7 +1120,84 @@ class HiFTSubmodule(NodeSubmodule):
             wav = mel.new_zeros(0)
         else:
             wav = stream_vocode(self.hift, stream, mel, final, self.config.hift_context_frames)
-        return (wav.clamp(-1, 1) * 32767).to(torch.int16)
+        return self._pcm(wav)
+
+    # -- captured steps ---------------------------------------------------------
+
+    def _pieces(self, rid: int, mel: torch.Tensor, final: bool) -> list[tuple[int, torch.Tensor, bool]]:
+        """``mel`` in chunks a window of the largest bucket holds beside a stream's tail."""
+        cfg = self.config
+        # the holdback again for frames still pending from a chunk too short to emit
+        room = max(cfg.hift_capture_frame_buckets) - cfg.hift_tail_frames - cfg.hift.stream_holdback_frames
+        chunks = list(mel.split(room, dim=-1)) if mel.shape[-1] else [mel]
+        return [(rid, c, final and i == len(chunks) - 1) for i, c in enumerate(chunks)]
+
+    def _plan_row(self, rid: int, mel: torch.Tensor, final: bool) -> StreamRow | None:
+        state = self.request_state(rid)
+        stream = state.get("stream")
+        if stream is None:
+            stream = CapturedStream()
+            state.add("stream", stream)
+        if mel.shape[-1] == 0 and not final:
+            return None
+        cfg = self.config
+        return plan_stream_row(cfg.hift, stream, mel, final, cfg.hift_context_frames, cfg.hift_tail_frames)
+
+    def _replay(self, rows: list[tuple[int, StreamRow]], runners: Mapping[str, Any]) -> torch.Tensor:
+        """The rows' PCM16 from the smallest captured window that holds them."""
+        cfg = self.config
+        longest = max(row.new_mel.shape[-1] + cfg.hift_tail_frames - row.skip for _, row in rows)
+        for bucket in cfg.hift_capture_frame_buckets:
+            runner = runners.get(vocode_region(bucket))
+            if bucket >= longest and runner is not None and runner.can_run(len(rows)):
+                break
+        else:
+            raise RuntimeError(
+                f"no captured vocoder step holds {len(rows)} rows of {longest} frames: captures were left out for "
+                "memory; free some, or set hift_capture_frame_buckets to [] to run the vocoder eagerly"
+            )
+        device = self.get_device()
+        first = rows[0][1].new_mel
+        new_mel = torch.zeros(len(rows), first.shape[0], bucket, device=device, dtype=first.dtype)
+        for i, (_, row) in enumerate(rows):
+            new_mel[i, :, : row.new_mel.shape[-1]] = row.new_mel
+        counts = torch.empty(len(_VOCODE_COUNTS), len(rows), dtype=torch.long, device=device)
+        self._counts.copy_(
+            counts,
+            [row.new_mel.shape[-1] for _, row in rows]
+            + [row.skip for _, row in rows]
+            + [row.history for _, row in rows]
+            + [row.frames for _, row in rows]
+            + [row.start for _, row in rows]
+            + [row.carry_at for _, row in rows]
+            + [int(row.advance) for _, row in rows],
+        )
+        statics = {"new_mel": new_mel, **dict(zip(_VOCODE_COUNTS, counts, strict=True))}
+        return runner.run(static_inputs=statics, request_ids=[rid for rid, _ in rows], real_bs=len(rows))["pcm"]
+
+    @torch.no_grad()
+    def _run_captured(self, rids, mels, finals, runners: Mapping[str, Any]) -> list[torch.Tensor]:
+        """Each row's new PCM16, a round of replays per chunk of its longest row."""
+        pieces = [self._pieces(r, m, f) for r, m, f in zip(rids, mels, finals, strict=True)]
+        out: list[list[torch.Tensor]] = [[] for _ in rids]
+        for piece in range(max(len(p) for p in pieces)):
+            planned = [
+                (i, self._plan_row(*p[piece])) for i, p in enumerate(pieces) if piece < len(p)
+            ]
+            rows = [(i, row) for i, row in planned if row is not None]
+            if not rows:
+                continue
+            pcm = self._replay([(rids[i], row) for i, row in rows], runners)
+            for k, (i, row) in enumerate(rows):
+                out[i].append(finish_stream_row(self.config.hift, row, pcm[k]))
+        empty = mels[0].new_zeros(0, dtype=torch.int16)
+        return [torch.cat(o) if len(o) > 1 else (o[0] if o else empty) for o in out]
+
+    def _run(self, rids, mels, finals, runners: Mapping[str, Any]) -> list[torch.Tensor]:
+        # no regions: a device with no captures, or none fit in memory
+        if self.config.hift_captured and runners:
+            return self._run_captured(rids, mels, finals, runners)
+        return [self._vocode(r, m, f) for r, m, f in zip(rids, mels, finals, strict=True)]
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
         del batch
@@ -839,20 +1209,77 @@ class HiFTSubmodule(NodeSubmodule):
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]):
         del graph_walk, engine_inputs
-        if len(inputs) == 1:
-            return {**inputs[0].tensor_inputs, **inputs[0].kwargs}
         return {
             MEL: [inp.tensor_inputs[MEL] for inp in inputs],
             "rid": [inp.kwargs["rid"] for inp in inputs],
             "final": [inp.kwargs["final"] for inp in inputs],
         }
 
+    @staticmethod
+    def _runners(engine_inputs) -> Mapping[str, Any]:
+        return engine_inputs.piecewise_runners if engine_inputs is not None else {}
+
     @torch.no_grad()
     def forward(self, graph_walk, engine_inputs, mel, rid, final, **kwargs) -> NameToTensorList:
-        del graph_walk, engine_inputs, kwargs
-        return {AUDIO_CHUNK: [self._vocode(rid, mel, final)]}
+        del graph_walk, kwargs
+        return {AUDIO_CHUNK: [self._run(rid, mel, final, self._runners(engine_inputs))[0]]}
 
     @torch.no_grad()
     def forward_batched(self, graph_walk, engine_inputs, mel, rid, final, **kwargs) -> dict[int, NameToTensorList]:
-        del graph_walk, engine_inputs, kwargs
-        return {r: {AUDIO_CHUNK: [self._vocode(r, m, f)]} for r, m, f in zip(rid, mel, final, strict=True)}
+        del graph_walk, kwargs
+        pcm = self._run(rid, mel, final, self._runners(engine_inputs))
+        return {r: {AUDIO_CHUNK: [p]} for r, p in zip(rid, pcm, strict=True)}
+
+    # -- captured vocode --------------------------------------------------------
+
+    def _vocode_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+        pool = inp.resources[HIFT_STATE]
+        tail = pool.gather(MEL_TAIL_BLOCK, None, label=HIFT_STATE_LABEL)
+        carry = pool.gather(PHASE_CARRY_BLOCK, None, label=HIFT_STATE_LABEL)
+        output = self.hift.vocode_stream(VocodeInputs(**inp.static_inputs), tail, carry)
+        pool.scatter_(MEL_TAIL_BLOCK, output.tail, None, label=HIFT_STATE_LABEL)
+        pool.scatter_(PHASE_CARRY_BLOCK, output.phase_carry, None, label=HIFT_STATE_LABEL)
+        return {"pcm": self._pcm(output.wav)}
+
+    def _vocode_static_inputs(self, shape: PiecewiseCaptureShape, frames: int, device) -> dict[str, torch.Tensor]:
+        dtype = self.hift.conv_pre.weight.dtype
+        counts = {name: torch.zeros(shape.bs, dtype=torch.long, device=device) for name in _VOCODE_COUNTS}
+        return {
+            "new_mel": torch.zeros(shape.bs, self.config.hift.in_channels, frames, dtype=dtype, device=device),
+            **counts,
+        }
+
+    @staticmethod
+    def _vocode_step(request_ids, seq_lens) -> SubmoduleStep:
+        """A row addresses its stream's slot; a padding row the sink."""
+        del seq_lens
+        return SubmoduleStep(
+            steps={
+                HIFT_STATE: RecurrentStep(
+                    segments=tuple(Segment(rid, HIFT_STATE_LABEL, 1) for rid in request_ids)
+                )
+            },
+        )
+
+    def get_piecewise_accelerator_graph_configs(
+        self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any
+    ) -> dict[str, PiecewiseAcceleratorGraphConfig]:
+        """One region per frame bucket, largest first, as the flow's: regions
+        share a pool, and a smaller capture reuses the blocks a larger one freed."""
+        del autocast_dtype, tp_world_size, kwargs
+        cfg = self.config
+        sizes = [bs for bs in cfg.hift_capture_batch_sizes if bs <= cfg.hift_max_batch_size]
+        if not cfg.hift_captured or not sizes:
+            return {}
+        return {
+            vocode_region(frames): PiecewiseBatchedConfig(
+                capture_fn=self._vocode_capture,
+                make_static_inputs=functools.partial(self._vocode_static_inputs, frames=frames, device=device),
+                declare_step=self._vocode_step,
+                seq_len=frames,
+                capture_batch_sizes=sizes,
+                # a stream's state lives in the pool only the captured windows read and write
+                required=True,
+            )
+            for frames in sorted(cfg.hift_capture_frame_buckets, reverse=True)
+        }
