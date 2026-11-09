@@ -2174,6 +2174,27 @@ into one GPU call. A submodule controls this behavior with these methods:
   every ready row fits, it doesn't matter. An admit that runs out of KV pages offloads the row
   last in that same line.
 
+**Walk priorities.** Which (node, walk) a worker's next step goes to is a
+``SchedulingPolicy`` (``mstar/worker/scheduling_policy.py``). By default it is round robin:
+the least recently scheduled key first, and a speculation chain keeps its first step before
+it gives way to other ready work. A model that returns ``WalkPriority`` entries from
+``Model.get_walk_priorities`` gets ``Priority`` instead. An entry names a node (all its
+walks), a walk (all its nodes) or one (node, walk), and where entries overlap the most
+specific decides: a pair over a walk over a node. Keys with ready rows go in priority order,
+round robin among equals, and a chain gives way at once when a key above its own has a row
+the engine would take. That trades the other keys' steps for the listed one's latency, so it
+suits a walk whose steps are short, such as a TTS model's prefill, whose first audio waits on
+it while decode streams have time to spare: list the walk, and every node on it is covered.
+A key that stays ready holds lower ones back for as long as it does, unless they have a
+``max_wait``: a ready key that has gone that many of the worker's chain steps (every step on
+its main chain, side-lane steps not counted) since it last ran goes
+first, longest waiting first, and a chain gives it its next step. A priority on one walk of a
+combined walk lifts the whole combined key in that order, its other walks' rows included, and
+a backlogged key, split over several steps, still finishes first whatever its priority. A
+deployment replaces the entries, sets a default ``max_wait`` or turns priorities off with the
+serving config's ``scheduling`` (see :doc:`serving`). An entry naming nothing the model runs,
+a negative priority, or two entries for the same target refuse the worker's start.
+
 .. _combined-walks:
 
 **Combined walks.** By default a step holds one walk. A model lets several walks of a node
