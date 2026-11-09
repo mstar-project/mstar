@@ -314,3 +314,22 @@ def test_every_chain_step_counts_toward_a_wait_and_side_lane_steps_do_not():
         _ran(sched, NODE, DECODE)  # a chain continuing its own rows is a step too
     _ran(sched, *VAE)
     assert sched.chain_steps == 3 and sched.chain_step_of == {D: 3}
+
+
+def test_a_side_lane_key_gets_no_bound():
+    sched = make_scheduler(side_keys={VAE}, layout_fields={"default_max_wait": 4, "my_walks": frozenset({D, VAE})})
+    assert sched.policy.max_waits == {D: 4}
+
+
+def test_a_wait_counts_the_chain_steps_note_ran_records():
+    """Steps the scheduler didn't build (a chain continuing its own rows) still make
+    a bounded key wait, in the order and at a chain's first step."""
+    sched, runtime = _priority_scheduler({"p0": PREFILL, "d0": DECODE},
+                                         entries=(WalkPriority(NODE, PREFILL, 1), WalkPriority(NODE, DECODE, 0, 3)))
+    _ran(sched, NODE, DECODE)
+    for _ in range(3):
+        _ran(sched, NODE, PREFILL)
+    assert sched.batch_number == 0, "no step was built"
+    assert sched.policy.order({P: [], D: []}, sched) == [D, P]
+    runtime.ready = {"p0", "d0"}
+    assert sched.chain_yields(P, 0, False)

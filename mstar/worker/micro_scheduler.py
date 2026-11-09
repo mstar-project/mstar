@@ -256,7 +256,8 @@ class MicroScheduler:
                 if priority:
                     priorities[key] = max(priorities.get(key, priority), priority)
             key = self._key(node, walk)
-            if bound is not None:
+            # a side-lane key's steps aren't counted, so it keeps round robin
+            if bound is not None and self._lane(key) == CHAIN_LANE:
                 max_waits[key] = min(max_waits.get(key, bound), bound)
         return Priority(priorities, max_waits)
 
