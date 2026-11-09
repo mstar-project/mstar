@@ -55,6 +55,11 @@ from mstar.engine.resources import (
     PositionSpec,
     ResourceReqConfig,
 )
+from mstar.engine.resources.recurrent.config import (
+    RecurrentBlockConfig,
+    RecurrentStateConfig,
+    RecurrentStateSpec,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
@@ -80,6 +85,8 @@ from mstar.model.cosyvoice3.config import (
     END_OF_PROMPT_ID,
     FLOW_NODE,
     HIFT_NODE,
+    HIFT_STATE,
+    HIFT_STATE_LABEL,
     LM_ATTN,
     LM_KV,
     LM_LABEL,
@@ -97,7 +104,9 @@ from mstar.model.cosyvoice3.submodules import (
     MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
+    MEL_TAIL_BLOCK,
     MIN_SPEECH_TOKENS,
+    PHASE_CARRY_BLOCK,
     PREV_TOKEN,
     PROMPT_TOKENS,
     REF_AUDIO,
@@ -133,6 +142,8 @@ MAX_CFM_TIMESTEPS = 100
 MAX_SEED = 2**63 - 1
 MAX_TEMPERATURE = 5.0
 MAX_RAS_WINDOW = 64
+# Requests the vocoder's state pool holds, past any request cap in configs/
+HIFT_STATE_REQUESTS = 128
 
 
 def _sizes(name: str, values: Any) -> tuple[int, ...]:
@@ -166,6 +177,8 @@ class CosyVoice3Model(Model):
         flow_capture_frame_buckets: list[int] | None = None,
         flow_capture_batch_sizes: list[int] | None = None,
         flow_capture_batch_frames: int | None = None,
+        hift_capture_frame_buckets: list[int] | None = None,
+        hift_capture_batch_sizes: list[int] | None = None,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -197,6 +210,25 @@ class CosyVoice3Model(Model):
             cfg.flow_capture_batch_sizes = _sizes("flow_capture_batch_sizes", flow_capture_batch_sizes)
         if flow_capture_batch_frames is not None:
             cfg.flow_capture_batch_frames = _integer("flow_capture_batch_frames", flow_capture_batch_frames, low=0)
+        if hift_capture_frame_buckets is not None:
+            cfg.hift_capture_frame_buckets = _sizes("hift_capture_frame_buckets", hift_capture_frame_buckets)
+        if hift_capture_batch_sizes is not None:
+            cfg.hift_capture_batch_sizes = _sizes("hift_capture_batch_sizes", hift_capture_batch_sizes)
+        if (
+            cfg.hift_captured
+            and cfg.hift_capture_batch_sizes
+            and max(cfg.hift_capture_batch_sizes) < cfg.hift_max_batch_size
+        ):
+            raise ValueError(
+                f"hift_capture_batch_sizes must reach hift_max_batch_size ({cfg.hift_max_batch_size}): "
+                "a vocoder step past the largest capture has no graph to replay"
+            )
+        needed = cfg.hift_tail_frames + cfg.hift.stream_holdback_frames
+        if cfg.hift_captured and max(cfg.hift_capture_frame_buckets) <= needed:
+            raise ValueError(
+                f"the largest hift_capture_frame_buckets must hold more than a stream's {needed} frames of "
+                "tail and pending mel"
+            )
         if max_new_tokens_limit is not None:
             cfg.max_new_tokens_limit = _integer(
                 "max_new_tokens_limit",
@@ -233,9 +265,25 @@ class CosyVoice3Model(Model):
         return 2 + cfg.max_text_tokens + prompt_speech + self._speech_limit
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a request cap the LM KV pool cannot hold: nothing preempts a
-        stream once the pool is full."""
+        """Refuse a request cap the LM KV pool or a stream-state pool cannot hold:
+        nothing preempts a stream once a pool is full."""
         check_kv_pools_fit(self, config, config_path, logger)
+        cap = config.get("max_concurrent_requests")
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+            return  # check_kv_pools_fit reports it
+        from mstar.model.base import serving_resources
+
+        try:
+            specs = serving_resources(self, config)
+        except ValueError:
+            return  # a `resources:` block the validation's resource checks report
+        for spec in specs:
+            if isinstance(spec, RecurrentStateSpec) and spec.config.usable_slots < cap:
+                raise ValueError(
+                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need as many slots "
+                    f"in resources.{spec.resource_key}, which holds {spec.config.usable_slots}; raise its "
+                    "max_slots or lower max_concurrent_requests"
+                )
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         lm = self.config.lm
@@ -246,7 +294,7 @@ class CosyVoice3Model(Model):
             max_seq_len=self._max_seq_len(),
             num_qo_heads=lm.num_attention_heads,
         )
-        return [
+        specs: list[NodeResourceSpec] = [
             KVSpec(resource_key=LM_KV, nodes={LM_NODE}, config=kv),
             AttentionSpec(resource_key=LM_ATTN, nodes={LM_NODE}, config=AttentionConfig(kv_cache=LM_KV)),
             PositionSpec(
@@ -255,6 +303,7 @@ class CosyVoice3Model(Model):
                 config=PositionConfig(kv_cache=LM_KV, rope_theta=lm.rope_theta),
             ),
         ]
+        return specs + hift_state_specs(self.config)
 
     def get_request_resource_configs(
         self,
@@ -809,6 +858,33 @@ class CosyVoice3Model(Model):
         hift.load_weights((k, v.to(device)) for k, v in self._state_dict(self.config.hift_weights))
         hift.keep_f0_predictor_in_float64()
         return HiFTSubmodule(hift.eval(), self.config)
+
+
+def hift_state_specs(config: CosyVoice3Config, dtype: torch.dtype = torch.float32) -> list[NodeResourceSpec]:
+    """What a captured vocoder keeps per stream: its mel tail and phase carry."""
+    if not config.hift_captured:
+        return []
+    hift = config.hift
+    return [
+        RecurrentStateSpec(
+            resource_key=HIFT_STATE,
+            nodes={HIFT_NODE},
+            config=RecurrentStateConfig(
+                num_layers=1,
+                blocks={
+                    MEL_TAIL_BLOCK: RecurrentBlockConfig(
+                        shape=(hift.in_channels, config.hift_tail_frames), dtype=dtype, per_layer=False,
+                    ),
+                    PHASE_CARRY_BLOCK: RecurrentBlockConfig(
+                        shape=(hift.nb_harmonics + 1,), dtype=dtype, per_layer=False,
+                    ),
+                },
+                # a slot per request, and the sink
+                max_slots=HIFT_STATE_REQUESTS + 1,
+                labels=(HIFT_STATE_LABEL,),
+            ),
+        )
+    ]
 
 
 def _parse_dtype(name: str) -> torch.dtype:

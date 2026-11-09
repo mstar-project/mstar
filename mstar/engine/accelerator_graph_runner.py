@@ -254,6 +254,16 @@ def fail_if_graphs_required(missing: list[str]) -> None:
     )
 
 
+def fail_if_required_regions_dropped(missing: list[str]) -> None:
+    """A ``required`` region's shapes left out of capture, which no environment
+    allows: such a region has no eager path to serve them."""
+    if missing:
+        raise RuntimeError(
+            "accelerator graph capture left out " + ", ".join(missing) + ", which their regions "
+            "require (no eager path serves them): free GPU memory, or capture fewer of their shapes"
+        )
+
+
 def _is_packed(config: AcceleratorGraphConfig) -> bool:
     return config.get_config_type() == AcceleratorGraphConfigType.FLASH_INFER_PACKED
 
@@ -1806,6 +1816,10 @@ class PiecewiseAcceleratorGraphRunner:
 
     def set_slot(self, slot: int):
         self._current_slot = slot % self._num_slots
+
+    @property
+    def required(self) -> bool:
+        return self._config.required
 
     @property
     def any_graphs(self) -> bool:
