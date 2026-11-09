@@ -141,6 +141,7 @@ def main(argv: list[str] | None = None) -> None:
     name = deployment(command)
     if name is not None:
         env.setdefault("MSTAR_SIM_NODE", name)
+    print("mstar_sim: emulated CUDA run; timings are not GPU measurements.", file=sys.stderr, flush=True)
     os.execvpe(sys.executable, [sys.executable, *command], env)
 
 

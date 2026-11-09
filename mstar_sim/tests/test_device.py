@@ -240,6 +240,27 @@ def test_a_launch_names_its_processes_clock_table(command, table):
     assert deployment(command) == (str(os.getpid()) if table == "the launcher's pid" else table)
 
 
+@pytest.mark.parametrize("options, data_exists", [
+    ([], False), ([], True), (["--cost", "tables"], True),
+    (["--cost", "roofline"], False), (["--fast"], True),
+    (["--profile-db", "measured.json"], True),
+])
+def test_a_launch_labels_emulated_timings(options, data_exists, monkeypatch, capsys):
+    from mstar_sim import __main__ as launcher
+    from mstar_sim import tables
+
+    monkeypatch.delenv("MSTAR_SIM_COST", raising=False)
+    monkeypatch.setattr(tables, "data_dir", lambda: "/unused/aic-data")
+    monkeypatch.setattr(launcher.os.path, "isdir", lambda path: data_exists)
+    # exec replaces the launcher, so its notice must already be visible then.
+    def execvpe(*args):
+        notice = capsys.readouterr().err.lower()
+        assert "emulated" in notice and "not gpu measurements" in notice
+
+    monkeypatch.setattr(launcher.os, "execvpe", execvpe)
+    launcher.main([*options, "--", "-c", "pass"])
+
+
 def test_graph_replay_costs_its_kernels_and_reprices_value_dependent_ones():
     """A replay costs what its kernels cost eagerly; a kernel priced from the
     values in its arguments (attention over the latest plan) is priced again
