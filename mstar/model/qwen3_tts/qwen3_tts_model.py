@@ -58,6 +58,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -482,6 +483,23 @@ class Qwen3TTSModel(Model):
     # Model ABC: resources
     # -----------------------------------------------------------------------
 
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """Per-request adapters on the Talker: every linear of its stack and the
+        codec-group-0 head (one row per request: the last token's), named as the
+        checkpoint does (``talker.*``) or as the Talker alone does. The text projection
+        takes none: it runs in ``prepare_inputs``, outside the step. The CodePredictor's
+        depth loop and the speaker / codec models are not served."""
+        from mstar.engine.resources.lora import LORA_RESOURCE_KEY
+        from mstar.model.components.lora.modules import PER_SEGMENT, meta_root, module_lora_spec
+        from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
+
+        root = meta_root(lambda group: Qwen3TTSTalkerModel(self.config, comm_group=group))
+        return [module_lora_spec(
+            root, resource_key=LORA_RESOURCE_KEY, nodes={"Talker"}, root_path="model",
+            rows={"codec_head": PER_SEGMENT},
+            exclude={"text_projection": "runs in prepare_inputs, outside the planned step"},
+        )]
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Talker paged KV + attention/position/sampler resources, and the
         Codec's per-stream decoder state.
@@ -710,23 +728,24 @@ class Qwen3TTSModel(Model):
         import torchaudio.functional as audio_functional
 
         from mstar.api_server.media_io import check_resample_rate, read_soundfile_capped
-        from mstar.model.media_limits import read_sound_file, sound_file_seconds
+        from mstar.model.media_limits import decoding_upload, read_sound_file, sound_file_seconds
 
-        # Bound the clip before decoding it: a small compressed file can hold hours of audio.
-        info = soundfile.info(filepath)
         target_rate = self.config.codec.input_sample_rate
-        check_resample_rate(info.samplerate, target_rate)
-        seconds = sound_file_seconds(info.frames, info.samplerate)
-        if seconds is not None:
-            self._check_reference_duration(seconds)
-            # the header can understate the length, so the decode stops at the bound too
-            waveform, sample_rate = read_soundfile_capped(filepath, self.config.reference_max_seconds)
-            audio = torch.from_numpy(waveform)
-        else:
-            # no sample count in the header (a FLAC written to a pipe): count it as it decodes
-            waveform, sample_rate = read_sound_file(filepath, self.config.reference_max_seconds)
-            self._check_reference_duration(len(waveform) / sample_rate)
-            audio = torch.from_numpy(waveform).mean(dim=1)
+        # Bound the clip before decoding it: a small compressed file can hold hours of audio.
+        with decoding_upload(filepath, "the reference audio"):
+            info = soundfile.info(filepath)
+            check_resample_rate(info.samplerate, target_rate)
+            seconds = sound_file_seconds(info.frames, info.samplerate)
+            if seconds is not None:
+                self._check_reference_duration(seconds)
+                # the header can understate the length, so the decode stops at the bound too
+                waveform, sample_rate = read_soundfile_capped(filepath, self.config.reference_max_seconds)
+                audio = torch.from_numpy(waveform)
+            else:
+                # no sample count in the header (a FLAC written to a pipe): count it as it decodes
+                waveform, sample_rate = read_sound_file(filepath, self.config.reference_max_seconds)
+                self._check_reference_duration(len(waveform) / sample_rate)
+                audio = torch.from_numpy(waveform).mean(dim=1)
         if sample_rate != target_rate:
             audio = audio_functional.resample(audio, sample_rate, target_rate)
         return TensorAndMetadata(
@@ -1231,19 +1250,10 @@ class Qwen3TTSModel(Model):
         talker.to_empty(device=device)
 
         # The top-level checkpoint interleaves Talker and CodePredictor under
-        # ``talker.*``. Stream only the non-CodePredictor keys into this model.
-        def talker_weights():
-            for name, tensor in iter_safetensors_shards(
-                self.local_dir, device=device, prefix="talker."
-            ):
-                if not name.startswith("talker.code_predictor."):
-                    yield name.removeprefix("talker."), tensor
-
-        loaded = load_hf_weights(
-            talker,
-            talker_weights(),
-            stacked_params=LLAMA_STACKED_PARAMS,
-        )
+        # ``talker.*``; the Talker's rules drop the CodePredictor's keys.
+        rules = talker.checkpoint_rules()
+        weights = iter_safetensors_shards(self.local_dir, device=device, prefix=rules.prefix)
+        loaded = rules.load(talker, ((name.removeprefix(rules.prefix), t) for name, t in weights))
         cp_prefix = "talker.code_predictor."
         talker_keys = {
             key for key in _checkpoint_keys(self.local_dir, "talker.")

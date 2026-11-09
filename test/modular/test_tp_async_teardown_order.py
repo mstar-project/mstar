@@ -13,13 +13,12 @@ N+1 is sent; a follower still running N defers it, and tears it down once N is d
 it takes N+1. The order matters as well: the free list hands pages back out in the order
 they were freed, so another order gives a follower other page ids than rank 0's.
 
-Drives ``Worker.run`` over stubs. The GPU thread is a stub that holds N+1's admit back until
-a request is torn down, or a while.
+Drives ``Worker.run`` and the real ``StepPipeline`` over stubs. The GPU thread is a stub that holds N+1's admit back
+until a request is torn down, or a while.
 """
 
 from __future__ import annotations
 
-import contextlib
 import sys
 import threading
 from pathlib import Path
@@ -37,6 +36,7 @@ from mstar.utils.ipc_format import (  # noqa: E402
     ScheduleTPNode,
     WorkerMessageType,
 )
+from mstar.worker import step_pipeline as pipeline_mod  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
 from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
 from mstar.worker.stream_buffers import StreamBufferManager  # noqa: E402
@@ -82,8 +82,7 @@ def _step_message(seq: int, **kwargs) -> ScheduleTPNode:
 class _Scheduler:
     """Takes each plain step off the real FIFO, the rows of ``steps[seq]``."""
 
-    def __init__(self, lockstep, serial: bool = False):
-        self.lockstep = lockstep
+    def __init__(self, serial: bool = False):
         self.steps = [STEP_N] + ([[HANDLES["kept"]]] if serial else [])
 
     def next_batch(self, **kwargs):
@@ -98,9 +97,6 @@ class _Scheduler:
 
     def note_ran(self, batch):
         del batch
-
-    def remember_ready(self):
-        return contextlib.nullcontext()
 
     def clear_rid(self, rid):
         pass
@@ -133,9 +129,11 @@ def _rank(
         remove_request=lambda rid: None, get_partition_for_node=lambda node: "p",
     )
     tensor_manager = SimpleNamespace(force_cleanup_request=lambda rid: None)
+    scheduler = _Scheduler(serial)
     w = make_worker(
-        worker_id=f"rank{tp_rank}", is_tp_follower=tp_rank > 0,
-        _graph_runtime=SimpleNamespace(
+        worker_id=f"rank{tp_rank}", is_tp_follower=tp_rank > 0, scheduler=scheduler,
+        profile_info=SimpleNamespace(pop_request=lambda rid: None),
+        graph_runtime=SimpleNamespace(
             get_rid_handle=HANDLES.get, get_rid_string=wire.get,
             get_sharding_config=lambda rid: SimpleNamespace(groups=[group]),
             remove_request=lambda rid: None,
@@ -149,18 +147,15 @@ def _rank(
             barrier_all=lambda: None, restore_default_timeout=lambda: None,
         ),
     )
-    w._max_consecutive_spec, w._launch_wait_s, w._metrics = 1024, 0.0, None
-    w._in_flight_rids = set()
+    scheduler.lockstep = w.lockstep
     for rid, handle in HANDLES.items():
         w.lifecycle.add(handle, rid)
-    w.scheduler = _Scheduler(w.lockstep, serial)
     w.lockstep.enqueue_follow(_step_message(0))
     if serial:
         w.lockstep._no_spec.add(0)
         w.lockstep.enqueue_follow(_step_message(1))
     elif tp_rank:
         w.lockstep.enqueue_follow(_step_message(1, speculative=True, spec_from_seq=0))
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
 
     def _broadcast(node_batch, **kwargs):
         if tp_rank:
@@ -168,7 +163,7 @@ def _rank(
         w.lockstep._broadcast_seq += 1
         return w.lockstep._broadcast_seq - 1
 
-    def _build_speculation(pending, consecutive, fair):
+    def _build_speculation(pending):
         if pending is not None and pending.tp_seq == 1:
             raise _Stop
         if pending is None or tp_rank:
@@ -179,7 +174,6 @@ def _rank(
 
     def _follow(pending):
         w.lockstep.pop_follow_head()
-        w._in_flight_rids |= {HANDLES["kept"]}
         return _speculation(1, [HANDLES["kept"]])
 
     def _gpu(batch, node_batch, plan_future=None):
@@ -198,27 +192,30 @@ def _rank(
             w.ingest._remove_request(body)
 
     w.ingest.process_messages = _process_messages
-    w._build_executing_batch = lambda batch: _batch(
-        batch.tp_seq, list(batch.request_to_worker_graph))[1]
+    w.build_executing = lambda batch: _batch(batch.tp_seq, list(batch.request_to_worker_graph))[1]
+    monkeypatch.setattr(pipeline_mod, "build_executing_batch", lambda services, batch: w.build_executing(batch))
     w.lockstep.broadcast = _broadcast
-    w._build_speculation = _build_speculation
-    w._try_follow_speculation = _follow
-    w._is_tp_follow_pending = lambda pending: bool(tp_rank)
-    w._execute_on_gpu_thread = _gpu
-    w._preplan_spec = lambda pending, spec: False
-    for name in (
-        "_init_engine_thread", "_report_failures", "_set_in_flight_flag",
-        "_clear_in_flight_flag", "_thread_outputs_to_speculative", "_settle_speculation",
-        "_postprocess_batch",
-    ):
-        setattr(w, name, lambda *a, **k: None)
+    w.speculator.build = _build_speculation
+    w.speculator.follow = _follow
+    w.speculator.is_tp_follow_pending = lambda pending: bool(tp_rank)
+    w.executor._body = _gpu
+    w.executor._preplan_spec = lambda pending, spec: False
+
+    def _nothing(*a, **k):
+        return None
+
+    w.pipeline._report_failures = _nothing
+    for name in ("_init_engine_thread", "_set_in_flight", "clear_in_flight", "postprocess"):
+        setattr(w.executor, name, _nothing)
+    for name in ("thread_outputs", "settle"):
+        setattr(w.speculator, name, _nothing)
     for name in ("check_ready_tensors", "poll_stream_buffers"):
-        setattr(w.ingest, name, lambda *a, **k: None)
+        setattr(w.ingest, name, _nothing)
 
     def _fail_loudly(error, *args):
         raise error
 
-    w._handle_main_loop_error = _fail_loudly
+    w.pipeline._handle_error = _fail_loudly
     return w, log
 
 
@@ -246,7 +243,6 @@ def test_rank_0_holds_a_removal_until_a_step_carries_its_journal(monkeypatch):
     replays the drop with the next step and tears "idle" down after the step the removal is stamped with, so rank 0
     holds the removal until N goes out with the drop."""
     w, log = _rank(monkeypatch, tp_rank=0, inbox=[[RemoveRequest(request_id="idle")]])
-    w.parallel_nodes = w.parallel_leader_nodes = {NODE}
     w.lockstep._led, w.lockstep._followers = frozenset({NODE}), {NODE: ["rank1"]}
     owed = set()
     w.engine_manager.get_engine = lambda node: SimpleNamespace(owes_moves=lambda: bool(owed))
@@ -277,7 +273,8 @@ def test_a_follower_tears_down_what_a_head_with_no_rows_released_before_it_build
     w.lifecycle.add(HANDLES["gone"], "gone")
     removal = RemoveRequest(request_id="gone", source=MessageSource.TP_RANK_0, after_tp_seq=0)
     w.lifecycle.remove(HANDLES["gone"], removal, w.lockstep.last_consumed_seq)
-    w._tear_down_request = lambda rid: log.append(("teardown", w.lifecycle.wire_of(rid)))
+    wire = {handle: rid for rid, handle in HANDLES.items()}
+    w.pipeline._tear_down_request = lambda rid: log.append(("teardown", wire[rid]))
 
     def _next_batch(exclude_target=None):
         if exclude_target is not None:
@@ -287,9 +284,9 @@ def test_a_follower_tears_down_what_a_head_with_no_rows_released_before_it_build
         log.append(("built", 1))
         return "N+1"
 
-    w.scheduler = SimpleNamespace(next_batch=_next_batch)
+    w.pipeline.scheduler = SimpleNamespace(next_batch=_next_batch)
 
-    assert w._next_batch((NODE, WALK)) == "N+1"
+    assert w.pipeline._next_batch((NODE, WALK)) == "N+1"
     assert log == [("took", 0), ("teardown", "gone"), ("built", 1)], "N+1 would admit with gone's pages held here"
 
 
@@ -311,15 +308,15 @@ def test_a_follower_holds_a_stamped_removal_until_it_has_consumed_the_step(monke
     w, log = _rank(monkeypatch, tp_rank=1, inbox=[])
     w.ingest._remove_request(removal)
 
-    w._teardown(w._in_flight_rids)
+    w.pipeline._teardown(w.pipeline.in_flight_rids)
     assert ("teardown", "idle") not in log, log
 
     w.lockstep.pop_follow_head()  # N
-    w._teardown(w._in_flight_rids)
+    w.pipeline._teardown(w.pipeline.in_flight_rids)
     assert ("teardown", "idle") not in log, log
 
     w.lockstep.pop_follow_head()  # N+1
-    w._teardown(w._in_flight_rids)
+    w.pipeline._teardown(w.pipeline.in_flight_rids)
     assert [entry for entry in log if entry[0] == "teardown"] == [("teardown", "idle")], log
 
 
@@ -404,7 +401,7 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
     # N+1 is voided, so after it the serial path's next step is N+2
     w.scheduler.steps += [None, [HANDLES["kept"]]]
     w.lockstep.enqueue_follow(_step_message(2))
-    build_executing, build_speculation = w._build_executing_batch, w._build_speculation
+    build_executing, build_speculation = w.build_executing, w.speculator.build
 
     def _executing(batch):
         node_batch = build_executing(batch)
@@ -412,23 +409,23 @@ def test_a_follower_that_drops_a_step_tears_down_before_it_takes_the_next(monkey
             node_batch.failed_requests = {HANDLES["also"]: "failed"}
         return node_batch
 
-    def _speculation_or_stop(pending, consecutive, fair):
+    def _speculation_or_stop(pending):
         if pending is not None and pending.tp_seq == 2:
             raise _Stop
-        return build_speculation(pending, consecutive, fair)
+        return build_speculation(pending)
 
-    follow = w._try_follow_speculation
+    follow = w.speculator.follow
 
     def _follow(pending):
         spec = follow(pending)
         spec.continuing_rids = {HANDLES["kept"]}
         return spec
 
-    w._build_executing_batch = _executing
-    w._build_speculation = _speculation_or_stop
-    w._try_follow_speculation = _follow
-    w._drop_failed_rids = lambda *args: None
-    w._reset_skip_plan_flags = lambda node_batch: None
+    w.build_executing = _executing
+    w.speculator.build = _speculation_or_stop
+    w.speculator.follow = _follow
+    w.executor.drop_failed_rids = lambda *args: None
+    w.executor.reset_skip_plan_flags = lambda node_batch: None
     w._graph_runtime.push_back_node = lambda *args: None
     _run(w)
 
@@ -439,7 +436,7 @@ def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
     """The fence waits past any number of warning intervals; it never gives up.
     A lone-rank step (``tp_seq=-1``) is the case that used to."""
     tp_seq = -1
-    monkeypatch.setattr(worker_mod, "_ADMIT_FENCE_WARN_S", 0.001)
+    monkeypatch.setattr(pipeline_mod, "_ADMIT_FENCE_WARN_S", 0.001)
     admitted = threading.Event()
     warnings = []
 
@@ -448,7 +445,7 @@ def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
         if len(warnings) == 3:
             admitted.set()  # the admit lands during the third interval
 
-    monkeypatch.setattr(worker_mod.logger, "warning", warn)
+    monkeypatch.setattr(pipeline_mod.logger, "warning", warn)
     w = make_worker(worker_id="rank0")
     _, executing = _batch(tp_seq, [HANDLES["kept"]])
     executing.launch_started_event = admitted
@@ -456,6 +453,6 @@ def test_the_admit_fence_waits_out_a_slow_admit(monkeypatch):
         tp_seq=tp_seq, node_name=NODE, graph_walk=WALK, node_batch=executing,
     )
 
-    w._await_admit_settled(pending)
+    w.pipeline._await_admit_settled(pending)
 
     assert admitted.is_set() and len(warnings) == 3

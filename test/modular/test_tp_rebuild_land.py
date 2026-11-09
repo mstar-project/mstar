@@ -7,9 +7,9 @@ Under MSTAR_KV_DEBUG_ASSERTS the follower's page trail then differs from rank 0'
 stops.
 
 Two ranks with real KV pools and rebuild logs drop v, rebuild it over N and N+1, and the follower checks rank 0's
-trail on the step after. The follower builds N+1 with the real `Worker._try_follow_speculation`, or with
+trail on the step after. The follower builds N+1 with the real `Speculator.follow`, or with
 `MicroScheduler._try_schedule_tp_follow` when rank 0 sends N+1 after N, and both ranks post-process with the real
-`Worker._finish_rebuild_rows`.
+`StepExecutor._finish_rebuild_rows`.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rebuild import KeptIds, LayoutRow, Rebuilds
-from mstar.worker.speculation import SpeculationBuilder, SpeculationContext
 from mstar.worker.stream_buffers import StreamBufferManager
 
 # v's rebuild writes its 5-page prompt: three pages in N and the rest in N+1
@@ -70,16 +69,12 @@ class _Rank:
             get_consumed_edges=lambda node, spec_node, walk: frozenset(),
         )
         w = self.worker = make_worker(
-            _rebuilds=self.rebuilds, scheduler=self.scheduler, lockstep=self.lockstep,
+            rebuilds=self.rebuilds, scheduler=self.scheduler, lockstep=self.lockstep,
             admission=self.scheduler.admission, engine_manager=engine_manager, request_state=request_state,
-            streams=streams, tensor_manager=tensors, _graph_runtime=graph_runtime,
+            streams=streams, tensor_manager=tensors, graph_runtime=graph_runtime,
         )
-        w._wait_for_step = lambda batch_N: None
-        w._preemption = SimpleNamespace(rebuilt=lambda rid, node, tokens: None)
-        w._spec_builder = SpeculationBuilder(SpeculationContext(
-            graph_runtime=graph_runtime, tensor_manager=tensors, request_state=request_state,
-            scheduler=self.scheduler, streams=streams, engine_manager=engine_manager,
-        ))
+        w.executor.wait_for_step = lambda batch_N: None
+        w.executor.preemption = SimpleNamespace(rebuilt=lambda rid, node, tokens: None)
 
     def post_process(self, batch: ScheduledBatch) -> None:
         rows = list(batch.request_to_worker_graph)
@@ -87,7 +82,7 @@ class _Rank:
             request_ids=rows, skipped_rids=set(), cached_rids=set(), per_request_info=dict.fromkeys(rows),
         )
         pending = SimpleNamespace(batch=batch, node_batch=node_batch, node_name=NODE)
-        self.worker._finish_rebuild_rows(pending, {})
+        self.worker.executor._finish_rebuild_rows(pending, {})
 
 
 def _step(seq: int, chunks=CHUNKS) -> ScheduledBatch:
@@ -135,7 +130,7 @@ def test_a_rebuild_over_two_steps_lands_on_the_follower_with_rank_0s(monkeypatch
         lockstep.enqueue_follow(_head(lead, 2, ["v"], speculative=True, spec_from_seq=1))
         pending = SimpleNamespace(tp_seq=1, node_name=NODE, graph_walk=PREFILL, batch=n, partition="p",
                                   node_batch=SimpleNamespace(commit_done=SimpleNamespace(is_set=lambda: True)))
-        n_1 = one.worker._try_follow_speculation(pending).scheduled_batch
+        n_1 = one.worker.speculator.follow(pending).scheduled_batch
         zero.post_process(_step(1))
         one.post_process(n)
     else:

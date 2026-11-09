@@ -87,7 +87,7 @@ def _worker(is_tp_follower=False) -> Worker:
     request_state = RequestStateManager(node_to_partition={NODE: "default"})
     w = make_worker(
         worker_id=WORKER, is_tp_follower=is_tp_follower, tensor_manager=tensor_manager,
-        _graph_runtime=runtime, request_state=request_state,
+        graph_runtime=runtime, request_state=request_state,
         engine_manager=SimpleNamespace(
             add_request=lambda rid, cfgs, info: None,
             remove_request=lambda rid: None,
@@ -97,10 +97,8 @@ def _worker(is_tp_follower=False) -> Worker:
         communicator=SimpleNamespace(send=lambda *a, **k: None),
         wakeup_event=SimpleNamespace(register_futures=lambda f: None),
         streams=StreamBufferManager(request_state, tensor_manager, []),
+        profile_info=SimpleNamespace(pop_request=lambda rid: None),
     )
-    w.profile_info = SimpleNamespace(pop_request=lambda rid: None)
-    w._in_flight_rids = set()
-    w.enable_nvtx = False
     return w
 
 

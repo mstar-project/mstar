@@ -1,7 +1,8 @@
 """Where each request is in its lifecycle on this worker.
 
 Bookkeeping only: this records what arrived and answers which requests can be
-torn down or ACKed now, and calls no other component. The worker runs the
+torn down or ACKed now. It asks the graph runtime, which owns the handle <-> wire
+id table, to translate, and calls no other component. The worker runs the
 teardowns.
 
 Removes and drains are recorded when their message arrives, and applied at the
@@ -11,7 +12,7 @@ outstanding.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Set
 
 from mstar.utils.containers import RecentSet
 from mstar.utils.ipc_format import (
@@ -32,15 +33,18 @@ logger = logging.getLogger(__name__)
 # another NEW_REQUEST.
 _REMOVED_RIDS_KEEP = 4096
 
+# `no_new_work` with nothing to exclude, so a scan with no teardown allocates nothing
+_NONE: frozenset[int] = frozenset()
+
 
 class RequestLifecycle:
-    def __init__(self, layout: WorkerLayout):
+    def __init__(self, layout: WorkerLayout, graph_runtime):
         self._is_tp_follower = layout.is_tp_follower
+        self._runtime = graph_runtime
 
-        # handle <-> wire id of each request on this worker
-        self._wires: dict[int, str] = {}
-        self._handles: dict[str, int] = {}
-        # rid -> the order requests arrived at this worker in
+        # rid -> the order requests arrived at this worker in. Also which rids
+        # are admitted here and not yet torn down: the runtime keeps a handle
+        # past `removed`, until the teardown's last step frees it.
         self.arrivals: dict[int, int] = {}
         self._arrived = 0
 
@@ -76,9 +80,7 @@ class RequestLifecycle:
         """A NEW_REQUEST, of which a request with several partitions here sends
         one per partition: it keeps its first arrival. Its parked messages
         stay parked until ``take_parked``."""
-        if rid not in self._wires:
-            self._wires[rid] = wire_rid
-            self._handles[wire_rid] = rid
+        if rid not in self.arrivals:
             self._arrived += 1
             self.arrivals[rid] = self._arrived
         if wire_rid in self.draining or wire_rid in self.pending_drains:
@@ -107,9 +109,6 @@ class RequestLifecycle:
         After READS_DONE the producer may free what it sent."""
         return wire_rid not in self._reads_done_sent
 
-    def wire_of(self, rid: int) -> str:
-        return self._wires[rid]
-
     # -- failure -------------------------------------------------------------
 
     def fail(self, errors: dict[int, str]) -> None:
@@ -117,7 +116,7 @@ class RequestLifecycle:
         dropped: the conductor answers a failure with the REMOVE that clears the
         entry, and it sends none for a request it no longer knows."""
         for rid, msg in errors.items():
-            if rid in self._wires:
+            if rid in self.arrivals:
                 self.failed_rids.add(rid)
                 # the first error is the specific one; a step's generic one can follow it
                 self._unreported.setdefault(rid, msg)
@@ -169,8 +168,6 @@ class RequestLifecycle:
         """Forget a request that was torn down, or never admitted (``rid`` None).
         Returns the messages that were parked for it, for the caller to drop."""
         if rid is not None:
-            self._wires.pop(rid, None)
-            self._handles.pop(wire_rid, None)
             self.arrivals.pop(rid, None)
             self.failed_rids.discard(rid)
             self.pending_removes.pop(rid, None)
@@ -202,7 +199,7 @@ class RequestLifecycle:
         and forwards nothing."""
         if (
             not self._is_tp_follower or body.source == MessageSource.TP_RANK_0
-            or body.request_id not in self._handles
+            or self._handle(body.request_id) is None
         ):
             self.pending_drains.add(body.request_id)
 
@@ -212,13 +209,13 @@ class RequestLifecycle:
         under it would race the GPU thread."""
         if not self.pending_drains:
             return []
-        handle = self._handles.get
+        handle = self._handle
         return [wire for wire in self.pending_drains if handle(wire) not in in_flight]
 
     def begin_drain(self, wire_rid: str) -> int | None:
         """Take no new work for the request. Its handle, if it has been admitted."""
         self.pending_drains.discard(wire_rid)
-        rid = self._handles.get(wire_rid)
+        rid = self._handle(wire_rid)
         if rid is not None:
             self.failed_rids.add(rid)
         self.draining.add(wire_rid)
@@ -229,12 +226,17 @@ class RequestLifecycle:
         request was never admitted, so it holds no handle-keyed state)."""
         if not self.draining:
             return []
-        handle = self._handles.get
+        handle = self._handle
         return [(w, handle(w)) for w in self.draining if w not in self._reads_done_sent]
 
     def reads_done(self, wire_rid: str) -> None:
         """READS_DONE went out. The rid stays draining until its remove."""
         self._reads_done_sent.add(wire_rid)
+
+    def _handle(self, wire_rid: str) -> int | None:
+        """``wire_rid``'s handle while it is admitted here, else None."""
+        rid = self._runtime.get_rid_handle(wire_rid)
+        return rid if rid in self.arrivals else None
 
     # -- queries --------------------------------------------------------------
 
@@ -246,31 +248,43 @@ class RequestLifecycle:
             or self.pending_drains or self.draining
         )
 
+    def no_new_work(self, *also: Iterable[int]) -> Set[int]:
+        """The rids a scan gives no new step: failed or with a remove pending,
+        plus ``also``'s. Unlike `closing`, a drain counts only once begun, when
+        it marks its rid failed."""
+        if not also and not self.failed_rids and not self.pending_removes:
+            return _NONE
+        return self.failed_rids.union(self.pending_removes, *also)
+
+    def closing(self, rid: int, wire_rid: str | None) -> bool:
+        """Whether ``rid`` (``wire_rid`` on the wire) is on its way out:
+        `no_new_work`'s, or with a drain pending or begun."""
+        return (
+            rid in self.pending_removes or rid in self.failed_rids
+            or wire_rid in self.pending_drains or wire_rid in self.draining
+        )
+
     def is_tearing_down(self, rid: int) -> bool:
-        """Removed, aborted or failed: no further speculative work for ``rid``.
+        """`closing`, for a rid without its wire id: no further speculative
+        work for ``rid``.
 
         A deferred drain only fires once no step holds the rid, and a same-node
         speculation chain keeps holding it every step, so a drain the chain does
         not see would never fire and the rollout would run to ``max_iters`` for
         a client that has gone."""
-        if rid in self.pending_removes or rid in self.failed_rids:
-            return True
-        wire = self._wires.get(rid)
-        return wire in self.pending_drains or wire in self.draining
+        wire = None
+        if (self.pending_drains or self.draining) and rid in self.arrivals:
+            wire = self._runtime.get_rid_string(rid)
+        return self.closing(rid, wire)
 
     def publishable(self, batch) -> list[int]:
         """The rows of a landed step that may publish: no late KV snapshot for a
         request on its way out, whose remove waits behind this very step, and
         none for a rebuild row, whose request keeps the publication from before
         its drop. Called on the GPU thread, so it reads these live."""
-        removing, failed = self.pending_removes, self.failed_rids
-        pending_drains, draining = self.pending_drains, self.draining
+        closing, rebuild_rids = self.closing, batch.step_context.rebuild_rids
         return [
             rid for rid in batch.request_ids
             if (info := batch.per_request_info.get(rid)) is not None
-            if rid not in removing
-            and rid not in batch.step_context.rebuild_rids
-            and rid not in failed
-            and info.request_id not in pending_drains
-            and info.request_id not in draining
+            if rid not in rebuild_rids and not closing(rid, info.request_id)
         ]

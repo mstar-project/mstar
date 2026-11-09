@@ -18,16 +18,16 @@ from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.utils.ipc_format import ScheduleTPNode
 from mstar.worker.chunk_loops import ChunkLoops
 from mstar.worker.scheduled_batch import ScheduledBatch
+from mstar.worker.speculation import Speculator
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker
 
 NODE, MIXED = "LLM", "mixed"
 _ENGINE = SimpleNamespace(residency=lambda node, rid: Residency.RESIDENT)
 
 
-def _follower(head: ScheduleTPNode) -> Worker:
-    """A real ``Worker`` with only what ``_try_follow_speculation`` reads, as
-    far as assembling the step."""
+def _follower(head: ScheduleTPNode) -> Speculator:
+    """A real ``Speculator`` with only what ``follow`` reads, as far as
+    assembling the step."""
     capped = []
     scheduler = make_scheduler(
         engine_manager=SimpleNamespace(get_engine=lambda node: _ENGINE), parallel_leader_nodes=set(),
@@ -37,44 +37,44 @@ def _follower(head: ScheduleTPNode) -> Worker:
             set_loop_caps=lambda node, rids, walks, loops, caps: capped.extend(zip(rids, caps, strict=True)),
         ),
     )
-    worker = make_worker(
-        worker_id="worker_1", scheduler=scheduler, lockstep=scheduler.lockstep, admission=scheduler.admission,
-    )
-    worker.lockstep.enqueue_follow(head)
-    worker.capped = capped
-    worker.prepped = []
+    prepped = []
 
     def prep(prep_input):
-        worker.prepped.append(list(prep_input.rids))
+        prepped.append(list(prep_input.rids))
         return SpeculationPrepOutput(
             consumed_streaming_edge_idxs=[], ready_rids=list(prep_input.rids),
             wg_ids=[0] * len(prep_input.rids), input_edges=ColumnarEdgeSpecs.empty(),
         )
 
-    worker._graph_runtime = SimpleNamespace(
-        get_spec_target=lambda *args: SimpleNamespace(node_name=NODE, graph_walk="decode"),
-        prep_follow_spec_rids=prep,
+    tensor_manager = SimpleNamespace(get_tensor=lambda uuid: uuid, get_tensors=list)
+    request_state = SimpleNamespace(per_request_info={})
+    worker = make_worker(
+        worker_id="worker_1", scheduler=scheduler, lockstep=scheduler.lockstep, admission=scheduler.admission,
+        graph_runtime=SimpleNamespace(
+            get_spec_target=lambda *args: SimpleNamespace(node_name=NODE, graph_walk="decode"),
+            prep_follow_spec_rids=prep,
+        ),
+        tensor_manager=tensor_manager,
+        request_state=request_state,
+        # no connections: nothing to poll, and the step's edges read as they are
+        streams=StreamBufferManager(request_state, tensor_manager, []),
     )
-    worker.tensor_manager = SimpleNamespace(
-        get_tensor=lambda uuid: uuid, get_tensors=list,
-    )
-    worker.request_state = SimpleNamespace(per_request_info={})
-    worker._in_flight_rids = set()
-    worker.assembled = {}
-
-    # no connections: nothing to poll, and the step's edges read as they are
-    worker.streams = StreamBufferManager(worker.request_state, worker.tensor_manager, [])
+    follower = worker.speculator
+    follower.lockstep.enqueue_follow(head)
+    follower.capped = capped
+    follower.prepped = prepped
+    follower.assembled = {}
 
     def assemble(pending, target, rid_to_wg, inputs, consumed, continuing, fresh_final, **kwargs):
-        worker.assembled = dict(rid_to_wg=rid_to_wg, inputs=inputs, continuing=list(continuing), **kwargs)
+        follower.assembled = dict(rid_to_wg=rid_to_wg, inputs=inputs, continuing=list(continuing), **kwargs)
         batch = ScheduledBatch(
             node_name=NODE, graph_walk=MIXED, request_to_worker_graph=dict(rid_to_wg),
             request_walks=kwargs["request_walks"] or {}, chunk_ranges=kwargs["chunk_ranges"],
         )
         return SimpleNamespace(continuing_rids=set(continuing), node_batch=SimpleNamespace(), scheduled_batch=batch)
 
-    worker._spec_builder = SimpleNamespace(assemble=assemble)
-    return worker
+    follower._spec_builder = SimpleNamespace(assemble=assemble)
+    return follower
 
 
 def _pending(batch_n: ScheduledBatch) -> SimpleNamespace:
@@ -104,7 +104,7 @@ def test_a_follower_runs_a_row_mid_prefill_as_the_leader_does():
     )
     follower = _follower(head)
 
-    speculation = follower._try_follow_speculation(_pending(_batch_n()))
+    speculation = follower.follow(_pending(_batch_n()))
 
     assert follower.prepped == [["d0"]]
     assert follower.assembled["continuing"] == ["d0"], "the leader advances no loop for a row mid-prefill"
@@ -124,7 +124,7 @@ def test_a_followers_last_chunk_ends_its_prompt_as_the_leaders_does():
     )
     follower = _follower(head)
 
-    follower._try_follow_speculation(_pending(_batch_n()))
+    follower.follow(_pending(_batch_n()))
 
     assert follower.assembled["chunk_ranges"] == {"p0": (4, 10, 10, 6)}
     assert follower.assembled["incomplete_node_rids"] == set()
@@ -140,7 +140,7 @@ def test_a_follower_refuses_a_speculative_head_whose_chunks_do_not_match_its_row
     follower = _follower(head)
 
     with pytest.raises(ValueError):
-        follower._try_follow_speculation(_pending(_batch_n()))
+        follower.follow(_pending(_batch_n()))
 
     assert follower.prepped == []
     assert follower.lockstep.follow_head() is head
@@ -160,7 +160,7 @@ def test_a_follower_caps_a_fresh_rows_loop_on_its_first_chunk_as_the_leader_does
         wg_ids={"p1": 0}, edge_specs=ColumnarEdgeSpecs.empty(),
     )
 
-    follower._try_follow_speculation(_pending(_batch_n()))
+    follower.follow(_pending(_batch_n()))
 
     assert follower.assembled["chunk_ranges"]["p1"] == (2, 6, 12, 6)
     assert follower.capped == [("p1", 12)]

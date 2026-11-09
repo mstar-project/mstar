@@ -16,6 +16,7 @@ from mstar.engine.resources.attn.config import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
+    BlockCausalAttentionSpec,
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "RequestOffloading",
     "AttentionConfig",
     "AttentionSpec",
+    "BlockCausalAttentionSpec",
     "AttentionStep",
     "AttnBackend",
     "BucketKey",

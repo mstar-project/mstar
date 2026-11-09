@@ -8,7 +8,7 @@ ever reschedule that batch — followers cannot initiate scheduling for
 parallel nodes — so whoever pops it must submit it unconditionally.
 
 The chain's step (``pick_chain_step`` / ``take_chain_step``, which
-``worker._try_speculate_next`` merges) is a discretionary consumer: it may
+``Speculator._try_speculate_next`` merges) is a discretionary consumer: it may
 reject rids from the batch it is handed (the "in-flight rid wins" branch).
 Handing it a TP-follow batch therefore risks stranding a popped
 ScheduleTPNode with no re-queue path, hanging the whole TP group at the next
