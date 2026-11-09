@@ -21,10 +21,11 @@ class RebuildPolicy:
     ``sample_output`` is the output that carries the one id a row samples, and ``loop`` the loop each of
     whose iterations samples one.
 
-    ``pad_ids`` are the ids a step replaces with the encoders' outputs, one row each in order. A request with host
-    copies that samples one is never dropped after, since its rebuild row would hold a pad its host copies have no
-    row for, and every row after it in the step would read the wrong encoder rows. A walk of ids alone runs with no
-    encoder output, so a pad in its rebuild row is embedded as the decode step embedded it.
+    ``pad_ids`` are the ids a step replaces with the encoders' outputs, one row each in order. A request whose last
+    prefill step read more than its ids and that samples one is never dropped after, since the rebuild row of that
+    step would hold a pad its host copies have no row for, and every row after it in the step would read the wrong
+    encoder rows. A step of ids alone runs with no encoder output, so a pad in its rebuild row is embedded as the
+    decode step embedded it.
     """
     walks: frozenset[str]
     ids_input: str
