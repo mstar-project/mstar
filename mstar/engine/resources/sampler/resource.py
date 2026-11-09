@@ -48,7 +48,7 @@ class SamplerResource(Resource):
     def __init__(
         self,
         vocab_size: int | None,
-        enable_repetion_penalty: bool,
+        enable_repetition_penalty: bool,
         device: torch.device,
         comm_group: JointGroups | None=None,
         enable_min_p: bool = False,
@@ -60,7 +60,7 @@ class SamplerResource(Resource):
         enable_processed_logprobs: bool = False,
         greedy_capture: bool | None = None,
     ):
-        self._track_seen_tokens = enable_repetion_penalty
+        self._track_seen_tokens = enable_repetition_penalty
         self._loopback_state = dict(loopback_state or {})
         self._enable_min_p = enable_min_p
         self._enable_logprobs = enable_logprobs
@@ -119,9 +119,9 @@ class SamplerResource(Resource):
         # traffic is bs x [vocab] copies plus a [bs, vocab] gather per step, all
         # off-graph on the GPU thread's critical path, so dropping it when it
         # cannot matter is the whole point of the split.
-        self._apply_penalty_this_step: bool = enable_repetion_penalty
+        self._apply_penalty_this_step: bool = enable_repetition_penalty
         self._apply_filters_this_step: bool = True
-        self._penalty_needed_this_step: bool = enable_repetion_penalty
+        self._penalty_needed_this_step: bool = enable_repetition_penalty
         # Resident requests that asked for a penalty. Held as a set rather than
         # recomputed per step: `admit` is on the per-step path and this only
         # moves on ingest/remove.
@@ -191,7 +191,7 @@ class SamplerResource(Resource):
     def build(cls, spec: SamplerSpec, info: EngineResourceInfo):
         return cls(
             vocab_size=spec.vocab_size,
-            enable_repetion_penalty=spec.enable_repetion_penalty,
+            enable_repetition_penalty=spec.enable_repetition_penalty,
             device=info.device,
             comm_group=info.joint_comm_group,
             enable_min_p=spec.enable_min_p,

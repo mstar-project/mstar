@@ -6,6 +6,7 @@ import torch
 from jinja2 import TemplateError
 
 from mstar.api_server.openai.adapters import flatten_messages
+from mstar.conductor.conductor import Conductor
 from mstar.graph.base import Loop
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
 
@@ -21,12 +22,21 @@ def _decode(m: Glm5NextModel) -> Loop:
     return decode
 
 
-def test_budget_and_loop_cap_are_held_to_the_window():
-    m = _model()
+@pytest.mark.parametrize("k", [0, 3])
+def test_a_budget_past_the_window_is_refused_not_clamped(k):
+    m = _model(mtp_num_draft_tokens=k)
     topk = m.config.index_topk
-    assert m.get_max_output_tokens(max_output_tokens=10_000) == topk
-    # a one-token prompt's context reaches index_topk after topk - 1 iterations
+    # a one-token prompt's context reaches index_topk after topk - 1 iterations; the prefill
+    # emits the first token
     assert _decode(m).max_iters == topk - 1
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = m
+    conductor._loop_max_iters = {"decode_loop": _decode(m).max_iters}
+    assert conductor._max_output_tokens({"max_output_tokens": 10_000}) == 10_000
+    assert conductor._loop_caps({"max_output_tokens": topk}) == {"decode_loop": topk - 1}
+    for over in (topk + 1, 10_000):
+        with pytest.raises(ValueError, match=f"runs at most {topk - 1}"):
+            conductor._loop_caps({"max_output_tokens": over})
 
 
 def test_mtp_loop_cap_is_held_to_the_cache_rows():

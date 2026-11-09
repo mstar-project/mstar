@@ -94,6 +94,30 @@ from mstar.model.vjepa2.weight_loader import (
 
 logger = logging.getLogger(__name__)
 
+# Every model_kwargs key a request may carry.
+REQUEST_KWARGS = frozenset({
+    "num_frames", "skip_predictor", "rollout_horizon", "stream_rollout", "mpc",
+    "actions", "states", "extrinsics", "goal_hidden", "goal_hidden_fill", "context_mask", "target_mask",
+})
+
+
+def _flag(kwargs: dict | None, key: str) -> bool:
+    """A boolean request flag; absent or null is False, anything but a bool is a ``ValueError``."""
+    value = (kwargs or {}).get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false; got {value!r}")
+    return value
+
+
+def _as_tensor(kwargs: dict, key: str, dtype: torch.dtype) -> torch.Tensor:
+    """A client array as a tensor; a non-numeric or ragged one is a ``ValueError``."""
+    try:
+        return torch.as_tensor(kwargs[key], dtype=dtype)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"{key} must be a numeric array; {exc}") from None
+
 
 # ImageNet normalization constants (match HF ``IMAGENET_DEFAULT_MEAN``/``STD``).
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -684,6 +708,8 @@ class VJepa2Model(Model):
         (and optionally ``extrinsics``) through ``**kwargs``.
         """
         out: NameToTensorList = {}
+        rollout_horizon = self._rollout_horizon(kwargs)
+        mpc = _flag(kwargs, "mpc")
         rollout = self._initial_walk(kwargs) in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING)
         num_tokens = None  # the encoder's output tokens, which the predictor masks index
 
@@ -692,14 +718,19 @@ class VJepa2Model(Model):
             sampled = meta.get("sampled_indices")
             if sampled is None:
                 raise ValueError("V-JEPA 2 decodes the frames its load_video sampled; this video has no such metadata")
-            # Per-request override of the frame budget (e.g. to experiment
-            # with longer clips on larger GPUs); defaults to the model's
-            # pretraining frames_per_clip. Clamped to whatever frames were
-            # sampled (fewer than frames_per_clip if the source video was
-            # short — e.g. AC rollout requests with the F-8 /
-            # droid-256px-8f workload ship 8-frame clips).
-            target_frames = int(kwargs.get("num_frames", self.config.frames_per_clip))
-            target_frames = min(target_frames, len(sampled))
+            # Per-request frame budget, at most what load_video sampled
+            # (frames_per_clip, or fewer for a short clip such as the 8-frame
+            # AC rollout workload). Absent, it is all of them.
+            available = len(sampled)
+            target_frames = kwargs.get("num_frames")
+            if target_frames is None:
+                target_frames = available
+            elif isinstance(target_frames, bool) or not isinstance(target_frames, int) \
+                    or not 1 <= target_frames <= available:
+                raise ValueError(
+                    f"num_frames must be an integer in [1, {available}] (the frames sampled from "
+                    f"this video, at most frames_per_clip={self.config.frames_per_clip}); got {target_frames!r}"
+                )
             keep = _sample_frames_uniform(torch.arange(len(sampled)), target_frames).tolist()
             if self.config.predictor_kind == "ac" and rollout:
                 # AC rollout encoder context: AC_ROLLOUT_NUM_FRAMES frames, as
@@ -727,8 +758,8 @@ class VJepa2Model(Model):
             states = kwargs.get("states")
             if actions is None or states is None:
                 raise ValueError("V-JEPA 2-AC requires 'actions' and 'states' kwargs (per-timestep tensors).")
-            out["actions"] = [torch.as_tensor(actions, dtype=torch.float32)]
-            out["states"] = [torch.as_tensor(states, dtype=torch.float32)]
+            out["actions"] = [_as_tensor(kwargs, "actions", torch.float32)]
+            out["states"] = [_as_tensor(kwargs, "states", torch.float32)]
             logger.info(
                 "process_prompt: AC actions shape=%s states shape=%s",
                 tuple(out["actions"][0].shape),
@@ -738,24 +769,20 @@ class VJepa2Model(Model):
                 extrinsics = kwargs.get("extrinsics")
                 if extrinsics is None:
                     raise ValueError("use_extrinsics=True but no 'extrinsics' kwarg provided.")
-                out["extrinsics"] = [torch.as_tensor(extrinsics, dtype=torch.float32)]
+                out["extrinsics"] = [_as_tensor(kwargs, "extrinsics", torch.float32)]
 
             # AC rollout needs T_total >= T_ctx + H - 1.  Fail fast
             # in process_prompt so the client gets a clear error before any
             # forward pass runs.  Sliced per-iter inside the rollout submodule
             # (see ``VJepa2ACRolloutPredictorSubmodule._rollout_step``).
-            requested = int(kwargs.get("rollout_horizon", 0) or 0)
-            if requested > 1:
-                # H is the loop's cap: the rollout runs no more iterations than that
-                rollout_horizon = self._rollout_horizon(kwargs)
-                capped = f" (capped at max_rollout_horizon={rollout_horizon})" if rollout_horizon < requested else ""
+            if rollout_horizon > 1:
                 t_ctx = 1
                 required = t_ctx + rollout_horizon - 1
                 act_tensor = out["actions"][0]
                 t_total = act_tensor.size(0) if act_tensor.dim() == 2 else act_tensor.size(1)
                 if t_total < required:
                     raise ValueError(
-                        f"AC rollout with rollout_horizon={requested}{capped} requires "
+                        f"AC rollout with rollout_horizon={rollout_horizon} requires "
                         f"actions/states trajectory length >= T_ctx + H - 1 = "
                         f"{t_ctx} + {rollout_horizon} - 1 = {required}; got {t_total}."
                     )
@@ -776,7 +803,7 @@ class VJepa2Model(Model):
             #     field, so the request would 400 before reaching this
             #     handler.  A scalar serializes to <20 bytes and hits the
             #     same scorer math end-to-end.
-            if kwargs.get("mpc"):
+            if mpc:
                 goal_hidden = kwargs.get("goal_hidden")
                 if goal_hidden is None:
                     fill = kwargs.get("goal_hidden_fill")
@@ -787,6 +814,8 @@ class VJepa2Model(Model):
                             "prefill_video_encoder_only call) or "
                             "'goal_hidden_fill' (scalar, for smoke-test only)."
                         )
+                    if isinstance(fill, bool) or not isinstance(fill, (int, float)):
+                        raise ValueError(f"goal_hidden_fill must be a number; got {fill!r}")
                     n_tokens = self.config.grid_depth * self.config.grid_size * self.config.grid_size
                     d = self.config.hidden_size
                     out["goal_hidden"] = [
@@ -798,7 +827,7 @@ class VJepa2Model(Model):
                         tuple(out["goal_hidden"][0].shape),
                     )
                 else:
-                    out["goal_hidden"] = [torch.as_tensor(goal_hidden, dtype=torch.float32)]
+                    out["goal_hidden"] = [_as_tensor(kwargs, "goal_hidden", torch.float32)]
                     logger.info(
                         "process_prompt: MPC goal_hidden shape=%s",
                         tuple(out["goal_hidden"][0].shape),
@@ -831,7 +860,8 @@ class VJepa2Model(Model):
         return ProcessPromptOutput(out, {"kv_layout": kv_layout})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {self.ROLLOUT_LOOP_NAME: self._rollout_horizon(model_kwargs)}
+        # a loop runs at least once
+        return {self.ROLLOUT_LOOP_NAME: max(1, self._rollout_horizon(model_kwargs))}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         if self.config.predictor_kind != "ac":
@@ -841,9 +871,8 @@ class VJepa2Model(Model):
             (self.PREFILL_VIDEO_ROLLOUT_STREAMING, self.ROLLOUT_LOOP_NAME),
         ))}}
 
-    def _rollout_horizon(self, model_kwargs: dict) -> int:
-        requested = int(model_kwargs.get("rollout_horizon", 2) or 2)
-        return max(1, min(requested, self.config.max_rollout_horizon))
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "video":
@@ -865,13 +894,26 @@ class VJepa2Model(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
+    def _rollout_horizon(self, model_kwargs: dict | None) -> int:
+        """The request's ``rollout_horizon``: 0 (absent) or 1 is a single pass."""
+        horizon = (model_kwargs or {}).get("rollout_horizon")
+        if horizon is None:
+            return 0
+        # past the rollout loop's max_iters, the conductor refuses it (get_loop_caps)
+        if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 0:
+            raise ValueError(f"rollout_horizon must be an integer >= 0; got {horizon!r}")
+        return horizon
+
     def _initial_walk(self, model_kwargs: dict | None) -> str:
-        if model_kwargs and model_kwargs.get("skip_predictor"):
+        horizon = self._rollout_horizon(model_kwargs)
+        stream = _flag(model_kwargs, "stream_rollout")
+        mpc = _flag(model_kwargs, "mpc")
+        if _flag(model_kwargs, "skip_predictor"):
             return self.PREFILL_VIDEO_ENCODER_ONLY
         # MPC walk (AC only).  Requested via ``mpc=True`` with
         # K-way actions/states and a pre-encoded ``goal_hidden``.  Checked
         # before rollout because AC deployments never hit the rollout walk.
-        if model_kwargs and model_kwargs.get("mpc") and self.config.predictor_kind == "ac":
+        if mpc and self.config.predictor_kind == "ac":
             return self.PREFILL_VIDEO_MPC
         # Rollout walk: triggered by ``rollout_horizon > 1``.  H == 1 is
         # equivalent to a single-pass prefill — save a loop's worth of
@@ -879,12 +921,8 @@ class VJepa2Model(Model):
         # Available for both masked and AC (sliding-window).
         # Streaming: opt into per-iter client emit via ``stream_rollout=True``;
         # default stays batched so existing clients don't break.
-        if model_kwargs:
-            horizon = int(model_kwargs.get("rollout_horizon", 0) or 0)
-            if horizon > 1:
-                if model_kwargs.get("stream_rollout"):
-                    return self.PREFILL_VIDEO_ROLLOUT_STREAMING
-                return self.PREFILL_VIDEO_ROLLOUT
+        if horizon > 1:
+            return self.PREFILL_VIDEO_ROLLOUT_STREAMING if stream else self.PREFILL_VIDEO_ROLLOUT
         return self.PREFILL_VIDEO
 
     def walk_plan(

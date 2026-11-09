@@ -853,10 +853,13 @@ DROID robot's normalization stats:
 With ``norm_stats`` set, Pi0.5 takes the raw robot state in ``robot_state`` and returns
 actions in robot units, as openpi's policy server does. ``norm_stats`` can also be the path
 of an openpi ``norm_stats.json``. Without it, ``robot_state`` must already be normalized to
-[-1, 1].
+[-1, 1]. Either way it is a list of 1 to ``state_dim`` finite numbers (the checkpoint's
+``max_state_dim``, 32 when it sets none); anything else is a 400.
 
 Per-request knobs (``temperature``, ``voice``, ``max_output_tokens``, …) are sent by the
-client instead — see :doc:`clients`. Give each request its own ``seed`` for independent
+client instead — see :doc:`clients`, and :ref:`generation-parameters` for what each
+sampling knob means.
+Give each request its own ``seed`` for independent
 samples. A seed fixes a request's tokens whatever it is batched with only where M\* draws
 with one kernel that reads each row's own seed: on CUDA, a sampler whose vocabulary is at
 most 4,096 tokens (the talker and code-predictor samplers of Qwen3-TTS and Qwen3-Omni),

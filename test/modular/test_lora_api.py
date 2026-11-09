@@ -40,7 +40,7 @@ except ImportError:  # collected without package context
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
 from mstar.api_server.entrypoint import APIServer, request_validation_error, resolve_lora_spec  # noqa: E402
 from mstar.api_server.lora_admin import LoraAdmin  # noqa: E402
-from mstar.api_server.openai.adapters import SubmitArgs  # noqa: E402
+from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult, RequestFailed  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 from mstar.communication.wire import decode, encode  # noqa: E402
@@ -161,6 +161,9 @@ class _EveryRoute:
 
     def speech_to_request(self, req, upload_dir):
         return self._args(req, "audio")
+
+    # the route's entry point: speech_to_request plus a sent speed
+    speech_request = OpenAIAdapter.speech_request
 
     def image_to_request(self, req, upload_dir):
         return self._args(req, "image")
