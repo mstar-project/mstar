@@ -294,14 +294,15 @@ def test_an_undecodable_frame_is_answered_and_the_socket_goes_on(stacks, monkeyp
 @pytest.mark.parametrize("binary", [False, True], ids=["json", "msgpack"])
 def test_a_live_call_takes_appends_until_its_input_ends(stacks, monkeypatch, binary):
     messages = [
-        {"request_id": "call", "text": "start"},
+        {"request_id": "call", "text": "start", "end_input": False},
         {"request_id": "call", "append": {"text": "more", "files": [_file("a.wav", b"RIFF1", binary, stream="audio")]}},
         {"request_id": "call", "append": [_file("b.wav", b"RIFF2", binary)], "end_input": ["audio"]},
+        {"request_id": "call", "append": {"model_kwargs": {"k": 2}}},
         {"request_id": "call", "append": {"text": "last", "model_kwargs": {"k": 1}}, "end_input": True},
         {"request_id": "call", "append": {"text": "after the end"}},
     ]
     (py, (ps, pa)), (rust, (rs, ra)) = _both(stacks, monkeypatch, True, messages, binary=binary, ending=2, settle=True)
-    assert (rs, ra) == (ps, pa) and len(pa) == 3
+    assert (rs, ra) == (ps, pa) and len(pa) == 4
     assert rust["call"] == py["call"]
 
 
@@ -314,7 +315,7 @@ def test_a_rejected_append_ends_the_call_with_its_error(stacks, monkeypatch, cas
         "bad-text": {"request_id": "r", "append": {"text": 3}},
         "empty": {"request_id": "r", "append": {}},
     }[case]
-    messages = [{"request_id": "r", "text": "start"}, append]
+    messages = [{"request_id": "r", "text": "start", "end_input": False}, append]
     (py, (ps, pa)), (rust, (rs, ra)) = _both(stacks, monkeypatch, True, messages, ending=1, settle=True)
     assert (rs, ra) == (ps, pa)
     assert rust["r"] == py["r"]
@@ -323,16 +324,19 @@ def test_a_rejected_append_ends_the_call_with_its_error(stacks, monkeypatch, cas
 
 def test_live_call_refusals_read_as_pythons(stacks, monkeypatch):
     messages = [
-        {"text": "a live call with no id"},
+        {"text": "a live call with no id", "end_input": False},
         {"request_id": "nobody", "append": {"text": "x"}},
         {"request_id": "once", "text": "x", "end_input": True},
-        {"request_id": "late", "text": "start"},
+        # an opening is one-shot unless it says otherwise, so an empty one is refused, with a hint
+        {"request_id": "empty"},
+        {"request_id": "late", "text": "start", "end_input": False},
         {"request_id": "late", "append": {"text": "too late"}, "end_input": True},
     ]
-    (py, (ps, pa)), (rust, (rs, ra)) = _both(stacks, monkeypatch, True, messages, ending=5, settle=True)
+    (py, (ps, pa)), (rust, (rs, ra)) = _both(stacks, monkeypatch, True, messages, ending=6, settle=True)
     assert (rs, ra) == (ps, pa)
-    for rid in ("None", "nobody", "once"):
+    for rid in ("None", "nobody", "once", "empty"):
         assert rust.get(rid) == py.get(rid), rid
+    assert py["empty"][0]["error"].endswith("(open a live call with end_input: false)")
     # the late notice and the call's own replies race on either frontend
     as_set = lambda replies: sorted(json.dumps(r, sort_keys=True) for r in replies)  # noqa: E731
     assert as_set(rust["late"]) == as_set(py["late"])
