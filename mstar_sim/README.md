@@ -193,8 +193,9 @@ the roofline.
   room, so admission paths that depend on it only run with graphs on.
 - A value that was never computed reads as zeros: data-dependent control flow on device values
   (beyond small tensors) takes the zero branch. A small tensor counts as never computed once a
-  stand-in wrote it (a Triton launch: any tensor it was handed, but for resident planning's
-  integer kernels, `kernels.KEPT_WRITES`, which do their writes) and after an op reads such a
+  stand-in wrote it (a Triton launch: any tensor it was handed, but for the resident kernels of
+  `kernels.KEPT_WRITES`, for lengths, columns and write addresses, which do their writes; the
+  sampler's cell gather stays a plain stand-in, so it marks the planner's store) and after an op reads such a
   value; a real write of all of it ends that, and a real write of part doesn't. An allocation
   nothing wrote also reads as zeros, and doesn't count.
 - Exporting a kept tensor for IPC moves its storage into shared memory, so its `data_ptr()`

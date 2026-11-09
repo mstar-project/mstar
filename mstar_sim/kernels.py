@@ -152,7 +152,7 @@ def _gather_block_rows(slots, kv_len, store, table, lens, **_):
 
 # Triton kernels by name, for what they write on values the emulator keeps (a launch computes
 # nothing else: :mod:`mstar_sim.triton_launch`). Resident planning's integer bookkeeping, as
-# ``mstar.engine.resources.resident`` does it off a GPU: the lengths a step's attention is priced by.
+# resident planning does it off a GPU.
 KEPT_WRITES = {
     "_scatter_cells_kernel": _scatter_cells,
     "_gather_column_kernel": _gather_column,
