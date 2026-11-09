@@ -37,16 +37,23 @@ class MpsDaemon:
 
     def __init__(self, directory: str | None = None):
         self.directory = directory or tempfile.mkdtemp(prefix="mstar_mps_")
-        self.client_env = {
+        # the daemon's own: its server sees the deployment's CUDA_VISIBLE_DEVICES
+        self._daemon_env = {
             "CUDA_MPS_PIPE_DIRECTORY": os.path.join(self.directory, "pipe"),
             "CUDA_MPS_LOG_DIRECTORY": os.path.join(self.directory, "log"),
         }
+        self.client_env = dict(self._daemon_env)
+        # A client's CUDA_VISIBLE_DEVICES indexes the server's devices, not the host's: under
+        # `--gpus 2` a client asking for device 2 finds none, so clients count from 0.
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if visible:
+            self.client_env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, range(len(visible.split(",")))))
         self._proc: subprocess.Popen | None = None
 
     def start(self, timeout_s: float = 10.0) -> None:
         if shutil.which(CONTROL) is None:
             raise RuntimeError(f"mps: true needs {CONTROL} on PATH (it ships with the NVIDIA driver)")
-        for path in self.client_env.values():
+        for path in self._daemon_env.values():
             os.makedirs(path, exist_ok=True)
         # Foreground mode keeps the daemon our child, so stop() can reap it by PID.
         command = [CONTROL, "-f"]
@@ -56,7 +63,7 @@ class MpsDaemon:
             with open(os.path.join(self.client_env["CUDA_MPS_LOG_DIRECTORY"], "stderr.log"), "w") as err:
                 self._proc = subprocess.Popen(
                     command,
-                    env={**os.environ, **self.client_env},
+                    env={**os.environ, **self._daemon_env},
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
                 )
             deadline = time.monotonic() + timeout_s
@@ -94,7 +101,7 @@ class MpsDaemon:
         try:
             result = subprocess.run(
                 [CONTROL], input=f"{command}\n", text=True, capture_output=True,
-                env={**os.environ, **self.client_env}, timeout=10, check=False,
+                env={**os.environ, **self._daemon_env}, timeout=10, check=False,
             )
         except subprocess.TimeoutExpired:
             logger.warning("MPS control command %r timed out", command)

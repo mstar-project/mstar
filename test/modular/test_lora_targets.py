@@ -836,10 +836,14 @@ def test_header_refusals_reach_the_client_as_themselves():
     with pytest.raises(ValueError, match="does not fit") as misfit:
         spec.check_adapter("x", bad)
     with pytest.raises(ValueError, match="DoRA") as dora:
-        inspect_keys(spec, [("base_model.model.layers.0.fc.lora_magnitude_vector", (HIDDEN,))])
+        inspect_keys(spec, [
+            (key.format("A"), (4, HIDDEN)), (key.format("B"), (HIDDEN, 4)),
+            ("base_model.model.layers.0.fc.lora_magnitude_vector", (HIDDEN,)),
+        ])
     for exc in (misfit.value, dora.value):
         assert describe_load_error(exc) == str(exc)
     assert "/srv" not in describe_load_error(OSError("/srv/adapters/x: permission denied"))
+    assert describe_load_error(ValueError("bad /srv/adapters/x.safetensors")) == "bad x.safetensors"
 
 
 def test_gather_shrink_op_matches_its_fake():

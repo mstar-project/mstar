@@ -271,7 +271,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
        kernels instead of time-slicing (the ASR ``*_split`` configs, and the speech ones:
-       ``chatterbox*_split``, ``omnivoice_split``, ``qwen3tts_split``). NVIDIA only, and it
+       ``chatterbox*_split``, ``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``). NVIDIA only, and it
        needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
        shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
        ``false``.
@@ -622,7 +622,7 @@ before it spawns the workers, run every worker as its client so their kernels ov
 and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
 processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
 driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
-Chatterbox models and OmniVoice set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+Chatterbox models, OmniVoice and CosyVoice3 set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
 
 **A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
 group runs that node's steps on a lane of their own instead of the worker's main chain:
