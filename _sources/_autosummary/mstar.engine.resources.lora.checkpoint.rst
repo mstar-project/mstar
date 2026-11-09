@@ -18,6 +18,8 @@ mstar.engine.resources.lora.checkpoint
       normalize_lora_state_dict
       parse_lora_key
       read_lora_file
+      refuse_non_adapter
+      require_regular_file
       sidecar_default_alpha
    
    

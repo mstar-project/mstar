@@ -21,6 +21,7 @@ mstar.api\_server.request\_types
       ClientAppend
       ConductorStatus
       DataWorkerProfile
+      LoraAdapterResult
       PreprocessInput
       RequestComplete
       RequestFailed

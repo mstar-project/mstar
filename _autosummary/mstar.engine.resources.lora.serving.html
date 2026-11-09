@@ -244,6 +244,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -478,6 +479,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -746,7 +748,7 @@ adds them to the model’s other specs.</p>
 <td><p>The deployment's LoRA specs, YAML applied, the one keyed <code class="docutils literal notranslate"><span class="pre">lora</span></code> first; none when its config turns LoRA on nowhere.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.serving.served_lora_targets" title="mstar.engine.resources.lora.serving.served_lora_targets"><code class="xref py py-obj docutils literal notranslate"><span class="pre">served_lora_targets</span></code></a>(lora)</p></td>
-<td><p>The targets a deployment keeps when its YAML lists no <code class="docutils literal notranslate"><span class="pre">targets</span></code>: those one of its configured adapters touches, as the <code class="docutils literal notranslate"><span class="pre">targets</span></code> list every process then applies.</p></td>
+<td><p>The targets a deployment keeps when its adapters are fixed at startup (runtime updates off, no YAML <code class="docutils literal notranslate"><span class="pre">targets</span></code>): those one of its adapters touches, as the <code class="docutils literal notranslate"><span class="pre">targets</span></code> list every process then applies.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.serving.size_lora_specs" title="mstar.engine.resources.lora.serving.size_lora_specs"><code class="xref py py-obj docutils literal notranslate"><span class="pre">size_lora_specs</span></code></a>(lora, model_config)</p></td>
 <td><p>Apply the YAML's <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block to the LoRA specs keyed apart from <code class="docutils literal notranslate"><span class="pre">lora</span></code>.</p></td>
@@ -814,8 +816,8 @@ specs, and with them a runtime load or unload recorded on one.</p>
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.serving.served_lora_targets">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.serving.</span></span><span class="sig-name descname"><span class="pre">served_lora_targets</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">lora</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/serving.html#served_lora_targets"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.serving.served_lora_targets" title="Link to this definition">#</a></dt>
-<dd><p>The targets a deployment keeps when its YAML lists no <code class="docutils literal notranslate"><span class="pre">targets</span></code>: those one of
-its configured adapters touches, as the
+<dd><p>The targets a deployment keeps when its adapters are fixed at startup (runtime
+updates off, no YAML <code class="docutils literal notranslate"><span class="pre">targets</span></code>): those one of its adapters touches, as the
 <code class="docutils literal notranslate"><span class="pre">targets</span></code> list every process then applies. Every other target would hold zero
 weights in every slot, yet cost its kernels on every step and its memory (the LM
 head’s and the embedding’s are vocabulary-sized). The first spec (the LLM’s) keeps

@@ -31,6 +31,7 @@
    body_limit
    data_worker
    entrypoint
+   lora_admin
    media_io
    openai
    openpi

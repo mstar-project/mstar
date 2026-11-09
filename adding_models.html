@@ -243,6 +243,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -477,6 +478,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -1939,8 +1941,8 @@ first keyed <code class="docutils literal notranslate"><span class="pre">&quot;l
 <code class="docutils literal notranslate"><span class="pre">link_lora_specs</span></code>: a module belongs to the spec that places it (the one whose
 <code class="docutils literal notranslate"><span class="pre">adapter_roots</span></code> claim it most specifically, when several do), and the others leave
 it alone (<code class="docutils literal notranslate"><span class="pre">ignored_modules</span></code>), so one adapter file serves both. The one <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes them all, the conductor opens every request
-with the same adapter on each, and the startup check reads an adapter under every
-spec.</p></li>
+with the same adapter on each, and the startup and runtime-load checks read an adapter
+under every spec.</p></li>
 <li><p><strong>Binding and rows.</strong> <code class="docutils literal notranslate"><span class="pre">NodeSubmodule.bind_node_resources</span></code> binds every placed module
 under <code class="docutils literal notranslate"><span class="pre">root_path</span></code>, after checking it is the declared target and that the pool’s
 shard is its rank-local shape (a module built whole on a TP node fails here, not in a
@@ -1994,7 +1996,8 @@ over the patch. DoRA (PEFT’s <code class="docutils literal notranslate"><span 
 tokens and bias LoRA are refused by name. A YAML <code class="docutils literal notranslate"><span class="pre">targets:</span> <span class="pre">[...]</span></code> keeps a subset of
 the model’s targets (dropping vocabulary-sized ones saves their slots); an adapter
 touching a dropped target is refused, and its modules stay unbound. Without the list,
-a deployment keeps the targets its configured adapters touch: the conductor reads them once at startup (<code class="docutils literal notranslate"><span class="pre">served_lora_targets</span></code>) and spawns
+a deployment with <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> off keeps the targets its configured adapters
+touch: the conductor reads them once at startup (<code class="docutils literal notranslate"><span class="pre">served_lora_targets</span></code>) and spawns
 every worker with that list, so every process builds the same pools; an adapter it
 cannot read fails the deployment.</p></li>
 <li><p><strong>Requests.</strong> Nothing per model. The conductor opens every request with a
@@ -2087,6 +2090,16 @@ meanwhile.</p>
 serve LoRA yet: the pool lays rows out per request over the whole batch, while each SP rank
 holds a shard of the tokens and each CFG rank one guidance branch’s rows, so building the
 pool refuses the deployment.</p>
+<p>Adapters loaded and unloaded at runtime (<code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code>) reach each worker as
+a control message from the conductor, which each rank applies whenever it arrives rather
+than at a step the instance agrees on. <code class="docutils literal notranslate"><span class="pre">LoraAdapterPool.load_adapter_async</span></code> only reads the
+adapter into the host tier, on the reader thread (the worker acknowledges the load from its
+main loop once every pool has it), and <code class="docutils literal notranslate"><span class="pre">unload_adapter</span></code> only stops new requests from naming
+it; once no live request names it (immediately, or at the last one’s teardown) the pool
+forgets its host copy and its name’s slot entry, and leaves the slot’s weights and LRU
+standing as they were. Neither touches what an admit decides from, and the next request
+that names the adapter is ingested after a reload, which reaches every rank after the
+unload did. Nothing per model is needed for either.</p>
 </section>
 </section>
 <section id="step-3-declare-the-computation-graph">
@@ -3120,10 +3133,13 @@ A resource sized per step refuses <code class="docutils literal notranslate"><sp
 <code class="docutils literal notranslate"><span class="pre">max_rank</span></code> (the largest rank served; slots are sized to it), <code class="docutils literal notranslate"><span class="pre">cpu_capacity</span></code>
 (adapters held in pinned host memory), <code class="docutils literal notranslate"><span class="pre">adapters</span></code> (adapter name to safetensors
 path: the names requests can ask for), <code class="docutils literal notranslate"><span class="pre">targets</span></code> (the subset of the model’s
-targets to allocate; by default the targets the configured adapters touch; a
-secondary node’s spec
+targets to allocate; by default, with <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> off, the targets the
+configured adapters touch, and every target with it on; a secondary node’s spec
 left with none builds no pool, while a YAML list leaving the model’s first spec
-(its LLM’s) none is an error). One <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes every LoRA spec of the
+(its LLM’s) none is an error), <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> (default false: serve
+<code class="docutils literal notranslate"><span class="pre">/v1/load_lora_adapter</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/unload_lora_adapter</span></code>),
+<code class="docutils literal notranslate"><span class="pre">runtime_update_timeout_s</span></code> (default 120: how long the conductor waits for every
+worker to answer one before giving up on it). One <code class="docutils literal notranslate"><span class="pre">lora:</span></code> block sizes every LoRA spec of the
 model</p></td>
 </tr>
 </tbody>

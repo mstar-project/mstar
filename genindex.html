@@ -597,6 +597,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -831,6 +832,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -1074,6 +1076,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ChunkingPolicy.accumulated_outputs">(mstar.model.submodule_base.ChunkingPolicy attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps.ack">ack() (mstar.conductor.lora_ops.LoraAdapterOps method)</a>
+</li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.ack_unread_tensors">ack_unread_tensors() (mstar.communication.tensors.TensorCommunicationManager method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.packing.html#mstar.model.cosmos3.components.packing.action_condition_frame_indexes">action_condition_frame_indexes() (in module mstar.model.cosmos3.components.packing)</a>
@@ -1350,14 +1354,14 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.dsa.manager.html#mstar.engine.resources.dsa.manager.IndexKeyStore.append">(mstar.engine.resources.dsa.manager.IndexKeyStore method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.waypoint.components.dit.html#mstar.model.waypoint.components.dit.WaypointDiT.append_frame">append_frame() (mstar.model.waypoint.components.dit.WaypointDiT method)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.model.waypoint.components.html#mstar.model.waypoint.components.WaypointDiT.append_frame">(mstar.model.waypoint.components.WaypointDiT method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.utils.html#mstar.model.utils.KeysAndConverter.append_key">append_key() (mstar.model.utils.KeysAndConverter method)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeTranscription.apply">apply() (mstar.api_server.openai.serving_realtime.RealtimeTranscription method)</a>
@@ -1754,6 +1758,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.begin_suppress_tokens">begin_suppress_tokens (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoad.behind">behind (mstar.worker.lora_loads.LoraLoad attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.OutboxCommunicator.BEHIND_WARN_S">BEHIND_WARN_S (mstar.communication.communicator.OutboxCommunicator attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.waypoint.components.layers.html#mstar.model.waypoint.components.layers.bf16_roundtrip">bf16_roundtrip() (in module mstar.model.waypoint.components.layers)</a>
@@ -1813,17 +1819,19 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessage.body">(mstar.utils.ipc_format.WorkerMessage attribute)</a>
 </li>
+        <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoad.body">(mstar.worker.lora_loads.LoraLoad attribute)</a>
+</li>
       </ul></li>
       <li><a href="_autosummary/mstar.model.command_a_plus.config.html#mstar.model.command_a_plus.config.CommandAPlusTextConfig.bos_token_id">bos_token_id (mstar.model.command_a_plus.config.CommandAPlusTextConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.html#mstar.engine.resources.kv.bounded.BoundedKVConfig">BoundedKVConfig (class in mstar.engine.resources.kv.bounded)</a>
 
       <ul>
         <li><a href="_autosummary/mstar.engine.resources.kv.bounded.config.html#mstar.engine.resources.kv.bounded.config.BoundedKVConfig">(class in mstar.engine.resources.kv.bounded.config)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager">BoundedKVManager (class in mstar.engine.resources.kv.bounded.manager)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.html#mstar.engine.resources.kv.bounded.BoundedKVSpec">BoundedKVSpec (class in mstar.engine.resources.kv.bounded)</a>
@@ -3796,12 +3804,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.encoder_ffn_dim">encoder_ffn_dim (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.encoder_head_dim">encoder_head_dim (mstar.model.whisper.config.WhisperModelConfig property)</a>
 </li>
       <li><a href="_autosummary/mstar.model.whisper.config.html#mstar.model.whisper.config.WhisperModelConfig.encoder_layers">encoder_layers (mstar.model.whisper.config.WhisperModelConfig attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.higgs_audio.config.html#mstar.model.higgs_audio.config.HiggsAudioModelConfig.encoder_output_length">encoder_output_length() (mstar.model.higgs_audio.config.HiggsAudioModelConfig method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.voxcpm2.config.html#mstar.model.voxcpm2.config.AudioVAEConfig.encoder_rates">encoder_rates (mstar.model.voxcpm2.config.AudioVAEConfig attribute)</a>
@@ -3883,9 +3891,19 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.FailedRead.error">error (mstar.communication.tensors.FailedRead attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoraAdapterAck.error">(mstar.utils.ipc_format.LoraAdapterAck attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestFailed.error_message">error_message (mstar.api_server.request_types.RequestFailed attribute)</a>
+        <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoad.error">(mstar.worker.lora_loads.LoraLoad attribute)</a>
 </li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.LoraAdapterResult.error_message">error_message (mstar.api_server.request_types.LoraAdapterResult attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestFailed.error_message">(mstar.api_server.request_types.RequestFailed attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.FailRequests.errors">errors (mstar.utils.ipc_format.FailRequests attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.streaming_response.html#mstar.api_server.streaming_response.errors_in_band">errors_in_band() (in module mstar.api_server.streaming_response)</a>
@@ -3929,6 +3947,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.communication.communicator.html#mstar.communication.communicator.EXPECTED_MSTAR_RUST_VERSION">EXPECTED_MSTAR_RUST_VERSION (in module mstar.communication.communicator)</a>
 </li>
       <li><a href="_autosummary/mstar.model.glm5_next.weight_loader.html#mstar.model.glm5_next.weight_loader.expected_parameter_paths">expected_parameter_paths() (in module mstar.model.glm5_next.weight_loader)</a>
+</li>
+      <li><a href="_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps.expire">expire() (mstar.conductor.lora_ops.LoraAdapterOps method)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.arena.html#mstar.communication.arena.export_arena_plan">export_arena_plan() (in module mstar.communication.arena)</a>
 </li>
@@ -4110,6 +4130,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.Resource.fingerprint">(mstar.engine.resources.Resource method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoads.finish">finish() (mstar.worker.lora_loads.LoraLoads method)</a>
+</li>
       <li><a href="_autosummary/mstar.model.audio_watermark.html#mstar.model.audio_watermark.WatermarkStream.finished">finished (mstar.model.audio_watermark.WatermarkStream attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.kokoro.config.html#mstar.model.kokoro.config.KokoroModelConfig.first_chunk_target_phonemes">first_chunk_target_phonemes (mstar.model.kokoro.config.KokoroModelConfig attribute)</a>
@@ -6436,8 +6458,6 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.chatterbox.config.html#mstar.model.chatterbox.config.T3BackboneConfig.llama_520m">llama_520m() (mstar.model.chatterbox.config.T3BackboneConfig class method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.cosyvoice3.config.html#mstar.model.cosyvoice3.config.CosyVoice3Config.llm_weights">llm_weights (mstar.model.cosyvoice3.config.CosyVoice3Config attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosyvoice3.config.html#mstar.model.cosyvoice3.config.CosyVoice3Config.lm">lm (mstar.model.cosyvoice3.config.CosyVoice3Config attribute)</a>
@@ -6448,14 +6468,22 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.cosyvoice3.config.html#mstar.model.cosyvoice3.config.LMConfig">LMConfig (class in mstar.model.cosyvoice3.config)</a>
 </li>
-      <li><a href="_autosummary/mstar.engine.resources.lora.store.html#mstar.engine.resources.lora.store.LoraAdapterStore.load">load() (mstar.engine.resources.lora.store.LoraAdapterStore method)</a>
+      <li><a href="_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps.load">load() (mstar.conductor.lora_ops.LoraAdapterOps method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.lora.store.html#mstar.engine.resources.lora.store.LoraAdapterStore.load">(mstar.engine.resources.lora.store.LoraAdapterStore method)</a>
 </li>
+        <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoads.load">(mstar.worker.lora_loads.LoraLoads method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter">load_adapter() (mstar.engine.resources.lora.pool.LoraAdapterPool method)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.load_adapter_async">load_adapter_async() (mstar.engine.resources.lora.pool.LoraAdapterPool method)</a>
 </li>
       <li><a href="_autosummary/mstar.model.cosyvoice3.components.onnx_weights.html#mstar.model.cosyvoice3.components.onnx_weights.load_campplus">load_campplus() (in module mstar.model.cosyvoice3.components.onnx_weights)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.model.omnivoice.components.codec.html#mstar.model.omnivoice.components.codec.load_codec">load_codec() (in module mstar.model.omnivoice.components.codec)</a>
 </li>
       <li><a href="_autosummary/mstar.model.omnivoice.config.html#mstar.model.omnivoice.config.OmniVoiceConfig.load_dtype">load_dtype (mstar.model.omnivoice.config.OmniVoiceConfig attribute)</a>
@@ -6468,6 +6496,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.omnilingual_asr.weight_loader.html#mstar.model.omnilingual_asr.weight_loader.load_into">load_into() (in module mstar.model.omnilingual_asr.weight_loader)</a>
 </li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.LOAD_LORA_ADAPTER">LOAD_LORA_ADAPTER (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessageType.LOAD_LORA_ADAPTER">(mstar.utils.ipc_format.WorkerMessageType attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.load_lora_file">load_lora_file() (in module mstar.engine.resources.lora.checkpoint)</a>
 </li>
       <li><a href="_autosummary/mstar.model.pi05.components.normalization.html#mstar.model.pi05.components.normalization.load_norm_stats">load_norm_stats() (in module mstar.model.pi05.components.normalization)</a>
@@ -6513,6 +6547,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.utils.html#mstar.model.utils.load_weights_from_hf_shards">load_weights_from_hf_shards() (in module mstar.model.utils)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.store.html#mstar.engine.resources.lora.store.LoadedAdapter">LoadedAdapter (class in mstar.engine.resources.lora.store)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoadLoraAdapter">LoadLoraAdapter (class in mstar.utils.ipc_format)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.LoadLoraAdapterRequest">LoadLoraAdapterRequest (class in mstar.api_server.openai.protocol)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.cpus.html#mstar.utils.cpus.HostGpu.local">local (mstar.utils.cpus.HostGpu attribute)</a>
 </li>
@@ -6634,7 +6672,11 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.graph.base.html#mstar.graph.base.LoopStateRegistry">LoopStateRegistry (class in mstar.graph.base)</a>
 </li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.LORA_ADAPTER_ACK">LORA_ADAPTER_ACK (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.SidecarScaling.lora_alpha">lora_alpha (mstar.engine.resources.lora.checkpoint.SidecarScaling attribute)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoadLoraAdapter.lora_digest">lora_digest (mstar.utils.ipc_format.LoadLoraAdapter attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.html#mstar.engine.resources.lora.lora_enabled">lora_enabled() (in module mstar.engine.resources.lora)</a>
 
@@ -6644,6 +6686,22 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.NodeSubmodule.lora_keys">lora_keys (mstar.model.submodule_base.NodeSubmodule attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.LoadLoraAdapterRequest.lora_name">lora_name (mstar.api_server.openai.protocol.LoadLoraAdapterRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.UnloadLoraAdapterRequest.lora_name">(mstar.api_server.openai.protocol.UnloadLoraAdapterRequest attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoadLoraAdapter.lora_name">(mstar.utils.ipc_format.LoadLoraAdapter attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.UnloadLoraAdapter.lora_name">(mstar.utils.ipc_format.UnloadLoraAdapter attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.LoadLoraAdapterRequest.lora_path">lora_path (mstar.api_server.openai.protocol.LoadLoraAdapterRequest attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoadLoraAdapter.lora_path">(mstar.utils.ipc_format.LoadLoraAdapter attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.lora_rows">lora_rows() (in module mstar.model.submodule_base)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.serving.html#mstar.engine.resources.lora.serving.lora_specs">lora_specs() (in module mstar.engine.resources.lora.serving)</a>
@@ -6658,7 +6716,13 @@ window.runMermaid = runMermaid;</script>
       </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.LoraAdapter">LoraAdapter (class in mstar.engine.resources.lora.checkpoint)</a>
 </li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoraAdapterAck">LoraAdapterAck (class in mstar.utils.ipc_format)</a>
+</li>
+      <li><a href="_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps">LoraAdapterOps (class in mstar.conductor.lora_ops)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool">LoraAdapterPool (class in mstar.engine.resources.lora.pool)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.LoraAdapterResult">LoraAdapterResult (class in mstar.api_server.request_types)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.store.html#mstar.engine.resources.lora.store.LoraAdapterStore">LoraAdapterStore (class in mstar.engine.resources.lora.store)</a>
 </li>
@@ -6677,6 +6741,10 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.LoraLayer">LoraLayer (class in mstar.engine.resources.lora.checkpoint)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraLayerDelta">LoraLayerDelta (class in mstar.engine.resources.lora.pool)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoad">LoraLoad (class in mstar.worker.lora_loads)</a>
+</li>
+      <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoads">LoraLoads (class in mstar.worker.lora_loads)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.html#mstar.engine.resources.lora.LoraModuleRef">LoraModuleRef (class in mstar.engine.resources.lora)</a>
 
@@ -7355,6 +7423,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ImageGenerationRequest.model_config">(mstar.api_server.openai.protocol.ImageGenerationRequest attribute)</a>
 </li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.LoadLoraAdapterRequest.model_config">(mstar.api_server.openai.protocol.LoadLoraAdapterRequest attribute)</a>
+</li>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelCard.model_config">(mstar.api_server.openai.protocol.ModelCard attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.ModelList.model_config">(mstar.api_server.openai.protocol.ModelList attribute)</a>
@@ -7362,6 +7432,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.SpeechRequest.model_config">(mstar.api_server.openai.protocol.SpeechRequest attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.TranscriptionRequest.model_config">(mstar.api_server.openai.protocol.TranscriptionRequest attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.UnloadLoraAdapterRequest.model_config">(mstar.api_server.openai.protocol.UnloadLoraAdapterRequest attribute)</a>
 </li>
         <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.VideoGenerationRequest.model_config">(mstar.api_server.openai.protocol.VideoGenerationRequest attribute)</a>
 </li>
@@ -7445,6 +7517,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.wire.html#module-mstar.communication.wire">mstar.communication.wire</a>
 </li>
         <li><a href="_autosummary/mstar.conductor.html#module-mstar.conductor">mstar.conductor</a>
+</li>
+        <li><a href="_autosummary/mstar.conductor.lora_ops.html#module-mstar.conductor.lora_ops">mstar.conductor.lora_ops</a>
 </li>
         <li><a href="_autosummary/mstar.conductor.mps.html#module-mstar.conductor.mps">mstar.conductor.mps</a>
 </li>
@@ -7918,6 +7992,8 @@ window.runMermaid = runMermaid;</script>
 </li>
         <li><a href="_autosummary/mstar.worker.host_pool.html#module-mstar.worker.host_pool">mstar.worker.host_pool</a>
 </li>
+        <li><a href="_autosummary/mstar.worker.lora_loads.html#module-mstar.worker.lora_loads">mstar.worker.lora_loads</a>
+</li>
         <li><a href="_autosummary/mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils">mstar.worker.node_manager_utils</a>
 </li>
         <li><a href="_autosummary/mstar.worker.phase_timer.html#module-mstar.worker.phase_timer">mstar.worker.phase_timer</a>
@@ -8193,6 +8269,13 @@ window.runMermaid = runMermaid;</script>
 
       <ul>
         <li><a href="_autosummary/mstar.conductor.html#module-mstar.conductor">module</a>
+</li>
+      </ul></li>
+      <li>
+    mstar.conductor.lora_ops
+
+      <ul>
+        <li><a href="_autosummary/mstar.conductor.lora_ops.html#module-mstar.conductor.lora_ops">module</a>
 </li>
       </ul></li>
       <li>
@@ -9848,6 +9931,13 @@ window.runMermaid = runMermaid;</script>
 </li>
       </ul></li>
       <li>
+    mstar.worker.lora_loads
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.lora_loads.html#module-mstar.worker.lora_loads">module</a>
+</li>
+      </ul></li>
+      <li>
     mstar.worker.node_manager_utils
 
       <ul>
@@ -10149,6 +10239,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.streaming.chunk_policy.html#mstar.streaming.chunk_policy.SlidingWindowChunkPolicy.next_chunk_size">(mstar.streaming.chunk_policy.SlidingWindowChunkPolicy method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps.next_deadline">next_deadline() (mstar.conductor.lora_ops.LoraAdapterOps method)</a>
+</li>
       <li><a href="_autosummary/mstar.communication.edge_items.html#mstar.communication.edge_items.StreamRow.next_node">next_node (mstar.communication.edge_items.StreamRow attribute)</a>
 
       <ul>
@@ -10743,6 +10835,16 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.cosmos3.components.sound_tokenizer.html#mstar.model.cosmos3.components.sound_tokenizer.OobleckResidualUnit">OobleckResidualUnit (class in mstar.model.cosmos3.components.sound_tokenizer)</a>
 </li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.LoraAdapterResult.op_id">op_id (mstar.api_server.request_types.LoraAdapterResult attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoadLoraAdapter.op_id">(mstar.utils.ipc_format.LoadLoraAdapter attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoraAdapterAck.op_id">(mstar.utils.ipc_format.LoraAdapterAck attribute)</a>
+</li>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.UnloadLoraAdapter.op_id">(mstar.utils.ipc_format.UnloadLoraAdapter attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.model.cosyvoice3.components.onnx_weights.html#mstar.model.cosyvoice3.components.onnx_weights.OnnxNode.op_type">op_type (mstar.model.cosyvoice3.components.onnx_weights.OnnxNode attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.wire.html#mstar.communication.wire.OPAQUE">OPAQUE (in module mstar.communication.wire)</a>
@@ -10759,10 +10861,10 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.KVReqConfig.opened_labels">(mstar.engine.resources.KVReqConfig method)</a>
 </li>
       </ul></li>
-      <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.opening_prefix_caches">opening_prefix_caches() (in module mstar.engine.resources.kv.config)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.opening_prefix_caches">opening_prefix_caches() (in module mstar.engine.resources.kv.config)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PrefixSpan.opens_step">opens_step (mstar.engine.resources.kv.config.PrefixSpan attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.model.utils.html#mstar.model.utils.Operation">Operation (class in mstar.model.utils)</a>
@@ -12134,7 +12236,11 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.model.cosmos3.loader.html#mstar.model.cosmos3.loader.read_vision_encoder_weight_shapes">read_vision_encoder_weight_shapes() (in module mstar.model.cosmos3.loader)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.layout.html#mstar.engine.resources.kv.bounded.layout.RowLayout.reads">reads (mstar.engine.resources.kv.bounded.layout.RowLayout attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoad.reads">(mstar.worker.lora_loads.LoraLoad attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.READS_DONE">READS_DONE (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedPlan.reads_row_source">reads_row_source (mstar.engine.resources.kv.bounded.manager.BoundedPlan attribute)</a>
@@ -12298,6 +12404,8 @@ window.runMermaid = runMermaid;</script>
       <li><a href="_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.RefusalMiddleware">RefusalMiddleware (class in mstar.observability.metrics)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.attn.config.refuse_context_only">refuse_context_only() (in module mstar.engine.resources.attn.config)</a>
+</li>
+      <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.refuse_non_adapter">refuse_non_adapter() (in module mstar.engine.resources.lora.checkpoint)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.refuse_undeclared_labels">refuse_undeclared_labels() (in module mstar.engine.resources.kv.config)</a>
 </li>
@@ -12667,6 +12775,8 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.observability.metrics.html#mstar.observability.metrics.require_prometheus_client">require_prometheus_client() (in module mstar.observability.metrics)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.require_regular_file">require_regular_file() (in module mstar.engine.resources.lora.checkpoint)</a>
+</li>
       <li><a href="_autosummary/mstar.model.waypoint.checkpoint.html#mstar.model.waypoint.checkpoint.require_taehv_runtime">require_taehv_runtime() (in module mstar.model.waypoint.checkpoint)</a>
 </li>
       <li><a href="_autosummary/mstar.api_server.openai.serving_realtime.html#mstar.api_server.openai.serving_realtime.RealtimeSession.resample">resample() (mstar.api_server.openai.serving_realtime.RealtimeSession method)</a>
@@ -12705,8 +12815,6 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.ChunkingPolicy.reserve_whole_prefill">(mstar.model.submodule_base.ChunkingPolicy attribute)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.StreamResampler.reset">reset() (mstar.api_server.media_io.StreamResampler method)</a>
 
       <ul>
@@ -12723,6 +12831,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.kv.ring.html#mstar.engine.resources.kv.ring.LayerRingCache.reset">(mstar.engine.resources.kv.ring.LayerRingCache method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.base.AttentionResource.reset_default_cursors">reset_default_cursors() (mstar.engine.resources.base.AttentionResource method)</a>
 </li>
       <li><a href="_autosummary/mstar.utils.streams.html#mstar.utils.streams.reset_device_scheduling">reset_device_scheduling() (in module mstar.utils.streams)</a>
@@ -13395,6 +13505,18 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.TokenStop.runtime_check">runtime_check (mstar.model.submodule_base.TokenStop attribute)</a>
 </li>
+      <li><a href="_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.config.LoraSpec.runtime_update_timeout_s">runtime_update_timeout_s (mstar.engine.resources.lora.config.LoraSpec attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.lora.html#mstar.engine.resources.lora.LoraSpec.runtime_update_timeout_s">(mstar.engine.resources.lora.LoraSpec attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.engine.resources.lora.config.html#mstar.engine.resources.lora.config.LoraSpec.runtime_updates">runtime_updates (mstar.engine.resources.lora.config.LoraSpec attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.engine.resources.lora.html#mstar.engine.resources.lora.LoraSpec.runtime_updates">(mstar.engine.resources.lora.LoraSpec attribute)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.api_server.rust_frontend.html#mstar.api_server.rust_frontend.RustFrontendBridge">RustFrontendBridge (class in mstar.api_server.rust_frontend)</a>
 </li>
       <li><a href="_autosummary/mstar.communication.tensor_store.html#mstar.communication.tensor_store.RustTensorBookkeeping">RustTensorBookkeeping (class in mstar.communication.tensor_store)</a>
@@ -13725,6 +13847,8 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.engine.resources.html#mstar.engine.resources.PosScheme.SEQUENTIAL">(mstar.engine.resources.PosScheme attribute)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.LoraAdapterResult.served">served (mstar.api_server.request_types.LoraAdapterResult attribute)</a>
+</li>
       <li><a href="_autosummary/mstar.engine.resources.lora.html#mstar.engine.resources.lora.served_lora_adapters">served_lora_adapters() (in module mstar.engine.resources.lora)</a>
 
       <ul>
@@ -14557,8 +14681,12 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.Status">Status (class in mstar.utils.ipc_format)</a>
 </li>
-      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestFailed.status">status (mstar.api_server.request_types.RequestFailed attribute)</a>
+      <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.LoraAdapterResult.status">status (mstar.api_server.request_types.LoraAdapterResult attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.RequestFailed.status">(mstar.api_server.request_types.RequestFailed attribute)</a>
 </li>
+      </ul></li>
       <li><a href="_autosummary/mstar.api_server.media_io.html#mstar.api_server.media_io.AudioTooLongError.status_code">status_code (mstar.api_server.media_io.AudioTooLongError attribute)</a>
 </li>
       <li><a href="_autosummary/mstar.observability.catalog.html#mstar.observability.catalog.STATUS_FAMILIES">STATUS_FAMILIES (in module mstar.observability.catalog)</a>
@@ -15495,7 +15623,23 @@ window.runMermaid = runMermaid;</script>
         <li><a href="_autosummary/mstar.communication.tensors.html#mstar.communication.tensors.TensorCommunicationManager.unlink_owned_files">(mstar.communication.tensors.TensorCommunicationManager method)</a>
 </li>
       </ul></li>
+      <li><a href="_autosummary/mstar.conductor.lora_ops.html#mstar.conductor.lora_ops.LoraAdapterOps.unload">unload() (mstar.conductor.lora_ops.LoraAdapterOps method)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.worker.lora_loads.html#mstar.worker.lora_loads.LoraLoads.unload">(mstar.worker.lora_loads.LoraLoads method)</a>
+</li>
+      </ul></li>
       <li><a href="_autosummary/mstar.engine.resources.lora.pool.html#mstar.engine.resources.lora.pool.LoraAdapterPool.unload_adapter">unload_adapter() (mstar.engine.resources.lora.pool.LoraAdapterPool method)</a>
+</li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.UNLOAD_LORA_ADAPTER">UNLOAD_LORA_ADAPTER (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
+
+      <ul>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerMessageType.UNLOAD_LORA_ADAPTER">(mstar.utils.ipc_format.WorkerMessageType attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.UnloadLoraAdapter">UnloadLoraAdapter (class in mstar.utils.ipc_format)</a>
+</li>
+      <li><a href="_autosummary/mstar.api_server.openai.protocol.html#mstar.api_server.openai.protocol.UnloadLoraAdapterRequest">UnloadLoraAdapterRequest (class in mstar.api_server.openai.protocol)</a>
 </li>
       <li><a href="_autosummary/mstar.engine.resources.lora.html#mstar.engine.resources.lora.AdapterInfo.unmapped">unmapped (mstar.engine.resources.lora.AdapterInfo attribute)</a>
 
@@ -16223,9 +16367,11 @@ window.runMermaid = runMermaid;</script>
 </li>
       <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE">WORKER_GRAPHS_DONE (mstar.utils.ipc_format.ConductorMessageType attribute)</a>
 </li>
-      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.SetupDone.worker_id">worker_id (mstar.utils.ipc_format.SetupDone attribute)</a>
+      <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoraAdapterAck.worker_id">worker_id (mstar.utils.ipc_format.LoraAdapterAck attribute)</a>
 
       <ul>
+        <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.SetupDone.worker_id">(mstar.utils.ipc_format.SetupDone attribute)</a>
+</li>
         <li><a href="_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.WorkerStatus.worker_id">(mstar.utils.ipc_format.WorkerStatus attribute)</a>
 </li>
       </ul></li>

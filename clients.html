@@ -244,6 +244,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -478,6 +479,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -1119,21 +1121,28 @@ naming the base model; see the Qwen3.5 notes in <a class="reference internal" hr
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
 <td><p>Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/audio/speech</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/load_lora_adapter</span></code>, <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/unload_lora_adapter</span></code></p></td>
+<td><p>any LoRA model whose <code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">lora:</span></code> block sets <code class="docutils literal notranslate"><span class="pre">runtime_updates:</span> <span class="pre">true</span></code>;
+404 otherwise</p></td>
+<td><p>Load or unload a LoRA adapter while serving, with vLLM’s bodies
+(<code class="docutils literal notranslate"><span class="pre">{&quot;lora_name&quot;,</span> <span class="pre">&quot;lora_path&quot;}</span></code> / <code class="docutils literal notranslate"><span class="pre">{&quot;lora_name&quot;}</span></code>; a missing field is a 400). See
+the Qwen3.5 notes in <a class="reference internal" href="models.html"><span class="doc">Supported Models</span></a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/audio/speech</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">kokoro</span></code>, <code class="docutils literal notranslate"><span class="pre">orpheus</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_omni</span></code></p></td>
 <td><p>Text-to-speech (<code class="docutils literal notranslate"><span class="pre">kokoro</span></code> streams sentence by sentence with <code class="docutils literal notranslate"><span class="pre">stream=True</span></code>).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/voices</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/voices</span></code></p></td>
 <td><p>speech models that publish a voice list through their speech adapter (<code class="docutils literal notranslate"><span class="pre">kokoro</span></code>, <code class="docutils literal notranslate"><span class="pre">orpheus</span></code>; 404 otherwise)</p></td>
 <td><p>The <code class="docutils literal notranslate"><span class="pre">voice</span></code> ids the served model accepts, plus its default.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/audio/transcriptions</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/audio/transcriptions</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">whisper_large</span></code>, <code class="docutils literal notranslate"><span class="pre">whisper_large_v3_turbo</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_asr</span></code>, <code class="docutils literal notranslate"><span class="pre">qwen3_asr_realtime</span></code>, <code class="docutils literal notranslate"><span class="pre">higgs_audio</span></code>, <code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_*</span></code>, <code class="docutils literal notranslate"><span class="pre">canary</span></code>, <code class="docutils literal notranslate"><span class="pre">canary_qwen</span></code>, <code class="docutils literal notranslate"><span class="pre">parakeet</span></code>,
 <code class="docutils literal notranslate"><span class="pre">nemotron_asr</span></code></p></td>
 <td><p>Speech-to-text (multipart upload; <code class="docutils literal notranslate"><span class="pre">json</span></code> / <code class="docutils literal notranslate"><span class="pre">text</span></code> / <code class="docutils literal notranslate"><span class="pre">verbose_json</span></code> /
 <code class="docutils literal notranslate"><span class="pre">srt</span></code> / <code class="docutils literal notranslate"><span class="pre">vtt</span></code>; streaming via <code class="docutils literal notranslate"><span class="pre">transcript.text.delta</span></code> events).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WS</span> <span class="pre">/v1/realtime?intent=transcription</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">WS</span> <span class="pre">/v1/realtime?intent=transcription</span></code></p></td>
 <td><p>models whose adapter can continue a hypothesis</p></td>
 <td><p>Streaming speech-to-text: <code class="docutils literal notranslate"><span class="pre">input_audio_buffer.append</span></code> PCM16 chunks in,
 <code class="docutils literal notranslate"><span class="pre">conversation.item.input_audio_transcription.delta</span></code> (append-only) and
@@ -1142,11 +1151,11 @@ finishes the utterance. Input is <code class="docutils literal notranslate"><spa
 <code class="docutils literal notranslate"><span class="pre">{&quot;type&quot;:</span> <span class="pre">&quot;audio/pcm&quot;,</span> <span class="pre">&quot;rate&quot;:</span> <span class="pre">24000}</span></code>, resampled to 16 kHz. Turn
 detection is null (client commits), <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> or <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code>; see below.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/generations</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
 <td><p>Text-to-image.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/edits</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/images/edits</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">bagel</span></code></p></td>
 <td><p>Image editing (image + prompt → image).</p></td>
 </tr>

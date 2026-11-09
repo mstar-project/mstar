@@ -597,6 +597,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -831,6 +832,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -1025,7 +1027,9 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">stat</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">NamedTuple</span>
@@ -1081,11 +1085,22 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="require_regular_file">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.require_regular_file">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">require_regular_file</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Refuse anything but a regular file before it is opened: safetensors' open of a FIFO</span>
+<span class="sd">    waits for a writer while holding the GIL, which freezes the whole process."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">stat</span><span class="o">.</span><span class="n">S_ISREG</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">stat</span><span class="p">(</span><span class="n">path</span><span class="p">)</span><span class="o">.</span><span class="n">st_mode</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">OSError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">path</span><span class="si">}</span><span class="s2"> is not a regular file"</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="load_lora_file">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.load_lora_file">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">load_lora_file</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">safetensors.torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_file</span>
 
+    <span class="n">require_regular_file</span><span class="p">(</span><span class="n">path</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">load_file</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">device</span><span class="p">))</span></div>
 
 
@@ -1208,6 +1223,18 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="refuse_non_adapter">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.lora.checkpoint.html#mstar.engine.resources.lora.checkpoint.refuse_non_adapter">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">refuse_non_adapter</span><span class="p">(</span><span class="n">keys</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A checkpoint none of whose keys is a ``lora_A`` / ``lora_B`` tensor is not a LoRA</span>
+<span class="sd">    adapter (a model's weights, say). Raised as an ``OSError``, as an unreadable file is,</span>
+<span class="sd">    so a client that names a server path learns nothing of what the file holds</span>
+<span class="sd">    (``describe_load_error``)."""</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="nb">any</span><span class="p">(</span><span class="n">_AB_KEY</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="n">normalize_lora_key</span><span class="p">(</span><span class="n">key</span><span class="p">))</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">keys</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="ne">OSError</span><span class="p">(</span><span class="s2">"not a LoRA adapter: the file holds no lora_A / lora_B tensors"</span><span class="p">)</span></div>
+
+
+
 <span class="c1"># what a PEFT checkpoint holds besides plain LoRA, and why it cannot be served per request</span>
 <span class="n">_UNSUPPORTED</span> <span class="o">=</span> <span class="p">(</span>
     <span class="p">(</span><span class="s2">"lora_magnitude_vector"</span><span class="p">,</span> <span class="s2">"a DoRA adapter (use_dora=True), whose magnitude rescales "</span>
@@ -1242,6 +1269,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">default_alpha</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="nb">float</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
 <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">LoraAdapter</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Group raw LoRA tensors into per-module ``(A, B, alpha)`` triples in reference-library naming."""</span>
+    <span class="n">refuse_non_adapter</span><span class="p">(</span><span class="n">state_dict</span><span class="p">)</span>
     <span class="n">sd</span> <span class="o">=</span> <span class="p">{</span><span class="n">normalize_lora_key</span><span class="p">(</span><span class="n">key</span><span class="p">):</span> <span class="n">value</span> <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">state_dict</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
     <span class="k">if</span> <span class="n">convert_keys</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">sd</span> <span class="o">=</span> <span class="n">convert_keys</span><span class="p">(</span><span class="n">sd</span><span class="p">)</span>

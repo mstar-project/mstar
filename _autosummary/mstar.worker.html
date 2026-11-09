@@ -240,6 +240,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -474,6 +475,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -726,28 +728,31 @@
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.host_pool.html#module-mstar.worker.host_pool" title="mstar.worker.host_pool"><code class="xref py py-obj docutils literal notranslate"><span class="pre">host_pool</span></code></a></p></td>
 <td><p>Host memory a worker copies request state into, so a request can leave the device and come back.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils" title="mstar.worker.node_manager_utils"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_manager_utils</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.lora_loads.html#module-mstar.worker.lora_loads" title="mstar.worker.lora_loads"><code class="xref py py-obj docutils literal notranslate"><span class="pre">lora_loads</span></code></a></p></td>
+<td><p>Runtime LoRA adapter loads and unloads on a worker: a load reads in the background and is acknowledged from the main loop.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.node_manager_utils.html#module-mstar.worker.node_manager_utils" title="mstar.worker.node_manager_utils"><code class="xref py py-obj docutils literal notranslate"><span class="pre">node_manager_utils</span></code></a></p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.phase_timer.html#module-mstar.worker.phase_timer" title="mstar.worker.phase_timer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">phase_timer</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.phase_timer.html#module-mstar.worker.phase_timer" title="mstar.worker.phase_timer"><code class="xref py py-obj docutils literal notranslate"><span class="pre">phase_timer</span></code></a></p></td>
 <td><p>Per-phase timing of the worker's threads, and the NVTX range that goes with each phase.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.rebuild.html#module-mstar.worker.rebuild" title="mstar.worker.rebuild"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rebuild</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.rebuild.html#module-mstar.worker.rebuild" title="mstar.worker.rebuild"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rebuild</span></code></a></p></td>
 <td><p>What a worker keeps so a request dropped from a node's KV can be rebuilt there, as the node's <cite>RebuildPolicy</cite> declares, and how far each rebuild has run.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.rid_table.html#module-mstar.worker.rid_table" title="mstar.worker.rid_table"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rid_table</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.rid_table.html#module-mstar.worker.rid_table" title="mstar.worker.rid_table"><code class="xref py py-obj docutils literal notranslate"><span class="pre">rid_table</span></code></a></p></td>
 <td><p>Worker-local integer handles for request ids.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.scheduled_batch.html#module-mstar.worker.scheduled_batch" title="mstar.worker.scheduled_batch"><code class="xref py py-obj docutils literal notranslate"><span class="pre">scheduled_batch</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.scheduled_batch.html#module-mstar.worker.scheduled_batch" title="mstar.worker.scheduled_batch"><code class="xref py py-obj docutils literal notranslate"><span class="pre">scheduled_batch</span></code></a></p></td>
 <td><p>A step's rows as the scheduler hands them on, and the chunk arithmetic that goes with them.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.spec_rows.html#module-mstar.worker.spec_rows" title="mstar.worker.spec_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_rows</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.spec_rows.html#module-mstar.worker.spec_rows" title="mstar.worker.spec_rows"><code class="xref py py-obj docutils literal notranslate"><span class="pre">spec_rows</span></code></a></p></td>
 <td><p>A speculative step's per-row objects, built as columns.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.stream_buffers.html#module-mstar.worker.stream_buffers" title="mstar.worker.stream_buffers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">stream_buffers</span></code></a></p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.stream_buffers.html#module-mstar.worker.stream_buffers" title="mstar.worker.stream_buffers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">stream_buffers</span></code></a></p></td>
 <td><p>Streaming edges on one worker, both sides.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="mstar.worker.worker_metrics.html#module-mstar.worker.worker_metrics" title="mstar.worker.worker_metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">worker_metrics</span></code></a></p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="mstar.worker.worker_metrics.html#module-mstar.worker.worker_metrics" title="mstar.worker.worker_metrics"><code class="xref py py-obj docutils literal notranslate"><span class="pre">worker_metrics</span></code></a></p></td>
 <td><p>The engine worker's metrics, built only while metrics are on.</p></td>
 </tr>
 </tbody>

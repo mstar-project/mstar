@@ -36,6 +36,7 @@
    host_pool
    input_ingest
    lockstep
+   lora_loads
    micro_scheduler
    node_manager_utils
    phase_timer

@@ -26,6 +26,8 @@ mstar.utils.ipc\_format
       EnableMetrics
       FailRequests
       InputSignals
+      LoadLoraAdapter
+      LoraAdapterAck
       MessageBody
       MessageSource
       NewRequest
@@ -39,6 +41,7 @@ mstar.utils.ipc\_format
       StopLoops
       TPNoSpeculation
       TensorReceived
+      UnloadLoraAdapter
       UnpersistTensors
       WorkerGraphsDone
       WorkerMessage

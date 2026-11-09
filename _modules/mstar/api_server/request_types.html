@@ -597,6 +597,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -831,6 +832,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -1114,11 +1116,28 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="LoraAdapterResult">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.LoraAdapterResult">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">LoraAdapterResult</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The conductor's answer to a LoRA adapter load or unload, once every worker hosting</span>
+<span class="sd">    the pool has acknowledged it: ``error_message`` is None on success, else ``status``</span>
+<span class="sd">    is the HTTP status the API server answers with."""</span>
+    <span class="n">op_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">error_message</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">status</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">200</span>
+    <span class="c1"># whether the conductor serves the name once the operation is over, so the API</span>
+    <span class="c1"># server's selection follows it whatever the outcome; None when it has no LoRA</span>
+    <span class="n">served</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
 <span class="c1"># what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder</span>
 <span class="c1"># tries branches in order and takes the first whose required fields are all</span>
 <span class="c1"># present, so a body must lack a required field of every branch before it.</span>
 <span class="n">APIServerMessageBody</span> <span class="o">=</span> <span class="p">(</span>
-    <span class="n">ResultTensors</span> <span class="o">|</span> <span class="n">ResultTokens</span> <span class="o">|</span> <span class="n">RequestComplete</span> <span class="o">|</span> <span class="n">RequestFailed</span> <span class="o">|</span> <span class="n">ConductorStatus</span> <span class="o">|</span> <span class="kc">None</span>
+    <span class="n">ResultTensors</span> <span class="o">|</span> <span class="n">ResultTokens</span> <span class="o">|</span> <span class="n">RequestComplete</span> <span class="o">|</span> <span class="n">RequestFailed</span> <span class="o">|</span> <span class="n">ConductorStatus</span>
+    <span class="o">|</span> <span class="n">LoraAdapterResult</span> <span class="o">|</span> <span class="kc">None</span>
 <span class="p">)</span>
 
 
@@ -1128,7 +1147,7 @@ window.runMermaid = runMermaid;</script>
 <span class="k">class</span><span class="w"> </span><span class="nc">APIServerMessage</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""Envelope for messages received by the API server."""</span>
     <span class="c1"># "result_tensors" | "result_tokens" | "request_complete" | "request_failed"</span>
-    <span class="c1"># | "conductor_status" | "setup_done"</span>
+    <span class="c1"># | "conductor_status" | "lora_adapter_result" | "setup_done"</span>
     <span class="n">message_type</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">body</span><span class="p">:</span> <span class="n">APIServerMessageBody</span> <span class="o">=</span> <span class="kc">None</span></div>
 

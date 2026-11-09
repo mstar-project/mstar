@@ -244,6 +244,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -478,6 +479,7 @@
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -1505,9 +1507,10 @@ on the head).</p>
 <p>Every target is sized into each slot and runs its kernels on every step that has an
 adapter row, whether that row’s adapter uses it or not. The LM head and embedding are
 vocabulary-sized: at <code class="docutils literal notranslate"><span class="pre">max_rank:</span> <span class="pre">16</span></code> and 4 slots, about 40 MB each per GPU (the head’s
-split over TP ranks, the embedding’s whole on each). So the pools keep only the targets
-the configured adapters touch, and a vision encoder whose adapters are all text-only
-builds no pool, unless the YAML lists the ones to keep:</p>
+split over TP ranks, the embedding’s whole on each). So with <code class="docutils literal notranslate"><span class="pre">runtime_updates</span></code> off
+(no adapter can arrive after startup), the pools keep only the targets the configured
+adapters touch, and a vision encoder whose adapters are all text-only builds no pool.
+With it on, every target is kept unless the YAML lists the ones to keep:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">resources</span><span class="p">:</span>
   <span class="n">lora</span><span class="p">:</span>
     <span class="n">targets</span><span class="p">:</span> <span class="p">[</span><span class="n">qkv_proj</span><span class="p">,</span> <span class="n">o_proj</span><span class="p">,</span> <span class="n">in_proj_fused</span><span class="p">,</span> <span class="n">out_proj</span><span class="p">,</span> <span class="n">gate_up_proj</span><span class="p">,</span> <span class="n">down_proj</span><span class="p">,</span>
@@ -1543,6 +1546,38 @@ at TP4, and the DeltaNet <code class="docutils literal notranslate"><span class=
 on one GPU in every shipped config.</p>
 <p>LoRA needs the Python frontend (<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code> refuses to start with a <code class="docutils literal notranslate"><span class="pre">lora</span></code>
 block).</p>
+<p>Adapters can also be loaded and unloaded while the server runs, with vLLM’s
+endpoints and bodies. They make the server read paths a client names, so they are off
+unless the <code class="docutils literal notranslate"><span class="pre">lora</span></code> block opts in, and answer 404 otherwise (as vLLM’s do without
+<code class="docutils literal notranslate"><span class="pre">VLLM_ALLOW_RUNTIME_LORA_UPDATING</span></code>). The block may name no adapters at all
+(<code class="docutils literal notranslate"><span class="pre">resources:</span> <span class="pre">{lora:</span> <span class="pre">{max_slots:</span> <span class="pre">4,</span> <span class="pre">runtime_updates:</span> <span class="pre">true}}</span></code>):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">curl</span> <span class="o">-</span><span class="n">X</span> <span class="n">POST</span> <span class="n">localhost</span><span class="p">:</span><span class="mi">8000</span><span class="o">/</span><span class="n">v1</span><span class="o">/</span><span class="n">load_lora_adapter</span> <span class="o">-</span><span class="n">H</span> <span class="s1">'Content-Type: application/json'</span> \
+    <span class="o">-</span><span class="n">d</span> <span class="s1">'{"lora_name": "sql", "lora_path": "/adapters/qwen3_5-4b-sql"}'</span>
+<span class="n">curl</span> <span class="o">-</span><span class="n">X</span> <span class="n">POST</span> <span class="n">localhost</span><span class="p">:</span><span class="mi">8000</span><span class="o">/</span><span class="n">v1</span><span class="o">/</span><span class="n">unload_lora_adapter</span> <span class="o">-</span><span class="n">H</span> <span class="s1">'Content-Type: application/json'</span> \
+    <span class="o">-</span><span class="n">d</span> <span class="s1">'{"lora_name": "sql"}'</span>
+</pre></div>
+</div>
+<p><code class="docutils literal notranslate"><span class="pre">lora_path</span></code> is a PEFT directory (its <code class="docutils literal notranslate"><span class="pre">adapter_model.safetensors</span></code> is read) or a
+safetensors file, readable at the same path by the API server, the conductor (which
+reads the adapter’s header to check requests on it) and every worker. A load is checked
+first (LoRA layers present, rank within <code class="docutils literal notranslate"><span class="pre">max_rank</span></code>, only the targets above, shapes
+that fit them), then read by every worker that hosts a node with a LoRA pool (the LLM’s
+or the vision encoder’s); the name is selectable, and listed by <code class="docutils literal notranslate"><span class="pre">/v1/models</span></code>, once all
+of them have it. A load that fails on any worker is undone on all of them and answered
+with a 400, as is a name that is already loaded. A refusal says why the adapter cannot be
+served (its rank, its modules, its shapes); a file that cannot be read at all gets the
+same answer whether it is missing, unreadable or not an adapter, and the details go to
+the server log. A worker that does not answer within <code class="docutils literal notranslate"><span class="pre">runtime_update_timeout_s</span></code>
+(default 120) fails the load with a 504, and the load is undone everywhere, so the name
+is free to try again.</p>
+<p>To change an adapter’s weights, unload it and load it again: each adapter is pinned to
+the digest of the weights checked when it was configured or loaded, and a worker that
+reads other weights from its path (the file overwritten in place) refuses them, on every
+rank, rather than serve them under the old name and prefix-cache entries. An unload stops
+new requests on the name at once (they get the 400 an unknown adapter gets; an unknown
+name in the unload is a 404); if the conductor refuses it, the name is selectable again.
+Requests already running on it finish on its weights, after which its slot and host copy
+are freed; loading the name again before then is a 400 that says so.</p>
 <p>Qwen3.8-27B (<code class="docutils literal notranslate"><span class="pre">qwen3_8_27b</span></code>) is the Qwen3.5 architecture and runs on the same
 code, served from <code class="docutils literal notranslate"><span class="pre">configs/qwen3_8_27b_tp4.yaml</span></code> (TP4):</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">mstar</span> <span class="n">serve</span> <span class="n">qwen3_8_27b</span> <span class="o">--</span><span class="n">gpus</span> <span class="mi">0</span><span class="p">,</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">,</span><span class="mi">3</span>

@@ -244,6 +244,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -478,6 +479,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -739,6 +741,8 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.normalize_lora_state_dict"><code class="docutils literal notranslate"><span class="pre">normalize_lora_state_dict()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.parse_lora_key"><code class="docutils literal notranslate"><span class="pre">parse_lora_key()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.read_lora_file"><code class="docutils literal notranslate"><span class="pre">read_lora_file()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.refuse_non_adapter"><code class="docutils literal notranslate"><span class="pre">refuse_non_adapter()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.require_regular_file"><code class="docutils literal notranslate"><span class="pre">require_regular_file()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.sidecar_default_alpha"><code class="docutils literal notranslate"><span class="pre">sidecar_default_alpha()</span></code></a></li>
 </ul>
             </nav>
@@ -786,6 +790,12 @@ merge’s <code class="docutils literal notranslate"><span class="pre">resolve_l
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.checkpoint.read_lora_file" title="mstar.engine.resources.lora.checkpoint.read_lora_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">read_lora_file</span></code></a>(path[, convert_keys])</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">normalize_lora_state_dict</span></code> over a safetensors file, with its sidecar's scaling.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.checkpoint.refuse_non_adapter" title="mstar.engine.resources.lora.checkpoint.refuse_non_adapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">refuse_non_adapter</span></code></a>(keys)</p></td>
+<td><p>A checkpoint none of whose keys is a <code class="docutils literal notranslate"><span class="pre">lora_A</span></code> / <code class="docutils literal notranslate"><span class="pre">lora_B</span></code> tensor is not a LoRA adapter (a model's weights, say).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.checkpoint.require_regular_file" title="mstar.engine.resources.lora.checkpoint.require_regular_file"><code class="xref py py-obj docutils literal notranslate"><span class="pre">require_regular_file</span></code></a>(path)</p></td>
+<td><p>Refuse anything but a regular file before it is opened: safetensors' open of a FIFO waits for a writer while holding the GIL, which freezes the whole process.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.lora.checkpoint.sidecar_default_alpha" title="mstar.engine.resources.lora.checkpoint.sidecar_default_alpha"><code class="xref py py-obj docutils literal notranslate"><span class="pre">sidecar_default_alpha</span></code></a>(path)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">(module,</span> <span class="pre">rank)</span> <span class="pre">-&gt;</span> <span class="pre">alpha</span></code> reproducing PEFT's scaling for an adapter whose safetensors has no alpha keys.</p></td>
@@ -1014,6 +1024,35 @@ merge’s <code class="docutils literal notranslate"><span class="pre">resolve_l
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.checkpoint.refuse_non_adapter">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.checkpoint.</span></span><span class="sig-name descname"><span class="pre">refuse_non_adapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">keys</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/checkpoint.html#refuse_non_adapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.checkpoint.refuse_non_adapter" title="Link to this definition">#</a></dt>
+<dd><p>A checkpoint none of whose keys is a <code class="docutils literal notranslate"><span class="pre">lora_A</span></code> / <code class="docutils literal notranslate"><span class="pre">lora_B</span></code> tensor is not a LoRA
+adapter (a model’s weights, say). Raised as an <code class="docutils literal notranslate"><span class="pre">OSError</span></code>, as an unreadable file is,
+so a client that names a server path learns nothing of what the file holds
+(<code class="docutils literal notranslate"><span class="pre">describe_load_error</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.lora.checkpoint.require_regular_file">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.checkpoint.</span></span><span class="sig-name descname"><span class="pre">require_regular_file</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/checkpoint.html#require_regular_file"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.checkpoint.require_regular_file" title="Link to this definition">#</a></dt>
+<dd><p>Refuse anything but a regular file before it is opened: safetensors’ open of a FIFO
+waits for a writer while holding the GIL, which freezes the whole process.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.checkpoint.sidecar_default_alpha">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.lora.checkpoint.</span></span><span class="sig-name descname"><span class="pre">sidecar_default_alpha</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">path</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/checkpoint.html#sidecar_default_alpha"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.checkpoint.sidecar_default_alpha" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">(module,</span> <span class="pre">rank)</span> <span class="pre">-&gt;</span> <span class="pre">alpha</span></code> reproducing PEFT’s scaling for an adapter whose safetensors has no
@@ -1111,6 +1150,8 @@ would suggest <code class="docutils literal notranslate"><span class="pre">1</sp
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.normalize_lora_state_dict"><code class="docutils literal notranslate"><span class="pre">normalize_lora_state_dict()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.parse_lora_key"><code class="docutils literal notranslate"><span class="pre">parse_lora_key()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.read_lora_file"><code class="docutils literal notranslate"><span class="pre">read_lora_file()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.refuse_non_adapter"><code class="docutils literal notranslate"><span class="pre">refuse_non_adapter()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.require_regular_file"><code class="docutils literal notranslate"><span class="pre">require_regular_file()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.lora.checkpoint.sidecar_default_alpha"><code class="docutils literal notranslate"><span class="pre">sidecar_default_alpha()</span></code></a></li>
 </ul>
   </nav></div>

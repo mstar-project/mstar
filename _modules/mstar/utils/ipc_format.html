@@ -597,6 +597,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="../../../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -831,6 +832,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="../../../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -1060,7 +1062,9 @@ window.runMermaid = runMermaid;</script>
     <span class="n">STOP_LOOPS</span> <span class="o">=</span> <span class="s2">"stop_loops"</span>
     <span class="n">TP_NO_SPEC</span> <span class="o">=</span> <span class="s2">"tp_no_spec"</span>
     <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span>
-    <span class="n">CLIENT_STREAM_ROUTE</span> <span class="o">=</span> <span class="s2">"client_stream_route"</span></div>
+    <span class="n">CLIENT_STREAM_ROUTE</span> <span class="o">=</span> <span class="s2">"client_stream_route"</span>
+    <span class="n">LOAD_LORA_ADAPTER</span> <span class="o">=</span> <span class="s2">"load_lora_adapter"</span>
+    <span class="n">UNLOAD_LORA_ADAPTER</span> <span class="o">=</span> <span class="s2">"unload_lora_adapter"</span></div>
 
 
 
@@ -1385,7 +1389,10 @@ window.runMermaid = runMermaid;</script>
     <span class="n">FAIL_REQUESTS</span> <span class="o">=</span> <span class="s2">"fail_requests"</span>
     <span class="n">READS_DONE</span> <span class="o">=</span> <span class="s2">"reads_done"</span>
     <span class="n">WORKER_STATUS</span> <span class="o">=</span> <span class="s2">"worker_status"</span>
-    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span></div>
+    <span class="n">ENABLE_METRICS</span> <span class="o">=</span> <span class="s2">"enable_metrics"</span>
+    <span class="n">LOAD_LORA_ADAPTER</span> <span class="o">=</span> <span class="s2">"load_lora_adapter"</span>
+    <span class="n">UNLOAD_LORA_ADAPTER</span> <span class="o">=</span> <span class="s2">"unload_lora_adapter"</span>
+    <span class="n">LORA_ADAPTER_ACK</span> <span class="o">=</span> <span class="s2">"lora_adapter_ack"</span></div>
 
 
 
@@ -1496,6 +1503,46 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Start the workers' histograms and counters. The API server sends it to</span>
 <span class="sd">    the conductor after its warmup requests; the conductor forwards it to</span>
 <span class="sd">    every worker (``WorkerMetrics.start_counting``)."""</span></div>
+
+
+
+<div class="viewcode-block" id="LoadLoraAdapter">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoadLoraAdapter">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">LoadLoraAdapter</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Serve a LoRA adapter from now on (``POST /v1/load_lora_adapter``). The API server</span>
+<span class="sd">    sends it to the conductor, which forwards it to every worker hosting the LoRA pool</span>
+<span class="sd">    and answers once all of them have acknowledged. ``op_id`` pairs the acks and the</span>
+<span class="sd">    answer with the request; ``lora_path`` is a safetensors file every process can read.</span>
+<span class="sd">    ``lora_digest`` (hex) is the digest of the weights the API server checked and keys</span>
+<span class="sd">    the prefix cache under: a worker reading other weights refuses the load.</span>
+<span class="sd">    """</span>
+    <span class="n">op_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">lora_name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">lora_path</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">lora_digest</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
+
+
+
+<div class="viewcode-block" id="UnloadLoraAdapter">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.UnloadLoraAdapter">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">UnloadLoraAdapter</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Stop serving a LoRA adapter to new requests (``POST /v1/unload_lora_adapter``);</span>
+<span class="sd">    routed like ``LoadLoraAdapter``."""</span>
+    <span class="n">op_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">lora_name</span><span class="p">:</span> <span class="nb">str</span></div>
+
+
+
+<div class="viewcode-block" id="LoraAdapterAck">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.ipc_format.html#mstar.utils.ipc_format.LoraAdapterAck">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">LoraAdapterAck</span><span class="p">(</span><span class="n">MessageBody</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A worker's answer to a load or unload: ``error`` is None when it succeeded."""</span>
+    <span class="n">op_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">worker_id</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">error</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span></div>
 
 
 

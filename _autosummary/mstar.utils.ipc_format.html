@@ -244,6 +244,7 @@
 </ul>
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.mps.html">mstar.conductor.mps</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.conductor.workers.html">mstar.conductor.workers</a></li>
@@ -478,6 +479,7 @@
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
@@ -730,9 +732,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ABORT_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ABORT_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ENABLE_METRICS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ENABLE_METRICS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.FAIL_REQUESTS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.FAIL_REQUESTS</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.LOAD_LORA_ADAPTER"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.LOAD_LORA_ADAPTER</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.LORA_ADAPTER_ACK"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.LORA_ADAPTER_ACK</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.READS_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.SETUP_DONE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.UNLOAD_LORA_ADAPTER"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.UNLOAD_LORA_ADAPTER</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_GRAPHS_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_STATUS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_STATUS</span></code></a></li>
 </ul>
@@ -780,6 +785,19 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.InputSignals.producer_done_items"><code class="docutils literal notranslate"><span class="pre">InputSignals.producer_done_items</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.InputSignals.request_id"><code class="docutils literal notranslate"><span class="pre">InputSignals.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.InputSignals.request_info"><code class="docutils literal notranslate"><span class="pre">InputSignals.request_info</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_digest"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter.lora_digest</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_name"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter.lora_name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_path"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter.lora_path</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter.op_id"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter.op_id</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoraAdapterAck"><code class="docutils literal notranslate"><span class="pre">LoraAdapterAck</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoraAdapterAck.error"><code class="docutils literal notranslate"><span class="pre">LoraAdapterAck.error</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoraAdapterAck.op_id"><code class="docutils literal notranslate"><span class="pre">LoraAdapterAck.op_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoraAdapterAck.worker_id"><code class="docutils literal notranslate"><span class="pre">LoraAdapterAck.worker_id</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.MessageBody"><code class="docutils literal notranslate"><span class="pre">MessageBody</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -885,6 +903,11 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TensorReceived.successful_tensors"><code class="docutils literal notranslate"><span class="pre">TensorReceived.successful_tensors</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnloadLoraAdapter"><code class="docutils literal notranslate"><span class="pre">UnloadLoraAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnloadLoraAdapter.lora_name"><code class="docutils literal notranslate"><span class="pre">UnloadLoraAdapter.lora_name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnloadLoraAdapter.op_id"><code class="docutils literal notranslate"><span class="pre">UnloadLoraAdapter.op_id</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnpersistTensors"><code class="docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnpersistTensors.request_id"><code class="docutils literal notranslate"><span class="pre">UnpersistTensors.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnpersistTensors.uuid_to_ref_count"><code class="docutils literal notranslate"><span class="pre">UnpersistTensors.uuid_to_ref_count</span></code></a></li>
@@ -919,12 +942,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.EDGE_ITEMS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.EDGE_ITEMS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.ENABLE_METRICS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.ENABLE_METRICS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.INPUT_SIGNALS</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.LOAD_LORA_ADAPTER"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.LOAD_LORA_ADAPTER</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.REMOVE_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.REMOVE_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.SCHEDULE_TP"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.SCHEDULE_TP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.STOP_LOOPS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.STOP_LOOPS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TENSOR_RECEIVED"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TENSOR_RECEIVED</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TP_NO_SPEC</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.UNLOAD_LORA_ADAPTER"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.UNLOAD_LORA_ADAPTER</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.UNPERSIST_TENSORS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.UNPERSIST_TENSORS</span></code></a></li>
 </ul>
 </li>
@@ -976,6 +1001,12 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.InputSignals" title="mstar.utils.ipc_format.InputSignals"><code class="xref py py-obj docutils literal notranslate"><span class="pre">InputSignals</span></code></a>(request_id, inputs, ...)</p></td>
 <td><p></p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.LoadLoraAdapter" title="mstar.utils.ipc_format.LoadLoraAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoadLoraAdapter</span></code></a>(op_id, lora_name, lora_path)</p></td>
+<td><p>Serve a LoRA adapter from now on (<code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/load_lora_adapter</span></code>).</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.LoraAdapterAck" title="mstar.utils.ipc_format.LoraAdapterAck"><code class="xref py py-obj docutils literal notranslate"><span class="pre">LoraAdapterAck</span></code></a>(op_id, worker_id[, error])</p></td>
+<td><p>A worker's answer to a load or unload: <code class="docutils literal notranslate"><span class="pre">error</span></code> is None when it succeeded.</p></td>
+</tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-obj docutils literal notranslate"><span class="pre">MessageBody</span></code></a>()</p></td>
 <td><p></p></td>
 </tr>
@@ -1015,19 +1046,22 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.TensorReceived" title="mstar.utils.ipc_format.TensorReceived"><code class="xref py py-obj docutils literal notranslate"><span class="pre">TensorReceived</span></code></a>(successful_tensors, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnpersistTensors" title="mstar.utils.ipc_format.UnpersistTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a>(request_id, uuid_to_ref_count)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnloadLoraAdapter" title="mstar.utils.ipc_format.UnloadLoraAdapter"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnloadLoraAdapter</span></code></a>(op_id, lora_name)</p></td>
+<td><p>Stop serving a LoRA adapter to new requests (<code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/unload_lora_adapter</span></code>); routed like <code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.UnpersistTensors" title="mstar.utils.ipc_format.UnpersistTensors"><code class="xref py py-obj docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a>(request_id, uuid_to_ref_count)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerGraphsDone" title="mstar.utils.ipc_format.WorkerGraphsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerGraphsDone</span></code></a>(request_id, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerGraphsDone" title="mstar.utils.ipc_format.WorkerGraphsDone"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerGraphsDone</span></code></a>(request_id, ...)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessage" title="mstar.utils.ipc_format.WorkerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessage</span></code></a>(message_type, body)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessage" title="mstar.utils.ipc_format.WorkerMessage"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessage</span></code></a>(message_type, body)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerMessageType" title="mstar.utils.ipc_format.WorkerMessageType"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerMessageType</span></code></a>(*values)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerStatus</span></code></a>(worker_id, metrics)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.ipc_format.WorkerStatus" title="mstar.utils.ipc_format.WorkerStatus"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkerStatus</span></code></a>(worker_id, metrics)</p></td>
 <td><p>A worker's engine metrics, sent once per status interval only while metrics are on: cumulative or current values per graph node or tensor edge, never per-request data.</p></td>
 </tr>
 </tbody>
@@ -1127,6 +1161,16 @@ which then takes no more items.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.LOAD_LORA_ADAPTER">
+<span class="sig-name descname"><span class="pre">LOAD_LORA_ADAPTER</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'load_lora_adapter'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.LOAD_LORA_ADAPTER" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.LORA_ADAPTER_ACK">
+<span class="sig-name descname"><span class="pre">LORA_ADAPTER_ACK</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'lora_adapter_ack'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.LORA_ADAPTER_ACK" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.NEW_REQUEST">
 <span class="sig-name descname"><span class="pre">NEW_REQUEST</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'new_request'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.NEW_REQUEST" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -1139,6 +1183,11 @@ which then takes no more items.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE">
 <span class="sig-name descname"><span class="pre">SETUP_DONE</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'setup_done'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.ConductorMessageType.UNLOAD_LORA_ADAPTER">
+<span class="sig-name descname"><span class="pre">UNLOAD_LORA_ADAPTER</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'unload_lora_adapter'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.ConductorMessageType.UNLOAD_LORA_ADAPTER" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1411,6 +1460,79 @@ step can fail several of them for different reasons.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.InputSignals.request_info">
 <span class="sig-name descname"><span class="pre">request_info</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.conductor.request_info.html#mstar.conductor.request_info.CurrentForwardPassInfo" title="mstar.conductor.request_info.CurrentForwardPassInfo"><span class="pre">CurrentForwardPassInfo</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.InputSignals.request_info" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoadLoraAdapter">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">LoadLoraAdapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">op_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_name</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_digest</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#LoadLoraAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
+<p>Serve a LoRA adapter from now on (<code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/load_lora_adapter</span></code>). The API server
+sends it to the conductor, which forwards it to every worker hosting the LoRA pool
+and answers once all of them have acknowledged. <code class="docutils literal notranslate"><span class="pre">op_id</span></code> pairs the acks and the
+answer with the request; <code class="docutils literal notranslate"><span class="pre">lora_path</span></code> is a safetensors file every process can read.
+<code class="docutils literal notranslate"><span class="pre">lora_digest</span></code> (hex) is the digest of the weights the API server checked and keys
+the prefix cache under: a worker reading other weights refuses the load.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>op_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>lora_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>lora_path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>lora_digest</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoadLoraAdapter.lora_digest">
+<span class="sig-name descname"><span class="pre">lora_digest</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_digest" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoadLoraAdapter.lora_name">
+<span class="sig-name descname"><span class="pre">lora_name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_name" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoadLoraAdapter.lora_path">
+<span class="sig-name descname"><span class="pre">lora_path</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_path" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoadLoraAdapter.op_id">
+<span class="sig-name descname"><span class="pre">op_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.LoadLoraAdapter.op_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoraAdapterAck">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">LoraAdapterAck</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">op_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">worker_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">error</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#LoraAdapterAck"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.LoraAdapterAck" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
+<p>A worker’s answer to a load or unload: <code class="docutils literal notranslate"><span class="pre">error</span></code> is None when it succeeded.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>op_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>worker_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>error</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoraAdapterAck.error">
+<span class="sig-name descname"><span class="pre">error</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.utils.ipc_format.LoraAdapterAck.error" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoraAdapterAck.op_id">
+<span class="sig-name descname"><span class="pre">op_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.LoraAdapterAck.op_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.LoraAdapterAck.worker_id">
+<span class="sig-name descname"><span class="pre">worker_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.LoraAdapterAck.worker_id" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
@@ -1986,6 +2108,32 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.UnloadLoraAdapter">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">UnloadLoraAdapter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">op_id</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">lora_name</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#UnloadLoraAdapter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.UnloadLoraAdapter" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
+<p>Stop serving a LoRA adapter to new requests (<code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/unload_lora_adapter</span></code>);
+routed like <code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>op_id</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>lora_name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.UnloadLoraAdapter.lora_name">
+<span class="sig-name descname"><span class="pre">lora_name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.UnloadLoraAdapter.lora_name" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.UnloadLoraAdapter.op_id">
+<span class="sig-name descname"><span class="pre">op_id</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.utils.ipc_format.UnloadLoraAdapter.op_id" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.UnpersistTensors">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.utils.ipc_format.</span></span><span class="sig-name descname"><span class="pre">UnpersistTensors</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">request_id</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">uuid_to_ref_count</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/ipc_format.html#UnpersistTensors"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.ipc_format.UnpersistTensors" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="#mstar.utils.ipc_format.MessageBody" title="mstar.utils.ipc_format.MessageBody"><code class="xref py py-class docutils literal notranslate"><span class="pre">MessageBody</span></code></a></p>
@@ -2165,6 +2313,11 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <dd></dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.LOAD_LORA_ADAPTER">
+<span class="sig-name descname"><span class="pre">LOAD_LORA_ADAPTER</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'load_lora_adapter'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.LOAD_LORA_ADAPTER" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST">
 <span class="sig-name descname"><span class="pre">NEW_REQUEST</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'new_request'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -2192,6 +2345,11 @@ start none — the conductor’s gate before sending the hard RemoveRequest.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC">
 <span class="sig-name descname"><span class="pre">TP_NO_SPEC</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'tp_no_spec'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.utils.ipc_format.WorkerMessageType.UNLOAD_LORA_ADAPTER">
+<span class="sig-name descname"><span class="pre">UNLOAD_LORA_ADAPTER</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'unload_lora_adapter'</span></span><a class="headerlink" href="#mstar.utils.ipc_format.WorkerMessageType.UNLOAD_LORA_ADAPTER" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -2296,9 +2454,12 @@ edge, never per-request data.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ABORT_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ABORT_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.ENABLE_METRICS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.ENABLE_METRICS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.FAIL_REQUESTS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.FAIL_REQUESTS</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.LOAD_LORA_ADAPTER"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.LOAD_LORA_ADAPTER</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.LORA_ADAPTER_ACK"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.LORA_ADAPTER_ACK</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.READS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.READS_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.SETUP_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.SETUP_DONE</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.UNLOAD_LORA_ADAPTER"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.UNLOAD_LORA_ADAPTER</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_GRAPHS_DONE"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_GRAPHS_DONE</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.ConductorMessageType.WORKER_STATUS"><code class="docutils literal notranslate"><span class="pre">ConductorMessageType.WORKER_STATUS</span></code></a></li>
 </ul>
@@ -2346,6 +2507,19 @@ edge, never per-request data.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.InputSignals.producer_done_items"><code class="docutils literal notranslate"><span class="pre">InputSignals.producer_done_items</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.InputSignals.request_id"><code class="docutils literal notranslate"><span class="pre">InputSignals.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.InputSignals.request_info"><code class="docutils literal notranslate"><span class="pre">InputSignals.request_info</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_digest"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter.lora_digest</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_name"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter.lora_name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter.lora_path"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter.lora_path</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoadLoraAdapter.op_id"><code class="docutils literal notranslate"><span class="pre">LoadLoraAdapter.op_id</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoraAdapterAck"><code class="docutils literal notranslate"><span class="pre">LoraAdapterAck</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoraAdapterAck.error"><code class="docutils literal notranslate"><span class="pre">LoraAdapterAck.error</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoraAdapterAck.op_id"><code class="docutils literal notranslate"><span class="pre">LoraAdapterAck.op_id</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.LoraAdapterAck.worker_id"><code class="docutils literal notranslate"><span class="pre">LoraAdapterAck.worker_id</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.MessageBody"><code class="docutils literal notranslate"><span class="pre">MessageBody</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -2451,6 +2625,11 @@ edge, never per-request data.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.TensorReceived.successful_tensors"><code class="docutils literal notranslate"><span class="pre">TensorReceived.successful_tensors</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnloadLoraAdapter"><code class="docutils literal notranslate"><span class="pre">UnloadLoraAdapter</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnloadLoraAdapter.lora_name"><code class="docutils literal notranslate"><span class="pre">UnloadLoraAdapter.lora_name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnloadLoraAdapter.op_id"><code class="docutils literal notranslate"><span class="pre">UnloadLoraAdapter.op_id</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnpersistTensors"><code class="docutils literal notranslate"><span class="pre">UnpersistTensors</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnpersistTensors.request_id"><code class="docutils literal notranslate"><span class="pre">UnpersistTensors.request_id</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.UnpersistTensors.uuid_to_ref_count"><code class="docutils literal notranslate"><span class="pre">UnpersistTensors.uuid_to_ref_count</span></code></a></li>
@@ -2485,12 +2664,14 @@ edge, never per-request data.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.EDGE_ITEMS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.EDGE_ITEMS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.ENABLE_METRICS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.ENABLE_METRICS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.INPUT_SIGNALS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.INPUT_SIGNALS</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.LOAD_LORA_ADAPTER"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.LOAD_LORA_ADAPTER</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.NEW_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.NEW_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.REMOVE_REQUEST"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.REMOVE_REQUEST</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.SCHEDULE_TP"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.SCHEDULE_TP</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.STOP_LOOPS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.STOP_LOOPS</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TENSOR_RECEIVED"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TENSOR_RECEIVED</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.TP_NO_SPEC"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.TP_NO_SPEC</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.UNLOAD_LORA_ADAPTER"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.UNLOAD_LORA_ADAPTER</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.ipc_format.WorkerMessageType.UNPERSIST_TENSORS"><code class="docutils literal notranslate"><span class="pre">WorkerMessageType.UNPERSIST_TENSORS</span></code></a></li>
 </ul>
 </li>
