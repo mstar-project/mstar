@@ -32,7 +32,9 @@ from pathlib import Path
 MODEL = "ripple_65b"
 MAX_TOKENS = 128
 TOP_K = 5
-NEAR_TIE = 0.75  # the gate's top-1/top-2 logit gap, #1133's yardstick
+# the gate's top-1/top-2 logit gap. The largest flip seen: 0.19 at TP2, 0.13 at TP4, TP8, eager and beside
+# decoding streams; the reference against itself, under 0.03
+NEAR_TIE = 0.25
 WINDOW, CHUNK = 1024, 2048
 REPO = Path(__file__).resolve().parents[2]
 

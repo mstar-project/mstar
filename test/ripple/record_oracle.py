@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 
 TOP_K = 5
-NEAR_TIE = 0.75
+NEAR_TIE = 0.25  # as run_parity.py
 MAX_REALIGN = 32
 STOP_IDS = (100265, 100257)  # <|im_end|>, <|endoftext|>
 
