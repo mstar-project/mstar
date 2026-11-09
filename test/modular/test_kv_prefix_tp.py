@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import threading
 from array import array
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,6 +15,7 @@ import yaml
 from test_kv_prefix_correctness import NODE, PAGE_SIZE, ROOT, WALK
 from test_kv_prefix_layout_lease import ASK, IMAGE, IMAGE_WALK, OTHER_ASK, TEXT, _config, _walks
 from test_kv_prefix_lease import _StubTransfer
+from test_resident_delta import _Commit
 from test_tp_async_teardown_order import _rank, _Stop
 from test_tp_rebuild_land import _Rank
 from test_worker_rebuild import _kept
@@ -398,14 +398,14 @@ def test_the_async_path_stops_a_follower_that_lost_a_page_once_n_commits():
     head.speculative, head.spec_from_seq = True, 4
     worker = _follower_worker(follower)
     worker.lockstep.enqueue_follow(head)
+    commit = _Commit()
     step_n = SimpleNamespace(
-        tp_seq=4, node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(commit_done=threading.Event()),
+        tp_seq=4, node_name=NODE, graph_walk=WALK, node_batch=SimpleNamespace(commit_done=commit, request_ids=[]),
     )
 
-    assert worker._try_follow_speculation(step_n) is None, "a page N could still index was called lost"
-    step_n.node_batch.commit_done.set()
     with pytest.raises(SystemExit, match=r"here \(1\)"):
         worker._try_follow_speculation(step_n)
+    assert commit.waited, "a page N could still index was called lost"
 
 
 @pytest.mark.parametrize("cache_open", [True, False])

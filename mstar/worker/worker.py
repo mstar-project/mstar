@@ -1936,13 +1936,17 @@ class Worker:
         # "not ready" never could.
         # Of the steps before the head, only N may still index a page of the head's hit, or hold pages back
         committed = pending.node_batch.commit_done
-        if not self.lockstep.settle_delta(caught_up=committed.is_set()):
-            if committed.is_set() or not self.lockstep.awaits_commit():
+        caught_up = committed.is_set()
+        while not self.lockstep.settle_delta(caught_up):
+            if not self.lockstep.awaits_commit(pending.node_batch.request_ids):
                 return None
-            # A reload in the head waits for N's commit, which every exit of N's step releases.
+            if caught_up:
+                raise SystemExit(
+                    f"TP ranks diverged: rank 0's moves still wait on step seq {pending.tp_seq} after it committed here"
+                )
+            # every exit of N's step releases its commit
             committed.wait()
-            if not self.lockstep.settle_delta(caught_up=True):
-                return None
+            caught_up = True
 
         batch_N = pending.batch
         # The leader names its rids by wire string; these are this rank's handles.

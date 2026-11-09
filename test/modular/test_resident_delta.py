@@ -1199,7 +1199,7 @@ class _SpecParent:
                 return {"r0": 0}
 
         self.batch = _Batch()
-        self.node_batch = SimpleNamespace(commit_done=threading.Event())
+        self.node_batch = SimpleNamespace(commit_done=threading.Event(), request_ids=["r0"])
 
 
 def test_the_async_follow_path_will_not_build_mid_replay():
@@ -1926,7 +1926,7 @@ def test_a_follower_takes_rank_0s_reload_into_the_pages_its_window_gives_back_on
     scheduler.lockstep.enqueue_follow(ScheduleTPNode(NODE, "decode", [], spec_seq=0, resident_delta=delta))
 
     assert not scheduler.lockstep.settle_delta(caught_up=False), "the follower reloaded v before its commit"
-    assert scheduler.lockstep.awaits_commit() and follower.residency("v") is Residency.ON_HOST
+    assert scheduler.lockstep.awaits_commit(()) and follower.residency("v") is Residency.ON_HOST
 
     follower.commit(step, ctx)
     assert scheduler.lockstep.settle_delta(caught_up=True)
