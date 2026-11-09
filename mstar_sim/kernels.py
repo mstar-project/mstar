@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import warnings
 
 import torch
 
@@ -135,7 +136,12 @@ def _advance_column(slots, store, STRIDE, COL, TRASH, **_):
 
 
 def _gather_block_rows(slots, kv_len, store, table, lens, **_):
-    lens.copy_(kv_len + 1)  # the kernel's own count, with this step's token: what attention is priced by
+    if store._data.device.type == "meta":  # no lengths to read: an unknown length costs the row's longest
+        warnings.warn("mstar_sim: the resident table is too big to keep: decode attention is priced at max_seq_len",
+                      stacklevel=2)
+        lens.fill_(torch.iinfo(lens.dtype).max)
+    else:
+        lens.copy_(kv_len + 1)  # the kernel's own count, with this step's token: what attention is priced by
 
 
 # Triton kernels by name, for what they write on values the emulator keeps (a launch computes

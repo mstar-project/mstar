@@ -2853,8 +2853,11 @@ def test_skipped_in_selects_what_a_plain_run_skipped(tmp_path):
                             "test/a/test_classes.py::test_named_gpu_skipif"}, (selection, out)
 
 
-def test_a_resident_decode_step_is_priced_at_its_rows_kv_lengths():
-    """A resident step plans on the device: its Triton kernels fill the lengths attention is priced by."""
+@pytest.mark.parametrize("cells, priced", [(64, [[301], [302]]), ((1 << 20) + 1, [[4096], [4096]])],
+                         ids=["kept", "too_big_to_keep"])
+def test_a_resident_decode_step_is_priced_at_its_rows_kv_lengths(cells, priced):
+    """A resident step plans on the device: its Triton kernels fill the lengths attention is priced by. A table
+    too big to keep has no lengths to read: as with any unknown length, the row is priced at its longest."""
     out = run_sim("""
         import types, torch
         import flashinfer.decode as decode
@@ -2863,7 +2866,7 @@ def test_a_resident_decode_step_is_priced_at_its_rows_kv_lengths():
 
         seen, lengths = [], decode._row_lengths
         decode._row_lengths = lambda *a: seen.append(lengths(*a)) or seen[-1]
-        store = torch.zeros(64, dtype=torch.long, device="cuda")
+        store = torch.zeros(%d, dtype=torch.long, device="cuda")
         slots = torch.tensor([1], device="cuda")
         cells = torch.tensor([[17], [300]], device="cuda")  # (the stride is 16: row 1's length, column 1)
         kv_len = torch.zeros(1, dtype=torch.long, device="cuda")
@@ -2883,8 +2886,8 @@ def test_a_resident_decode_step_is_priced_at_its_rows_kv_lengths():
         cells.copy_(torch.zeros(2, 1, dtype=torch.long, device="cuda"))  # the next step queues no write
         graph.replay()
         print(seen)
-    """, gpu="b200")
-    assert out.strip() == "[[301], [302]]", out
+    """ % cells, gpu="b200")
+    assert out.strip() == str(priced), out
 
 
 def test_every_cuda_seam_mstar_reaches_is_emulated():
