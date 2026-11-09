@@ -567,6 +567,14 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         del graph_walk
         return self.step_dtypes is not None
 
+    @staticmethod
+    def attention_step(segments: Sequence[Segment] | None = None) -> AttentionStep:
+        """A denoise step's self-attention: non-causal, and laid out by its bucket
+        alone (``fixed_layout``), since every row of a bucket, padding rows
+        included, carries the bucket key and so the bucket's spans. A subclass that
+        declares its own step builds its self-attentions here."""
+        return AttentionStep(segments=None if segments is None else tuple(segments), causal=False, fixed_layout=True)
+
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
         slot_lease: SlotLease | None = None, piecewise_leases=None, **kwargs,
@@ -582,7 +590,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         ]
         return SubmoduleStep(
             segments=segments,
-            steps={self.attn_resource_key: AttentionStep(causal=False)},
+            steps={self.attn_resource_key: self.attention_step()},
             cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
         )
 
