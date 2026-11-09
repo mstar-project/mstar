@@ -36,8 +36,7 @@ name: Claude Review
 #      inert and posts. In light
 #      and nogpu mode the worst case for a prompt injection is a bad
 #      comment. In full mode the live test runs the PR's code with a shell on
-#      the GPU box, as root on a shared Slurm node; see the README's threat
-#      model for what that box can reach.
+#      the GPU box; see the README's threat model for what that box can reach.
 #   5. Third-party actions are pinned to a commit SHA, since they run with the
 #      API key. Bump them deliberately.
 #   6. Every step that isn't an action runs main's .github/review/bot.py (or,
@@ -47,14 +46,14 @@ name: Claude Review
 #      fixed list), and what it posts goes to gh on stdin.
 #
 # `/review` (full mode) adds a second job, live-test, that runs no model and no PR code
-# here either: it rents GPUs (the team's Slurm nodes, else an open Eras listing),
+# here either: it rents GPUs (an open Eras listing),
 # starts the live-test session on that box (gpu_review_box.sh), waits for it,
 # collects its report and media, posts them, and approves the PR when the rule
 # in gpu_review.py holds. The box gets the PR's public code, a fixed brief, the
 # review's notes and the PR's title and description (pr-body.md) as data, and its
-# own Anthropic key (LIVE_TEST_ANTHROPIC_KEY), never a GitHub token or a cloud
-# key; the GPUs go when the box's session ends (Slurm's --time, Eras's Pod
-# deadline), whether or not this job is still running.
+# own Anthropic key (an Eras secret), never a GitHub token or a cloud key; the
+# GPUs go when the box's session ends (or at the Eras Pod's deadline), whether
+# or not this job is still running.
 
 # When it runs, and who can cause it. Only on request; opening or pushing to
 # a PR never starts a review.
@@ -531,17 +530,11 @@ jobs:
           ref: ${{ needs.review.outputs.main_sha }}
           persist-credentials: false
 
-      # gpu.py's settings, from repository variables. From secrets: the ssh key every box is reached
-      # with, and REVIEW_SLURM_NODES, each node's host and pinned host key (a step's env: is printed to
-      # the public log before the step runs, so it can't mask a variable in time). The key stays on the
-      # runner: it never reaches the box.
+      # gpu.py's settings, from repository variables, and from a secret the ssh key every box is
+      # reached with. The key stays on the runner: it never reaches the box.
       - name: Configure the GPUs
         env:
           SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
-          SLURM_NODES: ${{ secrets.REVIEW_SLURM_NODES }}
-          SLURM_AUTHORS: ${{ vars.REVIEW_SLURM_AUTHORS }}
-          COMMENTER: ${{ github.triggering_actor }}
-          MAX_GPUS: ${{ vars.REVIEW_GPU_MAX_GPUS }}
           HOURS: ${{ vars.REVIEW_GPU_HOURS }}
           MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR }}
           MAX_RUNS: ${{ vars.REVIEW_GPU_MAX_RUNS }}
@@ -582,8 +575,6 @@ jobs:
         id: start
         continue-on-error: true
         env:
-          # The box's own key, never the review's: the box runs PR code with a shell.
-          LIVE_TEST_ANTHROPIC_KEY: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           BASE: ${{ steps.cfg.outputs.base }}
           GPUS: ${{ steps.cfg.outputs.gpus }}
           HOURS: ${{ steps.cfg.outputs.hours }}
@@ -605,7 +596,7 @@ jobs:
 
       # What the box and the providers wrote, redacted in place before anything reads it, so the
       # comment, the kept report and the artifact all get the redacted copy: bot.py's patterns and
-      # the exact values of the secrets and hosts this job holds.
+      # the exact values of the secrets this job holds.
       - name: Redact the live test's output
         if: always() && steps.cfg.outcome == 'success'
         id: redact
@@ -614,7 +605,6 @@ jobs:
           S1: ${{ secrets.LIVE_TEST_ANTHROPIC_KEY }}
           S2: ${{ secrets.ANTHROPIC_API_KEY }}
           S3: ${{ secrets.ERAS_API_KEY }}
-          NODES: ${{ secrets.REVIEW_SLURM_NODES }}
         run: python3 .github/review/gpu_review.py redact
 
       # The media go to the gallery repository (GitHub Pages), never into this
