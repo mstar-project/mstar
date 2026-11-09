@@ -133,7 +133,11 @@ class FlashInferManager(AttentionManager):
             )
         # one SP-placed server hung at its first 32k prefill on fa2 and the cause isn't known (#1363)
         backend = self._wrapper_kv_kwargs["backend"]
-        if placement.over_sp and capability is not None and (backend == "fa2" or (backend == "auto" and not fa3)):
+        # an explicit fa2 on any GPU; `auto` where the capability says FlashInfer has no fa3
+        on_fa2 = (backend == "fa2" and self._device.type == "cuda") or (
+            backend == "auto" and capability is not None and not fa3
+        )
+        if placement.over_sp and on_fa2:
             logger.warning(
                 "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel; an unexplained one-off "
                 "lockstep hang in an fa2 prefill is still open (#1363)",

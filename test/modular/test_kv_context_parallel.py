@@ -841,6 +841,7 @@ def test_a_placed_pool_plans_on_fa2_for_auto_from_sm100(monkeypatch):
     (True, (10, 0), "auto", "warned"),  # auto runs fa2 from SM100
     (True, (8, 0), "auto", "warned"),  # and below SM90, where FlashInfer has no fa3
     (True, (8, 0), "fa2", "warned"),
+    (True, None, "fa2", "warned"),  # off NVIDIA too
     (False, (9, 0), "fa2", "quiet"),
     (False, (10, 0), "fa2", "quiet"),
 ])
@@ -855,7 +856,8 @@ def test_fa2_over_an_sp_placed_pool(monkeypatch, caplog, over_sp, capability, ba
     else:
         joint = JointGroups(tp_group=_group(0, P), sp_group=CommGroup.trivial(), instance=_group(0, P))
     with caplog.at_level(logging.WARNING, logger=fi_mod.logger.name):
-        _cp_attention(joint, CPU, torch.float32, flashinfer_backend=backend)
+        # nothing here touches the device but the check of its type, so no GPU is needed
+        _cp_attention(joint, torch.device("cuda", 0), torch.float32, flashinfer_backend=backend)
     assert any("fa2" in r.getMessage() for r in caplog.records) == (outcome == "warned")
 
 
