@@ -28,9 +28,9 @@ class WalkPriority(NamedTuple):
     walk) it names: a node's walks, a walk's nodes, or one pair. Where entries overlap,
     the most specific decides: a pair over a walk over a node.
 
-    ``priority``: higher first, unlisted 0. ``max_wait``: the most steps the key may go
-    without running while it has ready rows, before it goes first; None falls back to
-    the policy's default, which may itself be none (no bound)."""
+    ``priority``: higher first, unlisted 0. ``max_wait``: the most of the worker's chain
+    steps the key may go without running while it has ready rows, before it goes first;
+    None falls back to the policy's default, which may itself be none (no bound)."""
 
     node: str | None = None
     walk: str | None = None
@@ -43,6 +43,9 @@ class ReadyPeek(Protocol):
 
     batch_number: int
     node_and_walk_to_last_batch_num: Mapping[Key, int]
+    # chain-lane steps taken, and each scheduling key's last
+    chain_steps: int
+    chain_step_of: Mapping[Key, int]
 
     def has_ready_excluding(self, exclude_target: Key | None, among: Collection[Key] | None = None) -> bool:
         """Whether a key other than ``exclude_target`` (and, given ``among``, one of
@@ -80,9 +83,9 @@ class Priority(RoundRobin):
 
     A chain also gives up its first step to a ready key above its own or one that has
     waited its bound. Where round robin would ask anyway, its peek covers those keys
-    too, so a pass makes at most one. A key's wait is the steps this worker has run
-    since that key last ran, so one that comes ready after an idle spell may go first
-    once."""
+    too, so a pass makes at most one. A key's wait is the chain steps this worker has
+    taken since that key last ran, so one that comes ready after an idle spell may go
+    first once."""
 
     def __init__(self, priorities: Mapping[Key, int], max_waits: Mapping[Key, int]):
         self.priorities = dict(priorities)
@@ -100,7 +103,7 @@ class Priority(RoundRobin):
         """(steps waited, key) of the bounded keys at or past their bound."""
         if not self.max_waits:
             return []
-        now, last = peek.batch_number, peek.node_and_walk_to_last_batch_num
+        now, last = peek.chain_steps, peek.chain_step_of
         return [(now - last.get(key, 0), key) for key, bound in self.max_waits.items()
                 if now - last.get(key, 0) >= bound]
 

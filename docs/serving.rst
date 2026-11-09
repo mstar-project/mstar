@@ -328,7 +328,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
    * - ``scheduling``
      - *(optional)* Which (node, walk) a worker's next step goes to (see "Walk priorities" in
        :doc:`adding_models`). ``policy``: ``priority`` (the default) or ``round_robin``, which
-       turns the model's priorities off. ``max_wait``: the most of a worker's steps a ready key
+       turns the model's priorities off. ``max_wait``: the most of a worker's chain steps (side-lane steps not counted) a ready key
        may go without running before it goes first, for every key its entry leaves unbounded.
        ``walk_priorities``: a list of entries ``{node, walk, priority, max_wait}``, each naming
        a node, a walk or both, which replaces the model's list; the most specific entry for a

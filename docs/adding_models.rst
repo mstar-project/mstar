@@ -2186,7 +2186,8 @@ the engine would take. That trades the other keys' steps for the listed one's la
 suits a walk whose steps are short, such as a TTS model's prefill, whose first audio waits on
 it while decode streams have time to spare: list the walk, and every node on it is covered.
 A key that stays ready holds lower ones back for as long as it does, unless they have a
-``max_wait``: a ready key that has gone that many of the worker's steps since it last ran goes
+``max_wait``: a ready key that has gone that many of the worker's chain steps (every step on
+its main chain, side-lane steps not counted) since it last ran goes
 first, longest waiting first, and a chain gives it its next step. A priority on one walk of a
 combined walk lifts the whole combined key in that order, its other walks' rows included, and
 a backlogged key, split over several steps, still finishes first whatever its priority. A

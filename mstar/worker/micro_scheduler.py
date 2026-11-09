@@ -142,6 +142,10 @@ class MicroScheduler:
         self._chunk_starts = itertools.count()
         # (rid, node) -> cached prefix a measured, not yet chunked row starts past
         self.cached_prefix: dict[tuple[int, str], int] = {}
+        # chain-lane steps taken, and the last one each scheduling key ran: what a
+        # ``max_wait`` counts (``note_ran``)
+        self.chain_steps = 0
+        self.chain_step_of: dict[tuple[str, str], int] = {}
         self.policy = self._policy(layout)
 
         # lockstep-parallel (TP / SP / CFG instance) scheduling
@@ -233,9 +237,10 @@ class MicroScheduler:
     def _policy(self, layout: WorkerLayout) -> SchedulingPolicy:
         """Round robin, or ``Priority`` over this worker's (node, walk) entries. A
         combined walk's key takes the highest priority and the tightest bound of its
-        walks', so its rows are served as the most urgent of them; each real walk keeps
-        its own, which a chain keys on. A worker with nothing above 0 and nothing bounded
-        keeps round robin, which already serves the least recent key first."""
+        walks', so its rows are served as the most urgent of them. A real walk keeps its
+        own priority, which a chain keys on; its bound sits on its scheduling key only,
+        the key steps are recorded under. A worker with nothing above 0 and nothing
+        bounded keeps round robin, which already serves the least recent key first."""
         default_wait = layout.default_max_wait
         if layout.scheduling_policy == "round_robin" or (
             default_wait is None and not any(e.priority or e.max_wait for e in layout.walk_priorities.values())
@@ -250,8 +255,9 @@ class MicroScheduler:
             for key in {(node, walk), self._key(node, walk)}:
                 if priority:
                     priorities[key] = max(priorities.get(key, priority), priority)
-                if bound is not None:
-                    max_waits[key] = min(max_waits.get(key, bound), bound)
+            key = self._key(node, walk)
+            if bound is not None:
+                max_waits[key] = min(max_waits.get(key, bound), bound)
         return Priority(priorities, max_waits)
 
     def chain_yields(self, chain_key: tuple[str, str], consecutive: int, mid_prompt: bool) -> bool:
@@ -278,6 +284,11 @@ class MicroScheduler:
         self._turns += len(rows)
         turns.update(zip(rows, range(first, self._turns + 1), strict=True))
         self._latest_step[key] = first
+        if self._lane(key) == CHAIN_LANE:
+            # every chain step counts, one that only continues its own rows too, for
+            # the policy's waits; round robin's order keeps to the steps it built
+            self.chain_steps += 1
+            self.chain_step_of[key] = self.chain_steps
 
     def last_in_line(self, node_name: str, graph_walk: str, rids: Iterable[int]) -> int:
         """Of ``rids``, the one a step of ``(node_name, graph_walk)`` would

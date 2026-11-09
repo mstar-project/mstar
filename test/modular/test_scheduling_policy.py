@@ -1,6 +1,8 @@
 """Scheduling policies: the order of ready (node, walk) keys, when a speculation chain
 yields, how a model's or a deployment's entries resolve, and what ``next_batch`` hands out."""
 
+from types import SimpleNamespace
+
 import pytest
 from test_scheduler_rebuild import DECODE, MIXED, NODE, PREFILL, _Engine, _Runtime, _State
 
@@ -20,6 +22,7 @@ class _Peek:
     def __init__(self, answer=lambda exclude, among: True, now=0, last=None):
         self.answer, self.asked = answer, []
         self.batch_number, self.node_and_walk_to_last_batch_num = now, dict(last or {})
+        self.chain_steps, self.chain_step_of = now, dict(last or {})
 
     def has_ready_excluding(self, exclude_target, among=None):
         self.asked.append((exclude_target, None if among is None else frozenset(among)))
@@ -171,7 +174,8 @@ def test_a_combined_walks_key_takes_its_most_urgent_walks_priority_and_bound():
         walk_priorities=_entries(WalkPriority(NODE, PREFILL, 2, 6), WalkPriority(NODE, DECODE, 0, 3)),
     ).policy
     assert (policy.priority((NODE, MIXED)), policy.priority(P), policy.priority(D)) == (2, 2, 0)
-    assert (policy.max_waits[(NODE, MIXED)], policy.max_waits[P], policy.max_waits[D]) == (3, 6, 3)
+    # a bound sits on the key steps are recorded under, the combined one
+    assert policy.max_waits == {(NODE, MIXED): 3}
 
 
 # -- through the real scheduler -----------------------------------------------------------
@@ -284,3 +288,29 @@ def test_two_higher_walks_taking_turns_do_not_strand_a_third_past_its_bound():
     sched, runtime = _priority_scheduler(walks, entries=entries)
     steps = _steps(sched, runtime, walks, 10)
     assert DECODE in steps[:5] and steps.count(DECODE) >= 2, steps
+
+
+def _ran(sched, node, walk):
+    sched.note_ran(SimpleNamespace(node_name=node, graph_walk=walk, request_to_worker_graph={"r": "wg0"},
+                                   turn_order=None))
+
+
+def test_a_bounded_walk_under_a_combined_walk_waits_on_the_combined_key():
+    """The combined key ran every step, so nothing is overdue: a bound on the real
+    walk, which no step records, would read as overdue for the rest of the run."""
+    sched, runtime = _priority_scheduler({"p0": PREFILL, "d0": DECODE}, entries=(), combined=True, mixes=False)
+    sched.policy = sched._policy(SimpleNamespace(
+        scheduling_policy="priority", default_max_wait=2, walk_priorities={}, my_walks=frozenset({P, D}),
+    ))
+    for _ in range(5):
+        _ran(sched, NODE, DECODE)
+    runtime.ready = {"p0", "d0"}
+    assert not sched.chain_yields(D, 0, False)
+
+
+def test_every_chain_step_counts_toward_a_wait_and_side_lane_steps_do_not():
+    sched = make_scheduler(side_keys={VAE})
+    for _ in range(3):
+        _ran(sched, NODE, DECODE)  # a chain continuing its own rows is a step too
+    _ran(sched, *VAE)
+    assert sched.chain_steps == 3 and sched.chain_step_of == {D: 3}
