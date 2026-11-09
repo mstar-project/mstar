@@ -5,13 +5,19 @@ Against ``mstar serve ripple_65b``; every subcommand exits nonzero on any failed
 
     prompts   the eight parity prompts, with the ids mstar's own chat path renders
     collect   greedy replies to them through /v1/chat/completions, saved under a tag
-    load      the ~5K prompt while at least four other requests decode
+    load      the ~4.4K prompt while at least four other requests decode
     gate      the parity criteria from record_oracle.py's output
 
+The gate pairs its main tag with a second collect on the same server (``<main>b``), the other TP
+degree, and ``eager`` if one was collected (a tree whose LLM declares no captures). The oracle's
+``--control-tag`` must be the gate's main tag.
+
     python test/ripple/run_parity.py prompts --ckpt <snapshot> --out out
-    python test/ripple/run_parity.py collect --port 8000 --tag tp2 --out out
-    python test/ripple/record_oracle.py ... --runs out/runs --out out/oracle_bf16.json
-    python test/ripple/run_parity.py gate --out out
+    python test/ripple/run_parity.py collect --port 8000 --tag tp2 --out out    # TP2 server
+    python test/ripple/run_parity.py collect --port 8000 --tag tp2b --out out
+    python test/ripple/run_parity.py collect --port 8001 --tag tp4 --out out    # TP4 server
+    python test/ripple/record_oracle.py ... --runs out/runs --control-tag tp2 --out out/oracle_bf16.json
+    python test/ripple/run_parity.py gate --out out --tags tp2,tp4
 """
 from __future__ import annotations
 
@@ -204,19 +210,20 @@ def summary(entries: list[dict]) -> tuple[str, int]:
 
 def pair(a_rows: list[dict], b_rows: list[dict]) -> tuple[str, int]:
     """Two served runs against each other. Each already passes criterion 2 alone; here, the first
-    token where they part must be a near tie in the oracle, on the shared prefix."""
+    token where they part must be a near tie in the oracle, on the shared prefix. ``served`` ends
+    on the stop token of a reply that stopped, so one that stops where the other goes on parts there."""
     same, bad, gaps = 0, 0, []
     for x, y in zip(a_rows, b_rows, strict=True):
-        n = min(len(x["ids"]), len(y["ids"]))
-        k = next((i for i in range(n) if x["ids"][i] != y["ids"][i]), None)
+        xs, ys = x["served"], y["served"]
+        k = next((i for i in range(min(len(xs), len(ys))) if xs[i] != ys[i]), None)
         if k is None:
             same += 1
             continue
         logit = dict(zip(x["top5"][k], x["top5_logits"][k], strict=True))
-        if y["ids"][k] not in logit or x["ids"][k] not in logit:
+        if ys[k] not in logit or xs[k] not in logit:
             bad += 1
             continue
-        gaps.append(abs(logit[x["ids"][k]] - logit[y["ids"][k]]))
+        gaps.append(abs(logit[xs[k]] - logit[ys[k]]))
         bad += gaps[-1] > NEAR_TIE
     return f"identical {same}/{len(a_rows)}, gaps where they part {[round(g, 2) for g in gaps]}, bad {bad}", bad
 
