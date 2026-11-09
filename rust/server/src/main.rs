@@ -719,15 +719,22 @@ enum StreamFormat {
 
 /// `create_speech`'s check on `stream_format`: absent and an explicit `null`
 /// both mean "not sent" (`model_extra.pop(..., None)`), `"audio"` and `"sse"`
-/// are the two it takes, and anything else is the 400 its `{!r}` quotes.
+/// are the two it takes, and anything else is a 400 that quotes a string and
+/// names any other type, exactly as the Python frontend's `describe_rejected`.
 fn speech_stream_format(v: Option<&Value>) -> Result<Option<StreamFormat>, String> {
     match v {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) if s == "audio" => Ok(Some(StreamFormat::Audio)),
         Some(Value::String(s)) if s == "sse" => Ok(Some(StreamFormat::Sse)),
+        // A string is quoted, as the Python frontend's `repr` quotes it; any
+        // other type is named rather than read back. See `json_type_name`.
+        Some(Value::String(s)) => Err(format!(
+            "stream_format must be 'audio' or 'sse', got {}",
+            media::py_repr(s)
+        )),
         Some(other) => Err(format!(
             "stream_format must be 'audio' or 'sse', got {}",
-            media::py_repr_json(other)
+            media::json_type_name(other)
         )),
     }
 }
@@ -2040,10 +2047,10 @@ mod tests {
         assert_eq!(sf(r#"{"input":"hi","stream_format":"sse"}"#), Ok(Some(StreamFormat::Sse)));
     }
 
-    /// The refusal quotes the value the way Python's `{stream_format!r}` does,
-    /// whatever JSON type the client sent.
+    /// The refusal quotes a string as Python's `repr` does and names any other
+    /// JSON type, which is what the Python frontend's `describe_rejected` says.
     #[test]
-    fn stream_format_refuses_anything_else_quoting_it_like_python() {
+    fn stream_format_refuses_anything_else_quoting_a_string_and_naming_a_type() {
         let msg = |body: &str| {
             speech_stream_format(
                 serde_json::from_str::<SpeechRequest>(body).unwrap().stream_format.as_ref(),
@@ -2060,23 +2067,37 @@ mod tests {
         );
         assert_eq!(
             msg(r#"{"input":"hi","stream_format":true}"#),
-            "stream_format must be 'audio' or 'sse', got True"
+            "stream_format must be 'audio' or 'sse', got a boolean"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":false}"#),
+            "stream_format must be 'audio' or 'sse', got a boolean"
         );
         assert_eq!(
             msg(r#"{"input":"hi","stream_format":1}"#),
-            "stream_format must be 'audio' or 'sse', got 1"
+            "stream_format must be 'audio' or 'sse', got a number"
+        );
+        // -0 and an integer past u64 both arrive as f64; the old code had to
+        // reproduce Python's repr of each, and now neither is read back.
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":-0.0}"#),
+            "stream_format must be 'audio' or 'sse', got a number"
+        );
+        assert_eq!(
+            msg(r#"{"input":"hi","stream_format":18446744073709551616}"#),
+            "stream_format must be 'audio' or 'sse', got a number"
         );
         assert_eq!(
             msg(r#"{"input":"hi","stream_format":1.5}"#),
-            "stream_format must be 'audio' or 'sse', got 1.5"
+            "stream_format must be 'audio' or 'sse', got a number"
         );
         assert_eq!(
             msg(r#"{"input":"hi","stream_format":["sse"]}"#),
-            "stream_format must be 'audio' or 'sse', got ['sse']"
+            "stream_format must be 'audio' or 'sse', got an array"
         );
         assert_eq!(
             msg(r#"{"input":"hi","stream_format":{"a":1}}"#),
-            "stream_format must be 'audio' or 'sse', got {'a': 1}"
+            "stream_format must be 'audio' or 'sse', got an object"
         );
     }
 
@@ -2116,7 +2137,7 @@ mod tests {
     /// and keyed exactly as `openai._util.sse` writes them.
     #[test]
     fn sse_wraps_each_piece_of_audio_and_closes_with_done() {
-        let events = sse_events(vec![SpeechOut::Audio(b"".to_vec()), SpeechOut::Audio(b"ab".to_vec())]);
+        let events = sse_events(vec![SpeechOut::Audio(b"\x01\x02".to_vec()), SpeechOut::Audio(b"ab".to_vec())]);
         assert_eq!(
             events,
             vec![

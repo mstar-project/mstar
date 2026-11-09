@@ -184,9 +184,9 @@ pub struct SpeechRequest {
     /// kept out of `extra` and never reaches the engine as a model kwarg, as
     /// `create_speech` pops it out of pydantic's `model_extra`. Held as a
     /// `Value`, not a `String`: absent and an explicit `null` both read as
-    /// "not sent", and any other value is the handler's 400 quoting it, not a
-    /// schema rejection — which is what `stream_format not in (None, "audio",
-    /// "sse")` answers on the Python side.
+    /// "not sent", and any other value is the handler's 400 naming or quoting
+    /// it, not a schema rejection — which is what `stream_format not in (None,
+    /// "audio", "sse")` answers on the Python side.
     #[serde(default)]
     pub stream_format: Option<Value>,
     /// Passed on as sent; the server's normalize_generation_kwargs holds the rules.

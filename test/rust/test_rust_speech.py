@@ -260,12 +260,19 @@ REFUSALS = {
                                     "sentence_chunking": "yes", "stream": True}),
     "engine-refusal-stream": ("qwen3_tts_1p7b", {"input": "please refuse", "stream": True}),
     "engine-refusal": ("qwen3_tts_1p7b", {"input": "please refuse"}),
-    # stream_format takes "audio" and "sse"; anything else is refused before
-    # any work, quoting what the client sent the way Python's `{!r}` does
+    # stream_format takes "audio" and "sse"; anything else is refused before any
+    # work, with a text both frontends produce: a string quoted as Python's
+    # `repr` quotes it, any other JSON type named. These cases are the ones that
+    # made quoting a non-string value hard to match between the two.
     "stream-format-wav": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": "wav"}),
     "stream-format-case": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": "SSE"}),
     "stream-format-empty": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": ""}),
     "stream-format-true": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": True}),
+    # False and 0 are the pair the Python guard compares with ==, and -0 is the
+    # one Python holds as an int where serde_json reports a float
+    "stream-format-false": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": False}),
+    "stream-format-zero": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 0}),
+    "stream-format-negative-zero": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": -0.0}),
     "stream-format-int": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 1}),
     "stream-format-bigint": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 2**63}),
     "stream-format-float": ("qwen3_tts_1p7b", {"input": "Hi.", "stream_format": 1e-5}),

@@ -88,13 +88,42 @@ def list_voices(api) -> VoiceList | None:
     )
 
 
+def describe_rejected(value):
+    """A client's rejected value for a 400: quoted when it is a string, named by
+    its JSON type otherwise.
+
+    The Rust frontend has to produce the same text. Quoting a string is easy to
+    match; reproducing ``repr`` of every other type is not, because Python and
+    serde_json disagree on an integer too large for ``i64``, on ``-0``, on the
+    digits of some floats, and on the order of an object's keys. Naming the type
+    sidesteps all of it, and a client that sent the wrong type does not need its
+    value read back.
+    """
+    if isinstance(value, str):
+        return repr(value)
+    if value is None:
+        return "null"
+    if isinstance(value, bool):  # before int: bool is a subclass of it
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, (list, tuple)):
+        return "an array"
+    if isinstance(value, dict):
+        return "an object"
+    return "a value of another type"
+
+
 async def create_speech(api, model_name, adapter, req, raw_request=None):
     sample_rate = api.model.get_output_sample_rate("audio") if api.model is not None else 24000
     # OpenAI's own streaming switch, which its SDK (and so LiveKit's TTS plugin)
     # sends instead of ``stream``. Popped so it does not reach the model as a kwarg.
     stream_format = (req.model_extra or {}).pop("stream_format", None)
     if stream_format not in (None, "audio", "sse"):
-        raise HTTPException(status_code=400, detail=f"stream_format must be 'audio' or 'sse', got {stream_format!r}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"stream_format must be 'audio' or 'sse', got {describe_rejected(stream_format)}",
+        )
     # A compressed container (the SDK's default mp3) cannot be streamed here;
     # stream_format then falls back to one whole body, which those clients read too.
     stream = bool(req.stream) or (

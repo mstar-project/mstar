@@ -1228,6 +1228,34 @@ def test_speech_refuses_an_unknown_stream_format(client_and_stub):
     stub.model_name = "kokoro"
     r = client.post("/v1/audio/speech", json={"input": "hi", "stream_format": "chunks"})
     assert r.status_code == 400 and stub.last_submit is None
+    assert r.json()["error"]["message"] == "stream_format must be 'audio' or 'sse', got 'chunks'"
+
+
+@pytest.mark.parametrize(
+    ("sent", "described"),
+    [
+        ("SSE", "'SSE'"),
+        ("", "''"),
+        (True, "a boolean"),
+        (False, "a boolean"),  # == 0, and the guard compares with ==
+        (0, "a number"),
+        (-0.0, "a number"),  # Python keeps it an int; serde_json reports a float
+        (1, "a number"),
+        (1.5, "a number"),
+        (["sse"], "an array"),
+        ({"a": 1}, "an object"),
+    ],
+)
+def test_speech_refusal_quotes_a_string_and_names_any_other_type(client_and_stub, sent, described):
+    # The Rust frontend answers the same text; its
+    # `stream_format_refuses_anything_else_quoting_a_string_and_naming_a_type`
+    # asserts these same pairs. Reading a non-string value back would mean
+    # matching Python's `repr` in Rust, which serde_json's number model cannot.
+    client, stub = client_and_stub
+    stub.model_name = "kokoro"
+    r = client.post("/v1/audio/speech", json={"input": "hi", "stream_format": sent})
+    assert r.status_code == 400 and stub.last_submit is None
+    assert r.json()["error"]["message"] == f"stream_format must be 'audio' or 'sse', got {described}"
 
 
 def test_speech_stream_format_with_a_compressed_format_returns_one_body(client_and_stub):
