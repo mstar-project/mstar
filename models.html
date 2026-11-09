@@ -2077,6 +2077,15 @@ B200, 1,723 s on an H100), and about two minutes once the cache is warm.
 in the deployment YAML captures the eager step instead: on a B200 the server
 is up in about 15 seconds, with about a third less throughput at
 concurrency 1 and a sixth less at concurrency 8.</p></li>
+<li><p>The Talker’s prefill (both LMs over the prompt, the first patch’s solve and
+the stop head) is captured too, per total prompt tokens (up to 2,048) and
+prompts in a step (up to 32); a step past them runs the LMs eagerly.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">configs/voxcpm2.yaml</span></code> runs the VAE decoder’s windows on the worker’s side
+lane (<code class="docutils literal notranslate"><span class="pre">side_stream:</span> <span class="pre">true</span></code>), beside the Talker’s steps rather than taking
+turns with them.</p></li>
+<li><p>The streaming VAE decoder is <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>’d at start-up, about a
+quarter faster per window batch; <code class="docutils literal notranslate"><span class="pre">model_kwargs:</span> <span class="pre">{compile_vae:</span> <span class="pre">false}</span></code>
+decodes eagerly.</p></li>
 <li><p>A request may hold the whole 8,192-position context, and nothing preempts a
 request once a KV cache is full, so each LM’s cache defaults to 2,049 pages
 (32 such requests and the sink page, about 9.7 GB for both) and the YAML sets
