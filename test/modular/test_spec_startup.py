@@ -155,6 +155,15 @@ class _Unchecked(NodeResourceSpec):
         raise NotImplementedError
 
 
+def test_block_causal_attention_is_refused_though_its_parent_can_verify():
+    from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, BlockCausalAttentionSpec
+
+    config = AttentionConfig(kv_cache="kv_cache")
+    assert resource_problems(_decl(), _specs(attn=AttentionSpec("attn", {NODE}, config))) == []
+    problems = resource_problems(_decl(), _specs(attn=BlockCausalAttentionSpec("attn", {NODE}, config, block_size=4)))
+    assert any("'attn'" in p and "block-causal" in p for p in problems), problems
+
+
 def test_a_sampler_with_a_history_or_logprobs_is_refused():
     specs = _specs(sampler=SamplerSpec("sampler", {NODE}, vocab_size=32, max_repetition_window=8))
     assert any("history" in p for p in resource_problems(_decl(), specs))
