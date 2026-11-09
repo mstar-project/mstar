@@ -3183,7 +3183,9 @@ def main(argv: list[str] | None = None):
     )
 
     from mstar.api_server.openai.adapters import get_adapter
-    if getattr(get_adapter(model_name), "supports_realtime_transcription", False):
+    _live_transcription = model is not None and model.turn_tokens is None and any(
+        conn.audio is not None for conn in model.get_partition_topology().client_connections())
+    if _live_transcription or getattr(get_adapter(model_name), "supports_realtime_transcription", False):
         from mstar.api_server.openai import realtime_vad
         realtime_vad.report_availability()   # warns now if server_vad or semantic_vad cannot run
 

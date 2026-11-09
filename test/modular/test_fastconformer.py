@@ -814,16 +814,36 @@ def test_encoder_takes_no_batch_wider_than_its_graphs():
     assert engine.get_max_batch_size("conformer_encoder", "encode") == max(node.capture_batch_sizes)
 
 
-@pytest.mark.parametrize("unsupported", [
-    dict(lookahead=3), dict(normalize=True), dict(reflect_edges=False), dict(n_fft=2048),
-])
+@pytest.mark.parametrize("unsupported", [dict(normalize=True), dict(n_fft=2048)])
 def test_encoder_refuses_what_it_cannot_stream(unsupported):
-    """A right context, a per-clip normalization, the 2.5 featurizer (whose
-    zero-padded edges a stream's front end does not cut) or a window longer
-    than the samples the front end keeps are refused when the node is built,
-    not met as wrong frames mid-stream."""
+    """A per-clip normalization or a window longer than the samples the front
+    end keeps are refused when the node is built, not met as wrong frames
+    mid-stream."""
     with pytest.raises(ValueError, match=next(iter(unsupported))):
         _stream_node(**unsupported)
+
+
+# -1: a stream that ends just short of a chunk, whose last step runs into one chunk more
+@pytest.mark.parametrize("n", [16000 * 2 + 777, 16000 * 2, 1600 + 160, -1])
+@pytest.mark.parametrize("regions", [False, True])
+@pytest.mark.parametrize(("lookahead", "reflect_edges"), [(0, False), (3, False), (3, True), (6, False)])
+def test_encoder_chunks_stream_the_offline_frames(lookahead, reflect_edges, regions, n):
+    """A stream cut on the chunk grid, a zero-padded or reflected featurizer and
+    the checkpoint's chunked attention: the frames, in order, are the whole-clip
+    encoding, a short last chunk included, with and without the graphs."""
+    enc = _Encoder(lookahead=lookahead, reflect_edges=reflect_edges)
+    if regions:
+        enc.regions = _encoder_regions(enc, STEP, LAYERS)
+    n = n if n > 0 else 4 * enc.node.chunk_samples - 100
+    wav = torch.randn(n) * 0.1
+    enc.node.item_per_step = True
+    got = _stream(enc, {1: wav}, {1: enc.node.chunk_samples})[1]
+    want = enc.offline(wav)
+    # a decoder takes an item as one chunk of frames, at most a chunk's
+    assert max(item.shape[0] for item in got) <= lookahead + 1
+    got = torch.cat(got)
+    assert got.shape[0] == want.shape[0]
+    assert torch.allclose(got, want, atol=1e-5)
 
 
 @pytest.mark.parametrize("n_fft", [512, 1024])

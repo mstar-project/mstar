@@ -8,10 +8,12 @@ resources:
   transducer_state:
     max_slots: 129
 node_groups:
-  - node_names: [audio_encoder, transducer]
+  - node_names: [audio_encoder, stream_encoder, transducer, transducer_stream]
     ranks: [0]
 # Constructor options (forwarded to ParakeetModel.__init__):
 # model_kwargs:
 #   lookahead: 13  # right attention context in 80 ms frames: 0, 3, 6 or 13;
-#                  # wider is more accurate, and the widest is the default
+#                  # wider is more accurate, and the widest is the default. A
+#                  # live call hears lookahead + 1 frames at a time, so it also
+#                  # sets the latency: 3 is 320 ms, 13 is 1.12 s.
 #   compile_step: false  # decode with eager kernels: start-up a few seconds faster, decoding ~2.5x slower

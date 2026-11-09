@@ -3615,8 +3615,10 @@ streams (audio and video, say): each has its own buffer and its own end.
   seam), refuses non-finite samples and clamps to [-1, 1]. Nemotron VoiceChat declares
   ``ClientAudio(16000, 1280)``: its encoder's 80 ms frame, taken from the encoder's own
   hop and subsampling.
-- A model that declares ``ClientAudio`` decides when to speak (full duplex). To serve
-  ``/v1/realtime`` conversations it also declares ``turn_tokens = (start_id, end_id)`` on
+- A model that declares ``ClientAudio`` and no ``turn_tokens`` serves transcription sessions
+  (``/v1/realtime?intent=transcription``) from its stream: its text is the session's transcript,
+  so it needs no step pairing. One that decides when to speak (full duplex) serves
+  ``/v1/realtime`` conversations once it also declares ``turn_tokens = (start_id, end_id)`` on
   the model (a property when the ids come from its config): the text tokens that open and
   close each reply, and, if its replies may get no end mark, ``turn_idle_steps``: a reply
   then also ends after that many steps with no text and no audio above ``turn_silence_rms``

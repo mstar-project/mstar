@@ -231,12 +231,18 @@ async def realtime(websocket: WebSocket):
     intent = websocket.query_params.get("intent")
     api = _api()
     audio = api.client_audio if api is not None else []
+    # a model that hears audio as it comes and writes a transcript, with no turns
+    if len(audio) == 1 and intent == "transcription" and api.model.turn_tokens is None \
+            and (adapter := get_adapter(api.model_name)) is not None:
+        await serving_realtime.RealtimeLiveTranscription(api, api.model_name, adapter, websocket, audio[0]).run()
+        return
     # why a model with an audio client stream can't hold a conversation (None: it can)
     no_conversation = None
     if audio:
         channels = api.model.get_output_audio_channels("audio")
         if api.model.turn_tokens is None:
-            no_conversation = "this model has no turn tokens, so it can't serve OpenAI Realtime conversations"
+            no_conversation = ("this model has no turn tokens, so it can't serve OpenAI Realtime conversations; "
+                               "use /v1/realtime?intent=transcription")
         elif len(audio) > 1:
             no_conversation = f"this model takes audio on {len(audio)} client streams, and a conversation feeds one"
         elif channels != 1:

@@ -1,7 +1,8 @@
 """
 ParakeetModel: NVIDIA's FastConformer transducer speech recognizers —
 Parakeet-TDT-0.6B-v3 (25 European languages, offline) and Nemotron-3.5-ASR
-(cache-aware streaming, run here over whole clips).
+(cache-aware streaming). Both take whole clips; Nemotron ASR also hears a live
+call as it comes, over ``/v1/realtime`` or ``/generate/ws``.
 
 A FastConformer encoder hears the clip once, then a transducer reads it frame
 by frame: a small LSTM over the tokens emitted so far and the frame under the
@@ -18,6 +19,14 @@ Graph walk:
     transcribe — audio_encoder -> a transducer loop over the encoder output:
                  each iteration's tokens to the client, until the cursor
                  passes the clip's last frame
+
+A cache-aware checkpoint adds two walks, one partition each, for a live call:
+    encode_stream — stream_encoder, one step per chunk (lookahead + 1 frames)
+                    of the client's audio
+    decode_stream — transducer_stream, one step per chunk of frames, its tokens
+                    to the client; both end with the client's stream
+A whole clip runs ``transcribe`` and a live call the other two: the partition a
+request doesn't use is done from the start, so whole clips pay nothing for it.
 """
 
 import json
@@ -26,6 +35,7 @@ import logging
 import torch
 
 from mstar.communication.tensors import NameToTensorList
+from mstar.conductor.request_info import DEFAULT_PARTITION, PartitionDefinition
 from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.resources.recurrent import RecurrentStateConfig, RecurrentStateSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
@@ -33,9 +43,18 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import Model, ProcessPromptOutput, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples
 from mstar.model.parakeet.config import (
+    AUDIO_IN,
     DECODE_LOOP,
+    ENCODER_FRAMES,
+    LIVE_DECODE_LOOP,
+    LIVE_DECODE_WALK,
+    LIVE_ENCODE_LOOP,
+    LIVE_ENCODE_WALK,
     NUM_FRAMES,
     PROMPT_ID,
+    STREAM_CONV,
+    STREAM_FRONT,
+    STREAM_KV,
     TRANSDUCER_STATE,
     WALK,
     ParakeetModelConfig,
@@ -43,6 +62,15 @@ from mstar.model.parakeet.config import (
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import SentencePieceDetokenizer, TextOutput
+from mstar.streaming.chunk_policy import FixedChunkPolicy
+from mstar.streaming.topology import (
+    CLIENT,
+    ClientAudio,
+    ClientStreamLimits,
+    Connection,
+    PartitionTopology,
+    StreamingGraphEdge,
+)
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -58,6 +86,8 @@ class ParakeetModel(Model):
     MAX_AUDIO_SECONDS = 610.0
     # requests the default state pool holds; the YAMLs cap max_concurrent_requests here
     MAX_CONCURRENT_REQUESTS = 128
+    # the longest live call: its loops' ceiling and its client stream's bound
+    MAX_LIVE_SECONDS = 3600
     # a few tiny ops per upload; see "Preprocessing threads" in docs/adding_models.rst
     PREPROCESS_TORCH_THREADS = 1
     INTERNAL_KWARGS = (NUM_FRAMES, PROMPT_ID)
@@ -76,6 +106,16 @@ class ParakeetModel(Model):
         )
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
+    @property
+    def live(self) -> bool:
+        """A cache-aware checkpoint also hears a live stream."""
+        return self.config.encoder.causal
+
+    @property
+    def chunk_frames(self) -> int:
+        """Encoder frames a live step takes: its attention's chunk."""
+        return self.config.encoder.lookahead + 1
+
     def checkpoint_path(self) -> str:
         return str(self.local_dir)
 
@@ -84,10 +124,13 @@ class ParakeetModel(Model):
         return int(self.config.encoder.output_lengths(num_samples // HOP_LENGTH))
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        # no cache and no sampler (decoding is greedy): the decoder state is all
+        # no cache and no sampler (decoding is greedy): the decoder state is all,
+        # and a live stream's encoder state
         return [
+            *self._stream_resources(),
             RecurrentStateSpec(
-                resource_key=TRANSDUCER_STATE, nodes={"transducer"},
+                resource_key=TRANSDUCER_STATE,
+                nodes={"transducer", "transducer_stream"} if self.live else {"transducer"},
                 config=RecurrentStateConfig(
                     # the LSTM's layers are in h's and c's shape
                     num_layers=1,
@@ -97,6 +140,16 @@ class ParakeetModel(Model):
                 ),
             ),
         ]
+
+    def _stream_resources(self) -> list[NodeResourceSpec]:
+        if not self.live:
+            return []
+        from mstar.model.components.fastconformer_stream import stream_node_resources
+
+        return stream_node_resources(
+            self.config.encoder, HOP_LENGTH, "stream_encoder", self.MAX_CONCURRENT_REQUESTS,
+            kv_key=STREAM_KV, conv_key=STREAM_CONV, front_key=STREAM_FRONT,
+        )
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a ``max_concurrent_requests`` the state pool can't hold. A
@@ -148,7 +201,7 @@ class ParakeetModel(Model):
             )),
             outputs=[],
         )
-        return {WALK: Sequential([
+        walks = {WALK: Sequential([
             GraphNode(
                 name="audio_encoder",
                 input_names=["audio"],
@@ -156,6 +209,64 @@ class ParakeetModel(Model):
             ),
             decode,
         ])}
+        if self.live:
+            steps = self._live_chunks()
+            walks[LIVE_ENCODE_WALK] = Loop(
+                name=LIVE_ENCODE_LOOP,
+                section=GraphNode(
+                    name="stream_encoder",
+                    input_names=[AUDIO_IN],
+                    consumes_stream=True,
+                    outputs=[StreamingGraphEdge(next_node="transducer_stream", name=ENCODER_FRAMES,
+                                                target_partition="Decoder")],
+                ),
+                max_iters=steps,
+                outputs=[],
+            )
+            walks[LIVE_DECODE_WALK] = Loop(
+                name=LIVE_DECODE_LOOP,
+                section=GraphNode(
+                    name="transducer_stream",
+                    input_names=[ENCODER_FRAMES],
+                    consumes_stream=True,
+                    outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name="tokens", output_modality="text")],
+                ),
+                max_iters=steps,
+                outputs=[],
+            )
+        return walks
+
+    def _live_chunks(self) -> int:
+        """The most chunks of audio a live call can hold, its stream's end included."""
+        return self.MAX_LIVE_SECONDS * SAMPLE_RATE // (self._chunk_samples()) + 2
+
+    def _chunk_samples(self) -> int:
+        return HOP_LENGTH * self.config.encoder.subsampling_factor * self.chunk_frames
+
+    def get_partitions(self) -> list[PartitionDefinition]:
+        if not self.live:
+            return super().get_partitions()
+        return [
+            PartitionDefinition(name=DEFAULT_PARTITION, graph_walks={WALK}),
+            PartitionDefinition(name="Encoder", graph_walks={LIVE_ENCODE_WALK}, initial_walk=LIVE_ENCODE_WALK),
+            PartitionDefinition(name="Decoder", graph_walks={LIVE_DECODE_WALK}, initial_walk=LIVE_DECODE_WALK,
+                                producer_partitions=["Encoder"]),
+        ]
+
+    def get_partition_topology(self) -> PartitionTopology:
+        if not self.live:
+            return super().get_partition_topology()
+        return PartitionTopology(partitions=[DEFAULT_PARTITION, "Encoder", "Decoder"], connections=[
+            # the data worker cuts the audio on a chunk, the encoder's step
+            Connection(from_partition=CLIENT, to_partition="Encoder", edge_name=AUDIO_IN,
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1),
+                       limits=ClientStreamLimits(max_items=self.MAX_LIVE_SECONDS * SAMPLE_RATE,
+                                                 item_size=torch.numel, unit="samples"),
+                       audio=ClientAudio(SAMPLE_RATE, frame_samples=self._chunk_samples())),
+            # a step's frames are one item, and the decoder takes them together
+            Connection(from_partition="Encoder", to_partition="Decoder", edge_name=ENCODER_FRAMES,
+                       chunk_policy_factory=lambda: FixedChunkPolicy(chunk_size=1)),
+        ])
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # a ceiling the runtime enforces: the most iterations a clip can take
@@ -173,9 +284,17 @@ class ParakeetModel(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
     ) -> list[WalkStep]:
-        # one walk, until the decode loop's cursor passes the last frame; it carries the
         # host values the decode steps read: the capture's bucket, Nemotron's prompt
-        return [WalkStep(WALK, step_metadata={key: model_kwargs.get(key) for key in self.INTERNAL_KWARGS})]
+        step_metadata = {key: model_kwargs.get(key) for key in self.INTERNAL_KWARGS}
+        # A whole clip runs the default partition's one walk, until the decode loop's
+        # cursor passes the last frame. A live call (no clip; its audio arrives on the
+        # client stream) runs the other two, each one stream-fed loop that ends with
+        # its stream. The partitions a request doesn't use have nothing to run.
+        live = not input_signals.get("audio")
+        walk = {DEFAULT_PARTITION: WALK, "Encoder": LIVE_ENCODE_WALK, "Decoder": LIVE_DECODE_WALK}[partition_name]
+        if (partition_name == DEFAULT_PARTITION) == live:
+            return []
+        return [WalkStep(walk, step_metadata=step_metadata)]
 
     def process_prompt(
         self,
@@ -190,7 +309,10 @@ class ParakeetModel(Model):
         exist, and Nemotron's language prompt from ``language`` (a locale such
         as ``en-US``, a bare code, or ``auto``, the default). Parakeet-TDT
         detects the language itself and refuses only a ``language`` it
-        doesn't know."""
+        doesn't know. A live call has no clip: its audio comes on the client
+        stream."""
+        if self.live and not (tensors or {}).get("audio_inputs"):
+            return ProcessPromptOutput({}, {PROMPT_ID: self.config.prompt_id(kwargs.get("language"))})
         samples = clip_samples(tensors, self.MAX_AUDIO_SECONDS, "this model")
         metadata = {NUM_FRAMES: self._num_frames(samples.shape[0])}
         if self.config.has_prompt:
@@ -229,7 +351,9 @@ class ParakeetModel(Model):
                 device=device, dtype=autocast_dtype,
             )
             return FastConformerEncoderSubmodule(encoder, normalize_features=self.config.normalize_features)
-        if node_name == "transducer":
+        if node_name == "stream_encoder":
+            return self._stream_encoder(device, autocast_dtype)
+        if node_name in ("transducer", "transducer_stream"):
             from mstar.model.components.transducer import TransducerHead
             from mstar.model.parakeet.submodules import TransducerSubmodule
 
@@ -244,5 +368,22 @@ class ParakeetModel(Model):
                 raise KeyError(f"transducer weights: missing {missing[:4]}, unexpected {unexpected[:4]}")
             return TransducerSubmodule(
                 head.eval(), compile_step=self.compile_step, encoder_dtype=autocast_dtype or torch.float32,
+                live_frames=self.chunk_frames if node_name == "transducer_stream" else None,
             )
         return None
+
+    def _stream_encoder(self, device: str, autocast_dtype: torch.dtype | None) -> NodeSubmodule:
+        from mstar.model.components.audio_features import NemoLogMel
+        from mstar.model.components.fastconformer import FastConformerEncoder
+        from mstar.model.components.fastconformer_stream import FastConformerStreamSubmodule
+
+        cfg = self.config.encoder
+        encoder = FastConformerEncoder.load(
+            cfg, ((k.removeprefix("encoder."), v) for k, v in self._weights(device, "encoder.")),
+            device=device, dtype=autocast_dtype, kv_key=STREAM_KV, conv_key=STREAM_CONV,
+        )
+        return FastConformerStreamSubmodule(
+            encoder, NemoLogMel(num_mel_bins=cfg.num_mel_bins, normalize=False, device=device), None,
+            input_edge=AUDIO_IN, output_edge=ENCODER_FRAMES, front_key=STREAM_FRONT,
+            batch_sizes=[1, 2, 4, 8, 16, 32], item_per_step=True,
+        )

@@ -186,9 +186,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``nemotron_asr``
      - ``nvidia/nemotron-3.5-asr-streaming-0.6b``
      - Cache-aware streaming FastConformer + RNN-T with a language prompt (``language``: a locale
-       such as ``en-US``, a bare code, or ``auto``); served over whole clips, with the streaming
-       model's chunked attention at its widest lookahead (``lookahead`` in the YAML's
-       ``model_kwargs``). Clips up to 10 min; longer uploads are windowed. No timestamps.
+       such as ``en-US``, a bare code, or ``auto``); serves whole clips and live calls over
+       ``/v1/realtime?intent=transcription``, at its widest lookahead by default (``lookahead`` in
+       the YAML's ``model_kwargs``). Clips up to 10 min; longer uploads are windowed. No timestamps.
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
@@ -471,6 +471,14 @@ FastConformer ASR (``canary``, ``canary_qwen``, ``parakeet``, ``nemotron_asr``) 
 - Install with ``.[asr]``. Uploads that libsndfile can't read (M4A, WebM) are decoded by
   torchcodec, which needs FFmpeg.
 - One GPU per deployment: both nodes share a rank, and there is no tensor parallelism.
+- ``nemotron_asr`` also hears a live call as it comes, over
+  ``/v1/realtime?intent=transcription`` (see :doc:`clients`) or ``/generate/ws``: a stream of
+  ``lookahead + 1`` encoder frames per 80 ms of audio each, decoded chunk by chunk, not
+  re-decoded, so its transcript is the checkpoint's streaming output. ``lookahead`` also sets
+  the latency, 320 ms at 3 and 1.12 s at 13 (the default), and both a clip's and a live
+  call's frames use it. A live call's state is bounded however long it runs; the live
+  path takes about 2.4 GB of GPU memory beside the whole-clip path's 4.6 GB (a second copy of the
+  encoder weights and each stream's bounded state).
 - All four run the FastConformer encoder ``nemotron_duplex`` streams
   (``mstar/model/components/fastconformer.py``), over the whole clip. Canary, Parakeet and
   Nemotron ASR read its dimensions from the HF ``encoder_config``; Canary-Qwen from NeMo's

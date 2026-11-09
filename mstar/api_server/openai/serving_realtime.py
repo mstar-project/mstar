@@ -197,6 +197,10 @@ class RealtimeSession:
     resampler: media_io.StreamResampler | None = None
     # samples the last chunk was short of its boundary (see take_chunk)
     short: int = 0
+    # a model that hears audio as it comes (RealtimeLiveTranscription), not re-decodes
+    stream_as_it_comes: bool = False
+    # samples already on that model's stream: an item's length without holding its audio
+    streamed_samples: int = 0
     # server turn detection (None: the client commits); the segmenter, like
     # the resampler, spans turns, so a commit does not reset either
     turn_detection: realtime_vad.ServerVAD | realtime_vad.SemanticVAD | None = None
@@ -265,9 +269,11 @@ class RealtimeSession:
         arrive, rounded once over the whole item (not per append), so the cap
         does not depend on how the audio was split."""
         held = self.resampler.held(extra) if self.resampler is not None else extra
-        return self.pending_samples + held + sum(int(a.size) for a in self.heard)
+        return self.pending_samples + held + self.streamed_samples + sum(int(a.size) for a in self.heard)
 
     def take_chunk(self) -> np.ndarray | None:
+        if self.stream_as_it_comes:  # the data worker cuts it on the model's chunk
+            return self.flush()
         """Every full chunk of pending audio as one array, or None until
         enough arrived. Output the resampler still holds for its lookahead
         counts toward the chunk, so a chunk of 24 kHz input is decoded on the
@@ -297,7 +303,7 @@ class RealtimeSession:
 
     def clear(self) -> None:
         """Start a new item; the stream state (resampler, segmenter, odd byte) goes on."""
-        self.pending, self.pending_samples, self.heard, self.short = [], 0, [], 0
+        self.pending, self.pending_samples, self.heard, self.short, self.streamed_samples = [], 0, [], 0, 0
         self.chunk_id, self.raw_hypothesis, self.emitted = 0, "", ""
         self.item_id = f"item_{uuid.uuid4().hex[:12]}"
 
@@ -730,13 +736,16 @@ class RealtimeTranscription:
                     return
             await self.commit()
         elif kind == "input_audio_buffer.clear":
-            s = self.session
-            s.clear()
-            s.odd_byte = b""
-            s.reset_stream()
+            self.clear_item()
             await self.send(server_event("input_audio_buffer.cleared"))
         else:
             await self.send(error_event(f"unknown event {_excerpt(kind)}"))
+
+    def clear_item(self) -> None:
+        s = self.session
+        s.clear()
+        s.odd_byte = b""
+        s.reset_stream()
 
     async def apply(self, ops: list[tuple]) -> None:
         """Carry out segmenter operations in order (see ``TurnSegmenter``).
@@ -936,6 +945,116 @@ class RealtimeTranscription:
             await self.send(server_event(
                 "conversation.item.input_audio_transcription.delta", item_id=s.item_id, delta=firm,
             ))
+
+
+class RealtimeLiveTranscription(RealtimeTranscription):
+    """A transcription session on a model that hears audio as it comes (one
+    ``ClientAudio`` client stream and no turn tokens): each item is one engine
+    request, opened by its first audio and ended by its commit, whose tokens go
+    out as deltas; nothing is re-decoded."""
+
+    def __init__(self, api, model_name: str, adapter, websocket: WebSocket, stream: Connection):
+        super().__init__(api, model_name, adapter, websocket)
+        self.session.stream_as_it_comes = True
+        self.stream = stream.edge_name
+        self.chunk_seconds = stream.audio.frame_samples / stream.audio.sample_rate
+        # the stream's own bound on one item's length, not the re-decoding path's
+        if stream.limits is not None and stream.limits.max_items is not None:
+            self.session.max_item_seconds = stream.limits.max_items / stream.audio.sample_rate
+        self.key: str | None = None
+        self.relay_task: asyncio.Task | None = None
+
+    async def run(self) -> None:
+        try:
+            await super().run()
+        finally:
+            self._abort()
+
+    def _abort(self) -> None:
+        key, task = self.key, self.relay_task
+        self.key = self.relay_task = None
+        if task is not None:
+            task.cancel()
+        if key is not None:
+            self.api.abort_submission(key)
+
+    async def _open(self) -> bool:
+        s = self.session
+        kwargs = {"language": s.request.language} if s.request.language else None
+        try:
+            request_id = self.api.submit_request(
+                text=None, input_modalities=[], output_modalities=["text"], streaming=True, model_kwargs=kwargs,
+                request_id=rid(f"rt-{s.session_id}"), model=s.request.model, end_input=False,
+            )
+        except HTTPException as exc:
+            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+            return False
+        except ValueError as exc:
+            await self.send(error_event(_clip(_scrub_paths(str(exc), self.api.upload_dir))))
+            return False
+        self.key = self.api.submission_key(request_id)
+        self.relay_task = asyncio.create_task(self.relay(self.api.iter_result_chunks(request_id)))
+        return True
+
+    async def relay(self, chunks) -> None:
+        """The call's text as deltas of the item, until the call ends."""
+        s = self.session
+        decoder = Utf8Stream()
+        try:
+            async for chunk in chunks:
+                if chunk.modality == "text":
+                    s.raw_hypothesis += decoder.feed(bytes(chunk.data))
+                    text = self.current_text()
+                    await self.emit(text, hold=0)
+                    # the step this text came from covers its chunk of audio
+                    step = (chunk.metadata or {}).get("step", s.chunk_id)
+                    await self.send(server_event(
+                        "mstar.transcription.partial", item_id=s.item_id, text=text, chunk_id=step,
+                        audio_seconds=min((step + 1) * self.chunk_seconds, s.streamed_samples / SAMPLE_RATE),
+                        created=now(),
+                    ))
+                elif chunk.modality == "error":
+                    http_status = int((chunk.metadata or {}).get("status") or 500)
+                    message = bytes(chunk.data).decode("utf-8", "replace")
+                    await self.send(error_event(_clip(_scrub_paths(message, self.api.upload_dir)),
+                                                kind=error_type(http_status)))
+        except HTTPException as exc:   # the request failed, so it has ended too
+            await self.send(error_event(str(exc.detail), kind=error_type(exc.status_code)))
+
+    async def step(self, chunk: np.ndarray, final: bool = False) -> None:
+        s = self.session
+        if self.key is None and not await self._open():
+            return
+        s.streamed_samples += int(chunk.size)
+        s.chunk_id += 1
+        try:
+            self.api.stream_input(self.key, samples={self.stream: chunk})
+        except ValueError as exc:  # past the call's input budget: the item ends with it
+            self.api.reject_input(self.key, f"append rejected: {exc}", 400)
+
+    async def commit(self) -> None:
+        """End the item: its stream ends, and the rest of its tokens arrive."""
+        s = self.session
+        tail = s.flush()
+        if tail is not None and tail.size:
+            await self.step(tail, final=True)
+        key, task = self.key, self.relay_task
+        self.key = self.relay_task = None
+        if key is not None:
+            self.api.stream_input(key, end_input=True)
+            await task
+        await self.emit(self.current_text(), hold=0)
+        await self.send(server_event("input_audio_buffer.committed", item_id=s.item_id))
+        await self.send(server_event(
+            "conversation.item.input_audio_transcription.completed",
+            item_id=s.item_id, transcript=self.current_text(),
+        ))
+        s.clear()
+
+    def clear_item(self) -> None:
+        """A clear drops the item's call too: what it heard can't be unheard."""
+        self._abort()
+        super().clear_item()
 
 
 # Client events a conversation refuses with an ``unsupported`` error, the call

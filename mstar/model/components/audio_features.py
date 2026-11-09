@@ -296,10 +296,9 @@ class NemoLogMel:
         """Frames of a stream ``num_samples`` long that no later audio changes:
         frame m spans ``[m * hop - n_fft/2, m * hop + n_fft/2)``, and the first
         reflects ``n_fft/2`` samples past the stream's first, so it needs more
-        than that. At the stream's end, every frame of the clip. ``reflect_edges``
-        streams only."""
-        assert self.reflect_edges
-        if num_samples <= self.n_fft // 2:
+        than that (zero-padded, it needs that many). At the stream's end, every
+        frame of the clip."""
+        if num_samples < self.n_fft // 2 + self.reflect_edges:
             return 0
         if final:
             return self.num_frames(num_samples)
@@ -308,15 +307,16 @@ class NemoLogMel:
     def stream_span(self, x: torch.Tensor, start: int, lo: int, hi: int, final: bool) -> torch.Tensor:
         """The samples ``windows`` reads for a stream's frames ``lo .. hi - 1``,
         from ``x``, its preemphasized samples from sample ``start`` on (from its
-        first, while its first frames are cut): reflected at the stream's edges
-        as ``batch`` reflects a clip's. Only ``reflect_edges`` streams."""
-        assert self.reflect_edges
+        first, while its first frames are cut): reflected or zero-padded at the
+        stream's edges, as ``batch`` treats a clip's."""
         pad, hop = self.n_fft // 2, self.hop_length
         if lo * hop < pad:  # frame lo reads past the stream's first sample
-            assert start == 0, "the reflection needs the stream's first samples"
-            x, start = torch.cat([x[1: pad + 1].flip(0), x]), start - pad
+            assert start == 0, "the edge needs the stream's first samples"
+            head = x[1: pad + 1].flip(0) if self.reflect_edges else x.new_zeros(pad)
+            x, start = torch.cat([head, x]), start - pad
         if final:
-            x = torch.cat([x, x[-pad - 1: -1].flip(0)])
+            tail = x[-pad - 1: -1].flip(0) if self.reflect_edges else x.new_zeros(pad)
+            x = torch.cat([x, tail])
         return x[lo * hop - pad - start: (hi - 1) * hop + pad - start]
 
     def __call__(self, waveform: torch.Tensor) -> torch.Tensor:

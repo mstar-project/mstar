@@ -1732,3 +1732,48 @@ def test_unsupported_events_are_errors_and_the_call_goes_on(duplex):
         _recv_until(ws, "input_audio_buffer.committed")
         assert not api.aborted
     assert len(api.submits) == 1 and len(api.appends) == 2
+
+
+class _LiveTranscriptionAPI(_DuplexAPI):
+    """A model with one audio client stream and no turn marks: one call per item."""
+
+    def __init__(self, outputs=()):
+        super().__init__(outputs, end=True)
+        self.model.turn_tokens = None
+        self.ended: list = []
+
+    def stream_input(self, key, file_paths=None, end_input=False, *, samples=None, **kw):
+        assert file_paths is None
+        if end_input:
+            self.ended.append(key)
+        else:
+            self.appends.append(samples["audio_in"])
+        return True
+
+
+def test_transcription_of_a_live_model_streams_one_call_per_item(monkeypatch):
+    import mstar.api_server
+    from mstar.api_server.openai import router as router_module
+
+    api = _LiveTranscriptionAPI([_text(0, b" hello"), _text(1, b" world")])
+    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
+    fake_ep.api_server = api
+    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
+    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
+    monkeypatch.setattr(router_module, "get_adapter", lambda name: adapters.TransducerAdapter())
+    app = FastAPI()
+    app.include_router(router_module.router)
+    with TestClient(app).websocket_connect("/v1/realtime?intent=transcription") as ws:
+        assert ws.receive_json()["type"] == "transcription_session.created"
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.2)}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        events = _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+        assert len(api.appends) == 1 and api.appends[0].size == 3200
+        assert api.ended == [api.submits[0]["request_id"]]
+        assert "".join(e["delta"] for e in events if e["type"].endswith(".delta")) == "hello world"
+        assert events[-1]["transcript"] == "hello world"
+        # the next item is a call of its own
+        ws.send_text(json.dumps({"type": "input_audio_buffer.append", "audio": _pcm(0.1)}))
+        ws.send_text(json.dumps({"type": "input_audio_buffer.commit"}))
+        _recv_until(ws, "conversation.item.input_audio_transcription.completed")
+        assert len(api.submits) == 2

@@ -6,6 +6,11 @@ iteration reads its rows' state from the recurrent pool, runs ``CHUNK`` greedy
 steps, each projecting the frames under the cursors (with Nemotron's language
 prompt), writes the state back and emits the iteration's tokens; the stop
 check ends a request's loop once its cursor has passed its last frame.
+
+A live call's decode loop takes one chunk of frames per iteration from the
+stream encoder: enough greedy steps to finish any chunk, so the cursor is at
+the chunk's end when the iteration writes it back, and the next chunk starts
+from frame 0 of its own frames.
 """
 from __future__ import annotations
 
@@ -22,7 +27,15 @@ from mstar.engine.fp32_precision import fp32_precision_scope, node_fp32_precisio
 from mstar.engine.resources import Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.recurrent import RecurrentStatePool, RecurrentStep
 from mstar.model.components.transducer import CHUNK, TransducerHead
-from mstar.model.parakeet.config import DECODE_LOOP, NUM_FRAMES, PROMPT_ID, TRANSDUCER_STATE, WALK
+from mstar.model.parakeet.config import (
+    DECODE_LOOP,
+    ENCODER_FRAMES,
+    LIVE_DECODE_WALK,
+    NUM_FRAMES,
+    PROMPT_ID,
+    TRANSDUCER_STATE,
+    WALK,
+)
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     HostRows,
@@ -66,7 +79,7 @@ class TransducerSubmodule(NodeSubmodule):
 
     def __init__(
         self, head: TransducerHead, compile_step: bool = True, frame_buckets=FRAME_BUCKETS,
-        encoder_dtype: torch.dtype = torch.float32, chunk: int = CHUNK,
+        encoder_dtype: torch.dtype = torch.float32, chunk: int = CHUNK, live_frames: int | None = None,
     ):
         super().__init__()
         self.head = head
@@ -74,6 +87,10 @@ class TransducerSubmodule(NodeSubmodule):
         # steps an iteration; the model's loop cap counts CHUNK, so only tests
         # that drive the node by hand pass fewer
         self.chunk = chunk
+        # a live chunk's frames, and the most greedy steps they can take: a frame
+        # takes at most max_symbols_per_step, so one iteration finishes a chunk
+        self.live_frames = live_frames
+        self.live_steps = None if live_frames is None else live_frames * head.config.max_symbols_per_step
         # the encoder output's dtype, which the captures' frames buffers take
         self.encoder_dtype = encoder_dtype
         # where a fresh slot starts, and every padding row; in full fp32, as
@@ -102,19 +119,30 @@ class TransducerSubmodule(NodeSubmodule):
         graph_walk: str,
         fwd_info: CurrentForwardPassInfo,
         inputs: NameToTensorList,
+        is_final_stream_chunk: bool = False,
         **kwargs,
-    ) -> NodeInputs:
+    ) -> NodeInputs | None:
+        if self.live_frames is not None:
+            frames = inputs.get(ENCODER_FRAMES)
+            if not frames:
+                # the stream's terminal chunk is empty when its last frames were
+                # taken before its end reached this worker; declined, it ends the loop
+                assert is_final_stream_chunk, "an empty chunk before the end of the stream"
+                return None
+            return self._node_inputs(frames[0], fwd_info, self.live_frames)
         states = inputs["encoder_states"][0]
         counted = fwd_info.step_metadata.get(NUM_FRAMES)
         if counted is not None and states.shape[0] != counted:
             raise ValueError(
                 f"the encoder heard {states.shape[0]} frames of this clip, process_prompt counted {counted}"
             )
+        return self._node_inputs(states, fwd_info, self._bucket(states.shape[0]))
+
+    def _node_inputs(self, states: torch.Tensor, fwd_info: CurrentForwardPassInfo, bucket: int | None) -> NodeInputs:
         # the prompt is known on the host, so it rides the step metadata
         kwargs = {PROMPT_ID: fwd_info.step_metadata[PROMPT_ID]} if self.head.prompt_projector is not None else {}
         return NodeInputs(
-            tensor_inputs={"encoder_states": states}, kwargs=kwargs, input_seq_len=1,
-            resource_step_info=self._bucket(states.shape[0]),
+            tensor_inputs={"encoder_states": states}, kwargs=kwargs, input_seq_len=1, resource_step_info=bucket,
         )
 
     def _padding(self, rows: int, like: torch.Tensor) -> torch.Tensor:
@@ -170,6 +198,8 @@ class TransducerSubmodule(NodeSubmodule):
         per_request_input_metadata=None,
         **kwargs: Any,
     ) -> int | None:
+        if self.live_frames is not None:
+            return self.live_frames
         buckets = {self._bucket(info.step_metadata.get(NUM_FRAMES)) for info in per_request_info.values()}
         return buckets.pop() if len(buckets) == 1 else None
 
@@ -186,11 +216,12 @@ class TransducerSubmodule(NodeSubmodule):
         row to the bucket."""
         hidden = self.head.config.encoder_hidden_size
         kwargs = {PROMPT_ID: 0} if self.head.prompt_projector is not None else {}
-        return [
-            BatchedAcceleratorGraphConfig(
-                capture_graph_walk=WALK,
+
+        def config(walk: str, bucket: int, dtype: torch.dtype) -> BatchedAcceleratorGraphConfig:
+            return BatchedAcceleratorGraphConfig(
+                capture_graph_walk=walk,
                 single_request_inputs=NodeInputs(
-                    tensor_inputs={"encoder_states": torch.zeros(0, hidden, dtype=self.encoder_dtype, device=device)},
+                    tensor_inputs={"encoder_states": torch.zeros(0, hidden, dtype=dtype, device=device)},
                     kwargs=kwargs,
                     input_seq_len=1,
                     resource_step_info=bucket,
@@ -200,8 +231,11 @@ class TransducerSubmodule(NodeSubmodule):
                 # the step inside is compiled already, once for every capture
                 compile=False,
             )
-            for bucket in self.frame_buckets
-        ]
+
+        if self.live_frames is not None:
+            # a stream's frames come in fp32 (``FastConformerStreamSubmodule``)
+            return [config(LIVE_DECODE_WALK, self.live_frames, torch.float32)]
+        return [config(WALK, bucket, self.encoder_dtype) for bucket in self.frame_buckets]
 
     # -- forward ------------------------------------------------------------------
 
@@ -227,16 +261,19 @@ class TransducerSubmodule(NodeSubmodule):
         pool: RecurrentStatePool = engine_inputs.resources[TRANSDUCER_STATE]
         # a fresh slot, and a padding row on the sink, start from the start state
         state = {name: pool.gather(name, start=start) for name, start in self._start.items()}
-        tokens, active = self.head.advance(encoder_states, lengths, state, self.chunk, self._step, prompt_ids)
+        live = self.live_frames is not None
+        steps = self.live_steps if live else self.chunk
+        tokens, active = self.head.advance(encoder_states, lengths, state, steps, self._step, prompt_ids)
+        if live:
+            # the next chunk's frames start at 0
+            state["cursor"] = state["cursor"] - lengths
         for name, value in state.items():
             pool.scatter_(name, value)
-        # tokens are -1 where a step emitted none
-        return BatchedModelOutput(
-            row_outputs={"tokens": tokens},
-            # the tokens too: the stop check doesn't read them, but the
-            # client's copy then comes from their host rows, not a copy per request
-            check_stop_buffers={"active": active, "tokens": tokens},
-        )
+        # tokens are -1 where a step emitted none. The tokens go to the stop check
+        # too: it doesn't read them, but the client's copy then comes from their
+        # host rows, not a copy per request. A live chunk has no stop to check.
+        buffers = {"tokens": tokens} if live else {"active": active, "tokens": tokens}
+        return BatchedModelOutput(row_outputs={"tokens": tokens}, check_stop_buffers=buffers)
 
     def forward(
         self,
@@ -267,6 +304,8 @@ class TransducerSubmodule(NodeSubmodule):
         request_infos: dict[str, CurrentForwardPassInfo],
         host_rows: HostRows,
     ) -> dict[str, set[str]] | None:
+        if self.live_frames is not None:
+            return {}   # a live loop ends with its stream
         pairs = host_rows.first_values("active", request_ids)
         if pairs is None:
             return None

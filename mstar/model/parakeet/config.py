@@ -16,6 +16,12 @@ from mstar.model.utils import GRANARY_LANGUAGES, base_language
 SUPPORTED_MODEL_TYPES = ("parakeet_tdt", "parakeet_rnnt", "nemotron3_5_asr")
 
 WALK, DECODE_LOOP = "transcribe", "decode_loop"
+# a live call's walks, one per partition, and the edges between them
+LIVE_ENCODE_WALK, LIVE_ENCODE_LOOP = "encode_stream", "encode_stream_loop"
+LIVE_DECODE_WALK, LIVE_DECODE_LOOP = "decode_stream", "decode_stream_loop"
+AUDIO_IN, ENCODER_FRAMES = "audio_in", "encoder_frames"
+# a live stream's encoder state: the bounded KV, conv tails and front-end tails
+STREAM_KV, STREAM_CONV, STREAM_FRONT = "stream_kv", "stream_conv", "stream_front"
 # each request's decoding state between iterations of the decode loop
 TRANSDUCER_STATE = "transducer_state"
 # model_kwargs and step_metadata keys, from process_prompt: the clip's encoder

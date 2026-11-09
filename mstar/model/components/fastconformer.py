@@ -6,8 +6,8 @@ then each Conformer block runs half an FFN, relative-position self-attention, a
 depthwise convolution and another half FFN. The position term is a dense float
 bias on the attention scores, so attention over a clip runs through SDPA rather
 than a paged kernel. Cache-aware streaming checkpoints differ only in causal
-convolutions, a LayerNorm in the conv module and chunked attention; with no
-right context they also run as a stream, attending in a bounded KV
+convolutions, a LayerNorm in the conv module and chunked attention; they also
+run as a stream, a chunk at a time, attending in a bounded KV
 (``FastConformerEncoder.blocks_stream``).
 """
 from __future__ import annotations
@@ -254,7 +254,7 @@ class RelPositionAttention(nn.Module):
         h, d = config.num_heads, config.head_dim
         self.num_heads, self.head_dim = h, d
         self.layer_idx, self._kv_key = layer_idx, kv_key
-        self.left_context = config.left_context
+        self.left_context, self.chunk = config.left_context, config.lookahead + 1
         self.kv = None
         self.band = None
         self.qkv_proj = nn.Linear(config.hidden_size, 3 * h * d, bias=config.attention_bias)
@@ -266,13 +266,18 @@ class RelPositionAttention(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         if self._kv_key is not None:
             self.kv = resources[self._kv_key]
-            # distances 0..left_context, all a stream's frame sees (row d is
-            # distance d), projected in the weights' dtype, which is what autocast
-            # computes it in: fixed weights, so once, here, before any capture
+            # every distance a stream's frame sees, ascending, projected in the
+            # weights' dtype, which is what autocast computes it in: fixed weights,
+            # so once, here, before any capture. Frame by frame (a chunk of one)
+            # those are 0..left_context. A chunk's frames also see each other, and
+            # a stream's last step can run into a chunk more (its end pads a few
+            # frames), so the widest step is two chunks
             w = self.relative_k_proj.weight
-            n = self.left_context + 1
+            self.retained = stream_retained_frames(self.left_context, self.chunk)
+            widest = 1 if self.chunk == 1 else 2 * self.chunk
+            n = self.retained + 2 * widest - 1
             with torch.no_grad():
-                band = rel_positional_encoding(n, w.shape[1], w.device, w.dtype)[:n].flip(0)
+                band = rel_positional_encoding(self.retained + widest, w.shape[1], w.device, w.dtype)[:n].flip(0)
                 self.band = self.relative_k_proj(band).view(n, self.num_heads, self.head_dim).transpose(0, 1)
 
     def _qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -301,18 +306,30 @@ class RelPositionAttention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
         return self.o_proj(out.transpose(1, 2).reshape(b, t, h * d))
 
+    def _chunks_may_attend(self, t: int, device) -> torch.Tensor:
+        """``(t, distances)``: whether a query of a ``t``-frame step, which starts
+        on a chunk boundary, may attend the key at each distance from it, as
+        ``chunked_attention_mask``. Only a stream's last step spans two chunks."""
+        distance = torch.arange(-(t - 1), self.retained + t, device=device)
+        query = torch.arange(t, device=device)[:, None]
+        diff = query // self.chunk - (query - distance) // self.chunk
+        return (diff >= 0) & (diff <= self.retained // self.chunk)
+
     def forward_stream(self, x: torch.Tensor) -> torch.Tensor:
-        """A stream step: each new frame attends the ``left_context`` frames
-        before it and itself, the older ones from the KV, which then keeps this
+        """A stream step: each new frame attends the frames behind its chunk
+        and its own chunk, the older ones from the KV, which then keeps this
         step's. The position term depends on the distance alone, so it goes in
         as the band of distances projected at bind, unscaled: the kernel scales
         the sum."""
         q, k, v = self._qkv(x)
         b, t, h, d = q.shape
-        r = self.band  # (H, left + 1, D)
+        # (H, distances, D): the kernel reads this step's distances, -(t - 1) on
+        r = self.band if self.chunk == 1 else self.band[:, 2 * self.chunk - t: 2 * self.chunk + self.retained + t - 1]
         # in k's dtype: under autocast the bias add promotes q, and the kernel takes one dtype
         q_u = (q + self.bias_u).to(k.dtype).transpose(1, 2)
-        bias = torch.matmul((q + self.bias_v).transpose(1, 2), r.transpose(-2, -1))  # (B, H, T, left + 1)
+        bias = torch.matmul((q + self.bias_v).transpose(1, 2), r.transpose(-2, -1))  # (B, H, T, distances)
+        if t > self.chunk > 1:
+            bias = bias.masked_fill(~self._chunks_may_attend(t, bias.device), torch.finfo(bias.dtype).min)
         out = self.kv.attend(self.layer_idx, q_u, k.transpose(1, 2), v.transpose(1, 2), rel_bias=bias,
                              ieee=k.dtype == torch.float32)
         return self.o_proj(out.reshape(b, t, h * d))
@@ -431,6 +448,12 @@ class FastConformerBlock(nn.Module):
         x = x + conv(self.norm_conv(x))
         x = torch.add(x, self.feed_forward2(self.norm_feed_forward2(x)), alpha=0.5)
         return self.norm_out(x)
+
+
+def stream_retained_frames(left_context: int, chunk: int) -> int:
+    """The frames a stream of ``chunk``-frame steps keeps for the next chunk to
+    attend, whole chunks only, as ``chunked_attention_mask`` sees them."""
+    return left_context // chunk * chunk
 
 
 def chunked_attention_mask(seq_len: int, left_context: int, lookahead: int, device) -> torch.Tensor:

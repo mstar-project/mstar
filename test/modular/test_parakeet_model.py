@@ -15,6 +15,8 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WalkStep
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
+    LIVE_DECODE_WALK,
+    LIVE_ENCODE_WALK,
     NUM_FRAMES,
     PROMPT_ID,
     TRANSDUCER_STATE,
@@ -93,10 +95,12 @@ def test_unsupported_checkpoint(tmp_path):
 @pytest.mark.parametrize("nemotron", [False, True])
 def test_graph_and_process_prompt(tmp_path, nemotron):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
-    assert model.nodes == ["audio_encoder", "transducer"]
-    (pool,) = model.get_node_resources()
+    assert model.nodes == (["audio_encoder", "stream_encoder", "transducer", "transducer_stream"] if nemotron
+                           else ["audio_encoder", "transducer"])
+    *_, pool = model.get_node_resources()
     assert isinstance(pool, RecurrentStateSpec) and pool.resource_key == TRANSDUCER_STATE
-    assert pool.nodes == {"transducer"} and pool.config.usable_slots == model.MAX_CONCURRENT_REQUESTS
+    assert pool.nodes == ({"transducer", "transducer_stream"} if nemotron else {"transducer"})
+    assert pool.config.usable_slots == model.MAX_CONCURRENT_REQUESTS
     assert pool.config.blocks.keys() == {"h", "c", "dec_out", "cursor", "symbols"}
     out = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(8000)]},
                                language="de")
@@ -161,9 +165,7 @@ def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
     speculates a request's first iteration but no next one; the request runs
     it once."""
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
-    walks = model.get_graph_walk_graphs()
-    assert walks.keys() == {WALK}
-    walk = walks[WALK]
+    walk = model.get_graph_walk_graphs()[WALK]
     assert isinstance(walk, Sequential)
     encoder, loop = walk.sections
     assert encoder.name == "audio_encoder"
@@ -186,6 +188,28 @@ def test_one_walk_the_encoder_then_a_decode_loop(tmp_path, nemotron):
     assert model.walk_plan("default", ["audio"], ["text"], {"audio": [_pointer(1)]}, kwargs) == [
         WalkStep(WALK, step_metadata={NUM_FRAMES: 7, PROMPT_ID: 3 if nemotron else None}),
     ]
+
+
+def test_a_cache_aware_checkpoint_serves_a_clip_or_a_live_call(tmp_path):
+    """A whole clip runs its one walk, and a live call the two stream walks,
+    each in its own partition; the partitions a request doesn't use are done
+    from the start, so a clip's graph is the same as before."""
+    model = ParakeetModel(str(_snapshot(tmp_path, nemotron=True)))
+    assert {p.name for p in model.get_partitions()} == {"default", "Encoder", "Decoder"}
+    client = model.get_partition_topology().client_connections()
+    assert [c.audio.frame_samples for c in client] == [1280 * model.chunk_frames]
+    for walk, partition in ((LIVE_ENCODE_WALK, "Encoder"), (LIVE_DECODE_WALK, "Decoder")):
+        assert isinstance(model.get_graph_walk_graphs()[walk], Loop), partition
+
+    def done(signals):
+        return {p: model.get_initial_forward_pass_args(p, ["audio"], ["text"], signals, {}).request_done
+                for p in ("default", "Encoder", "Decoder")}
+
+    assert done({"audio": [_pointer(1)]}) == {"default": False, "Encoder": True, "Decoder": True}
+    assert done({}) == {"default": True, "Encoder": False, "Decoder": False}
+    # a live call opens with no audio: nothing for the data worker to load, only the prompt
+    out = model.process_prompt(None, [], ["text"], tensors={}, language="de")
+    assert out.new_input_tensors == {} and out.metadata == {PROMPT_ID: 2}
 
 
 def test_startup_refuses_more_requests_than_slots(tmp_path):

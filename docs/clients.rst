@@ -580,6 +580,12 @@ Per-model notes:
   in ``transcription_session.update``; a smaller ``chunk_seconds`` is raised to 0.5. An item holds
   at most 300 s of audio (``max_item_seconds`` in the session, lower if the model hears
   less): commit before then, since an append past it is refused with an ``error``.
+- **Realtime transcription, on a model that hears audio as it comes** (a ``ClientAudio`` client
+  stream and no ``turn_tokens``, such as ``nemotron_asr``) — each item is one engine request,
+  opened by its first append and ended by its commit, so its text streams as
+  ``conversation.item.input_audio_transcription.delta`` events while the audio is still
+  arriving, and ``mstar.transcription.partial`` events report the audio covered so far. No
+  ``chunk_seconds`` applies, and an item holds up to the model's bound on a live call.
 - **Realtime turn detection** — by default the client ends each utterance with
   ``input_audio_buffer.commit``. With ``"turn_detection": {"type": "server_vad"}`` the
   server does it, as OpenAI's server VAD does: ``threshold`` (default 0.5),

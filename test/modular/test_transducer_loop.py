@@ -27,6 +27,8 @@ from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.components.transducer import CHUNK
 from mstar.model.parakeet.config import (
     DECODE_LOOP,
+    ENCODER_FRAMES,
+    LIVE_DECODE_WALK,
     NUM_FRAMES,
     PROMPT_ID,
     TRANSDUCER_STATE,
@@ -289,6 +291,29 @@ def test_loop_matches_the_reference(scenario, durations, mode):
     assert sum(map(len, expected)) > len(clips), "the head emitted almost nothing; the test would be vacuous"
     if scenario == "never_blank":
         assert [len(tokens) for tokens in expected] == [head.config.max_symbols_per_step * n for n in lengths]
+
+
+@pytest.mark.parametrize("chunk", [1, 4, 14])
+@pytest.mark.parametrize("scenario", ["random", "never_blank", "blank_runs"])
+def test_a_live_stream_decodes_the_whole_clip_tokens(scenario, chunk):
+    """Frames arriving a chunk at a time give the tokens of the whole clip:
+    the state carries across chunks and every frame is decoded in its chunk's
+    one iteration, even when each emits the most tokens a frame can."""
+    head, clips = SCENARIOS[scenario]([])
+    harness = Harness(head)
+    node = harness.node
+    node.live_frames, node.live_steps = chunk, chunk * head.config.max_symbols_per_step
+    with torch.no_grad():
+        for rid, clip in enumerate(clips[:4]):
+            harness.runner.ingest_request(rid)
+            info = _info(rid, clip.shape[0])
+            got = []
+            for at in range(0, clip.shape[0], chunk):
+                inputs = [node.prepare_inputs(LIVE_DECODE_WALK, info, {ENCODER_FRAMES: [clip[at:at + chunk]]})]
+                ctx = StepContext(request_ids=[rid], graph_walk=LIVE_DECODE_WALK, slot=0, capture=False)
+                out = harness._drive(LIVE_DECODE_WALK, inputs, {rid: info}, ctx)
+                got += [t for t in out.row_outputs["tokens"][0].tolist() if t >= 0]
+            assert got == _reference(head, clip), (rid, clip.shape[0])
 
 
 def test_each_request_decodes_under_its_own_prompt():
