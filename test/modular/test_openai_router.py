@@ -9,6 +9,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import sys
 import tempfile
 import threading
@@ -176,6 +177,28 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
     assert r.status_code == 400
     # a refused input is the client's error, on every route
     assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.parametrize("exc,level", [
+    # a refusal is one INFO line: a client that sent stop on every call logged a traceback each
+    (ValueError("stop sequences are not supported"), logging.INFO),
+    # still a 400, but maybe a bug in the route, so it keeps its stack
+    (TypeError("'NoneType' object is not subscriptable"), logging.ERROR),
+], ids=["refusal", "type-error"])
+def test_a_chat_s_400_logs_a_traceback_only_for_a_type_error(client_and_stub, monkeypatch, caplog, exc, level):
+    from mstar.api_server.openai import adapters
+
+    def raising(self, req, upload_dir):
+        raise exc
+
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    monkeypatch.setattr(adapters.BagelAdapter, "chat_to_request", raising)
+    caplog.set_level(logging.INFO, logger="mstar.api_server.openai.router")
+    r = client.post("/v1/chat/completions", json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 400
+    [record] = [rec for rec in caplog.records if rec.name == "mstar.api_server.openai.router"]
+    assert (record.levelno, record.exc_info is not None) == (level, level == logging.ERROR)
 
 
 def test_chat_refuses_server_paths_uniformly(client_and_stub, tmp_path):
@@ -372,6 +395,23 @@ def test_chat_audio_output(client_and_stub):
     assert wav[:4] == b"RIFF" and wav[8:12] == b"WAVE"
 
 
+def test_chat_audio_output_is_in_the_requested_format(client_and_stub):
+    client, stub = client_and_stub
+    stub.model_name = "qwen3_omni"
+    pcm = _pcm([0, 16000, -16000])
+    stub.next_chunks = [_Chunk("audio", pcm)]
+    body = {"messages": [{"role": "user", "content": "x"}], "modalities": ["text", "audio"],
+            "audio": {"voice": "Ethan", "format": "pcm16"}}
+    reply = client.post("/v1/chat/completions", json=body).json()
+    assert base64.b64decode(reply["choices"][0]["message"]["audio"]["data"]) == pcm
+    # stream deltas are raw PCM16, so any other container is refused rather than mislabeled
+    r = client.post("/v1/chat/completions", json={**body, "stream": True, "audio": {"format": "wav"}})
+    assert r.status_code == 400 and "pcm16" in r.json()["error"]["message"]
+    # the refusal names the chat field and its formats, not the speech route's
+    r = client.post("/v1/chat/completions", json={**body, "audio": {"format": "pcm"}})
+    assert r.status_code == 400 and r.json()["error"]["message"].startswith("audio.format 'pcm' cannot be produced")
+
+
 def test_audio_speech(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "orpheus"
@@ -493,6 +533,9 @@ def test_videos_generations_ltx2_5_requests_audio_and_muxes(client_and_stub, mon
 
     def fake_mux(video, audio, sample_rate, num_channels, video_fps=None):
         muxed.update(video=video, audio=audio, sample_rate=sample_rate, num_channels=num_channels)
+        # ffmpeg can run for minutes: off the event loop, which keeps serving meanwhile
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
         return b"muxed"
 
     monkeypatch.setattr(media_io, "mux_mp4_with_pcm16", fake_mux)
@@ -781,6 +824,34 @@ def test_images_n_below_one_is_400(client_and_stub):
     message = resp.json()["error"]["message"]
     assert resp.status_code == 400 and message.startswith("n must be between 1 and") and "got 0" in message
 
+_PNG = ("in.png", b"\x89PNGinput", "image/png")
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG), ("mask", _PNG)], "data": {"prompt": "x"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG), ("image", _PNG)], "data": {"prompt": "x"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG)], "data": {"prompt": "x", "n": "2"}}),
+    ("bagel", "/v1/images/edits", {"files": [("image", _PNG)], "data": {"prompt": "x", "response_format": "url"}}),
+    ("bagel", "/v1/images/generations", {"json": {"prompt": "x", "response_format": "url"}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "n": 2}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "response_format": "url"}}),
+], ids=["mask", "two-images", "edit-n", "edit-url", "image-url", "video-n", "video-url"])
+def test_image_and_video_routes_refuse_what_they_would_drop(client_and_stub, model, path, body):
+    """A mask, a second image, n > 1 on a one-result route, or a url response was dropped with a 200."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    resp = client.post(path, **body)
+    assert resp.status_code == 400, resp.text
+    assert stub.last_submit is None and not any(stub.upload_dir.iterdir())
+
+
+def test_images_edits_takes_the_openai_image_list_name(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = [_Chunk("image", b"\x89PNGedited")]
+    resp = client.post("/v1/images/edits", files=[("image[]", _PNG)], data={"prompt": "x"})
+    assert resp.status_code == 200 and "image" in stub.last_submit["file_paths"]
+
+
 @pytest.mark.parametrize("model", ["cosmos3", "cosmos3_edge"])
 def test_an_edit_the_model_cannot_do_is_a_400_and_leaves_no_upload(client_and_stub, model):
     """A model with image generation but no editing refuses the edit as the
@@ -1004,7 +1075,7 @@ _ATTACHMENTS = _CHAT["messages"][0]["content"][:2]
     ("qwen3_omni", {"messages": [{"role": "user", "content": _ATTACHMENTS}, {"role": "tool", "content": "42"}]},
      "a message's role must be system, developer, user or assistant, not 'tool'"),
     ("cosmos3_edge", {"messages": [{"role": "user", "content": _ATTACHMENTS}], "chat_template_kwargs": True},
-     "argument of type 'bool' is not iterable"),
+     "chat_template_kwargs must be an object"),
 ], ids=["bad-attachment", "bad-role", "bad-template-kwargs"])
 def test_a_chat_refused_after_its_attachments_leaves_no_upload_behind(client_and_stub, model, body, message):
     """A chat refused once some attachments are saved is never submitted, so

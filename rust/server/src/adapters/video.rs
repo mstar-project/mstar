@@ -80,48 +80,12 @@ impl OpenAIAdapter for Cosmos3Edge {
         true
     }
     fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
-        // How the vLLM recipe toggles thinking; a flat enable_thinking wins.
-        // Read before the attachments are saved, since a malformed value
-        // refuses the request.
-        let thinking = template_enable_thinking(req.extra.get("chat_template_kwargs"))?;
-        let mut args = text_chat(req, upload_dir, allow_remote)?;
-        args.model_kwargs.remove("chat_template_kwargs");
-        if let Some(on) = thinking {
-            set_default(&mut args.model_kwargs, "enable_thinking", on);
-        }
-        Ok(args)
+        template_kwargs_chat(req, upload_dir, allow_remote)
     }
     fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
         Cosmos3.image_to_request(req)
     }
     fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
         Cosmos3.video_to_request(req, upload_dir, allow_remote)
-    }
-}
-
-/// `chat_template_kwargs.enable_thinking` read as `Cosmos3EdgeAdapter` does:
-/// `(kwargs or {})`, then `kwargs["enable_thinking"]` as sent when it has the
-/// key, so the model refuses a non-boolean rather than reading `"false"` as
-/// true. A falsy value is no kwargs; a value Python cannot look the key up in
-/// is the `TypeError` that answers 400 there.
-pub(super) fn template_enable_thinking(kwargs: Option<&Value>) -> Result<Option<Value>, String> {
-    const KEY: &str = "enable_thinking";
-    match kwargs {
-        None => Ok(None),
-        Some(v) if !truthy(v) => Ok(None),
-        Some(Value::Object(m)) => Ok(m.get(KEY).cloned()),
-        Some(Value::Array(items)) if items.iter().any(|i| i.as_str() == Some(KEY)) => {
-            Err("list indices must be integers or slices, not str".to_string())
-        }
-        Some(Value::String(s)) if s.contains(KEY) => {
-            Err("string indices must be integers, not 'str'".to_string())
-        }
-        Some(Value::Array(_) | Value::String(_)) => Ok(None),
-        Some(Value::Bool(_)) => Err("argument of type 'bool' is not iterable".to_string()),
-        Some(Value::Number(n)) => Err(format!(
-            "argument of type '{}' is not iterable",
-            if n.is_f64() { "float" } else { "int" }
-        )),
-        Some(Value::Null) => Ok(None),
     }
 }
