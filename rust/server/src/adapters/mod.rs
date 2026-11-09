@@ -44,7 +44,7 @@ pub use images::*;
 pub use messages::flatten_messages;
 use messages::*;
 pub use speech::*;
-pub use video::{Cosmos3, Cosmos3Edge, Wan22, LTX25};
+pub use video::{Cosmos3, Cosmos3Edge, MiniMaxH3, Wan22, LTX25};
 
 /// One element of a chat prompt, in request order: mstar's `PromptPart`,
 /// field for field, so the bridge builds one from each as it arrives.
@@ -299,6 +299,7 @@ pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
     ("VoxCPM2Adapter", &VoxCPM2),
     ("Wan22Adapter", &Wan22),
     ("LTX25Adapter", &LTX25),
+    ("MiniMaxH3Adapter", &MiniMaxH3),
 ];
 
 /// The adapter for a Python class name; `None` for a class with no port here.
@@ -358,6 +359,17 @@ fn py_float_repr(x: f64) -> String {
     } else {
         format!("{sign}{}.{}", &digits[..point], &digits[point..])
     }
+}
+
+/// Python's `str.isspace()`, which `strip` and `split` use: Unicode whitespace
+/// and the four ASCII separators U+001C..U+001F.
+pub(crate) fn py_space(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// `str.strip()`.
+pub(crate) fn py_strip(s: &str) -> &str {
+    s.trim_matches(py_space)
 }
 
 /// Python's `bool()` of a JSON value.

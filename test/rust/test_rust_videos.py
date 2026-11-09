@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -50,6 +51,8 @@ def _chunks(prompt: str, video: bytes) -> list:
         return [_Chunk("video", video, {"window": 0}), _Chunk("video", video, {"window": 1})]
     if "fails" in prompt:
         return [_Chunk("video", video), _Chunk("error", b"Error in worker: boom", {"status": 500})]
+    if "refused" in prompt:
+        return [_Chunk("error", b"could not decode the conditioning image", {"status": 400})]
     return [_Chunk("video", video)]
 
 
@@ -87,6 +90,7 @@ class _PythonVideoServer:
         pass
 
     lora_kwargs = APIServer.lora_kwargs
+    open_result_stream = APIServer.open_result_stream
 
 
 def _post(port, body, timeout=60):
@@ -99,7 +103,7 @@ def _post(port, body, timeout=60):
         return e.code, e.headers.get("content-type"), e.read()
 
 
-VIDEO_CLASSES = ["Cosmos3Adapter", "LTX25Adapter", "Wan22Adapter"]
+VIDEO_CLASSES = ["Cosmos3Adapter", "LTX25Adapter", "MiniMaxH3Adapter", "Wan22Adapter"]
 
 VIDEO_CASES = {
     "text": {"prompt": "a cat"},
@@ -114,6 +118,17 @@ VIDEO_CASES = {
     "empty-strings": {"prompt": "a cat", "image": "", "video": "", "size": ""},
     "no-audio": {"prompt": "a cat", "audio": False},
     "server-path": {"prompt": "a cat", "image": "/etc/passwd"},
+    # MiniMax-H3's keyframes, sound switch, frame rate and count
+    "keyframes": {"prompt": "a cat", "image": f"data:image/png;base64,{PNG}",
+                  "last_image": f"data:image/png;base64,{PNG}"},
+    "last-image-only": {"prompt": "a cat", "last_image": f"data:image/png;base64,{PNG}"},
+    "last-image-not-a-string": {"prompt": "a cat", "last_image": 5},
+    "last-image-refused": {"prompt": "a cat", "image": f"data:image/png;base64,{PNG}", "last_image": "/etc/passwd"},
+    "audio-not-a-bool": {"prompt": "a cat", "audio": "yes"},
+    "audio-null": {"prompt": "a cat", "audio": None},
+    "fps-24": {"prompt": "a cat", "fps": 24},
+    "fps-30": {"prompt": "a cat", "fps": 30},
+    "two": {"prompt": "a cat", "n": 2},
 }
 
 
@@ -130,11 +145,14 @@ def test_a_video_request_is_submitted_or_refused_as_the_python_adapter_does(cls,
     except ValueError as e:
         want, refusal = None, str(e)
     stub = _RustVideoStub(b"mp4")
-    with _model_stack(model, stub) as (port, _upload):
+    with _model_stack(model, stub) as (port, upload):
         status, _, data = _post(port, body)
+        left = list(Path(upload).iterdir())
     if refusal is not None:
         assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
         assert not stub.submitted
+        # a keyframe saved before the refusal goes with it
+        assert left == []
         return
     assert status == 200, data
     (sub,) = stub.submitted
@@ -204,3 +222,15 @@ def test_stream_video_writes_the_python_routes_ndjson(prompt, tmp_path, monkeypa
     python_lines = [json.loads(line) for line in py.content.splitlines()]
     assert rust_lines == python_lines
     assert rust_lines[-1]["modality"] == ("done" if "windows" in prompt else "error")
+
+
+def test_a_stream_video_the_engine_refuses_at_once_gets_its_status_on_both(tmp_path, monkeypatch):
+    """A refusal before the first window (a conditioning image that doesn't
+    decode) is the response's status, not a 200 with an ``error`` line."""
+    model = _model_of("Wan22Adapter")
+    body = {"model": model, "prompt": "refused", "stream_video": True}
+    py = _python_videos(model, body, tmp_path, monkeypatch, b"mp4-bytes")
+    with _model_stack(model, _RustVideoStub(b"mp4-bytes")) as (port, _upload):
+        status, _, data = _post(port, body)
+    assert status == py.status_code == 400
+    assert json.loads(data) == py.json()

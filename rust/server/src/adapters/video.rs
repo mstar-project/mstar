@@ -1,4 +1,4 @@
-//! Video models: the Cosmos3 family.
+//! Video models: Cosmos3, Wan2.2, LTX-2.5 and MiniMax-H3.
 
 use super::*;
 
@@ -14,8 +14,8 @@ impl OpenAIAdapter for Cosmos3 {
     }
     fn image_to_request(&self, req: &ImageGenerationRequest) -> Result<SubmitArgs, String> {
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-        if let Some(size) = &req.size {
-            set_default(&mut mk, "size", Value::from(size.clone()));
+        if let Some(size) = nonempty(&req.size) {
+            set_default(&mut mk, "size", Value::from(size));
         }
         set_seed(&mut mk, req.seed);
         Ok(SubmitArgs {
@@ -92,7 +92,7 @@ impl OpenAIAdapter for Wan22 {
     }
     fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
-        video_size_kwargs(&mut mk, nonempty(&req.size), "832x480")?;
+        super::images::size_kwargs(&mut mk, nonempty(&req.size), "832x480")?;
         video_fields(&mut mk, req);
         if nonempty(&req.video).is_some() {
             return Err("Wan2.2 does not support 'video' conditioning; provide 'image' or neither.".to_string());
@@ -126,7 +126,7 @@ impl OpenAIAdapter for LTX25 {
         }
         let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
         let with_audio = mk.remove("audio").is_none_or(|v| truthy(&v));
-        video_size_kwargs(&mut mk, nonempty(&req.size), "960x544")?;
+        super::images::size_kwargs(&mut mk, nonempty(&req.size), "960x544")?;
         video_fields(&mut mk, req);
         let output = if with_audio { vec!["video", "audio"] } else { vec!["video"] };
         Ok(SubmitArgs {
@@ -136,6 +136,97 @@ impl OpenAIAdapter for LTX25 {
             model_kwargs: mk,
             ..SubmitArgs::default()
         })
+    }
+}
+
+/// MiniMax-H3: one mp4 with its 32 kHz stereo audio as AAC (`audio: false` for
+/// the video alone), `image` its first frame and `last_image` its last. Only 24 fps.
+pub struct MiniMaxH3;
+
+impl OpenAIAdapter for MiniMaxH3 {
+    fn supports_videos(&self) -> bool {
+        true
+    }
+    fn video_to_request(&self, req: &VideoGenerationRequest, upload_dir: &Path, _allow_remote: bool) -> Result<SubmitArgs, String> {
+        if nonempty(&req.video).is_some() {
+            return Err("MiniMax-H3 takes keyframes ('image', extra_body 'last_image'), not a 'video'.".to_string());
+        }
+        if let Some(fps) = req.fps.filter(|f| *f != 24.0) {
+            return Err(format!("MiniMax-H3 generates at 24 fps; got fps={}", py_float_repr(fps)));
+        }
+        if let Some(n) = req.n.filter(|n| *n != 1) {
+            return Err(format!("MiniMax-H3 generates one video per request; got n={n}"));
+        }
+        let mut mk: Map<String, Value> = req.extra.clone().into_iter().collect();
+        let with_audio = match mk.remove("audio") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => b,
+            Some(other) => return Err(format!("extra_body 'audio' must be true or false; got {}", py_value_repr(&other))),
+        };
+        let last_image = mk.remove("last_image").filter(|v| !v.is_null());
+        super::images::size_kwargs(&mut mk, nonempty(&req.size), "1344x768")?;
+        set_seed(&mut mk, req.seed);
+        if let Some(nf) = req.num_frames {
+            set_default(&mut mk, "num_frames", Value::from(nf));
+        }
+        let refs: Vec<(&str, Value)> = [("first", req.image.clone().map(Value::String)), ("last", last_image)]
+            .into_iter()
+            .filter_map(|(anchor, r)| r.map(|r| (anchor, r)))
+            .collect();
+        for (anchor, r) in &refs {
+            if !r.is_string() {
+                let name = if *anchor == "first" { "image" } else { "extra_body 'last_image'" };
+                return Err(format!("{name} must be a data URL; got {}", py_type_name(r)));
+            }
+        }
+        let mut paths: Vec<String> = Vec::new();
+        for (_, r) in &refs {
+            match media::resolve_media_ref(r.as_str().unwrap_or(""), upload_dir, false) {
+                Ok((_, path)) => paths.push(path),
+                Err(e) => {
+                    // a refused request is never submitted, so no deferred cleanup
+                    // covers the keyframe saved before the refusal
+                    remove_under(upload_dir, &paths);
+                    return Err(e);
+                }
+            }
+        }
+        if !paths.is_empty() {
+            mk.insert("keyframe_anchors".to_string(), refs.iter().map(|(a, _)| Value::from(*a)).collect());
+        }
+        let input = if paths.is_empty() { vec!["text"] } else { vec!["image", "text"] };
+        let output = if with_audio { vec!["video", "audio"] } else { vec!["video"] };
+        Ok(SubmitArgs {
+            text: Some(req.prompt.clone()),
+            file_paths: if paths.is_empty() { BTreeMap::new() } else { BTreeMap::from([("image".to_string(), paths)]) },
+            input_modalities: input.into_iter().map(str::to_string).collect(),
+            output_modalities: output.into_iter().map(str::to_string).collect(),
+            model_kwargs: mk,
+            ..SubmitArgs::default()
+        })
+    }
+}
+
+/// `type(value).__name__` of a JSON value as `json.loads` gives it.
+fn py_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "NoneType",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float",
+        Value::Number(_) => "int",
+        Value::String(_) => "str",
+        Value::Array(_) => "list",
+        Value::Object(_) => "dict",
+    }
+}
+
+/// `media_io.remove_uploads`: the files under `upload_dir` among `paths`.
+fn remove_under(upload_dir: &Path, paths: &[String]) {
+    let Ok(root) = upload_dir.canonicalize() else { return };
+    for p in paths {
+        if Path::new(p).canonicalize().is_ok_and(|c| c.starts_with(&root)) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -153,19 +244,4 @@ fn video_fields(mk: &mut Map<String, Value>, req: &VideoGenerationRequest) {
     if let Some(fps) = req.fps {
         set_default(mk, "fps", json_num(fps));
     }
-}
-
-/// Wan2.2's and LTX-2.5's `size` onto `width` / `height`: Python's
-/// `(int(v) for v in size.lower().split("x"))` into two names, refused with the
-/// adapter's own example.
-fn video_size_kwargs(mk: &mut Map<String, Value>, size: Option<&str>, example: &str) -> Result<(), String> {
-    let Some(size) = size else { return Ok(()) };
-    let lowered = size.to_lowercase();
-    let parsed: Option<Vec<i64>> = lowered.split('x').map(|p| p.trim().parse().ok()).collect();
-    let Some([width, height]) = parsed.as_deref().and_then(|v| <[i64; 2]>::try_from(v).ok()) else {
-        return Err(format!("size must be 'WxH' (e.g. '{example}'); got {}", crate::media::py_repr(size)));
-    };
-    set_default(mk, "width", Value::from(width));
-    set_default(mk, "height", Value::from(height));
-    Ok(())
 }

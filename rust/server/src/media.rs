@@ -120,6 +120,54 @@ fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
 /// it differs from the container's, the video timestamps are rescaled so
 /// playback stays in sync with the audio. Blocking; an `Err` leaves the caller
 /// the video alone, as Python falls back to it.
+/// `subprocess.run(cmd, capture_output=True, timeout=timeout)`: the child's
+/// output, or an `Err` once it has run past `timeout` (it is killed, as
+/// `subprocess.run` kills it).
+fn run_with_timeout(cmd: &mut std::process::Command, timeout: std::time::Duration) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let name = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{name} failed: {e}"))?;
+    // drained as the child writes, so a full pipe cannot stall it
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().map_err(|e| format!("{name} failed: {e}"))? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{name} timed out after {} seconds", timeout.as_secs()));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// `mux_mp4_with_pcm16`'s limits on the frame-rate query and the mux.
+const FFPROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FFMPEG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub fn mux_mp4_with_pcm16(
     video_mp4: &[u8],
     pcm: &[u8],
@@ -127,27 +175,29 @@ pub fn mux_mp4_with_pcm16(
     num_channels: i64,
     video_fps: Option<f64>,
 ) -> Result<Vec<u8>, String> {
+    use std::os::unix::fs::DirBuilderExt;
     let dir = std::env::temp_dir().join(format!("mstar_mux_{}", Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // private, as `TemporaryDirectory`'s: the generated clip is the client's
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| e.to_string())?;
     let result = (|| {
         let (vpath, apath, opath) = (dir.join("v.mp4"), dir.join("a.pcm"), dir.join("out.mp4"));
         std::fs::write(&vpath, video_mp4).map_err(|e| e.to_string())?;
         std::fs::write(&apath, pcm).map_err(|e| e.to_string())?;
         let mut itsscale = None;
         if let Some(fps) = video_fps {
-            let probe = std::process::Command::new("ffprobe")
+            let mut probe = std::process::Command::new("ffprobe");
+            probe
                 .args(["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate",
                        "-of", "csv=p=0"])
-                .arg(&vpath)
-                .output();
-            if let Ok(probe) = probe {
-                let out = String::from_utf8_lossy(&probe.stdout);
-                if let Some((num, den)) = out.trim().split_once('/') {
-                    if let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>()) {
-                        let container = num / den;
-                        if den != 0.0 && container > 0.0 && (container - fps).abs() > 1e-3 {
-                            itsscale = Some(container / fps);
-                        }
+                .arg(&vpath);
+            // a query that times out fails the mux; one that answers nothing leaves the rate
+            let probe = run_with_timeout(&mut probe, FFPROBE_TIMEOUT)?;
+            let out = String::from_utf8_lossy(&probe.stdout);
+            if let Some((num, den)) = out.trim().split_once('/') {
+                if let (Ok(num), Ok(den)) = (num.parse::<f64>(), den.parse::<f64>()) {
+                    let container = num / den;
+                    if den != 0.0 && container > 0.0 && (container - fps).abs() > 1e-3 {
+                        itsscale = Some(container / fps);
                     }
                 }
             }
@@ -162,7 +212,7 @@ pub fn mux_mp4_with_pcm16(
         cmd.arg(&apath);
         cmd.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]);
         cmd.arg(&opath);
-        let out = cmd.output().map_err(|e| format!("ffmpeg mux failed: {e}"))?;
+        let out = run_with_timeout(&mut cmd, FFMPEG_TIMEOUT).map_err(|e| format!("ffmpeg mux failed: {e}"))?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(format!("ffmpeg mux failed: {}", stderr.trim().chars().take(500).collect::<String>()));

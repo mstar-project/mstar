@@ -169,3 +169,54 @@ def test_speech_images_and_videos_run_under_the_adapter_too(route, body, cls, ca
         return
     assert status == py_status == 200, data
     assert (stub.submitted[0]["mk"] or {}) == _resolved(api.submitted[0], served)
+
+
+# A 1x1 PNG, the edit's input image.
+PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+    "1f15c4890000000d49444154789c6360f8cfc0f01f0005000201e7a5b6"
+    "2a0000000049454e44ae426082")
+
+
+def _edit_form(fields: dict) -> tuple[bytes, str]:
+    boundary = "----mstarlora"
+    body = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+        for k, v in fields.items()
+    )
+    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="in.png"\r\n'
+             "Content-Type: image/png\r\n\r\n").encode() + PNG + b"\r\n"
+    return body + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
+
+@pytest.mark.parametrize("case", ["adapter", "unknown", "kwarg", "kwarg-disagrees", "no-model"])
+def test_an_image_edit_runs_under_the_adapter_its_form_names(case, tmp_path, monkeypatch):
+    """``/v1/images/edits`` reads ``model`` from a form field, not JSON."""
+    model = _model_of("DiffusionImageAdapter")
+    served = ServedModels(base=[model], adapters=["sql", "chat"], lora=True)
+    body, ctype = _edit_form({"prompt": "make it blue", **CHATS[case]})
+    api, client = _python(model, served, tmp_path, monkeypatch)
+    py = client.post("/v1/images/edits", content=body, headers={"Content-Type": ctype})
+    stub = _Rust()
+    with _model_stack(model, stub, env={SERVED_MODELS_ENV: served_models_json(served)}) as (port, _upload):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/images/edits", data=body,
+                                     headers={"Content-Type": ctype})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                status, data = r.status, r.read()
+        except urllib.error.HTTPError as e:
+            status, data = e.code, e.read()
+    want_error = None
+    if api.submitted:
+        try:
+            _resolved(api.submitted[0], served)
+        except ValueError as e:
+            want_error = str(e)
+    elif py.status_code != 200:
+        want_error = py.json()["error"]["message"]
+    if want_error is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, want_error)
+        assert stub.submitted == []
+        return
+    assert status == py.status_code == 200, data
+    assert (stub.submitted[0]["mk"] or {}) == _resolved(api.submitted[0], served)
