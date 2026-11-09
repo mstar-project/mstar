@@ -4553,6 +4553,10 @@ class KVManager(AttentionResource):
         """Mark ``rid``, admitted as a request a drop here can free, as one no drop can free from now on. As for a
         request marked so at its arrival, the host sets aside room for the pages it holds, or it turns guaranteed
         when the host has none (`_cover_move`)."""
+        assert self._world_size == 1, (
+            f"KV {self.name}: {rid} lost its log above one rank, where no move tells the other ranks and no node keeps "
+            "a log of a step that read more than its ids"
+        )
         with self._lock:
             self._overrides[rid] = replace(self._overrides[rid], rebuildable=False)
             if rid in self._allotments:
