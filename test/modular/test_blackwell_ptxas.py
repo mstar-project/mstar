@@ -131,7 +131,7 @@ def _elems_per_thread(config) -> float:
 
 
 @pytest.fixture
-def two_elements_per_thread(monkeypatch):
+def two_elements_per_thread(monkeypatch, torch_flag):
     """Inductor's pointwise kernels limited to their candidate configs giving
     each thread two elements; returns a list with one entry per limited kernel."""
     from torch._inductor.runtime import triton_heuristics
@@ -149,7 +149,7 @@ def two_elements_per_thread(monkeypatch):
 
     monkeypatch.setattr(triton_heuristics, "cached_autotune", two_only)
     # compile in this process, where the limit applies
-    monkeypatch.setattr(torch._inductor.config, "compile_threads", 1)
+    torch_flag(torch._inductor.config, "compile_threads", 1)
     return limited
 
 

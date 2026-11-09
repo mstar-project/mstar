@@ -32,6 +32,7 @@ from mstar.kernels.table import TABLE_DIR, Rows, TableEntry, dtype_name, file_st
 OP_SWEEPS = {
     "moe_gemm": "benchmark.kernels.moe_gemm:MoeGemmSweep",
     "moe_decode": "benchmark.kernels.moe_decode:MoeDecodeSweep",
+    "ragged_attention": "benchmark.kernels.ragged_attention:RaggedAttentionSweep",
 }
 
 
@@ -150,9 +151,13 @@ def _us(value: float) -> str:
 
 
 def sweep(op_name: str, shape: dict[str, int], dtype: torch.dtype, buckets, quick: bool, note: str | None,
-          out_dir: Path | None, report: list, min_gain: float, fresh: bool = False) -> bool:
+          out_dir: Path | None, report: list, min_gain: float, fresh: bool = False, arch: bool = False) -> bool:
     """Sweep one shape; False when it found rows it can't write."""
     op: KernelOp = get_op(op_name)
+    command = op.sweep_command(dtype, shape)
+    if command is None:
+        raise SystemExit(f"{op_name}'s sweep times {', '.join(op.sweep_dtypes)} only; measure a "
+                         f"{dtype_name(dtype)} entry end to end (benchmark/kernels/README.md)")
     cls = _sweeper(op_name)
     device = torch.device("cuda", torch.cuda.current_device())
     dev = device_key(device)
@@ -188,7 +193,6 @@ def sweep(op_name: str, shape: dict[str, int], dtype: torch.dtype, buckets, quic
     if not chosen:
         print("# no rows: nothing to write", flush=True)
         return True
-    command = op.sweep_command(dtype, shape)
     if buckets != tuple(cls.default_buckets):
         command += f" --buckets {','.join(map(str, buckets))}"
     try:
@@ -203,7 +207,7 @@ def sweep(op_name: str, shape: dict[str, int], dtype: torch.dtype, buckets, quic
         return False
     print(f"# rows: {describe_rows(rows)}", flush=True)
     if out_dir is not None:
-        path = out_dir / op_name / f"{file_stem(dev.name)}.json"
+        path = out_dir / op_name / f"{file_stem(dev.arch if arch else dev.name)}.json"
         write_entry(path, new)
         reset_lookups()
         print(f"# wrote {path}", flush=True)
@@ -225,6 +229,8 @@ def main() -> None:
     where = parser.add_mutually_exclusive_group()
     where.add_argument("--out", type=Path, help="write DIR/<op>/<GPU>.json (for MSTAR_KERNEL_TABLES)")
     where.add_argument("--write", action="store_true", help=f"write into {TABLE_DIR}")
+    parser.add_argument("--arch", action="store_true",
+                        help="write the architecture's file (sm_103.json), for rows that hold on every GPU of it")
     parser.add_argument("--json", type=Path, help="also write every bucket's timings here")
     parser.add_argument("--list", action="store_true", help="list ops and table coverage, then exit")
     args = parser.parse_args()
@@ -240,7 +246,7 @@ def main() -> None:
     out_dir = TABLE_DIR if args.write else args.out
     report: list = []
     ok = [sweep(args.op, _parse_shape(text), dtype, buckets, args.quick, args.note, out_dir, report,
-                args.min_gain, args.fresh) for text in args.shape]
+                args.min_gain, args.fresh, args.arch) for text in args.shape]
     if args.json:
         args.json.write_text(json.dumps(report, indent=1, default=str) + "\n")
     if not all(ok):

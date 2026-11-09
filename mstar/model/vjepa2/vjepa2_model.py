@@ -38,10 +38,6 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -59,16 +55,16 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
-    ForwardPassArgs,
     KVLabel,
     LabelLayout,
     Model,
     ProcessPromptOutput,
     TensorAndMetadata,
+    WalkStep,
     video_metadata_dict,
 )
 from mstar.model.components.video_decode import decode_frames_at
-from mstar.model.media_limits import VideoBudget, video_decode_threads
+from mstar.model.media_limits import VideoBudget, decoding_upload, video_decode_threads
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.vjepa2.components.ac_predictor import VisionTransformerPredictorAC
 from mstar.model.vjepa2.components.predictor import VJEPA2Predictor
@@ -97,6 +93,30 @@ from mstar.model.vjepa2.weight_loader import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Every model_kwargs key a request may carry.
+REQUEST_KWARGS = frozenset({
+    "num_frames", "skip_predictor", "rollout_horizon", "stream_rollout", "mpc",
+    "actions", "states", "extrinsics", "goal_hidden", "goal_hidden_fill", "context_mask", "target_mask",
+})
+
+
+def _flag(kwargs: dict | None, key: str) -> bool:
+    """A boolean request flag; absent or null is False, anything but a bool is a ``ValueError``."""
+    value = (kwargs or {}).get(key)
+    if value is None:
+        return False
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false; got {value!r}")
+    return value
+
+
+def _as_tensor(kwargs: dict, key: str, dtype: torch.dtype) -> torch.Tensor:
+    """A client array as a tensor; a non-numeric or ragged one is a ``ValueError``."""
+    try:
+        return torch.as_tensor(kwargs[key], dtype=dtype)
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise ValueError(f"{key} must be a numeric array; {exc}") from None
 
 
 # ImageNet normalization constants (match HF ``IMAGENET_DEFAULT_MEAN``/``STD``).
@@ -450,8 +470,8 @@ class VJepa2Model(Model):
         #     Orpheus LLM -> SNAC), which isn't what per-iter client
         #     emit requires.
         # Both walks route to the SAME ``rollout_predictor`` node name
-        # (same submodule, same engine type, same ``check_stop``
-        # semantics) — only the emit topology differs.  Gated per-request
+        # (same submodule, same engine type, same loop cap) — only the
+        # emit topology differs.  Gated per-request
         # via ``model_kwargs["stream_rollout"]`` in ``_initial_walk``.
         rollout_inputs: list[str] = ["encoder_hidden"]
         rollout_loopback_outputs: list[GraphEdge] = [
@@ -481,14 +501,14 @@ class VJepa2Model(Model):
 
         # -- Batched (masked + AC): accumulated_outputs, one message at
         # -- loop completion.  ``max_iters`` is a config-level upper bound
-        # -- baked in at graph-build time; the per-request horizon is
-        # -- enforced inside the submodule via ``check_stop`` when
-        # -- iter_idx + 1 reaches it.
+        # -- baked in at graph-build time; the per-request horizon is the
+        # -- loop's cap (``get_loop_caps``).
         rollout_section_batched = GraphNode(
             name="rollout_predictor",
             input_names=rollout_inputs,
             outputs=list(rollout_loopback_outputs),
-            # dynamic rollout loop; don't want async scheduling to overshoot by one
+            # synchronous: speculation on the rollout is unmeasured (its loop is capped,
+            # so it would not overshoot)
             enable_async_scheduling=False
         )
         rollout_loop_batched = Loop(
@@ -522,7 +542,8 @@ class VJepa2Model(Model):
                     output_modality="video",
                 ),
             ],
-            # dynamic rollout loop; don't want async scheduling to overshoot by one
+            # synchronous: speculation on the rollout is unmeasured (its loop is capped,
+            # so it would not overshoot)
             enable_async_scheduling=False
         )
         rollout_loop_streaming = Loop(
@@ -627,7 +648,8 @@ class VJepa2Model(Model):
         from torchcodec.decoders import VideoDecoder
 
         target_frames = self.config.frames_per_clip
-        decoder = VideoDecoder(filepath, num_ffmpeg_threads=video_decode_threads())
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            decoder = VideoDecoder(filepath, num_ffmpeg_threads=video_decode_threads())
 
         metadata_obj = getattr(decoder, "metadata", None)
         total = None
@@ -686,21 +708,29 @@ class VJepa2Model(Model):
         (and optionally ``extrinsics``) through ``**kwargs``.
         """
         out: NameToTensorList = {}
+        rollout_horizon = self._rollout_horizon(kwargs)
+        mpc = _flag(kwargs, "mpc")
         rollout = self._initial_walk(kwargs) in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING)
+        num_tokens = None  # the encoder's output tokens, which the predictor masks index
 
         if tensors and "video_inputs" in tensors and len(tensors["video_inputs"]) > 0:
             meta = ((kwargs.get("input_metadata") or {}).get("video_inputs") or [{}])[0]
             sampled = meta.get("sampled_indices")
             if sampled is None:
                 raise ValueError("V-JEPA 2 decodes the frames its load_video sampled; this video has no such metadata")
-            # Per-request override of the frame budget (e.g. to experiment
-            # with longer clips on larger GPUs); defaults to the model's
-            # pretraining frames_per_clip. Clamped to whatever frames were
-            # sampled (fewer than frames_per_clip if the source video was
-            # short — e.g. AC rollout requests with the F-8 /
-            # droid-256px-8f workload ship 8-frame clips).
-            target_frames = int(kwargs.get("num_frames", self.config.frames_per_clip))
-            target_frames = min(target_frames, len(sampled))
+            # Per-request frame budget, at most what load_video sampled
+            # (frames_per_clip, or fewer for a short clip such as the 8-frame
+            # AC rollout workload). Absent, it is all of them.
+            available = len(sampled)
+            target_frames = kwargs.get("num_frames")
+            if target_frames is None:
+                target_frames = available
+            elif isinstance(target_frames, bool) or not isinstance(target_frames, int) \
+                    or not 1 <= target_frames <= available:
+                raise ValueError(
+                    f"num_frames must be an integer in [1, {available}] (the frames sampled from "
+                    f"this video, at most frames_per_clip={self.config.frames_per_clip}); got {target_frames!r}"
+                )
             keep = _sample_frames_uniform(torch.arange(len(sampled)), target_frames).tolist()
             if self.config.predictor_kind == "ac" and rollout:
                 # AC rollout encoder context: AC_ROLLOUT_NUM_FRAMES frames, as
@@ -718,6 +748,8 @@ class VJepa2Model(Model):
                 tensors["video_inputs"][0], [sampled[i] for i in keep], transform=self._preprocess_frames,
             )
             out["video_frames"] = [processed]
+            tubelet = self.config.tubelet_size
+            num_tokens = max(len(keep), tubelet) // tubelet * self.config.grid_size ** 2
             # the encoder reads ``video_frames``; don't ship the raw input
             out["video_inputs"] = []
 
@@ -726,8 +758,8 @@ class VJepa2Model(Model):
             states = kwargs.get("states")
             if actions is None or states is None:
                 raise ValueError("V-JEPA 2-AC requires 'actions' and 'states' kwargs (per-timestep tensors).")
-            out["actions"] = [torch.as_tensor(actions, dtype=torch.float32)]
-            out["states"] = [torch.as_tensor(states, dtype=torch.float32)]
+            out["actions"] = [_as_tensor(kwargs, "actions", torch.float32)]
+            out["states"] = [_as_tensor(kwargs, "states", torch.float32)]
             logger.info(
                 "process_prompt: AC actions shape=%s states shape=%s",
                 tuple(out["actions"][0].shape),
@@ -737,13 +769,12 @@ class VJepa2Model(Model):
                 extrinsics = kwargs.get("extrinsics")
                 if extrinsics is None:
                     raise ValueError("use_extrinsics=True but no 'extrinsics' kwarg provided.")
-                out["extrinsics"] = [torch.as_tensor(extrinsics, dtype=torch.float32)]
+                out["extrinsics"] = [_as_tensor(kwargs, "extrinsics", torch.float32)]
 
             # AC rollout needs T_total >= T_ctx + H - 1.  Fail fast
             # in process_prompt so the client gets a clear error before any
             # forward pass runs.  Sliced per-iter inside the rollout submodule
             # (see ``VJepa2ACRolloutPredictorSubmodule._rollout_step``).
-            rollout_horizon = int(kwargs.get("rollout_horizon", 0) or 0)
             if rollout_horizon > 1:
                 t_ctx = 1
                 required = t_ctx + rollout_horizon - 1
@@ -772,7 +803,7 @@ class VJepa2Model(Model):
             #     field, so the request would 400 before reaching this
             #     handler.  A scalar serializes to <20 bytes and hits the
             #     same scorer math end-to-end.
-            if kwargs.get("mpc"):
+            if mpc:
                 goal_hidden = kwargs.get("goal_hidden")
                 if goal_hidden is None:
                     fill = kwargs.get("goal_hidden_fill")
@@ -783,6 +814,8 @@ class VJepa2Model(Model):
                             "prefill_video_encoder_only call) or "
                             "'goal_hidden_fill' (scalar, for smoke-test only)."
                         )
+                    if isinstance(fill, bool) or not isinstance(fill, (int, float)):
+                        raise ValueError(f"goal_hidden_fill must be a number; got {fill!r}")
                     n_tokens = self.config.grid_depth * self.config.grid_size * self.config.grid_size
                     d = self.config.hidden_size
                     out["goal_hidden"] = [
@@ -794,19 +827,30 @@ class VJepa2Model(Model):
                         tuple(out["goal_hidden"][0].shape),
                     )
                 else:
-                    out["goal_hidden"] = [torch.as_tensor(goal_hidden, dtype=torch.float32)]
+                    out["goal_hidden"] = [_as_tensor(kwargs, "goal_hidden", torch.float32)]
                     logger.info(
                         "process_prompt: MPC goal_hidden shape=%s",
                         tuple(out["goal_hidden"][0].shape),
                     )
 
-        # Optional user-supplied masks (masked predictor only). the submodule
-        # builds full-coverage defaults if notpreent.
+        # Optional user-supplied masks (masked predictor only), both or neither:
+        # without them the submodule builds full-coverage defaults.
         if self.config.predictor_kind != "ac":
-            for mask_name in ("context_mask", "target_mask"):
-                m = kwargs.get(mask_name)
-                if m is not None:
-                    out[mask_name] = [torch.as_tensor(m, dtype=torch.long)]
+            given = [name for name in ("context_mask", "target_mask") if kwargs.get(name) is not None]
+            if len(given) == 1:
+                raise ValueError(f"V-JEPA 2 takes context_mask and target_mask together; got only {given[0]}")
+            for mask_name in given:
+                try:
+                    m = torch.as_tensor(kwargs[mask_name])
+                except (TypeError, ValueError, RuntimeError):
+                    m = torch.empty(0)  # refused below with the rest
+                if m.dtype.is_floating_point or m.dtype.is_complex or m.dtype == torch.bool or m.numel() == 0 \
+                        or m.ndim > 2 or m.ndim == 2 and m.shape[0] != 1 or m.min() < 0 \
+                        or num_tokens is not None and m.max() >= num_tokens:
+                    raise ValueError(
+                        f"V-JEPA 2 {mask_name} must be one row of token indices in [0, {num_tokens}), the clip's tokens"
+                    )
+                out[mask_name] = [m.long()]
 
         kv_layout = {}
         if self.config.predictor_kind == "ac":
@@ -816,7 +860,8 @@ class VJepa2Model(Model):
         return ProcessPromptOutput(out, {"kv_layout": kv_layout})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {self.ROLLOUT_LOOP_NAME: self._rollout_horizon(model_kwargs)}
+        # a loop runs at least once
+        return {self.ROLLOUT_LOOP_NAME: max(1, self._rollout_horizon(model_kwargs))}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         if self.config.predictor_kind != "ac":
@@ -826,9 +871,8 @@ class VJepa2Model(Model):
             (self.PREFILL_VIDEO_ROLLOUT_STREAMING, self.ROLLOUT_LOOP_NAME),
         ))}}
 
-    def _rollout_horizon(self, model_kwargs: dict) -> int:
-        requested = int(model_kwargs.get("rollout_horizon", 2) or 2)
-        return max(1, min(requested, self.config.max_rollout_horizon))
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         if modality == "video":
@@ -850,13 +894,26 @@ class VJepa2Model(Model):
     # Model ABC: forward pass orchestration
     # ------------------------------------------------------------------
 
+    def _rollout_horizon(self, model_kwargs: dict | None) -> int:
+        """The request's ``rollout_horizon``: 0 (absent) or 1 is a single pass."""
+        horizon = (model_kwargs or {}).get("rollout_horizon")
+        if horizon is None:
+            return 0
+        # past the rollout loop's max_iters, the conductor refuses it (get_loop_caps)
+        if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 0:
+            raise ValueError(f"rollout_horizon must be an integer >= 0; got {horizon!r}")
+        return horizon
+
     def _initial_walk(self, model_kwargs: dict | None) -> str:
-        if model_kwargs and model_kwargs.get("skip_predictor"):
+        horizon = self._rollout_horizon(model_kwargs)
+        stream = _flag(model_kwargs, "stream_rollout")
+        mpc = _flag(model_kwargs, "mpc")
+        if _flag(model_kwargs, "skip_predictor"):
             return self.PREFILL_VIDEO_ENCODER_ONLY
         # MPC walk (AC only).  Requested via ``mpc=True`` with
         # K-way actions/states and a pre-encoded ``goal_hidden``.  Checked
         # before rollout because AC deployments never hit the rollout walk.
-        if model_kwargs and model_kwargs.get("mpc") and self.config.predictor_kind == "ac":
+        if mpc and self.config.predictor_kind == "ac":
             return self.PREFILL_VIDEO_MPC
         # Rollout walk: triggered by ``rollout_horizon > 1``.  H == 1 is
         # equivalent to a single-pass prefill — save a loop's worth of
@@ -864,115 +921,30 @@ class VJepa2Model(Model):
         # Available for both masked and AC (sliding-window).
         # Streaming: opt into per-iter client emit via ``stream_rollout=True``;
         # default stays batched so existing clients don't break.
-        if model_kwargs:
-            horizon = int(model_kwargs.get("rollout_horizon", 0) or 0)
-            if horizon > 1:
-                if model_kwargs.get("stream_rollout"):
-                    return self.PREFILL_VIDEO_ROLLOUT_STREAMING
-                return self.PREFILL_VIDEO_ROLLOUT
+        if horizon > 1:
+            return self.PREFILL_VIDEO_ROLLOUT_STREAMING if stream else self.PREFILL_VIDEO_ROLLOUT
         return self.PREFILL_VIDEO
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        walk = self._initial_walk(model_kwargs)
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=walk,
-            is_prefill=True,
-            kwargs=(model_kwargs or {}),
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """One walk, chosen by ``_initial_walk``.
 
-        inputs: list[GraphEdge] = []
-        if "video_frames" in input_signals:
-            edge = GraphEdge(next_node="video_encoder", name="video_frames")
-            edge.tensor_info = input_signals["video_frames"]
-            inputs.append(edge)
-
-        if walk == self.PREFILL_VIDEO:
-            for name in ("actions", "states", "extrinsics"):
-                if name in input_signals:
-                    edge = GraphEdge(next_node="predictor", name=name)
-                    edge.tensor_info = input_signals[name]
-                    inputs.append(edge)
-            # Optional masks (masked predictor): When absent, the submodule
-            # builds full-coverage defaults
-            for name in ("context_mask", "target_mask"):
-                edge = GraphEdge(next_node="predictor", name=name)
-                edge.tensor_info = input_signals.get(name, [])
-                inputs.append(edge)
-
-        if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING) \
-                and self.config.predictor_kind == "ac":
-            # AC rollout: route per-timestep actions/states (and optional
-            # extrinsics) to the rollout node.  The submodule identity-
-            # loop-backs them across iters and slices per-iter based on
-            # dynamic_loop_iter_counts["rollout_loop"].  Streaming variant
-            # routes identically — the only downstream difference is the
-            # section's EMIT_TO_CLIENT edge.
-            for name in ("actions", "states", "extrinsics"):
-                if name in input_signals:
-                    edge = GraphEdge(next_node="rollout_predictor", name=name)
-                    edge.tensor_info = input_signals[name]
-                    inputs.append(edge)
-
-        if walk == self.PREFILL_VIDEO_MPC:
-            # actions / states / extrinsics go to the MPC predictor node.
-            for name in ("actions", "states", "extrinsics"):
-                if name in input_signals:
-                    edge = GraphEdge(next_node="ac_predictor_mpc", name=name)
-                    edge.tensor_info = input_signals[name]
-                    inputs.append(edge)
-            # goal_hidden goes directly to the scorer (skips the predictor
-            # entirely — scorer compares predicted vs goal outside the AC
-            # predictor's forward).
-            if "goal_hidden" in input_signals:
-                edge = GraphEdge(next_node="mpc_scorer", name="goal_hidden")
-                edge.tensor_info = input_signals["goal_hidden"]
-                inputs.append(edge)
-
-        step_metadata: dict = {"is_prefill": True}
-        if input_signals.get("video_frames"):
-            # The encoder's capture bucket is chosen before its inputs exist
-            # (VJepa2EncoderSubmodule.cg_key_info), so the clip shape rides here.
-            step_metadata["video_shape"] = tuple(int(d) for d in input_signals["video_frames"][0].dims)
-        if walk in (self.PREFILL_VIDEO_ROLLOUT, self.PREFILL_VIDEO_ROLLOUT_STREAMING):
-            # Per-request horizon enforced by ``VJepa2RolloutPredictorSubmodule``
-            # via ``check_stop`` once iter_idx + 1 reaches it.  The
-            # graph's Loop is always built with ``max_iters=config.max_rollout_horizon``.
-            # Streaming variant uses the same horizon logic — the submodule
-            # doesn't distinguish walks.
-            step_metadata["rollout_horizon"] = self._rollout_horizon(model_kwargs or {})
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=step_metadata,
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        # Single-walk Phase-1 flow: after prefill_video (or its encoder-only
-        # variant), the request is done.
-        return ForwardPassArgs(
-            full_metadata=partition_metadata,
-            inputs=[],
-            unpersist_tensors=[],
-            request_done=True,
-        )
+        Every walk starts at the encoder, so a request without frames could
+        never finish; ``process_prompt`` emits the AC inputs (``actions``,
+        ``states``, ``extrinsics``, ``goal_hidden``) or refuses the request.
+        """
+        if not input_signals.get("video_frames"):
+            raise ValueError("V-JEPA 2 requires a video (video_frames)")
+        # The encoder's capture bucket is chosen before its inputs exist
+        # (VJepa2EncoderSubmodule.cg_key_info), so the clip shape rides here.
+        shape = tuple(int(d) for d in input_signals["video_frames"][0].dims)
+        return [WalkStep(self._initial_walk(model_kwargs), step_metadata={"video_shape": shape})]
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading

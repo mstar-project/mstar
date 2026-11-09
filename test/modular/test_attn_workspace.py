@@ -428,6 +428,7 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
     class _Runner:
         any_graphs = False
         dropped_buckets = ()
+        recompile_limit = None
 
         def __init__(self, **kwargs):
             pass
@@ -449,7 +450,7 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
     monkeypatch.setattr(engine, "_compile_regions", lambda: None, raising=False)
     monkeypatch.setattr(engine, "_build_piecewise_runners", lambda *args: {}, raising=False)
     monkeypatch.setattr(engine, "_plan_captures", lambda *args: events.append("size"), raising=False)
-    monkeypatch.setattr(engine, "_compile_submodules", lambda: None, raising=False)
+    monkeypatch.setattr(engine, "_compile_submodules", lambda limits: None, raising=False)
     engine.warmup()
     assert events == ["prepare", "size", "seal", "capture"]
 

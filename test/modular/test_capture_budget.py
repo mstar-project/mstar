@@ -78,7 +78,8 @@ class _StubMeasuredRunner:
         self._capture_costs = {}
         self._lent = set()
         self._executables = {}
-        self._comm_group = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        trivial = CommGroup.trivial()
+        self._comm_group = JointGroups(tp_group=trivial, sp_group=trivial, instance=trivial)
         self.warmed: list[tuple[BucketKey, int]] = []
         self.forwards: list[int] = []
 
@@ -236,7 +237,7 @@ def test_a_tp_group_sizes_its_buckets_again_together(measured, wanted, peer_want
         _bucket("decode", bs, bs): CaptureCost(bs * _MIB, 2 * bs * _MIB, 0, 2) for bs in (16, 8, 4, 2)
     }
     runner = _StubMeasuredRunner(torch.device("cpu"), walk)
-    runner._comm_group.tp_group = _PeerGroup([peer_wanted])
+    runner._comm_group.instance = _PeerGroup([peer_wanted])
     runner.size_captures()
 
     costs = _sized(runner.size_lent_captures(wanted))
@@ -440,6 +441,7 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
 
 
 @requires_cuda
+@pytest.mark.gpu_exclusive
 def test_graphs_take_no_more_executable_memory_than_sizing_counts():
     """A graph's executable memory is outside the allocator, so no pool shows
     it. On Qwen3-Omni, 162 graphs held 724 MiB beyond their pools, and capture
@@ -791,7 +793,8 @@ class _StubPlannedRunner:
         self._resident = None
         self._num_slots = 1
         self._buckets = {}
-        self._comm_group = JointGroups(tp_group=_PeerGroup(peer), sp_group=CommGroup.trivial())
+        peer_group = _PeerGroup(peer)
+        self._comm_group = JointGroups(tp_group=peer_group, sp_group=CommGroup.trivial(), instance=peer_group)
         self._dummy_rows = SimpleNamespace(release_all=lambda: None)
         self._graph_backend = SimpleNamespace(
             is_available=lambda: True, graph_pool_handle=lambda: AcceleratorGraphPool(object()),
@@ -799,8 +802,13 @@ class _StubPlannedRunner:
         )
         self._blocked_buckets = []
         self._executables = {}
+        self._twins = {}
+        self._resources = {"sampler": SimpleNamespace(lean_capture=True), "lora": SimpleNamespace(lean_capture=True)}
+        self.dropped_buckets = []
         self.tried: list[BucketKey] = []
         self.forwards: list[int] = []
+        # buckets whose capture raises
+        self.failing: set[BucketKey] = set()
 
     def prepare_for_capture(self):
         return self._specs
@@ -808,6 +816,8 @@ class _StubPlannedRunner:
     def _capture_one(self, spec, forwards):
         self.tried.append(spec.bucket)
         self.forwards.append(forwards)
+        if spec.bucket in self.failing:
+            raise RuntimeError("out of memory")
         return spec.bucket
 
     _get_addtl_slot_specs = staticmethod(lambda spec: [])
@@ -888,3 +898,103 @@ def test_a_runner_with_no_graphs_keeps_its_largest_bucket_as_its_batch_cap():
     cap = engine.get_max_batch_size("Code2Wav", "code2wav_chunk")
 
     assert cap == 32, "a batch past the largest bucket is an eager step the floor never measured"
+
+
+# ---- lean twins ----
+
+def _twin(bucket: BucketKey, *lean: str) -> BucketKey:
+    return BucketKey(bucket.graph_walk, bucket.bs, bucket.num_tokens, bucket.cg_key_info, frozenset(lean))
+
+
+_DECODE8 = _bucket("thinker_decode", 8, 8)
+
+
+def test_a_twin_never_takes_a_plain_buckets_room():
+    """On a tight card the greedy twins, cheaper than the widest plain bucket, used to
+    take its room, and a deployment requiring graphs failed to boot."""
+    twin = _twin(_DECODE8, "sampler")
+    pools = {"LLM": {_DECODE: _cost(100, kept=100), _DECODE8: _cost(100, kept=100), twin: _cost(60, kept=60)}}
+
+    plan = plan_captures(pools, free=200 * _MIB)
+
+    assert plan.buckets == {"LLM": {_DECODE, _DECODE8}}, "every plain bucket must be planned before any twin"
+    assert plan_captures(pools, free=260 * _MIB).buckets == {"LLM": {_DECODE, _DECODE8, twin}}
+
+
+def test_a_twin_is_planned_only_beside_its_plain_bucket():
+    """Its steps are its plain bucket's: without that one they run eagerly, and the twin
+    would never be leased."""
+    twin = _twin(_DECODE, "sampler")
+    pools = {"LLM": {_DECODE: _cost(300, kept=300), twin: _cost(10, kept=10)}}
+
+    assert plan_captures(pools, free=100 * _MIB).buckets == {"LLM": set()}
+
+
+def test_the_costliest_twins_are_the_first_left_out():
+    """Twins go in cheapest first, as plain buckets do; at equal cost the tie goes to
+    capture order, which lists the widest first."""
+    twins = {_twin(_DECODE8, "sampler"): _cost(30, kept=30), _twin(_DECODE, "sampler"): _cost(60, kept=60)}
+    pools = {"LLM": {_DECODE: _cost(10, kept=10), _DECODE8: _cost(10, kept=10), **twins}}
+
+    plan = plan_captures(pools, free=(20 + 50) * _MIB)
+
+    assert plan.buckets == {"LLM": {_DECODE, _DECODE8, _twin(_DECODE8, "sampler")}}
+    tied = {"LLM": {_DECODE: _cost(10, kept=10), _DECODE8: _cost(10, kept=10),
+                    _twin(_DECODE, "sampler"): _cost(30, kept=30), _twin(_DECODE8, "sampler"): _cost(30, kept=30)}}
+    assert plan_captures(tied, free=(20 + 30) * _MIB).buckets == {"LLM": {_DECODE, _DECODE8, _twin(_DECODE, "sampler")}}
+
+
+def test_a_region_captured_lean_alone_plans_as_a_plain_bucket():
+    """A one-row region's bucket names the LoRA pool lean, with no plain twin beside it."""
+    region = ("vision", BucketKey("__piecewise__", 1, 64, "vision", frozenset({"lora"})))
+
+    assert plan_captures({"N piecewise": {region: _cost(10)}}, free=100 * _MIB).buckets == {"N piecewise": {region}}
+
+
+def test_a_runner_captures_every_plain_bucket_before_any_twin():
+    twin = _twin(_PREFILL, "sampler")
+    runner = _StubPlannedRunner([_DECODE, twin, _PREFILL], peer=[True, True, True])
+    runner._capture_costs = {_DECODE: _cost(100), _PREFILL: _cost(900), twin: _cost(800)}
+
+    runner.warmup_and_capture({_DECODE, _PREFILL, twin})
+
+    assert runner.tried == [_PREFILL, _DECODE, twin], "a twin must not take memory a plain bucket would capture into"
+
+
+def test_a_twin_is_kept_only_while_every_rank_keeps_its_plain_bucket(caplog):
+    """The peer left the plain bucket out, so its steps run eagerly on both ranks: a
+    twin captured here alone would be leased here alone."""
+    twin = _twin(_DECODE, "sampler")
+    runner = _StubPlannedRunner([_DECODE, twin], peer=[False, True])
+
+    with caplog.at_level("INFO"):
+        runner.warmup_and_capture({_DECODE, twin})
+
+    assert runner.tried == [] and runner._buckets == {}, "the twin must not be planned without its plain bucket"
+    assert runner.dropped_buckets == [_DECODE], "the plain bucket runs eagerly, and says so"
+    assert "lean twin" not in caplog.text, "its steps don't replay a plain bucket: the plain one's error covers them"
+
+
+@pytest.mark.parametrize("fewer", [False, True], ids=["plain", "fewer_lean"])
+def test_a_twin_left_out_is_not_a_dropped_bucket(caplog, monkeypatch, fewer):
+    from mstar.engine.accelerator_graph_runner import fail_if_graphs_required
+
+    both, sampler = _twin(_DECODE, "sampler", "lora"), _twin(_DECODE, "sampler")
+    buckets = [_DECODE, both, sampler] if fewer else [_DECODE, both]
+    runner = _StubPlannedRunner(buckets, peer=[True] * len(buckets))
+    runner.failing = {both}
+
+    with caplog.at_level("INFO"):
+        runner.warmup_and_capture(set(buckets))
+
+    assert runner.dropped_buckets == [], "a twin's steps replay another bucket, not eagerly"
+    monkeypatch.setenv("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "1")
+    fail_if_graphs_required([str(key) for key in runner.dropped_buckets])
+    serving = f"the lean twin {sampler}" if fewer else "the plain bucket"
+    line = f"lean twin {both} not captured; its steps replay {serving}"
+    assert [(r.levelname, r.getMessage()) for r in caplog.records if "lean twin" in r.getMessage()] == [
+        ("INFO", f"AcceleratorGraphRunner[Thinker]: {line}"),
+    ]
+    assert "these run eagerly" not in caplog.text
+    assert both not in runner._buckets and _DECODE in runner._buckets
+    assert runner._twins == ({_DECODE: {sampler.lean: sampler}} if fewer else {})

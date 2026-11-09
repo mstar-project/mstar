@@ -14,7 +14,7 @@ from mstar.testing_utils._overrides import stub_with
 
 class StubModel(Model):
     """Declares no resources or walks, and its nodes run in dummy mode. A request
-    has no empty answer for how it starts or moves on, so those methods raise."""
+    has no neutral plan or prompt, so those methods raise."""
 
     def get_node_resources(self):
         return []
@@ -25,11 +25,8 @@ class StubModel(Model):
     def get_submodule(self, *args, **kwargs):
         return None
 
-    def get_initial_forward_pass_args(self, *args, **kwargs):
-        raise NotImplementedError(f"{type(self).__name__} does not define get_initial_forward_pass_args")
-
-    def get_partition_forward_pass_args(self, *args, **kwargs):
-        raise NotImplementedError(f"{type(self).__name__} does not define get_partition_forward_pass_args")
+    def walk_plan(self, *args, **kwargs):
+        raise NotImplementedError(f"{type(self).__name__} does not define walk_plan")
 
     def process_prompt(self, *args, **kwargs):
         raise NotImplementedError(f"{type(self).__name__} does not define process_prompt")
