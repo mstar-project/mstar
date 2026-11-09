@@ -85,3 +85,18 @@ def test_idle_hold_from_the_config_and_the_environment(monkeypatch):
 def test_a_bad_idle_hold_fails_the_startup_check(value):
     with pytest.raises(ValueError, match="idle_hold"):
         knobs.check({"idle_hold": value})
+
+
+def test_step_threads_from_the_config_and_the_environment(monkeypatch):
+    assert knobs.step_threads() == "threaded"
+    knobs.configure({"step_threads": "serial"})
+    assert knobs.step_threads() == "serial"
+    monkeypatch.setenv("MSTAR_STEP_THREADS", "threaded")
+    assert knobs.step_threads() == "threaded"
+
+
+@pytest.mark.parametrize("value", ["inline", True, 1])
+def test_a_bad_step_threads_fails_the_startup_check(value):
+    with pytest.raises(ValueError, match="step_threads"):
+        knobs.check({"step_threads": value})
+

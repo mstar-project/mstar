@@ -618,8 +618,8 @@ def test_the_api_server_and_its_workers_read_the_idle_hold(api_plan, monkeypatch
     assert plan.pinned == frozenset() and plan.declined and "idle_hold qos" in plan.why
     assert cpus._gpu_locks == {}, "a plan that pins nothing takes no lock"
     worker = _bare_worker("worker_0", "cuda:0")
-    worker._plan_step_cpus(["worker_0"], ["cuda:0"])
-    assert worker._step_cpus is None
+    step, _ = worker._plan_step_cpus(["worker_0"], ["cuda:0"])
+    assert step is None
 
 
 def test_the_vendor_is_the_first_processors(tmp_path):
@@ -829,8 +829,8 @@ def test_the_api_server_and_the_conductors_workers_build_one_plan(
     assert all(api.result not in step.cpus for step in api.workers)
     for kw, step in zip(spawned, api.workers, strict=True):
         worker = _bare_worker(kw["worker_id"], kw["device"])
-        worker._plan_step_cpus(kw["worker_ids"], kw["local_worker_devices"])
-        assert cpus.plan() == api and worker._step_cpus == step
+        planned, _ = worker._plan_step_cpus(kw["worker_ids"], kw["local_worker_devices"])
+        assert cpus.plan() == api and planned == step
     cpus.install(None)
     entrypoint.knobs.configure(None)
 
@@ -987,15 +987,15 @@ def test_the_first_server_pins_and_the_second_pins_nothing_with_a_warning(other_
     assert second.left == 64
     # its workers read the knob, so they pin nothing either
     worker = _bare_worker("worker_0", "cuda:0")
-    worker._plan_step_cpus(["worker_0"], ["cuda:0"])
-    assert worker._step_cpus is None and cpus.plan().pinned == frozenset()
+    step, _ = worker._plan_step_cpus(["worker_0"], ["cuda:0"])
+    assert step is None and cpus.plan().pinned == frozenset()
 
     other.communicate("")
     os.environ["MSTAR_STEP_THREAD_CORE"] = "always"
     first = api_plan()
     assert first.pinned == {41, 42, 43, 60} and A in cpus._gpu_locks
-    worker._plan_step_cpus(["worker_0"], ["cuda:0"])
-    assert worker._step_cpus.cpus == {41, 42, 43}
+    step, _ = worker._plan_step_cpus(["worker_0"], ["cuda:0"])
+    assert step.cpus == {41, 42, 43}
 
 
 def test_always_takes_the_lock_too(other_server, api_plan):
@@ -1225,8 +1225,8 @@ def test_the_api_server_takes_the_next_free_set_and_its_workers_follow(core_serv
     api = entrypoint.deployment_cpu_plan(config)
     assert api.workers[0].cpus == {35, 36, 37} and api.result == 38 and os.environ[cpus.CORE_SET_ENV] == "1"
     worker = _bare_worker("worker_0", "cuda:0")
-    worker._plan_step_cpus(["worker_0"], ["cuda:0"])
-    assert cpus.plan() == api and worker._step_cpus.cpus == {35, 36, 37}
+    step, _ = worker._plan_step_cpus(["worker_0"], ["cuda:0"])
+    assert cpus.plan() == api and step.cpus == {35, 36, 37}
     from api_server_helpers import make_test_api_server
 
     cpus.install(api)
@@ -1281,8 +1281,8 @@ def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
     monkeypatch.delenv(cpus.CORE_SET_ENV, raising=False)
     w = _bare_worker()
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
-        w._plan_step_cpus(["worker_0", "worker_1", "worker_2"], ["cuda:0", "cuda:1", "cuda:2"])
-    assert w._step_cpus.cpus == {3, 4, 5} and w._process_cpus == HOST
+        step, process_cpus = w._plan_step_cpus(["worker_0", "worker_1", "worker_2"], ["cuda:0", "cuda:1", "cuda:2"])
+    assert step.cpus == {3, 4, 5} and process_cpus == HOST
     # three workers' three CPUs and the API server's CPU leave 54 - 10 for the pools
     assert cpus.plan().result == 31 and cpus.plan().left == 54 - 10
     assert ("step threads (main, GPU, plan) on CPUs 3-5 (always: GPU 2 of 2 on its NUMA node, over its allowed "
@@ -1290,8 +1290,8 @@ def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
 
     # standalone (no conductor list): the only worker
     w = _bare_worker()
-    w._plan_step_cpus(["worker_1"], None)
-    assert w._step_cpus.cpus == {3, 4, 5}
+    step, _ = w._plan_step_cpus(["worker_1"], None)
+    assert step.cpus == {3, 4, 5}
 
     # a number the mask can't honour stops the worker
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "300")
@@ -1301,9 +1301,10 @@ def test_the_worker_takes_its_row_and_logs_it(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("MSTAR_STEP_THREAD_CORE", "off")
     w = _bare_worker()
     with caplog.at_level(logging.INFO, logger="mstar.worker.worker"):
-        w._plan_step_cpus(["worker_1"], None)
-    assert w._step_cpus is None and "step threads not pinned (step_thread_core off)" in caplog.text
-    w._pin_step_thread()  # a no-op
+        step, process_cpus = w._plan_step_cpus(["worker_1"], None)
+    assert step is None and "step threads not pinned (step_thread_core off)" in caplog.text
+    w.executor._step_cpus, w.executor._process_cpus = step, process_cpus
+    w.executor.pin_this_thread()  # a no-op
     cpus.install(None)
 
 
@@ -1549,9 +1550,10 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     then a speculated one the plan thread pre-plans. Each of the three threads
     reports its mask from inside its own work; a thread one of them starts
     afterwards for intra-op work keeps the process mask."""
+    import mstar.worker.step_pipeline as pipeline_mod
     import mstar.worker.worker as worker_mod
     from mstar.worker.micro_scheduler import ScheduledBatch
-    from mstar.worker.worker import Speculation
+    from mstar.worker.speculation import Speculation
 
     allowed, cpu = _two_cpus()
     step = frozenset({cpu, min(allowed)} if width == 2 else {cpu})
@@ -1603,7 +1605,7 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
         mask("plan", _confined_to(step, steps))
         return True
 
-    def build_speculation(pending, consecutive, fair):
+    def build_speculation(pending):
         iteration[0] += 1
         if iteration[0] != 2:
             return None, None
@@ -1620,8 +1622,6 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     w = make_worker(
         worker_id="worker_0",
         device=torch.device("cpu"),
-        _step_cpus=StepCpus(step, "test"),
-        _process_cpus=allowed,
         parallel_groups=SimpleNamespace(barrier_all=stub, restore_default_timeout=stub),
         engine_manager=SimpleNamespace(warmup_all=stub, get_engine=lambda node: None),
         communicator=SimpleNamespace(send=stub, wait_for_work=stub),
@@ -1629,23 +1629,26 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
         request_state=SimpleNamespace(get_partition_for_node=lambda node: "p"),
         scheduler=SimpleNamespace(next_batch=next_batch, note_ran=stub),
     )
+    w.executor._step_cpus, w.executor._process_cpus = StepCpus(step, "test"), allowed
     for name in ("_await_admit_settled", "_teardown", "_report_failures", "_fail_requests",
-                 "_set_in_flight_flag", "_clear_in_flight_flag",
-                 "_settle_speculation", "_drop_rows_whose_loop_stopped", "_handle_admit_failure",
-                 "_thread_outputs_to_speculative", "_postprocess_batch"):
-        setattr(w, name, stub)
+                 "_drop_rows_whose_loop_stopped", "_handle_admit_failure"):
+        setattr(w.pipeline, name, stub)
+    for name in ("_set_in_flight", "clear_in_flight", "postprocess"):
+        setattr(w.executor, name, stub)
+    for name in ("settle", "thread_outputs"):
+        setattr(w.speculator, name, stub)
     for name in ("process_messages", "check_ready_tensors", "poll_stream_buffers"):
         setattr(w.ingest, name, stub)
-    w._build_executing_batch = executing
-    w._build_speculation = build_speculation
-    w._plans_ahead = lambda spec: True
-    w._preplan_spec = preplan
-    w._execute_on_gpu_thread = gpu
+    monkeypatch.setattr(pipeline_mod, "build_executing_batch", lambda services, batch: executing(batch))
+    w.speculator.build = build_speculation
+    w.speculator.plans_ahead = lambda spec: True
+    w.executor._preplan_spec = preplan
+    w.executor._body = gpu
 
     def fail_loudly(error, *args):
         raise error
 
-    w._handle_main_loop_error = fail_loudly
+    w.pipeline._handle_error = fail_loudly
     errors = []
 
     def run():
@@ -1666,3 +1669,50 @@ def test_run_moves_the_main_gpu_and_plan_threads_to_their_cpus(monkeypatch, intr
     # no other thread of the process landed on a step CPU, the intra-op pool
     # the plan thread just used included (looked at while it was alive)
     assert seen["plan"][2] == []
+
+
+# ── step_threads: serial ────────────────────────────────────────────────────
+
+
+def _executor(monkeypatch, step_threads, seen):
+    """A StepExecutor with only what ``start`` reads, its thread initializer
+    recorded instead of run, and pre-plan on."""
+    from mstar.utils import knobs
+    from mstar.worker.step_executor import StepExecutor
+
+    knobs.configure({"step_threads": step_threads} if step_threads else None)
+    monkeypatch.setattr(StepExecutor, "_init_engine_thread", lambda self: seen.append(threading.get_ident()))
+    monkeypatch.setattr(knobs, "pre_plan_enabled", lambda: True)
+    executor = StepExecutor.__new__(StepExecutor)
+    executor.worker_id = "w"
+    executor._gpu_pool = executor._plan_pool = None
+    executor.start()
+    return executor
+
+
+def test_serial_steps_run_on_the_caller_and_hand_back_a_finished_future(monkeypatch):
+    from mstar.utils import knobs
+
+    seen: list[int] = []
+    executor = _executor(monkeypatch, "serial", seen)
+    # both "threads" initialized, on the caller
+    assert seen == [threading.get_ident()] * 2
+    for pool in (executor._gpu_pool, executor._plan_pool):
+        done = pool.submit(threading.get_ident)
+        assert done.done() and done.result() == threading.get_ident()
+        called = []
+        done.add_done_callback(called.append)
+        assert called == [done]
+        failed = pool.submit(lambda: 1 / 0)
+        assert isinstance(failed.exception(timeout=0), ZeroDivisionError)
+    knobs.configure(None)
+
+
+def test_threaded_steps_keep_real_pools(monkeypatch):
+    seen: list[int] = []
+    executor = _executor(monkeypatch, None, seen)
+    for pool in (executor._gpu_pool, executor._plan_pool):
+        assert pool.submit(threading.get_ident).result() != threading.get_ident()
+        pool.shutdown()
+    # each pool's initializer ran on its own thread
+    assert len(seen) == 2 and threading.get_ident() not in seen

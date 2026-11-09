@@ -114,17 +114,6 @@ if [ -f "$CACHE_TAR" ]; then
 fi
 
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-# torchaudio has no 2.12 release, so a plain resolve pairs torch 2.12 with torchaudio 2.11 and libtorchaudio
-# can't load: `mstar serve` exits on every fresh box. Pin one matching family (run on an H200, 2026-11-08) until
-# torchaudio catches up, then delete this.
-mkdir -p "$WORKDIR"
-cat > "$WORKDIR/constraints.txt" <<'PINS'
-torch==2.11.0
-torchvision==0.26.0
-torchaudio==2.11.0
-torchcodec==0.11.1
-PINS
-export UV_CONSTRAINT=$WORKDIR/constraints.txt
 command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 
 checkout() {  # checkout <dir> <ref> <refspec>
@@ -140,17 +129,7 @@ build_arm() {  # build_arm <dir>
     cd "$dir"
     [ -d .venv ] || uv venv -q --python 3.12 --seed
     source .venv/bin/activate
-    # The pins lose only to an arm that moves torch or torchcodec past them: uv can't resolve that, so the arm
-    # installs as it asks and says so. A PR that merely widens the range still resolves to the pinned family.
-    # Any other failure (a network error, say) stops here, so a transient one can't put the arms on different torches.
-    rc=0
-    out=$(uv pip install -q --torch-backend=auto -e ".[all]" maturin 2>&1) || rc=$?
-    [ -z "$out" ] || printf '%s\n' "$out" >&2
-    if [ "$rc" != 0 ]; then
-      grep -qE 'No solution found|unsatisfiable' <<<"$out" || exit "$rc"
-      echo "bootstrap.sh: $dir doesn't resolve with the pinned torch family ($UV_CONSTRAINT); installing it without the pins, so this arm is not on that family: check that its torch and torchaudio match" >&2
-      env -u UV_CONSTRAINT uv pip install -q --torch-backend=auto -e ".[all]" maturin
-    fi
+    uv pip install -q --torch-backend=auto -e ".[all]" maturin
     maturin develop -q --release -m rust/Cargo.toml
     # mstar-server, for rows served with --rust-frontend
     [ ! -d rust/server ] || (cd rust/server && cargo build --release -q)
