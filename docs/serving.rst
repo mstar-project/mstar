@@ -491,34 +491,34 @@ dropped if it can be rebuilt from its token ids. The request that ran short gets
 to its shortage. When the newer requests can't cover it, it moves to the host if the host pool can
 hold all of its pages, and otherwise waits holding its pages. A request on the host, a dropped one
 and one waiting for pages wait outside the queue, so a new prompt that fits still starts, unless one
-of them is the oldest request in its pool, which no newer prompt passes. They are tried oldest
-first, before the queue. The oldest refused request that moves can let in moves newer requests that
-wait holding pages, to the host or by a drop as above. A request on the host returns once its pages
-and one more page fit, or every page its grant needed when it moved itself, and its pages are then
-copied back. A dropped request returns once its prompt, or its history and one more page if that is
-larger, fits, counting no prompt page another request holds, then recomputes its KV in prefill
-chunks cut by its walk's chunk budget, and isn't dropped again until it writes a token past that. A
-request that streams an output in ``unpausable_outputs`` reserves its whole footprint in every pool,
-with every cache hit counted, and is never dropped or moved to the host. Voice requests then queue
-when the pool is short and are never preempted mid-stream. A request with images, video or audio can
-be dropped at one rank when its node's rebuild policy names the walks its prompt runs in: the worker
-keeps a host copy of what each prefill step read, the encoder's output included, and rebuilds the
-request by running those steps again in order: a Qwen3.5 chat with images or a video, a Bagel image
-chat, a Qwen3-Omni request with audio or images in and text out, or a Higgs Audio transcription. A
-Qwen3-Omni request with video in and text out and a Bagel think-mode edit with no guidance key only
-part of their prompt, which a rebuild can't key again, so they are rebuilt only with the prefix
-cache off for the request or the server. A request no drop can free, because it holds KV made from
-another node's outputs or from media it keeps no copies of, or a node that keeps no token ids writes
-its KV, moves only to the host: when it is admitted the host pool sets room aside for its prompt,
-and it reserves only its prompt. The room grows with each page the request takes after that, so its
-move always fits. Bagel generations, which write a label per guidance, and requests with media above
-one rank are such requests. When the host pool has no room for it at admission, or later once the
-device has room for the rest of its footprint, the request reserves its whole footprint in that
-pool, as a voice request does, and the host pool logs it. While the device has no room for that
-either, nothing is logged: newer requests move for it as for any request that runs short, and
-otherwise it moves to the host, into the room set aside for it, and returns once its whole footprint
-fits. So ``cpu_offload_pages`` also sets how many pages such requests can hold with only their
-prompt reserved.
+of them is the oldest request in its pool, which no newer prompt passes unless its room is already
+allotted. They are tried oldest first, before the queue. The oldest refused request that moves can
+let in moves newer requests that wait holding pages, to the host or by a drop as above. A request on
+the host returns once its pages and one more page fit, or every page its grant needed when it moved
+itself, and its pages are then copied back. A dropped request returns once its prompt, or its
+history and one more page if that is larger, fits, counting no prompt page another request holds,
+then recomputes its KV in prefill chunks cut by its walk's chunk budget, and isn't dropped again
+until it writes a token past that. A request that streams an output in ``unpausable_outputs``
+reserves its whole footprint in every pool, with every cache hit counted, and is never dropped or
+moved to the host. Voice requests then queue when the pool is short and are never preempted
+mid-stream. A request with images, video or audio can be dropped at one rank when its node's rebuild
+policy names the walks its prompt runs in: the worker keeps a host copy of what each prefill step
+read, the encoder's output included, and rebuilds the request by running those steps again in order:
+a Qwen3.5 chat with images or a video, a Bagel image chat, a Qwen3-Omni request with audio or images
+in and text out, or a Higgs Audio transcription. A Qwen3-Omni request with video in and text out and
+a Bagel think-mode edit with no guidance key only part of their prompt, which a rebuild can't key
+again, so they are rebuilt only with the prefix cache off for the request or the server. A request
+no drop can free, because it holds KV made from another node's outputs or from media it keeps no
+copies of, or a node that keeps no token ids writes its KV, moves only to the host: when it is
+admitted the host pool sets room aside for its prompt, and it reserves only its prompt. The room
+grows with each page the request takes after that, so its move always fits. Bagel generations, which
+write a label per guidance, and requests with media above one rank are such requests. When the host
+pool has no room for it at admission, or later once the device has room for the rest of its
+footprint, the request reserves its whole footprint in that pool, as a voice request does, and the
+host pool logs it. While the device has no room for that either, nothing is logged: newer requests
+move for it as for any request that runs short, and otherwise it moves to the host, into the room
+set aside for it, and returns once its whole footprint fits. So ``cpu_offload_pages`` also sets how
+many pages such requests can hold with only their prompt reserved.
 
 Above one rank, and on a node with a second paged KV cache, such as Whisper's decoder, a decode
 step that finds no page and nothing to offload holds its requests until they time out. Elsewhere at

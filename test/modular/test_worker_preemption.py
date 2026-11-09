@@ -473,6 +473,30 @@ def test_make_room_moves_nothing_once_the_oldest_refused_request_fits():
     assert _admitted(kv, "x") and not _admitted(kv, "y"), "y took the room x fit in"
 
 
+def test_a_request_its_moves_admitted_starts_while_an_older_return_holds_its_pools_queue_back():
+    """make_room dropped w for b, and the drop admitted b. a, older than b, was dropped after that and became the
+    oldest request in the pool, which held b's queue back. b never started, and a waited for the pages b's allotment
+    holds."""
+    kv = _pool()
+    _running(kv, "x", 1, arrival=0)
+    _running(kv, "a", 6, arrival=1)
+    _running(kv, "w", 3, arrival=3)
+    assert _preempt(kv, "w", _short(kv, "w"), droppable=lambda rid: True).waits
+    _runner(kv).readmit("w", NODE)
+    _request(kv, "b", 3, arrival=2)
+    assert not _admitted(kv, "b")
+    w = _worker(kv)
+    w._rebuilds._kept[NODE]["w"] = _kept(3 * PAGE_SIZE)
+    w._preemption.make_room()
+    assert kv.residency("w") is Residency.DROPPED and "b" in kv._allotments
+    _drop(kv, "a")
+    _remove(kv, "x")
+
+    started = _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert (NODE, "b") in started, "b waited behind a, and a for the pages b's allotment holds"
+
+
 def test_make_room_walks_again_only_once_a_refusal_or_a_request_it_could_move_changes():
     """o waits to return into pages r holds, and r, waiting for its shortage, can't be dropped until its ids cover its
     KV. Each pass walked every refusal again, about 2 ms with 32 requests waiting. Walking only once a refusal's room
