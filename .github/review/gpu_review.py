@@ -446,8 +446,9 @@ def review_threads(pr):
 
 
 def blocking(review, pages, stacked):
-    """The open P0–P2 findings, by the summary's own rule (render_summary.open_findings)."""
-    return [f"{where} ({p})" for where, p, _ in render_summary.open_findings(review, pages, stacked) if p != "P3"]
+    """The open P0–P2 findings, by the summary's own rule (render_summary.open_findings), an edited one marked."""
+    return [f"{where} ({p}, {render_summary.EDITED})" if what == render_summary.EDITED else f"{where} ({p})"
+            for where, p, what in render_summary.open_findings(review, pages, stacked) if p != "P3"]
 
 
 def file_gate(files, repo_root):
@@ -786,7 +787,9 @@ def post(out, pr, head_sha, runner_temp, run_url, trusted="", gated="", approve_
                 "or a fork owned by someone with write access; this review stands without it.\n")
     elif gated == "true":
         reasons = render_summary.inert(Path(runner_temp, "gate.txt").read_text()).rstrip("\n")
-        body = f"No live test yet: fix what the review left open first ({reasons}), then comment `/review` again.\n"
+        body = (f"No live test yet ({reasons}): a finding's thread was edited after the bot posted it, so another "
+                "`/review` can't clear it and a person has to decide.\n" if render_summary.EDITED in reasons else
+                f"No live test yet: fix what the review left open first ({reasons}), then comment `/review` again.\n")
     elif text(lt / "comment.md"):
         body = text(lt / "comment.md")
     elif text(lt / "unavailable.md"):
