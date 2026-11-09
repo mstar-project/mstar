@@ -2,10 +2,15 @@ name: CI
 on:
   pull_request:
     branches: [main]
-  # Every merge is tested on main too: PRs that are each green alone can still
-  # break main when they land together.
+  # Every commit on main is tested too, including merges that skip the queue
+  # (an admin can bypass it).
   push:
     branches: [main]
+  # The merge queue tests each PR merged with main and with every PR queued
+  # ahead of it, before it lands, so that break shows up here instead of on
+  # main. A check the queue requires must run on this event, or the queue
+  # waits for it forever. Each queued commit is its own concurrency group.
+  merge_group:
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -44,7 +49,7 @@ jobs:
             args: >-
               -n 4 --dist worksteal
               --ignore=test/modular/test_tp_async_lockstep_sim.py
-              test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
+              test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases mstar_sim/tests
           # Its three simulations take up to 3.5 minutes each on these runners
           # and would set the main shard's wall time, so they run beside it.
           - name: CPU Core (TP lockstep sim)
@@ -62,6 +67,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+          # A queue run's branch is deleted at once, so a cache saved there is never read.
+          save-if: ${{ github.event_name != 'merge_group' }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -158,6 +165,7 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.event_name != 'merge_group' }}
           workspaces: |
             rust
             rust/server
@@ -190,9 +198,11 @@ jobs:
           # pyyaml: the runtime tests reach mstar.model.base, which imports it;
           # prometheus-client: the frontend's /metrics test renders a real registry;
           # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
-          # parity cases run the Python app through fastapi's TestClient
+          # parity cases run the Python app through fastapi's TestClient;
+          # soundfile (its wheel bundles libsndfile): the voice-clip checks and
+          # the compressed-speech byte parity, which skip without it
           pip install pytest==9.2.0 msgpack numpy pyyaml prometheus-client \
-            fastapi uvicorn python-multipart httpx
+            fastapi uvicorn python-multipart httpx soundfile
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level)
           pip install torch --index-url https://download.pytorch.org/whl/cpu

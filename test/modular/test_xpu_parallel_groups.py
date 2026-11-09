@@ -19,7 +19,7 @@ def _exercise_parallel_groups(rank, rendezvous):
         world_parallel_groups=[(0, 1)],
     )
     group = CommGroup(rank, rank, [0, 1]) if rank < 2 else CommGroup.trivial()
-    parallel.add("llm", group)
+    parallel.add("llm", group, "tp")
     parallel.init_dist(init_method=rendezvous, device=torch.device("xpu", rank))
     try:
         if rank == 2:

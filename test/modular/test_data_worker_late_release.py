@@ -23,8 +23,7 @@ import pytest
 from mstar.api_server.data_worker import PreprocessWorker, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
 from mstar.communication.event import EventWakeup
-from mstar.model.base import Model
-from mstar.streaming.topology import PartitionTopology
+from mstar.testing_utils.model import StubModel
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -34,20 +33,13 @@ from mstar.utils.ipc_format import (
 )
 
 
-class _Model:
+class _Model(StubModel):
     def __init__(self, fail_preprocess=False):
         self.fail_preprocess = fail_preprocess
-
-    def get_partition_topology(self):
-        return PartitionTopology(partitions=["default"])
 
     def process_prompt(self, *args, **kwargs):
         if self.fail_preprocess:
             raise ValueError("bad knob")
-
-    # the inline path's per-value default, over the stub's postprocess
-    postprocess_inline = Model.postprocess_inline
-    text_output = Model.text_output
 
     def postprocess(self, output, modality, request_kwargs=None):
         return f"<{int(output[0])}>".encode()

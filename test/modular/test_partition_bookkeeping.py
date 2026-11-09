@@ -25,9 +25,10 @@ from mstar.conductor.request_info import CurrentForwardConductorMetadata, Partit
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.runtime.base import RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.model.base import ForwardPassArgs, WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology
+from mstar.testing_utils.model import StubModel
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import NewRequestConductor
 
@@ -108,7 +109,7 @@ def test_split_inputs_keeps_persist_order_across_walks():
     assert [x.uuid for x in got.tensor_info] == [1, 2, 3]
 
 
-class _TwoStreamModel(Model):
+class _TwoStreamModel(StubModel):
     def get_graph_walk_graphs(self):
         return {"p": GraphNode(name="p", input_names=["x"], outputs=[]),
                 "c": GraphNode(name="c", input_names=["y"], outputs=[])}
@@ -129,18 +130,6 @@ class _TwoStreamModel(Model):
     def get_partition_forward_pass_args(self, partition_name, partition_metadata, *a, **k):
         # P ends; C waits on its streams
         return ForwardPassArgs(partition_metadata, [], [], request_done=partition_name == "P")
-
-    def get_node_resources(self):
-        return []
-
-    def process_prompt(self, *a, **k):
-        return {}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
 
 
 class _ColonNamesModel(_TwoStreamModel):

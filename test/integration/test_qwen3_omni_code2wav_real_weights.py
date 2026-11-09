@@ -124,13 +124,15 @@ def stream(submodule: Code2WavSubmodule, frames: torch.Tensor) -> list[tuple[Str
     while buffer.has_chunk_ready():
         chunk = buffer.pop_chunk()
         meta = {"r": InputMetadata(stream_chunks={"codec_tokens": chunk.info})}
-        key = submodule.cg_key_info("code2wav_chunk", {"r": fwd_info}, per_request_input_metadata=meta)
         engine_inputs = ModelInputsFromEngine(
-            request_ids=["r"], per_request_info={}, per_request_input_metadata=meta, captured=key is None,
+            request_ids=["r"], per_request_info={}, per_request_input_metadata=meta, captured=True,
         )
         item = submodule.prepare_inputs(
             "code2wav_chunk", fwd_info, {"codec_tokens": [chunk.data["data"]]}, input_metadata=meta["r"],
         )
+        if item is None:
+            # declined like the engine declines it: no new frame, so no forward and no audio
+            continue
         with torch.no_grad():
             outputs = submodule.forward_batched(
                 "code2wav_chunk", engine_inputs, **submodule.preprocess("code2wav_chunk", engine_inputs, [item]),

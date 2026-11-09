@@ -40,6 +40,7 @@ from mstar.engine.resources.attn.wrappers import (
 from mstar.engine.resources.base import AttentionResource
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 MIB = 1024 * 1024
 CPU = torch.device("cpu")
@@ -426,6 +427,7 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
     class _Runner:
         any_graphs = False
         dropped_buckets = ()
+        recompile_limit = None
 
         def __init__(self, **kwargs):
             pass
@@ -443,22 +445,14 @@ def test_the_engine_seals_between_sizing_and_capture(monkeypatch):
         def post_warmup_validate(self):
             pass
 
-    engine = engine_mod.Engine.__new__(engine_mod.Engine)
-    engine._device = CPU
-    engine._enable_nvtx = False
-    engine._resources = {"attn": _Resource()}
-    engine._runner = None
-    engine._side_stream_nodes = frozenset()
-    engine._submodules = {"dit": SimpleNamespace(
-        submodule=SimpleNamespace(warmup_compiles=lambda: None, resident_walks=frozenset), resources={},
-        joint_comm_group=None, num_slots=2,
-        fp32_precision=None, node_dtype=None, lora_pools=(),
-    )}
+    mgmt = make_mgmt(SimpleNamespace(warmup_compiles=lambda: None, resident_walks=frozenset))
+    mgmt._num_slots = 2
+    engine = make_engine(_resources={"attn": _Resource()}, _submodules={"dit": mgmt})
     monkeypatch.setattr(engine_mod, "AcceleratorGraphRunner", _Runner)
     monkeypatch.setattr(engine, "_compile_regions", lambda: None, raising=False)
     monkeypatch.setattr(engine, "_build_piecewise_runners", lambda *args: {}, raising=False)
     monkeypatch.setattr(engine, "_plan_captures", lambda *args: events.append("size"), raising=False)
-    monkeypatch.setattr(engine, "_compile_submodules", lambda: None, raising=False)
+    monkeypatch.setattr(engine, "_compile_submodules", lambda limits: None, raising=False)
     engine.warmup()
     assert events == ["prepare", "size", "seal", "capture"]
 

@@ -8,7 +8,6 @@ import pytest
 import torch
 from torch import nn
 
-from mstar.engine.engine import Engine
 from mstar.engine.resources import PositionStep, Resource, StepContext, StepRunner
 from mstar.engine.resources.base import CachedPrefix
 from mstar.engine.resources.kv.config import PrefixSpan
@@ -20,6 +19,7 @@ from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import TALKER_KV, THINKER_KV, THINKER_MIXED, THINKER_POS, Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, Qwen3OmniModel, image_span
 from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule, ThinkerSubmodule, VisionEncoderSubmodule
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 RID = "r0"
 NODE = "Thinker"
@@ -70,13 +70,14 @@ def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None,
     prepared = thinker.prepare_inputs(walk, info, inputs)
     if held is None:
         return prepared
-    engine = Engine.__new__(Engine)
-    engine._runner = StepRunner(
-        {THINKER_KV: _Holding(held.tokens, held.position), THINKER_POS: thinker.node_resources[THINKER_POS]},
-        node_resources={NODE: [THINKER_KV, THINKER_POS]},
+    engine = make_engine(
+        _runner=StepRunner(
+            {THINKER_KV: _Holding(held.tokens, held.position), THINKER_POS: thinker.node_resources[THINKER_POS]},
+            node_resources={NODE: [THINKER_KV, THINKER_POS]},
+        ),
+        _submodules={NODE: make_mgmt(submodule=thinker)},
+        _keyed_walks={NODE: {"prefill_text", "prefill_vision", "prefill_audio"}},
     )
-    engine._submodules = {NODE: SimpleNamespace(submodule=thinker)}
-    engine._keyed_walks = {NODE: {"prefill_text", "prefill_vision", "prefill_audio"}}
     batch = SimpleNamespace(
         node_name=NODE, cached_rids=set(), per_request_info_wrapped={rid: info},
         step_context=StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False),
@@ -105,6 +106,7 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker)
         "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": [torch.randn(6, HIDDEN)] * 2,
         "image_grid_thw": [torch.tensor([1, 4, 6])],
     }
+    thinker.node_resources[THINKER_POS].ingest_request(RID)
     whole = _prepare(thinker, "prefill_vision", image)
 
     cut = thinker.split_inputs("prefill_vision", SimpleNamespace(rid_handle=RID), whole, 3, whole.input_seq_len)
@@ -197,6 +199,23 @@ def test_an_images_span_is_what_its_positions_place():
     )
 
 
+@pytest.mark.parametrize("grid, seconds_per_grid", [((1, 8, 12), None), ((4, 8, 12), 2.0)], ids=["image", "video"])
+def test_vision_positions_match_transformers(grid, seconds_per_grid):
+    hf = pytest.importorskip("transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe")
+    start, per_second = 37, 13.0
+    ours = get_rope_index_vision(
+        torch.tensor(grid), start, per_second, spatial_merge_size=2, seconds_per_grid=seconds_per_grid,
+    )
+
+    # transformers' get_rope_index: a frame group's temporal index is its time, every axis offset by the start
+    t_index = torch.arange(grid[0]).float() * (seconds_per_grid or 1) * per_second
+    grids = torch.tensor([grid])
+    reference = hf.Qwen3OmniMoePreTrainedModelForConditionalGeneration.get_llm_pos_ids_for_vision(
+        None, start, 0, 2, t_index, grids[:, 1], grids[:, 2],
+    )
+    assert torch.equal(ours, reference)
+
+
 _SPECIALS = {
     "<|vision_start|>": 151652, "<|vision_end|>": 151653, "<|image_pad|>": 151655, "<|video_pad|>": 151656,
     "<|audio_start|>": 151669, "<|audio_end|>": 151670, "<|audio_pad|>": 151675,
@@ -240,7 +259,8 @@ class _Processor:
         return turns + "<|im_start|>assistant\n"
 
     @staticmethod
-    def image_processor(images, return_tensors):
+    def image_processor(images, return_tensors, input_data_format):
+        assert input_data_format == "channels_last"
         height, width, _ = images[0].shape
         return {"pixel_values": torch.zeros(1), "image_grid_thw": torch.tensor([[1, height // 16, width // 16]])}
 
@@ -401,10 +421,11 @@ def test_the_encoders_are_not_compiled_while_their_output_is_cached(monkeypatch,
     compiled = []
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: compiled.append(fn) or fn)
     cls = {"audio_encoder": AudioEncoderSubmodule, "vision_encoder": VisionEncoderSubmodule}[node]
-    engine = Engine.__new__(Engine)
-    engine._device = torch.device("cuda")
-    engine._item_encoders = {node}
-    engine._submodules = {node: SimpleNamespace(submodule=object.__new__(cls), forward="eager")}
+    engine = make_engine(
+        _device=torch.device("cuda"),
+        _item_encoders={node},
+        _submodules={node: make_mgmt(submodule=object.__new__(cls), forward="eager")},
+    )
 
     engine._compile_submodules()
 

@@ -1,5 +1,6 @@
 import functools
 import itertools
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -16,10 +17,16 @@ from mstar.conductor.request_info import (
     PartitionDefinition,
     StreamingConnectionState,
 )
-from mstar.distributed.base import ShardingConfig, ShardingGroup
+from mstar.distributed.base import (
+    PARALLEL_AXES,
+    ShardingConfig,
+    ShardingGroup,
+    mesh_groups,
+    node_group_axis_sizes,
+)
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.config import RetentionPolicy
-from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
     GraphEdge,
@@ -31,8 +38,9 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMPTY_DESTINATION
-from mstar.model.media_limits import VideoBudget, read_image, video_decode_threads
+from mstar.model.media_limits import VideoBudget, decoding_upload, read_image, video_decode_threads
 from mstar.model.multimodal import TEXT, PromptPart
+from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import (
     CHUNK_LOOP_END,
     ChunkingPolicy,
@@ -133,9 +141,6 @@ def _applying_chunking(build):
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
-if TYPE_CHECKING:
-    from mstar.engine.resources.lora.config import LoraSpec
-
 DECODE = "decode"
 MAX_OUTPUT_TOKENS = 2048
 
@@ -143,6 +148,16 @@ MAX_OUTPUT_TOKENS = 2048
 class TensorAndMetadata:
     data: torch.Tensor
     metadata: dict = field(default_factory=dict)
+
+
+class RobotIO(NamedTuple):
+    """What a robot policy's requests and outputs look like, for the API
+    server's robot protocols (the openpi WebSocket)."""
+    # the model_kwargs key a request's robot state goes under
+    state_kwarg: str
+    # the shape of the float32 actions ``postprocess`` returns for "action"
+    action_horizon: int
+    action_dim: int
 
 
 class ProcessPromptOutput(NamedTuple):
@@ -186,7 +201,7 @@ class Span(NamedTuple):
     ``scratch`` is the most a non-committing step writes before the span
     commits into those slots, as a denoised window does.
     """
-    kind: str
+    kind: SpanKind
     walk: str
     length: int
     advance: int
@@ -214,15 +229,15 @@ class LabelLayout(NamedTuple):
     def keyed_count(self) -> int:
         if self.keyed_spans is not None:
             return self.keyed_spans
-        return next((i for i, span in enumerate(self.spans) if span.kind == "rows"), len(self.spans))
+        return next((i for i, span in enumerate(self.spans) if span.kind == SpanKind.ROWS), len(self.spans))
 
     def row(self) -> list:
         """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
-        ``[length, advance, walk, scratch, digest, end key, opens step]``: plain values, which keep a
-        request's kwargs on the wire's msgpack path. Digest and end key are None until the preprocess
-        worker keys the span."""
+        ``[length, advance, walk, scratch, digest, end key, opens step, kind]``: plain values, which
+        keep a request's kwargs on the wire's msgpack path. Digest and end key are None until the
+        preprocess worker keys the span."""
         for i, span in enumerate(self.spans):
-            if span.kind not in ("ids", "digest", "rows"):
+            if span.kind not in tuple(SpanKind):
                 raise ValueError(f"a span of kind {span.kind!r}")
             if not span.opens_step and (i == 0 or self.spans[i - 1].walk != span.walk):
                 raise ValueError(f"span {i} of walk {span.walk!r} opens no step, but " + (
@@ -236,7 +251,11 @@ class LabelLayout(NamedTuple):
                 )
         retention = self.retention
         return [
-            [[span.length, span.advance, span.walk, span.scratch, None, None, span.opens_step] for span in self.spans],
+            [
+                [span.length, span.advance, span.walk, span.scratch, None, None, span.opens_step,
+                 SpanKind(span.kind).value]
+                for span in self.spans
+            ],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
@@ -256,7 +275,7 @@ def prompt_spans(
             spans.extend(item_spans(step))
             continue
         length = texts[step.index].numel()
-        spans.append(Span("ids", text_walk, length, length, "text_inputs"))
+        spans.append(Span(SpanKind.IDS, text_walk, length, length, "text_inputs"))
     return spans
 
 
@@ -314,23 +333,18 @@ class WorkerGraph:
     ranks: list[int] = field(default_factory=list)
     tp_size: int = 1
     sp_size: int = 1
+    cfg_size: int = 1
 
-    # ``ranks`` form a 2D [sp_size, tp_size] mesh per instance (instances tile
-    # for data parallelism). ``_tp_ranks`` are the mesh rows (tensor-parallel
-    # comm groups: sharded heads/weights, all-reduce); ``_sp_ranks`` are the
-    # columns (sequence-parallel comm groups: Ulysses all-to-all);
-    # ``_instance_ranks`` are the whole instances (every rank of an instance runs
-    # a request together; empty without TP/SP, so the data-parallel replicas the
-    # conductor routes to are ``replica_ranks``). With
-    # sp_size==1 this reduces to the old ``ranks`` chunked by ``tp_size``
-    # (trivial SP groups; instance == TP row). ``tp_size`` is rewritten in
-    # __post_init__ to the instance size (tp*sp) so the conductor — which models
-    # a parallel group as its lockstep unit — routes to the whole instance; the
-    # original per-axis degrees live in ``_tp_comm_size`` and ``sp_size``.
-    _tp_ranks: list[list[int]] = field(default_factory=list)
-    _sp_ranks: list[list[int]] = field(default_factory=list)
+    # ``ranks`` tile into lockstep instances (instances tile for data
+    # parallelism), each a row-major mesh over ``PARALLEL_AXES``.
+    # ``_axis_ranks`` holds each axis's comm groups (tp: sharded heads and
+    # weights, all-reduce; sp: Ulysses all-to-all; cfg: one share of the
+    # guidance branches each); ``_instance_ranks`` are the whole instances
+    # (every rank of an instance runs a request together; empty without a
+    # parallel axis, so the data-parallel replicas the conductor routes to are
+    # ``replica_ranks``).
+    _axis_ranks: dict[str, list[list[int]]] = field(default_factory=dict)
     _instance_ranks: list[list[int]] = field(default_factory=list)
-    _tp_comm_size: int = 1
     _group_id: int = field(default=-1)  # original index into config's node_groups
 
     # Dense index over the deployment's worker graphs, reassigned by the
@@ -341,37 +355,31 @@ class WorkerGraph:
     worker_graph_id: int = field(default_factory=lambda: next(_wg_id_counter))
 
     def __post_init__(self):
-        if (self.tp_size > 1 or self.sp_size > 1) and not self._tp_ranks:
-            tp = self.tp_size  # tensor-parallel (row / all-reduce) degree
-            sp = self.sp_size  # sequence-parallel (all-to-all) degree
-            inst = tp * sp
+        inst = self.instance_size
+        if inst > 1:
             assert len(self.ranks) % inst == 0, (
                 f"WorkerGraph {self.worker_graph_id} has {len(self.ranks)} ranks; "
-                f"not divisible by tp_size*sp_size ({tp}*{sp}={inst})."
+                f"not divisible by its instance size ({self.axis_sizes}: {inst})."
             )
-            tp_ranks: list[list[int]] = []
-            sp_ranks: list[list[int]] = []
-            instance_ranks: list[list[int]] = []
-            for base in range(0, len(self.ranks), inst):
-                block = self.ranks[base:base + inst]
-                instance_ranks.append(block)
-                # row-major [sp][tp] grid over this instance's ranks
-                grid = [block[s * tp:(s + 1) * tp] for s in range(sp)]
-                tp_ranks += grid  # rows: vary tp within fixed sp
-                sp_ranks += [
-                    [grid[s][t] for s in range(sp)] for t in range(tp)
-                ]  # columns: vary sp within fixed tp
-            self._tp_ranks = tp_ranks
-            self._sp_ranks = sp_ranks
-            self._instance_ranks = instance_ranks
-            self._tp_comm_size = tp
-            # Conductor routes to the lockstep unit (the whole instance).
-            self.tp_size = inst
+            self._instance_ranks = [self.ranks[base:base + inst] for base in range(0, len(self.ranks), inst)]
+            self._axis_ranks = {axis: [] for axis in PARALLEL_AXES}
+            for block in self._instance_ranks:
+                for axis, groups in mesh_groups(block, self.axis_sizes).items():
+                    self._axis_ranks[axis] += groups
+
+    @property
+    def axis_sizes(self) -> dict[str, int]:
+        return {axis: getattr(self, f"{axis}_size") for axis in PARALLEL_AXES}
+
+    @property
+    def instance_size(self) -> int:
+        """Ranks in one lockstep instance: the conductor's routing unit."""
+        return math.prod(self.axis_sizes.values())
 
     @property
     def replica_ranks(self) -> list[list[int]]:
         """The ranks of each data-parallel replica: the lockstep instances, or
-        one rank apiece without TP/SP. The conductor routes a request to one."""
+        one rank apiece without a parallel axis. The conductor routes a request to one."""
         return self._instance_ranks or [[r] for r in self.ranks]
 
 
@@ -414,8 +422,7 @@ def _divide_into_worker_graphs(
                 consumes_stream=graph.consumes_stream,
                 _group_id=group_idx,
                 ranks=ng["ranks"],
-                tp_size=ng.get("tp_size", 1),
-                sp_size=ng.get("sp_size", 1),
+                **{f"{axis}_size": size for axis, size in node_group_axis_sizes(ng).items()},
             )
         ]
 
@@ -553,22 +560,37 @@ class ForwardPassArgs:
 
 def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
-    overrides: the model's declaration, and its LoRA specs when the YAML turns LoRA on
-    (``mstar.engine.resources.lora.serving``)."""
-    from mstar.engine.resources.lora.serving import declared_lora_specs, size_lora_specs
+    overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
+    its ``resources:`` block does not name."""
+    named = (model_config.get("resources") or {}).keys()
+    return [
+        spec for spec in model.get_node_resources() or []
+        if not spec.opt_in or spec.resource_key in named
+    ]
 
-    specs = list(model.get_node_resources() or [])
-    lora = declared_lora_specs(model, model_config)
-    size_lora_specs(lora, model_config)
-    return specs + lora
+
+def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+    """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
+    overrides applied. A ``per_node`` spec is whole here, as the API server checks
+    requests and adapters against it; ``serving_resources`` splits it."""
+    from mstar.engine.resources.spec import apply_yaml_overrides
+
+    specs = enabled_resources(model, model_config)
+    apply_yaml_overrides(specs, model_config)
+    return specs
 
 
 def built_resources(specs: list[NodeResourceSpec]) -> list[NodeResourceSpec]:
-    """The specs a deployment builds of its ``enabled_resources``, the YAML's overrides
-    applied: all but a LoRA spec the YAML's ``targets`` left with none."""
-    from mstar.engine.resources.lora.serving import drop_lora_specs_without_targets
-
-    return drop_lora_specs_without_targets(specs)
+    """The specs a deployment builds of its declared ones: each ``per_node`` spec as its
+    instances (``NodeResourceSpec.for_node``)."""
+    built: list[NodeResourceSpec] = []
+    for spec in specs:
+        if not spec.per_node:
+            built.append(spec)
+            continue
+        instances = (spec.for_node(node) for node in sorted(spec.nodes))
+        built.extend(instance for instance in instances if instance is not None)
+    return built
 
 
 def parse_autocast_dtype(value) -> torch.dtype | None:
@@ -583,18 +605,15 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
 
 
 def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
-    """The resource specs a deployment builds: ``enabled_resources``, the YAML's
-    ``resources:`` overrides applied, as ``built_resources``.
+    """The resource specs a deployment builds: ``declared_resources``, as
+    ``built_resources``.
 
     Every process that reads specs resolves them here, so the conductor validates
-    requests against what the workers built. ``validate_deployment`` takes the same
-    steps, reporting every problem rather than the first.
+    requests against what the workers built, under the same keys.
+    ``validate_deployment`` takes the same steps, reporting every problem rather than
+    the first.
     """
-    from mstar.engine.resources.spec import apply_yaml_overrides
-
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
-    return built_resources(specs)
+    return built_resources(declared_resources(model, model_config))
 
 
 class Model(ABC):
@@ -621,7 +640,9 @@ class Model(ABC):
     # doesn't fit the context, instead of having its length cut to fit.
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
-    ENGINE_KWARGS: tuple[str, ...] = ("seed", "prefix_cache", "return_token_ids", LORA_ADAPTER_KWARG)
+    ENGINE_KWARGS: tuple[str, ...] = (
+        "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
+    )
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -722,16 +743,13 @@ class Model(ABC):
                     f"Node group with ep_config contains nodes not in "
                     f"ep_enabled_nodes {sharding_config.ep_enabled_nodes}: {ng['node_names']}"
                 )
-            tp = ng.get("tp_size", 1)
-            sp = ng.get("sp_size", 1)
-            instance_size = tp * sp
+            instance_size = math.prod(node_group_axis_sizes(ng).values())
             if instance_size <= 1:
                 continue
-            # The sharding group is the lockstep unit — tp*sp workers routed
-            # together. TP shards weights via shard_dim-driven fanout; SP is
-            # in-module (replicated signals, no shard_dim) but its ranks must
-            # still run each request together, so the group spans the whole
-            # instance.
+            # The sharding group is the lockstep unit — the whole instance's
+            # workers, routed together. TP shards weights via shard_dim-driven
+            # fanout; SP and CFG are in-module (replicated signals, no
+            # shard_dim) but their ranks must still run each request together.
             groups.append(ShardingGroup(
                 nodes=set(ng["node_names"]),
                 tp_size=instance_size,
@@ -764,23 +782,11 @@ class Model(ABC):
 
         The whole declaration: a KV cache's shape, the attention backend over
         it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it.
+        hands each node the subset naming it. An opt-in spec (per-request LoRA
+        adapters) is declared here too, and built only for a deployment whose
+        ``resources:`` block names it.
         """
         pass
-
-    def get_lora_specs(self) -> list["LoraSpec"]:
-        """The per-request LoRA adapters this model can serve: a spec per node they
-        reach (none for a model that serves none), the first keyed
-        ``LORA_RESOURCE_KEY`` and the others apart (an LLM's and its vision encoder's),
-        and the conductor opens a request with the same adapter on each.
-
-        Built only when the deployment's YAML has a ``resources: lora:`` block (see
-        ``serving_resources``): a deployment without one builds exactly what it did
-        before. Usually by ``module_lora_spec`` from each node's weights root, whose
-        LoRA-capable modules the node then binds itself. The conductor opens each
-        request with a ``LoraReqConfig`` from the ``lora_adapter`` kwarg.
-        """
-        return []
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.
@@ -803,6 +809,11 @@ class Model(ABC):
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         """``{node: {combined_walk: {constituent walks}}}``: walks the scheduler may batch together."""
+        return {}
+
+    def rebuild_policies(self) -> dict[str, RebuildPolicy]:
+        """``{node: policy}``: how a request dropped from each node's KV is rebuilt. A node without one never
+        drops a request."""
         return {}
 
     def combined_walk_of(self) -> dict[tuple[str, str], str]:
@@ -959,6 +970,7 @@ class Model(ABC):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         prompt_parts: list[PromptPart] | None = None,
+        open_streams: frozenset[str] = frozenset(),
         **kwargs,
     ) -> "NameToTensorList | ProcessPromptOutput":
         """Tokenize prompt and produce initial tensors for the request.
@@ -981,6 +993,10 @@ class Model(ABC):
             prompt_parts: Ordered text/attachment sequence as written.
                 ``None`` from entrypoints with no ordering to preserve; see
                 :func:`mstar.model.multimodal.parts_from_modalities`.
+            open_streams: The client streams the opening leaves open for
+                appends; empty for a one-shot request. Raise
+                ``ValueError`` here for a live opening the request's settings
+                can't serve.
             **kwargs: Model-specific parameters (e.g., from model_kwargs).
 
         Returns:
@@ -1002,19 +1018,22 @@ class Model(ABC):
         """Turn one append the client sends to a running request into items of
         the model's client streams (``Connection(from_partition=CLIENT, ...)``).
 
-        Called by the API server data worker for each append that carries text
-        or files, after it has loaded the files the way it loads a request's
+        Called by the API server data worker for each append that carries text,
+        files or ``model_kwargs``, after it has loaded the files the way it loads a request's
         (``chunk.tensors``: ``audio_inputs``, ``image_inputs``,
         ``video_inputs``). ``chunk.streams`` names the stream the client meant
         each file for, where it named one; ``chunk.model_kwargs`` are the
         append's own, beside the opening's ``chunk.request_kwargs``. Returns
         items by client edge name; each list entry is one item of that stream.
         Raise ``ValueError`` for an append the model can't take (the client
-        gets a 400); an append with text that yields no item is refused.
+        gets a 400); an append of text or ``model_kwargs`` that yields no item
+        is refused.
 
         Keep it stateless: the consuming node folds items into its own state.
         Tensors ``process_prompt`` returns under a client edge's name are the
-        stream's first chunk, so a one-shot request needs no append.
+        stream's first chunk, so a one-shot request needs no append. A model
+        whose client streams all declare ``ClientAudio`` needs none: the data
+        worker turns its appends into items.
         """
         raise NotImplementedError(f"{type(self).__name__} takes no streamed input")
 
@@ -1025,24 +1044,39 @@ class Model(ABC):
 
         return TensorAndMetadata(img)
 
+    def load_decoded_image(self, image: torch.Tensor, device: str) -> TensorAndMetadata:
+        """What :meth:`load_image` returns, for an image that reached the API
+        server already decoded: RGB uint8 ``[3, H, W]``, as ``read_image(path,
+        rgb=True)`` decodes a file. A model that takes such images (e.g. from
+        the openpi endpoint) overrides this so the two paths agree; the rest
+        take images only as files."""
+        raise NotImplementedError(f"{type(self).__name__} takes images only as files")
+
+    def robot_io(self) -> RobotIO | None:
+        """A robot policy's request and output shapes, which the openpi
+        WebSocket serves it by; None for a model that is not one."""
+        return None
+
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         # libsndfile first, so WAV, FLAC, OGG and MP3 do not depend on the
         # FFmpeg build torchcodec happens to load (some base images ship a
         # video-only one); torchcodec for the other containers.
-        from mstar.model.components.audio_features import load_audio_file
+        from mstar.api_server.media_io import MAX_AUDIO_SECONDS
+        from mstar.model.components.audio_features import load_speech_file
 
-        audio = load_audio_file(filepath, sample_rate=16000)
+        audio = load_speech_file(filepath, 16000, MAX_AUDIO_SECONDS)
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(self, filepath: str, device: str):
         from torchcodec.decoders import VideoDecoder
 
-        decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
         budget = VideoBudget()
         frames = []
-        for frame in decoder:
-            budget.add(*frame.shape[-2:])
-            frames.append(frame)
+        with decoding_upload(filepath, "the video", ffmpeg=True):
+            decoder = VideoDecoder(filepath, device=device, num_ffmpeg_threads=video_decode_threads())
+            for frame in decoder:
+                budget.add(*frame.shape[-2:])
+                frames.append(frame)
         video = torch.stack(frames)
         del frames
         video = video.float().div_(255.0)
@@ -1116,7 +1150,7 @@ class Model(ABC):
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None, sp_group=None,
-        moe_parallel: "MoeParallelConfig | None" = None,
+        moe_parallel: "MoeParallelConfig | None" = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
 
@@ -1131,6 +1165,12 @@ class Model(ABC):
         participates in a non-trivial SP group, so models without SP support
         never receive it. Models that support SP forward it to their
         attention so it can all-to-all the sequence around the kernel.
+
+        ``cfg_group`` is the node's classifier-free-guidance comm group, for
+        a node in ``cfg_enabled_nodes`` whose group sets ``cfg_size > 1``
+        (passed only then): each rank runs its ``my_rows(cfg_group,
+        branches)`` share of the branches and ``cfg_group.all_gather``
+        reassembles them. Nothing else about the node changes.
 
         ``moe_parallel`` is the node group's ``ep_config``: TP or EP for the
         node's routed experts. Passed only for a node in ``ep_enabled_nodes``
@@ -1163,9 +1203,10 @@ class Model(ABC):
         return {}
 
     def request_kwargs(self) -> frozenset[str] | None:
-        """Every ``model_kwargs`` key this model reads, including the ones an
-        OpenAI adapter maps onto it. A request carrying any other key is served,
-        and the key logged as ignored. None (the default) declares nothing, so
+        """Every ``model_kwargs`` key this model reads beyond ``ENGINE_KWARGS``,
+        ``LENGTH_KWARGS`` and ``INTERNAL_KWARGS``, including the ones an OpenAI
+        adapter maps onto it. A request carrying any other key is served, and
+        the key logged as ignored. None (the default) declares nothing, so
         nothing is logged.
         """
         return None
@@ -1185,6 +1226,16 @@ class Model(ABC):
         speech codecs used by the audio models here.
         """
         return 24000
+
+    # ``(start_id, end_id)``: the text tokens that open and close a full-duplex
+    # model's turns (see "Streams from the client" in docs/adding_models.rst); None: none.
+    turn_tokens: tuple[int, int] | None = None
+    # A model whose replies may never get their end mark: a reply ends after this many
+    # steps with no text, no mark and no audio above ``turn_silence_rms`` (the RMS of
+    # samples in [-1, 1]), and text outside a reply opens one; None: only the marks end
+    # and open them.
+    turn_idle_steps: int | None = None
+    turn_silence_rms: float = 0.005
 
     def get_output_audio_channels(self, modality: str = "audio") -> int:
         """Channel count of the interleaved 16-bit PCM ``postprocess`` emits for

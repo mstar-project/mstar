@@ -99,13 +99,14 @@ def build_wan22_dit(
     model_path_hf: str,
     device: torch.device | str = "cpu",
     cache_dir: str | None = None,
+    sp_group=None,
 ) -> Wan22DiT:
     """Meta-build, materialize on ``device``, and load the checkpoint into a
-    ready-to-serve (eval-mode) native DiT."""
+    ready-to-serve (eval-mode) native DiT (``sp_group``: see ``Wan22DiT``)."""
     transformer_dir = resolve_transformer_dir(model_path_hf, cache_dir)
 
     with torch.device("meta"):
-        dit = Wan22DiT(config)
+        dit = Wan22DiT(config, sp_group=sp_group)
     dit.cast_serving_dtypes()
     dit.to_empty(device=device)
 
