@@ -335,6 +335,90 @@ def test_removing_a_request_gives_its_slice_back():
     )
 
 
+PROMPT = (PrefixSpan(4, 4, PREFILL),)
+
+
+def _ranks() -> tuple[Rebuilds, Rebuilds]:
+    """Rank 0 and a follower of ``NODE``, each with a 32-byte pool that r's prompt fills."""
+    leader = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")))
+    follower = Rebuilds({NODE: POLICY}, _graphs(), HostPool(32, torch.device("cpu")), followed=frozenset({NODE}))
+    for rebuilds in (leader, follower):
+        assert _ingest(rebuilds, R, PROMPT)
+    return leader, follower
+
+
+def test_a_follower_keeps_the_log_of_a_request_rank_0_keeps_when_its_own_pool_is_full():
+    """Each rank gives a slice back at its own teardown. Rank 0 tears r down before a arrives and the follower
+    after, so only rank 0's pool has room for a's log. Rank 0 can then drop a, and a follower that kept no log of a
+    stopped. The follower takes a's room past its pool."""
+    leader, follower = _ranks()
+    leader.remove_request(R)
+
+    assert _ingest(leader, A, PROMPT) and _ingest(follower, A, PROMPT)
+    follower.remove_request(R)
+    follower.record(_ran(PREFILL, {A: {"text_inputs": [torch.arange(4)]}}))
+
+    assert leader.kept(A, NODE) is not None
+    assert follower.kept(A, NODE) is not None, "rank 0 can drop a request the follower keeps no log of"
+    [ids] = follower.kept(A, NODE).records[0].inputs["text_inputs"]
+    assert ids.tolist() == [0, 1, 2, 3] and follower.pool.nbytes_used() == 0, (
+        "the follower kept other ids, or a's log takes room in its pool"
+    )
+
+
+def test_a_full_pool_names_the_node_whose_log_it_couldnt_hold():
+    """Rank 0 journals each node its pool refused a log, for its followers. A request no drop can free took no room,
+    which every rank works out alike."""
+    leader, _ = _ranks()
+    writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"decode_loop"}))}}
+    layouts = {"kv": [StreamLayout(spans=PROMPT, growth=(("decode_loop", 1),))]}
+
+    unpausable = leader.ingest_request(B, writes, layouts, unpausable=True)
+    full = leader.ingest_request(A, writes, layouts, unpausable=False)
+
+    assert full == ({"kv": False}, {NODE}), "a follower would keep a log rank 0's pool refused"
+    assert unpausable.unheld == set(), "rank 0 would journal a refusal every rank makes"
+
+
+def test_a_follower_gives_back_the_log_of_a_request_rank_0s_pool_couldnt_hold():
+    """Rank 0's pool has no room for a's log, so a is not rebuildable there and rank 0 never drops it. The follower
+    took a's room past its pool and counted a rebuildable until rank 0's journal said otherwise."""
+    leader, follower = _ranks()
+    assert not _ingest(leader, A, PROMPT) and _ingest(follower, A, PROMPT)
+
+    assert follower.refuse(A, NODE) == ["kv"], "the follower would admit a in another class than rank 0"
+    assert follower.kept(A, NODE) is None and not follower.pool._spilled, (
+        "the follower holds a log outside its pool that rank 0 never drops with"
+    )
+
+
+def test_a_follower_refuses_every_log_rank_0_gave_back_with_the_one_its_pool_couldnt_hold():
+    """The LLM and the talker write one cache, and rank 0's pool held the log of only one of them. A drop there then
+    can't free a, so rank 0 gave the other's room back too. A follower that kept that log held it until a's
+    teardown."""
+    talker, node = "talker", SimpleNamespace(input_names={"text_inputs"}, outputs=[SimpleNamespace(name="new_token")])
+    nodes = {NODE: node, talker: node}
+    loop = SimpleNamespace(get_nodes=lambda: nodes)
+    graphs = {
+        PREFILL: SimpleNamespace(get_nodes=lambda: nodes, get_loops=dict),
+        DECODE: SimpleNamespace(get_nodes=lambda: nodes, get_loops=lambda: {"decode_loop": loop}),
+    }
+    policies = {NODE: POLICY, talker: POLICY}
+    what = NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"decode_loop"}))
+    writes = {"kv": {NODE: what, talker: what}}
+    layouts = {"kv": [StreamLayout(spans=PROMPT, growth=(("decode_loop", 1),))]}
+    leader = Rebuilds(policies, graphs, HostPool(32, torch.device("cpu")))
+    follower = Rebuilds(policies, graphs, HostPool(32, torch.device("cpu")), followed=frozenset(policies))
+
+    (refused,) = leader.ingest_request(A, writes, layouts, unpausable=False).unheld
+    follower.ingest_request(A, writes, layouts, unpausable=False)
+
+    assert follower.refuse(A, refused) == ["kv"]
+    assert follower.kept(A, NODE) is None and follower.kept(A, talker) is None, (
+        "the follower keeps a log rank 0 gave back"
+    )
+
+
 def test_a_request_takes_8_bytes_for_each_prompt_id_when_it_arrives():
     """A slice held 4 B for each prompt id, too few to keep a prompt its walk read as int64."""
     rebuilds = Rebuilds({NODE: POLICY}, _graphs(), HostPool(1 << 10, torch.device("cpu")))

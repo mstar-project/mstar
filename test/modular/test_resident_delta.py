@@ -2177,6 +2177,22 @@ def test_a_follower_gives_back_the_ids_of_a_request_rank_0_journals_as_keeping_n
     assert follow.apply_resident_delta(delta, rebuilds) and rebuilds.forgot == [("x", NODE)]
 
 
+def test_a_follower_admits_a_request_rank_0s_rebuild_pool_couldnt_hold_in_rank_0s_class(monkeypatch):
+    """Rank 0's rebuild pool had no room for x's log, so no drop on rank 0 frees x and rank 0 guarantees it. The
+    follower took x's room past its own pool and counted x rebuildable, so it asked for x's prompt where rank 0
+    reserved x's footprint."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader,), "x", 1, arrival=1, rebuildable=False)
+    _ingest((follower,), "x", 1, arrival=1)
+    lead.keeps_no_ids(NODE, "x")
+
+    assert _admits(leader, "x")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _Forgets(["kv"]))
+
+    assert follower._guaranteed == leader._guaranteed == {"x"}, "x is preemptible here and never preempted on rank 0"
+    assert _counts(follower) == _counts(leader)
+
+
 def _follower_of(follow):
     """A follower's scheduler over ``follow``, whose log keeps v's ids and runs no rebuild."""
     scheduler = _follower_scheduler(follow, _KeepsIds())

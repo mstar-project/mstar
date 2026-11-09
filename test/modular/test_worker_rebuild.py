@@ -320,6 +320,38 @@ def test_a_follower_of_a_lockstep_node_sets_aside_twice_the_pool():
     assert leader.pool.nbytes == 1 << 20 and follower.pool.nbytes == 2 << 20, "the follower's pool is rank 0's size"
 
 
+def test_a_follower_of_a_lockstep_node_takes_room_past_its_pool_for_every_log():
+    """Rank 0's pool decides which requests keep a log, so a follower whose pool is full still takes room for one."""
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
+    my_walks = {(NODE, PREFILL), (NODE, DECODE)}
+    rebuilds = _make_rebuilds(
+        model, {"rebuild_host_mb": 1}, my_walks, {NODE}, torch.device("cpu"), engine, frozenset({NODE}),
+    )
+    writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
+    # 6 MiB of ids, past the follower's 2 MiB
+    layout = StreamLayout(spans=(PrefixSpan(3 << 18, 3 << 18, PREFILL),), growth=(("loop", 1),))
+
+    ingested = rebuilds.ingest_request(R, writes, {"kv": [layout]}, unpausable=False)
+
+    assert ingested == ({"kv": True}, set()) and rebuilds.kept(R, NODE) is not None, (
+        "rank 0 can drop a request the follower keeps no log of"
+    )
+
+
+def test_ingest_journals_each_node_whose_log_rank_0s_pool_couldnt_hold():
+    """A follower takes room for every log, so rank 0 journals each one its pool refused, ahead of any move of the
+    request, and the follower gives that room back."""
+    w, eng = _worker(_rebuilds=Rebuilds({NODE: POLICY}, _graphs(), HostPool(16, torch.device("cpu"))))
+    journaled = []
+    eng.keeps_no_ids = lambda node, rid: journaled.append((node, rid))
+
+    for rid in (R, A):
+        w._set_rebuildable(rid, _config())
+
+    assert journaled == [(NODE, A)], "a follower keeps a log rank 0's pool couldn't hold, or gives back one it held"
+
+
 def test_rebuild_host_mb_0_rebuilds_no_request_there():
     """``rebuild_host_mb: 0`` set no pool aside but left the node among the ones whose requests rebuild here, so
     preemption still ran its pass for the node, as for one with a rebuild policy."""
