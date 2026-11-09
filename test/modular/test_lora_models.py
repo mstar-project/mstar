@@ -27,7 +27,7 @@ import lora_module_helpers as H  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
-from mstar.engine.resources.lora import LoraBaseOnly, LoraReqConfig, LoraSpec  # noqa: E402
+from mstar.engine.resources.lora import LoraReqConfig, LoraSpec  # noqa: E402
 from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lora_key  # noqa: E402
 from mstar.engine.resources.lora.store import inspect_keys  # noqa: E402
 from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, SlotLease, StepContext  # noqa: E402
@@ -326,8 +326,12 @@ def _vision_pool(paths, max_slots=2):
 
 
 def _admit(lora_pool, step, rid, adapter, walk="encode", lease=None):
+    from test_lora_pool import engine_lean
+
     lora_pool.ingest_request(rid, LoraReqConfig(adapter=adapter))
-    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease)
+    # lean as the engine sets it: a lease's bucket's, or what an eager step's rows allow
+    lean = engine_lean(lora_pool, [rid]) if lease is None else lease.bucket.lean
+    ctx = StepContext(request_ids=[rid], graph_walk=walk, slot=0, capture=False, slot_lease=lease, lean=lean)
     lora = step.steps[VISION_LORA]
     assert lora_pool.admit(lora, ctx).ok
     lora_pool.plan(lora, ctx)
@@ -341,7 +345,7 @@ def _encode_leased(sub, lora_pool):
     its own, both base-only."""
     region_cfg = sub.get_piecewise_accelerator_graph_configs(torch.device("cpu"), H.DTYPE)[VISION_BLOCK_LOOP]
     bucket = 32
-    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, LoraBaseOnly(VISION_BLOCK_LOOP)))
+    lease = SlotLease(slot=0, bucket=BucketKey(PIECEWISE_WALK, 1, bucket, VISION_BLOCK_LOOP, frozenset({VISION_LORA})))
     inp = _prompt(sub)
     outer = engine_step(sub, "encode", ["r"], [inp], piecewise_leases={VISION_BLOCK_LOOP: lease})
     assert set(outer.steps) == {VISION_LORA}
