@@ -2014,7 +2014,9 @@ each row count compiling its own graph.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention
-resource (FlashInfer, FA3 on Hopper) as an opaque op inside the compiled graph,
+resource (FlashInfer, FA3 on Hopper; on a B300 the ``ragged_attention`` kernel table
+picks torch's cuDNN SDPA, the kernel ``attention_backend: sdpa`` runs, and the two
+configs give the same videos at the same step time) as an opaque op inside the compiled graph,
 6% off a 1280x704x81 denoise step on an H200 against cuDNN SDPA, measured on
 an earlier version of the DiT block, before the adaLN was computed in one pass
 and the q/k norm and RoPE were fused
@@ -2244,9 +2246,13 @@ conditioning tokens, in order).
 Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
 
 ``attention_backend``
-   ``sdpa`` (default) is the reference kernel, cuDNN on an H100. ``flashinfer`` runs the
-   DiT's joint attention on the engine's ragged FlashInfer resource; both are CUDA-graph
-   replayable.
+   ``sdpa`` (the shipped configs) is the reference kernel: torch's SDPA called by the model,
+   cuDNN on an H100 and a B300. ``flashinfer`` (the model's default when a config names none)
+   runs the DiT's joint attention on the engine's ragged attention resource, whose kernel the
+   GPU's ``ragged_attention`` table picks: torch's cuDNN SDPA on ``sm_103`` (B300), FlashInfer's
+   ragged prefill (FA3 on Hopper) where no table covers the GPU. ``resources: dit_attn:
+   backend: flashinfer`` keeps FlashInfer. Both are CUDA-graph replayable. Z-Image takes the
+   same knob.
 
 ``compile``
    ``torch.compile`` of the transformer, one trace per shape.
