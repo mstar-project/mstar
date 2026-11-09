@@ -1,4 +1,3 @@
-
 import torch
 
 from mstar.communication.tensors import NameToTensorList
@@ -26,6 +25,8 @@ from mstar.model.waypoint.config import WaypointConfig
 PRIME_WALK = "prime"
 ROLLOUT_WALK = "rollout"
 ROLLOUT_LOOP_NAME = "rollout_loop"
+# the client stream of per-frame controller rows (see WaypointModel._action_rows)
+ACTIONS_STREAM = "actions"
 
 # Resource labels this node declares.
 KV_RESOURCE = "kv"
@@ -147,9 +148,11 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs | None:
-        """This frame's row: the ring clock, its controller slice, and either
+        """This frame's row: the ring clock, its controller row, and either
         the noise to denoise from (rollout) or the latent to prime with. Also
-        the nine decoder histories the fused decode reads and writes.
+        the nine decoder histories the fused decode reads and writes. A
+        rollout step on the actions stream's empty final chunk is declined,
+        which ends the loop.
 
         Runs on the host, outside any captured region, which is why the noise
         is drawn here rather than in ``forward``: a captured region cannot
@@ -163,19 +166,18 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
         dtype = self.dit.dtype
         # The clock is per request and lives on the host
         state = self.request_state(fwd_info.rid_handle)
-
         frame_pos = int(state.get("frame_pos", 0))
 
         if graph_walk == PRIME_WALK:
-            # Prime has its own idle action and must not consume the
-            # client's action zero.
+            # Prime has its own idle action; the client's first action is the
+            # first rollout frame's.
             mouse, button, scroll = self._idle_controller(device, dtype)
         else:
-            # the loop's cap (num_steps) ends the rollout, so this stays in range
-            action_index = int(fwd_info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
-            mouse, button, scroll = self._controller_slice(
-                inputs, action_index, device, dtype
-            )
+            rows = inputs.get(ACTIONS_STREAM)
+            if not rows:
+                assert kwargs.get("is_final_stream_chunk"), "an empty chunk before the end of the stream"
+                return None
+            mouse, button, scroll = self._controller_row(rows[0], device, dtype)
         tensor_inputs = {
             # [1], never []: see the class docstring.
             "frame_pos": torch.full((1,), frame_pos, dtype=torch.int64, device=device),
@@ -249,41 +251,13 @@ class WaypointDitSubmodule(_FunctionalAeMixin, NodeSubmodule):
             dtype=dtype,
         )
 
-    def _controller_slice(
-        self,
-        inputs: NameToTensorList,
-        action_index: int,
-        device: torch.device,
-        dtype: torch.dtype,
+    def _controller_row(
+        self, row: torch.Tensor, device: torch.device, dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """This frame's ``(mouse, button, scroll)``, each ``[1, 1, *]``.
-
-        The request carries the whole scripted action stream as ``[1, F, *]``
-        and one frame is sliced out per step; the conductor re-injects the
-        same loop-external tensor every iteration while the rollout counter
-        advances through it. Prime never calls this method.
-        """
-        widths = {"mouse": 2, "button": self.config.n_buttons, "scroll": 1}
-        out = []
-        for name, width in widths.items():
-            supplied = inputs.get(name) if inputs is not None else None
-            if not supplied:
-                raise ValueError(f"Waypoint rollout is missing its {name!r} action stream.")
-            stream = supplied[0]
-            if stream.ndim != 3 or stream.shape[0] != 1 or stream.shape[2] != width:
-                raise ValueError(
-                    f"Waypoint {name!r} stream must have shape [1, steps, {width}]; "
-                    f"got {tuple(stream.shape)}."
-                )
-            if not 0 <= action_index < stream.shape[1]:
-                raise IndexError(
-                    f"Waypoint action index {action_index} is outside the {name!r} "
-                    f"stream of length {stream.shape[1]}."
-                )
-            out.append(
-                stream[:, action_index : action_index + 1].to(device=device, dtype=dtype)
-            )
-        return tuple(out)
+        """One action row, ``[mouse dx, dy | buttons | scroll]``, as this
+        frame's ``(mouse, button, scroll)``, each ``[1, 1, *]``."""
+        row = row.to(device=device, dtype=dtype).reshape(1, 1, -1)
+        return tuple(row.split((2, self.config.n_buttons, 1), dim=-1))
 
     def _idle_controller(
         self, device: torch.device, dtype: torch.dtype,

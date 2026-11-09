@@ -321,7 +321,10 @@ def decode():
     return rt, book
 
 
-def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
+def _run_pass(rt, book, rid, uuids, on_decode=None, declined_decode=None) -> list[str]:
+    """One pass of the walk. ``declined_decode`` (1-based) is the ar_decode
+    iteration the row declines on its stream's final chunk: the worker stops
+    the loop and completes the node with no outputs."""
     def fresh():
         u = next(uuids)
         book.put_tensor(u, _info(u))
@@ -342,13 +345,19 @@ def _run_pass(rt, book, rid, uuids, on_decode=None) -> list[str]:
         if node == "ar_decode" and on_decode is not None:
             on_decode()
         signals = rt.get_output_signals(node, WALK)
+        declined = node == "ar_decode" and log.count(node) == declined_decode
+        if declined:
+            rt.stop_loops_batched(
+                partition="default", graph_walk=WALK, last_node_run=node,
+                loop_names=ParallelList([rid], [["ar_loop"]]),
+            )
         rt.complete_and_route_batch(
             RouteInput(
                 partition="default", graph_walk=WALK, node_name=node,
                 output_signals=signals,
                 wg_ids=ParallelList([rid], [WG_ID]),
-                tensors=[fresh() for _ in signals],
-                num_tensors=[1] * len(signals),
+                tensors=[] if declined else [fresh() for _ in signals],
+                num_tensors=[0 if declined else 1] * len(signals),
             ),
         )
     return log
@@ -366,6 +375,18 @@ def test_a_capped_loop_ends_at_its_cap_on_every_pass(decode):
 
     assert first.count("ar_decode") == second.count("ar_decode") == 2
     assert other.count("ar_decode") == 4, "the cap leaked to the next request"
+
+
+def test_a_loop_ends_on_an_iteration_that_ran_no_forward(decode):
+    rt, book = decode
+    uuids = iter(range(1, 500))
+    rid = _admit(rt)
+
+    first = _run_pass(rt, book, rid, uuids, declined_decode=2)
+    second = _run_pass(rt, book, rid, uuids)
+
+    assert first == ["prefill", "ar_decode", "ar_decode"]
+    assert second.count("ar_decode") == 4, "the walk did not complete"
 
 
 def test_speculation_stops_at_the_cap(decode):

@@ -337,7 +337,7 @@ def test_a_row_the_cache_served_does_not_make_a_batch_too_big_alone():
     )
     worker.pipeline._handle_admit_failure(batch, SimpleNamespace(
         node_name=SCHED_NODE, admit_error=reason, failed_resource="kv",
-        request_ids=list(spans), cached_rids={"cached"},
+        request_ids=list(spans), no_forward_rids={"cached"},
     ))
 
     assert _engine(worker).offloaded == ["decoder"], "the request holding pages was not evicted"
