@@ -1010,3 +1010,19 @@ def test_postprocess_skips_a_rid_whose_forward_raised():
     assert submodule.postprocessed == ["a"]
     assert set(batch.failed_requests) == {"b"}
     assert batch.failed_requests["b"].message == "ValueError: forward failed for b"
+
+
+def test_a_raised_batch_postprocess_blames_no_row():
+    """The hook runs over the whole batch, so a ``TypeError`` from it can't be
+    pinned on one row: each reports a server error, not a 400 of its own."""
+    class Raises(_TailSubmodule):
+        def batch_postprocess(self, *args, **kwargs):
+            raise TypeError("bad batch")
+
+    engine = make_engine(_submodules={"node": make_mgmt(submodule=Raises())})
+    batch = _exec_batch(["a", "b"])
+
+    engine._postprocess_batch(batch, {"a": {"token": 1}, "b": {"token": 2}})
+
+    assert {err.status for err in batch.failed_requests.values()} == {500}
+    assert set(batch.failed_requests) == {"a", "b"}

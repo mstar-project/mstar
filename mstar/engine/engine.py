@@ -502,11 +502,13 @@ class ExecutingBatch:
         self.outputs_ready.set()
         self.commit_done.set()
 
-    def register_failure(self, rid: int, error: Exception, walk: str | None = None):
+    def register_failure(
+        self, rid: int, error: Exception, walk: str | None = None, *, whole_step: bool = False,
+    ):
         self.failed_requests[rid] = RequestError.from_exception(
             error,
             f"request {rid} failed (node={self.node_name}, walk={walk or self.graph_walk})",
-            log=logger,
+            log=logger, whole_step=whole_step,
         )
 
     def drop_rids(self, rids: set[int]):
@@ -2266,7 +2268,7 @@ class Engine:
                     rids, batch.node_name, batch.step_context.graph_walk,
                 )
                 for rid in rids:
-                    batch.register_failure(rid, error)
+                    batch.register_failure(rid, error, whole_step=True)
 
     def exec_and_postprocess(
         self, batch: ExecutingBatch
