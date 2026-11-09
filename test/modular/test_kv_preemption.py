@@ -186,6 +186,27 @@ def test_a_request_that_moved_holds_back_newer_prompts_once_it_is_the_oldest(mov
     assert _admitted(kv, "v") and _ready(kv, "c2")
 
 
+def test_small_prompts_pass_a_dropped_request_with_pages_free_while_an_older_request_runs():
+    """A dropped request waited in the queue at its arrival, so six 1-page prompts waited behind v with 6 pages free.
+    It holds newer prompts back only once it is the oldest."""
+    kv = _pool()
+    _running(kv, "r", 2, arrival=1)
+    _running(kv, "v", 7, arrival=2)
+    assert _preempt(kv, "r", _step(kv, "r", 2 * PAGE_SIZE).reason.pages_short, droppable=lambda rid: True).to_drop == [
+        "v"
+    ]
+    _drop(kv, "v")
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok
+
+    started = []
+    for arrival in range(3, 9):
+        _request(kv, f"c{arrival}", 1, arrival)
+        if _ready(kv, f"c{arrival}"):
+            started.append(arrival)
+
+    assert len(started) == 6, "the 1-page prompts waited behind v with pages free"
+
+
 def test_the_engine_orders_requests_by_the_arrival_their_request_info_carries():
     kv = _pool()
     engine = Engine.__new__(Engine)
@@ -1223,6 +1244,31 @@ def test_a_request_neither_the_host_nor_the_device_can_cover_is_short_of_its_foo
     )
 
 
+def test_a_request_short_of_its_guarantee_returns_from_the_host_while_newer_guaranteed_prompts_keep_arriving():
+    """r moved itself to the host, short of its guarantee, and asks to return with its whole footprint. Each newer
+    guaranteed prompt started in the room the last one left, so r waited until it timed out."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(3)
+    _running(kv, "r", 2, arrival=1, rebuildable=False)
+    _running(kv, "s", 1, arrival=2, rebuildable=False)
+    _running(kv, "x", 6, arrival=3)
+    assert _preempt(kv, "r", _step(kv, "r", PAGE_SIZE).reason.pages_short, droppable=lambda rid: False) == (
+        Victims(["r"], [], [])
+    )
+    assert _offload(kv, "r")
+
+    finished = "x"
+    for arrival in range(4, 24):
+        _remove(kv, finished)
+        finished = f"g{arrival}"
+        _request(kv, finished, 1, arrival, guaranteed=True)
+        _runner(kv).admit_request(finished, NODE, WALK)
+        if _admitted(kv, "r"):
+            break
+
+    assert "r" in kv._allotments, "r waited on the host while newer guaranteed prompts kept passing it"
+
+
 def test_a_waiting_request_the_full_host_turns_guaranteed_moves_more_newer_requests_for_its_footprint():
     """p asks the host to set room aside for its prompt only once z2's drop has made room for that prompt. The host
     has none, so p turns guaranteed and asks for its whole footprint, which z2's pages don't cover."""
@@ -1266,6 +1312,34 @@ def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_isnt_admitt
 
     _drop(kv, "z1")
     assert "p" in kv._guaranteed and not _admitted(kv, "p")
+    _drop(kv, "z2")
+
+    assert "p" not in kv._allotments, "p was admitted guaranteed with less than its footprint"
+    for rid in ("o", "z1", "z2"):
+        _remove(kv, rid)
+    assert _admitted(kv, "p") and kv._allotments["p"].pages == 6
+
+
+def test_a_waiting_request_that_turns_guaranteed_on_its_own_admission_isnt_admitted_short_by_its_next_victim():
+    """q's end grows the room to p's 2-page prompt, so the runner admits p, the host has no room to set aside for it,
+    and p asks for its 6-page footprint. Its earmark still asked for the prompt, so z2's drop then admitted p,
+    guaranteed, with 2 pages."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(0)
+    _running(kv, "o", 5, arrival=0)
+    _running(kv, "z1", 2, arrival=2)
+    _running(kv, "z2", 1, arrival=3)
+    _running(kv, "q", 2, arrival=4)
+    for rid in ("z2", "z1"):
+        short = _step(kv, rid, 3 * PAGE_SIZE).reason.pages_short
+        assert _preempt(kv, rid, short, droppable=lambda rid: False).waits
+        _runner(kv).readmit(rid, NODE)
+    _request(kv, "p", 2, arrival=1, rebuildable=False)
+    assert not _ready(kv, "p")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["z2", "z1"]
+    _remove(kv, "q")
+    assert not _admitted(kv, "p") and "p" in kv._guaranteed
+
     _drop(kv, "z2")
 
     assert "p" not in kv._allotments, "p was admitted guaranteed with less than its footprint"
