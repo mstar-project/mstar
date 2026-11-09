@@ -226,18 +226,21 @@ def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
 # More input characters than this per token of context can't fit: a vocabulary's
 # longest token spans a few dozen characters at most.
 _MAX_PROMPT_CHARS_PER_TOKEN = 64
+# A deployment with no paged KV has no context to key on, and its models cut a
+# long prompt instead of refusing it. Past this it is abuse, not a prompt: the
+# largest paged-KV bound (262,144 tokens at 64 characters each).
+_MAX_PROMPT_CHARS_WITHOUT_KV = 1 << 24
 
 
 def _max_prompt_chars(model: Model | None, model_config: dict | None) -> int | None:
-    """The longest prompt worth tokenizing, in characters, for any tokenizer, or
-    None when the deployment has no paged KV to fit it in."""
+    """The longest prompt worth tokenizing, in characters, for any tokenizer."""
     if model is None or not model_config:
         return None
     contexts = [
         spec.config.max_seq_len for spec in serving_resources(model, model_config)
         if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig)
     ]
-    return max(contexts) * _MAX_PROMPT_CHARS_PER_TOKEN if contexts else None
+    return max(contexts) * _MAX_PROMPT_CHARS_PER_TOKEN if contexts else _MAX_PROMPT_CHARS_WITHOUT_KV
 
 
 def adapter_prefix_roots(
@@ -954,7 +957,7 @@ class PreprocessWorkerThread:
         if self._max_prompt_chars is not None:
             chars = max(len(input.text or ""), sum(len(p.text or "") for p in input.prompt_parts or ()))
             if chars > self._max_prompt_chars:
-                raise ValueError(f"prompt of {chars} characters exceeds the model context")
+                raise ValueError(f"prompt of {chars} characters is too long for this model")
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,

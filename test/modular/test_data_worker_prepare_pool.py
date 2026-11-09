@@ -374,6 +374,13 @@ def test_a_prompt_far_past_the_context_is_refused_before_it_is_tokenized():
             return [KVSpec(resource_key="kv", nodes={"node"}, config=config)]
 
     wt = _thread(Model(), config={"model": "m"}, sized=False)
-    with pytest.raises(ValueError, match="exceeds the model context"):
+    with pytest.raises(ValueError, match="too long for this model"):
         wt._prepare_input(_input("r", "a" * (8 * 64 + 1)))
+    assert wt.model.threads == {}
+
+
+def test_a_prompt_past_the_ceiling_is_refused_without_a_paged_kv():
+    wt = _thread(_Model(), config={"model": "m"}, sized=False)
+    with pytest.raises(ValueError, match="too long for this model"):
+        wt._prepare_input(_input("r", "a" * ((1 << 24) + 1)))
     assert wt.model.threads == {}
