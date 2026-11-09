@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 # The serving config's ``rebuild_host_mb`` unless it sets one: 8M prompt ids
 # at 8 B each.
 DEFAULT_REBUILD_HOST_MB = 64
-# The same where a node copies what a walk reads besides the ids. A 1024-token image at hidden size 4096 is 8 MiB of
-# bf16 encoder output.
+# The default where a node copies what a walk reads besides the ids: 128 images of 1024 tokens at hidden size 4096,
+# 8 MiB each of bf16 encoder output.
 DEFAULT_REBUILD_MEDIA_HOST_MB = 1024
 
 
