@@ -188,7 +188,7 @@ def test_an_unread_key_warns_on_every_request(caplog):
         for _ in range(3):
             server._report_ignored_params({"initial_prompt": "x"})
         server._report_ignored_params(
-            {"seed": 1, "prefix_cache": True, "lora_adapter": "a", "max_output_tokens": 4,
+            {"seed": 1, "prefix_cache": True, "lora_adapter": "a", "lora_digest": "d", "max_output_tokens": 4,
              "return_token_ids": True, "return_logprobs": True},
         )
     levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]

@@ -23,7 +23,7 @@ import logging
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -40,7 +40,14 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import (
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    WalkStep,
+)
 from mstar.model.canary.config import (
     ATTN,
     CONTEXT_LABEL,
@@ -52,9 +59,9 @@ from mstar.model.canary.config import (
     SAMPLER,
     CanaryModelConfig,
 )
-from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
+from mstar.model.components.audio_features import HOP_LENGTH, clip_samples
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import SentencePieceDetokenizer, check_kv_pools_fit, check_loaded, kv_pages
+from mstar.model.utils import SentencePieceDetokenizer, TextOutput, check_kv_pools_fit, check_loaded, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -66,6 +73,8 @@ CHECKPOINT_FILES = ["*.json", "*.jinja", "*.safetensors"]
 class CanaryModel(Model):
     """Canary speech recognition / translation: FastConformer encoder +
     autoregressive Transformer decoder."""
+
+    DECODE_LOOP = "decode_loop"
 
     # the route's 40 s window, plus slack for containers that decode longer than
     # their header said; still the largest encoder graph and 4 context pages
@@ -144,10 +153,9 @@ class CanaryModel(Model):
         check_kv_pools_fit(self, config, config_path, logger)
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         return {
             SAMPLER: SamplingReqConfig(
@@ -170,10 +178,6 @@ class CanaryModel(Model):
 
     def get_max_output_tokens_limit(self) -> int:
         return self.get_max_output_tokens()
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([
@@ -205,55 +209,19 @@ class CanaryModel(Model):
         )
         return dict(prefill=prefill, decode=decode)
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
-        audio_edge = GraphEdge(next_node="audio_encoder", name="audio")
-        audio_edge.tensor_info = input_signals.get("audio", [])
-        text_edge = GraphEdge(next_node="decoder", name="text_inputs")
-        text_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [audio_edge, text_edge]
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """prefill -> decode loop -> done."""
-        metadata = partition_metadata
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # the decode loop returned: EOS or the token limit
-            return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
-        edge = GraphEdge(next_node="decoder", name="text_inputs")
-        edge.tensor_info = persist_signals.get("new_token", [])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=[edge],
-            unpersist_tensors=list(edge.tensor_info),
-            step_metadata={"is_prefill": False},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # the prefill hears the clip and samples the first token; decode feeds each one back
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # prompt / output
@@ -303,14 +271,8 @@ class CanaryModel(Model):
     def max_input_files(self) -> dict[str, int]:
         return {"audio": 1}
 
-    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
-        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
-
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        if modality == "text":
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
-        raise ValueError(f"Unsupported modality for Canary: {modality!r}")
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._detokenizer)
 
     # -------------------------------------------------------------------
     # submodules
@@ -355,7 +317,7 @@ class CanaryModel(Model):
                 name_remapper=CanaryDecoderModel.remap,
             )
             check_loaded(decoder, loaded, "Canary decoder")
-            return CanaryDecoderSubmodule(decoder=decoder.eval(), config=self.config)
+            return CanaryDecoderSubmodule(decoder.eval(), self.config)
         return None
 
 
