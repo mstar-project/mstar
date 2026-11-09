@@ -11,6 +11,7 @@ and ``test/rust/test_rust_frontend.py``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import queue
 import threading
@@ -34,7 +35,8 @@ from mstar.communication.event import EventWakeup
 from mstar.conductor.request_info import WalkStep
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import MAX_OUTPUT_TOKENS, Model
+from mstar.model.base import MAX_OUTPUT_TOKENS, Model, TensorAndMetadata
+from mstar.model.registry import MODEL_REGISTRY, get_model_class
 from mstar.model.utils import TextOutput
 from mstar.utils.ipc_format import ConductorMessageType, NewRequestConductor, WorkerGraphsDone
 
@@ -160,6 +162,35 @@ def test_a_prompt_split_around_its_image_counts_the_images_positions(build, tmp_
     text = sum(ids.numel() for name, segments in worker.tensor_manager.stored.items()
                if name.startswith("text_inputs") for ids in segments)
     assert sent == text + 2 + image_tokens
+
+
+def test_a_whisper_request_gets_through_the_data_worker(tmp_path):
+    """A real ``WhisperModel``: its forced decoder prompt is the count."""
+    from test_model_kv_layouts import _whisper
+
+    model = _whisper()
+    model.load_audio = lambda filepath, device: TensorAndMetadata(
+        data=torch.zeros(16000), metadata={"sample_rate": 16000, "num_channels": 1})
+    worker = _data_worker(model)
+    clip = tmp_path / "clip.wav"
+    clip.write_bytes(b"")
+
+    worker._process_input(PreprocessInput(
+        request_id="r", text=None, file_paths={"audio": [str(clip)]},
+        input_modalities=["audio"], output_modalities=["text"], model_kwargs={"language": "en"},
+    ))
+
+    [msg] = worker.communicator.sent
+    assert msg.body.prompt_tokens == worker.tensor_manager.stored["text_inputs"][0].numel() > 0
+
+
+@pytest.mark.parametrize("module, cls", sorted(set(MODEL_REGISTRY.values())))
+def test_no_registered_model_overrides_prompt_tokens_with_other_arguments(module, cls):
+    """The data worker calls ``prompt_tokens(tensors, kv_layout)`` on every
+    model, so a helper of the same name with other arguments fails each request."""
+    name = next(name for name, entry in MODEL_REGISTRY.items() if entry == (module, cls))
+    theirs = inspect.signature(get_model_class(name).prompt_tokens)
+    assert list(theirs.parameters) == list(inspect.signature(Model.prompt_tokens).parameters)
 
 
 STOP_ID = 2
