@@ -41,8 +41,8 @@ class Admission:
     such a resource once it asks nothing more of the request (`Resource.ask`), since that takes nothing from the
     requests ahead of it. A request that asks again (`readmit`) waits in no queue, and `admit_waiting` tries it,
     oldest first, whenever what it didn't fit has grown. It holds up no newer request unless it is the oldest
-    request that has asked a resource it waits for, when that resource's queue admits no one, so newer prompts
-    can't keep passing it.
+    request that has asked a resource it waits for, when that resource's queue admits no one it hasn't already
+    reserved for, so newer prompts can't keep passing it.
     """
 
     def __init__(self, resources: Mapping[str, Resource], ask_order: Collection[str]) -> None:
@@ -188,7 +188,6 @@ class Admission:
             nodes = self._reserve(rid, lambda node, rid=rid: published_of(rid, node))
             if nodes:
                 started.extend((node, rid) for node in nodes)
-        held = self._held_back()
         admitted = True
         while admitted:
             admitted = False
@@ -197,6 +196,7 @@ class Admission:
                     continue
                 rid = queue[0]
                 entry = self._waiting[rid]
+                held = self._held_back(rid)
                 if any(self._queues[key][0] != rid or key in self._short or key in held for key in entry.asked):
                     continue
                 nodes = self._reserve(rid, lambda node, rid=rid: published_of(rid, node))
@@ -292,14 +292,14 @@ class Admission:
         resource refuses it."""
         if rid in self._refused:
             return None
-        held = self._held_back()
+        held = self._held_back(rid)
         passing, reserved = [], []
         for key, (node_name, graph_walk) in self._waiting[rid].asked.items():
             first = self._queues[key][0]
+            if key in held:
+                return None
             if key in self._passes and self._resources[key].ask(rid, node_name, graph_walk) is None:
                 reserved.append(key)
-            elif key in held:
-                return None
             elif first == rid:
                 if key in self._short:
                     return None
@@ -319,9 +319,9 @@ class Admission:
     def _blocked(self, rids: Iterable[str]) -> dict[str, str]:
         """Those of the waiting ``rids`` that can't start now and may be passed, each with the resource whose queue
         a return holds back, or that refused it, first in its queue or passing, and hasn't grown since."""
-        back = self._held_back()
         blocked = {}
         for rid in rids:
+            back = self._held_back(rid)
             if key := next((key for key in self._waiting[rid].asked if key in back), None):
                 blocked[rid] = key
                 continue
@@ -332,11 +332,14 @@ class Admission:
                 blocked[rid] = held[0]
         return blocked
 
-    def _held_back(self) -> set[str]:
-        """The resources whose oldest asker waits for them as a return."""
+    def _held_back(self, rid: str) -> set[str]:
+        """The resources waiting ``rid`` asked whose oldest asker waits for them as a return, other than those that
+        have already reserved for ``rid`` and so ask nothing more of it."""
+        asked = self._waiting[rid].asked
         return {
-            key for key, askers in self._askers.items()
-            if askers and askers[0] in self._returns and key in self._waiting[askers[0]].asked
+            key for key, (node_name, graph_walk) in asked.items()
+            if (askers := self._askers[key]) and askers[0] in self._returns and key in self._waiting[askers[0]].asked
+            and self._resources[key].ask(rid, node_name, graph_walk) is not None
         }
 
     def _leave(self, rid: str, keys: Collection[str]) -> None:

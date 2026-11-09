@@ -500,7 +500,7 @@ ran short gets the pages freed, up to its shortage. When the newer requests can'
 moves to the host if the host pool can hold all of its pages, and otherwise waits holding its
 pages. A request on the host, a dropped one and one waiting for pages wait outside the queue, so a
 new prompt that fits still starts, unless one of them is the oldest request in its pool, which no
-newer prompt passes. They are tried oldest first, before the queue. The oldest refused request that moves can let
+newer prompt passes unless its room is already allotted. They are tried oldest first, before the queue. The oldest refused request that moves can let
 in moves newer requests that wait holding pages, to the host or by a drop as above, and the pages they free are set aside for
 it. A request on the host returns once its pages and one more page fit, or every page its
 grant needed when it moved itself, and its pages are then copied back. A dropped request returns
