@@ -25,8 +25,12 @@ name: Claude Review
 #   4. The job's token can write only to pull requests, and the review app's
 #      token (below) only to pull requests and issues of this repository, and
 #      in full mode to the media repository's contents
-#      (REVIEW_MEDIA_REPO). The job token has no issues: write (the app token
-#      it mints does, to post and react) and can't read repository variables.
+#      (REVIEW_MEDIA_REPO). The one exception is the approval's own token,
+#      minted for the approve step alone, which has contents write on this
+#      repository (GitHub counts an app's approval only when it can push); that
+#      step runs no model and no PR code. The job token has no issues: write
+#      (the app token it mints does, to post and react) and can't read
+#      repository variables.
 #      The model has no shell and no mutation tools: it returns its inline
 #      findings and the summary as fields, which a workflow step redacts, makes
 #      inert and posts. In light
