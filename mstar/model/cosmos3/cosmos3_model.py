@@ -155,7 +155,6 @@ VISION_ENCODER_NODE = "vision_encoder"
 REASONER_NODE = "reasoner"
 
 
-
 class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 

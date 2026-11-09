@@ -765,9 +765,9 @@ Worker scheduling
        when the runner admits it (``SamplerResource.reserve``): past them it
        waits, as for a recurrent state slot, until a removed request frees
        one. Only for a node that reads its tokens back on the device
-       (Qwen3.5, Qwen3-ASR, Whisper) with the device loop-back on, on one
-       rank: above one, where admission doesn't decide, the masters grow and
-       the scatter runs after the replay, as with ``0``.
+       (Qwen3.5, Qwen3-ASR, Whisper, the Cosmos3 reasoner) with the device
+       loop-back on, on one rank: above one, where admission doesn't decide,
+       the masters grow and the scatter runs after the replay, as with ``0``.
    * - ``MSTAR_SAMPLER_SLOTS``
      - config's ``knobs: sampler_slots``, else ``4096``
      - Request rows of the sampler masters a captured graph indexes when
