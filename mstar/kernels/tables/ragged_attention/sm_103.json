@@ -5,10 +5,9 @@
     {
       "dtype": "bfloat16",
       "shape": {"head_dim": 128, "num_kv_heads": 24, "num_qo_heads": 24},
-      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=24,num_kv_heads=24,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,32768,65536", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "FLUX.2 klein 4B dit joint attention at 1024x1024 (4608 tokens) and Wan2.2-TI2V-5B self-attention at 832x480x33 (3510 tokens), served on these rows. Rows: cudnn up to 4608 tokens, the largest size a served model ran on it; FlashInfer's default past that; measured above 4608 tokens (LTX-2.5's video self-attention sizes) is kernel-level only"},
+      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=24,num_kv_heads=24,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,32768,65536", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "FLUX.2 klein 4B dit joint attention at 1024x1024 (4608 tokens) and Wan2.2-TI2V-5B self-attention at 832x480x33 (3510 tokens), served on these rows. Rows: cudnn at every size; measured above 4608 tokens is kernel-level only"},
       "rows": {
-        "4608": {"impl": "cudnn"},
-        "*": {"impl": "flashinfer"}
+        "*": {"impl": "cudnn"}
       },
       "measured": {
         "128": {"us": 11.41, "default_us": 22.41, "cudnn_us": 11.41, "flashinfer_fa2_us": 21.0, "flashinfer_cudnn_us": 26.02},
@@ -24,10 +23,9 @@
     {
       "dtype": "bfloat16",
       "shape": {"head_dim": 128, "num_kv_heads": 30, "num_qo_heads": 30},
-      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=30,num_kv_heads=30,head_dim=128 --buckets 128,1024,4096,4608", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "Z-Image Turbo dit attention at 1024x1024 (main 4128-4224, image 4096, caption 32-128 tokens), served on these rows. Rows: cudnn up to 4608 tokens, the largest size a served model ran on it; FlashInfer's default past that"},
+      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=30,num_kv_heads=30,head_dim=128 --buckets 128,1024,4096,4608", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "Z-Image Turbo dit attention at 1024x1024 (main 4128-4224, image 4096, caption 32-128 tokens), served on these rows. Rows: cudnn at every size; past 4608 tokens neither swept nor served"},
       "rows": {
-        "4608": {"impl": "cudnn"},
-        "*": {"impl": "flashinfer"}
+        "*": {"impl": "cudnn"}
       },
       "measured": {
         "128": {"us": 11.67, "default_us": 22.77, "cudnn_us": 11.67, "flashinfer_fa2_us": 21.76, "flashinfer_cudnn_us": 26.05},
@@ -39,10 +37,9 @@
     {
       "dtype": "bfloat16",
       "shape": {"head_dim": 128, "num_kv_heads": 32, "num_qo_heads": 32},
-      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=32,num_kv_heads=32,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,32768,65536", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "FLUX.2 klein 9B dit joint attention at 1024x1024 (4608 tokens), served on these rows. Rows: cudnn up to 4608 tokens, the largest size a served model ran on it; FlashInfer's default past that; measured above 4608 tokens (LTX-2.5's video self-attention sizes) is kernel-level only"},
+      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-09", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=32,num_kv_heads=32,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,32768,65536", "torch": "2.12.1+cu132", "triton": "3.7.1", "mstar": "454fcc3ae", "note": "FLUX.2 klein 9B dit joint attention at 1024x1024 (4608 tokens), and with the \"*\" row LTX-2.5's video self-attention at 544x960x121 (8160 tokens, captured), served on these rows. Rows: cudnn at every size; measured past 8160 tokens is kernel-level only"},
       "rows": {
-        "4608": {"impl": "cudnn"},
-        "*": {"impl": "flashinfer"}
+        "*": {"impl": "cudnn"}
       },
       "measured": {
         "128": {"us": 11.56, "default_us": 23.42, "cudnn_us": 11.56, "flashinfer_fa2_us": 21.69, "flashinfer_cudnn_us": 25.1},

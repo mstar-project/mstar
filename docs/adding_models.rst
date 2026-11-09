@@ -1012,10 +1012,11 @@ geometry on the GPU. An eager plan runs the row its layout's longest query segme
 one slot can run a different kernel from one layout to the next; a captured bucket runs the row of
 the layout that first plans it. On ``sm_103`` the table names torch's cuDNN SDPA (``RaggedAttnBackend.CUDNN``) for
 klein 4B / 9B and Z-Image's geometries (24, 32 and 30 heads of 128; Wan2.2-TI2V-5B's 24 heads read
-klein 4B's entry) up to 4608 tokens, the largest size a served model ran on it: under a CUDA graph
-FlashInfer's ``auto`` stays on FA2 there (its cutlass plan can't be replanned in graph mode, and its
-cuDNN path needs cuDNN 9.24), which is about 4.5x slower at those sizes. Past 4608 tokens a ``"*"``
-row names ``flashinfer``, the resource's own default. A GPU of the architecture reads the file
+klein 4B's entry, LTX-2.5's 32-head video self-attention klein 9B's): under a CUDA graph FlashInfer's
+``auto`` stays on FA2 there (its cutlass plan can't be replanned in graph mode, and its cuDNN path needs
+cuDNN 9.24), which is 3.5-5x slower from 1k to 64k tokens. An entry whose larger sizes no served model
+has run bounds them with a numeric last row and a ``"*"`` row naming ``flashinfer``, the resource's own
+default. A GPU of the architecture reads the file
 whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
 segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
 the layout it was planned with, so a captured bucket takes it only when the step that plans it
