@@ -352,6 +352,11 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.media_limits.html">mstar.model.media_limits</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.minimax_h3.html">mstar.model.minimax_h3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.minimax_h3.components.html">mstar.model.minimax_h3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.minimax_h3.tests.html">mstar.model.minimax_h3.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.muse.html">mstar.model.muse</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.muse.components.html">mstar.model.muse.components</a></li>
@@ -391,7 +396,6 @@
 </details></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
 </ul>
 </details></li>
@@ -740,6 +744,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-streaming-rollout-windowed-video">Cosmos3 streaming rollout (windowed video)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#ltx-2-5-ltx2-5">LTX-2.5 (<code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code>)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#minimax-h3-minimax-h3">MiniMax-H3 (<code class="docutils literal notranslate"><span class="pre">minimax_h3</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flux-2-klein-flux2-klein-flux2-klein-9b">FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)</a></li>
 </ul>
             </nav>
@@ -1026,7 +1031,15 @@ the FLUX Non-Commercial License; check it before deploying.</p></td>
 joint audio-video DiT and Gemma-4 text encoder, emitting an H.264 video and 48 kHz
 stereo audio. Gated; LTX-2.x Community License.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">minimax_h3</span></code> <em>(Beta)</em></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">MiniMaxAI/MiniMax-H3</span></code></p></td>
+<td><p>MiniMax-H3 (FL2VA) text- and first/last-frame-to-audio+video: a 33B packed-sequence
+audio-video DiT, CFG-distilled (one forward per step, 50 sigma points by default), a
+Qwen3-VL-32B conditioner (keyframes through its vision tower) and a ViT video VAE,
+emitting an H.264 video at 24 fps with 32 kHz stereo audio (one mp4 with AAC on
+<code class="docutils literal notranslate"><span class="pre">/v1/videos/generations</span></code>). MiniMax H3 Community License Agreement.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">z_image_turbo</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Tongyi-MAI/Z-Image-Turbo</span></code></p></td>
 <td><p>Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
 encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.</p></td>
@@ -2885,6 +2898,97 @@ video VAE’s decoder at load for <code class="docutils literal notranslate"><sp
 from the eager decode; other shapes decode eager). The SP2 config doesn’t capture 1088x1920
 but lists it there, so its two-stage decode runs compiled too.</p>
 </section>
+<section id="minimax-h3-minimax-h3">
+<h2>MiniMax-H3 (<code class="docutils literal notranslate"><span class="pre">minimax_h3</span></code>)<a class="headerlink" href="#minimax-h3-minimax-h3" title="Link to this heading">#</a></h2>
+<p>Text- and first/last-frame-to-audio+video on <strong>MiniMax-H3</strong> (<code class="docutils literal notranslate"><span class="pre">MiniMaxAI/MiniMax-H3</span></code>,
+its <code class="docutils literal notranslate"><span class="pre">FL2VA</span></code> checkpoint; MiniMax H3 Community License Agreement): a 33B packed-sequence
+audio-video DiT, guidance-distilled (one forward per step), a Qwen3-VL-32B conditioner
+and a ViT video VAE, at 24 fps with 32 kHz stereo audio. Not ported: <code class="docutils literal notranslate"><span class="pre">Ref2VA</span></code>, the
+H3-Context-IR prompt rewriter and the 2K regenerator.</p>
+<p>Nodes: <code class="docutils literal notranslate"><span class="pre">text_encoder</span></code> (Qwen3-VL to layer 50, keyframes through its vision tower, then
+the DiT’s <code class="docutils literal notranslate"><span class="pre">condition_proj</span></code> and token refiner; once per request), <code class="docutils literal notranslate"><span class="pre">vae_encoder</span></code>
+(keyframes), <code class="docutils literal notranslate"><span class="pre">dit</span></code> (the DiT scaffold’s denoise loop, Ulysses SP), <code class="docutils literal notranslate"><span class="pre">vae_decoder</span></code> and
+<code class="docutils literal notranslate"><span class="pre">audio_decoder</span></code>. In the SP configs <code class="docutils literal notranslate"><span class="pre">vae_decoder</span></code> sits in the DiT’s SP group: each rank
+decodes a share of the clips, between denoise steps.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>mstar<span class="w"> </span>serve<span class="w"> </span>minimax_h3<span class="w">                                        </span><span class="c1"># 4 GPUs: DiT SP4</span>
+mstar<span class="w"> </span>serve<span class="w"> </span>minimax_h3<span class="w"> </span>--config<span class="w"> </span>configs/minimax_h3_sp8.yaml<span class="w">   </span><span class="c1"># 8 GPUs: DiT SP8</span>
+mstar<span class="w"> </span>serve<span class="w"> </span>minimax_h3<span class="w"> </span>--config<span class="w"> </span>configs/minimax_h3_sp2.yaml<span class="w">   </span><span class="c1"># 2 GPUs: DiT SP2</span>
+mstar<span class="w"> </span>serve<span class="w"> </span>minimax_h3<span class="w"> </span>--config<span class="w"> </span>configs/minimax_h3_2gpu.yaml<span class="w">  </span><span class="c1"># 2 GPUs, no SP</span>
+</pre></div>
+</div>
+<p>Request knobs (<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>): <code class="docutils literal notranslate"><span class="pre">height</span></code> / <code class="docutils literal notranslate"><span class="pre">width</span></code> (multiples of 32, aspect 1:4 to
+4:1; default 768x1344, or the first keyframe’s aspect), <code class="docutils literal notranslate"><span class="pre">num_frames</span></code> (snapped up to
+17n+5, 5 to 15 s; default 124), <code class="docutils literal notranslate"><span class="pre">num_inference_steps</span></code> (sigma points, default 50: 49
+forwards), <code class="docutils literal notranslate"><span class="pre">flow_shift</span></code> / <code class="docutils literal notranslate"><span class="pre">audio_flow_shift</span></code> (12 / 3), <code class="docutils literal notranslate"><span class="pre">seed</span></code>, and with one or two
+images <code class="docutils literal notranslate"><span class="pre">keyframe_anchors</span></code> (<code class="docutils literal notranslate"><span class="pre">first</span></code> / <code class="docutils literal notranslate"><span class="pre">last</span></code> per image). These are a 400: a prompt
+over the text encoder’s 262,144 positions (keyframe tokens included; <code class="docutils literal notranslate"><span class="pre">max_prompt_tokens</span></code>
+lowers it), a packed sequence over <code class="docutils literal notranslate"><span class="pre">max_packed_rows</span></code> (default 131072: the longest 768p
+clip, 14.4 s, with a ~25k-token prompt), Qwen’s vision tokens in the prompt, and a last
+keyframe outside 1:4 to 4:1 next to a first one (it is cropped to the canvas). One request
+runs per denoise step. <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/v1/videos/generations</span></code>
+returns one mp4 with the audio as AAC (<code class="docutils literal notranslate"><span class="pre">image</span></code> is the first frame,
+<code class="docutils literal notranslate"><span class="pre">extra_body.last_image</span></code> the last; the mux needs <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code> on <code class="docutils literal notranslate"><span class="pre">PATH</span></code>).</p>
+<p>Deployment knobs (<code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>; the SP configs set <code class="docutils literal notranslate"><span class="pre">compile</span></code>, <code class="docutils literal notranslate"><span class="pre">vae_tile_batch:</span> <span class="pre">28</span></code> and
+<code class="docutils literal notranslate"><span class="pre">vae_compile</span></code>):</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">compile</span></code>: the DiT’s blocks, static per row bucket: each new bucket compiles (5-8 s)
+mid-request. At <code class="docutils literal notranslate"><span class="pre">MSTAR_RECOMPILE_LIMIT</span></code>’s default of 84 (measured at SP2 on H200), a
+bucket past the 42nd runs partly eager and one past the 84th fully eager; buckets compiled
+before stay compiled.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">row_bucket</span></code>: the DiT’s packed rows pad up to a multiple of this and of the SP size, as
+a tail segment that attends only to itself and reaches no output. Default 256 with
+<code class="docutils literal notranslate"><span class="pre">compile</span></code> (one graph per 256 prompt tokens per canvas, at most 0.7% more rows at
+768p), else 1.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">vae_tile_batch</span></code>: 256-px tiles per decoder call (28 is one 768p clip).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">vae_compile</span></code>: the decoder’s blocks, static per tile batch; a canvas or clip share with
+another tile count compiles again. A 768p clip’s share decodes in 2.1 s instead of 3.2 s
+on one H200, within 62.9 dB of eager.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code>: <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code>, or <code class="docutils literal notranslate"><span class="pre">sdpa</span></code> (the reference’s kernel).</p></li>
+</ul>
+<p>Async scheduling is on for the DiT and the decoder, the default for parallel nodes
+(<code class="docutils literal notranslate"><span class="pre">tp_async_sched:</span> <span class="pre">false</span></code> turns it off); on and off measured within noise. Runtime needs:
+PyAV, transformers’ image processor (a server that can’t import it, e.g. next to a
+torchaudio built for another torch, refuses to start), FlashInfer, and <code class="docutils literal notranslate"><span class="pre">ffmpeg</span></code>. Each DiT
+rank holds the whole DiT, and the SP configs put the conditioner beside it on rank 0 (117 GiB
+in use once loaded), so they need 141 GB GPUs (H200); no config has been run on 80 GB cards.</p>
+<p>At <code class="docutils literal notranslate"><span class="pre">attention_backend:</span> <span class="pre">sdpa</span></code> the nodes’ modules, driven by <code class="docutils literal notranslate"><span class="pre">test/minimax_h3/parity.py</span></code>
+(fp32 matmuls at “highest”), are bit-identical to diffusers’ MiniMax-H3 pipeline end to end
+(latents, frames, waveform); with <code class="docutils literal notranslate"><span class="pre">--exact</span></code> the script exits nonzero when one isn’t.
+FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H200, three
+seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers’, where the
+reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
+served clip is below that spread on one seed’s video and another’s audio.</p>
+<p>Seconds per clip, one request at a time, each engine on the same H200s (M* on torch
+2.12.1+cu132 and FlashInfer 0.7.2; text only, 1344x768, 124 frames, 49 DiT forwards, seed 0,
+median of 3 after a warmup; <code class="docutils literal notranslate"><span class="pre">benchmark/minimax_h3/bench_video.py</span> <span class="pre">--seed</span> <span class="pre">0</span></code> sends these
+requests):</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>s/clip</p></th>
+<th class="head"><p>M*</p></th>
+<th class="head"><p>SGLang 0.5.23</p></th>
+<th class="head"><p>vllm-omni 0.33.0rc1</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>SP4, 4x H200 (<code class="docutils literal notranslate"><span class="pre">configs/minimax_h3.yaml</span></code>)</p></td>
+<td><p>76.8</p></td>
+<td><p>71.8</p></td>
+<td><p>78.2</p></td>
+</tr>
+<tr class="row-odd"><td><p>SP8, 8x H200 (<code class="docutils literal notranslate"><span class="pre">configs/minimax_h3_sp8.yaml</span></code>)</p></td>
+<td><p>39.4</p></td>
+<td><p>38.1</p></td>
+<td><p>41.8</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>SGLang ran <code class="docutils literal notranslate"><span class="pre">--performance-mode</span> <span class="pre">speed</span></code> at Ulysses 4 / 8, without compile or step caching;
+vllm-omni USP 4 / 8 with the text encoder and VAE split as wide. The DiT’s 49 steps are
+~74 s of the SP4 clip. Not done: CUDA-graph capture, more than one request per step, tensor
+parallelism, <code class="docutils literal notranslate"><span class="pre">Ref2VA</span></code>.</p>
+</section>
 <section id="flux-2-klein-flux2-klein-flux2-klein-9b">
 <h2>FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)<a class="headerlink" href="#flux-2-klein-flux2-klein-flux2-klein-9b" title="Link to this heading">#</a></h2>
 <p>Text-to-image and reference-image editing on the step-distilled <strong>FLUX.2 [klein]</strong>
@@ -3118,6 +3222,7 @@ since its magnitudes would be dropped from the merge.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cosmos3-streaming-rollout-windowed-video">Cosmos3 streaming rollout (windowed video)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#wan2-2-wan22">Wan2.2 (<code class="docutils literal notranslate"><span class="pre">wan22</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#ltx-2-5-ltx2-5">LTX-2.5 (<code class="docutils literal notranslate"><span class="pre">ltx2_5</span></code>)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#minimax-h3-minimax-h3">MiniMax-H3 (<code class="docutils literal notranslate"><span class="pre">minimax_h3</span></code>)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#flux-2-klein-flux2-klein-flux2-klein-9b">FLUX.2 [klein] (<code class="docutils literal notranslate"><span class="pre">flux2_klein</span></code> / <code class="docutils literal notranslate"><span class="pre">flux2_klein_9b</span></code>)</a></li>
 </ul>
   </nav></div>

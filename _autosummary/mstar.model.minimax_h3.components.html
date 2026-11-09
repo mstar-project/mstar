@@ -8,7 +8,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>mstar.model.qwen3_5.components.rope &#8212; M* v0.2.1 Documentation</title>
+    <title>mstar.model.minimax_h3.components &#8212; M* v0.2.1 Documentation</title>
   
   
   
@@ -46,12 +46,12 @@
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=ccdb6887"></script>
     <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.model.qwen3_5.components.rope';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = '_autosummary/mstar.model.minimax_h3.components';</script>
     <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="mstar.model.qwen3_5.config" href="mstar.model.qwen3_5.config.html" />
-    <link rel="prev" title="mstar.model.qwen3_5.components" href="mstar.model.qwen3_5.components.html" />
+    <link rel="next" title="mstar.model.minimax_h3.tests" href="mstar.model.minimax_h3.tests.html" />
+    <link rel="prev" title="mstar.model.minimax_h3" href="mstar.model.minimax_h3.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
@@ -139,10 +139,6 @@
     </div>
   
 
-  
-    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
-      <span class="fa-solid fa-outdent"></span>
-    </button>
   
 </div>
 
@@ -352,6 +348,11 @@
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.media_limits.html">mstar.model.media_limits</a></li>
+<li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.model.minimax_h3.html">mstar.model.minimax_h3</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l4 current active"><a class="current reference internal" href="#">mstar.model.minimax_h3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.minimax_h3.tests.html">mstar.model.minimax_h3.tests</a></li>
+</ul>
+</details></li>
 <li class="toctree-l3"><a class="reference internal" href="mstar.model.multimodal.html">mstar.model.multimodal</a></li>
 <li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.muse.html">mstar.model.muse</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.muse.components.html">mstar.model.muse.components</a></li>
@@ -389,9 +390,8 @@
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
 </ul>
 </details></li>
-<li class="toctree-l3 current active has-children"><a class="reference internal" href="mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
-<li class="toctree-l4 current active"><a class="reference internal" href="mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
-<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.config.html">mstar.model.qwen3_5.config</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
 <li class="toctree-l4"><a class="reference internal" href="mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
 </ul>
 </details></li>
@@ -573,7 +573,7 @@
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.model.qwen3_5.components.rope.rst?plain=1" target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/_autosummary/mstar.model.minimax_h3.components.rst?plain=1" target="_blank"
    class="btn btn-sm btn-source-file-button dropdown-item"
    title="Show source"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -590,7 +590,7 @@
       
       
       
-      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.model.qwen3_5.components.rope.html&body=Your%20issue%20content%20here." target="_blank"
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2F_autosummary/mstar.model.minimax_h3.components.html&body=Your%20issue%20content%20here." target="_blank"
    class="btn btn-sm btn-source-issues-button dropdown-item"
    title="Open an issue"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -620,7 +620,7 @@
       
       
       
-      <li><a href="../_sources/_autosummary/mstar.model.qwen3_5.components.rope.rst" target="_blank"
+      <li><a href="../_sources/_autosummary/mstar.model.minimax_h3.components.rst" target="_blank"
    class="btn btn-sm btn-download-source-button dropdown-item"
    title="Download source file"
    data-bs-placement="left" data-bs-toggle="tooltip"
@@ -690,9 +690,7 @@
 <button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
     <i class="fa-solid fa-magnifying-glass fa-lg"></i>
 </button>
-<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
-    <span class="fa-solid fa-list"></span>
-</button>
+
 </div></div>
       
     </div>
@@ -703,24 +701,11 @@
               
 
 <div id="jb-print-docs-body" class="onlyprint">
-    <h1>mstar.model.qwen3_5.components.rope</h1>
+    <h1>mstar.model.minimax_h3.components</h1>
     <!-- Table of contents -->
     <div id="print-main-content">
         <div id="jb-print-toc">
             
-            <div>
-                <h2> Contents </h2>
-            </div>
-            <nav aria-label="Page">
-                <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.apply_partial_mrope"><code class="docutils literal notranslate"><span class="pre">apply_partial_mrope()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.compute_3d_cos_sin"><code class="docutils literal notranslate"><span class="pre">compute_3d_cos_sin()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.compute_inv_freq"><code class="docutils literal notranslate"><span class="pre">compute_inv_freq()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.text_position_ids"><code class="docutils literal notranslate"><span class="pre">text_position_ids()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.vision_position_advance"><code class="docutils literal notranslate"><span class="pre">vision_position_advance()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.vision_position_ids"><code class="docutils literal notranslate"><span class="pre">vision_position_ids()</span></code></a></li>
-</ul>
-            </nav>
         </div>
     </div>
 </div>
@@ -730,157 +715,14 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="module-mstar.model.qwen3_5.components.rope">
-<span id="mstar-model-qwen3-5-components-rope"></span><h1>mstar.model.qwen3_5.components.rope<a class="headerlink" href="#module-mstar.model.qwen3_5.components.rope" title="Link to this heading">#</a></h1>
-<p>Qwen3.5’s interleaved 3D MRoPE, over a partial rotary dim.</p>
-<p>Model-side because the position resource serves only 1D RoPE. The three grids
-are interleaved <code class="docutils literal notranslate"><span class="pre">[T,H,W,T,H,W,...]</span></code> over the frequency dims, and only
-<code class="docutils literal notranslate"><span class="pre">head_dim</span> <span class="pre">*</span> <span class="pre">partial_rotary_factor</span></code> of each head is rotated (64 of 256 for
-every released size).</p>
-<p>TODO: this duplicates <code class="docutils literal notranslate"><span class="pre">qwen3_omni/components/rope.py</span></code> apart from the partial
-rotation. Both belong in <code class="docutils literal notranslate"><span class="pre">model/components/rope.py</span></code>.</p>
-<p class="rubric">Functions</p>
+  <section id="module-mstar.model.minimax_h3.components">
+<span id="mstar-model-minimax-h3-components"></span><h1>mstar.model.minimax_h3.components<a class="headerlink" href="#module-mstar.model.minimax_h3.components" title="Link to this heading">#</a></h1>
+<p class="rubric">Modules</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.components.rope.apply_partial_mrope" title="mstar.model.qwen3_5.components.rope.apply_partial_mrope"><code class="xref py py-obj docutils literal notranslate"><span class="pre">apply_partial_mrope</span></code></a>(q, k, cos, sin[, ...])</p></td>
-<td><p>Rotate the leading <code class="docutils literal notranslate"><span class="pre">cos.shape[-1]</span></code> dims of each head, pass the rest.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.components.rope.compute_3d_cos_sin" title="mstar.model.qwen3_5.components.rope.compute_3d_cos_sin"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compute_3d_cos_sin</span></code></a>(position_ids_3d, ...[, ...])</p></td>
-<td><p>cos/sin of shape <code class="docutils literal notranslate"><span class="pre">[seq_len,</span> <span class="pre">rotary_dim]</span></code> from <code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">seq_len]</span></code> positions.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.components.rope.compute_inv_freq" title="mstar.model.qwen3_5.components.rope.compute_inv_freq"><code class="xref py py-obj docutils literal notranslate"><span class="pre">compute_inv_freq</span></code></a>(rotary_dim, rope_theta[, ...])</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">/</span> <span class="pre">theta^(2i/d)</span></code> over the rotated dims only; <code class="docutils literal notranslate"><span class="pre">[rotary_dim</span> <span class="pre">//</span> <span class="pre">2]</span></code>.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.components.rope.text_position_ids" title="mstar.model.qwen3_5.components.rope.text_position_ids"><code class="xref py py-obj docutils literal notranslate"><span class="pre">text_position_ids</span></code></a>(seq_len[, start_pos, device])</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">seq_len]</span></code> for a pure-text span: all three grids advance together.</p></td>
-</tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.components.rope.vision_position_advance" title="mstar.model.qwen3_5.components.rope.vision_position_advance"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vision_position_advance</span></code></a>(grid_thw, ...)</p></td>
-<td><p>How far one image moves the position cursor.</p></td>
-</tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.qwen3_5.components.rope.vision_position_ids" title="mstar.model.qwen3_5.components.rope.vision_position_ids"><code class="xref py py-obj docutils literal notranslate"><span class="pre">vision_position_ids</span></code></a>(grid_thw, spatial_merge_size)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">t</span> <span class="pre">*</span> <span class="pre">h'</span> <span class="pre">*</span> <span class="pre">w']</span></code> for one image, where <code class="docutils literal notranslate"><span class="pre">h'</span> <span class="pre">=</span> <span class="pre">h</span> <span class="pre">//</span> <span class="pre">merge</span></code>.</p></td>
-</tr>
 </tbody>
 </table>
 </div>
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.components.rope.apply_partial_mrope">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.components.rope.</span></span><span class="sig-name descname"><span class="pre">apply_partial_mrope</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">q</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">k</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">cos</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sin</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">unsqueeze_dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/components/rope.html#apply_partial_mrope"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.components.rope.apply_partial_mrope" title="Link to this definition">#</a></dt>
-<dd><p>Rotate the leading <code class="docutils literal notranslate"><span class="pre">cos.shape[-1]</span></code> dims of each head, pass the rest.</p>
-<p><code class="docutils literal notranslate"><span class="pre">q</span></code>/<code class="docutils literal notranslate"><span class="pre">k</span></code> are <code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">heads,</span> <span class="pre">head_dim]</span></code>; cos/sin are
-<code class="docutils literal notranslate"><span class="pre">[tokens,</span> <span class="pre">rotary_dim]</span></code> and broadcast over the head axis.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>q</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>k</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>cos</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>sin</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>unsqueeze_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>]</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.components.rope.compute_3d_cos_sin">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.components.rope.</span></span><span class="sig-name descname"><span class="pre">compute_3d_cos_sin</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">position_ids_3d</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inv_freq</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mrope_section</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">target_dtype</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/components/rope.html#compute_3d_cos_sin"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.components.rope.compute_3d_cos_sin" title="Link to this definition">#</a></dt>
-<dd><p>cos/sin of shape <code class="docutils literal notranslate"><span class="pre">[seq_len,</span> <span class="pre">rotary_dim]</span></code> from <code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">seq_len]</span></code> positions.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>position_ids_3d</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>inv_freq</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>mrope_section</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em>)</p></li>
-<li><p><strong>target_dtype</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.dtype" title="(in PyTorch v2.15)"><em>dtype</em></a><em> | </em><em>None</em>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>, <a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>]</p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.components.rope.compute_inv_freq">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.components.rope.</span></span><span class="sig-name descname"><span class="pre">compute_inv_freq</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rotary_dim</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rope_theta</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/components/rope.html#compute_inv_freq"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.components.rope.compute_inv_freq" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">1</span> <span class="pre">/</span> <span class="pre">theta^(2i/d)</span></code> over the rotated dims only; <code class="docutils literal notranslate"><span class="pre">[rotary_dim</span> <span class="pre">//</span> <span class="pre">2]</span></code>.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>rotary_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>rope_theta</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a><em> | </em><em>None</em>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.components.rope.text_position_ids">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.components.rope.</span></span><span class="sig-name descname"><span class="pre">text_position_ids</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">seq_len</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_pos</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/components/rope.html#text_position_ids"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.components.rope.text_position_ids" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">seq_len]</span></code> for a pure-text span: all three grids advance together.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>seq_len</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>start_pos</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a><em> | </em><em>None</em>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.components.rope.vision_position_advance">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.components.rope.</span></span><span class="sig-name descname"><span class="pre">vision_position_advance</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">grid_thw</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spatial_merge_size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/components/rope.html#vision_position_advance"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.components.rope.vision_position_advance" title="Link to this definition">#</a></dt>
-<dd><p>How far one image moves the position cursor.</p>
-<p><code class="docutils literal notranslate"><span class="pre">max(h',</span> <span class="pre">w')</span></code> positions, not its <code class="docutils literal notranslate"><span class="pre">t</span> <span class="pre">*</span> <span class="pre">h'</span> <span class="pre">*</span> <span class="pre">w'</span></code> tokens: the grids run
-in parallel.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>grid_thw</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>spatial_merge_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
-</dd>
-</dl>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="mstar.model.qwen3_5.components.rope.vision_position_ids">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.qwen3_5.components.rope.</span></span><span class="sig-name descname"><span class="pre">vision_position_ids</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">grid_thw</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">spatial_merge_size</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">start_pos</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/qwen3_5/components/rope.html#vision_position_ids"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.qwen3_5.components.rope.vision_position_ids" title="Link to this definition">#</a></dt>
-<dd><p><code class="docutils literal notranslate"><span class="pre">[3,</span> <span class="pre">t</span> <span class="pre">*</span> <span class="pre">h'</span> <span class="pre">*</span> <span class="pre">w']</span></code> for one image, where <code class="docutils literal notranslate"><span class="pre">h'</span> <span class="pre">=</span> <span class="pre">h</span> <span class="pre">//</span> <span class="pre">merge</span></code>.</p>
-<p>T is constant across a frame while H and W sweep the merged patch grid,
-all based at <code class="docutils literal notranslate"><span class="pre">start_pos</span></code>; row-major over <code class="docutils literal notranslate"><span class="pre">(t,</span> <span class="pre">h',</span> <span class="pre">w')</span></code>, the merger’s
-token order.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>grid_thw</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
-<li><p><strong>spatial_merge_size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
-<li><p><strong>start_pos</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#float" title="(in Python v3.12)"><em>float</em></a>)</p></li>
-<li><p><strong>device</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensor_attributes.html#torch.device" title="(in PyTorch v2.15)"><em>device</em></a><em> | </em><em>None</em>)</p></li>
-</ul>
-</dd>
-<dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
-</dd>
-</dl>
-</dd></dl>
-
 </section>
 
 
@@ -895,20 +737,20 @@ token order.</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="mstar.model.qwen3_5.components.html"
+       href="mstar.model.minimax_h3.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">mstar.model.qwen3_5.components</p>
+        <p class="prev-next-title">mstar.model.minimax_h3</p>
       </div>
     </a>
     <a class="right-next"
-       href="mstar.model.qwen3_5.config.html"
+       href="mstar.model.minimax_h3.tests.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">mstar.model.qwen3_5.config</p>
+        <p class="prev-next-title">mstar.model.minimax_h3.tests</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -918,28 +760,6 @@ token order.</p>
             </div>
             
             
-              
-                <dialog id="pst-secondary-sidebar-modal"></dialog>
-                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
-
-
-  <div class="sidebar-secondary-item"><div
-    id="pst-page-navigation-heading-2"
-    class="page-toc tocsection onthispage">
-    <i class="fa-solid fa-list"></i> Contents
-  </div>
-  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
-    <ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.apply_partial_mrope"><code class="docutils literal notranslate"><span class="pre">apply_partial_mrope()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.compute_3d_cos_sin"><code class="docutils literal notranslate"><span class="pre">compute_3d_cos_sin()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.compute_inv_freq"><code class="docutils literal notranslate"><span class="pre">compute_inv_freq()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.text_position_ids"><code class="docutils literal notranslate"><span class="pre">text_position_ids()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.vision_position_advance"><code class="docutils literal notranslate"><span class="pre">vision_position_advance()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.qwen3_5.components.rope.vision_position_ids"><code class="docutils literal notranslate"><span class="pre">vision_position_ids()</span></code></a></li>
-</ul>
-  </nav></div>
-
-</div></div>
               
             
           </div>

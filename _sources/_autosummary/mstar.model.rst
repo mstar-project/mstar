@@ -47,6 +47,7 @@
    loader
    ltx2_5
    media_limits
+   minimax_h3
    multimodal
    multimodal_decoder
    muse
