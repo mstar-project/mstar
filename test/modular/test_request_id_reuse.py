@@ -195,6 +195,48 @@ def rig():
     r.close()
 
 
+def test_cancelled_collection_sends_abort_through_the_data_worker(rig):
+    """Cancellation crosses the real facade and worker queue into the outbox;
+    input tensors stay owned until the conductor authorizes hard cleanup."""
+    key = rig.submit("cancel while waiting").request_id
+    assert key != "X"
+
+    async def cancel():
+        entered = asyncio.Event()
+
+        async def collect():
+            entered.set()
+            # The caller resumes only after this direct await yields inside
+            # the collector, so cancellation cannot precede its first run.
+            return await rig.server.collect_results("X")
+
+        task = asyncio.create_task(collect())
+        await entered.wait()
+        assert not task.done()
+        assert rig.server.pending_requests[key].wake is not None
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel())
+    rig.settle()
+
+    assert not rig.server.pending_requests
+    assert not rig.server._live
+    assert not rig.server._client_ids
+    assert [body.request_id for body in rig.socket.sent_of(ConductorMessageType.ABORT_REQUEST)] == [key]
+    assert [
+        (body.request_id, body.entity_id)
+        for body in rig.socket.sent_of(ConductorMessageType.READS_DONE)
+    ] == [(key, PREPROCESS)]
+    assert rig.tm.forced == [], "abort must not unlink inputs before REMOVE_REQUEST"
+
+    # Deliver the conductor's cleanup authorization through the real worker loop.
+    rig.socket.deliver(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(key))
+    rig.settle()
+    assert rig.tm.forced == [key]
+
+
 def test_the_older_request_s_drain_does_not_free_the_reuse_on_the_conductor(rig):
     """The client aborts X and resubmits X at once. The conductor admits the
     newer request while the older one still drains; the older one's last
