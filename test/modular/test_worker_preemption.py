@@ -132,7 +132,7 @@ def _refused(batch, reason, failed_resource="kv"):
     """The step of ``batch``'s rows that ``reason`` refused, with every row prepared."""
     return SimpleNamespace(
         node_name=batch.node_name, admit_error=reason, failed_resource=failed_resource,
-        request_ids=list(batch.request_to_worker_graph), cached_rids=set(),
+        request_ids=list(batch.request_to_worker_graph), cached_rids=set(), no_forward_rids=set(),
         step_context=SimpleNamespace(graph_walk=batch.graph_walk),
     )
 
