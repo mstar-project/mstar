@@ -729,6 +729,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.check_budget"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.check_budget()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.chunkable"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.chunkable()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.cut_budgets"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.cut_budgets()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.forget_request"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.forget_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.max_batch_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.max_batch_tokens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.min_chunk_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.min_chunk_tokens()</span></code></a></li>
@@ -881,6 +882,18 @@ chunking off (a null budget) or the worker chunks nothing on the node.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.cut_budgets">
+<span class="sig-name descname"><span class="pre">cut_budgets</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.cut_budgets"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.cut_budgets" title="Link to this definition">#</a></dt>
+<dd><p>(node, walk) -&gt; budget, for each budget that cuts a prompt: a chunkable
+walk’s own, and that of the combined walk it runs in.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)">dict</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>, <a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>], <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.forget_request">
 <span class="sig-name descname"><span class="pre">forget_request</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.forget_request"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.forget_request" title="Link to this definition">#</a></dt>
 <dd><dl class="field-list simple">
@@ -913,13 +926,19 @@ worker chunks nothing on the node.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.chunking.ChunkingManagement.min_chunk_tokens">
-<span class="sig-name descname"><span class="pre">min_chunk_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">budget</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.min_chunk_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.min_chunk_tokens" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">min_chunk_tokens</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">budget</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">align</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/chunking.html#ChunkingManagement.min_chunk_tokens"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.chunking.ChunkingManagement.min_chunk_tokens" title="Link to this definition">#</a></dt>
 <dd><p>The fewest tokens the scheduler cuts a row to under <code class="docutils literal notranslate"><span class="pre">budget</span></code>, or
 the whole budget when that is smaller. Without a floor, decode rows
-that fill the budget leave a prompt a token or two a step.</p>
+that fill the budget leave a prompt a token or two a step. A cut is a
+multiple of <code class="docutils literal notranslate"><span class="pre">align</span></code> (<cite>Engine.chunk_alignment</cite>), so the floor rounds up
+to one, within the budget: a floor between two multiples would leave the
+oldest prompt’s share of a step too small to cut.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>budget</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>budget</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>align</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
@@ -1103,6 +1122,7 @@ walks with a budget of their own. None otherwise.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.check_budget"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.check_budget()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.chunkable"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.chunkable()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.cut_budgets"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.cut_budgets()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.forget_request"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.forget_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.max_batch_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.max_batch_tokens()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.chunking.ChunkingManagement.min_chunk_tokens"><code class="docutils literal notranslate"><span class="pre">ChunkingManagement.min_chunk_tokens()</span></code></a></li>

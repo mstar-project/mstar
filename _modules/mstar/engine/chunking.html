@@ -1196,11 +1196,33 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="ChunkingManagement.min_chunk_tokens">
 <a class="viewcode-back" href="../../../_autosummary/mstar.engine.chunking.html#mstar.engine.chunking.ChunkingManagement.min_chunk_tokens">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">min_chunk_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">min_chunk_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">budget</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">align</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""The fewest tokens the scheduler cuts a row to under ``budget``, or</span>
 <span class="sd">        the whole budget when that is smaller. Without a floor, decode rows</span>
-<span class="sd">        that fill the budget leave a prompt a token or two a step."""</span>
-        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_min_chunk_tokens</span><span class="p">,</span> <span class="n">budget</span><span class="p">)</span></div>
+<span class="sd">        that fill the budget leave a prompt a token or two a step. A cut is a</span>
+<span class="sd">        multiple of ``align`` (`Engine.chunk_alignment`), so the floor rounds up</span>
+<span class="sd">        to one, within the budget: a floor between two multiples would leave the</span>
+<span class="sd">        oldest prompt's share of a step too small to cut."""</span>
+        <span class="n">floor</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_min_chunk_tokens</span><span class="p">,</span> <span class="n">budget</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">align</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">floor</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">align</span><span class="p">,</span> <span class="nb">min</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">floor</span> <span class="o">//</span> <span class="n">align</span><span class="p">)</span> <span class="o">*</span> <span class="n">align</span><span class="p">,</span> <span class="n">budget</span> <span class="o">-</span> <span class="n">budget</span> <span class="o">%</span> <span class="n">align</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">floor</span></div>
+
+
+<div class="viewcode-block" id="ChunkingManagement.cut_budgets">
+<a class="viewcode-back" href="../../../_autosummary/mstar.engine.chunking.html#mstar.engine.chunking.ChunkingManagement.cut_budgets">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">cut_budgets</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">"""(node, walk) -&gt; budget, for each budget that cuts a prompt: a chunkable</span>
+<span class="sd">        walk's own, and that of the combined walk it runs in."""</span>
+        <span class="n">out</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">],</span> <span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">for</span> <span class="n">node</span><span class="p">,</span> <span class="n">walk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_policies</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">chunkable</span><span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">):</span>
+                <span class="k">continue</span>
+            <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="p">((</span><span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">),</span> <span class="p">(</span><span class="n">node</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_combined_walk_of</span><span class="o">.</span><span class="n">get</span><span class="p">((</span><span class="n">node</span><span class="p">,</span> <span class="n">walk</span><span class="p">)))):</span>
+                <span class="n">budget</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_batch_tokens</span><span class="p">(</span><span class="o">*</span><span class="n">key</span><span class="p">)</span> <span class="k">if</span> <span class="n">key</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="kc">None</span>
+                <span class="k">if</span> <span class="n">budget</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                    <span class="n">out</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">budget</span>
+        <span class="k">return</span> <span class="n">out</span></div>
 
 
 <div class="viewcode-block" id="ChunkingManagement.walk_caps">

@@ -1251,6 +1251,11 @@ hit always leaves the last page to recompute, and at its KV hit’s last page
 boundary when that is past what it restored. A shared prefix is then served from the third request
 that shares it. A step longer than the largest captured bucket checkpoints less often, so that
 its checkpoints fit the captured steps’ buffer, and keeps its boundaries on that interval.</p></li>
+<li><p>A prompt the step budget cuts into chunks keeps each chunk’s last boundary (a chunk with
+more of its prompt to come keeps its own end), so a resend restores past its first chunk,
+and a later chunk’s snapshot makes the earlier one the first to evict, as a reply’s is.
+Checkpoints fall a page apart from where a chunk starts, so the pool declares a page as its
+<code class="docutils literal notranslate"><span class="pre">chunk_alignment</span></code> and the scheduler cuts its chunks whole pages long.</p></li>
 <li><p>A decode step that ends a page keeps the state there, so a later turn that re-sends the
 reply restores it. It replaces the request’s previous decode snapshot once the KV chain
 keys its page; a step whose token never reaches the chain, such as the one speculated
@@ -2386,6 +2391,10 @@ prefix again.</p></li>
 whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
 a walk whose state grows by something other than the tokens a step runs.</p></li>
 </ul>
+<p>A resource that keeps state only on a grid counted from a chunk’s start declares
+<code class="docutils literal notranslate"><span class="pre">Resource.chunk_alignment</span></code>, and a cut chunk of the node’s rows is then a multiple of
+every alignment its resources declare (<code class="docutils literal notranslate"><span class="pre">Engine.chunk_alignment</span></code>). The chunk floor rounds
+up to it, and a budget under it fails loading.</p>
 <p>A streaming consumer of an accumulated edge whose <code class="docutils literal notranslate"><span class="pre">ChunkPolicy</span></code> expects one item
 (<code class="docutils literal notranslate"><span class="pre">FixedChunkPolicy(1)</span></code>, say) sets <code class="docutils literal notranslate"><span class="pre">Connection.join_dim</span></code>, so its <code class="docutils literal notranslate"><span class="pre">StreamBuffer</span></code>
 joins the pieces into that item. A consumer that can take the pieces as they come says
