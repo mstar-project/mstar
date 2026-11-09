@@ -696,9 +696,9 @@ class FlashInferDecodeWrapper:
         _resident_decode_arrays_kernel[(bs,)](
             slots, kv_len, store,
             w._paged_kv_indptr_buf, w._paged_kv_indices_buf, w._paged_kv_last_page_len_buf,
-            w._paged_kv_indices_buf.shape[0],
+            w._paged_kv_indices_buf.shape[0], bs,
             STRIDE=stride, BLOCK=block_col, PAGE=self.page_size,
-            ROWS=bs, ROWS_P2=triton.next_power_of_2(bs), APPENDS=int(appends), num_warps=1,
+            ROWS_P2=triton.next_power_of_2(bs), APPENDS=int(appends), num_warps=1,
         )
 
     @torch.compiler.disable
@@ -733,16 +733,15 @@ def _gather_block_rows_kernel(
 
 @triton.jit
 def _resident_decode_arrays_kernel(
-    slots_ptr, kv_len_ptr, store_ptr, indptr_ptr, indices_ptr, last_page_len_ptr, capacity,
-    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr,
-    ROWS: tl.constexpr, ROWS_P2: tl.constexpr, APPENDS: tl.constexpr,
+    slots_ptr, kv_len_ptr, store_ptr, indptr_ptr, indices_ptr, last_page_len_ptr, capacity, num_rows,
+    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, ROWS_P2: tl.constexpr, APPENDS: tl.constexpr,
 ):
     # one program a row; its first index is the page count of the rows before it.
     # A row reads its stored length, plus the step's token if it appends one, and
     # at least the one token of its sink page.
     i = tl.program_id(0)
     rows = tl.arange(0, ROWS_P2)
-    lens = tl.maximum(tl.load(kv_len_ptr + rows, mask=rows < ROWS, other=0) + APPENDS, 1)
+    lens = tl.maximum(tl.load(kv_len_ptr + rows, mask=rows < num_rows, other=0) + APPENDS, 1)
     counts = (lens - 1) // PAGE + 1
     start = tl.sum(tl.where(rows < i, counts, 0))
     n = tl.maximum(tl.load(kv_len_ptr + i) + APPENDS, 1)

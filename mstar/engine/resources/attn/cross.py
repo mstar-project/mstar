@@ -130,6 +130,9 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._resident_qo_indptr: dict[int, torch.Tensor] = {}
         self._preplan_states: dict[str, AttentionWrapper] = {}
         self._preplanned = False
+        # the wrapper keys a pending preplan planned, whose cached plans a
+        # dropped preplan leaves naming workspaces it filled on the plan stream
+        self._preplan_keys: list = []
         # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
         self._last_plans: dict[Any, _LastPlan] = {}
 
@@ -163,7 +166,8 @@ class FlashInferCrossManager(CrossAttentionManager):
             # the context's paged arrays come off the tables
             table = step.block_tables[pool]
             wrapper.gather_resident(
-                step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col, appends=False,
+                step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col,
+                appends=not step.streams[pool].reads,
             )
             step.lengths_only.add(pool)
 
@@ -205,6 +209,7 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._current_plan_states = self._preplan_states
             self._preplan_states = {}
             self._preplanned = False
+            self._preplan_keys = []
             return
 
         laps = PhaseLaps(f"{ctx.plan_phase}.cross_attn.")
@@ -227,6 +232,8 @@ class FlashInferCrossManager(CrossAttentionManager):
                 plan_label, lease, num_rows=num_rows, slot=ctx.slot, decode=decode,
             )
             request_ids = tuple(packing.request_ids)
+            if ctx.is_preplan:
+                self._preplan_keys.append(state_key)
             if ctx.resident is not None and (lease.bucket, self._kv_cache_name) in ctx.resident.lengths_only:
                 # FlashInfer's schedule reads only the lengths, which a context keeps
                 indptrs = context_out.cpu_indptrs
@@ -282,6 +289,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_states = {}
+        # a step run in its place on the same slot must plan again rather than
+        # skip to a schedule whose copies nothing ordered before its replay
+        for key in self._preplan_keys:
+            self._scheduled_lens.pop(key, None)
+            self._last_plans.pop(key, None)
+        self._preplan_keys = []
 
     def _context_output(self, ctx: StepContext):
         """The context label's KV plan output (its views are each request's
