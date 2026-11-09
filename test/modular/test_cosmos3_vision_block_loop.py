@@ -116,3 +116,32 @@ def test_the_vision_attention_declares_fa3():
     ))
     spec = model._vision_attention_spec()
     assert spec.config.head_dim == 72 and spec.config.backend is RaggedAttnBackend.DENSE
+
+
+def test_position_tables_are_kept_within_a_byte_budget():
+    """The node keeps resized position tables up to its byte budget, least
+    recently used dropped first, and doesn't keep one over an eighth of it."""
+    from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
+
+    config = Cosmos3ReasonerConfig(
+        vision=Cosmos3VisionEncoderConfig(
+            hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=4,
+            patch_size=2, num_patches=16, spatial_merge_size=1,
+        ),
+        projector_input_hidden_size=32, projector_hidden_size=48, projector_out_hidden_size=24,
+    )
+    model = Cosmos3VisionModel(config).eval()
+    node = Cosmos3VisionEncoderSubmodule(model, SimpleNamespace(reasoner=config))
+    one = model.position_table(1, 1)
+    patch = one.numel() * one.element_size()
+    node.POSITION_TABLE_BYTES = 64 * patch  # an eighth: 8 patches
+    with torch.no_grad():
+        for hw in ((2, 2), (2, 4), (4, 2), (2, 2)):  # 4, 8 and 8 patches; (2, 2) used again
+            node._position_table(*hw)
+        assert list(node._position_tables) == [(2, 4), (4, 2), (2, 2)]
+        node._position_table(6, 4)  # 24 patches, over an eighth: built, not kept
+        assert (6, 4) not in node._position_tables
+        node.POSITION_TABLE_BYTES = 16 * patch  # an eighth: 2 patches
+        node._position_table(1, 1)  # 21 patches held: the least recent, (2, 4), goes
+        assert list(node._position_tables) == [(4, 2), (2, 2), (1, 1)]
+        assert node._position_table_bytes == 13 * patch

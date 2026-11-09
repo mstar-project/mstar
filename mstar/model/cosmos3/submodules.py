@@ -3212,8 +3212,11 @@ class Cosmos3VisionEncoderSubmodule(PackedBlockLoopEncoder):
     # fp32 either way).
     disable_autocast = True
     BLOCK_LOOP_DTYPE = torch.bfloat16
-    # Resized position tables kept, one per frame grid seen.
-    POSITION_TABLES_KEPT = 64
+    # Resized position tables kept on the device, least recently used dropped
+    # first, within a byte budget: one is h*w x hidden, ~151 MB at the processor's
+    # largest frame, so a count alone could hold gigabytes. A table over an
+    # eighth of the budget is built per call and not kept.
+    POSITION_TABLE_BYTES = 256 << 20
 
     def __init__(self, vision_model, config):
         vision = config.reasoner.vision if config.reasoner is not None else None
@@ -3223,16 +3226,23 @@ class Cosmos3VisionEncoderSubmodule(PackedBlockLoopEncoder):
         super().__init__(vision_model, node_config, output="vision_embeds")
         self.model_config = config
         self._position_tables: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
+        self._position_table_bytes = 0
 
     def _position_table(self, h: int, w: int) -> torch.Tensor:
         """The frame's resized position grid, built on the device once per (h, w)."""
         table = self._position_tables.get((h, w))
-        if table is None:
-            table = self._position_tables[h, w] = self.model.position_table(h, w)
-            if len(self._position_tables) > self.POSITION_TABLES_KEPT:
-                self._position_tables.popitem(last=False)
-        else:
+        if table is not None:
             self._position_tables.move_to_end((h, w))
+            return table
+        table = self.model.position_table(h, w)
+        size = table.numel() * table.element_size()
+        if size > self.POSITION_TABLE_BYTES // 8:
+            return table
+        self._position_tables[h, w] = table
+        self._position_table_bytes += size
+        while self._position_table_bytes > self.POSITION_TABLE_BYTES:
+            _, dropped = self._position_tables.popitem(last=False)
+            self._position_table_bytes -= dropped.numel() * dropped.element_size()
         return table
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
