@@ -72,7 +72,6 @@ def _preprocess_failure(model, file_paths=None, upload_dir=None):
         take_failed_reads=lambda: [],
     )
     wt.model = model
-    wt._client_edges = frozenset()
     wt.device = "cpu"
     wt.tensor_uuid_to_metadata_per_request = {}
     wt.request_model_kwargs = {}
@@ -80,7 +79,6 @@ def _preprocess_failure(model, file_paths=None, upload_dir=None):
     wt._draining_rids = set()
     wt._reads_done_sent = set()
     wt._live_requests = {}
-    wt._client_edges = frozenset()
     wt._preparing = deque()
     wt._keyed_labels = {}
     wt.upload_dir = upload_dir

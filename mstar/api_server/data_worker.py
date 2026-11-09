@@ -710,6 +710,8 @@ class PreprocessWorkerThread:
     # None (a thread built without __init__) leaves a refused request's uploads to the
     # HTTP layer's deferred cleanup
     upload_dir: str | os.PathLike | None = None
+    # the model's client streams by edge name; none for a thread built without __init__
+    _client_edges: frozenset[str] = frozenset()
 
     def __init__(
         self,
