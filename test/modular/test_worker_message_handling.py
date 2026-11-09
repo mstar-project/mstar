@@ -36,7 +36,7 @@ def _stub_worker(active_rids):
     )
     worker = make_worker(
         request_state=request_state,
-        _graph_runtime=types.SimpleNamespace(get_rid_handle=handles.get),
+        graph_runtime=types.SimpleNamespace(get_rid_handle=handles.get),
     )
     for rid, handle in handles.items():
         worker.lifecycle.add(handle, rid)

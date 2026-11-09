@@ -54,6 +54,7 @@ Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import torch
@@ -126,7 +127,7 @@ from mstar.model.cosmos3.submodules import (
     latent_frames,
     sound_frames,
 )
-from mstar.model.media_limits import VideoBudget
+from mstar.model.media_limits import UndecodableMediaError, VideoBudget
 from mstar.model.multimodal import TEXT, PromptPart, check_attachments, parts_from_modalities
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -146,6 +147,10 @@ class Cosmos3Model(Model):
     """NVIDIA Cosmos3 generator implementation."""
 
     PREPROCESS_ONLY_KWARGS = ("action", "robot_state")
+    # Requests prepare at once: the loaders and process_prompt keep no shared
+    # state, and their work (image decode, resize, torch ops) releases the GIL.
+    # Inline, a burst of image prompts queued ~10 ms each behind one another.
+    PREPROCESS_PARALLEL = True
     # The width of a policy request's robot_state, which process_prompt hands
     # the conductor (the values themselves ride the action_inputs edge).
     INTERNAL_KWARGS = ("robot_state_dim", "action_shape")
@@ -1097,17 +1102,17 @@ class Cosmos3Model(Model):
         """Decode a conditioning / reasoner video to ``[T, C, H, W]`` in [0, 1].
 
         torchcodec (the base implementation) needs system FFmpeg shared
-        libraries; where they are absent, PyAV — which ships its own — decodes
-        the same frames. The metadata carries the frame rate under
-        ``average_fps`` either way (the reasoner's frame sampling and
-        timestamps read it)."""
+        libraries; where they are absent or refuse the file, PyAV — which
+        ships its own — decodes the same frames. The metadata carries the
+        frame rate under ``average_fps`` either way (the reasoner's frame
+        sampling and timestamps read it)."""
         from mstar.model.base import TensorAndMetadata
 
         try:
             return super().load_video(filepath, device)
-        except (ImportError, RuntimeError, OSError) as exc:
+        except (ImportError, RuntimeError, OSError, UndecodableMediaError) as exc:
             reason = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
-            logger.warning("torchcodec video decode unavailable (%s); decoding %s with PyAV.", reason, filepath)
+            logger.warning("torchcodec video decode failed (%s); decoding %s with PyAV.", reason, filepath)
         import av
 
         budget = VideoBudget()
@@ -1374,6 +1379,9 @@ class Cosmos3Model(Model):
                 1, int(mk.get("max_sequence_length", constants.DEFAULT_MAX_SEQUENCE_LENGTH))
             ),
         }
+        # the packing divides by it, and postprocess muxes at it
+        if not math.isfinite(params["fps"]) or params["fps"] <= 0:
+            raise ValueError(f"Cosmos3 fps must be positive and finite; got {mk.get('fps')!r}.")
         latent_px = self.config.vae.scale_factor_spatial
         if params["width"] < latent_px or params["height"] < latent_px:
             raise ValueError(

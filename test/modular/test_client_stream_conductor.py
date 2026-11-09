@@ -315,10 +315,11 @@ def _stub_worker(sbuf):
     request_state = SimpleNamespace(per_request_info={7: req_info})
     stub = make_worker(
         worker_id="worker_0",
-        _graph_runtime=SimpleNamespace(get_rid_handle=lambda rid: 7 if rid == "r" else None),
+        graph_runtime=SimpleNamespace(get_rid_handle=lambda rid: 7 if rid == "r" else None),
         request_state=request_state,
         streams=StreamBufferManager(request_state, None, []),
         tensor_manager=SimpleNamespace(
+            get_tensor=None,
             start_read_tensors=lambda rid, edges, graph_walk=None: edges and reads.append(
                 [info.uuid for edge in edges for info in edge.tensor_info]
             ) or [],

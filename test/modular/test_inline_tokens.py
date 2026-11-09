@@ -19,7 +19,7 @@ from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.model.submodule_base import HostRows
 from mstar.testing_utils.model import StubModel
 from mstar.testing_utils.worker import make_worker
-from mstar.worker.worker import Worker
+from mstar.worker.step_executor import StepExecutor
 
 # -- wire --------------------------------------------------------------------
 
@@ -160,8 +160,9 @@ def test_a_row_that_fails_postprocessing_fails_only_its_request():
     worker.result_tensor_queue.put(InlineTokens(["bad", "good"], [13, 2], "text"))
     chunks = {c.request_id: c for c in _run_until(worker, stop, 2)}
     assert chunks["good"].modality == "text" and chunks["good"].data == b"<2>"
-    assert chunks["bad"].modality == "error" and b"bad token" in chunks["bad"].data
-    assert chunks["bad"].metadata["status"] == 400
+    # past intake a ValueError is a server bug: a 500 that keeps its text in the log
+    assert chunks["bad"].modality == "error" and b"internal error (error id " in chunks["bad"].data
+    assert chunks["bad"].metadata["status"] == 500
 
 
 def test_inline_logprobs_land_in_their_chunks_metadata():
@@ -253,14 +254,13 @@ class _Batch:
         self.node_batch = SimpleNamespace(withheld_outputs=withheld or {})
 
 
-def _worker(runtime=_Runtime()):
-    w = make_worker(_graph_runtime=runtime)
-    return w
+def _executor(runtime=_Runtime()):
+    return make_worker(graph_runtime=runtime).executor
 
 
 def test_inline_values_follow_the_batch_order_off_the_host_rows():
     rows = HostRows((7, 8, 9), {"new_token": torch.tensor([[70], [80], [90]])})
-    sig, vals = _worker()._inline_emit_values(
+    sig, vals = _executor()._inline_emit_values(
         _Engine({"text_inputs": "new_token"}), _Batch(), rows, [9, 7, 8], ["text_inputs", "kv"],
     )
     assert sig == "text_inputs" and vals == [90, 70, 80]
@@ -268,7 +268,7 @@ def test_inline_values_follow_the_batch_order_off_the_host_rows():
 
 def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():
     rows = HostRows((7, 8), {"new_token": torch.tensor([70, 80])})
-    w = _worker()
+    w = _executor()
     eng = _Engine({"text_inputs": "new_token"})
     none = (None, [])
     assert w._inline_emit_values(eng, _Batch(), rows, [7, 8, 9], ["text_inputs"]) == none
@@ -278,7 +278,7 @@ def test_inline_values_fall_back_when_a_rid_has_no_row_or_nothing_applies():
 
     class _NoInline:
         supports_inline_emit = False
-    assert _worker(_NoInline())._inline_emit_values(
+    assert _executor(_NoInline())._inline_emit_values(
         eng, _Batch(), rows, [7, 8], ["text_inputs"],
     ) == none
 
@@ -288,7 +288,7 @@ def test_a_mixed_step_inlines_its_decode_rows():
     # decode rows still go inline, and the prefill row carries its own token
     rows = HostRows((7, 8, 9), {"new_token": torch.tensor([[70], [80], [90]])})
     batch = _Batch({7: "decode", 8: "prefill_text", 9: "decode"}, label="mixed")
-    sig, vals = _worker()._inline_emit_values(
+    sig, vals = _executor()._inline_emit_values(
         _Engine({"text_inputs": "new_token"}), batch, rows, [7, 8, 9], ["text_inputs"],
     )
     assert sig == "text_inputs" and vals == [70, 80, 90]
@@ -297,12 +297,12 @@ def test_a_mixed_step_inlines_its_decode_rows():
 def test_a_mixed_step_falls_back_when_a_decode_row_has_no_value():
     rows = HostRows((7,), {"new_token": torch.tensor([[70]])})
     batch = _Batch({7: "prefill_text", 9: "decode"}, label="mixed")
-    assert _worker()._inline_emit_values(
+    assert _executor()._inline_emit_values(
         _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
     ) == (None, [])
     # a row of a walk that sends no inline value needs none
     batch = _Batch({7: "decode", 9: "prefill_text"}, label="mixed")
-    assert _worker()._inline_emit_values(
+    assert _executor()._inline_emit_values(
         _Engine({"text_inputs": "new_token"}), batch, rows, [7, 9], ["text_inputs"],
     ) == ("text_inputs", [70, 0])
 
@@ -314,20 +314,18 @@ def test_row_logprobs_follow_the_batch_order():
         "new_token": torch.tensor([70, 80, 90, 0]),
         SAMPLED_LOGPROB: torch.tensor([-0.5, nan, -0.25, nan]),
     })
-    assert Worker._row_logprobs(rows, [9, 7, 8]) == [-0.25, -0.5, None]
-    assert Worker._row_logprobs(rows, [7, 6]) == [-0.5, None], "a rid with no row has none"
+    assert StepExecutor._row_logprobs(rows, [9, 7, 8]) == [-0.25, -0.5, None]
+    assert StepExecutor._row_logprobs(rows, [7, 6]) == [-0.5, None], "a rid with no row has none"
     # empty when no row has one
-    assert Worker._row_logprobs(None, [7]) == []
-    assert Worker._row_logprobs(HostRows((7,), {"new_token": torch.tensor([70])}), [7]) == []
-    assert Worker._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
+    assert StepExecutor._row_logprobs(None, [7]) == []
+    assert StepExecutor._row_logprobs(HostRows((7,), {"new_token": torch.tensor([70])}), [7]) == []
+    assert StepExecutor._row_logprobs(HostRows((7,), {SAMPLED_LOGPROB: torch.tensor([nan])}), [7]) == []
 
 
 def _inline_step(withheld=None):
     """A one-row device-loopback decode step whose token rides inline, as
     `_get_postprocess_request` sees it."""
-    w = _worker()
-    w._stop_token_signal, w._device_loopback, w._innermost_loop_by_node = {}, {}, {}
-    w.enable_prof = False
+    w = _executor()
     engine = SimpleNamespace(
         device_loopback_signals=lambda node, walk: ("text_inputs",),
         inline_client_signals=lambda node, walk: {"text_inputs": "new_token"},
