@@ -26,7 +26,7 @@ from test_kv_prefix_layout_lease import _Node as _LayoutNode
 from test_kv_prefix_lease import NODE, PAGE_SIZE, WALK, _ctx, _keys, _manager, _StubTransfer
 from test_kv_release import _window_manager
 from test_kv_row_passes import backend  # noqa: F401, the Rust and the Python page arena
-from test_runner_admission import _StubPool
+from test_runner_admission import _PassingPool, _StubPool
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import Engine
@@ -632,6 +632,67 @@ def test_a_request_its_moves_admitted_starts_while_an_older_dropped_one_holds_it
     started = _runner(kv).admit_waiting(lambda rid, node: None)
 
     assert (NODE, "b") in started, "b waits behind a, which waits for the pages b's allotment holds"
+
+
+def test_a_request_its_moves_admitted_passes_a_first_request_the_oldest_return_holds_back():
+    """b's moves admitted it, then a, older, was dropped, and f, older than b, asked for the first time. As the oldest
+    request, a holds back the KV cache's queue, so f waited there, b waited behind f for a row, and a waited for the
+    pages b's allotment holds."""
+    kv, rows = _pool(), _PassingPool(8)
+    _RUNNERS[id(kv)] = (kv, StepRunner({"kv": kv, "rows": rows}, node_resources={NODE: ["kv", "rows"]}))
+    _running(kv, "x", 1, arrival=0)
+    _running(kv, "a", 6, arrival=1)
+    _running(kv, "w", 3, arrival=4)
+    assert _preempt(kv, "w", _short(kv, "w"), droppable=lambda rid: True).waits
+    _runner(kv).readmit("w", NODE)
+    _request(kv, "b", 3, arrival=3)
+    assert not _admitted(kv, "b")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["w"]
+    _drop(kv, "w")
+    assert "b" in kv._allotments
+    _drop(kv, "a")
+    _remove(kv, "x")
+    _request(kv, "f", 1, arrival=2)
+    assert _runner(kv).admit_request("f", NODE, WALK).queued
+
+    started = _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert (NODE, "b") in started, "b waits behind f for a row, f behind a, and a for the pages b's allotment holds"
+
+
+def test_a_victim_that_held_no_page_holds_back_no_newer_prompt_while_an_older_request_runs():
+    """p gave back its allotment for r before it wrote anything, and asks for its prompt again as a prompt does.
+    Waiting first in the queue at its arrival, it held back every newer prompt, with pages free for them."""
+    kv = _pool()
+    _running(kv, "r", 5, arrival=0)
+    _request(kv, "p", 5, arrival=1)
+    assert _admitted(kv, "p")
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).to_ask == ["p"]
+    _runner(kv).readmit("p", NODE)
+    _request(kv, "s", 1, arrival=2)
+
+    assert _ready(kv, "s") and not _admitted(kv, "p"), "s waited behind p with pages free, though r is older than p"
+
+
+def test_the_pages_kept_for_a_waiting_request_stop_at_what_it_asks_for():
+    """h asks for 2 pages and the move made for it frees 20. All 20 were kept from passers, h took 2, and the other 18
+    stayed hidden until a request admitted in order took them, so p was refused with 18 pages free."""
+    kv = _manager(max_num_pages=25)
+    kv.local_loops = {"decode"}
+    _running(kv, "x", 4, arrival=0)
+    _running(kv, "v", 20, arrival=3)
+    assert _preempt(kv, "v", _short(kv, "v"), droppable=lambda rid: True).waits
+    _runner(kv).readmit("v", NODE)
+    _request(kv, "h", 2, arrival=1)
+    assert not _admitted(kv, "h")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["v"]
+    _drop(kv, "v")
+    assert _admitted(kv, "h")
+    _request(kv, "b", 19, arrival=2)
+    _request(kv, "p", 1, arrival=4)
+
+    assert not _ready(kv, "b") and _ready(kv, "p"), "p was refused with the pages h didn't take kept from it"
+    assert kv._kept == 0
 
 
 def test_a_request_no_move_covers_waits_until_its_whole_shortage_fits():

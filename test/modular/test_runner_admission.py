@@ -276,3 +276,26 @@ def test_no_request_passes_a_first_request_where_it_fits_while_another_resource_
     assert runner.admit_retrieve("p", "solo", WALK).queued, "p took pages the head fits in"
     lora.free = 1
     assert runner.admit_waiting(_nothing) == [(NODE, "head")]
+
+
+def test_no_request_passes_where_the_oldest_request_waits_to_return():
+    """v was dropped and waits to return, and h, refused, is first in the queue. While o, older than v, waited, c
+    passed h. Once o left, v was the oldest request, and d passed h too, into the units v waits for."""
+    kv, lora = _LendingPool(8, needs={"v": 4, "w": 3, "h": 7}), _StubPool(0)
+    runner = _runner({NODE: ["kv"], "other": ["lora"]}, kv=kv, lora=lora)
+    for arrival, rid in enumerate(("o", "v", "w", "h", "c", "d")):
+        runner.ingest_request(rid, None, arrival)
+    assert runner.admit_retrieve("o", "other", WALK).queued
+    for rid in ("v", "w"):
+        assert runner.admit_retrieve(rid, NODE, WALK).ready
+    # v returns with its history and a unit more
+    kv.unreserve("v")
+    kv.needs["v"] = 6
+    runner.readmit("v", NODE)
+    assert runner.admit_retrieve("h", NODE, WALK).queued
+    assert runner.admit_retrieve("c", NODE, WALK).ready, "c waited behind h, though o is older than v"
+    runner.remove_request("o")
+
+    assert runner.admit_retrieve("d", NODE, WALK).queued, "d passed h into the units v, the oldest request, waits for"
+    runner.remove_request("w")
+    assert (NODE, "v") in runner.admit_waiting(_nothing)
