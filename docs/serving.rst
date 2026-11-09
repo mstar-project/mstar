@@ -257,10 +257,10 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        a 503.
    * - ``unpausable_outputs``
      - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
-       that streams one of them reserves its whole KV footprint and is never preempted (see
-       below). Defaults to the model's ``UNPAUSABLE_OUTPUTS``, which is ``[audio]`` unless the
-       model declares otherwise. ``[]`` gives a voice deployment a fast first chunk under KV
-       pressure, at the cost of a pause when its requests are preempted.
+       that streams one of them reserves its whole KV footprint and is never preempted once it
+       starts (see below). Defaults to the model's ``UNPAUSABLE_OUTPUTS``, which is ``[audio]``
+       unless the model declares otherwise. ``[]`` gives a voice deployment a fast first chunk
+       under KV pressure, at the cost of a pause when its requests are preempted.
    * - ``routing_weights``
      - *(optional)* The weights of the data-parallel replica pick (see below), one per
        term: ``load`` for the live requests on a replica, and ``prefix`` for the share of
