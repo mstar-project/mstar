@@ -262,7 +262,7 @@ The GPU model families depend on:
   to a CUDA 12 torch install ``fa3-fwd==0.0.2``. A mismatched wheel fails to import, and every
   ``dense`` attention then runs on FlashInfer with a warning at startup; check with
   ``python -c "import fa3_fwd_interface"``.
-- **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
+- **mooncake-transfer-engine** (0.3.14 or newer) — RDMA tensor transport for
   multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
   (``SHM``) or ``TCP`` transport instead (see :doc:`serving`, which also covers the network
   it needs). The extras install Mooncake's CUDA 12 wheel; next to a CUDA 13 torch
