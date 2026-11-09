@@ -7,9 +7,13 @@ segments of one packed forward. There is nothing to page, nothing to advance,
 and nothing to carry between steps: the resource holds only planned wrappers.
 """
 
+import functools
 import itertools
+import logging
 import weakref
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
 
 import torch
 
@@ -26,7 +30,11 @@ from mstar.engine.resources.attn.ragged.config import (
 )
 from mstar.engine.resources.attn.ragged.wrappers import _RaggedPrefillBase
 from mstar.engine.resources.base import AttentionResource, CGSlotKey, EngineResourceInfo
-from mstar.engine.resources.step import Segment, SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.kernels.registry import describe_rows
+from mstar.kernels.table import Choice, Rows
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_ragged_attn_backend(
@@ -283,49 +291,39 @@ class _RaggedManagerBase:
         # plan H2Ds each layout into static buffers that a captured replay reads
         return True
 
-    def _build_wrapper(
-        self, label: str, slot: int, cu_seqlens: torch.Tensor | None = None, **graph_kwargs,
-    ) -> _RaggedPrefillBase:
-        """A new wrapper for one (label, slot); ``graph_kwargs`` size a captured one.
-        ``cu_seqlens`` is the layout it is about to be planned with."""
-        return self.wrapper_class(**self._kwargs, **graph_kwargs)
+    def _build_wrapper(self, label: str, slot: int, **wrapper_kwargs) -> _RaggedPrefillBase:
+        """A new wrapper of the manager's own kernel for one (label, slot).
+        ``wrapper_kwargs`` size a captured one (``_graph_kwargs``) or override one
+        of the kernel's defaults (a FlashInfer backend)."""
+        return self.wrapper_class(**self._kwargs, **wrapper_kwargs)
 
-    def _cg_wrapper(
-        self, lease: SlotLease, label: str, cu_seqlens: torch.Tensor | None = None,
-    ) -> _RaggedPrefillBase:
-        """The captured-graph wrapper for one (bucket, slot, label).
-
-        Built on the first plan for that key, like the paged backend's. Its
-        static buffers are fixed for its lifetime, so they are sized off the
-        config's segment ceiling at the bucket's batch size
-        (``max_segments_for``) and the bucket's token count — NOT off this
-        first plan's ``num_rows``, which is only one of the layouts the bucket
-        will replay.
-        """
-        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
-        wrapper = self._cg_plan_states.get(key)
-        if wrapper is not None:
-            return wrapper
-
-        bucket = lease.bucket
-        max_segments = self._config.max_segments_for(bucket.bs)
+    def _graph_kwargs(self, bucket: BucketKey) -> dict:
+        """What sizes a captured wrapper for ``bucket``. Its static buffers are
+        fixed for its lifetime, so they are sized off the config's segment
+        ceiling at the bucket's batch size (``max_segments_for``) and the
+        bucket's token count — NOT off the first plan's ``num_rows``, which is
+        only one of the layouts the bucket will replay."""
         # the bucket's own token count is the ceiling; the per-request override
         # is for a runner that buckets by batch size alone
-        max_tokens = max(
-            bucket.num_tokens, self._config.max_tokens_for(bucket.bs) or 0
-        )
-        wrapper = self._build_wrapper(
-            label, lease.slot, cu_seqlens,
+        max_tokens = max(bucket.num_tokens, self._config.max_tokens_for(bucket.bs) or 0)
+        return dict(
             accelerator_graph=True,
-            max_num_segments=max_segments,
+            max_num_segments=self._config.max_segments_for(bucket.bs),
             max_total_tokens=max_tokens,
         )
-        self._cg_plan_states[key] = wrapper
+
+    def _cg_wrapper(self, lease: SlotLease, label: str) -> _RaggedPrefillBase:
+        """The captured-graph wrapper for one (bucket, slot, label), built on the
+        first plan for that key, like the paged backend's."""
+        key = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label)
+        wrapper = self._cg_plan_states.get(key)
+        if wrapper is None:
+            wrapper = self._cg_plan_states[key] = self._build_wrapper(
+                label, lease.slot, **self._graph_kwargs(lease.bucket),
+            )
         return wrapper
 
-    def _eager_wrapper(
-        self, label: str, slot: int, cu_seqlens: torch.Tensor | None = None,
-    ) -> _RaggedPrefillBase:
+    def _eager_wrapper(self, label: str, slot: int) -> _RaggedPrefillBase:
         """The persistent eager wrapper for one (label, slot).
 
         Slotted for the same reason the captured ones are, and on the same
@@ -334,8 +332,13 @@ class _RaggedManagerBase:
         key = EagerSlotKey(label=label, slot=slot)
         wrapper = self._eager_plan_states.get(key)
         if wrapper is None:
-            wrapper = self._eager_plan_states[key] = self._build_wrapper(label, slot, cu_seqlens)
+            wrapper = self._eager_plan_states[key] = self._build_wrapper(label, slot)
         return wrapper
+
+    def _wrapper_for(self, lease: SlotLease | None, slot: int, label: str) -> _RaggedPrefillBase:
+        if lease is not None:
+            return self._cg_wrapper(lease, label)
+        return self._eager_wrapper(label, slot)
 
     @property
     def supports_preplan(self):
@@ -363,13 +366,6 @@ class _RaggedManagerBase:
         for seg in segments:
             cu.append(cu[-1] + seg.span)
         return torch.tensor(cu, dtype=torch.int32, pin_memory=torch.cuda.is_available())
-
-    def _wrapper_for(
-        self, lease: SlotLease | None, slot: int, label: str, cu_seqlens: torch.Tensor | None = None,
-    ) -> _RaggedPrefillBase:
-        if lease is not None:
-            return self._cg_wrapper(lease, label, cu_seqlens)
-        return self._eager_wrapper(label, slot, cu_seqlens)
 
     def plan(self, step, ctx: StepContext):
         self.reset_default_cursors()
@@ -460,9 +456,79 @@ class _RaggedManagerBase:
         return self._wrapper(label).run(q, k, v)
 
 
+def _flashinfer_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _RaggedPrefillBase:
+    """The manager's own FlashInfer wrapper, on the row's ``backend`` (the
+    manager's ``flashinfer_backend`` without one)."""
+    backend = (config or {}).get("backend")
+    return manager._build_wrapper(label, slot, **({} if backend is None else {"backend": backend}), **graph_kwargs)
+
+
+def _cudnn_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _RaggedPrefillBase:
+    from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper
+
+    # an eager one runs a later layout of unequal segments on the manager's own wrapper
+    fallback = None if graph_kwargs else functools.partial(manager._build_wrapper, label, slot)
+    return CudnnRaggedPrefillWrapper(**manager._kwargs, fallback=fallback, **graph_kwargs)
+
+
+@dataclass(frozen=True)
+class WrapperFactory:
+    """How a self-attention manager builds one implementation's wrapper for a
+    ``ragged_attention`` row: ``build(manager, label, slot, row config, **graph_kwargs)``."""
+
+    build: Callable[..., _RaggedPrefillBase]
+    # Runs only a layout of equal-length segments, and once captured only the
+    # layout it was first planned with (the graph bakes it in).
+    layout_bound: bool = False
+
+
+# A row's ``impl`` -> its wrapper. A new implementation adds its factory here and
+# its ``Impl`` (with what it can't run) to ``kernels.RAGGED_ATTENTION``.
+WRAPPER_FACTORIES: Mapping[str, WrapperFactory] = MappingProxyType({
+    "flashinfer": WrapperFactory(_flashinfer_wrapper),
+    "cudnn": WrapperFactory(_cudnn_wrapper, layout_bound=True),
+})
+
+
+def uniform_lengths(lens: Sequence[int]) -> bool:
+    """Every non-empty segment has one length and the empty ones come last."""
+    n = len(lens)
+    while n and lens[n - 1] == 0:
+        n -= 1
+    return n > 0 and all(length == lens[0] for length in lens[:n])
+
+
 class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     """Self-attention: every label in the step is its own layout, each segment
-    attending within itself."""
+    attending within itself.
+
+    With ``kernel_rows`` (a ``ragged_attention`` table's, or the ``cudnn``
+    backend's one row) a wrapper runs the row its layout's longest query segment
+    falls in, built by that row's ``WRAPPER_FACTORIES`` entry, for its lifetime:
+    a captured graph can't switch kernels, and an eager wrapper keeps the
+    captured ones' rule. A layout-bound row takes only equal-length segments, and
+    under capture only a config that declares ``fixed_bucket_layouts``;
+    otherwise the wrapper is the manager's own, at its defaults.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        config: RaggedAttentionConfig,
+        key: str,
+        kernel_rows: Rows | None = None,
+    ):
+        super().__init__(device=device, dtype=dtype, config=config, key=key)
+        self._kernel_rows = kernel_rows
+        if kernel_rows is None:
+            return
+        unknown = sorted({choice.impl for _, choice in kernel_rows} - WRAPPER_FACTORIES.keys())
+        if unknown:
+            raise ValueError(f"ragged attention {key!r}: rows name {unknown}, which have no wrapper here")
+        logger.info("ragged attention %r (%d/%d heads, head dim %d, %s): %s", key, config.num_qo_heads,
+                    config.num_kv_heads, config.head_dim, str(dtype).removeprefix("torch."),
+                    describe_rows(kernel_rows))
 
     def plan(self, step: AttentionStep, ctx: StepContext):
         refuse_context_only(step, type(self).__name__)
@@ -471,9 +537,41 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     def _plan_layouts(self, step: AttentionStep, ctx: StepContext, plan_states) -> None:
         for label, segments in self._group_segments_by_label(step.segments or ()).items():
             cu_seqlens = self._cu_seqlens(segments)
-            wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label, cu_seqlens)
+            if self._kernel_rows is None:
+                wrapper = self._wrapper_for(ctx.slot_lease, ctx.slot, label)
+            else:
+                wrapper = self._table_wrapper(ctx.slot_lease, ctx.slot, label, [seg.span for seg in segments])
             wrapper.plan(cu_seqlens=cu_seqlens, causal=step.causal)
             plan_states[label] = wrapper
+
+    def _table_wrapper(self, lease: SlotLease | None, slot: int, label: str, spans: list[int]) -> _RaggedPrefillBase:
+        """The (label, slot)'s wrapper, built on its first plan for the row that
+        layout runs."""
+        if lease is not None:
+            key, cache = CGSlotKey(bucket=lease.bucket, slot=lease.slot, label=label), self._cg_plan_states
+        else:
+            key, cache = EagerSlotKey(label=label, slot=slot), self._eager_plan_states
+        wrapper = cache.get(key)
+        if wrapper is not None:
+            return wrapper
+        graph_kwargs = {} if lease is None else self._graph_kwargs(lease.bucket)
+        choice = self._row_for(spans, captured=lease is not None)
+        if choice is None:
+            wrapper = self._build_wrapper(label, slot, **graph_kwargs)
+        else:
+            wrapper = WRAPPER_FACTORIES[choice.impl].build(self, label, slot, choice.config, **graph_kwargs)
+        cache[key] = wrapper
+        return wrapper
+
+    def _row_for(self, spans: list[int], captured: bool) -> Choice | None:
+        """The row a layout of ``spans`` runs; None for the manager's own wrapper."""
+        from mstar.engine.resources.attn.ragged.kernels import choice_for
+
+        choice = choice_for(self._kernel_rows, max(spans, default=0))
+        if WRAPPER_FACTORIES[choice.impl].layout_bound and (
+                not uniform_lengths(spans) or (captured and not self._config.fixed_bucket_layouts)):
+            return None
+        return choice
 
 
 class _RaggedCrossManagerBase(_RaggedManagerBase, RaggedCrossAttnManager):

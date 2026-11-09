@@ -12,11 +12,16 @@ import pytest
 import torch
 
 from mstar.engine.resources import (
+    AttentionStep,
+    BucketKey,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedAttnBackend,
     RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
+    Segment,
+    SlotLease,
+    StepContext,
     apply_yaml_overrides,
 )
 from mstar.engine.resources.attn.ragged import kernels as kernels_module
@@ -104,7 +109,7 @@ def test_a_gpu_without_a_table_keeps_flashinfer(gpu, key):
     manager = build(spec())
     assert type(manager) is FlashInferRaggedManager
     assert manager._kernel_rows is None
-    assert manager._kwargs["backend"] == "auto"
+    assert manager._flashinfer_backend == "auto"
 
 
 def test_a_geometry_without_an_entry_keeps_flashinfer(gpu):
@@ -147,7 +152,7 @@ def test_a_named_backend_or_kernel_wins_over_the_table(gpu, override):
     apply_yaml_overrides([s], {"resources": {"dit_attn": override}})
     manager = build(s)
     assert manager._kernel_rows is None
-    assert manager._kwargs["backend"] == override.get("flashinfer_backend", "auto")
+    assert manager._flashinfer_backend == override.get("flashinfer_backend", "auto")
 
 
 @pytest.mark.parametrize("key", [B300, H100], ids=["sm_103", "sm_90"])
@@ -202,6 +207,10 @@ class _StubFlashInfer:
     def __init__(self, workspace_buffer=None, backend="auto", **kwargs):
         self.backend = backend
         self.kwargs = kwargs
+        self.planned = []
+
+    def plan(self, cu_seqlens, causal=False):
+        self.planned.append(cu_seqlens.tolist())
 
 
 @pytest.fixture
@@ -216,16 +225,29 @@ def manager_with(rows, fixed_bucket_layouts=True):
                                    kernel_rows=rows)
 
 
+def planned(manager, *spans, label="main", lease=None):
+    """The wrapper ``manager`` plans one segment per span under ``label`` on."""
+    rids = [f"r{i}" for i in range(len(spans))]
+    step = AttentionStep(segments=tuple(Segment(rid, label, n) for rid, n in zip(rids, spans, strict=True)),
+                         causal=False)
+    manager.plan(step, StepContext(request_ids=rids, graph_walk="image_gen", slot=0 if lease is None else lease.slot,
+                                   capture=False, slot_lease=lease))
+    return manager._current_plan_states[label]
+
+
+def lease(bs, tokens, slot=1):
+    return SlotLease(slot=slot, bucket=BucketKey(graph_walk="image_gen", bs=bs, num_tokens=tokens))
+
+
 CUDNN_ROWS = ((None, Choice("cudnn")),)
 
 
 def test_equal_segments_get_the_cudnn_wrapper(stub_flashinfer):
-    w = manager_with(CUDNN_ROWS)._build_wrapper("main", 0, cu(4608, 4608))
-    assert type(w) is CudnnRaggedPrefillWrapper
+    assert type(planned(manager_with(CUDNN_ROWS), 4608, 4608)) is CudnnRaggedPrefillWrapper
 
 
 def test_unequal_segments_get_flashinfer(stub_flashinfer):
-    w = manager_with(CUDNN_ROWS)._build_wrapper("main", 0, cu(4608, 1024))
+    w = planned(manager_with(CUDNN_ROWS), 4608, 1024)
     assert type(w) is _StubFlashInfer
     assert w.backend == "auto"
 
@@ -233,16 +255,15 @@ def test_unequal_segments_get_flashinfer(stub_flashinfer):
 def test_a_row_per_size_class(stub_flashinfer):
     rows = ((256, Choice("flashinfer", {"backend": "fa2"})), (None, Choice("cudnn")))
     m = manager_with(rows)
-    short = m._build_wrapper("caption", 0, cu(96, 96))
+    short = planned(m, 96, 96, label="caption")
     assert type(short) is _StubFlashInfer and short.backend == "fa2"
-    assert type(m._build_wrapper("main", 0, cu(4192, 4192))) is CudnnRaggedPrefillWrapper
+    assert type(planned(m, 4192, 4192)) is CudnnRaggedPrefillWrapper
 
 
 def test_a_captured_wrapper_is_sized_like_the_flashinfer_one(stub_flashinfer):
-    w = manager_with(CUDNN_ROWS)._build_wrapper("main", 1, cu(4608), accelerator_graph=True,
-                                                max_num_segments=1, max_total_tokens=4608)
+    w = planned(manager_with(CUDNN_ROWS), 4608, lease=lease(1, 4608))
     assert type(w) is CudnnRaggedPrefillWrapper
-    assert w.accelerator_graph and w.max_total_tokens == 4608
+    assert w.accelerator_graph and w.max_total_tokens == 4608 and w.max_num_segments == 1
     assert w._make_fallback is None
 
 
@@ -250,9 +271,8 @@ def test_a_captured_bucket_needs_fixed_layouts_for_cudnn(stub_flashinfer):
     """A captured cuDNN wrapper bakes its layout in; a resource whose buckets replay other
     layouts stays on FlashInfer under capture, and takes cuDNN eagerly."""
     m = manager_with(CUDNN_ROWS, fixed_bucket_layouts=False)
-    graph = dict(accelerator_graph=True, max_num_segments=2, max_total_tokens=2 * 4608)
-    assert type(m._build_wrapper("main", 0, cu(4608, 4608), **graph)) is _StubFlashInfer
-    assert type(m._build_wrapper("main", 0, cu(4608, 4608))) is CudnnRaggedPrefillWrapper
+    assert type(planned(m, 4608, 4608, lease=lease(2, 2 * 4608))) is _StubFlashInfer
+    assert type(planned(m, 4608, 4608)) is CudnnRaggedPrefillWrapper
 
 
 def _image_dit(model: str):
@@ -279,14 +299,12 @@ def test_the_image_dits_declare_fixed_bucket_layouts(model):
 
 
 def test_an_eager_cudnn_wrapper_falls_back_for_unequal_segments(stub_flashinfer):
-    w = manager_with(CUDNN_ROWS)._build_wrapper("main", 0, cu(64, 64))
-    planned = []
+    w = planned(manager_with(CUDNN_ROWS), 64, 64)
     fallback = w._make_fallback()
     assert type(fallback) is _StubFlashInfer
-    fallback.plan = lambda cu_seqlens, causal: planned.append((cu_seqlens.tolist(), causal))
     w._make_fallback = lambda: fallback
     w.plan(cu(64, 32))
-    assert planned == [([0, 64, 96], False)] and w._on_fallback
+    assert fallback.planned == [[0, 64, 96]] and w._on_fallback
     w.plan(cu(32, 32))
     assert not w._on_fallback and w._layout == (2, 32, False)
 
