@@ -9,6 +9,7 @@ the review, posts what `render` makes of its fields, and starts a re-review from
 what `read_state` reads back.
 """
 import base64
+import itertools
 import json
 import os
 import re
@@ -42,6 +43,18 @@ TYPES = ("new-model", "bug", "perf", "feature", "refactor", "test", "docs", "ci"
 # `#` not before a space or another `#`: those are a Markdown heading, which links nothing.
 MARKUP = re.compile(r"(?i)(?:[@<&\\]|#(?![\s#]|$)|\](?=[(:])|!(?=\[)|:(?=//)|(?<![a-z0-9])(?:g(?=h-)|w(?=ww\.)))"
                     r"(?!\u200b)")
+# A live-test report's fenced code, read as GitHub's CommonMark does (`report_blocks`): lines end at \n, \r or \r\n,
+# which isn't str.splitlines.
+LINE = re.compile(r"[^\r\n]*(?:\r\n?|\n|\Z)")
+FENCE_OPEN = re.compile(r"( {0,3})(?:(`{3,})([^`]*)|(~{3,})(.*))")
+FENCE_CLOSE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*")
+LIST_ITEM = re.compile(r"[ \t]*(?:[-+*]|\d+[.)])(?:[ \t]|$)")
+# The HTML a report may keep, exactly so, for a folded section. At the start of a line it opens an HTML block
+# that lasts until a blank line.
+BARE_TAG = re.compile(r"</?(?:details|summary)>")
+# A fence language GitHub leaves as code. These it draws instead, and anything else (`&#109;ermaid`) may spell them.
+PLAIN_LANGUAGE = re.compile(r"[A-Za-z0-9_+.-]*")
+DRAWN_LANGUAGES = ("mermaid", "geojson", "topojson", "stl", "math")
 STRINGS = {"type": "array", "items": {"type": "string"}}
 SCHEMA = {
     "type": "object",
@@ -147,6 +160,59 @@ def inert(value):
     if isinstance(value, dict):
         return {k: inert(v) for k, v in value.items()}
     return value
+
+
+def report_blocks(text):
+    """`text`, at the top level of a comment, as ([piece, in a fence] for each run of lines, the fence left open or
+    ""). A fenced code block by CommonMark's rule is left out of `inert` only where GitHub is sure to read it as one.
+    An opener that isn't sure ends that for the rest of the text, which is then just `inert`, fence or not: one
+    indented under what may be a list item (the item's end also ends the fence, so the next line is outside it),
+    one in the HTML block a bare tag opens (no fence at all), one GitHub draws instead of showing. Skipping only that
+    line wouldn't do: if GitHub does read it as a fence, GitHub's closing line would look like an opener here, and the
+    text after it, outside any fence, would go through unneutralised."""
+    lines, fence, sure, listed, html = [], "", True, False, False
+    for line in LINE.findall(text):
+        body, code = line.rstrip("\r\n"), bool(fence)
+        if fence:
+            close = FENCE_CLOSE.fullmatch(body)
+            if close and close[1][0] == fence[0] and len(close[1]) >= len(fence):
+                fence = ""
+        else:
+            opener = FENCE_OPEN.fullmatch(body) if sure else None
+            if opener:
+                language = re.match(r"[^ \t]*", (opener[3] or opener[5] or "").strip(" \t"))[0]
+                sure = not (opener[1] and listed or html or not PLAIN_LANGUAGE.fullmatch(language)
+                            or language.lower() in DRAWN_LANGUAGES)
+                if sure:
+                    fence, code = opener[2] or opener[4], True
+            listed = listed or bool(LIST_ITEM.match(body))
+            html = bool(BARE_TAG.search(body)) or (html and body.strip(" \t") != "")
+        lines.append((line, code))
+    return [("".join(line for line, _ in run), code) for code, run in itertools.groupby(lines, lambda x: x[1])], fence
+
+
+def inert_report(text):
+    """The box's report as `inert` makes it, except what GitHub shows as written anyway: its fenced code (so a command
+    in one still copies) and the exact tags `<details>`, `</details>`, `<summary>` and `</summary>`. A fence can't
+    ping, link or load anything, but the bot reads its markers from a comment's raw text, so `<!--` is split there
+    too. A second pass changes nothing."""
+    def neutral(m):
+        return m[0] if m[0] == "<" and BARE_TAG.match(m.string, m.start()) else m[0] + "\u200b"
+
+    return "".join(piece.replace("<!--", "<\u200b!--") if code else MARKUP.sub(neutral, piece)
+                   for piece, code in report_blocks(text)[0])
+
+
+def report_closers(text):
+    """What ends the fence and the `<details>` the report `text` left open, so the bot's text after it (and a cut) stays
+    outside them."""
+    pieces, fence = report_blocks(text)
+    depth = 0
+    for piece, code in pieces:
+        for tag in BARE_TAG.findall(piece) if not code else ():
+            depth += (tag == "<details>") - (tag == "</details>" and depth > 0)
+    closers = [*([fence] if fence else []), *["</details>"] * min(depth, 200)]  # 200: stays within a comment's length
+    return "".join(f"\n{c}" for c in closers) + "\n" if closers else ""
 
 
 def stacked_above(path):
