@@ -131,9 +131,9 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         # Leased, the captured block loop declares, plans and commits the
         # attention per replay, and that is the node's whole step, unless the
         # node has a resource whose step is its segments (a LoRA pool): no row
-        # of a leased step uses it (the idle loop refuses them in `can_lease`),
+        # of a leased step uses it (the lean loop refuses them in `can_lease`),
         # but the bound modules outside the loop (patch embed, projection)
-        # still need a planned step to run idle against, so the spans are
+        # still need a planned step to run lean against, so the spans are
         # declared for the engine to add the resource's step of them
         # (`engine_step`).
         leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))

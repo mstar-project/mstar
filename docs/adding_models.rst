@@ -313,6 +313,16 @@ There are two ``ResourceReqConfig`` subclasses:
 
   ``SamplerStep(apply_filters=False)`` samples a step with top-k/top-p off (e.g. a
   TTS's first code); declare it the same way on every step of a walk.
+
+  A step whose every row samples greedily (``samples_greedy``: temperature 0, no
+  repetition penalty, no ``min_tokens`` and no log-probs) takes each row's argmax instead
+  of the full sampler's draw, eagerly or in a twin of each batched capture (see **Lean
+  captures** below); any other step runs the full sampler. By default only a sampler whose
+  ``vocab_size`` is past the one-kernel draw (4096) does this, since a narrower one draws
+  in one kernel already. ``SamplerSpec.greedy_capture`` overrides that: ``false`` turns it
+  off, and with it the twins' capture memory and time, for a deployment that never samples
+  greedily, and ``true`` turns it on whatever the vocabulary. A deployment sets it in its
+  ``resources:`` block. The model declares nothing for it.
 - ``KVReqConfig`` holds ``needed_labels``, ``needed_labels_per_node`` and
   ``needed_labels_per_node_walk``. These name the cache streams that the request will
   actually read. In a PD-disaggregated deployment, a KV transfer then copies only those
@@ -339,8 +349,8 @@ request reads.
 A spec can also build its own request's config from ``model_kwargs``
 (``NodeResourceSpec.request_config``), which the conductor adds beside the model's. That
 is how a resource the deployment declares, such as a LoRA pool, takes per-request
-settings without model code. A row with no config under a resource's key may leave that
-resource idle for the step; see **Idle captures** under Step 5.
+settings without model code. A row with no config under a resource's key may let that
+resource run lean for the step; see **Lean captures** under the resources table.
 
 ``get_sampling_config(node_name, model_kwargs)`` still exists as a helper for assembling
 sampling parameters. The engine no longer reads it directly. Pass its result into a
@@ -854,6 +864,23 @@ The spec types are:
        the serving YAML has a ``resources: lora:`` block. One spec spans every node
        adapters reach, with a pool per node. See `Per-request LoRA adapters`_.
 
+**Lean captures.** A resource whose kernels can be left out of a step whose rows all
+allow it sets ``Resource.lean_capture``, answers ``lean_for(request_ids)`` from state
+every rank of a lockstep instance sets alike (its ingests), and says which kinds of capture
+get its twin (``lean_captures``). Beside each bucket whose step drives such resources, the
+engine captures a twin for each set of them, keyed by that set (``BucketKey.lean``). A step
+replays the twin of every resource its rows let run lean, else one with fewer of them
+(largest set first, ties in declaration order), else the plain bucket; the engine names the
+set in ``StepContext.lean``, eager steps included, and each resource checks its rows again
+at plan. A resource whose callers read its plan inside the forward also overrides
+``Resource.outside_step``, which the engine enters around compile warm-ups outside any step
+(the LoRA pool's runs them lean). Twins are sized, planned and captured after every plain
+bucket, and a twin left out (under the capture budget, say) is logged at INFO and is not a
+dropped bucket: its steps replay the plain bucket. Lean resources: the LoRA pool, for
+steps none of whose rows names an adapter, in every kind of capture; and a sampler (see
+``SamplingReqConfig``), for steps whose rows all sample greedily, in batched captures. A
+model declares nothing for these.
+
 Orpheus declares four specs for its one autoregressive node. Its ``snac_decoder`` node
 appears in no spec, so it receives no resources:
 
@@ -1275,9 +1302,9 @@ placed exactly as weights are.
   node's does, from its own segments (an ``attn_key`` region's: one per row), planned
   per replay and handing the enclosing step's plan back at its commit. A region
   replayed as one row per step (``one_row_per_step``) addresses every row to the first
-  request's adapter, so the engine captures it idle (``BucketKey.idle``) and leases it
-  only for a step none of whose rows runs an adapter; a step with one runs the region
-  eagerly under the node's step.
+  request's adapter, so the engine captures it with the pool lean (``BucketKey.lean``
+  names the pool) and leases it only for a step none of whose rows runs an adapter; a
+  step with one runs the region eagerly under the node's step.
 
 ``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
@@ -1321,17 +1348,20 @@ placed exactly as weights are.
   ``max_rank``, only declared targets, shapes that fit), not per request. A request on an
   adapter is prefix-cached in its adapter's own namespace (see **Cross-request prefix
   reuse**).
-- **Capture and compile.** Nothing per model. The pool is idle-capable
-  (``idle_capture``), so a node serving adapters captures each bucket it would capture
-  anyway and also that bucket's idle twin, which records no LoRA kernel and compiles
-  separately; a step of base-model rows replays the twin, or runs its deltas as ``y``
-  untouched eagerly (see **Idle captures**). A capture plans every row on the zero
-  adapter; a replay's plan writes each row's slot into the buffers that capture
+- **Capture and compile.** Nothing per model: a node serving adapters captures the same
+  buckets and compiles the same as one that does not. A capture plans every row on the
+  zero adapter; a replay's plan writes each row's slot into the buffers that capture
   recorded, so a captured graph serves any mix of adapters without recapture. The
   kernels are the custom ops ``mstar::lora_shrink`` and ``mstar::lora_expand_`` (the
   latter declares the ``y`` it writes), so ``torch.compile`` takes them as single nodes
   without a graph break. Under Triton the launch grid depends on the token count and
-  the slot count alone.
+  the slot count alone. The pool is a lean resource (``Resource.lean_capture``; see
+  **Lean captures** under the resources table), so the engine captures every bucket whose
+  step drives it a second time with no LoRA kernel in it: a step none of whose rows names
+  an adapter replays that twin (or runs its deltas as ``y`` untouched, eagerly), and the
+  LoRA capture when the twin was not captured. The choice reads only which adapter each
+  request named, the same on every rank, and the pool checks it again at plan;
+  ``cg_key_info`` and ``declare_step`` still state only the node's own key.
 - **dtype.** The slot weights take the nodes' compute dtype (the serving config's
   ``autocast_dtype``, e.g. ``float16``). A node that runs outside autocast sets
   ``LoraSpec.dtype`` to its weights' dtype.
@@ -1358,7 +1388,7 @@ once, and its admit fails it before handing out any slot, so it takes none that 
 request needs. A reservation counts slots and pins none: which slot an admit takes follows
 from the slot table alone. An
 adapter with nothing for a pool's targets (a text-only adapter on a vision tower's pool)
-takes no slot there and runs no delta (its steps can replay the idle capture; see **Idle captures**): the
+takes no slot there and runs no delta (its steps can replay the lean capture; see **Lean captures**): the
 pool knows it from the file's header at startup, or from a runtime load's read, and its
 rows address the zero adapter. Only the
 rank that chooses batches admits: on a lockstep instance the leader, whose choice the
@@ -2230,25 +2260,6 @@ BAGEL shows the case of two captures for one walk. It captures ``decode`` twice,
 with guidance enabled and a decode step with guidance disabled declare different segments
 over the same token count. BAGEL's ``cg_key_info`` reports which of the two a batch is.
 
-Idle captures
-^^^^^^^^^^^^^
-
-A resource whose kernels do nothing for rows that don't use it (a LoRA pool for base-model
-requests) sets ``Resource.idle_capture`` and answers ``Resource.idle_for(rids)``; a node
-takes at most one. The engine then captures a second time, with ``BucketKey.idle`` set and
-none of those kernels recorded, every bucket of each capture config whose declared step
-drives the resource. The idle twin compiles separately and is sized as a walk of its own.
-A step ``idle_for`` answers True for replays the idle twin of the bucket it would lease
-anyway, or that bucket when the twin was not captured; an idle bucket is planned after
-every plain bucket that fits, and kept only beside its plain one. The engine tells the
-resource through ``StepContext.idle``, eager steps included, so the resource plans nothing
-and launches nothing for an idle step. ``idle_for`` reads state every rank sets alike (its
-ingests), so ranks leasing over the same rows choose the same. A rank whose pre-plan was
-skipped leases over the rows the step kept, while another keeps the lease its pre-plan
-took, so the resource's kernels must hold no collective. Nothing changes for the model:
-its ``cg_key_info`` and ``declare_step`` state the same key either way. A piecewise
-region's bucket can be idle too (see the ``one_row_per_step`` regions above).
-
 Piecewise CUDA graphs (capturing an inner loop)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -2535,6 +2546,11 @@ that a misspelled setting is never silently ignored:
      - ``num_sessions``
    * - ``BoundedKVSpec``
      - ``max_slots``
+   * - ``SamplerSpec``
+     - ``enable_logprobs``, ``enable_processed_logprobs`` (see ``SamplingReqConfig``),
+       ``greedy_capture`` (``true`` / ``false``; by default a sampler past the one-kernel
+       draw takes each row's argmax in a step whose rows all sample greedily, in a twin of
+       each batched capture)
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype``, ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no

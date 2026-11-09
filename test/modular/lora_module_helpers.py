@@ -141,11 +141,6 @@ def _config(adapter: str | None) -> LoraReqConfig | None:
     return None if adapter is None else LoraReqConfig(adapter=adapter)
 
 
-def _idle(rows) -> bool:
-    """The step's ``StepContext.idle``, as the engine sets it: no row names an adapter."""
-    return all(adapter is None for _, adapter, _ in rows)
-
-
 def plan(pools, rows: list[tuple[str, str | None, int]]) -> None:
     """Ingest ``rows`` ((rid, adapter, span)) into each pool, then admit and plan one step
     over them, as the engine drives a step whose segments are one per request."""
@@ -153,8 +148,7 @@ def plan(pools, rows: list[tuple[str, str | None, int]]) -> None:
         for rid, adapter, _ in rows:
             p.ingest_request(rid, _config(adapter))
         step = ResourceStep(segments=tuple(Segment(rid, "main", n) for rid, _, n in rows))
-        ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk="prefill", slot=0, capture=False,
-                          idle=_idle(rows))
+        ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk="prefill", slot=0, capture=False)
         assert p.admit(step, ctx).ok
         p.plan(step, ctx)
 
@@ -164,8 +158,7 @@ def admit_declared(lora_pool, step, rows, walk: str = "prefill") -> None:
     the pool's step the engine adds to it (``with_segment_steps``)."""
     for rid, adapter, _ in rows:
         lora_pool.ingest_request(rid, _config(adapter))
-    ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk=walk, slot=0, capture=False,
-                      idle=_idle(rows))
+    ctx = StepContext(request_ids=[r for r, _, _ in rows], graph_walk=walk, slot=0, capture=False)
     key = lora_pool.spec.resource_key
     lora_step = with_segment_steps(step, (key,)).get(key)
     assert lora_step is not None, "the node's step declares no segments to lay its rows out from"

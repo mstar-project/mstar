@@ -22,8 +22,8 @@ RustTensorStore; purged by force_cleanup_request), RecurrentStatePool.{_keyed,
 _leases, _restores, _snap_writes, _decode, _unkeyed, _chunk_ends,
 _admit_restores, _admit_snaps, _admit_taken, _preplan_taken, _reserved} and KDAManager._verifying
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
-release), SamplerCells._cells (purged by the sampler's remove_request), and
-WorkerProfileInfo.
+release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the
+sampler's remove_request), and WorkerProfileInfo.
 
 Lockstep's follow count is the one deliberate exception: a
 ScheduleTPNode can arrive before the NEW_REQUEST that mints the handle, so it
