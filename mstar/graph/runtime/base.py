@@ -972,9 +972,9 @@ class GraphRuntime(PhasedPostprocess, ABC):
 
     @abstractmethod
     def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
-        """A request's limits (``StopPolicy.limits``) under every declared
-        walk's policies, from its forward-pass info as it arrives. Dropped
-        with the request."""
+        """A request's limits (``StopPolicy.limits``) under the declared
+        policies of the nodes in ``info``'s partition, from its forward-pass
+        info as it arrives. Dropped with the request."""
 
     @abstractmethod
     def check_stops(

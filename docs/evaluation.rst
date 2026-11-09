@@ -63,6 +63,15 @@ Suites
   large-v3 by default; CER for zh/ja/ko/th), speaker similarity to each item's
   reference clip (``--clone`` sends it as ``ref_audio``; ``--sim-judge``) and UTMOS
   (``--mos``). ``--engine vllm-omni|sglang-omni`` reads their raw PCM streams.
+  ``--engine nanovllm-voxcpm`` posts to Nano-vLLM-VoxCPM's ``/generate`` in the mode
+  M*'s VoxCPM2 runs for the same item: a clip as the reference block, and with its
+  transcript also as the prompt the speech continues. Its ``cfg_value`` defaults to
+  1.5 and M*'s VoxCPM2 to 2.0, so send ``--extra cfg_value=2.0`` to compare them.
+  Its demo server decodes at most ``NANOVLLM_SERVERPOOL_MAX_NUM_SEQS`` rows a step
+  (16 by default) and captures its decode graphs only that wide; start it with that
+  set to at least the concurrency (M*'s VoxCPM2 config runs 32). A stream that is
+  not PCM16 (``X-Audio-Encoding`` other than ``s16le``, as from a server before
+  2.0.3) is an error row.
 ``asr``
   ``/v1/audio/transcriptions``. Corpus WER (CER for character languages) against the
   manifest, latency percentiles, RTFx (audio seconds per wall second), and with

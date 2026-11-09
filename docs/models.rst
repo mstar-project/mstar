@@ -987,6 +987,14 @@ CosyVoice3 notes
   ``ref_audio`` clip (with its transcript in ``ref_text`` for zero-shot
   cloning) or a preset from ``voices_dir`` (see ``configs/cosyvoice3.yaml``).
   ``instructions`` carries a style instruction. Output is 24 kHz.
+- A streamed row solves only each hop's new frames, reading the K/V of the
+  frames before them from ``resources.flow_kv`` (about 1.8 MB a frame). Past
+  ``flow_cache_frames`` (768 by default, 15 s of prompt and speech) a row goes
+  back to re-solving every frame. The default pool holds that for 32 requests,
+  about 41 GiB. ``flow_cache_frames: 0`` turns it off, and so does a float32
+  estimator, which FlashInfer's kernels can't run.
+- ``configs/cosyvoice3_split.yaml`` runs the flow and vocoder on their own
+  worker on the same GPU, with MPS and batches of 16, for throughput.
 - Keep the reference clip short, a few seconds like CosyVoice's own 3.5 s
   prompt clip: with a 23 s clip as the preset, round-trip word error rate rose
   from 1.4% to 13.4%, with words dropped mid-sentence.
@@ -1011,6 +1019,17 @@ CosyVoice3 notes
   ``flow_capture_batch_sizes``, ``flow_capture_batch_frames``), which takes GPU
   memory and startup time. ``model_kwargs: {flow_capture_frame_buckets: []}``
   captures none, and every solve runs eagerly.
+- The streaming vocoder is captured the same way, one graph per window bucket
+  and batch size (``hift_capture_frame_buckets``, ``hift_capture_batch_sizes``,
+  about 3.3 GB at the defaults); each stream's mel tail and phase carry live in
+  the ``hift_state`` pool, a slot per request (``resources: hift_state:
+  {max_slots: N}``, one more than the requests). A chunk past the largest bucket
+  runs as several steps. ``hift_capture_frame_buckets: []`` runs the vocoder
+  eagerly.
+- The LM's prefill is captured with its decode, per prompt token bucket and
+  batch size (``lm_prefill_token_buckets``, ``lm_prefill_batch_sizes``; the LM's
+  graphs take about 130 MB together). A prompt past the largest bucket runs
+  eagerly, and ``lm_prefill_token_buckets: []`` captures no prefill.
 
 Qwen3-TTS notes
 ---------------

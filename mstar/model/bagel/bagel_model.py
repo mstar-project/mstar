@@ -696,6 +696,9 @@ class BagelModel(Model):
                     raise ValueError(f"BAGEL image {key} must be an integer, got {value!r}")
         result: NameToTensorList = {}
 
+        # nothing to prefill (blank text is the template alone): a 400 here, before admission
+        if (prompt is None or not prompt.strip()) and "image" not in input_modalities:
+            raise ValueError("BAGEL requires a text prompt or an image")
         is_understanding = (output_modalities or ["text"])[0] == "text"
         if prompt is None and "image" in input_modalities and is_understanding:
             # an image-only chat still opens its reply
@@ -773,6 +776,8 @@ class BagelModel(Model):
             return split_spans(result, self.SPANS)[0]
         if prompt is None:
             parts, segments = parts_from_modalities(input_modalities), []
+            # the prompt branch checks this; without it a declared image that never came is an IndexError
+            check_attachments(parts, {"image": len(images)})
             role_turns = uses_role_turns(parts, is_understanding)
         if images:
             # split into spans below, in place of the loaded list

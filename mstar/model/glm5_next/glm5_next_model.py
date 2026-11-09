@@ -60,6 +60,10 @@ from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 logger = logging.getLogger(__name__)
 
+# The quantized checkpoint format this loader reads itself: fp8 block-scale (dense
+# weights dequantized on load, routed experts fp8-resident).
+QUANT_METHODS = ("fp8",)
+
 
 class Glm5NextModel(Model):
     """GLM-5.3-Flash: 320B hybrid KDA/MLA MoE causal LM, text in / text out."""
@@ -510,7 +514,10 @@ class Glm5NextModel(Model):
 
         index_file = Path(source) / "model.safetensors.index.json"
         if not index_file.is_file():
-            check_loaded(language_model, load_weights(language_model, source, device=device), source)
+            check_loaded(
+                language_model, load_weights(language_model, source, device=device, quant_methods=QUANT_METHODS),
+                source,
+            )
             return
 
         with open(index_file) as f:
@@ -526,7 +533,7 @@ class Glm5NextModel(Model):
             len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
         )
         weights = iter_safetensors_shards(
-            source, device=device, keys=keys, slice_spec=specs.get,
+            source, device=device, keys=keys, slice_spec=specs.get, quant_methods=QUANT_METHODS,
         )
         check_loaded(language_model, language_model.load_weights(weights), source)
 
