@@ -31,10 +31,10 @@ Nodes:
   Cosmos3ReasonerSubmodule    -- the understanding tower as a causal VLM
                                  (shares the DiT's transformer instance and
                                  kv/attn resources, plus its own sampler):
-                                 ``reasoner_prefill`` / ``reasoner_prefill_vision``
-                                 write the prompt's K/V and sample the first
-                                 token, ``reasoner_decode`` one token per loop
-                                 iteration.
+                                 ``prefill_text`` / ``prefill_vision`` write
+                                 the prompt's K/V and sample the first token,
+                                 ``decode`` one token per iteration of
+                                 ``decode_loop``.
 
 Because the text tokens never receive a timestep embedding, the understanding
 K/V is denoise-step independent, so writing it once and re-reading it every step

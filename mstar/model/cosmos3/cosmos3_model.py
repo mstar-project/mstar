@@ -30,10 +30,10 @@ Edge checkpoints add the reasoner (the understanding tower served as a VLM):
     reasoner       (kv_cache, sampler) - the same transformer instance as the
                                  DiT (one copy of the text weights, the same KV
                                  pool), run as a causal text model.
-    reasoner_prefill / reasoner_prefill_vision - embed the chat-templated
-                 prompt (vision tokens scattered over the media placeholders),
-                 write its K/V, sample the first token.
-    reasoner_decode - one token per loop iteration until EOS / max tokens.
+    prefill_text / prefill_vision - embed the chat-templated prompt (vision
+                 tokens spliced in at the media placeholders), write its K/V,
+                 sample the first token.
+    decode - one token per iteration of decode_loop until EOS / max tokens.
 
 Streaming rollout (opt-in, ``enable_windowed_video``; ported from #198):
     video_gen_ar - the denoise loop run window by window over a long clip.
