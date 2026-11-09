@@ -930,13 +930,18 @@ def test_a_twin_is_planned_only_beside_its_plain_bucket():
     assert plan_captures(pools, free=100 * _MIB).buckets == {"LLM": set()}
 
 
-def test_the_widest_twins_are_the_first_left_out():
+def test_the_costliest_twins_are_the_first_left_out():
+    """Twins go in cheapest first, as plain buckets do; at equal cost the tie goes to
+    capture order, which lists the widest first."""
     twins = {_twin(_DECODE8, "sampler"): _cost(30, kept=30), _twin(_DECODE, "sampler"): _cost(60, kept=60)}
     pools = {"LLM": {_DECODE: _cost(10, kept=10), _DECODE8: _cost(10, kept=10), **twins}}
 
     plan = plan_captures(pools, free=(20 + 50) * _MIB)
 
     assert plan.buckets == {"LLM": {_DECODE, _DECODE8, _twin(_DECODE8, "sampler")}}
+    tied = {"LLM": {_DECODE: _cost(10, kept=10), _DECODE8: _cost(10, kept=10),
+                    _twin(_DECODE, "sampler"): _cost(30, kept=30), _twin(_DECODE8, "sampler"): _cost(30, kept=30)}}
+    assert plan_captures(tied, free=(20 + 30) * _MIB).buckets == {"LLM": {_DECODE, _DECODE8, _twin(_DECODE, "sampler")}}
 
 
 def test_a_region_captured_lean_alone_plans_as_a_plain_bucket():
