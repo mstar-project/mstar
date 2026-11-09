@@ -22,9 +22,11 @@ from test_kv_preemption import (  # noqa: F401
     PAGE_SIZE,
     _admitted,
     _ctx,
+    _drop,
     _offload,
     _pool,
     _preempt,
+    _queue,
     _ready,
     _request,
     _returns,
@@ -33,6 +35,7 @@ from test_kv_preemption import (  # noqa: F401
     _step,
     _stub_transfer,
 )
+from test_kv_prefix_lease import WALK, _manager
 
 from mstar.engine.engine import Engine, PagedKVCache
 from mstar.engine.resources import Residency
@@ -42,6 +45,7 @@ from mstar.engine.resources.step import ASKS, Segment
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.model.base import KVLabel
 from mstar.model.rebuild import RebuildPolicy
+from mstar.model.submodule_base import ARNodeInputs
 from mstar.observability.recorders import EdgeTransfers
 from mstar.testing_utils.worker import make_scheduler, make_worker
 from mstar.worker.host_pool import HostCopy, HostSlice
@@ -77,13 +81,13 @@ def _worker(kv):
     """The real handlers over one pool, with the engine's drop going straight to the pool and its runner."""
     def drop_request(node, rid, tokens):
         freed = kv.drop(rid, tokens)
-        _runner(kv).readmit(rid, node, queued=True)
+        _runner(kv).readmit(rid, node)
         return freed
 
     engine = _Engine(
         drop_refusal=lambda node, rid, tokens: kv.check_drop(rid, tokens), drop_request=drop_request,
         offload_request=lambda node, rid: _offload(kv, rid),
-        readmit_request=lambda node, rid, queued: _runner(kv).readmit(rid, node, queued),
+        readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
         newer_than=lambda rid: _runner(kv).newer_than(rid),
         refusals=lambda: _runner(kv).refusals(),
         paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)],
@@ -293,7 +297,7 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed)
     _running(kv, "o", 4, arrival=1)
     _running(kv, "z", 6, arrival=3)
     assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
-    _runner(kv).readmit("z", NODE, queued=False)
+    _runner(kv).readmit("z", NODE)
     # either way p asks for 5 pages, a guaranteed p for its prompt page and 4 of decode
     _request(kv, "p", 1 if guaranteed else 5, arrival=2, guaranteed=guaranteed)
     assert not _ready(kv, "p") and not _admitted(kv, "z")
@@ -335,7 +339,7 @@ def test_make_room_helps_the_oldest_refused_request_moves_can_let_in():
     kv._streams["p"]["main"].step_in_flight = False
     assert _preempt(kv, "p", _short(kv, "p"), droppable=lambda rid: False).waits
     for rid in ("y", "p"):
-        _runner(kv).readmit(rid, NODE, queued=False)
+        _runner(kv).readmit(rid, NODE)
     _request(kv, "o", 9, arrival=1)
     assert not _ready(kv, "o") and not _admitted(kv, "y")
     w = _worker(kv)
@@ -363,6 +367,103 @@ def test_make_room_asks_nothing_while_no_request_waits_holding_its_allotment():
     assert not read, "make_room read the refusals with no request it could move"
 
 
+def test_make_room_moves_nothing_once_the_oldest_refused_request_fits():
+    """x and y wait to return from their drops, and t's removal makes room for x. The walk passed over x, which fit
+    and so needed no move, and dropped p for y, which then took the room x fit in."""
+    kv = _manager(max_num_pages=21)
+    for arrival, (rid, pages) in enumerate((("s", 10), ("t", 3), ("x", 2), ("y", 3), ("p", 2))):
+        _running(kv, rid, pages, arrival)
+    kv._streams["p"]["main"].step_in_flight = True
+    short = _step(kv, "s", 4 * PAGE_SIZE).reason.pages_short
+    assert _preempt(kv, "s", short, droppable=lambda rid: True).to_drop == ["y", "x"]
+    kv._streams["p"]["main"].step_in_flight = False
+    for rid in ("y", "x"):
+        _drop(kv, rid)
+    assert _step(kv, "s", 4 * PAGE_SIZE).ok
+    assert _preempt(kv, "p", _step(kv, "p", PAGE_SIZE + 1).reason.pages_short, droppable=lambda rid: True).waits
+    _runner(kv).readmit("p", NODE)
+    assert not _admitted(kv, "x") and not _admitted(kv, "y")
+    _remove(kv, "t")
+    w = _worker(kv)
+    w._rebuilds._kept[NODE]["p"] = _kept(2 * PAGE_SIZE)
+
+    w._preemption.make_room()
+
+    assert kv.residency("p") is Residency.RESIDENT, "p was dropped for y, though x, older, fit"
+    assert _admitted(kv, "x") and not _admitted(kv, "y"), "y took the room x fit in"
+
+
+def test_make_room_walks_again_only_once_a_refusal_or_a_request_it_could_move_changes():
+    """o waits to return into pages r holds, and r, waiting for its shortage, can't be dropped until its ids cover its
+    KV. Each pass walked every refusal again, about 2 ms with 32 requests waiting. Walking only once a refusal's room
+    grew would miss r's ids reaching the host, which grows nothing, and o would wait for good."""
+    kv = _pool()
+    _running(kv, "x", 2, arrival=0)
+    _running(kv, "o", 3, arrival=1)
+    _running(kv, "r", 5, arrival=2)
+    kv._streams["r"]["main"].step_in_flight = True
+    assert _preempt(kv, "x", _short(kv, "x"), droppable=lambda rid: True).to_drop == ["o"]
+    kv._streams["r"]["main"].step_in_flight = False
+    _drop(kv, "o")
+    assert _step(kv, "r", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: True).waits
+    _runner(kv).readmit("r", NODE)
+    assert not _admitted(kv, "o")
+    w = _worker(kv)
+    walked, make_room = [], kv.make_room
+    kv.make_room = lambda *args: walked.append(args[0].rid) or make_room(*args)
+    w._preemption.make_room()
+    assert walked == ["o", "r"] and kv.residency("r") is Residency.RESIDENT
+    walked.clear()
+
+    w._preemption.make_room()
+    assert not walked, "make_room walked the refusals again with nothing changed"
+    w._rebuilds._kept[NODE]["r"] = _kept(7 * PAGE_SIZE)
+    w._preemption.make_room()
+
+    assert kv.residency("r") is Residency.DROPPED and _admitted(kv, "o"), "o waited after r could be dropped"
+
+
+def test_make_room_walks_again_once_a_running_request_lets_go_of_a_page_a_waiting_one_shares():
+    """o waits to return, and s, waiting for its shortage, shares its prompt's pages with h. Moving s frees too little
+    while h holds them. h's removal leaves the room as it was, since s still holds every page h held, but moving s
+    now frees them. The walk read only the refusals, the requests it could move and the host's room, none of which
+    changed, so o waited until something else did."""
+    kv = _pool()
+    shared = list(range(3 * PAGE_SIZE))
+    _running(kv, "x", 2, arrival=0)
+    _running(kv, "o", 3, arrival=1)
+    _request(kv, "h", 3, arrival=2, keyed=shared)
+    assert _ready(kv, "h") and _step(kv, "h", 3 * PAGE_SIZE).ok
+    _request(kv, "s", 4, arrival=3, keyed=shared + list(range(100, 100 + PAGE_SIZE)))
+    assert _ready(kv, "s")
+    inputs = ARNodeInputs(input_seq_len=4 * PAGE_SIZE)
+    kv.apply_cached_prefix("s", NODE, WALK, inputs, kv.resolve_cached_prefix("s", NODE, WALK, inputs))
+    assert _step(kv, "s", PAGE_SIZE).ok
+    for rid in ("h", "s"):
+        kv._streams[rid]["main"].step_in_flight = True
+    short = _step(kv, "x", 2 * PAGE_SIZE).reason.pages_short
+    assert _preempt(kv, "x", short, droppable=lambda rid: True).to_drop == ["o"]
+    for rid in ("h", "s"):
+        kv._streams[rid]["main"].step_in_flight = False
+    _drop(kv, "o")
+    assert _step(kv, "x", 2 * PAGE_SIZE).ok
+    assert _preempt(kv, "s", _step(kv, "s", 3 * PAGE_SIZE).reason.pages_short, droppable=lambda rid: True).waits
+    _runner(kv).readmit("s", NODE)
+    assert not _admitted(kv, "o")
+    w = _worker(kv)
+    w._rebuilds._kept[NODE]["s"] = _kept(4 * PAGE_SIZE)
+    w._preemption.make_room()
+    assert kv.residency("s") is Residency.RESIDENT and not _admitted(kv, "o")
+    room = kv._room()
+
+    _remove(kv, "h")
+    assert kv._room() == room
+    w._preemption.make_room()
+
+    assert kv.residency("s") is Residency.DROPPED, "o waited though moving s would now let it in"
+
+
 class _Pool:
     """A pool that asks for every request and fits it."""
 
@@ -381,7 +482,7 @@ def test_a_request_admitted_on_a_node_it_never_parked_on_is_unparked():
     nodes = ("LLM", "LLM_cfg")
     assert all(admission.admit("q", node, "decode", None, ["kv"]) is None for node in nodes)
     for node in nodes:
-        admission.readmit("q", node, ["kv"], queued=False)
+        admission.readmit("q", node, ["kv"])
     engine = _Engine(admit_waiting=admission.admit_waiting)
     request_state = SimpleNamespace(
         get_partition_for_node=lambda node: "p",
@@ -433,6 +534,29 @@ def test_a_request_on_the_host_without_a_step_of_its_own_holds_back_no_newer_req
 
     assert _ready(kv, "x"), "x waited behind v on the host"
     assert kv.is_offloaded("v") and "v" in kv._allotments, "v wasn't admitted ahead of x"
+
+
+def test_a_request_back_from_the_host_that_gives_back_its_allotment_waits_as_a_return():
+    """v, admitted to return from the host but not yet reloaded, holds an allotment and no device page, so r's
+    shortage has it give the allotment back. It then waited in the queue at its arrival, holding back every newer
+    prompt while it waited for its reload and a page, where every other request on the host waits outside it."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "o", 4, arrival=0)
+    _running(kv, "r", 3, arrival=1)
+    _running(kv, "v", 3, arrival=2)
+    assert _preempt(kv, "r", _short(kv, "r"), droppable=lambda rid: False).to_host == ["v"]
+    _offload(kv, "v")
+    _remove(kv, "o")
+    assert _admitted(kv, "v") and kv.is_offloaded("v")
+    reason = _step(kv, "r", 4 * PAGE_SIZE).reason
+    w = _worker(kv)
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
+
+    w._handle_admit_failure(batch, _refused(batch, reason))
+
+    assert "v" not in kv._allotments, "v kept the allotment r's shortage asked it to give back"
+    assert _returns(kv) == ["v"] and not _queue(kv), "v waits in the queue, though it is on the host"
 
 
 def test_a_backlogged_victim_goes_back_to_the_runtime():
@@ -505,7 +629,7 @@ def test_the_worker_keeps_ids_only_for_a_request_whose_output_can_pause(unpausab
 
     w._set_rebuildable(1, configs)
 
-    assert (1 in w._rebuilds._droppable[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
+    assert (1 in w._rebuilds._keeps_ids[NODE]) is not unpausable, "the conductor's mark didn't reach the kept ids"
 
 
 @pytest.mark.parametrize("layout", ["two labels", "two spans", "two loops"])
