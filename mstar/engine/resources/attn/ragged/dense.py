@@ -33,14 +33,6 @@ def _warn_dense_on_flashinfer(what: str, reason: str) -> None:
     )
 
 
-@functools.cache
-def _warn_ragged_cudnn_fallback(what: str) -> None:
-    logger.warning(
-        "Ragged %s backend 'cudnn' requested, but the cuDNN wrapper runs self-attention only; "
-        "using the ragged 'flashinfer' backend instead.", what,
-    )
-
-
 class DenseRaggedManager(_RaggedSelfManagerBase):
     wrapper_class = DenseRaggedPrefillWrapper
 

@@ -15,6 +15,7 @@ from mstar.engine.resources import (
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedAttnBackend,
+    RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     apply_yaml_overrides,
 )
@@ -56,10 +57,11 @@ def gpu(monkeypatch):
     reset_lookups()
 
 
-def spec(heads=24, head_dim=128, cls=RaggedAttentionSpec, **config):
+def spec(heads=24, head_dim=128, cls=RaggedAttentionSpec, block_size=None, **config):
+    config = {"num_kv_heads": heads, "dtype": torch.bfloat16, **config}
+    extra = {} if block_size is None else {"block_size": block_size}
     return cls(resource_key="dit_attn", nodes={"dit"},
-               config=RaggedAttentionConfig(num_qo_heads=heads, num_kv_heads=heads, head_dim=head_dim,
-                                            dtype=torch.bfloat16, **config))
+               config=RaggedAttentionConfig(num_qo_heads=heads, head_dim=head_dim, **config), **extra)
 
 
 def build(s, device=GPU):
@@ -155,17 +157,40 @@ def test_backend_cudnn_runs_cudnn_wherever_named(gpu, key):
     assert build(s)._kernel_rows == ((None, Choice("cudnn")),)
 
 
-def test_cross_attention_never_takes_cudnn(gpu, caplog):
+@pytest.mark.parametrize(("config", "why"), [
+    (dict(num_kv_heads=8, heads=16), "MHA only"),
+    (dict(head_dim=72), "padded to 128"),
+    (dict(dtype=torch.float32), "bf16 / fp16"),
+], ids=["gqa", "padded_head_dim", "fp32"])
+def test_backend_cudnn_is_refused_at_build_where_it_cant_run(gpu, config, why):
     gpu(B300)
-    from mstar.engine.resources.attn.ragged import dense as ragged_dense
+    s = spec(backend=RaggedAttnBackend.CUDNN, **config)
+    with pytest.raises(ValueError, match=f"names backend 'cudnn'.*{why}"):
+        build(s)
 
-    ragged_dense._warn_ragged_cudnn_fallback.cache_clear()
-    with caplog.at_level(logging.WARNING, logger=ragged_dense.logger.name):
-        manager = build(spec(cls=RaggedCrossAttentionSpec, backend=RaggedAttnBackend.CUDNN))
+
+@pytest.mark.parametrize("cls", [RaggedCrossAttentionSpec, RaggedBlockCausalAttentionSpec],
+                         ids=["cross", "block_causal"])
+def test_backend_cudnn_is_refused_at_build_off_self_attention(gpu, cls):
+    gpu(B300)
+    extra = {"block_size": 64} if cls is RaggedBlockCausalAttentionSpec else {}
+    with pytest.raises(ValueError, match="runs self-attention only"):
+        build(spec(cls=cls, backend=RaggedAttnBackend.CUDNN, **extra))
+
+
+def test_cudnn_cant_run_a_padded_head_dim(gpu):
+    """So a table row naming cudnn there is refused like the explicit backend (``kernel_rows``)."""
+    gpu(B300)
+    target = kernels_module.RAGGED_ATTENTION.target(
+        torch.bfloat16, {"num_qo_heads": 16, "num_kv_heads": 16, "head_dim": 72}, GPU)
+    assert "padded to 128" in kernels_module.RAGGED_ATTENTION.unavailable(target)["cudnn"]
+
+
+def test_cross_attention_reads_no_table(gpu):
+    gpu(B300)
+    manager = build(spec(cls=RaggedCrossAttentionSpec))
     assert type(manager) is FlashInferRaggedCrossManager
-    assert "self-attention only" in caplog.text
-    # and AUTO cross-attention reads no table
-    assert not hasattr(build(spec(cls=RaggedCrossAttentionSpec)), "_kernel_rows")
+    assert not hasattr(manager, "_kernel_rows")
 
 
 # --- which wrapper a layout gets ---------------------------------------------------------------

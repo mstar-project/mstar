@@ -1017,8 +1017,10 @@ segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured o
 the layout it was planned with, so a captured bucket takes it only when the config declares
 ``fixed_bucket_layouts=True`` (klein and Z-Image do: every row of a denoise bucket, padding rows
 included, spans the bucket's tokens), and stays on FlashInfer otherwise; an eager one runs
-unequal segments on FlashInfer. It is self-attention only. Where no table has the geometry, ``AUTO`` is FlashInfer with its own
-``auto`` choice. ``RaggedAttnBackend.DENSE`` plans the same layouts into static
+unequal segments on FlashInfer. It is self-attention only. A config that names ``backend: cudnn``
+fails at build where cuDNN can't run it: on a cross-attention or block-causal resource, under
+GQA, in a dtype other than bf16 / fp16, or at a head dim FlashInfer pads. Where no table has the
+geometry, ``AUTO`` is FlashInfer with its own ``auto`` choice. ``RaggedAttnBackend.DENSE`` plans the same layouts into static
 ``cu_seqlens`` buffers and runs FA3 ``flash_attn_varlen`` (AITER on ROCm) instead, with
 no page scatter. If that kernel is not importable, or the spec is a
 ``RaggedBlockCausalAttentionSpec`` (whose overlapping prefixes varlen cannot express),

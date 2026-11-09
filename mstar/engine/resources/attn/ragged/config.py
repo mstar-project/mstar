@@ -30,7 +30,8 @@ class RaggedAttnBackend(Enum):
     # FA3 (AITER on ROCm) varlen; YAML name matches AttnBackend.DENSE
     DENSE = "dense"
     # torch's cuDNN SDPA over equal-length segments, FlashInfer for any other
-    # layout; self-attention only
+    # layout; self-attention only, and refused at build where cuDNN can't run
+    # the geometry (GQA, a dtype other than bf16 / fp16, a padded head dim)
     CUDNN = "cudnn"
 
 

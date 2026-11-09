@@ -40,18 +40,21 @@ def resolve_ragged_attn_backend(
     return backend
 
 
-def _without_cudnn(backend: RaggedAttnBackend, what: str) -> RaggedAttnBackend:
+def _refuse_cudnn(spec, backend: RaggedAttnBackend, what: str) -> RaggedAttnBackend:
     if backend is RaggedAttnBackend.CUDNN:
-        from mstar.engine.resources.attn.ragged.dense import _warn_ragged_cudnn_fallback
-
-        _warn_ragged_cudnn_fallback(what)
-        return RaggedAttnBackend.FLASHINFER
+        raise ValueError(
+            f"ragged attention {spec.resource_key!r}: backend 'cudnn' runs self-attention only, "
+            f"not {what}; name 'auto', 'flashinfer' or 'dense'"
+        )
     return backend
 
 
-def _build_ragged(spec, info: EngineResourceInfo, manager_cls, kernel_table: bool = False, **kwargs):
+def _build_ragged(
+    spec, info: EngineResourceInfo, manager_cls, kernel_table: bool = False, cudnn: bool = False, **kwargs,
+):
     """``kernel_table``: read the ``ragged_attention`` rows for the rank's head
-    geometry (``kernels.kernel_rows``) and hand them to the manager."""
+    geometry (``kernels.kernel_rows``) and hand them to the manager. ``cudnn``:
+    hand it cuDNN's one row, refused here if cuDNN can't run the geometry."""
     config = spec.config
     joint = info.joint_comm_group
     if config.shard_over_sp or joint is None:
@@ -65,7 +68,13 @@ def _build_ragged(spec, info: EngineResourceInfo, manager_cls, kernel_table: boo
             "RaggedAttentionConfig.dtype on a node without a KV-backed attention "
             "(the engine has no KV dtype to fall back on)."
         )
-    if kernel_table:
+    if cudnn:
+        from mstar.engine.resources.attn.ragged.kernels import cudnn_rows
+
+        kwargs["kernel_rows"] = cudnn_rows(
+            spec.resource_key, config.num_qo_heads, config.num_kv_heads, config.head_dim, dtype, info.device,
+        )
+    elif kernel_table:
         from mstar.engine.resources.attn.ragged.kernels import kernel_rows
 
         rows = kernel_rows(config.num_qo_heads, config.num_kv_heads, config.head_dim, dtype, info.device)
@@ -121,9 +130,8 @@ class RaggedAttnManager(AttentionResource):
             )
         if backend is RaggedAttnBackend.CUDNN:
             from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
-            from mstar.kernels import Choice
 
-            return _build_ragged(spec, info, FlashInferRaggedManager, kernel_rows=((None, Choice("cudnn")),))
+            return _build_ragged(spec, info, FlashInferRaggedManager, cudnn=True)
         if backend is RaggedAttnBackend.FLASHINFER:
             # Deferred so naming the spec does not load FlashInfer, and because
             # `flashinfer` imports this class back.
@@ -143,7 +151,7 @@ class RaggedCrossAttnManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: RaggedCrossAttentionSpec, info: EngineResourceInfo):
-        backend = _without_cudnn(resolve_ragged_attn_backend(spec.config.backend, info.device), "cross-attention")
+        backend = _refuse_cudnn(spec, resolve_ragged_attn_backend(spec.config.backend, info.device), "cross-attention")
         if backend is RaggedAttnBackend.DENSE:
             from mstar.engine.resources.attn.ragged.dense import DenseRaggedCrossManager
             from mstar.engine.resources.attn.ragged.flashinfer import (
@@ -170,7 +178,7 @@ class RaggedBlockCausalAttnManager(AttentionResource):
 
     @classmethod
     def build(cls, spec: RaggedBlockCausalAttentionSpec, info: EngineResourceInfo):
-        backend = _without_cudnn(resolve_ragged_attn_backend(spec.config.backend, info.device), "block-causal")
+        backend = _refuse_cudnn(spec, resolve_ragged_attn_backend(spec.config.backend, info.device), "block-causal")
         if backend is RaggedAttnBackend.DENSE:
             from mstar.engine.resources.attn.ragged.dense import _warn_ragged_dense_fallback
 

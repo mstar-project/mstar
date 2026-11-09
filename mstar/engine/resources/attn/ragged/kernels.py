@@ -18,6 +18,7 @@ import logging
 
 import torch
 
+from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim
 from mstar.kernels import Choice, Impl, KernelOp, Target, Tolerance, register
 from mstar.kernels.table import Rows
 from mstar.platforms import current_platform
@@ -44,6 +45,15 @@ def _cudnn_unavailable(target: Target) -> str | None:
         return "the cuDNN wrapper runs MHA only"
     if target.dtype not in (torch.bfloat16, torch.float16):
         return f"cuDNN attention takes bf16 / fp16, not {target.dtype}"
+    head_dim = target.shape["head_dim"]
+    try:
+        padded = padded_head_dim(head_dim)
+    except ValueError as exc:
+        return str(exc)
+    if padded != head_dim:
+        # a compiled caller pads q / k / v to FlashInfer's head dim before the op
+        # (`compile_op`), and the cuDNN wrapper views them at the unpadded one
+        return f"head dim {head_dim} is padded to {padded} for FlashInfer, which the cuDNN wrapper doesn't take"
     return None
 
 
@@ -78,6 +88,19 @@ def kernel_rows(
                        "keeping FlashInfer", RAGGED_ATTENTION.format_shape(shape), sorted(refused), refused)
         return None
     return entry.rows
+
+
+def cudnn_rows(
+    key: str, num_qo_heads: int, num_kv_heads: int, head_dim: int, dtype: torch.dtype, device: torch.device,
+) -> Rows:
+    """``backend: cudnn``'s rows, cuDNN at every size; raises where it can't run, so a
+    config that names it fails at build rather than at its first request."""
+    shape = {"num_qo_heads": num_qo_heads, "num_kv_heads": num_kv_heads, "head_dim": head_dim}
+    why = RAGGED_ATTENTION.unavailable(RAGGED_ATTENTION.target(dtype, shape, device)).get("cudnn")
+    if why is not None:
+        raise ValueError(f"ragged attention {key!r} names backend 'cudnn', which can't run "
+                         f"{RAGGED_ATTENTION.format_shape(shape)} {str(dtype).removeprefix('torch.')} here: {why}")
+    return ((None, Choice("cudnn")),)
 
 
 def choice_for(rows: Rows, seq_len: int) -> Choice:
