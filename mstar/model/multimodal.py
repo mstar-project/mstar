@@ -520,12 +520,12 @@ def media_encoders(encoders: Sequence[MediaEncoder], layout: Mapping) -> list[Me
 
 
 def media_walks(
-    max_iters: int, encoders: Sequence[MediaEncoder] = (), text: bool = True,
+    max_iters: int, encoders: Sequence[MediaEncoder] = (), text: bool = True, node: str = "LLM",
 ) -> dict[str, GraphSection]:
     """``prefill_text`` (unless ``text`` is False), one media walk per subset
-    of ``encoders``, and ``decode``, over the ``LLM`` node and the encoders.
-    ``max_iters`` bounds the decode loop; it is a safety bound, not the
-    per-request budget."""
+    of ``encoders``, and ``decode``, over the decoder ``node`` and the
+    encoders. ``max_iters`` bounds the decode loop; it is a safety bound, not
+    the per-request budget."""
 
     def emit_first_token() -> GraphEdge:
         return GraphEdge(
@@ -534,20 +534,20 @@ def media_walks(
 
     walks: dict[str, GraphSection] = {}
     if text:
-        walks[PREFILL_TEXT] = GraphNode(name="LLM", input_names=["text_inputs"], outputs=[emit_first_token()])
+        walks[PREFILL_TEXT] = GraphNode(name=node, input_names=["text_inputs"], outputs=[emit_first_token()])
     for mask in range(1, 1 << len(encoders)):
         present = [e for i, e in enumerate(encoders) if mask >> i & 1]
         nodes = [
             GraphNode(
                 name=e.node, input_names=list(e.inputs),
-                outputs=[GraphEdge(next_node="LLM", name=e.output)],
+                outputs=[GraphEdge(next_node=node, name=e.output)],
             )
             for e in present
         ]
         walks[media_walk_name(present)] = Sequential([
             nodes[0] if len(nodes) == 1 else Parallel(nodes),
             GraphNode(
-                name="LLM",
+                name=node,
                 input_names=["text_inputs", *(e.output for e in present)],
                 outputs=[emit_first_token()],
             ),
@@ -555,10 +555,10 @@ def media_walks(
     walks["decode"] = Loop(
         name="decode_loop",
         section=GraphNode(
-            name="LLM",
+            name=node,
             input_names=["text_inputs"],
             outputs=[
-                GraphEdge(next_node="LLM", name="text_inputs"),
+                GraphEdge(next_node=node, name="text_inputs"),
                 GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
             ],
         ),
@@ -568,9 +568,9 @@ def media_walks(
     return walks
 
 
-def text_combined_walks() -> dict[str, dict[str, set[str]]]:
-    """Text prefill and decode rows of the ``LLM`` node share a step."""
-    return {"LLM": {MIXED: {PREFILL_TEXT, "decode"}}}
+def text_combined_walks(node: str = "LLM") -> dict[str, dict[str, set[str]]]:
+    """Text prefill and decode rows of the decoder ``node`` share a step."""
+    return {node: {MIXED: {PREFILL_TEXT, "decode"}}}
 
 
 def media_prefill_step(
