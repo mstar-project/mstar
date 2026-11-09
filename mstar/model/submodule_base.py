@@ -212,6 +212,10 @@ class StopPolicy:
     # AR, EOS: the resource label whose request config carries ``ignore_eos``;
     # None means EOS is never ignored
     sampler: str | None = None
+    # AR, EOS: for a node with no such resource, whether the request ignores EOS,
+    # in place of ``sampler``. Evaluated with ``max_iters``, on the info of the node's
+    # partition.
+    ignores_eos: Callable[[CurrentForwardPassInfo], bool] | None = None
     # the request's iteration limit for this loop; evaluated once per request
     # and walk, not per step. None is ``info.max_tokens``.
     max_iters: Callable[[CurrentForwardPassInfo], int] | None = None
@@ -231,7 +235,9 @@ class StopPolicy:
         if self.kind is not StopKind.EOS:
             max_iters = int(info.max_tokens if self.max_iters is None else self.max_iters(info))
         ignore_eos = False
-        if self.reads_token and self.sampler is not None:
+        if self.reads_token and self.ignores_eos is not None:
+            ignore_eos = bool(self.ignores_eos(info))
+        elif self.reads_token and self.sampler is not None:
             config = info.resource_configs.get(self.sampler)
             ignore_eos = bool(getattr(config, "ignore_eos", False))
         return StopLimits(max_iters, ignore_eos)

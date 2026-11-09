@@ -25,6 +25,7 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
+use serde_json::Value;
 use uuid::Uuid;
 
 /// Map a MIME type (top-level or full) to a file extension for persisting.
@@ -91,14 +92,80 @@ pub fn modality_from_mime(mime: &str) -> &'static str {
 // Inbound: persist request media into upload_dir, return (modality, path)
 // ---------------------------------------------------------------------------
 
-/// Decode base64 the way Python's `base64.b64decode(..., validate=False)` does:
-/// non-alphabet bytes are discarded rather than erroring. In practice the only
-/// such bytes are the interior newlines of line-wrapped payloads (what the
-/// `base64` CLI and `base64.encodebytes` emit by default), so stripping ASCII
-/// whitespace before a strict decode matches Python without accepting garbage.
+/// Client base64 decoded as the Python frontend's `_decode_base64_payload`
+/// does: whitespace anywhere is dropped (line-wrapped payloads), missing `=`
+/// padding is restored (some OpenAI clients strip it), and anything else
+/// outside the standard alphabet is refused.
 fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    let compact: String = payload.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    base64::engine::general_purpose::STANDARD.decode(compact.as_bytes())
+    use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+    use base64::engine::DecodePaddingMode;
+    // Python ignores the unused low bits of the last symbol too
+    const LENIENT: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new()
+            .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
+    // Python's `str.split()` whitespace: Unicode's plus the C0 separators
+    let compact: String = payload
+        .chars()
+        .filter(|c| !c.is_whitespace() && !('\u{1c}'..='\u{1f}').contains(c))
+        .collect();
+    LENIENT.decode(compact.as_bytes())
+}
+
+/// `media_io.BARE_REF_AUDIO_REFUSAL`.
+pub const BARE_REF_AUDIO_REFUSAL: &str =
+    "server file paths are refused; ref_audio must be a data URL, an http(s) URL or base64 audio the model can decode";
+
+/// A request's reference clip once saved, for the API server to check with the
+/// model's loader (`media_io.check_saved_ref_audio`) before anything is submitted.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RefAudioCheck {
+    pub path: String,
+    /// The library the model's loader opens it with (`check_ref_audio`'s `decoder`).
+    pub decoder: &'static str,
+    /// Sent as bare base64, which could be a server path as well as audio.
+    pub bare: bool,
+}
+
+/// Save a speech request's `ref_audio` as `adapters._resolve_ref_audio` does,
+/// up to its check: a data URL, an http(s) URL when remote fetch is allowed, or
+/// bare base64 (saved as `.wav`). A refusal is `(status, message)`.
+pub fn save_ref_audio(
+    reference: &Value,
+    upload_dir: &Path,
+    allow_remote: bool,
+    decoder: &'static str,
+) -> Result<RefAudioCheck, (u16, String)> {
+    let Value::String(reference) = reference else {
+        let kind = match reference {
+            Value::Bool(_) => "bool",
+            Value::Number(n) if n.is_f64() => "float",
+            Value::Number(_) => "int",
+            Value::Array(_) => "list",
+            Value::Object(_) => "dict",
+            _ => "NoneType",
+        };
+        return Err((400, format!("ref_audio must be a data URL or base64 string, got {kind}")));
+    };
+    let scheme = reference.split(':').next().unwrap_or("").to_ascii_lowercase();
+    if reference.starts_with("data:") || scheme == "http" || scheme == "https" {
+        let (_, path) = resolve_media_ref(reference, upload_dir, allow_remote).map_err(|e| (400, e))?;
+        return Ok(RefAudioCheck { path, decoder, bare: false });
+    }
+    let raw = decode_b64_lenient(reference).map_err(|_| (400, BARE_REF_AUDIO_REFUSAL.to_string()))?;
+    let stored = std::fs::create_dir_all(upload_dir).and_then(|()| {
+        let path = upload_dir.join(format!("{}.wav", Uuid::new_v4()));
+        std::fs::write(&path, raw).map(|()| path)
+    });
+    match stored {
+        Ok(path) => Ok(RefAudioCheck { path: path.to_string_lossy().into_owned(), decoder, bare: true }),
+        Err(e) => {
+            eprintln!("could not store a ref_audio upload under {}: {e}", upload_dir.display());
+            Err((500, "the server could not store ref_audio".to_string()))
+        }
+    }
 }
 
 fn save_bytes(raw: &[u8], mime: &str, upload_dir: &Path) -> std::io::Result<(String, String)> {
@@ -725,36 +792,48 @@ pub fn pcm16_to_wav_bytes(pcm: &[u8], sample_rate: u32, num_channels: u16) -> Ve
     out
 }
 
-/// Encode raw 16-bit PCM into `fmt`. Returns `(bytes, mime_type)`. `wav` and
-/// `pcm` are produced here; compressed formats need an encoder the Rust
-/// frontend doesn't carry, so they degrade to WAV (the Python side produces
-/// compressed containers when `soundfile` is available).
-pub fn pcm16_to_container(pcm: &[u8], sample_rate: u32, fmt: &str) -> (Vec<u8>, &'static str) {
-    match fmt.to_ascii_lowercase().as_str() {
-        "pcm" => (pcm.to_vec(), "audio/pcm"),
-        "wav" => (pcm16_to_wav_bytes(pcm, sample_rate, 1), "audio/wav"),
-        _ => (pcm16_to_wav_bytes(pcm, sample_rate, 1), "audio/wav"),
+/// Encode raw 16-bit PCM into `fmt` (checked by [`check_audio_format`]), as
+/// `media_io.pcm16_to_container`. Returns `(bytes, mime_type)`; the compressed
+/// formats come from the libsndfile Python's soundfile ships ([`crate::sndfile`]).
+pub fn pcm16_to_container(pcm: &[u8], sample_rate: u32, fmt: &str) -> Result<(Vec<u8>, &'static str), String> {
+    match fmt {
+        "pcm" => Ok((pcm.to_vec(), "audio/pcm")),
+        "wav" => Ok((pcm16_to_wav_bytes(pcm, sample_rate, 1), "audio/wav")),
+        _ => Ok((crate::sndfile::encode(pcm, sample_rate, fmt)?, crate::sndfile::mime(fmt))),
     }
 }
 
-/// `response_format` lower-cased (`wav` when empty), or the 400's text. A
-/// stream carries an open-ended WAV or bare PCM on either frontend, so its
-/// refusal reads as `media_io.check_audio_format`'s; the compressed containers
-/// the Python frontend encodes with soundfile have no encoder here.
-pub fn check_audio_format(fmt: &str, stream: bool) -> Result<String, String> {
+/// `media_io.audio_formats`: a stream carries an open-ended WAV or bare PCM;
+/// otherwise the compressed containers too, when libsndfile is loaded, and opus
+/// only at one of its native rates.
+pub(crate) fn audio_formats(stream: bool, sample_rate: u32, compressed: bool) -> Vec<&'static str> {
+    let mut formats = vec!["wav", "pcm"];
+    if !stream && compressed {
+        formats.extend(["mp3", "flac"]);
+        if crate::sndfile::OPUS_RATES.contains(&sample_rate) {
+            formats.push("opus");
+        }
+    }
+    formats
+}
+
+/// `response_format` lower-cased (`wav` when empty), or the 400's text, as
+/// `media_io.check_audio_format`.
+pub fn check_audio_format(fmt: &str, stream: bool, sample_rate: u32) -> Result<String, String> {
+    check_format(fmt, stream, sample_rate, crate::sndfile::available())
+}
+
+fn check_format(fmt: &str, stream: bool, sample_rate: u32, compressed: bool) -> Result<String, String> {
     let fmt = if fmt.is_empty() { "wav".to_string() } else { fmt.to_lowercase() };
-    if matches!(fmt.as_str(), "wav" | "pcm") {
+    let allowed = audio_formats(stream, sample_rate, compressed);
+    if allowed.contains(&fmt.as_str()) {
         return Ok(fmt);
     }
-    if stream {
-        return Err(format!(
-            "response_format {} cannot be streamed by this server; use one of: wav, pcm",
-            py_repr(&fmt)
-        ));
-    }
+    let how = if stream { "streamed" } else { "produced" };
     Err(format!(
-        "response_format {fmt:?} is not supported by the Rust frontend (only 'wav' and \
-         'pcm'); run the Python frontend for compressed containers"
+        "response_format {} cannot be {how} by this server; use one of: {}",
+        py_repr(&fmt),
+        allowed.join(", ")
     ))
 }
 
@@ -866,14 +945,48 @@ mod tests {
     use std::sync::Mutex;
 
     #[test]
-    fn a_stream_refuses_a_container_with_the_python_text() {
-        assert_eq!(check_audio_format("WAV", true).unwrap(), "wav");
-        assert_eq!(check_audio_format("", false).unwrap(), "wav");
+    fn a_format_is_refused_with_the_python_text() {
+        assert_eq!(check_format("WAV", true, 24000, true).unwrap(), "wav");
+        assert_eq!(check_format("", false, 24000, false).unwrap(), "wav");
         assert_eq!(
-            check_audio_format("MP3", true).unwrap_err(),
+            check_format("MP3", true, 24000, true).unwrap_err(),
             "response_format 'mp3' cannot be streamed by this server; use one of: wav, pcm"
         );
-        assert!(check_audio_format("mp3", false).unwrap_err().contains("not supported by the Rust frontend"));
+        assert_eq!(check_format("opus", false, 24000, true).unwrap(), "opus");
+        assert_eq!(
+            check_format("opus", false, 44100, true).unwrap_err(),
+            "response_format 'opus' cannot be produced by this server; use one of: wav, pcm, mp3, flac"
+        );
+        // no libsndfile: as the Python frontend without soundfile
+        assert_eq!(
+            check_format("mp3", false, 24000, false).unwrap_err(),
+            "response_format 'mp3' cannot be produced by this server; use one of: wav, pcm"
+        );
+    }
+
+    #[test]
+    fn base64_decodes_what_the_python_frontend_decodes() {
+        // each payload's outcome in `media_io._decode_base64_payload` on CPython 3.12
+        let a: Option<&[u8]> = Some(b"a");
+        for (payload, want) in [
+            ("YQ==", a),
+            ("YQ", a), // the client stripped the padding
+            ("YQ=", a),
+            ("YR==", a), // unused low bits set
+            ("YQ\r\n==\n", a),
+            ("Y Q\u{a0}\u{b}\u{1c}\u{85}\u{3000}", a),
+            ("YWJjZA", Some(&b"abcd"[..])),
+            ("", Some(&b""[..])),
+            ("Y", None),
+            ("Y==", None),
+            ("YQ===", None),
+            ("YQ==YQ==", None),
+            ("====", None),
+            ("-_", None),
+            ("YQ\u{200b}", None),
+        ] {
+            assert_eq!(decode_b64_lenient(payload).ok().as_deref(), want, "{payload:?}");
+        }
     }
 
     #[test]

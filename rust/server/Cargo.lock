@@ -861,6 +861,8 @@ dependencies = [
  "base64 0.22.1",
  "form_urlencoded",
  "futures",
+ "http-body-util",
+ "libc",
  "mstar-rust",
  "regex",
  "rmp-serde",

@@ -538,6 +538,7 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
             adapter_digests=self.lora_adapter_digests,
             is_pending=self.is_pending,
+            upload_dir=self.upload_dir,
         )
 
         # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker
@@ -3194,9 +3195,12 @@ def main(argv: list[str] | None = None):
             # Forward --host to the Rust frontend (it binds 127.0.0.1 by
             # default; --host 0.0.0.0 for the multi-node / container case).
             os.environ.setdefault("MSTAR_SERVER_HOST", args.host)
+            model = api_server.model
             rust_proc = launch_rust_server(
                 rust_frontend_bin, model_name,
-                args.port, bridge_dir, args.upload_dir, api_key=api_key, timeout=args.timeout)
+                args.port, bridge_dir, args.upload_dir, api_key=api_key,
+                timeout_s=args.timeout,
+                sample_rate=model.get_output_sample_rate("audio") if model is not None else None)
             logger.info("Starting mstar API server (Rust frontend) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
