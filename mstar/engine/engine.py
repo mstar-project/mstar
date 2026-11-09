@@ -123,6 +123,8 @@ class RankRebuilds(Protocol):
 
     def rebuilding(self, rid: int, node: str) -> bool: ...
 
+    def forget(self, rid: int, node: str) -> None: ...
+
 
 @contextmanager
 def _search_cap(submodule_mgmt, fraction: float | None, device) -> Iterator[None]:
@@ -3248,10 +3250,10 @@ class Engine:
         refusal = self.drop_refusal(node_name, request_id, tokens)
         if refusal is not None:
             raise RuntimeError(refusal)
-        at = len(self._resident_delta) if node_name in self._tp_leader_nodes else None
-        freed = sum(resource.drop(request_id, tokens) for resource in self._submodules[node_name].resources.values())
+        # before the drop, so the moves the pools journal as it frees room come after it
         if node_name in self._tp_leader_nodes:
-            self._journal(MoveKind.DROP, request_id, tokens, node=node_name, at=at)
+            self._journal(MoveKind.DROP, request_id, tokens, node=node_name)
+        freed = sum(resource.drop(request_id, tokens) for resource in self._submodules[node_name].resources.values())
         self._runner.readmit(request_id, node_name)
         return freed
 
@@ -3276,6 +3278,11 @@ class Engine:
         self._land_rebuild(node_name, request_id)
         if node_name in self._tp_leader_nodes:
             self._journal(MoveKind.LAND, request_id, node=node_name)
+
+    def keeps_no_ids(self, node_name: str, request_id: int) -> None:
+        """Rank 0 journals that the request keeps no ids on the node, so each follower gives back the ones it kept."""
+        if node_name in self._tp_leader_nodes:
+            self._journal(MoveKind.FORGET, request_id, node=node_name)
 
     def _land_rebuild(self, node_name: str, request_id: int) -> None:
         for resource in self._submodules[node_name].resources.values():
@@ -3383,7 +3390,7 @@ class Engine:
         wire_rid, journal = self._graph_runtime.get_rid_string(request_id), self._resident_delta
         # An UNRESERVE right after the RESERVE that made the allotment cancels it, so the followers don't replay both
         # moves at every `check_ready` where a second KV cache on the node keeps the request not ready. Both moves
-        # stay when the RESERVE grew an allotment, since the followers have to give that allotment back too.
+        # stay when the RESERVE grew an allotment, since the followers have to take that growth back too.
         if kind == MoveKind.UNRESERVE and count and journal.cancel(wire_rid, MoveKind.RESERVE, pool):
             return
         wire_victims = [self._graph_runtime.get_rid_string(victim) for victim in victims]
@@ -3407,11 +3414,12 @@ class Engine:
     def owes_moves(self) -> bool:
         return bool(self._resident_delta)
 
-    def apply_resident_delta(self, delta: OffloadDelta, rebuilds: RankRebuilds) -> bool:
+    def apply_resident_delta(self, delta: OffloadDelta, rebuilds: RankRebuilds, caught_up: bool = True) -> bool:
         """Match the leader's resident set on each node a move names. Mutates OffloadDelta
         by popping off the steps that have already landed. False means not all
         has landed and the caller must retry before trying the next step.
         ``rebuilds`` holds this rank's kept ids and the rebuilds it is running.
+        ``caught_up`` means every step this rank took before the delta's step has committed.
         """
         for _ in range(len(delta)):
             move = delta.peek_left()
@@ -3454,6 +3462,8 @@ class Engine:
                     )
                 self._land_rebuild(node_name, rid)
                 logger.debug("Replayed rank 0's LAND of request %s on %s", wire_rid, node_name)
+            elif kind == MoveKind.FORGET:
+                rebuilds.forget(rid, node_name)
             elif kind == MoveKind.OFFLOAD:
                 hosted = any(kv.cache.moves_to_host(rid) for kv in self.paged_kv_caches() if node_name in kv.nodes)
                 if self.residency(node_name, rid) is Residency.ON_HOST:
@@ -3495,6 +3505,10 @@ class Engine:
                 logger.debug(
                     "Replay: %s already resident on %s", wire_rid, node_name,
                 )
+            elif not caught_up:
+                # Rank 0 reloads after its commit of the step before, which can give back the pages the reload takes.
+                logger.debug("Replay: %s's reload on %s waits for this rank's last commit", wire_rid, node_name)
+                return False
             elif not all(
                 resource.reload(rid)
                 for resource in self._submodules[node_name].resources.values()

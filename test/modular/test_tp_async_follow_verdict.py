@@ -75,7 +75,7 @@ class _FakeEngineManager:
             residency=lambda node, rid: Residency.RESIDENT,
         )
 
-    def _apply(self, delta, rebuilding):
+    def _apply(self, delta, rebuilding, caught_up):
         while (move := delta.pop_left()) is not None:
             self.applied.append((move.rid, move.kind))
         return True

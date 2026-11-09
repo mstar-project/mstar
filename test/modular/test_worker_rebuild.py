@@ -302,6 +302,24 @@ def test_rebuild_host_mb_alone_sizes_the_pool_of_a_node_that_copies_media(monkey
     assert _make_media_rebuilds(config).pool.nbytes == mb << 20, "the pool would be another size than the key says"
 
 
+def test_a_follower_of_a_lockstep_node_sets_aside_twice_the_pool():
+    """A follower holds the logs of requests rank 0 has torn down until it tears them down too."""
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(worker_mod, "HostPool", lambda nbytes, device: SimpleNamespace(nbytes=nbytes))
+    model = SimpleNamespace(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs)
+    engine = SimpleNamespace(host_allowance=StepAllowance(), node_dtype=lambda node: torch.float32)
+    my_walks = {(NODE, PREFILL), (NODE, DECODE)}
+    try:
+        leader = _make_rebuilds(model, {"rebuild_host_mb": 1}, my_walks, set(), torch.device("cpu"), engine)
+        follower = _make_rebuilds(
+            model, {"rebuild_host_mb": 1}, my_walks, set(), torch.device("cpu"), engine, frozenset({NODE}),
+        )
+    finally:
+        monkeypatch.undo()
+
+    assert leader.pool.nbytes == 1 << 20 and follower.pool.nbytes == 2 << 20, "the follower's pool is rank 0's size"
+
+
 def test_rebuild_host_mb_0_rebuilds_no_request_there():
     """``rebuild_host_mb: 0`` set no pool aside but left the node among the ones whose requests rebuild here, so
     preemption still ran its pass for the node, as for one with a rebuild policy."""

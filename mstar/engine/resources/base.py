@@ -183,6 +183,7 @@ class MoveKind(IntEnum):
     GUARANTEE = 7
     ALLOT = 8
     WAIT = 9
+    FORGET = 10
 
 
 class Resource(ResidentHooks, ABC):

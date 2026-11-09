@@ -336,13 +336,13 @@ For example, an older and a newer request hold 5 pages each of a 10-page pool, a
 
 ## 6. TP followers
 
-Rank 0 journals a decision only when it reads state a follower lacks. It decides every reservation and its undo, the room a short grant counted, a request that waits for its shortage, a flip to guaranteed at admission, each earmark, drop and return, and records it in the `OffloadDelta` ([ipc_format.py](../../mstar/utils/ipc_format.py)) it sends with the next `ScheduleTPNode` of any of the worker's lockstep nodes, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts. Every rank works out the rest from those counts: the host room a reservation sets aside, as a follower replays the reservation, and the host room and the flip to guaranteed inside a step's admit. At TP the host holds no cached pages, since `prefix_cache_tp` refuses a host pool, so its room moves only with moves every rank makes in rank 0's order and is the same on every rank at each of those points.
+Rank 0 journals a decision only when it reads state a follower lacks. It decides every reservation and its undo, the room a short grant counted, a request that waits for its shortage, a flip to guaranteed at admission, each earmark, drop and return, and a request that keeps no ids, and records it in the `OffloadDelta` ([ipc_format.py](../../mstar/utils/ipc_format.py)) it sends with the next `ScheduleTPNode` of any of the worker's lockstep nodes, next to the offloads and reloads the delta already carries. A follower applies the delta before it builds that step, so every rank admits each step from the same counts. Every rank works out the rest from those counts: the host room a reservation sets aside, as a follower replays the reservation, and the host room and the flip to guaranteed inside a step's admit. At TP the host holds no cached pages, since `prefix_cache_tp` refuses a host pool, so its room moves only with moves every rank makes in rank 0's order and is the same on every rank at each of those points.
 
 ```python
 @dataclass
 class OffloadDelta:
     rids: list[str]
-    kinds: list[MoveKind]   # offload, reload, reserve, unreserve, earmark, drop, land, guarantee, allot or wait
+    kinds: list[MoveKind]   # offload, reload, reserve, unreserve, earmark, drop, land, guarantee, allot, wait or forget
     ...                     # the page counts and victims the kinds carry
 ```
 
@@ -351,8 +351,8 @@ class OffloadDelta:
 - A request that waits for its shortage goes out as a wait, with the pages it asks for, so every rank returns it with them from a move. A request that moves itself to the host goes out as that wait and a move to the host, as any victim's does.
 - The victims a waiting request chooses (§3.3) go out as its reservation, naming them, since only rank 0 knows that request waits for room. Rank 0 admits it once their moves cover it, or turns it guaranteed when the host has no room left, and journals that right after the move, since another rank can hold other room as the move lands there.
 - A follower drops a request with the tokens rank 0's rebuild writes, which its own KV refuses unless it holds as many.
-- A rebuild row rides `ScheduleTPNode` as any row mid-prefill does, with its chunk range. A follower knows the row from its own KV, which replayed rank 0's drop, starts the rebuild at its first row, and builds its input from its own kept ids, which match, since every rank samples rank 0's token.
-- A follower whose counts can't take a move exits.
+- A rebuild row rides `ScheduleTPNode` as any row mid-prefill does, with its chunk range. A follower knows the row from its own KV, which replayed rank 0's drop, starts the rebuild at its first row, and builds its input from its own kept ids, which match, since every rank samples rank 0's token. Rank 0's pool decides which requests keep ids, and rank 0 journals a request that keeps none, so a follower keeps the same ones.
+- A follower whose counts can't take a move exits. A follower replays a reload only once its own last step has committed, as rank 0 reloads after its commit, which can give back the pages the reload takes.
 - A pre-admit takes only free pages and host room already set aside. Rank 0 can't undo an eviction, a host room set aside or a flip for a stage it throws away, and a follower may never plan the step, so the pre-admit refuses and exec admits the step on every rank.
 
 With speculation on, rank 0 decides only where pages already move today, after the admit fence or after a refused step, so a speculative step never carries a move made after it was sent.
@@ -384,7 +384,7 @@ Under `MSTAR_KV_DEBUG_ASSERTS`:
 
 - **Drops cost a rebuild.** A victim the host pool can't hold is dropped and rebuilt. Under sustained overload the newest requests are dropped again each time an older request runs short.
 - **A lone rebuild isn't speculated.** Speculation targets come from the graph runtime, which holds no rebuild row, so a step of rebuild rows alone pays one scheduling gap per chunk. A rebuild chunk rides speculation when another row of its step gives a target.
-- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 256 KB for a 32K-token request. A request the pool can't hold is never dropped on that node, though with a host pool it can still move to the host.
+- **Kept ids.** A node with a rebuild policy copies each request's prompt ids to a pinned host pool, 64 MB by default, and keeps them until the request finishes: 256 KB for a 32K-token request. A request the pool can't hold is never dropped on that node, though with a host pool it can still move to the host. Above one rank, every rank but the first sets aside twice the pool, since each rank gives its slices back at its own teardown.
 - **Shared prefixes with host offload.** A hit on a page only the index holds is charged as fresh, so prompts sharing a prefix run fewer at once, though passing lets in those whose prefix a running request holds. With host offload on, 32 Bagel requests over four shared prefixes on 96 pages, with 512 host pages, at c16, took 6.17 s against 15.2 s today at 256 tokens, and 37.2 s against 54.4 s at 1,024 tokens, the medians of 8 launches. At 1,024 tokens the ranges overlap, 34.8 to 44.0 s against 37.7 to 57.5 s.
 - **Guaranteed requests queue.** On Orpheus at c16, streamed TTFA p99 rose from 247 ms to 2.58 s against preemption without classes. But, I am fine with the p99 cost since for voice, a later first chunk is better than a gap in the middle of playback.
 

@@ -363,7 +363,7 @@ class Rebuilds:
                 walk != row.walk or (chunk is not None and chunk.total != row.length)
                 or not all(name in inputs for name in names)
             ):
-                self._forget(node, rid)
+                self.forget(rid, node)
                 continue
             assert kept.used + nbytes <= piece.nbytes, (
                 f"{node} read more in {walk!r} than its rebuild policy's copy_width says"
@@ -434,7 +434,8 @@ class Rebuilds:
             self._pool.give(HostSlice(piece.offset + used, piece.nbytes - used))
             self._keeps_ids[node][rid] = HostSlice(piece.offset, used)
 
-    def _forget(self, node: str, rid: int) -> None:
+    def forget(self, rid: int, node: str) -> None:
+        """Give back ``rid``'s log on ``node``, so ``rid`` is never dropped there."""
         kept = self._kept[node].pop(rid, None)
         self._prefilling[node].discard(rid)
         if kept is not None and any(record.queued for record in kept.records):
@@ -487,7 +488,7 @@ class Rebuilds:
                 and rid not in prefilling
             ):
                 if token in pads:
-                    self._forget(node, rid)
+                    self.forget(rid, node)
                 else:
                     kept.sampled.append(token)
 
@@ -624,7 +625,7 @@ class Rebuilds:
 
     def remove_request(self, rid: int) -> None:
         for node in self._kept:
-            self._forget(node, rid)
+            self.forget(rid, node)
             self._cursors.pop((node, rid), None)
 
 

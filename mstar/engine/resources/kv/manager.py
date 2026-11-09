@@ -690,8 +690,8 @@ class KVManager(AttentionResource):
         # set by the engine on rank 0 of a TP node
         self.journal: Callable[..., None] | None = None
         # An allotment covers the labels `_nodes` open.
-        # `_asks` holds the pages `ask` counted for each request that asked and has no allotment yet, which its
-        #   allotment is sized from.
+        # `_asks` holds the pages each waiting request asks for: what `ask` counted for one with no allotment yet,
+        #   which its allotment is sized from, or the shortage one that holds its allotment waits on (`_wait`).
         # `local_loops` holds the loops that grow KV on `_nodes` in a walk this worker runs, set by the worker.
         # `_unused` counts the pages admitted requests were allotted and haven't used yet.
         # `_guaranteed` holds the requests that reserve what they grow into and are never preempted, decided at their
@@ -4226,7 +4226,8 @@ class KVManager(AttentionResource):
                 f"the streams leave {unused} allotted pages unused, but the pool counts {self._unused}"
             )
             evictable = 0 if self._index is None else len(self._index.evictable())
-            assert self._unused <= arena.num_free + evictable, (
+            # A follower replays rank 0's moves as they arrive, and its own commit can give the room back later.
+            assert not self._decides or self._unused <= arena.num_free + evictable, (
                 f"admitted requests were allotted {self._unused} pages they haven't used, "
                 f"but only {arena.num_free} are free and {evictable} evictable"
             )
@@ -4408,7 +4409,7 @@ class KVManager(AttentionResource):
             # read before `_need`, so that a snapshot filed between the two moves the counts past the mark
             counts = self._index_counts()
             pages, room = self._need(rid, node_name, graph_walk, published), self._room()
-            if pages > room or not self._admit(rid, pages, self.journal):
+            if pages > room or not self._admit(rid, pages):
                 if self._fixed_need(rid) is not None:
                     counts = None, None
                 return RoomMark(rid, node_name, graph_walk, published, room, *counts)
@@ -4442,15 +4443,13 @@ class KVManager(AttentionResource):
                 return PassMark(room, *counts)
             # The room kept for the head is never lent. A passer that runs short past this allotment is the newest
             # request holding pages, so preemption takes it first.
-            if not self._admit(rid, pages, self.journal, passed=True):
+            if not self._admit(rid, pages, passed=True):
                 return PassMark(room, None, None)
             return None
 
-    def _admit(
-        self, rid: str, pages: int, journal: Callable[..., None] | None = None, passed: bool = False,
-    ) -> bool:
+    def _admit(self, rid: str, pages: int, passed: bool = False) -> bool:
         """Allot ``rid`` the ``pages`` it asks for, which the room covers, or return False when ``rid`` turns
-        guaranteed here and the room doesn't cover its footprint. ``journal`` takes the flip and the reservation for
+        guaranteed here and the room doesn't cover its footprint. Rank 0 journals the flip and the reservation for
         the other ranks to replay, and ``passed`` is set for a request admitted past the first one in the queue,
         whose room leaves out `_kept`. Caller holds the lock."""
         # The host sets room aside for the prompt of a request that can move only there, and `_cover_move`
@@ -4459,13 +4458,13 @@ class KVManager(AttentionResource):
             pages = self._footprint(rid)
             self._flip(rid, pages)
             # the other ranks replay the flip, since it can come passes before the reservation they replay
-            if journal is not None:
-                journal(MoveKind.GUARANTEE, rid, pages)
+            if self.journal is not None:
+                self.journal(MoveKind.GUARANTEE, rid, pages)
             if pages > self._room() - (self._kept if passed else 0):
                 return False
         self._reserve(rid, pages, passed)
-        if journal is not None:
-            journal(MoveKind.RESERVE, rid, pages)
+        if self.journal is not None:
+            self.journal(MoveKind.RESERVE, rid, pages)
         return True
 
     def _reserve(self, rid: str, pages: int, passed: bool = False) -> None:
@@ -4475,11 +4474,12 @@ class KVManager(AttentionResource):
         kept = 0 if passed else min(self._kept, pages)
         self._kept -= kept
         if rid in self._allotments:
+            del self._asks[rid]
+            self._stalled.discard(rid)
             allotment = self._allotments[rid]
             allotment.kept = kept
-            allotment.grown, allotment.grown_from = self._asks.pop(rid), allotment.pages
-            self._stalled.discard(rid)
-            self._allot(rid, allotment.grown)
+            allotment.grown, allotment.grown_from = pages, allotment.pages
+            self._allot(rid, pages)
             self._made = None
         else:
             returning = self._return_pages(rid) if self._on_host(rid) else None
@@ -4531,13 +4531,9 @@ class KVManager(AttentionResource):
             self._cpu_pool.count_guaranteed(rid)
 
     def _flip(self, rid: str, pages: int) -> None:
-        """Guarantee ``rid``, which waits for room, so that it and the earmark it waits on ask for its footprint of
-        ``pages``."""
+        """Guarantee ``rid``, which waits for room, so that it asks for its footprint of ``pages``."""
         self._guarantee(rid)
         self._asks[rid] = pages
-        earmark = self._earmarks.get(rid)
-        if earmark is not None:
-            earmark.pages = pages
 
     def _cover_move(self, rid: str, n: int, undoable: bool) -> int:
         """Grow the room the host sets aside for ``rid`` by the ``n`` pages it is about to take, or guarantee ``rid``
@@ -4904,7 +4900,7 @@ class KVManager(AttentionResource):
                 self._kept += kept
                 freed -= kept
                 if self._decides and pages <= self._room():
-                    self._admit(earmark.rid, pages, self.journal)
+                    self._admit(earmark.rid, pages)
             else:
                 granted = min(earmark.pages - earmark.granted, freed)
                 if granted:
@@ -4944,10 +4940,8 @@ class KVManager(AttentionResource):
             if kind == MoveKind.EARMARK:
                 self._mark_victims(Earmark(rid, count, set()), victims)
             elif kind == MoveKind.RESERVE:
-                # a request that holds an allotment asks only for the shortage it waits on
-                if rid in self._allotments:
-                    self._asks[rid] = count
-                elif (failed := self._ask(rid)) is not None:
+                # a request that holds an allotment asks only for the shortage its WAIT set
+                if rid not in self._allotments and (failed := self._ask(rid)) is not None:
                     raise RuntimeError(failed.reason.message)
                 if victims:
                     # rank 0's `make_room`, whose reservation rank 0 journals once the moves of ``victims`` cover it

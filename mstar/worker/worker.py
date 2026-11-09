@@ -180,10 +180,13 @@ def _make_graph_runtime(
 
 def _make_rebuilds(
     model: Model | None, model_config: dict | None, my_walks: set[tuple[str, str]], lockstep_nodes: set[str],
-    device: torch.device, engine: Engine,
+    device: torch.device, engine: Engine, followed: frozenset[str] = frozenset(),
 ) -> Rebuilds:
     """What a dropped request is rebuilt from, on each node whose model declares how and whose rebuild this worker
-    runs: a disaggregated decode node can't run the prefill walk a rebuild needs."""
+    runs: a disaggregated decode node can't run the prefill walk a rebuild needs.
+
+    A worker that follows one of those nodes sets aside twice ``rebuild_host_mb``. Beside the ids of every request
+    rank 0 keeps ids for, it holds those of requests rank 0 has torn down until it tears them down too."""
     graphs = model.get_graph_walk_graphs() if model is not None else {}
     policies = {} if model is None else policies_run_here(model.rebuild_policies(), graphs, my_walks, lockstep_nodes)
     copies = any(names for node, policy in policies.items() for names in policy.check(node, graphs).values())
@@ -192,8 +195,9 @@ def _make_rebuilds(
     )
     if not host_mb:
         policies = {}
+    nbytes = host_mb << (21 if followed & policies.keys() else 20)
     return Rebuilds(
-        policies, graphs, HostPool(host_mb << 20, device) if policies else None, engine.host_allowance,
+        policies, graphs, HostPool(nbytes, device) if policies else None, engine.host_allowance,
         {node: dtype for node in policies if (dtype := engine.node_dtype(node)) is not None},
     )
 
@@ -604,6 +608,7 @@ class Worker:
         self.layout = layout
         self._rebuilds = _make_rebuilds(
             model, model_config, my_walks, self.parallel_nodes, self.device, self.engine_manager.engine,
+            layout.followed_nodes,
         )
         services = WorkerServices(
             worker_id=worker_id,
@@ -1950,11 +1955,15 @@ class Worker:
         # state that is still mid-replay. Every poll retries the owed moves, so
         # returning here makes progress where reading the half-applied state as
         # "not ready" never could.
-        if not self.lockstep.settle_delta(
-            # Of the steps before the head, only N may still index a page of the head's hit
-            caught_up=pending.node_batch.commit_done.is_set(),
-        ):
-            return None
+        # Of the steps before the head, only N may still index a page of the head's hit, or hold pages back
+        committed = pending.node_batch.commit_done
+        if not self.lockstep.settle_delta(caught_up=committed.is_set()):
+            if committed.is_set() or not self.lockstep.awaits_commit():
+                return None
+            # A reload in the head waits for N's commit, which every exit of N's step releases.
+            committed.wait()
+            if not self.lockstep.settle_delta(caught_up=True):
+                return None
 
         batch_N = pending.batch
         # The leader names its rids by wire string; these are this rank's handles.
