@@ -6,6 +6,7 @@
 //! Qwen3-ASR SDK's streaming algorithm); the tail can still change, the head
 //! is fixed. Turn detection (`server_vad`, `semantic_vad`) is [`vad`].
 
+mod audio;
 mod resample;
 mod vad;
 
@@ -19,6 +20,7 @@ use serde_json::{json, Map, Value};
 use crate::adapters::OpenAIAdapter;
 use crate::serving::{collect, rid, try_result_stream, AppState};
 use crate::transcription::TranscriptionRequest;
+use audio::AudioFormat;
 use resample::StreamResampler;
 use vad::{Op, ServerVad, SemanticVad, TurnDetection, TurnSegmenter, SAMPLE_RATE};
 
@@ -150,6 +152,15 @@ fn invalid(message: &str) -> Value {
 
 // ── settings ─────────────────────────────────────────────────────────────────
 
+/// `_append_error`: the `error` for an append of more than `MAX_ITEM_SECONDS`
+/// of `rate` audio. One append is capped at this on both intents, since it is
+/// resampled before any other cap applies.
+fn append_error(samples: usize, rate: usize) -> Option<Value> {
+    (samples as f64 > MAX_ITEM_SECONDS * rate as f64).then(|| {
+        invalid(&format!("an append holds at most {} s of audio; send it in shorter appends", g(MAX_ITEM_SECONDS)))
+    })
+}
+
 fn object<'a>(value: Option<&'a Value>, name: &str) -> Result<Option<&'a Map<String, Value>>, String> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -158,28 +169,14 @@ fn object<'a>(value: Option<&'a Value>, name: &str) -> Result<Option<&'a Map<Str
     }
 }
 
-/// `_input_rate`: `"pcm16"` is 16 kHz; `{"type": "audio/pcm", "rate": N}` names its rate.
-fn input_rate(fmt: Option<&Value>, current: usize) -> Result<usize, String> {
+/// `_input_format`: the transcription intent's `input_audio_format` (`current`
+/// when absent): a beta name, or a GA format object.
+fn input_format(fmt: Option<&Value>, current: AudioFormat) -> Result<AudioFormat, String> {
     match fmt {
-        None => Ok(current),
-        Some(Value::String(s)) if s == "pcm16" => Ok(SAMPLE_RATE),
-        Some(Value::Object(m)) if m.get("type") == Some(&Value::from("audio/pcm")) => {
-            let mut extra: Vec<&String> = m.keys().filter(|k| *k != "type" && *k != "rate").collect();
-            if !extra.is_empty() {
-                extra.sort();
-                let list = Value::Array(extra.iter().map(|k| Value::from(k.as_str())).collect());
-                return Err(format!("input_audio_format takes only type and rate; got {}", excerpt(&list)));
-            }
-            let rate = m.get("rate").cloned().unwrap_or(Value::from(24000));
-            match rate.as_u64() {
-                Some(r @ (16000 | 24000)) if !rate.is_boolean() => Ok(r as usize),
-                _ => Err(format!("input_audio_format.rate must be 16000 or 24000; got {}", excerpt(&rate))),
-            }
-        }
-        Some(other) => Err(format!(
-            "input_audio_format must be \"pcm16\" or {{\"type\": \"audio/pcm\", \"rate\": 24000}}; got {}",
-            excerpt(other)
-        )),
+        None | Some(Value::Null) => Ok(current),
+        Some(Value::String(name)) if AudioFormat::from_beta_name(name).is_some() => Ok(AudioFormat::from_beta_name(name).unwrap()),
+        Some(Value::Object(m)) => audio::audio_format(Some(m), "input_audio_format"),
+        Some(other) => Err(format!("input_audio_format must be pcm16, g711_ulaw, g711_alaw or an object; got {}", excerpt(other))),
     }
 }
 
@@ -334,7 +331,7 @@ struct Session {
     item_id: String,
     failures: ItemFailures,
     odd_byte: Option<u8>,
-    input_rate: usize,
+    input_format: AudioFormat,
     resampler: Option<StreamResampler>,
     short: usize,
     turn_detection: Option<TurnDetection>,
@@ -353,11 +350,11 @@ impl Session {
         (self.chunk_seconds * SAMPLE_RATE as f64).round_ties_even() as usize
     }
 
-    fn set_input_rate(&mut self, rate: usize) {
+    fn set_input_format(&mut self, fmt: AudioFormat) {
         self.clock_base = self.stream_samples;
         self.clock_in = 0;
-        self.input_rate = rate;
-        self.resampler = (rate != SAMPLE_RATE).then(|| StreamResampler::new(rate, SAMPLE_RATE));
+        self.input_format = fmt;
+        self.resampler = (fmt.rate != SAMPLE_RATE).then(|| StreamResampler::new(fmt.rate, SAMPLE_RATE));
     }
 
     fn resample(&mut self, audio: &[f32]) -> Vec<f32> {
@@ -388,7 +385,7 @@ impl Session {
 
     /// Put the timeline back on the input clock after the resampler starts over.
     fn realign(&mut self) {
-        let exact = self.clock_base + self.clock_in * SAMPLE_RATE as i64 / self.input_rate as i64;
+        let exact = self.clock_base + self.clock_in * SAMPLE_RATE as i64 / self.input_format.rate as i64;
         if let Some(seg) = &mut self.segmenter {
             seg.shift(exact - self.stream_samples);
         }
@@ -439,7 +436,7 @@ impl Session {
     }
 
     fn view(&self) -> Value {
-        let fmt = if self.input_rate == SAMPLE_RATE { json!("pcm16") } else { json!({"type": "audio/pcm", "rate": self.input_rate}) };
+        let fmt = self.input_format.beta_name().map_or_else(|| self.input_format.view(), Value::from);
         json!({
             "id": self.id,
             "object": "realtime.transcription_session",
@@ -455,36 +452,15 @@ impl Session {
                 "unfixed_chunks": self.unfixed_chunks,
                 "unfixed_tokens": self.unfixed_tokens,
                 "max_item_seconds": crate::adapters::json_num(self.max_item_seconds),
-                "sample_rate": self.input_rate,
+                "sample_rate": self.input_format.rate,
             },
         })
     }
 }
 
-/// `pcm16_to_float`: base64 PCM16 (with the previous append's odd byte) as
-/// float32 in [-1, 1), and the new odd byte. Whitespace is allowed; anything
-/// else outside the alphabet is an error.
-fn pcm16_to_float(payload: &Value, carry: Option<u8>) -> Result<(Vec<f32>, Option<u8>), ()> {
-    use base64::Engine;
-    let s = payload.as_str().ok_or(())?;
-    if !s.is_ascii() {
-        return Err(());
-    }
-    let compact: String = s.chars().filter(|c| !" \t\n\r\x0b\x0c".contains(*c)).collect();
-    let decoded = base64::engine::general_purpose::STANDARD.decode(compact.as_bytes()).map_err(|_| ())?;
-    let mut raw: Vec<u8> = carry.into_iter().collect();
-    raw.extend(decoded);
-    let odd = (raw.len() % 2 == 1).then(|| raw[raw.len() - 1]);
-    let samples = raw.as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes(*b) as f32 / 32768.0).collect();
-    Ok((samples, odd))
-}
-
 /// `write_wav`: float audio as 16-bit PCM, rounded half to even.
 fn wav_bytes(audio: &[f32]) -> Vec<u8> {
-    let pcm: Vec<u8> = audio
-        .iter()
-        .flat_map(|&v| ((v as f64 * 32768.0).round_ties_even().clamp(-32768.0, 32767.0) as i16).to_le_bytes())
-        .collect();
+    let pcm: Vec<u8> = audio::to_pcm16(audio).iter().flat_map(|s| s.to_le_bytes()).collect();
     crate::media::pcm16_to_wav_bytes(&pcm, SAMPLE_RATE as u32, 1)
 }
 
@@ -555,10 +531,14 @@ impl Realtime {
             }
             Some("input_audio_buffer.append") => {
                 let payload = ev.get("audio").cloned().unwrap_or(Value::from(""));
-                let Ok((audio, odd)) = pcm16_to_float(&payload, self.s.odd_byte) else {
+                let Ok((audio, odd)) = audio::decode_append(&payload, self.s.odd_byte, self.s.input_format.codec) else {
                     self.send(error_event("audio is not base64", "invalid_request_error", Some("invalid_audio"))).await;
                     return;
                 };
+                if let Some(error) = append_error(audio.len(), self.s.input_format.rate) {
+                    self.send(error).await;
+                    return;
+                }
                 if self.s.segmenter.is_none() && self.s.item_samples(audio.len()) as f64 > self.s.max_item_seconds * SAMPLE_RATE as f64 {
                     let message = format!(
                         "the item would pass {} s of audio; commit or clear the input audio buffer first",
@@ -686,12 +666,13 @@ impl Realtime {
     /// Apply a session update, all or nothing.
     fn update(&mut self, session: Map<String, Value>) -> Result<(), String> {
         let s = &self.s;
-        let rate = input_rate(session.get("input_audio_format"), s.input_rate)?;
-        if rate != s.input_rate && s.item_samples(0) > 0 {
-            return Err("commit or clear the input audio buffer before changing the input sample rate".into());
+        let fmt = input_format(session.get("input_audio_format"), s.input_format)?;
+        if fmt != s.input_format && s.item_samples(0) > 0 {
+            return Err("commit or clear the input audio buffer before changing the input audio format".into());
         }
-        if rate != s.input_rate && s.odd_byte.is_some() {
-            return Err("half a sample is pending; clear the input audio buffer before changing the input sample rate".into());
+        if fmt != s.input_format && s.odd_byte.is_some() {
+            // a commit keeps the half sample, so only clear helps
+            return Err("half a sample is pending; clear the input audio buffer before changing the input audio format".into());
         }
         let td = match session.get("turn_detection") {
             Some(v) => turn_detection(v)?,
@@ -755,8 +736,8 @@ impl Realtime {
         s.chunk_seconds = chunk_seconds;
         s.unfixed_chunks = unfixed_chunks;
         s.unfixed_tokens = unfixed_tokens;
-        if rate != s.input_rate {
-            s.set_input_rate(rate);
+        if fmt != s.input_format {
+            s.set_input_format(fmt);
         }
         if td != s.turn_detection {
             let old = s.segmenter.take();
@@ -954,7 +935,7 @@ pub async fn realtime(
         item_id: item_id(),
         failures: ItemFailures::default(),
         odd_byte: None,
-        input_rate: SAMPLE_RATE,
+        input_format: AudioFormat::pcm(SAMPLE_RATE),
         resampler: None,
         short: 0,
         turn_detection: None,
@@ -983,13 +964,5 @@ mod tests {
         assert_eq!(excerpt(&json!({"a": [[1]]})), "{'a': [[...]]}");
         let long = excerpt(&json!("x".repeat(300)));
         assert_eq!(long.chars().count(), 100);
-    }
-
-    #[test]
-    fn pcm16_keeps_an_odd_byte_for_the_next_append() {
-        let (a, odd) = pcm16_to_float(&json!("AAEC"), None).unwrap(); // 00 01 02
-        assert_eq!((a, odd), (vec![256.0 / 32768.0], Some(2)));
-        assert!(pcm16_to_float(&json!("A!=="), None).is_err());
-        assert!(pcm16_to_float(&Value::Null, None).is_err());
     }
 }
