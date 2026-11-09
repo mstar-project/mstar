@@ -716,7 +716,8 @@ class Engine:
                 sdpa=node_name in self._sdpa_nodes, host_fields=self._host_fields,
             )
             # Nodes in one engine can share layers, as BAGEL's LLM nodes share one language model, and a second
-            # node's bind would point those layers at a handle the first node's steps never open.
+            # node's bind would point those layers at a handle the first node's steps never open. A within-step handle
+            # keeps the sequence-parallel group and SDPA choice of the first node that builds it.
             handles = {name: shared.setdefault(name, handle) for name, handle in handles.items()}
             if handles:
                 bind_state_ops(handles)
