@@ -606,7 +606,7 @@ class VJepa2Model(Model):
     # ------------------------------------------------------------------
 
     def load_video(
-        self, filepath: str, device: str, *, model_kwargs=None, input_modalities=None, output_modalities=None,
+        self, filepath: str, device: str, *, request=None,
     ) -> TensorAndMetadata:
         """Read the video's header, choose the ``frames_per_clip`` sample indices and read the
         file's bytes; decode nothing.

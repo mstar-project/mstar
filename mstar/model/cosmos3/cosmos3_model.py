@@ -1099,7 +1099,7 @@ class Cosmos3Model(Model):
         return ProcessPromptOutput(out, {"kv_layout": {KV_CACHE: {REASONER_LABEL: main, UNCOND_LABEL: LabelLayout()}}})
 
     def load_video(
-        self, filepath: str, device: str, *, model_kwargs=None, input_modalities=None, output_modalities=None,
+        self, filepath: str, device: str, *, request=None,
     ):
         """Decode only the request's selected frames into its processing size.
 
@@ -1128,7 +1128,10 @@ class Cosmos3Model(Model):
         if not total:
             raise ValueError("video upload has no frames")
         del frame
-        mk = model_kwargs or {}
+        mk = (request.model_kwargs or {}) if request else {}
+        input_modalities, output_modalities = (
+            (request.input_modalities, request.output_modalities) if request else (None, None)
+        )
         reasoner = "text" in (output_modalities or [])
         if reasoner:
             cfg = self.config.reasoner.video_processor

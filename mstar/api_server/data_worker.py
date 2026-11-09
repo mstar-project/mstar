@@ -862,7 +862,7 @@ class PreprocessWorkerThread:
     def _load_media(
         self, file_paths: dict[str, list[str]] | None,
         raw_inputs: dict[str, list[torch.Tensor]] | None = None,
-        *, model_kwargs=None, input_modalities=None, output_modalities=None,
+        *, request: PreprocessInput | None = None,
     ) -> tuple[NameToTensorList, dict[str, list[dict]]]:
         """Raw modality tensors and their metadata, keyed ``{modality}_inputs``.
         The files, and ``raw_inputs`` (which stand in for their modality's
@@ -899,10 +899,7 @@ class PreprocessWorkerThread:
                 with budget.file():
                     if modality == "audio":
                         check_audio_duration(filepath)
-                    out = load(filepath, self.device, **({
-                        "model_kwargs": model_kwargs, "input_modalities": input_modalities,
-                        "output_modalities": output_modalities,
-                    } if modality == "video" else {}))
+                    out = load(filepath, self.device, **({"request": request} if modality == "video" else {}))
                     if modality == "audio":
                         charge_decoded_audio(out.data, out.metadata["sample_rate"])
                 tensors[key].append(out.data)
@@ -938,8 +935,7 @@ class PreprocessWorkerThread:
             # a prefix key hashes each input's file, and these have none
             raise ValueError("this deployment keys prompts by their media files; send the media as files")
         tensors, input_metadata = self._load_media(
-            input.file_paths, input.raw_inputs, model_kwargs=input.model_kwargs,
-            input_modalities=input.input_modalities, output_modalities=input.output_modalities,
+            input.file_paths, input.raw_inputs, request=input,
         )
 
 

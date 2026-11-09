@@ -412,9 +412,10 @@ def test_cosmos3_selection_still_counts_the_whole_source(tmp_path, monkeypatch):
     model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
     monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 4))
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
-        model.load_video(path, "cpu", model_kwargs={"width": 64, "height": 64})
+        model.load_video(path, "cpu", request=_video_request(model_kwargs={"width": 64, "height": 64}))
     monkeypatch.setenv("MSTAR_MAX_VIDEO_PIXELS", str(64 * 64 * 10))
-    assert model.load_video(path, "cpu", model_kwargs={"width": 64, "height": 64}).data.shape[0] == 5
+    loaded = model.load_video(path, "cpu", request=_video_request(model_kwargs={"width": 64, "height": 64}))
+    assert loaded.data.shape[0] == 5
 
 
 def test_a_tiny_frame_counts_as_the_minimum(monkeypatch):
@@ -887,7 +888,7 @@ def test_cosmos_video_load_selects_before_retaining_frames(tmp_path, mode):
         model.config.reasoner = Cosmos3ReasonerConfig()
         cfg = model.config.reasoner.video_processor
         cfg.min_pixels, cfg.max_pixels = 1024, 4096
-        loaded = model.load_video(path, "cpu", output_modalities=["text"], model_kwargs={"video_num_frames": 4})
+        loaded = model.load_video(path, "cpu", request=_video_request(["text"], {"video_num_frames": 4}))
         expected, grid = preprocess_video(original, cfg, 30, num_frames=4)
         actual, loaded_grid = preprocess_video(
             loaded.data, cfg, 30, sampled_frame_indices=loaded.metadata["sampled_frame_indices"],
@@ -896,10 +897,14 @@ def test_cosmos_video_load_selects_before_retaining_frames(tmp_path, mode):
         assert loaded_grid == grid
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     else:
-        loaded = model.load_video(path, "cpu", output_modalities=["video"], model_kwargs={
+        loaded = model.load_video(path, "cpu", request=_video_request(["video"], {
             "width": 32, "height": 48, "num_frames": 9, "condition_video_keep": mode,
-        })
+        }))
         selected = original[:5] if mode == "first" else original[-5:]
         expected = torch.nn.functional.interpolate(selected.float().div_(255), size=(48, 32), mode="nearest")
         assert loaded.data.shape == (5, 3, 48, 32)
         torch.testing.assert_close(loaded.data, expected, rtol=0, atol=0)
+
+
+def _video_request(output_modalities=None, model_kwargs=None):
+    return types.SimpleNamespace(model_kwargs=model_kwargs, input_modalities=None, output_modalities=output_modalities)

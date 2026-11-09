@@ -139,6 +139,9 @@ def _applying_chunking(build):
     return get_graph_walk_graphs
 
 if TYPE_CHECKING:
+    from mstar.api_server.request_types import PreprocessInput
+
+if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
@@ -1070,7 +1073,7 @@ class Model(ABC):
         return TensorAndMetadata(data=audio, metadata=dict(sample_rate=16000, num_channels=1))
 
     def load_video(
-        self, filepath: str, device: str, *, model_kwargs=None, input_modalities=None, output_modalities=None,
+        self, filepath: str, device: str, *, request: "PreprocessInput | None" = None,
     ):
         """Load video with the request context available for bounded frame selection."""
         from torchcodec.decoders import VideoDecoder
