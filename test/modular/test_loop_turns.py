@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import pytest  # noqa: E402
 
+import mstar.worker.step_pipeline as pipeline_mod  # noqa: E402
 import mstar.worker.worker as worker_mod  # noqa: E402
 from mstar.engine.engine import ExecutingBatch  # noqa: E402
 from mstar.engine.resources.step import FULL_ADMIT_OK, StepContext  # noqa: E402
@@ -38,11 +39,13 @@ from mstar.graph.runtime.base import (  # noqa: E402
     SpeculationOutput,
 )
 from mstar.model.submodule_base import StepOrder  # noqa: E402
-from mstar.testing_utils.worker import bound, make_scheduler, make_worker
+from mstar.testing_utils.worker import bound, make_scheduler, make_worker  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker.batch_builder import StepPick  # noqa: E402
 from mstar.worker.micro_scheduler import ChainPick, MicroScheduler, ScheduledBatch  # noqa: E402
-from mstar.worker.worker import SpeculationTarget, Worker  # noqa: E402
+from mstar.worker.speculation import SpeculationTarget, Speculator  # noqa: E402
+from mstar.worker.step_pipeline import StepPipeline  # noqa: E402
+from mstar.worker.worker import Worker  # noqa: E402
 
 NODE, WALK = "dit", "video_gen"
 KEY = (NODE, WALK)
@@ -115,7 +118,7 @@ def _admitted(sched: MicroScheduler, batch: ScheduledBatch, refused: bool = Fals
     pending = SimpleNamespace(batch=batch, node_batch=SimpleNamespace(
         admit_error=object() if refused else None,
     ))
-    Worker._count_turn(SimpleNamespace(scheduler=sched), pending)
+    StepPipeline._count_turn(SimpleNamespace(scheduler=sched), pending)
 
 
 def _run(
@@ -328,6 +331,7 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
     monkeypatch.setenv("MSTAR_PRE_PLAN_SPEC", "0")
     monkeypatch.setattr(worker_mod, "gc", SimpleNamespace(
         collect=lambda: None, freeze=lambda: None, get_freeze_count=lambda: 0))
+    monkeypatch.setattr(pipeline_mod, "build_executing_batch", lambda services, batch: executing(batch))
 
     def stub(*a, **k):
         return None
@@ -355,27 +359,24 @@ def _looping_worker(monkeypatch, sched, state, refuse=frozenset()) -> Worker:
         communicator=SimpleNamespace(send=stub, wait_for_work=idle),
         wakeup_event=SimpleNamespace(register_future=stub),
         scheduler=sched,
-        admission=sched.admission,
-        lockstep=sched.lockstep,
         request_state=state,
     )
     bound(sched, state)
-    for name in ("_pin_step_thread", "_init_engine_thread",
-                 "_apply_removes", "_fail_requests", "_apply_drains", "_report_failures", "_teardown",
-                 "_set_in_flight_flag", "_clear_in_flight_flag",
-                 "_drop_rows_whose_loop_stopped", "_handle_admit_failure", "_postprocess_batch"):
-        setattr(w, name, stub)
+    for name in ("_apply_removes", "_fail_requests", "_apply_drains", "_report_failures", "_teardown",
+                 "_drop_rows_whose_loop_stopped", "_handle_admit_failure"):
+        setattr(w.pipeline, name, stub)
+    for name in ("pin_this_thread", "_init_engine_thread", "_set_in_flight", "clear_in_flight", "postprocess"):
+        setattr(w.executor, name, stub)
     for name in ("process_messages", "check_ready_tensors", "poll_stream_buffers"):
         setattr(w.ingest, name, stub)
     w.lockstep.broadcast = lambda node_batch: -1
-    w._build_executing_batch = executing
-    w._build_speculation = lambda pending, consecutive, fair: (None, None)
-    w._execute_on_gpu_thread = gpu
+    w.speculator.build = lambda pending: (None, None)
+    w.executor._body = gpu
 
     def fail_loudly(error, *args):
         raise error
 
-    w._handle_main_loop_error = fail_loudly
+    w.pipeline._handle_error = fail_loudly
     return w
 
 
@@ -409,7 +410,7 @@ def test_a_lone_request_keeps_its_chain_without_a_scan():
 # ── the worker's side ───────────────────────────────────────────────────
 
 
-def _worker(chain: ChainPick, prep, taken=None, asked=None) -> Worker:
+def _speculator(chain: ChainPick, prep, taken=None, asked=None) -> Speculator:
     asked = {} if asked is None else asked
 
     def pick_chain_step(target, continuing, mid_prefill=(), next_iter_of=None):
@@ -420,7 +421,7 @@ def _worker(chain: ChainPick, prep, taken=None, asked=None) -> Worker:
         asked["yield"] = next_iter_of
         return False
 
-    worker = make_worker(
+    speculator = make_worker(
         scheduler=SimpleNamespace(
             backlog_splits_from=backlog_splits_from,
             pick_chain_step=pick_chain_step,
@@ -429,12 +430,12 @@ def _worker(chain: ChainPick, prep, taken=None, asked=None) -> Worker:
         ),
         tensor_manager=SimpleNamespace(get_tensor=lambda uuid: None),
         request_state=SimpleNamespace(),
-    )
-    worker._spec_preparer = SimpleNamespace(prepare=prep)
-    worker._yield_away_speculation = lambda batch, gave_way=False: SimpleNamespace(
+    ).speculator
+    speculator._spec_preparer = SimpleNamespace(prepare=prep)
+    speculator._yield_away_speculation = lambda batch, gave_way=False: SimpleNamespace(
         scheduled_batch=batch, gave_way=gave_way,
     )
-    return worker
+    return speculator
 
 
 _TARGET = SpeculationOutput(
@@ -459,9 +460,9 @@ def test_prep_gets_the_chains_rows_in_line_and_the_room():
 
     pick = StepPick(taken=[2, 9], continuing=[2, 3, 1], room=1, held_back=set(), ordered=True)
     asked = {}
-    worker = _worker(ChainPick(KEY, pick, []), prep, asked=asked)
+    speculator = _speculator(ChainPick(KEY, pick, []), prep, asked=asked)
 
-    assert worker._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3])) is None
+    assert speculator._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3])) is None
     assert seen == {"rids": [2, 3, 1], "room": 1}
     # the chain's rows run the step one iteration on, and the scheduler groups them there
     assert asked == {"pick": "denoise", "yield": "denoise"}
@@ -473,8 +474,8 @@ def test_a_chain_that_gives_its_whole_step_away_runs_the_waiting_rows():
     prepped for the chain's rows."""
     pick = StepPick(taken=[9], continuing=[1, 2, 3], room=0, held_back=set(), ordered=True)
     waiting = ScheduledBatch(NODE, WALK, request_to_worker_graph={9: 0})
-    worker = _worker(ChainPick(KEY, pick, []), prep=None, taken=waiting)
+    speculator = _speculator(ChainPick(KEY, pick, []), prep=None, taken=waiting)
 
-    spec = worker._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3]))
+    spec = speculator._try_speculate_next(_pending(), SpeculationTarget(_TARGET, [1, 2, 3]))
 
     assert spec.scheduled_batch is waiting and spec.gave_way

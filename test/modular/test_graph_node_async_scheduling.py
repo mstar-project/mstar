@@ -5,7 +5,7 @@ longer cloned per iteration (``ready_next_iter`` is a buffer on the node
 itself), so that API is gone and the flag trivially persists on the one live
 object. What still matters is the thing the flag exists for: the worker
 refuses to build a speculative batch for a node that opted out
-(``Worker._try_speculate_next``, which filters on
+(``Speculator._try_speculate_next``, which filters on
 ``wgio.nodes[info.node_name].enable_async_scheduling``).
 
 The graph layer itself does NOT apply that filter — it reports readiness and
