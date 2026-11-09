@@ -3000,9 +3000,12 @@ def _uvicorn_config(app, host: str, port: int, config: dict) -> uvicorn.Config:
     # Per-message deflate is negotiated server-wide, for every WebSocket route,
     # so it is the deployment's to turn off (see ws_per_message_deflate in
     # docs/serving.rst); on by default, as uvicorn's. With no log config of its
-    # own, uvicorn's records reach the root logger and its writer thread.
+    # own, uvicorn's records reach the root logger and its writer thread. A
+    # shutdown cuts what is still in flight after 30 s, as mstar-server does, or
+    # one client holding a stream open would hold SIGTERM for good.
     return uvicorn.Config(
         app, host=host, port=port, access_log=False, log_config=None,
+        timeout_graceful_shutdown=30,
         ws_per_message_deflate=bool(config.get("ws_per_message_deflate", True)),
         ws_max_size=_ws_max_size(config),
     )

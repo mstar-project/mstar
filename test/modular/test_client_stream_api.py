@@ -1930,6 +1930,12 @@ def test_websocket_deflate_is_a_serving_setting():
     assert off.ws_per_message_deflate is False
 
 
+def test_a_shutdown_does_not_wait_for_open_streams_for_ever():
+    """SIGTERM while a client holds a stream: uvicorn waits for every request
+    to finish unless it is given a limit."""
+    assert entrypoint._uvicorn_config(object(), "127.0.0.1", 8000, {}).timeout_graceful_shutdown is not None
+
+
 def test_websocket_message_size_is_a_serving_setting(monkeypatch):
     """The largest WebSocket message the server reads: an HTTP body's limit, not
     uvicorn's 16 MiB, whose close aborts every request pipelined on the socket,
