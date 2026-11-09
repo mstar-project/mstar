@@ -1450,12 +1450,6 @@ class Cosmos3Model(Model):
             raise ValueError(
                 f"Cosmos3 image conditioning requires a video request (num_frames > {frames_per_latent})."
             )
-        latent_px = self.config.vae.scale_factor_spatial
-        if params["width"] < latent_px or params["height"] < latent_px:
-            raise ValueError(
-                f"Cosmos3 width and height must be at least {latent_px} px (one latent pixel), "
-                f"got {params['width']}x{params['height']}."
-            )
         # Video-to-video: a non-action video input pins clean conditioning
         # latent frames taken from the request video (reference recipe defaults:
         # indexes (0, 1), keep "first", flow_shift 10.0). Validated here so a
