@@ -368,8 +368,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        keeps no ids, so it is never dropped on that node, though it can still move to the host
        with ``cpu_offload_pages``. On a TP, SP or CFG node the first rank's pool decides which requests keep
        ids, and every other rank keeps the same ones, since each rank rebuilds the requests its first rank drops.
-       Every other rank sets aside twice this, since it also holds the ids of requests the first rank has torn
-       down until it tears them down too, and copies a prompt that still doesn't fit outside the pool. A
+       Every other rank sets aside twice this, for the ids the first rank keeps and those of requests the first
+       rank has torn down that it hasn't torn down yet, and copies a prompt that doesn't fit outside the pool. A
        non-negative int, and 0 keeps no ids.
    * - ``warmup_requests``
      - *(optional)* Requests the server runs after the workers are ready and before it
