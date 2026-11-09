@@ -6,8 +6,9 @@
 //! input went on as silence and starts over.
 //!
 //! The arithmetic follows numpy's: the kernel from `np.sinc` and `np.kaiser`
-//! (Cephes' `i0`), each output a float64 sum in numpy's pairwise order, cast to
-//! float32. Only `sin`, from the platform's libm, can differ from numpy's.
+//! (Cephes' `i0`), each output a float64 dot product in the order `np.einsum`
+//! adds it, cast to float32. Only `sin`, from the platform's libm, can differ
+//! from numpy's.
 
 /// Cephes' Chebyshev series, as numpy's `_chbevl`.
 fn chbevl(x: f64, vals: &[f64]) -> f64 {
@@ -36,37 +37,29 @@ fn i0(x: f64) -> f64 {
     }
 }
 
-/// numpy's sum of a float64 run: pairwise, eight accumulators per block of at
-/// most 128, so a row adds up in the order numpy adds it.
-fn pairwise_sum(a: &[f64]) -> f64 {
-    let n = a.len();
-    if n < 8 {
-        let mut res = 0.0;
-        for &v in a {
-            res += v;
-        }
-        return res;
-    }
-    if n <= 128 {
-        let mut r = [0.0f64; 8];
-        r.copy_from_slice(&a[..8]);
-        let mut i = 8;
-        while i < n - n % 8 {
-            for j in 0..8 {
-                r[j] += a[i + j];
+/// `np.einsum("ij,ij->i")`'s sum of one row of products: numpy's x86
+/// baseline kernel, two lanes unrolled four times (no FMA), the tail
+/// zero-filled, then the two lanes added.
+fn einsum_sum(p: &[f64]) -> f64 {
+    let mut acc = [0.0f64; 2];
+    let n = p.len();
+    let mut i = 0;
+    while n - i >= 8 {
+        for (lane, a) in acc.iter_mut().enumerate() {
+            // the last pair of the block goes on first
+            for u in (0..4).rev() {
+                *a += p[i + 2 * u + lane];
             }
-            i += 8;
         }
-        let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
-        while i < n {
-            res += a[i];
-            i += 1;
-        }
-        return res;
+        i += 8;
     }
-    let mut n2 = n / 2;
-    n2 -= n2 % 8;
-    pairwise_sum(&a[..n2]) + pairwise_sum(&a[n2..])
+    while i < n {
+        for (lane, a) in acc.iter_mut().enumerate() {
+            *a += p.get(i + lane).copied().unwrap_or(0.0);
+        }
+        i += 2;
+    }
+    acc[0] + acc[1]
 }
 
 fn gcd(a: usize, b: usize) -> usize {
@@ -168,7 +161,7 @@ impl StreamResampler {
                     0.0
                 };
             }
-            out.push(pairwise_sum(&row) as f32);
+            out.push(einsum_sum(&row) as f32);
         }
         self.k_out = k_end as usize;
         // the first input the next output needs
@@ -189,6 +182,18 @@ mod tests {
         assert_eq!(i0(0.0), 1.0);
         assert!((i0(1.0) - 1.266_065_877_752_008_4).abs() < 1e-15);
         assert!((i0(10.0) - 2_815.716_628_466_254).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_row_adds_up_as_einsum_adds_it() {
+        // np.einsum("ij,ij->i", a[None], b[None]) for these rows, where
+        // numpy's pairwise sum gives 50.22597402597404 and 83.60779220779227
+        for (n, want) in [(99usize, 50.22597402597405f64), (147, 83.60779220779224)] {
+            let row: Vec<f64> = (0..n)
+                .map(|i| ((i * i % 97) as f64 / 7.0 - 6.0) * ((i * 31 % 53) as f64 / 11.0 - 2.4))
+                .collect();
+            assert_eq!(einsum_sum(&row), want);
+        }
     }
 
     #[test]

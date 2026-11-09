@@ -89,6 +89,8 @@ class _ASR:
 
     def __init__(self, upload_dir: Path):
         self.model_name = "qwen3_asr"
+        # no ClientAudio stream: this model is transcribed, not conversed with
+        self.client_audio = []
         self.model = _Model()
         self.upload_dir = upload_dir
         self.metrics = None
@@ -294,9 +296,15 @@ def test_semantic_vad_asks_the_end_of_turn_model_alike(stack, monkeypatch, eager
 
 
 REFUSED_UPDATES = {
-    "rate": {"input_audio_format": {"type": "audio/pcm", "rate": 44100}},
+    "rate": {"input_audio_format": {"type": "audio/pcm", "rate": 44000}},
+    "rate-float": {"input_audio_format": {"type": "audio/pcm", "rate": 16000.0}},
+    "rate-bool": {"input_audio_format": {"type": "audio/pcm", "rate": True}},
     "format": {"input_audio_format": "mp3"},
+    "format-type": {"input_audio_format": {"type": "audio/opus"}},
+    "format-no-type": {"input_audio_format": {"rate": 16000}},
     "format-extra": {"input_audio_format": {"type": "audio/pcm", "rate": 24000, "channels": 2}},
+    "g711-rate": {"input_audio_format": {"type": "audio/pcmu", "rate": 16000}},
+    "g711-rate-bool": {"input_audio_format": {"type": "audio/pcma", "rate": True}},
     "turn-type": {"turn_detection": {"type": "magic"}},
     "turn-key": {"turn_detection": {"type": "server_vad", "speed": 1}},
     "idle": {"turn_detection": {"type": "server_vad", "idle_timeout_ms": 5}},
@@ -342,12 +350,43 @@ def test_protocol_errors_read_as_pythons(stack, monkeypatch):
     _assert_same(py, rust)
 
 
-def test_an_item_past_the_cap_is_refused_alike(stack, monkeypatch):
-    long = np.zeros(16000 * 301, dtype=np.float32)
-    events = [{"type": "input_audio_buffer.append", "audio": _pcm(long)}]
+def test_an_append_or_item_past_the_cap_is_refused_alike(stack, monkeypatch):
+    # one append past 300 s, at 8 kHz G.711 (one byte a sample), then an item
+    # that two appends take past it
+    long = base64.b64encode(np.full(8000 * 301, 0xFF, np.uint8).tobytes()).decode()
+    half = _pcm(np.zeros(16000 * 160, dtype=np.float32))
+    events = [_session(input_audio_format="g711_ulaw"), {"type": "input_audio_buffer.append", "audio": long},
+              _session(input_audio_format="pcm16"),
+              {"type": "input_audio_buffer.append", "audio": half}, {"type": "input_audio_buffer.append", "audio": half}]
     py, rust = _both(stack, monkeypatch, events)
     _assert_same(py, rust)
-    assert py[0][1]["error"]["message"].startswith("the item would pass 300 s of audio")
+    errors = [e["error"]["message"] for e in py[0] if e["type"] == "error"]
+    assert errors[0].startswith("an append holds at most 300 s of audio")
+    assert errors[1].startswith("the item would pass 300 s of audio")
+
+
+@pytest.mark.parametrize("fmt", [
+    "g711_ulaw", "g711_alaw", {"type": "audio/pcmu"}, {"type": "audio/pcma", "rate": 8000},
+    {"type": "audio/pcm", "rate": 8000}, {"type": "audio/pcm", "rate": 11025}, {"type": "audio/pcm", "rate": 22050},
+    {"type": "audio/pcm", "rate": 32000}, {"type": "audio/pcm", "rate": 44100}, {"type": "audio/pcm", "rate": 48000},
+], ids=lambda f: f if isinstance(f, str) else f"{f['type'].split('/')[1]}-{f.get('rate', 'default')}")
+def test_every_input_format_reaches_the_engine_alike(stack, monkeypatch, fmt):
+    law = {"g711_ulaw": "audio/pcmu", "g711_alaw": "audio/pcma"}.get(fmt) if isinstance(fmt, str) else (
+        fmt["type"] if fmt["type"] != "audio/pcm" else None)
+    rate = 8000 if law else fmt["rate"]
+    r = media_io.StreamResampler(24000, rate)
+    audio = np.concatenate([r.push(_speech_24k()[: 24000 * 5]), r.flush()])
+    if law:
+        coded = media_io.g711_encode(media_io.to_pcm16(audio), law)
+        n = int(rate * 0.3)
+        appends = [{"type": "input_audio_buffer.append", "audio": base64.b64encode(coded[i:i + n]).decode()}
+                   for i in range(0, len(coded), n)]
+    else:
+        appends = _appends(audio, rate, 0.13)
+    events = [_session(input_audio_format=fmt), *appends, {"type": "input_audio_buffer.commit"}]
+    py, rust = _both(stack, monkeypatch, events)
+    _assert_same(py, rust)
+    assert py[1], "the engine heard nothing"
 
 
 def test_a_model_without_realtime_is_closed_with_pythons_reason(stack, monkeypatch):
