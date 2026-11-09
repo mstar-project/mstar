@@ -248,7 +248,7 @@ def test_a_step_of_packed_page_prefills_fits_a_captured_graph(tmp_path, max_crop
     pages = llm.max_batch_size("prefill_image")
     # "<image>\nFree OCR." and the BOS are under 16 tokens
     assert 1 < pages <= max(packed.capture_batch_sizes)
-    assert pages * (largest + 16) <= max(packed.capture_token_lengths)
+    assert pages * (largest + 16) <= max(packed.get_total_tokens(pages))
 
 
 class _CharTokenizer:

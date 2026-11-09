@@ -1,6 +1,7 @@
 
 import json
 import logging
+import os
 import re
 from collections.abc import Container
 from dataclasses import dataclass, field
@@ -48,6 +49,9 @@ def load_weights_from_file(
 ):
     from safetensors.torch import safe_open
 
+    from mstar.model.loader.quantization import refuse_unserved_quantization
+
+    refuse_unserved_quantization(safetensors_file)
     # Precompute expected keys for each module
     module_key_maps = []
     for mod in modules:
@@ -64,17 +68,12 @@ def load_weights_from_file(
     # Temporary per-module state dicts
     state_dicts = [dict() for _ in modules]
 
-    # safetensors can't take cuda:0 etc
-    st_device = "cuda" if str(device).startswith("cuda") else device
-
-    with safe_open(safetensors_file, framework="pt", device=st_device) as f:
+    # straight to the node's device: safetensors' "cuda" is the current GPU, not cuda:N
+    with safe_open(safetensors_file, framework="pt", device=str(device)) as f:
         for k in f.keys():
             for i, (_mod, _prefix, key_map) in enumerate(module_key_maps):
                 if k in key_map:
-                    tensor = f.get_tensor(k)
-                    if device != st_device:
-                        tensor = tensor.to(device, non_blocking=True)
-                    state_dicts[i][key_map[k]] = tensor
+                    state_dicts[i][key_map[k]] = f.get_tensor(k)
                     break
 
     # Load modules
@@ -259,7 +258,10 @@ def load_weights_from_hf_shards(
     """
     from safetensors.torch import safe_open
 
+    from mstar.model.loader.quantization import refuse_unserved_quantization
+
     repo_dir = Path(repo_dir)
+    refuse_unserved_quantization(repo_dir)
     index_path = repo_dir / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as f:
@@ -304,20 +306,17 @@ def load_weights_from_hf_shards(
         shard_to_hf_keys.setdefault(weight_map[k], []).append(k)
 
     hf_key_to_tensor = {}
-    st_device = "cuda" if str(device).startswith("cuda") else device
 
     # load in tensors to get {mod_key}
     for shard_file, keys_in_shard in shard_to_hf_keys.items():
         shard_path = str(repo_dir / shard_file)
         keys_set = set(keys_in_shard)
-        with safe_open(shard_path, framework="pt", device=st_device) as f:
+        # straight to the node's device: safetensors' "cuda" is the current GPU, not cuda:N
+        with safe_open(shard_path, framework="pt", device=str(device)) as f:
             for k in f.keys():
                 if k not in keys_set:
                     continue
-                tensor = f.get_tensor(k)
-                if device != st_device:
-                    tensor = tensor.to(device, non_blocking=True)
-                hf_key_to_tensor[k] = tensor
+                hf_key_to_tensor[k] = f.get_tensor(k)
 
     # Temporary per-module state dicts
     state_dicts: list[dict[str, torch.Tensor]] = [dict() for _ in modules]
@@ -624,6 +623,14 @@ def capture_ladder(key: str, value) -> list[int]:
             or any(isinstance(n, bool) or not isinstance(n, int) or n < 1 for n in value)):
         raise ValueError(f"{key} must be a non-empty list of distinct positive integers, got {value!r}")
     return list(value)
+
+
+def warn_retired_ladder_env(name: str, setting: str) -> None:
+    """Warn that the environment variable ``name``, a capture ladder the serving config's
+    ``prefill_token_buckets`` replaced, is set but no longer read; ``setting`` is the
+    serving config entry that sets it."""
+    if name in os.environ:
+        logger.warning("%s is no longer read; set the ladder in the serving config: %s", name, setting)
 
 
 def check_loaded(module: torch.nn.Module, loaded: set[str], what: str) -> None:

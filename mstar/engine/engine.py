@@ -1,6 +1,8 @@
 
 
+import functools
 import logging
+import math
 import os
 import threading
 import time
@@ -16,12 +18,14 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo, merge_publish_info
 from mstar.distributed.communication import JointGroups, WorkerParallelGroups
 from mstar.engine import with_recompile_limit
+from mstar.engine.accelerator_graph_config import apply_region_ladders
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CapturePlan,
     PiecewiseAcceleratorGraphRunner,
     autocast_scope,
     fail_if_graphs_required,
+    fail_if_required_regions_dropped,
     plan_captures,
 )
 from mstar.engine.chunking import DEFAULT_MIN_CHUNK_TOKENS, ChunkingManagement, ChunkRange
@@ -196,6 +200,10 @@ class SubmoduleManagement:
     fp32_precision: Fp32Precision | None = None
     # the node's request slots and device tables, where it runs on them
     resident: ResidentPlanner | None = None
+    # the serving config's prefill_token_buckets for the node: capture walk -> ladder,
+    # and piecewise region label -> ladder
+    token_ladders: Mapping[str, Any] = field(default_factory=dict)
+    region_ladders: Mapping[str, list[int]] = field(default_factory=dict)
 
     # Rotated globally, not per runner: slot-keyed buffers are shared across
     # buckets and regions, so per-runner counters let consecutive steps collide
@@ -284,7 +292,7 @@ class SubmoduleManagement:
 class ForwardPassInfoWrapper:
     """
     Stop-gap solution: the dynamic loop iters in CurrentForwardPassInfo may
-    be used in two places at once: in _postprocess_batch (for batch N), and
+    be used in two places at once: in ``StepExecutor.postprocess`` (for batch N), and
     in the forward pass for batch N+1, which require different iterations.
     The InputMetadata is built per executing batch, so its value is guaranteed
     to be up-to-date.
@@ -386,7 +394,8 @@ class ExecutingBatch:
     # submodule's ``uniform_row_inputs``
     uniform_inputs: NodeInputs | None = None
     # rids the submodule declined this step — e.g. a speculatively scheduled
-    # flow step for a request already past its own max iters
+    # flow step for a request already past its own max iters. One that takes
+    # its stream's final chunk still completes its node (see ``drop_rids``).
     skipped_rids: set[int] = field(default_factory=set)
     # rids whose whole walk this node's resources already hold. They run no
     # forward, but their node still completes so the request reaches its next walk.
@@ -399,7 +408,7 @@ class ExecutingBatch:
     withheld_outputs: dict[int, tuple[str, ...]] = field(default_factory=dict)
     # A lockstep step whose rows' input reads every rank checks before
     # preparing it: the leader's rows in its order (see
-    # ``Worker._drop_rows_whose_read_failed``); None for no check
+    # ``Lockstep.drop_rows_whose_read_failed``); None for no check
     read_check_rids: tuple[int, ...] | None = None
 
     admit_error: AdmitFailedReason | None = None
@@ -476,6 +485,12 @@ class ExecutingBatch:
     def graph_walk(self) -> str:
         return self.step_context.graph_walk
 
+    @property
+    def no_forward_rids(self) -> set:
+        """Rows that ran no forward but still complete their node: the ones
+        the cache served, and the ones that declined their stream's final chunk."""
+        return self.cached_rids | (self.final_stream_rids - set(self.request_ids))
+
     def register_prepare_batch(self, inputs: list[NodeInputs], uniform: NodeInputs | None = None):
         self.inputs = inputs
         self._seq_lens = None
@@ -514,10 +529,15 @@ class ExecutingBatch:
         if not rids:
             return
         self.request_ids = [rid for rid in self.request_ids if rid not in rids]
-        # A row that does not run this step must not end its streams on it:
-        # the worker would stop its loop and finalize a row it no longer has.
-        self.final_stream_rids.difference_update(rids)
-        self.partition_done_rids.difference_update(rids)
+        # A row that failed must not end its streams on this step: the worker
+        # would stop its loop and finalize a row it no longer has. A declined
+        # row still does: it completes its node without a forward, so a
+        # consumer needs no dummy step to end on an empty final chunk. A row
+        # the cache served does not: its walk completes without one (its chunk
+        # Loop's stride, ``complete_cached_walk``).
+        ended = rids - (self.skipped_rids - self.cached_rids)
+        self.final_stream_rids.difference_update(ended)
+        self.partition_done_rids.difference_update(ended)
         self.per_request_info = {
             rid: info for rid, info in self.per_request_info.items()
             if rid not in rids
@@ -572,6 +592,8 @@ class Engine:
         # the share of the device this worker's allocations may hold once
         # capture is done, None for whatever is free
         self._gpu_memory_fraction = gpu_memory_fraction
+        # node -> `chunk_alignment`, filled on first ask
+        self._chunk_alignment: dict[str, int] = {}
         self._resources: dict[str, Resource] = {}
         # resource key -> the nodes on this engine that use it
         self._resource_nodes: dict[str, frozenset[str]] = {}
@@ -608,7 +630,12 @@ class Engine:
         transfer_engine_info: TransferEngineInfo,
         kv_cache_type=None,
         model: "Model | None" = None,
+        token_ladders: Mapping[str, Any] | None = None,
+        region_ladders: Mapping[str, Any] | None = None,
     ):
+        """``token_ladders`` and ``region_ladders``: the serving config's
+        ``prefill_token_buckets``, node -> capture walk -> ladder and node ->
+        piecewise region label -> ladder, which the node's captures take at warmup."""
         self._device = device
         if self._device_capability is None or self._device_capability.device != device:
             self._device_capability = DeviceCapability.of(device)
@@ -700,6 +727,8 @@ class Engine:
                 # the dtype the engine manager cast this node to
                 node_dtype=resolve_node_dtype(submodule, self._autocast_dtype),
                 fp32_precision=node_fp32_precision(node_name, submodule),
+                token_ladders=(token_ladders or {}).get(node_name) or {},
+                region_ladders=(region_ladders or {}).get(node_name) or {},
             )
             submodule.bind_node_resources(resources)
             self._submodules[node_name].lora_pools = tuple(
@@ -773,8 +802,9 @@ class Engine:
 
         return [r for r in self._resources.values() if isinstance(r, LoraAdapterPool)]
 
-    def _compile_submodules(self) -> None:
-        """Apply torch.compile to submodule forward paths.
+    def _compile_submodules(self, recompile_limits: Mapping[str, int | None] | None = None) -> None:
+        """Apply torch.compile to submodule forward paths, each under its node's
+        ``recompile_limits`` entry (the capture runner's, whose code objects it shares).
 
         Compiles each submodule's ``forward`` and ``forward_batched`` with the
         default mode (fullgraph=False, dynamic=None), which in general provides
@@ -801,16 +831,17 @@ class Engine:
             dynamic = True if item_encoder and not getattr(submodule, "marks_dynamic_dims", False) else None
             try:
                 # no token count, these serve eager batches of any size
+                limit = (recompile_limits or {}).get(node_name)
                 submodule_mgmt.forward = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward,
                     fullgraph=False,
                     dynamic=dynamic,
-                )), submodule)
+                )), limit)
                 submodule_mgmt.forward_batched = with_recompile_limit(with_inductor_overrides(torch.compile(
                     submodule.forward_batched,
                     fullgraph=False,
                     dynamic=dynamic,
-                )), submodule)
+                )), limit)
                 logger.info("Engine: torch.compile applied to %s", node_name)
             except Exception:
                 logger.warning(
@@ -882,6 +913,8 @@ class Engine:
                 enable_nvtx=self._enable_nvtx,
                 device_capability=self.device_capability,
                 capture_stream=capture_stream,
+                token_ladders=submodule_mgmt.token_ladders,
+                step_tokens=functools.partial(self._chunking.max_step_tokens, node_name),
             )
             self._build_resident_planner(node_name, runner)
             piecewise[node_name] = self._build_piecewise_runners(
@@ -933,6 +966,12 @@ class Engine:
                 self._device, free / 2**20, plan.floor / 2**20,
             )
 
+        fail_if_required_regions_dropped([
+            f"{node_name} {label} bs={bs} total_tokens={tokens}"
+            for node_name, runners in piecewise.items()
+            for label, runner in runners.items() if runner.required
+            for bs, tokens in runner.dropped_shapes
+        ])
         fail_if_graphs_required([
             f"{node_name} {key}"
             for node_name, runner in ag_runners.items()
@@ -946,7 +985,7 @@ class Engine:
 
         # torch.compile applied after CUDA graph capture because the cuda
         # graph runner compiles internally
-        self._compile_submodules()
+        self._compile_submodules({node: runner.recompile_limit for node, runner in ag_runners.items()})
         for submodule_mgmt in self._submodules.values():
             with fp32_precision_scope(submodule_mgmt.fp32_precision), _outside_steps(submodule_mgmt):
                 submodule_mgmt.submodule.warmup_compiles()
@@ -1056,7 +1095,8 @@ class Engine:
     def _build_piecewise_runners(
         self, node_name: str, submodule_mgmt: SubmoduleManagement, capture_stream: Any = None,
     ) -> dict[str, PiecewiseAcceleratorGraphRunner]:
-        """One runner per region the submodule declares, not yet captured.
+        """One runner per region the submodule declares, on the ladder the
+        serving config names by its label, not yet captured.
 
         The caller captures them, and drops a region whose capture failed so
         its forward takes the eager path for that label.
@@ -1067,6 +1107,10 @@ class Engine:
             # the dtype the region runs in; an opted-out node keeps its params'
             node_dtype or torch.float32,
             submodule_mgmt.joint_comm_group.world_size,
+        )
+        apply_region_ladders(
+            node_name, configs, submodule_mgmt.region_ladders, submodule_mgmt.token_ladders,
+            type(submodule_mgmt.submodule),
         )
         runners: dict[str, PiecewiseAcceleratorGraphRunner] = {}
         # One graph memory pool for all of the node's regions (see
@@ -1868,7 +1912,7 @@ class Engine:
                 except Exception as error:
                     # this rid fails alone, as in prepare_inputs, and keeps its
                     # admitted state (which queued kernels may still write) until
-                    # its REMOVE. Under TP/SP the ranks stay in step only if every
+                    # its REMOVE. Under TP/SP/CFG the ranks stay in step only if every
                     # rank raises here.
                     batch.register_failure(rid, error)
                 finally:
@@ -2438,8 +2482,9 @@ class Engine:
         request_ids: list[int],
     ) -> None:
         """Publish state that must include the last iteration of a stopped loop."""
-        # A row that ran nothing this step -- one the prefix cache served whole
-        # -- has no iteration here to publish, though its loop still stops.
+        # A row that ran nothing this step -- one the prefix cache served whole,
+        # or one that declined its final chunk -- has no iteration here to
+        # publish, though its loop still stops.
         request_ids = [rid for rid in request_ids if rid in batch.per_request_info]
         if not request_ids:
             return
@@ -2491,7 +2536,7 @@ class Engine:
             is NodeSubmodule.filter_batched_output
         ):
             # No clone either: the worker takes the host copy on this thread,
-            # on this stream, right behind the step (``_stage_host_rows``), so
+            # on this stream, right behind the step (``HostCopies.stage_host_rows``), so
             # a later replay cannot overwrite the rows first, and nothing else
             # reads them on the device. Padded rows past the real ones ride
             # along and are never read.
@@ -2808,9 +2853,41 @@ class Engine:
             overrides, walks, combined_walk_of, override_mixed, no_chunking,
             min_chunk_tokens,
         )
+        self._check_chunk_alignment()
 
-    def min_chunk_tokens(self, budget: int) -> int:
-        return self._chunking.min_chunk_tokens(budget)
+    def _check_chunk_alignment(self) -> None:
+        """Refuse a budget under its node's `chunk_alignment`, and warn under three of
+        them: a cut chunk is a whole number of alignments, so every cut would run past
+        a smaller budget, and up to an alignment less one of each step goes unused."""
+        for (node, walk), budget in sorted(self._chunking.cut_budgets().items()):
+            if node not in self._submodules:
+                continue
+            align = self.chunk_alignment(node)
+            if budget < align:
+                raise ValueError(
+                    f"max_batch_tokens for {node}/{walk}: {budget} is under the {align}-token chunk "
+                    f"alignment {node}'s resources declare (`Resource.chunk_alignment`), so every cut "
+                    f"chunk would run over it; set at least {align}"
+                )
+            if budget < 3 * align:
+                logger.warning(
+                    "max_batch_tokens for %s/%s: %d is under three %d-token chunk alignments; a cut "
+                    "chunk is a multiple of %d tokens, so up to %d of a step's budget can go unused",
+                    node, walk, budget, align, align, align - 1,
+                )
+
+    def min_chunk_tokens(self, budget: int, align: int = 1) -> int:
+        return self._chunking.min_chunk_tokens(budget, align)
+
+    def chunk_alignment(self, node_name: str) -> int:
+        """What a cut chunk of a ``node_name`` row is a multiple of: the alignments its
+        resources declare (`Resource.chunk_alignment`). Set once the caches are open."""
+        align = self._chunk_alignment.get(node_name)
+        if align is None:
+            mgmt = self._submodules.get(node_name)
+            align = math.lcm(1, *(r.chunk_alignment for r in mgmt.resources.values())) if mgmt else 1
+            self._chunk_alignment[node_name] = align
+        return align
 
     def set_chunking_policies(
         self, policies: Mapping[tuple[str, str], ChunkingPolicy],
@@ -3071,7 +3148,7 @@ class Engine:
                 with stream if stream is not None else nullcontext():
                     self._order_after_pre_plans()
                     # A raise here takes what a raise from `pre_plan` below takes:
-                    # `Worker._preplan_spec` resets the pre-plan, whose reservation
+                    # `StepExecutor._preplan_spec` resets the pre-plan, whose reservation
                     # stays with its streams for exec's admit to find.
                     if ctx.resident is not None:
                         ctx.plan_phase = "res.pre_plan"
@@ -3241,7 +3318,7 @@ class Engine:
                 return False
             reloaded.append(resource)
         # Logged at the same level as the eviction in
-        # ``Worker._try_offload_cold_request`` and as a follower's replay, so
+        # ``Admission._evict`` and as a follower's replay, so
         # the two ranks' resident-set moves can be lined up side by side.
         # A reload only happens after an eviction, so this is not chatty.
         logger.info(

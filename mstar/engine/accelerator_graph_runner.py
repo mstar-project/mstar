@@ -12,12 +12,13 @@ from torch.distributed import ReduceOp
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine import with_recompile_limit
+from mstar.engine import recompile_limit, with_recompile_limit
 from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphPool,
     CapturedGraph,
 )
 from mstar.engine.accelerator_graph_config import (
+    DEFAULT_CAPTURE_BATCH_SIZES,
     DETERMINISTIC_COMPILE_MODE,
     AcceleratorGraphConfig,
     AcceleratorGraphConfigType,
@@ -25,6 +26,7 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
     PiecewiseCaptureShape,
     PiecewiseConfigType,
+    apply_token_ladders,
 )
 from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
@@ -40,14 +42,11 @@ from mstar.model.submodule_base import (
     lora_rows,
 )
 from mstar.platforms import current_platform
-from mstar.platforms.compile import with_inductor_overrides
+from mstar.platforms.compile import deterministic_inductor_options, with_inductor_overrides
 from mstar.utils import profiler
 from mstar.utils.device import DeviceCapability
 
 logger = logging.getLogger(__name__)
-
-
-DEFAULT_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
 
 # torch.compile arguments per compile level (``mstar serve -O``), for a captured
@@ -80,27 +79,6 @@ def compile_level() -> int:
         )
         return DEFAULT_COMPILE_LEVEL
     return level
-
-
-@cache
-def _has_deterministic_mode() -> bool:
-    import torch._inductor.config as inductor_config
-
-    if hasattr(inductor_config, "deterministic"):
-        return True
-    logger.warning(
-        "torch %s has no Inductor deterministic mode; compiles that ask for it time "
-        "their kernels instead, so their output can differ between server processes",
-        torch.__version__,
-    )
-    return False
-
-
-def deterministic_inductor_options() -> dict[str, Any]:
-    """Inductor options for its deterministic mode (see
-    ``DETERMINISTIC_COMPILE_MODE``), for a compile that sets its own options;
-    empty, with a warning, on a torch without the mode."""
-    return {"deterministic": True} if _has_deterministic_mode() else {}
 
 
 def compile_kwargs(config_mode: str | None) -> dict[str, Any]:
@@ -263,7 +241,7 @@ def capture_with_static_outputs(
 
 
 def fail_if_graphs_required(missing: list[str]) -> None:
-    """MSTAR_REQUIRE_CUDA_GRAPHS=1 turns a dropped bucket into a startup
+    """MSTAR_REQUIRE_ACCELERATOR_GRAPHS=1 turns a dropped bucket into a startup
     failure, for deployments that would rather not come up than serve the
     eager path at 10-20x the latency."""
     required = os.environ.get("MSTAR_REQUIRE_ACCELERATOR_GRAPHS", "0")
@@ -273,6 +251,16 @@ def fail_if_graphs_required(missing: list[str]) -> None:
         "accelerator graph capture failed for " + ", ".join(missing)
         + " and accelerator graphs are required"
     )
+
+
+def fail_if_required_regions_dropped(missing: list[str]) -> None:
+    """A ``required`` region's shapes left out of capture, which no environment
+    allows: such a region has no eager path to serve them."""
+    if missing:
+        raise RuntimeError(
+            "accelerator graph capture left out " + ", ".join(missing) + ", which their regions "
+            "require (no eager path serves them): free GPU memory, or capture fewer of their shapes"
+        )
 
 
 def _is_packed(config: AcceleratorGraphConfig) -> bool:
@@ -701,7 +689,13 @@ class AcceleratorGraphRunner:
         enable_nvtx: bool=False,
         device_capability: DeviceCapability | None = None,
         capture_stream: Any = None,
+        token_ladders: Mapping[str, Any] | None = None,
+        step_tokens: Callable[[str, int], int | None] = lambda walk, max_rows: None,
     ):
+        """``token_ladders``: the serving config's ``prefill_token_buckets``
+        for this node, applied to its packed captures under ``step_tokens``
+        ((walk, the capture's widest batch) -> the most tokens the scheduler
+        gives such a step, None for no budget; `apply_token_ladders`)."""
         self._submodule_name = submodule_name
         self._capture_stream = capture_stream
         self._submodule = submodule
@@ -713,6 +707,10 @@ class AcceleratorGraphRunner:
                 device, joint_comm_group.world_size
             )
         )
+        if token_ladders:
+            apply_token_ladders(
+                submodule_name, self._capture_configs, token_ladders, step_tokens, self._batch_sizes,
+            )
         self._resources = resources
         self._step_runner = step_runner
         self._device = device
@@ -768,7 +766,7 @@ class AcceleratorGraphRunner:
         self._compiled_forwards: dict[int, Any] = {}
 
         # Plan-overlap stream. Lazily created the first time pre_plan
-        # is called from Worker.plan_executor.
+        # is called from StepExecutor's plan thread.
         self._plan_stream: Any | None = None
 
         # Per-bucket template rows for declare-only calls; see
@@ -779,6 +777,7 @@ class AcceleratorGraphRunner:
             (max(self._batch_sizes(config)) for config in self._capture_configs),
             default=1,
         )
+        self.recompile_limit = self._recompile_limit()
 
     @property
     def any_graphs(self):
@@ -786,6 +785,19 @@ class AcceleratorGraphRunner:
 
     def _batch_sizes(self, config: AcceleratorGraphConfig) -> list[int]:
         return config.capture_batch_sizes or self.CAPTURE_BATCH_SIZES
+
+    def _recompile_limit(self) -> int | None:
+        """The dynamo recompile limit this node's compiled calls run under, None where the
+        engine's holds: ``compiled_entries_per_shape`` entries per compiled bucket the runner
+        captures (each batch size, token count and key traces apart; a LoRA node's base-only
+        twin is a key), and some for the engine's compiled forward, which shares the code
+        objects. A capture past the limit would run uncompiled inside its graph."""
+        shapes = {
+            (spec.config_idx, spec.bs, spec.num_tokens, spec.bucket.cg_key_info)
+            for spec in self._get_slot_specs() if spec.config.compile
+        }
+        need = self._submodule.compiled_entries_per_shape * len(shapes) + 16
+        return need if need > recompile_limit() else None
 
     def max_capture_bs(self, walks: Collection[str]) -> int:
         """The widest capture of any of ``walks``, 0 when none of them has one."""
@@ -903,8 +915,7 @@ class AcceleratorGraphRunner:
         for spec in self.prepare_for_capture():
             # the warm-up may hold collectives; every rank sizes these specs, in
             # config order, as it does the captures
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.instance.barrier()
             free = torch.cuda.mem_get_info(self._device)[0]
             try:
                 with self._warmed(spec, self.NUM_WARMUP) as warmed:
@@ -1009,8 +1020,7 @@ class AcceleratorGraphRunner:
                 continue
             # every rank barriers once per spec, pass or fail — a rank that
             # stopped early here would leave the others waiting
-            self._comm_group.tp_group.barrier()
-            self._comm_group.sp_group.barrier()
+            self._comm_group.instance.barrier()
 
             try:
                 slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
@@ -1280,7 +1290,7 @@ class AcceleratorGraphRunner:
             )
         return with_recompile_limit(with_inductor_overrides(
             self._compiled_forwards[spec.config_idx], spec.num_tokens,
-        ), self._submodule)
+        ), self.recompile_limit)
 
     def _dummy_engine_inputs(
         self, dummy_rids: list[int], graph_walk: str,
@@ -1775,7 +1785,9 @@ class PiecewiseAcceleratorGraphRunner:
         self._device_capability = device_capability or DeviceCapability.of(device or "cpu")
         self._graph_backend = self._device_capability.graph_backend
         self._autocast_dtype = autocast_dtype
-        self._comm_group = joint_comm_group or JointGroups(CommGroup.trivial(), CommGroup.trivial())
+        self._comm_group = joint_comm_group or JointGroups(
+            CommGroup.trivial(), CommGroup.trivial(), instance=CommGroup.trivial(),
+        )
         # scopes buffer allocation; `label` carries it but mangled with the region
         self._node_name = node_name
         self._prepared_shapes: list | None = None
@@ -1827,6 +1839,10 @@ class PiecewiseAcceleratorGraphRunner:
 
     def set_slot(self, slot: int):
         self._current_slot = slot % self._num_slots
+
+    @property
+    def required(self) -> bool:
+        return self._config.required
 
     @property
     def any_graphs(self) -> bool:
@@ -1900,8 +1916,7 @@ class PiecewiseAcceleratorGraphRunner:
         captured: list[CaptureCost] = []
         for shape in shapes:
             for slot in range(self._num_slots):
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
+                self._comm_group.instance.barrier()
                 free = torch.cuda.mem_get_info(self._device)[0]
                 try:
                     with self._warmed(shape, slot, self.NUM_WARMUP) as warmed:
@@ -2018,8 +2033,7 @@ class PiecewiseAcceleratorGraphRunner:
                 # rank still in pre-capture setup would mismatch one already in the
                 # warmup forward. Every rank walks all the slots even after a
                 # failure here, or the barrier counts diverge and they hang.
-                self._comm_group.tp_group.barrier()
-                self._comm_group.sp_group.barrier()
+                self._comm_group.instance.barrier()
                 try:
                     self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
                 except Exception:

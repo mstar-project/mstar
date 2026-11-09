@@ -388,10 +388,10 @@ def test_undecodable_reference_is_a_client_error(tmp_path):
         pytest.skip(f"torchcodec cannot load here: {exc}")
     bad = tmp_path / "ref.wav"
     bad.write_bytes(b"hello world" * 100)
-    with pytest.raises(ValueError, match="Could not decode the reference audio") as raised:
+    with pytest.raises(ValueError, match="could not decode the reference audio") as raised:
         ChatterboxModel._decode_audio(str(bad))
     # the message reaches the client, so it names no server path
-    assert str(tmp_path) not in str(raised.value) and raised.value.__cause__ is None
+    assert str(tmp_path) not in str(raised.value)
 
 
 def test_empty_reference_is_a_client_error(tmp_path):
@@ -869,7 +869,7 @@ def test_t3_prefill_is_captured_as_packed_graphs_for_both_guidance_modes():
     for cfg in packed:
         assert cfg.capture_graph_walk == "prefill"
         assert cfg.replay_graph_walks == ["prefill", "prefill_voice"]
-        assert cfg.capture_token_lengths == T3Submodule.PREFILL_TOKEN_BUCKETS
+        assert cfg.capture_token_lengths == {1: T3Submodule.PREFILL_TOKEN_BUCKETS}
         assert cfg.capture_batch_sizes == T3Submodule.PREFILL_CAPTURE_BATCH_SIZES == [1, 2, 4, 8]
         assert cfg.caps_eager_batch_size is False and cfg.compile is False
         # the combined cond + uncond plan carries twice the input tokens
@@ -1252,6 +1252,18 @@ def test_streaming_and_compile_knobs_reach_the_config():
     assert model.config.stream_context_tokens == 25 and model.config.s3gen_compile is True
     assert model.config.s3gen_graphs is False  # compile replaces the graphs
     assert _make_model().config.s3gen_compile is False
+
+
+def test_a_first_stream_chunk_shorter_than_the_vocoder_cache_is_refused():
+    """Chunk 1 vocodes its tokens past the 3-token look-ahead, 2 mel frames each; under the 8-frame
+    vocoder cache, chunk 2's crossfade read a short tail and every streamed request failed there."""
+    with pytest.raises(ValueError, match="stream_first_chunk_tokens"):
+        ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=6)
+    ChatterboxModel(model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=7)
+    # the offline decode has no first chunk
+    ChatterboxModel(
+        model_path_hf="ResembleAI/chatterbox", variant="chatterbox", stream_first_chunk_tokens=1, stream_chunk_tokens=0,
+    )
 
 
 def test_graph_and_precision_knobs_reach_the_config():

@@ -16,6 +16,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnSpec,
     LinearAttnVariant,
 )
+from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.spec import NodeResourceSpec
@@ -69,16 +70,18 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         "vocab.json",
         "tokenizer.json",
         "merges.txt",
+        # the tokenizer prefers it to tokenizer_config.json's template, and
+        # some fine-tunes (LightOnOCR-3, Surya) keep their template nowhere else
+        "chat_template.jinja",
     )
 
     def __init__(
         self,
         model_path_hf: str,
         cache_dir: str | None = None,
-        prefill_token_buckets: list[int] | None = None,
         **kwargs: Any,
     ):
-        super().__init__(model_path_hf, cache_dir, prefill_token_buckets)
+        super().__init__(model_path_hf, cache_dir)
         self.config = Qwen3_5Config.from_hf(self.local_dir)
         # None on a text-only checkpoint (`_create_submodule` then refuses a
         # vision_encoder node)
@@ -179,6 +182,12 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
             *self._vision_resources(),
         ]
 
+    def get_lora_specs(self) -> list[LoraSpec]:
+        """The LLM's, then the vision encoder's when the checkpoint has a vision tower."""
+        from mstar.model.qwen3_5.lora import qwen3_5_lora_specs
+
+        return qwen3_5_lora_specs(self.config, self.vision_config)
+
     def _vision_resources(self) -> list[NodeResourceSpec]:
         """The ViT tower's attention, its only resource; none when text-only."""
         if self.vision_config is None:
@@ -202,8 +211,6 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
                     max_segments_per_step=(
                         VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
                     ),
-                    # the tower's compiled block loop keeps attention in its graph
-                    compile_op=True,
                 ),
             ),
         ]
@@ -390,6 +397,8 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         out = self.image_processor(
             images=[as_uint8_chw(image, truncate=True).permute(1, 2, 0).numpy()], return_tensors="pt",
             do_rescale=False, do_normalize=False,
+            # inferred, a 1, 3 or 4 px tall image would be read as channels first
+            input_data_format="channels_last",
         )
         grid = out["image_grid_thw"][0]
         return PreparedMedia({"pixel_values": out["pixel_values"]}, [int(grid.prod()) // merge ** 2], [grid])
@@ -459,7 +468,4 @@ class Qwen3_5DenseModel(MultimodalDecoderModel):
         load_qwen3_5_weights(model, weights_dir, device=device)
         model.requires_grad_(False).eval()
         logger.info("Loaded Qwen3.5 LLM submodule onto %s", device)
-        return LLMSubmodule(
-            model, self.config, self.vision_config, self.encoders,
-            prefill_token_buckets=self.prefill_token_buckets,
-        )
+        return LLMSubmodule(model, self.config, self.vision_config, self.encoders)

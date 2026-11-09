@@ -259,7 +259,8 @@ class _Processor:
         return turns + "<|im_start|>assistant\n"
 
     @staticmethod
-    def image_processor(images, return_tensors):
+    def image_processor(images, return_tensors, input_data_format):
+        assert input_data_format == "channels_last"
         height, width, _ = images[0].shape
         return {"pixel_values": torch.zeros(1), "image_grid_thw": torch.tensor([[1, height // 16, width // 16]])}
 

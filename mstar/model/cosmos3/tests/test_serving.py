@@ -84,6 +84,10 @@ def test_gen_params_and_step_metadata() -> None:
     p = model._resolve_gen_params({"size": "480x256"}, ["text"], ["image"])
     assert (p["width"], p["height"]) == (480, 256)
     assert p["num_frames"] == 1 and p["has_image_condition"] is False
+    # under one latent pixel (16 px) a side had no latent and failed mid-pipeline
+    for size in ({"width": 4}, {"size": "480x8"}):
+        with pytest.raises(ValueError, match="at least 16"):
+            model._resolve_gen_params(size, ["text"], ["image"])
 
     # The denoise loop stops per-request (check_stop), so a per-request
     # num_inference_steps is honored, clamped to [1, max_inference_steps];
@@ -122,6 +126,13 @@ def test_gen_params_and_step_metadata() -> None:
     assert sm["is_prefill"] is True
     assert sm["height"] == 256 and sm["width"] == 256
     assert sm["num_inference_steps"] == 7
+
+
+@pytest.mark.parametrize("fps", [0, -24, float("nan"), float("inf")])
+def test_gen_params_reject_a_bad_fps(fps) -> None:
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="fps must be positive"):
+        model._resolve_gen_params({"fps": fps}, ["text"], ["video"])
 
 
 def test_dynamic_loop_check_stop_and_wasted_step() -> None:

@@ -26,14 +26,23 @@ form_urlencoded = "1"
 uuid = { version = "1", features = ["v4"] }
 serde_bytes = "0.11"
 tower-http = { version = "0.5", features = ["cors"] }
-ureq = { version = "2", default-features = false, features = ["tls"] }
+# dlopen of the libsndfile soundfile ships (src/sndfile.rs); already in the tree through tokio.
+libc = "0.2"
+# Names the limit error of a bounded body read; already in the tree through axum.
+http-body-util = "0.1"
+# Rewrites MSTAR_ROOT_PATH before routing; already in the tree through axum.
+tower = { version = "0.5", features = ["util"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+webpki-roots = "0.26"
+url = "2"
 # Constant-time API key compare; already in the tree through rustls.
 subtle = "2"
-# `\p{M}` and the printable classes for the Python-rule text code; already in the tree through tokenizers.
+# The printable classes for Python's `repr` of a str; already in the tree through tokenizers.
 regex = "1"
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+# a paused clock for the upload-cleanup test; the same tokio
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3

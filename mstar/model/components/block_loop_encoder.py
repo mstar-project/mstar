@@ -31,9 +31,10 @@ replay in its own `forward_batched`.
 
 A replay's attention plan holds at most the resource's
 ``max_segments_per_step`` segments under each label. A batch that would
-overflow it or the top patch bucket runs its requests one at a time instead,
-each replaying if it fits alone; a request too large alone runs the block
-loop eagerly, however few its patches.
+overflow it or the top patch bucket (of the ladder the region was captured
+on, the serving config's ``prefill_token_buckets`` where it names the region)
+runs its requests one at a time instead, each replaying if it fits alone; a
+request too large alone runs the block loop eagerly, however few its patches.
 """
 
 from collections.abc import Mapping, Sequence
@@ -76,6 +77,9 @@ class PackedBlockLoopEncoder(NodeSubmodule):
     # The dtype of what ``embed`` hands the block loop under the node's
     # autocast, which the replay's input buffers hold. None: autocast's.
     BLOCK_LOOP_DTYPE: torch.dtype | None = None
+    # The block loop's region once declared, whose ``total_tokens`` the engine
+    # sets to the serving config's ladder before it captures; None until then.
+    _block_loop: PiecewisePackedConfig | None = None
 
     def __init__(self, model: torch.nn.Module, config: Any, output: str):
         super().__init__()
@@ -90,10 +94,11 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         return media_grids(fwd_info.step_metadata.get(MEDIA_LAYOUT) or {}, self.output)
 
     def _declare(
-        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]],
+        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
     ) -> SubmoduleStep:
         """The node's step: each row's spans under each label, all
-        non-causal on the one vision attention resource."""
+        non-causal on the one vision attention resource (none when not
+        ``attention``)."""
         return SubmoduleStep(
             segments=[
                 Segment(request_id=rid, label=label, span=span)
@@ -101,7 +106,7 @@ class PackedBlockLoopEncoder(NodeSubmodule):
                 for label in self.SEGMENT_LABELS
                 for span in lengths[label]
             ],
-            steps={VISION_ATTN: AttentionStep(causal=False)},
+            steps={VISION_ATTN: AttentionStep(causal=False)} if attention else {},
         )
 
     def declare_step(
@@ -113,12 +118,19 @@ class PackedBlockLoopEncoder(NodeSubmodule):
         **kwargs,
     ) -> SubmoduleStep | None:
         # Leased, the captured block loop declares, plans and commits the
-        # attention per replay, and that is the node's whole step.
-        if (piecewise_leases or {}).get(VISION_BLOCK_LOOP):
+        # attention per replay, and that is the node's whole step, unless the
+        # node serves LoRA: no row of a leased step runs an adapter (the
+        # base-only loop refuses them in `can_lease`), but the bound modules
+        # outside the loop (patch embed, projection) still need a planned step
+        # to run base-only against, so the spans are declared for the engine
+        # to add their LoRA rows (`lora_rows`).
+        leased = bool((piecewise_leases or {}).get(VISION_BLOCK_LOOP))
+        if leased and not self.lora_keys:
             return None
-        return self._declare([
-            (rid, inp.resource_step_info) for rid, inp in zip(request_ids, inputs, strict=True)
-        ])
+        return self._declare(
+            [(rid, inp.resource_step_info) for rid, inp in zip(request_ids, inputs, strict=True)],
+            attention=not leased,
+        )
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         # packed, the requests must fit one replay together. Applied with the
@@ -157,18 +169,17 @@ class PackedBlockLoopEncoder(NodeSubmodule):
                 (rid, label_seq_lens or {label: seq_lens for label in self.SEGMENT_LABELS}),
             ])
 
-        return {
-            VISION_BLOCK_LOOP: PiecewisePackedConfig(
-                capture_fn=self._capture_block_loop,
-                make_static_inputs=make_static_inputs,
-                declare_step=declare_step,
-                lease_before_step=True,
-                one_row_per_step=True,
-                can_lease=self._fits_capture,
-                total_tokens=self.BLOCK_LOOP_PATCH_BUCKETS,
-                capture_batch_sizes=[1],
-            )
-        }
+        self._block_loop = PiecewisePackedConfig(
+            capture_fn=self._capture_block_loop,
+            make_static_inputs=make_static_inputs,
+            declare_step=declare_step,
+            lease_before_step=True,
+            one_row_per_step=True,
+            can_lease=self._fits_capture,
+            total_tokens=self.BLOCK_LOOP_PATCH_BUCKETS,
+            capture_batch_sizes=[1],
+        )
+        return {VISION_BLOCK_LOOP: self._block_loop}
 
     def _fits_capture(self, inputs: list[NodeInputs]) -> bool:
         """Whether the batch fits one replay (`_fits_replay`), under every
@@ -180,11 +191,13 @@ class PackedBlockLoopEncoder(NodeSubmodule):
 
     def _fits_replay(self, patches: int, segments: int) -> bool:
         """Whether a step of this many patches and attention segments fits one
-        replay: the top patch bucket, and the attention plan's per-step
-        segment ceiling, read from the resource so a YAML override holds."""
+        replay: the top patch bucket of the ladder the region takes, and the
+        attention plan's per-step segment ceiling, read from the resource so a
+        YAML override holds."""
+        buckets = self.BLOCK_LOOP_PATCH_BUCKETS if self._block_loop is None else self._block_loop.total_tokens
         # the whole step replays as one row (`one_row_per_step`)
         return (
-            patches <= self.BLOCK_LOOP_PATCH_BUCKETS[-1]
+            patches <= max(buckets)
             and segments <= self.node_resources[VISION_ATTN].max_segments_per_step
         )
 

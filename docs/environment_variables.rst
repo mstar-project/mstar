@@ -180,7 +180,8 @@ Communication
        Workers on CUDA set ``0`` unless you set it.
    * - ``GLOO_SOCKET_IFNAME``
      - ``lo``
-     - PyTorch's variable for the Gloo groups next to each TP/SP group.
+     - PyTorch's variable for the Gloo groups next to each parallel group
+       and for each lockstep instance.
        Same rule: the conductor sets ``lo`` for its workers unless you set
        it, so Gloo does not listen on the address the hostname resolves to.
 
@@ -212,13 +213,9 @@ model, so they are named for it.
        BAGEL defaults this option to true (see :doc:`models`).
        Off by default: capture costs one graph per (batch size, token bucket)
        and the eager flash-attn path is already fast. The win is removing
-       per-layer launch overhead on small images.
-   * - ``MSTAR_VIT_ACCELERATOR_GRAPH_TOKEN_BUCKETS``
-     - ``512,1024,2048,4096,4900``
-     - Comma-separated token-count buckets to capture, when
-       ``MSTAR_VIT_ACCELERATOR_GRAPH=1``. A batch longer than the largest bucket runs
-       eagerly. ``4900`` is ``70*70``, the exact length the ``vllm``
-       preprocess option emits.
+       per-layer launch overhead on small images. The serving config's
+       ``prefill_token_buckets: {vit_encoder: {vit_block_loop: [...]}}`` sets
+       the token buckets (see :doc:`serving`).
    * - ``MSTAR_VIT_ACCELERATOR_GRAPH_BATCH_SIZES``
      - ``1,2,4``
      - Comma-separated batch sizes to capture. Read only when
@@ -281,14 +278,19 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        ``Content-Length`` is answered before it is read, so a client that
        writes the whole body before reading the reply can see a connection
        reset instead of the 413; one that sends ``Expect: 100-continue``
-       gets the 413 before it sends the body.
+       gets the 413 before it sends the body. It also caps one
+       message on every WebSocket route unless the config sets
+       ``ws_max_message_mb``; a larger one closes the socket (1009).
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
        deployment at a prefix and does not strip that prefix before the
        request reaches the pod (Run:AI serves a workload at
-       ``/<project>/<job-name>/``, for instance); without it FastAPI 404s
-       every route. Empty by default, so a direct deployment is unaffected.
+       ``/<project>/<job-name>/``, for instance); without it every route
+       404s. A path under the prefix is routed without it, and any other path
+       as sent, on both frontends (Starlette's ``root_path``; ``route_path``
+       in ``rust/server/src/main.rs``). Empty by default, so a direct
+       deployment is unaffected.
    * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
      - ``10``
      - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
@@ -352,17 +354,61 @@ Read by the ``mstar-server`` binary and its bridge
        sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
-     - Per-request budget in the Rust frontend; on expiry the client gets
-       an error and the request is aborted in the backend.
+     - Per-request budget in the Rust frontend, in seconds; on expiry the
+       client gets an error and the request is aborted in the backend. ``0``
+       times every request out; a negative, non-finite or unreadable value is
+       the default. ``mstar serve --rust-frontend`` sets it from ``--timeout``
+       (``launch_rust_server``).
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``
-     - Sample rate stamped on ``/v1/audio/speech`` WAV output.
+     - Sample rate stamped on the Rust frontend's WAV output.
+       ``mstar serve --rust-frontend`` sets it to the model's
+       ``get_output_sample_rate("audio")``, as the Python frontend reads it.
+   * - ``MSTAR_LIBSNDFILE``
+     - unset
+     - The libsndfile the Rust frontend opens at startup to encode ``mp3``,
+       ``flac`` and ``opus`` speech (``rust/server/src/sndfile.rs``), called as
+       ``soundfile.write`` calls it, so the files are the Python frontend's
+       byte for byte (an Ogg stream's random serial aside). Unset, only ``wav``
+       and ``pcm`` are produced, as on the Python frontend without
+       ``soundfile``. ``launch_rust_server`` sets it to the library
+       ``soundfile`` loaded (``soundfile_library``) and drops an inherited
+       value; it is opened at run time, never linked, as its LAME encoder is
+       LGPL.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
-     - Allow ``http(s)`` media URLs in requests (fetched server-side,
-       30 s timeout). Off by default.
+     - Allow ``http(s)`` media URLs in requests, fetched server-side by both
+       frontends (``media_io.save_remote_url`` and ``save_remote_url`` in
+       ``rust/server/src/media.rs``). Off by default. A fetch follows at
+       most 3 redirects and takes at most 30 s; proxy variables are not
+       used, so the connection goes to the address that was checked. A host
+       that resolves to a loopback, private, link-local, multicast or
+       reserved address (cloud metadata included) is refused unless
+       allowlisted; an IPv6 address that carries an IPv4 one (IPv4-mapped,
+       NAT64 ``64:ff9b::/96``, 6to4 ``2002::/16``, IPv4-compatible) is
+       judged by that IPv4 address. Failures return a 400 with a short
+       message; the details are only logged. HTTPS certificates are checked
+       against the system trust store on the Python frontend and against
+       the bundled Mozilla roots (``webpki-roots``) on the Rust frontend,
+       so a private CA added to the system store is trusted by Python only.
+   * - ``MSTAR_REMOTE_ALLOWED_HOSTS``
+     - unset
+     - Comma-separated hosts and ``*.suffix`` patterns (``*.example.com``
+       matches its subdomains, not ``example.com``). When set, only these
+       hosts are fetched, on every redirect hop; listed hosts skip the
+       address check. An entry matches only a host the URL spells in
+       canonical form (an ASCII name, dotted-decimal IPv4, compressed IPv6
+       such as ``[::1]``); other spellings of an address (``2130706433``,
+       ``0x7f000001``, ``127.1``, ``[0:0:0:0:0:0:0:1]``) never match. Read
+       by the same two functions; the Rust frontend reads it once at
+       startup.
+   * - ``MSTAR_REMOTE_MAX_BYTES``
+     - ``67108864``
+     - Largest remote media file fetched (64 MiB), checked against
+       ``Content-Length`` and while streaming. Read like
+       ``MSTAR_REMOTE_ALLOWED_HOSTS``.
    * - ``MSTAR_MAX_CONCURRENT_REQUESTS``
-     - ``256``
+     - ``512``
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
        ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.
@@ -381,7 +427,7 @@ Read by the ``mstar-server`` binary and its bridge
      - The class name of the model's adapter in ``ADAPTER_REGISTRY``
        (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
        picks the OpenAI translation ``mstar-server`` uses
-       (``Adapter::from_python``). ``mstar-serve --rust-frontend`` always sets it;
+       (``adapters::from_python``, which looks it up in ``ADAPTERS``). ``mstar-serve --rust-frontend`` always sets it;
        a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
@@ -397,16 +443,9 @@ The Rust frontend serves no ``/generate/ws``, so a model's live client input
 (appends to a running request, see :doc:`clients`) needs the Python frontend;
 over ``/generate`` such a model's input ends when the request is submitted.
 
-It also carries no audio encoder or media muxer (the Python frontend
-uses ``soundfile`` / ``ffmpeg``), so two surfaces degrade:
+It also carries no media muxer (the Python frontend uses ``ffmpeg``), so one
+surface degrades:
 
-* ``/v1/audio/speech`` produces only ``wav`` and ``pcm``. Any other
-  ``response_format`` (``mp3``, ``opus``, ``flac``, …) is rejected with a 400
-  rather than silently returned as WAV. Run the Python frontend for compressed
-  containers.
-* ``/v1/audio/speech`` refuses ``ref_audio`` (Qwen3-TTS voice cloning) with a
-  400: the Python frontend decodes the clip and checks its length before
-  submitting it, and the Rust frontend has no decoder to do that with.
 * ``/v1/videos/generations`` (Cosmos3) returns the **video-only** mp4. When a
   request sets ``generate_sound``, Cosmos3 generates a separate audio track that
   mstar muxes into the mp4 as an AAC track; the Rust frontend cannot mux it, so
@@ -438,7 +477,8 @@ so attaching more files does not multiply them.
        header before decoding; over it, the request gets a 400. PNG, JPEG,
        WebP and GIF are read (FLUX.2 klein, which decodes with Pillow, also
        reads BMP and TIFF); other formats get a 400. A GIF or an animated
-       WebP is read as its first frame.
+       WebP is read as its first frame. Images are turned upright by their
+       EXIF orientation; a malformed EXIF block leaves one as stored.
    * - ``MSTAR_MAX_VIDEO_PIXELS``
      - ``1073741824``
      - Pixels a request's videos may decode to (see
@@ -477,7 +517,7 @@ Worker scheduling
      - Meaning
    * - ``MSTAR_TP_ASYNC_SCHED``
      - config's ``tp_async_sched``, else ``1``
-     - Async scheduling for lockstep-parallel (TP / SP) nodes; overrides the
+     - Async scheduling for lockstep-parallel (TP / SP / CFG) nodes; overrides the
        deployment config's ``tp_async_sched``. ``1`` (or ``true``): the
        instance leader speculates step N+1 of the parallel node during
        forward N (the existing single-worker speculation machinery, gate
@@ -502,6 +542,12 @@ Worker scheduling
        thread, which Whisper turbo's serve config sets: its 4-layer steps
        are too short to hide the planning in. Read by
        ``knobs.pre_plan_enabled``.
+   * - ``MSTAR_STEP_THREADS``
+     - config's ``knobs: step_threads``, else ``threaded``
+     - Where a worker runs a step's host work. ``threaded`` runs admit, plan and
+       the forward's launch on its GPU thread, and the pre-plan on its plan
+       thread. ``serial`` runs them on the main thread, so host work overlaps the
+       GPU but not other host work. Read by ``knobs.step_threads``.
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``auto``
      - Pin each worker's main, GPU and plan threads, and the API server's
@@ -684,18 +730,6 @@ Worker scheduling
        ``max_seq_len`` (the model's context, or ``resources: <kv>: max_seq_len``;
        not the config's top-level key), at most the pool's pages, plus a few, 8
        bytes each. Read by ``knobs.resident_planning``.
-   * - ``MSTAR_KV_PLAN_CACHE``
-     - config's ``knobs: kv_plan_cache``, else ``0``
-     - The KV manager plans a captured decode step off the previous step's
-       plan when the batch is the same rows in the same order and nothing
-       but that step's commit touched the streams: every length is one
-       more, pages change only where a row crossed a page boundary, and the
-       five FlashInfer index arrays come from numpy instead of a per-row
-       Python pass. The first version measured a loss at c64/c128 on 0.8B
-       (batches change every step or two there, and a hit still rebuilt the
-       views); the reworked path keeps the views lazy and is off by default
-       until measured. ``0`` plans every step from the streams. ``2`` runs
-       both and logs a difference, for checking a run.
    * - ``MSTAR_DEVICE_LOOPBACK``
      - config's ``knobs: device_loopback``, else ``1``
      - Whether a decode node may keep its loop-back token on the device:

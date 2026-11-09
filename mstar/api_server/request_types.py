@@ -10,6 +10,7 @@ from mstar.profile.format import InputInfo, RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 
 if TYPE_CHECKING:
+    import numpy as np
     import torch
 
 
@@ -92,11 +93,25 @@ class ConductorStatus:
     metrics: list[MetricSnapshot]
 
 
+@dataclass
+class LoraAdapterResult:
+    """The conductor's answer to a LoRA adapter load or unload, once every worker hosting
+    the pool has acknowledged it: ``error_message`` is None on success, else ``status``
+    is the HTTP status the API server answers with."""
+    op_id: str
+    error_message: str | None = None
+    status: int = 200
+    # whether the conductor serves the name once the operation is over, so the API
+    # server's selection follows it whatever the outcome; None when it has no LoRA
+    served: bool | None = None
+
+
 # what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder
 # tries branches in order and takes the first whose required fields are all
 # present, so a body must lack a required field of every branch before it.
 APIServerMessageBody = (
-    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus | None
+    ResultTensors | ResultTokens | RequestComplete | RequestFailed | ConductorStatus
+    | LoraAdapterResult | None
 )
 
 
@@ -104,7 +119,7 @@ APIServerMessageBody = (
 class APIServerMessage:
     """Envelope for messages received by the API server."""
     # "result_tensors" | "result_tokens" | "request_complete" | "request_failed"
-    # | "conductor_status" | "setup_done"
+    # | "conductor_status" | "lora_adapter_result" | "setup_done"
     message_type: str
     body: APIServerMessageBody = None
 
@@ -166,6 +181,9 @@ class ClientAppend:
     file_streams: dict[str, list[str | None]] | None = None
     # this append's own model_kwargs; the opening's stay the request's
     model_kwargs: dict | None = None
+    # per ClientAudio stream, decoded mono float32 samples at its declared
+    # rate: a route that decodes the client's codec itself appends without a file
+    samples: "dict[str, np.ndarray] | None" = None
     # Answers the append as late, with an error naming why; called from the
     # preprocess thread when the model routes items to a stream that has
     # ended (by the client, or with its consuming partition). None: nobody

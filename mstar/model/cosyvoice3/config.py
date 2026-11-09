@@ -34,6 +34,19 @@ LM_ATTN = "lm_attn"
 LM_POS = "lm_pos"
 LM_LABEL = "main"
 
+# Resource keys (vocoder node)
+HIFT_STATE = "hift_state"
+HIFT_STATE_LABEL = "main"
+# Resource keys (flow node): what a request's streamed solves keep between hops
+FLOW_KV = "flow_kv"
+FLOW_ATTN = "flow_attn"
+FLOW_TAILS = "flow_tails"
+FLOW_COND_LABEL = "cond"
+FLOW_UNCOND_LABEL = "uncond"
+FLOW_CFG_LABEL = "cfg"
+FLOW_TAILS_LABEL = "main"
+FLOW_KV_PAGE_FRAMES = 64
+
 # Node names
 SPEAKER_ENCODER_NODE = "speaker_encoder"
 LM_NODE = "llm"
@@ -162,6 +175,12 @@ class CausalHiFTConfig(S3GenHiFTConfig):
     noise_seconds: float = 300.0
 
     @property
+    def f0_left_history(self) -> int:
+        """Frames the F0 predictor reads before the first it predicts: its four causal
+        convolutions of kernel 3."""
+        return 8
+
+    @property
     def stream_holdback_frames(self) -> int:
         """Mel frames at the end of a non-final call whose audio is not final yet:
         the F0 predictor's and the pre-convolution's look-ahead, plus the frame
@@ -196,7 +215,8 @@ class CosyVoice3Config:
     max_text_tokens: int = 512  # prompt text + text
     max_reference_seconds: float = 30.0  # the tokenizer's single-pass limit
     max_speech_tokens: int = 2048  # ~82 s of audio per request
-    voice_cache_size: int = 64
+    # about 100 KB a voice on the GPU; a miss stalls the flow node about 30 ms
+    voice_cache_size: int = 1024
     max_new_tokens_limit: int | None = None
 
     # Streaming. The flow decoder re-runs over the prompt and every settled
@@ -218,6 +238,9 @@ class CosyVoice3Config:
     # Flow estimator precision ("bfloat16", "float32", "float16"); the Euler
     # state stays float32. "float32" is the reference's precision.
     flow_estimator_dtype: str = "bfloat16"
+    # Batch sizes of the captured LM prefills (`LM_PREFILL_TOKEN_BUCKETS` in
+    # submodules.py has their token ladder); () captures no prefill.
+    lm_prefill_batch_sizes: tuple[int, ...] = (1, 2, 4, 8)
     flow_max_batch_size: int = 8
     hift_max_batch_size: int = 8
     # Flow solves replayed as CUDA graphs, captured at startup for the default
@@ -232,3 +255,31 @@ class CosyVoice3Config:
     )
     flow_capture_batch_sizes: tuple[int, ...] = (1, 2, 3, 4, 6, 8)
     flow_capture_batch_frames: int = 8192
+    # Streaming vocoder steps replayed as CUDA graphs: one per frame bucket (a window's
+    # frames) and batch size, a stream's tail and phase in ``HIFT_STATE``. A longer chunk
+    # runs as several steps. No buckets, or a whole-history vocoder
+    # (``hift_context_frames = 0``), runs ``stream_vocode`` eagerly instead.
+    hift_capture_frame_buckets: tuple[int, ...] = (128, 192, 256, 320, 400)
+    hift_capture_batch_sizes: tuple[int, ...] = (1, 2, 4, 8)
+    # A streamed row keeps its solved frames' K/V per Euler step and CFG branch
+    # (about 1.8 MB a frame) and solves only new frames each hop, which attention's
+    # block-causal mask makes exact. Past this many frames a row goes back to
+    # re-solving all of them, which keeps the pool's size bounded. 0 re-solves every hop.
+    flow_cache_frames: int = 768
+    # Captured incremental solves: one per total new frames of a batch and batch size.
+    # The largest must hold a row's whole budget.
+    flow_new_frame_buckets: tuple[int, ...] = (
+        64, 128, 192, 256, 320, 384, 448, 512, 576, 640, 704, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 2048, 2304,
+        2560, 3200,
+    )
+    flow_new_batch_sizes: tuple[int, ...] = (1, 2, 4, 8)
+
+    @property
+    def hift_captured(self) -> bool:
+        return self.hift_context_frames > 0 and bool(self.hift_capture_frame_buckets)
+
+    @property
+    def hift_tail_frames(self) -> int:
+        """Frames a stream keeps: a window's context and F0 history, and the frames
+        still held back from emitting."""
+        return self.hift_context_frames + self.hift.f0_left_history + self.hift.stream_holdback_frames

@@ -74,6 +74,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "nemotron_duplex": "nemotron_duplex.yaml",
     "flux2_klein": "flux2_klein.yaml",
     "ltx2_5": "ltx2_5.yaml",
+    "minimax_h3": "minimax_h3.yaml",
     # bf16 fits one 141 GB GPU; muse_glimmer_tp2.yaml for two 80 GB ones
     "muse_glimmer": "muse_glimmer.yaml",
     "flux2_klein_9b": "flux2_klein_9b.yaml",
@@ -160,12 +161,16 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
     if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
+    if model in ("flux2_klein", "flux2_klein_9b"):  # Z-Image is text-to-image only
         lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
-        lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
     if model == "ltx2_5":
         lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
         lines.append("                          output_modalities=(\"video\", \"audio\"),")
         lines.append("                          height=544, width=960, num_frames=121)")
+    if model == "minimax_h3":
+        lines.append("    res = client.generate(text=\"a dog barking on a beach at sunset\",")
+        lines.append("                          output_modalities=(\"video\", \"audio\"),")
+        lines.append("                          height=768, width=1344, num_frames=124)")
     if model == "cosmos3_droid":
         lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
         lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
@@ -213,7 +218,8 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
-                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "muse_glimmer"):
+                 "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "minimax_h3",
+                 "muse_glimmer"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
@@ -235,6 +241,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         if model == "ltx2_5":
             lines.append("    oai.post(\"/videos/generations\", cast_to=dict, body={\"model\": \"ltx2_5\",")
             lines.append("             \"prompt\": \"a dog barking on a beach\", \"size\": \"960x544\"})")
+        if model == "minimax_h3":
+            lines.append("    oai.post(\"/videos/generations\", cast_to=dict, body={\"model\": \"minimax_h3\",")
+            lines.append("             \"prompt\": \"a dog barking on a beach\", \"size\": \"1344x768\"})")
     if model.startswith("omnilingual_asr_ctc_"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",

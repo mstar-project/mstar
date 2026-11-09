@@ -2,20 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 
 from mstar.api_server import media_io
-from mstar.api_server.openai._util import now, rid
-from mstar.api_server.streaming_response import ReleasingStreamingResponse
+from mstar.api_server.openai._util import check_inline_result, now, rid
+from mstar.api_server.streaming_response import ReleasingStreamingResponse, errors_in_band
 
 logger = logging.getLogger(__name__)
 
 
 async def create_videos(api, model_name, adapter, req, raw_request=None):  # noqa: ARG001
     """The response dict, or for ``stream_video`` the NDJSON response itself."""
-    args = adapter.video_to_request(req, api.upload_dir)
+    check_inline_result(req.response_format, req.n)
+    # off the loop: a conditioning image or video may be decoded, written or fetched
+    args = await asyncio.to_thread(adapter.video_to_request, req, api.upload_dir)
     request_id = rid("vid")
 
     stream = bool(args.model_kwargs.get("stream_video"))
@@ -58,7 +61,9 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
         if i < len(audios):
             audio = audios[i]
             try:
-                video = media_io.mux_mp4_with_pcm16(
+                # ffprobe + ffmpeg, up to minutes: off the event loop
+                video = await asyncio.to_thread(
+                    media_io.mux_mp4_with_pcm16,
                     video,
                     audio.data,
                     sample_rate=int((audio.metadata or {}).get("sample_rate", 48000)),
@@ -73,7 +78,7 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):  # noq
 
 def _stream_ndjson(api, request_id):
     # Bound to the submission now: the body is iterated later, by Starlette.
-    return _ndjson_lines(api.iter_result_chunks(request_id))
+    return _ndjson_lines(errors_in_band(request_id, api.iter_result_chunks(request_id)))
 
 
 async def _ndjson_lines(chunks):

@@ -90,7 +90,8 @@ def test_a_crafted_header_rate_is_refused_before_resampling(tmp_path, video_only
 def test_other_containers_still_go_to_torchcodec(tmp_path, video_only_ffmpeg):
     path = tmp_path / "clip.m4a"
     path.write_bytes(b"\x00\x00\x00\x18ftypM4A " + b"\x00" * 64)
-    with pytest.raises(RuntimeError, match="Invalid data"):
+    # an FFmpeg that loads and can't read the file: the client's error
+    with pytest.raises(ValueError, match="could not decode"):
         Model.load_audio(None, str(path), "cpu")
     assert video_only_ffmpeg.calls == [str(path)]
 
