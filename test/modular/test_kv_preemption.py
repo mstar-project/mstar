@@ -1132,7 +1132,7 @@ def _rebuilt(kv) -> None:
     assert _step(kv, "o", 4 * PAGE_SIZE).ok
     assert _preempt(kv, "o", _short(kv, "o"), droppable=lambda rid: True).to_drop == ["v"]
     _drop(kv, "v")
-    _request(kv, "a", 2, arrival=1)
+    _request(kv, "a", 4, arrival=1)
     _remove(kv, "o")
     assert _ready(kv, "a") and _admitted(kv, "v")
     assert _step(kv, "v", 2 * PAGE_SIZE).ok
