@@ -14,6 +14,7 @@ mstar.api\_server.openai.serving\_speech
    .. autosummary::
    
       create_speech
+      describe_rejected
       list_voices
    
    

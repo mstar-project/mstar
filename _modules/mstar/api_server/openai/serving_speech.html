@@ -1008,6 +1008,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">default). Streaming returns one open-ended response as the audio is produced:</span>
 <span class="sd">a WAV header followed by PCM16 frames, or, with ``response_format="pcm"``,</span>
 <span class="sd">the bare PCM16 frames that the OpenAI TTS clients (LiveKit, Pipecat) expect.</span>
+<span class="sd">A request streams when it sets ``stream`` or OpenAI's ``stream_format``, which</span>
+<span class="sd">is what the OpenAI SDK sends: ``"audio"`` streams the bytes as above, ``"sse"``</span>
+<span class="sd">wraps them in ``speech.audio.delta`` events closed by ``speech.audio.done``.</span>
 <span class="sd">``/v1/audio/voices`` lists the ``voice`` values the served model accepts.</span>
 
 <span class="sd">Long inputs can be synthesized as ordered sentence chunks (one engine request</span>
@@ -1031,13 +1034,15 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">__future__</span><span class="w"> </span><span class="kn">import</span> <span class="n">annotations</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">anyio</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPException</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">fastapi.responses</span><span class="w"> </span><span class="kn">import</span> <span class="n">Response</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server</span><span class="w"> </span><span class="kn">import</span> <span class="n">media_io</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">release_unread</span><span class="p">,</span> <span class="n">rid</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai._util</span><span class="w"> </span><span class="kn">import</span> <span class="n">error_type</span><span class="p">,</span> <span class="n">release_unread</span><span class="p">,</span> <span class="n">rid</span><span class="p">,</span> <span class="n">sse</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.protocol</span><span class="w"> </span><span class="kn">import</span> <span class="n">VoiceCard</span><span class="p">,</span> <span class="n">VoiceList</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.openai.speech_chunking</span><span class="w"> </span><span class="kn">import</span> <span class="n">split_sentences</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.api_server.streaming_response</span><span class="w"> </span><span class="kn">import</span> <span class="n">ReleasingStreamingResponse</span>
@@ -1090,13 +1095,57 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="describe_rejected">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html#mstar.api_server.openai.serving_speech.describe_rejected">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">describe_rejected</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A client's rejected value for a 400: quoted when it is a string, named by</span>
+<span class="sd">    its JSON type otherwise.</span>
+
+<span class="sd">    The Rust frontend has to produce the same text. Quoting a string is easy to</span>
+<span class="sd">    match; reproducing ``repr`` of every other type is not, because Python and</span>
+<span class="sd">    serde_json disagree on an integer too large for ``i64``, on ``-0``, on the</span>
+<span class="sd">    digits of some floats, and on the order of an object's keys. Naming the type</span>
+<span class="sd">    sidesteps all of it, and a client that sent the wrong type does not need its</span>
+<span class="sd">    value read back.</span>
+<span class="sd">    """</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="k">return</span> <span class="nb">repr</span><span class="p">(</span><span class="n">value</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">value</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s2">"null"</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>  <span class="c1"># before int: bool is a subclass of it</span>
+        <span class="k">return</span> <span class="s2">"a boolean"</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="p">(</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">)):</span>
+        <span class="k">return</span> <span class="s2">"a number"</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="p">(</span><span class="nb">list</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">)):</span>
+        <span class="k">return</span> <span class="s2">"an array"</span>
+    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">return</span> <span class="s2">"an object"</span>
+    <span class="k">return</span> <span class="s2">"a value of another type"</span></div>
+
+
+
 <div class="viewcode-block" id="create_speech">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.api_server.openai.serving_speech.html#mstar.api_server.openai.serving_speech.create_speech">[docs]</a>
 <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">create_speech</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">model_name</span><span class="p">,</span> <span class="n">adapter</span><span class="p">,</span> <span class="n">req</span><span class="p">,</span> <span class="n">raw_request</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
     <span class="n">sample_rate</span> <span class="o">=</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span><span class="o">.</span><span class="n">get_output_sample_rate</span><span class="p">(</span><span class="s2">"audio"</span><span class="p">)</span> <span class="k">if</span> <span class="n">api</span><span class="o">.</span><span class="n">model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="mi">24000</span>
+    <span class="c1"># OpenAI's own streaming switch, which its SDK (and so LiveKit's TTS plugin)</span>
+    <span class="c1"># sends instead of ``stream``. Popped so it does not reach the model as a kwarg.</span>
+    <span class="n">stream_format</span> <span class="o">=</span> <span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">model_extra</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">"stream_format"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">stream_format</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="kc">None</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">,</span> <span class="s2">"sse"</span><span class="p">):</span>
+        <span class="k">raise</span> <span class="n">HTTPException</span><span class="p">(</span>
+            <span class="n">status_code</span><span class="o">=</span><span class="mi">400</span><span class="p">,</span>
+            <span class="n">detail</span><span class="o">=</span><span class="sa">f</span><span class="s2">"stream_format must be 'audio' or 'sse', got </span><span class="si">{</span><span class="n">describe_rejected</span><span class="p">(</span><span class="n">stream_format</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">,</span>
+        <span class="p">)</span>
+    <span class="c1"># A compressed container (the SDK's default mp3) cannot be streamed here;</span>
+    <span class="c1"># stream_format then falls back to one whole body, which those clients read too.</span>
+    <span class="n">stream</span> <span class="o">=</span> <span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span>
+        <span class="n">stream_format</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">response_format</span> <span class="ow">or</span> <span class="s2">"wav"</span><span class="p">)</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="n">media_io</span><span class="o">.</span><span class="n">audio_formats</span><span class="p">(</span><span class="n">stream</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">stream</span><span class="p">:</span>
+        <span class="n">stream_format</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># before any upload or GPU work: a format we cannot produce is the client's error</span>
     <span class="k">try</span><span class="p">:</span>
-        <span class="n">fmt</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">check_audio_format</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">response_format</span><span class="p">,</span> <span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">),</span> <span class="n">sample_rate</span><span class="p">)</span>
+        <span class="n">fmt</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">check_audio_format</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">response_format</span><span class="p">,</span> <span class="n">stream</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">ValueError</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
         <span class="k">raise</span> <span class="n">HTTPException</span><span class="p">(</span><span class="n">status_code</span><span class="o">=</span><span class="mi">400</span><span class="p">,</span> <span class="n">detail</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="p">))</span> <span class="kn">from</span><span class="w"> </span><span class="nn">exc</span>
     <span class="c1"># blocking work (base64 decode, file write, an allowed remote fetch) off the loop</span>
@@ -1120,14 +1169,14 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">input_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">input_modalities</span><span class="p">,</span>
                 <span class="n">output_modalities</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">output_modalities</span><span class="p">,</span>
                 <span class="n">model_kwargs</span><span class="o">=</span><span class="n">_chunk_kwargs</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">model_kwargs</span><span class="p">,</span> <span class="n">index</span><span class="p">),</span>
-                <span class="n">streaming</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span><span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">),</span>
+                <span class="n">streaming</span><span class="o">=</span><span class="n">stream</span><span class="p">,</span>
                 <span class="n">request_id</span><span class="o">=</span><span class="n">chunk_id</span><span class="p">,</span>
                 <span class="n">model</span><span class="o">=</span><span class="n">req</span><span class="o">.</span><span class="n">model</span><span class="p">,</span>
             <span class="p">)</span>
 
         <span class="n">lookahead</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">int</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">adapter</span><span class="p">,</span> <span class="s2">"speech_chunk_lookahead"</span><span class="p">,</span> <span class="mi">2</span><span class="p">)))</span>
         <span class="n">pending</span> <span class="o">=</span> <span class="p">[</span><span class="n">submit</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">min</span><span class="p">(</span><span class="n">lookahead</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">)))]</span>
-        <span class="k">if</span> <span class="n">req</span><span class="o">.</span><span class="n">stream</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">stream</span><span class="p">:</span>
             <span class="n">raw_pcm</span> <span class="o">=</span> <span class="n">fmt</span> <span class="o">==</span> <span class="s2">"pcm"</span>
             <span class="c1"># a request the engine rejects gets its status, not an empty WAV</span>
             <span class="k">try</span><span class="p">:</span>
@@ -1136,6 +1185,11 @@ window.runMermaid = runMermaid;</script>
                 <span class="c1"># The first piece released itself; release the ones submitted ahead.</span>
                 <span class="n">release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">pending</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
                 <span class="k">raise</span>
+            <span class="k">if</span> <span class="n">raw_request</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="k">await</span> <span class="n">raw_request</span><span class="o">.</span><span class="n">is_disconnected</span><span class="p">():</span>
+                <span class="c1"># The client left before the first audio and no response has</span>
+                <span class="c1"># started, so nothing else would release the pieces submitted ahead.</span>
+                <span class="n">release_unread</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">pending</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+                <span class="k">return</span> <span class="n">Response</span><span class="p">(</span><span class="n">status_code</span><span class="o">=</span><span class="mi">499</span><span class="p">)</span>
 
             <span class="k">def</span><span class="w"> </span><span class="nf">release_unstarted</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="c1"># What _stream_pcm's finally does, for a body that never ran it.</span>
@@ -1143,12 +1197,16 @@ window.runMermaid = runMermaid;</script>
                 <span class="n">media_io</span><span class="o">.</span><span class="n">schedule_upload_cleanup</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">,</span> <span class="n">api</span><span class="o">.</span><span class="n">upload_dir</span><span class="p">)</span>
 
             <span class="n">stream_owns_uploads</span> <span class="o">=</span> <span class="kc">True</span>
-            <span class="k">return</span> <span class="n">ReleasingStreamingResponse</span><span class="p">(</span>
-                <span class="n">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">submit</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">),</span> <span class="n">pending</span><span class="p">,</span> <span class="n">first_iter</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span>
-                            <span class="n">with_wav_header</span><span class="o">=</span><span class="ow">not</span> <span class="n">raw_pcm</span><span class="p">,</span> <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">),</span>
-                <span class="n">release</span><span class="o">=</span><span class="n">release_unstarted</span><span class="p">,</span>
-                <span class="n">media_type</span><span class="o">=</span><span class="s2">"audio/pcm"</span> <span class="k">if</span> <span class="n">raw_pcm</span> <span class="k">else</span> <span class="s2">"audio/wav"</span><span class="p">,</span>
-                <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
+            <span class="n">body</span> <span class="o">=</span> <span class="n">_stream_pcm</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">submit</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">chunks</span><span class="p">),</span> <span class="n">pending</span><span class="p">,</span> <span class="n">first_iter</span><span class="p">,</span> <span class="n">sample_rate</span><span class="p">,</span>
+                               <span class="n">with_wav_header</span><span class="o">=</span><span class="ow">not</span> <span class="n">raw_pcm</span><span class="p">,</span> <span class="n">file_paths</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">file_paths</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">stream_format</span> <span class="o">==</span> <span class="s2">"sse"</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">_ClosingStreamingResponse</span><span class="p">(</span>
+                    <span class="n">_as_sse</span><span class="p">(</span><span class="n">body</span><span class="p">),</span> <span class="n">release</span><span class="o">=</span><span class="n">release_unstarted</span><span class="p">,</span>
+                    <span class="n">media_type</span><span class="o">=</span><span class="s2">"text/event-stream"</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
+                <span class="p">)</span>
+            <span class="k">return</span> <span class="n">_ClosingStreamingResponse</span><span class="p">(</span>
+                <span class="n">body</span><span class="p">,</span> <span class="n">release</span><span class="o">=</span><span class="n">release_unstarted</span><span class="p">,</span>
+                <span class="n">media_type</span><span class="o">=</span><span class="s2">"audio/pcm"</span> <span class="k">if</span> <span class="n">raw_pcm</span> <span class="k">else</span> <span class="s2">"audio/wav"</span><span class="p">,</span> <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">"Cache-Control"</span><span class="p">:</span> <span class="s2">"no-cache"</span><span class="p">},</span>
             <span class="p">)</span>
 
         <span class="n">pcm_parts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">bytes</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
@@ -1174,6 +1232,40 @@ window.runMermaid = runMermaid;</script>
     <span class="n">audio_bytes</span><span class="p">,</span> <span class="n">mime</span> <span class="o">=</span> <span class="n">media_io</span><span class="o">.</span><span class="n">pcm16_to_container</span><span class="p">(</span><span class="sa">b</span><span class="s2">""</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">pcm_parts</span><span class="p">),</span> <span class="n">sample_rate</span><span class="p">,</span> <span class="n">fmt</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">Response</span><span class="p">(</span><span class="n">content</span><span class="o">=</span><span class="n">audio_bytes</span><span class="p">,</span> <span class="n">media_type</span><span class="o">=</span><span class="n">mime</span><span class="p">)</span></div>
 
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">_ClosingStreamingResponse</span><span class="p">(</span><span class="n">ReleasingStreamingResponse</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""Closes its body iterator however the response ends. Starlette stops at</span>
+<span class="sd">    the failed or cancelled ``send`` when a client leaves mid-stream and leaves</span>
+<span class="sd">    the generator suspended at its ``yield``, so its release of the sentence</span>
+<span class="sd">    pieces still in flight would wait for garbage collection. A body that never</span>
+<span class="sd">    started is released by ``ReleasingStreamingResponse`` first, and closing it</span>
+<span class="sd">    afterwards runs nothing."""</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">scope</span><span class="p">,</span> <span class="n">receive</span><span class="p">,</span> <span class="n">send</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">await</span> <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__call__</span><span class="p">(</span><span class="n">scope</span><span class="p">,</span> <span class="n">receive</span><span class="p">,</span> <span class="n">send</span><span class="p">)</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="k">with</span> <span class="n">anyio</span><span class="o">.</span><span class="n">CancelScope</span><span class="p">(</span><span class="n">shield</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+                <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">body_iterator</span><span class="o">.</span><span class="n">aclose</span><span class="p">()</span>
+
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">_as_sse</span><span class="p">(</span><span class="n">audio</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""OpenAI's ``stream_format="sse"``: one ``speech.audio.delta`` per piece of</span>
+<span class="sd">    audio (base64, in ``response_format``), then ``speech.audio.done``. A failure</span>
+<span class="sd">    after the stream opened ends it with an ``error`` event instead of</span>
+<span class="sd">    ``speech.audio.done``: the 200 is already sent."""</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="k">async</span> <span class="k">for</span> <span class="n">data</span> <span class="ow">in</span> <span class="n">audio</span><span class="p">:</span>
+            <span class="k">yield</span> <span class="n">sse</span><span class="p">({</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"speech.audio.delta"</span><span class="p">,</span> <span class="s2">"audio"</span><span class="p">:</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64encode</span><span class="p">(</span><span class="n">data</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">"ascii"</span><span class="p">)})</span>
+    <span class="k">except</span> <span class="n">HTTPException</span> <span class="k">as</span> <span class="n">exc</span><span class="p">:</span>
+        <span class="k">yield</span> <span class="n">sse</span><span class="p">({</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"error"</span><span class="p">,</span> <span class="s2">"error"</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">"message"</span><span class="p">:</span> <span class="nb">str</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">detail</span><span class="p">),</span> <span class="s2">"type"</span><span class="p">:</span> <span class="n">error_type</span><span class="p">(</span><span class="n">exc</span><span class="o">.</span><span class="n">status_code</span><span class="p">),</span> <span class="s2">"code"</span><span class="p">:</span> <span class="n">exc</span><span class="o">.</span><span class="n">status_code</span><span class="p">,</span>
+        <span class="p">}})</span>
+        <span class="k">return</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="k">await</span> <span class="n">audio</span><span class="o">.</span><span class="n">aclose</span><span class="p">()</span>
+    <span class="k">yield</span> <span class="n">sse</span><span class="p">({</span><span class="s2">"type"</span><span class="p">:</span> <span class="s2">"speech.audio.done"</span><span class="p">})</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_is_error</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
