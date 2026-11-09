@@ -16,7 +16,8 @@ sys.path.insert(0, str(REPO_ROOT / ".github/review"))
 sys.path.insert(0, str(Path(__file__).parent))
 import bot  # noqa: E402
 import gpu_review  # noqa: E402
-from test_review_bot import Fail, FakeGh, step, workspace  # noqa: E402
+import render_summary  # noqa: E402
+from test_review_bot import Fail, FakeGh, finished, step, workspace  # noqa: E402
 
 blocking, file_gate = gpu_review.blocking, gpu_review.file_gate
 R = gpu_review.REPO
@@ -651,6 +652,36 @@ class TestApprove(unittest.TestCase):
             self.assertNotIn("Nothing left from the review.", text)
             self.assertIn("`inline 4`: disputed, you decide: a re-review judged it fixed, but none of this thread's "
                           "lines changed", text, "the checklist wouldn't name the finding and why")
+
+    def test_a_fixed_on_an_earlier_finding_outside_the_diff_clears_only_once_its_file_changed(self):
+        item = {"priority": "P1", "claim": "leak", "location": "mstar/a.py:3", "detail": "d"}
+        review = {"outside_diff": [], "since_last": "", "description_problems": [], "questions": [], "checked": [],
+                  "skipped": [], "types": ["bug"], "design": [], "latent": [],
+                  "risk": {"level": "low", "reason": "r", "look_at": []},
+                  "prior_findings": [{"ref": "mstar/a.py:3", "priority": "P1", "status": "fixed", "why": "done"}]}
+        pages = [threads_page()]
+
+        def left(since):
+            """The approval's reading of a re-review's `fixed` after commits whose diff is `since` (None: unknown)."""
+            with workspace() as ws:
+                (ws / "last-review.json").write_text(json.dumps({"head": "2" * 40, "outside_diff": [item]}))
+                if since is not None:
+                    (ws / "since.diff").write_text(since)
+                out, _ = step(bot.post, {"POST graphql": pages[0], "pr comment": "https://github.com/o/r/pull/7#c-9",
+                                         "GET repos/o/r/issues/7/comments": []},
+                              repo="o/r", pr="7", runner_temp=finished(review), head_sha="1" * 40, mode="full",
+                              salvaged="false")
+            judged = gpu_review.for_approval(json.loads(out["result"]), pages)
+            return blocking(judged, pages, []), render_summary.checklist(judged, pages, [])
+
+        self.assertEqual(left("diff --git a/mstar/a.py b/mstar/a.py\n--- a/mstar/a.py\n+++ b/mstar/a.py\n")[0], [],
+                         "a finding fixed in its file couldn't be cleared by a re-review")
+        for name, since in (("its file untouched", "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n"),
+                            ("unknown", None)):
+            found, text = left(since)
+            self.assertEqual(found, ["earlier mstar/a.py:3 (P1)"], f"{name}: the model's word alone would clear it")
+            self.assertIn("disputed, you decide: a re-review judged it fixed, but no commit since the last review",
+                          text, f"{name}: the checklist wouldn't name the finding and why")
 
     def test_not_approved_lists_the_rules_conditions_as_the_checklist(self):
         text, out, writes = self.approve({"value": "on"}, verdict="fail")

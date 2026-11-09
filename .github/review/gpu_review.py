@@ -494,15 +494,19 @@ def findings_changed(review, pr):
 
 
 def for_approval(review, pages):
-    """`review` as the approval reads it: a re-review's `fixed` or `moot` on a bot thread GitHub doesn't show as
-    outdated (none of its lines changed since the bot posted it) counts as `disputed`, so a person decides. The
-    summary's status line and the GPU gate keep the review's own judgement."""
-    unmoved = {str(first.get("databaseId", "")) for first, _, _, outdated in render_summary.bot_threads(pages)
-               if not outdated}
+    """`review` as the approval reads it: a re-review's `fixed` or `moot` counts as `disputed`, so a person decides,
+    where nothing in the code backs it: on a bot thread GitHub doesn't show as outdated (none of its lines changed
+    since the bot posted it), and on an earlier finding outside the diff, which has no thread, whose file no commit
+    since the last review is known to have touched (`untouched`, bot.untouched). The summary's status line and the
+    GPU gate keep the review's own judgement."""
+    unchanged = {**{str(first.get("databaseId", "")): "none of this thread's lines changed: a person decides, or "
+                                                       "change one of those lines"
+                    for first, _, _, outdated in render_summary.bot_threads(pages) if not outdated},
+                 **{location: "no commit since the last review is known to have touched its file: a person decides, "
+                              "or change that file" for location in review.get("untouched") or ()}}
     return {**review, "prior_findings": [
-        {**f, "status": "disputed", "why": f"a re-review judged it {f['status']}, but none of this thread's lines "
-                                           "changed: a person decides, or change one of those lines"}
-        if f["status"] in render_summary.CLEARS and f["ref"] in unmoved else f
+        {**f, "status": "disputed", "why": f"a re-review judged it {f['status']}, but {unchanged[f['ref']]}"}
+        if f["status"] in render_summary.CLEARS and f["ref"] in unchanged else f
         for f in review.get("prior_findings") or []]}
 
 
