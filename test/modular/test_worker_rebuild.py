@@ -246,6 +246,7 @@ def test_postprocess_journals_a_request_whose_last_prompt_chunk_the_pool_couldnt
     w, node, walk = _worker(eng, _Runtime()), "vocoder", "w"
     w._rebuilds._policies = {node: RebuildPolicy(walk, "text_inputs", "new_token", "loop")}
     w._rebuilds._kept, w._rebuilds._droppable = {node: {}}, {node: {1, 2}}
+    w._rebuilds._refused = {node: {}}
     w._rebuilds._pool = HostPool(8, torch.device("cpu"))
     batch = _step((1, 2), walk, node)
     eng.prepare_inputs(batch)
