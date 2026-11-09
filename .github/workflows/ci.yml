@@ -49,7 +49,7 @@ jobs:
             args: >-
               -n 4 --dist worksteal
               --ignore=test/modular/test_tp_async_lockstep_sim.py
-              test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases mstar_sim/tests
+              test/modular test/distributed test/chatterbox test/kokoro test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases
           # Its three simulations take up to 3.5 minutes each on these runners
           # and would set the main shard's wall time, so they run beside it.
           - name: CPU Core (TP lockstep sim)
@@ -172,8 +172,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install libzmq
-        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+      - name: Install libzmq and ffmpeg
+        # ffmpeg: the video parity tests mux a generated sound track, which skip without it
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev ffmpeg
       - name: Cargo tests (transport + arena semantics)
         working-directory: rust
         # The bindings without extension-module (see rust/Cargo.toml): the test

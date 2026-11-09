@@ -61,6 +61,7 @@ bridge socket is private to the pair.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -173,6 +174,8 @@ REQUEST_TIMEOUT_ENV = "MSTAR_REQUEST_TIMEOUT_S"
 SAMPLE_RATE_ENV = "MSTAR_SAMPLE_RATE"
 #: The libsndfile ``soundfile`` loaded, which mstar-server opens for mp3/flac/opus.
 LIBSNDFILE_ENV = "MSTAR_LIBSNDFILE"
+#: ``ServedModels`` as JSON: the names that select the base model, and the LoRA adapters.
+SERVED_MODELS_ENV = "MSTAR_SERVED_MODELS"
 
 
 def soundfile_library() -> str | None:
@@ -190,12 +193,22 @@ def soundfile_library() -> str | None:
     return getattr(soundfile, "_libname", None) or getattr(soundfile, "_full_path", None)
 
 
+def served_models_json(served_models) -> str:
+    """``SERVED_MODELS_ENV``'s value for a ``ServedModels``."""
+    return json.dumps({
+        "base": sorted(served_models.base), "adapters": list(served_models.adapters),
+        "lora": served_models.lora,
+    })
+
+
 def launch_rust_server(binary: str, model_name: str, port: int,
                        bridge_dir: str, upload_dir: str,
                        api_key: str | None = None, timeout_s: float | None = None,
-                       sample_rate: int | None = None) -> subprocess.Popen:
+                       sample_rate: int | None = None, served_models=None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
-    (``get_output_sample_rate``); ``None`` leaves the frontend's own default."""
+    (``get_output_sample_rate``); ``None`` leaves the frontend's own default.
+    ``served_models`` is the API server's ``ServedModels``, whose LoRA adapters a
+    request's ``model`` selects; ``None`` serves the base model alone."""
     # The key goes through the environment, not argv, which any local user
     # can read from the process list. ``api_key`` is the resolved setting, so
     # an inherited MSTAR_API_KEY must not override it.
@@ -209,6 +222,9 @@ def launch_rust_server(binary: str, model_name: str, port: int,
         env[REQUEST_TIMEOUT_ENV] = repr(max(timeout_s, 0.0) if timeout_s < 1e9 else 1e9)
     if sample_rate is not None:
         env[SAMPLE_RATE_ENV] = str(int(sample_rate))
+    env.pop(SERVED_MODELS_ENV, None)
+    if served_models is not None:
+        env[SERVED_MODELS_ENV] = served_models_json(served_models)
     env.pop(LIBSNDFILE_ENV, None)
     if (libsndfile := soundfile_library()) is not None:
         env[LIBSNDFILE_ENV] = libsndfile

@@ -48,13 +48,13 @@ def _connection(source, dest, edge):
     )
 
 
-def _model(topology=True, combined=None):
+def _model(topology=True, combined=None, priorities=None):
     return SimpleNamespace(
         get_graph_walk_graphs=_walks,
         get_partitions=lambda: [
-            PartitionDefinition(name="A", graph_walks={"produce"}, initial_walk="produce"),
-            PartitionDefinition(name="B", graph_walks={"consume"}, initial_walk="consume"),
-            PartitionDefinition(name="C", graph_walks={"decode_audio"}, initial_walk="decode_audio"),
+            PartitionDefinition(name="A", graph_walks={"produce"}),
+            PartitionDefinition(name="B", graph_walks={"consume"}),
+            PartitionDefinition(name="C", graph_walks={"decode_audio"}),
         ],
         get_partition_topology=lambda: PartitionTopology(
             partitions=["A", "B", "C"],
@@ -62,6 +62,7 @@ def _model(topology=True, combined=None):
         ) if topology else None,
         chunking_policy_of=lambda: {("consumer", "consume"): object()},
         combined_walk_of=lambda: combined or {},
+        get_walk_priorities=lambda: list(priorities or []),
     )
 
 
@@ -178,6 +179,23 @@ def test_chunk_loops_read_the_speculate_mid_prefill_setting():
 def test_combined_walks_come_from_the_model():
     combined = {("consumer", "consume"): "mixed"}
     assert _derive(_model(combined=combined), sharding=SimpleNamespace(groups=[])).combined_walk_of == combined
+
+
+def test_walk_priorities_resolve_to_this_workers_pairs_and_the_deployment_replaces_them():
+    from mstar.worker.scheduling_policy import WalkPriority
+
+    model = _model(priorities=[WalkPriority(walk="consume", priority=2), WalkPriority(walk="produce", priority=5)])
+    layout = _derive(model)
+    # "produce" runs on another worker: this one keeps only the pairs it runs
+    assert {pair: e.priority for pair, e in layout.walk_priorities.items()} == {
+        ("consumer", "consume"): 2, ("helper", "consume"): 2,
+    }
+    assert (layout.scheduling_policy, layout.default_max_wait) == ("priority", None)
+    config = {"scheduling": {"policy": "round_robin", "max_wait": 6,
+                             "walk_priorities": [{"node": "consumer", "walk": "consume", "priority": 1}]}}
+    layout = _derive(model, model_config=config)
+    assert {pair: e.priority for pair, e in layout.walk_priorities.items()} == {("consumer", "consume"): 1}
+    assert (layout.scheduling_policy, layout.default_max_wait) == ("round_robin", 6)
 
 
 COMBINED = {("consumer", "consume"): "mixed", ("consumer", "again"): "mixed"}
