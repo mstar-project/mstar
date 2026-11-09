@@ -530,7 +530,8 @@ dropped if it can be rebuilt from its token ids. The request that ran short gets
 freed, up to its shortage. When the newer requests can't cover it, it moves to the host if the
 host pool can hold all of its pages, and otherwise waits holding its pages. A request on the host,
 a dropped one and one waiting for pages wait outside the queue, so a new prompt that fits still
-starts, unless one of them is the oldest request in its pool, which no newer prompt passes.
+starts, unless one of them is the oldest request in its pool, which no newer prompt passes unless
+its room is already allotted.
 They are tried oldest first, before the queue. The oldest refused request that moves can let in
 moves newer requests that wait holding pages, to the host or by a drop as above. A request on the host
 returns once its pages and one more page fit, or every page its grant needed when it moved
