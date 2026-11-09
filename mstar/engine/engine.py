@@ -3198,8 +3198,8 @@ class Engine:
         return self._runner.refusals()
 
     def readmit_request(self, node_name: str, request_id: int) -> None:
-        """Ask the node's resources again for the request, which then waits until they fit it; see
-        `Admission.readmit`."""
+        """Ask the node's resources again for the request, which then waits until they fit it, as
+        `Admission.readmit` says."""
         self._runner.readmit(request_id, node_name)
 
     def drop_request(self, node_name: str, request_id: int, tokens: int) -> int:
