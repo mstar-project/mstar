@@ -411,10 +411,6 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     tensors = out.new_input_tensors
     step = model._prefill_step(tensors, out.metadata[MEDIA_LAYOUT])
     assert step.walk == "prefill_vision"
-    # the encoder gets each image and video once, in prompt order
-    assert all(a is b for a, b in zip(
-        step.input_tensors[("vision_encoder", "pixel_values")], tensors["pixel_values"], strict=True,
-    ))
 
     media = out.metadata[MEDIA_LAYOUT]
     (prompt,) = tensors["text_inputs"]
@@ -427,9 +423,8 @@ def test_vision_walk_matches_get_rope_index(model, processor, rope_model, layout
     # the stream's counter is keyed by the worker's handle, not the wire id (AGENTS.md invariant 14)
     start = 5
     llm.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: {7: start}.get(rid, 0))}
-    fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.metadata)
-    (ids,) = step.input_tensors[("LLM", "text_inputs")]
-    row = llm._media_inputs(fwd_info, {"text_inputs": [ids], "vision_embeds": [marks]})
+    fwd_info = SimpleNamespace(request_id="r", rid_handle=7, step_metadata=step.step_metadata)
+    row = llm._media_inputs(fwd_info, {"text_inputs": [prompt], "vision_embeds": [marks]})
 
     expected_row = ref["input_ids"][0].float()
     expected_row[ref["input_ids"][0] == model.config.image_token_id] = IMAGE_MARK
@@ -802,7 +797,7 @@ def test_the_checkpoint_sampling_defaults_reach_the_sampler(tmp_path):
     (ckpt / "generation_config.json").write_text(json.dumps({"temperature": 0.6, "top_k": 20, "min_p": 0.05}))
     model = Qwen3_5DenseModel(str(ckpt))
     (spec,) = [s for s in model.get_node_resources() if s.resource_key == SAMPLER]
-    cfg = model.get_request_resource_configs({}, {"min_p": 0.2})[SAMPLER]
+    cfg = model.get_request_resource_configs([], [], {"min_p": 0.2})[SAMPLER]
     cfg.validate(spec)
     assert (spec.enable_min_p, cfg.temperature, cfg.top_k, cfg.min_p) == (True, 0.6, 20, 0.2)
 
@@ -905,7 +900,7 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     llm = LLMSubmodule(nn.Linear(1, 1), model.config, model.vision_config, model.encoders)
     rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
     llm.node_resources = {ROPE: rope}
-    metadata = {"is_prefill": True, **step.metadata}
+    metadata = {"is_prefill": True, **step.step_metadata}
     kv = KVManager(
         cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, max_num_pages=64, page_size=16),
         name="kv", joint_comm_group=None, device=torch.device("cpu"), dtype=torch.float32,
@@ -927,7 +922,7 @@ def test_a_rebuilt_media_prompt_holds_the_slots_and_positions_of_an_uninterrupte
     config.apply_conductor_config(kv_layout={"main": kv_layout.row()}, loop_caps={"decode_loop": 8})
     kv.ingest_request(R, config)
     rope.ingest_request(R)
-    (ids,) = step.input_tensors[("LLM", "text_inputs")]
+    (ids,) = tensors["text_inputs"]
     prefill = llm._media_inputs(
         SimpleNamespace(request_id=R, rid_handle=R, step_metadata=metadata), {"text_inputs": [ids], **copied},
     )

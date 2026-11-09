@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -202,6 +203,18 @@ class Resource(ResidentHooks, ABC):
     ) -> bool:
         """Whether a capture of ``config_type`` gets this resource's lean twin."""
         return True
+
+    def outside_step(self) -> AbstractContextManager[None]:
+        """Run a ``lean_capture`` resource's callers outside any planned step (a
+        compile's warm-up) on this thread, as in a step that runs it lean."""
+        return nullcontext()
+
+    # Whether this resource's step on a node is the node's own segments
+    # (``SubmoduleStep.segments``: a request's span of tokens each, in the order the node
+    # packs its rows), so the node declares nothing for it: ``engine_step`` adds a
+    # ``ResourceStep`` of them under the resource's key (the LoRA pool, whose rows are the
+    # node's tokens).
+    steps_from_segments: bool = False
 
     # stays correct when a hit skips the front of a request; required of every resource on a keyed node
     prefix_skip_safe: bool = False
