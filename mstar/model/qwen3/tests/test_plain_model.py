@@ -41,6 +41,33 @@ def test_a_node_declares_kv_attention_positions_and_a_sampler(tmp_path):
     assert keys == {"kv_cache", "attn", "rope", "sampler"}
 
 
+def test_the_download_the_tokenizer_loads_fetches_a_template_kept_in_its_own_file(tmp_path, monkeypatch):
+    """On an empty cache, with the files filtered as the hub filters them."""
+    import shutil
+
+    from huggingface_hub.utils import filter_repo_objects
+
+    from mstar.model.qwen3.qwen3_model import Qwen3Model
+
+    repo, snapshot = tmp_path / "repo", tmp_path / "snapshot"
+    repo.mkdir()
+    snapshot.mkdir()
+    (repo / "config.json").write_text(json.dumps(CONFIG))
+    (repo / "chat_template.jinja").write_text("{{ messages }}")
+    (repo / "model.safetensors").write_text("")
+
+    def download(repo_id, cache_dir=None, allow_patterns=None):
+        names = [p.name for p in repo.iterdir()]
+        for name in filter_repo_objects(names, allow_patterns=allow_patterns):
+            shutil.copy(repo / name, snapshot / name)
+        return str(snapshot)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    model = Qwen3Model(model_path_hf="org/fine-tune", max_seq_len=256, accelerator_graph=False)
+    assert (model.local_dir / "chat_template.jinja").is_file()
+    assert not (model.local_dir / "model.safetensors").exists()
+
+
 def test_a_scaled_rope_in_rope_parameters_is_refused(tmp_path):
     with pytest.raises(ValueError, match="scaled RoPE"):
         _model(tmp_path, {"rope_parameters": {"rope_type": "yarn", "factor": 4.0}})
