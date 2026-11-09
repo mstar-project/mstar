@@ -59,7 +59,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{any, get, post},
     Json, Router,
 };
 use futures::StreamExt;
@@ -218,10 +218,10 @@ async fn main() {
         .route("/v1/models", get(list_models))
         .route("/v1/audio/voices", get(audio_voices))
         // long-lived sockets: outside the admission cap, as on the Python frontend
-        .route("/", get(ws::openpi::openpi_ws))
+        .route("/", any(ws::openpi::openpi_ws))
         .route("/healthz", get(ws::openpi::healthz))
-        .route("/generate/ws", get(ws::generate::generate_ws))
-        .route("/v1/realtime", get(realtime::realtime))
+        .route("/generate/ws", any(ws::generate::generate_ws))
+        .route("/v1/realtime", any(realtime::realtime))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
         .layer(axum::middleware::from_fn_with_state(

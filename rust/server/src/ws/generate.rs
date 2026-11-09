@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, WebSocket};
 use axum::extract::State;
 use axum::response::Response;
 use futures::future::{BoxFuture, FutureExt, Shared};
@@ -261,16 +261,19 @@ fn ws_model_kwargs(value: Option<&Val>) -> Result<Option<Map<String, Value>>, St
     }
 }
 
+/// Saved upload paths, by modality.
+type PathsByModality = BTreeMap<String, Vec<String>>;
+
 /// `_decode_ws_files`: a message's files saved under the upload directory,
 /// grouped by the modality of each name, and their parts. A message refused
 /// halfway leaves no files behind.
-fn decode_files(files: Option<&Val>, upload_dir: &Path) -> Result<(BTreeMap<String, Vec<String>>, Vec<Part>), String> {
+fn decode_files(files: Option<&Val>, upload_dir: &Path) -> Result<(PathsByModality, Vec<Part>), String> {
     let entries = match files {
         None | Some(Val::Nil) => return Ok((BTreeMap::new(), Vec::new())),
         Some(Val::List(items)) => items,
         Some(_) => return Err("files must be a list of {name, data} objects".into()),
     };
-    let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut paths = PathsByModality::new();
     let mut parts = Vec::new();
     let mut saved: Vec<PathBuf> = Vec::new();
     let result = (|| {
@@ -572,7 +575,7 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
         return;
     }
     let upload_dir = sock.st.upload_dir.clone();
-    let mut file_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut file_paths = PathsByModality::new();
     let prepared: Result<Map<String, Value>, String> = async {
         if message.get("append").is_some() {
             let mut misplaced: Vec<&str> = ["files", "model_kwargs", "text"].into_iter().filter(|k| message.get(k).is_some()).collect();
@@ -642,7 +645,11 @@ async fn append_one(sock: Arc<Socket>, message: Val, binary: bool, mut call: Cal
 }
 
 /// `GET /generate/ws`.
-pub async fn generate_ws(State(st): State<AppState>, ws: WebSocketUpgrade) -> Response {
+pub async fn generate_ws(State(st): State<AppState>, ws: super::Upgrade) -> Response {
+    let ws = match super::upgrade(ws) {
+        Ok(ws) => ws,
+        Err(not_found) => return not_found,
+    };
     let limit = super::max_message_bytes();
     ws.max_message_size(limit).max_frame_size(limit).on_upgrade(move |socket| serve(socket, st))
 }

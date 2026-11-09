@@ -9,7 +9,7 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -528,7 +528,7 @@ async fn infer(st: &AppState, policy: &Policy, obs: &Obs) -> Result<Vec<f32>, Fa
         }
     }
     let data = data.ok_or_else(|| Failure::Internal("RuntimeError: the request finished without actions".into()))?;
-    let values: Vec<f32> = data.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let values: Vec<f32> = data.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     let (h, d) = (policy.action_horizon, policy.action_dim);
     if data.len() % 4 != 0 || values.len() != h * d {
         return Err(Failure::Internal(format!(
@@ -540,7 +540,11 @@ async fn infer(st: &AppState, policy: &Policy, obs: &Obs) -> Result<Vec<f32>, Fa
 }
 
 /// `GET /` as a WebSocket: refused at the handshake unless the config has an `openpi:` block.
-pub async fn openpi_ws(State(st): State<AppState>, ws: WebSocketUpgrade) -> Response {
+pub async fn openpi_ws(State(st): State<AppState>, ws: super::Upgrade) -> Response {
+    let ws = match super::upgrade(ws) {
+        Ok(ws) => ws,
+        Err(not_found) => return not_found,
+    };
     let Some(policy) = policy() else {
         return StatusCode::FORBIDDEN.into_response();
     };

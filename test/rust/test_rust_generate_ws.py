@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -335,3 +337,19 @@ def test_live_call_refusals_read_as_pythons(stacks, monkeypatch):
     as_set = lambda replies: sorted(json.dumps(r, sort_keys=True) for r in replies)  # noqa: E731
     assert as_set(rust["late"]) == as_set(py["late"])
     assert {"request_id": "late", "append": True, "error": "the model's text stream has ended"} in py["late"]
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+@pytest.mark.parametrize("path", ["/", "/generate/ws", "/v1/realtime"])
+def test_a_plain_request_to_a_socket_route_reads_as_pythons(stacks, monkeypatch, method, path):
+    server, port = stacks(False)
+    monkeypatch.setattr(entrypoint, "api_server", server)
+    py = TestClient(entrypoint.app).request(method, path)
+    body = b"" if method == "POST" else None
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, data=body)
+    try:
+        with urllib.request.urlopen(request, timeout=15) as r:
+            rust = (r.status, json.loads(r.read()))
+    except urllib.error.HTTPError as e:
+        rust = (e.code, json.loads(e.read()))
+    assert rust == (py.status_code, py.json())
