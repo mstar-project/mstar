@@ -126,6 +126,8 @@ class Rebuilds:
         self._kept: dict[str, dict[int, KeptIds]] = {node: {} for node in policies}
         # node -> the handles that keep their ids, those whose pages a drop there can free
         self._keeps_ids: dict[str, set[int]] = {node: set() for node in policies}
+        # node -> handle -> the bytes of its prompt, for a request mid-prefill whose prompt the pool couldn't hold
+        self._refused: dict[str, dict[int, int]] = {node: {} for node in policies}
         # (node, handle) -> its rebuild, from the readiness check that starts it until its last chunk lands
         self._cursors: dict[tuple[str, int], RebuildCursor] = {}
         # nodes that have logged a prompt the pool couldn't hold
@@ -185,8 +187,8 @@ class Rebuilds:
     def keep_prompts(self, node_batch: ExecutingBatch, mid_prefill: Collection[int] = frozenset()) -> list[int]:
         """Copy a row's prompt to the host once the step that read the prompt completes, when the row is in the
         policy's walk, a drop here can free its request's pages, and the request keeps no ids yet. Returns the rows
-        the pool can't hold, which keep no ids from then on, except a row ``mid_prefill``, whose next chunk reads the
-        whole prompt again.
+        whose prompt the pool couldn't hold at their last chunk, which keep no ids from then on. A row ``mid_prefill``
+        can still keep its prompt at a later chunk that reads it.
 
         On a node this rank follows, a prompt the pool can't hold is copied outside the pool. Each rank gives a slice
         back at its own teardown, so a follower's pool can be fuller than rank 0's when rank 0 keeps a request's ids.
@@ -198,28 +200,36 @@ class Rebuilds:
         if walk != policy.walk and policy.walk not in walks.values():
             return []
         kept, keeps_ids = self._kept[node_batch.node_name], self._keeps_ids[node_batch.node_name]
+        refused = self._refused[node_batch.node_name]
         spill = node_batch.node_name in self._followed
         unkept = []
         for rid, row in node_batch.per_request_input_tensors.items():
-            # a TP follower's unread row has no inputs, and the step fails it
-            if not row or rid in kept or rid not in keeps_ids or walks.get(rid, walk) != policy.walk:
+            if rid in kept or rid not in keeps_ids or walks.get(rid, walk) != policy.walk:
                 continue
-            prompt = row[policy.ids_input][0]
-            copy = self._pool.copy_out(prompt, node_batch.completion_event, spill)
-            if copy is not None:
-                kept[rid] = KeptIds(copy, array("i"))
+            if row:
+                prompt = row[policy.ids_input][0]
+                copy = self._pool.copy_out(prompt, node_batch.completion_event, spill)
+                if copy is not None:
+                    kept[rid] = KeptIds(copy, array("i"))
+                    refused.pop(rid, None)
+                    continue
+                refused[rid] = prompt.nbytes
+            elif rid not in refused:
+                # a TP follower's unread row has no inputs, and the step fails it
                 continue
+            # A speculated chunk has no inputs, so a prompt refused at an earlier chunk is settled at its last one.
             if rid in mid_prefill:
                 continue
             keeps_ids.discard(rid)
             unkept.append(rid)
+            nbytes = refused.pop(rid)
             if node_batch.node_name not in self._logged_full:
                 self._logged_full.add(node_batch.node_name)
                 logger.warning(
                     "%s: the rebuild host pool has no room for a %d-byte prompt, with %d of %d bytes in use, so its "
                     "request keeps no ids and can't be dropped. Only the first on each node is logged, and the "
                     "serving config's rebuild_host_mb sizes the pool.",
-                    node_batch.node_name, prompt.nbytes, self._pool.nbytes_used(), self._pool.nbytes,
+                    node_batch.node_name, nbytes, self._pool.nbytes_used(), self._pool.nbytes,
                 )
         return unkept
 
@@ -348,6 +358,7 @@ class Rebuilds:
     def forget(self, rid: int, node: str) -> None:
         """Give back the ids ``rid`` keeps on ``node``, and keep none from here on."""
         self._keeps_ids[node].discard(rid)
+        self._refused[node].pop(rid, None)
         ids = self._kept[node].pop(rid, None)
         if ids is not None and ids.prompt.slice is not None:
             self._pool.give(ids.prompt.slice)
