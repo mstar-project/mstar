@@ -380,10 +380,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        ``dsa_long_context``) is logged and skipped. Loading also fails where a model
        refuses a region whose buckets it uses elsewhere: CosyVoice3's
        ``flow/solve_new_frames`` takes ``model_kwargs.flow_new_frame_buckets``. The
-       key replaces
-       ``model_kwargs.prefill_token_buckets``, ``prefill_batched_token_buckets``
-       (GLM-5.2), ``backbone_token_buckets`` (OmniVoice) and
-       ``lm_prefill_token_buckets`` (CosyVoice3), which fail loading.
+       key replaces ``model_kwargs.prefill_token_buckets``,
+       ``prefill_batched_token_buckets`` (GLM-5.2), ``backbone_token_buckets``
+       (OmniVoice) and ``lm_prefill_token_buckets`` (CosyVoice3), which fail loading.
    * - ``can_override_mixed_max_tokens``
      - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
        of its own under the step's. See *Chunked prefill budgets* below.

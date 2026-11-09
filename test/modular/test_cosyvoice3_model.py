@@ -204,7 +204,8 @@ def test_registry_yaml_and_adapter_agree(model):
         model.validate_config_yaml({**deployment, "max_concurrent_requests": 64}, str(CONFIG_PATH))
     # a pool left at its declared page size
     model.validate_config_yaml({**deployment, "resources": {"lm_kv": {"max_num_pages": 1792}}}, str(CONFIG_PATH))
-    # the flow packs and pages by its frame buckets, so the region ladder that mirrors them isn't the key's
+    # the flow packs its rows and sizes its cache by its frame buckets, so the region
+    # ladder that mirrors them isn't the key's
     with pytest.raises(ValueError, match="flow_new_frame_buckets"):
         model.validate_config_yaml(
             {**deployment, "prefill_token_buckets": {"flow": {"solve_new_frames": [64]}}}, str(CONFIG_PATH),
