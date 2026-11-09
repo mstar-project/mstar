@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -337,7 +338,10 @@ class CosyVoice3Model(Model):
         nothing preempts a stream once a pool is full, and a serving-config ladder
         for the flow's new-frame region, whose frame buckets also cap how rows
         pack and size the flow's cache (``flow_new_frame_buckets``)."""
-        if FLOW_NEW_FRAMES_REGION in ((config.get("prefill_token_buckets") or {}).get(FLOW_NODE) or {}):
+        # a malformed key is EngineManager's to report
+        ladders = config.get("prefill_token_buckets")
+        flow = ladders.get(FLOW_NODE) if isinstance(ladders, Mapping) else None
+        if isinstance(flow, Mapping) and FLOW_NEW_FRAMES_REGION in flow:
             raise ValueError(
                 f"{config_path}: prefill_token_buckets can't set {FLOW_NODE}/{FLOW_NEW_FRAMES_REGION}; its "
                 "buckets also pack the flow's rows and size its cache, so set model_kwargs.flow_new_frame_buckets"

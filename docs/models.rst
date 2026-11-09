@@ -1032,7 +1032,7 @@ CosyVoice3 notes
   [...]}}``, see :doc:`serving`, and ``lm_prefill_batch_sizes``; the LM's graphs
   take about 130 MB together). A prompt past the largest bucket runs eagerly, and
   ``lm_prefill_batch_sizes: []`` captures no prefill. The flow's new-frame region
-  keeps ``flow_new_frame_buckets``, which the key can't set.
+  keeps ``model_kwargs.flow_new_frame_buckets``, which the key can't set.
 
 Qwen3-TTS notes
 ---------------
