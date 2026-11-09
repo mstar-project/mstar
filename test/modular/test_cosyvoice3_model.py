@@ -204,6 +204,11 @@ def test_registry_yaml_and_adapter_agree(model):
         model.validate_config_yaml({**deployment, "max_concurrent_requests": 64}, str(CONFIG_PATH))
     # a pool left at its declared page size
     model.validate_config_yaml({**deployment, "resources": {"lm_kv": {"max_num_pages": 1792}}}, str(CONFIG_PATH))
+    # the flow packs and pages by its frame buckets, so the region ladder that mirrors them isn't the key's
+    with pytest.raises(ValueError, match="flow_new_frame_buckets"):
+        model.validate_config_yaml(
+            {**deployment, "prefill_token_buckets": {"flow": {"solve_new_frames": [64]}}}, str(CONFIG_PATH),
+        )
     assert isinstance(adapters.get_adapter("cosyvoice3"), adapters.CosyVoice3Adapter)
 
 
@@ -1404,6 +1409,9 @@ def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():
     assert prefill.replay_graph_walks == ["prefill", "prefill_voice"]
     assert prefill.capture_token_lengths == {1: sub.LM_PREFILL_TOKEN_BUCKETS}
     assert sub.resident_walks() == {"decode"}
+    # no prefill batch sizes is the switch that captures no prefill
+    sub, _ = _lm(_tiny_config(lm_prefill_batch_sizes=()))
+    assert [c.capture_graph_walk for c in sub.get_accelerator_graph_configs(torch.device("cpu"))] == ["decode"]
 
 
 def test_the_serving_configs_ladder_reaches_the_lm_prefill_capture():

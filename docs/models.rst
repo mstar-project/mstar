@@ -1028,10 +1028,11 @@ CosyVoice3 notes
   runs as several steps. ``hift_capture_frame_buckets: []`` runs the vocoder
   eagerly.
 - The LM's prefill is captured with its decode, per prompt token bucket and
-  batch size (the serving config's ``prefill_token_buckets: {llm:
-  {prefill_voice: [...]}}`` and ``lm_prefill_batch_sizes``; the LM's graphs take
-  about 130 MB together). A prompt past the largest bucket runs eagerly, and
-  ``lm_prefill_batch_sizes: []`` captures no prefill.
+  batch size (the serving config's ``prefill_token_buckets: {llm: {prefill_voice:
+  [...]}}``, see :doc:`serving`, and ``lm_prefill_batch_sizes``; the LM's graphs
+  take about 130 MB together). A prompt past the largest bucket runs eagerly, and
+  ``lm_prefill_batch_sizes: []`` captures no prefill. The flow's new-frame region
+  keeps ``flow_new_frame_buckets``, which the key can't set.
 
 Qwen3-TTS notes
 ---------------

@@ -378,7 +378,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        region captured by batch size alone; a walk or region the node captures nothing
        for at this deployment (a model that turns its captures off, such as GLM-5.2 with
        ``dsa_long_context``) is logged and skipped. The key replaces
-       ``model_kwargs.prefill_token_buckets``, which fails loading.
+       ``model_kwargs.prefill_token_buckets``, ``prefill_batched_token_buckets``
+       (GLM-5.2), ``backbone_token_buckets`` (OmniVoice) and
+       ``lm_prefill_token_buckets`` (CosyVoice3), which fail loading.
    * - ``can_override_mixed_max_tokens``
      - *(optional)* Per node, ``true`` to let a walk inside a combined walk take a budget
        of its own under the step's. See *Chunked prefill budgets* below.

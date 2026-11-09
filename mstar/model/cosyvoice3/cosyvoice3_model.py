@@ -110,6 +110,7 @@ from mstar.model.cosyvoice3.config import (
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
     DECODE_LOOP,
+    FLOW_NEW_FRAMES_REGION,
     MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
@@ -333,7 +334,14 @@ class CosyVoice3Model(Model):
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse a request cap the LM KV pool or a stream-state pool cannot hold:
-        nothing preempts a stream once a pool is full."""
+        nothing preempts a stream once a pool is full, and a serving-config ladder
+        for the flow's new-frame region, whose frame buckets also cap how rows
+        pack and size the flow's cache (``flow_new_frame_buckets``)."""
+        if FLOW_NEW_FRAMES_REGION in ((config.get("prefill_token_buckets") or {}).get(FLOW_NODE) or {}):
+            raise ValueError(
+                f"{config_path}: prefill_token_buckets can't set {FLOW_NODE}/{FLOW_NEW_FRAMES_REGION}; its "
+                "buckets also pack the flow's rows and size its cache, so set model_kwargs.flow_new_frame_buckets"
+            )
         check_kv_pools_fit(self, config, config_path, logger)
         cap = config.get("max_concurrent_requests")
         if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
