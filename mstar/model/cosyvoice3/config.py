@@ -215,7 +215,8 @@ class CosyVoice3Config:
     max_text_tokens: int = 512  # prompt text + text
     max_reference_seconds: float = 30.0  # the tokenizer's single-pass limit
     max_speech_tokens: int = 2048  # ~82 s of audio per request
-    voice_cache_size: int = 64
+    # about 100 KB a voice on the GPU; a miss stalls the flow node about 30 ms
+    voice_cache_size: int = 1024
     max_new_tokens_limit: int | None = None
 
     # Streaming. The flow decoder re-runs over the prompt and every settled

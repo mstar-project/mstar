@@ -362,6 +362,22 @@ def test_capture_sizes_short_of_the_batch_cap_are_refused(tmp_path, monkeypatch)
         CosyVoice3Model("x", hift_capture_batch_sizes=[1, 2])
 
 
+def test_a_raised_batch_cap_needs_captures_that_reach_it(tmp_path, monkeypatch):
+    """Checked against the default cap, captures up to 8 would boot under a cap of 16,
+    and every vocoder step of more than 8 rows would then fail with no graph to replay."""
+    monkeypatch.setattr("mstar.model.cosyvoice3.cosyvoice3_model.resolve_snapshot", lambda *a: str(tmp_path))
+    monkeypatch.setattr(CosyVoice3Model, "_build_text_tokenizer", lambda self: None)
+    with pytest.raises(ValueError, match="hift_max_batch_size"):
+        CosyVoice3Model("x", hift_max_batch_size=16)
+
+
+def test_a_lowered_batch_cap_takes_captures_up_to_it(tmp_path, monkeypatch):
+    monkeypatch.setattr("mstar.model.cosyvoice3.cosyvoice3_model.resolve_snapshot", lambda *a: str(tmp_path))
+    monkeypatch.setattr(CosyVoice3Model, "_build_text_tokenizer", lambda self: None)
+    model = CosyVoice3Model("x", hift_max_batch_size=4, hift_capture_batch_sizes=[1, 2, 4])
+    assert model.config.hift_max_batch_size == 4, "captures up to the cap were refused against the default cap"
+
+
 def test_a_state_pool_too_small_for_the_requests_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr("mstar.model.cosyvoice3.cosyvoice3_model.resolve_snapshot", lambda *a: str(tmp_path))
     monkeypatch.setattr(CosyVoice3Model, "_build_text_tokenizer", lambda self: None)
