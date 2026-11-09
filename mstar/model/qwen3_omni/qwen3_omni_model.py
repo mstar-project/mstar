@@ -31,7 +31,6 @@ Text-only mode:
 """
 
 import logging
-from pathlib import Path
 from typing import NamedTuple
 
 import torch
@@ -112,6 +111,7 @@ from mstar.streaming.topology import (
     ProducerWalkCtx,
     StreamingGraphEdge,
 )
+from mstar.utils.hf_snapshot import SAFETENSORS_SNAPSHOT, resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -154,22 +154,6 @@ def _talker_walk(ctx: ProducerWalkCtx) -> str:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
-    """Download (or locate) a HuggingFace snapshot and return the local path."""
-    from huggingface_hub import snapshot_download
-
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-        )
-    except Exception as e:
-        logger.warning("Error downloading from HuggingFace: %s", str(e))
-        return repo_id
-    return str(Path(local_dir))
 
 
 class ThinkerStep(NamedTuple):
@@ -248,7 +232,7 @@ class Qwen3OmniModel(Model):
         # Load config from pretrained checkpoint
         from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
 
-        local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
+        local_dir = str(resolve_snapshot_dir(model_path_hf, cache_dir=cache_dir, allow_patterns=SAFETENSORS_SNAPSHOT))
         self.config = Qwen3OmniModelConfig.from_pretrained(local_dir)
         self.local_dir = local_dir
         apply_code2wav_serving_overrides(self.config.code2wav, kwargs)

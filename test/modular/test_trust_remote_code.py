@@ -50,7 +50,7 @@ def test_qwen3_omni_tokenizer_and_processor_without_remote_code(qwen3_omni, monk
     from mstar.model.qwen3_omni import config as qwen_config
 
     tok_calls, proc_calls = [], []
-    monkeypatch.setattr(qwen3_omni, "_resolve_local_hf_snapshot", lambda *a, **k: str(tmp_path))
+    monkeypatch.setattr(qwen3_omni, "resolve_snapshot_dir", lambda *a, **k: tmp_path)
     monkeypatch.setattr(qwen_config.Qwen3OmniModelConfig, "from_pretrained",
                         classmethod(lambda cls, path: cls()))
     _patch_from_pretrained(monkeypatch, AutoTokenizer, tok_calls)

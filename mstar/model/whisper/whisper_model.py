@@ -39,7 +39,6 @@ adapter lifts those into ``language`` / ``segments``.
 """
 
 import logging
-from pathlib import Path
 
 import torch
 
@@ -95,23 +94,9 @@ from mstar.model.whisper.config import (
     WORDS_MARKER,
     WhisperModelConfig,
 )
+from mstar.utils.hf_snapshot import SAFETENSORS_SNAPSHOT, resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
-    from huggingface_hub import snapshot_download
-
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-        )
-    except Exception as e:
-        logger.warning("Error downloading from HuggingFace: %s", str(e))
-        return repo_id
-    return str(Path(local_dir))
 
 
 class WhisperDetokenizer(ByteLevelDetokenizer):
@@ -173,7 +158,9 @@ class WhisperModel(Model):
         self.cache_dir = cache_dir
         self.model_path_hf = model_path_hf
 
-        self.local_dir = _resolve_local_hf_snapshot(model_path_hf, cache_dir=cache_dir)
+        self.local_dir = str(resolve_snapshot_dir(
+            model_path_hf, cache_dir=cache_dir, allow_patterns=SAFETENSORS_SNAPSHOT,
+        ))
         self.config = WhisperModelConfig.from_pretrained(self.local_dir)
         self.AUDIO_INPUT_RATE = self.config.sampling_rate
 

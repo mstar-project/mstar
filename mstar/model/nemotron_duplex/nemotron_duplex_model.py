@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import copy
 import logging
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -113,6 +112,7 @@ from mstar.streaming.topology import (
     PartitionTopology,
     StreamingGraphEdge,
 )
+from mstar.utils.hf_snapshot import SAFETENSORS_SNAPSHOT, resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -163,17 +163,6 @@ def _sample_text_token(
             lg[s_idx[rm]] = float("-inf")
         sampled[b] = torch.multinomial(torch.softmax(lg, dim=-1), num_samples=1).item()
     return sampled
-
-
-def _resolve_local_hf_snapshot(repo_id: str, cache_dir: str | None = None) -> str:
-    from huggingface_hub import snapshot_download
-
-    try:
-        local_dir = snapshot_download(repo_id=repo_id, cache_dir=cache_dir, local_files_only=False)
-    except Exception as e:  # noqa: BLE001 - fall back to the raw id, mirrors Orpheus
-        logger.warning("Error downloading %s from huggingface: %s", repo_id, e)
-        return repo_id
-    return str(Path(local_dir))
 
 
 class NemotronDuplexModel(Model):
@@ -991,7 +980,9 @@ class NemotronDuplexModel(Model):
         from mstar.model.nemotron_duplex.components.nemotron_h import NemotronHForCausalLM
         from mstar.model.nemotron_duplex.submodules import NemotronHLLMSubmodule
 
-        local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        local_dir = str(resolve_snapshot_dir(
+            self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=SAFETENSORS_SNAPSHOT,
+        ))
         with torch.device("meta"):
             language_model = NemotronHForCausalLM(self.config.nano)
         language_model = self._build_and_load(language_model, device, autocast_dtype, local_dir)
@@ -1004,7 +995,9 @@ class NemotronDuplexModel(Model):
         from mstar.model.components.fastconformer_stream import FastConformerStreamSubmodule
         from mstar.model.loader.iterators import iter_safetensors_shards
 
-        local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        local_dir = str(resolve_snapshot_dir(
+            self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=SAFETENSORS_SNAPSHOT,
+        ))
         stt = self._json_config(local_dir).stt
         prefix = "stt_model.perception."
         weights = ((name.removeprefix(prefix), tensor)
@@ -1025,7 +1018,9 @@ class NemotronDuplexModel(Model):
         from mstar.model.nemotron_duplex.components.eartts_talker import EarTTSTalker
         from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
 
-        local_dir = _resolve_local_hf_snapshot(self.model_path_hf, cache_dir=self.cache_dir)
+        local_dir = str(resolve_snapshot_dir(
+            self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=SAFETENSORS_SNAPSHOT,
+        ))
         cfg = self._json_config(local_dir)
         with torch.device("meta"):
             talker = EarTTSTalker(cfg.eartts)

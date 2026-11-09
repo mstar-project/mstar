@@ -229,7 +229,7 @@ def _stub_checkpoint(monkeypatch, config=None):
     config.json, and each node's modules returned as built."""
     import mstar.model.nemotron_duplex.nemotron_duplex_model as ndm
 
-    monkeypatch.setattr(ndm, "_resolve_local_hf_snapshot", lambda *a, **k: "/nonexistent")
+    monkeypatch.setattr(ndm, "resolve_snapshot_dir", lambda *a, **k: "/nonexistent")
     monkeypatch.setattr(NemotronDuplexConfig, "from_pretrained", classmethod(lambda cls, d: config or cls()))
 
 
