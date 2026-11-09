@@ -194,6 +194,8 @@ def test_cg_key_info_and_declare_step_agree():
     assert step.cg_key_info == (8, 3)
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 11), ("b", "main", 11)]
     assert set(step.steps) == {"dit_attn"} and step.steps["dit_attn"].causal is False
+    # every row of a bucket spans its tokens, so the bucket's layout is fixed
+    assert step.steps["dit_attn"].fixed_layout is True
     assert ToyDenoise().declare_step(WALK, ["a"], [a]) is None  # no resource declared -> nothing to plan
 
 
