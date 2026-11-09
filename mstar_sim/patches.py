@@ -21,9 +21,9 @@ from outside.
 Each patch checks every mstar name it relies on at install, whether or not its
 option is on (:func:`_require`). One whose target is missing is skipped with a
 warning naming it (``SKIPPED``), so the emulator still runs on an older tree
-(a bisect, a corpus of old bugs). On the current tree none may be skipped:
-``mstar_sim/tests/test_device.py`` checks that in CI, so the mstar change that
-moves a target fails there.
+(a bisect, a corpus of old bugs). The optional upstream compatibility audit
+(``python -m pytest mstar_sim/audits``) reports skipped targets for emulator
+maintenance; moving a target does not fail required CPU Core through this check.
 """
 
 from __future__ import annotations
