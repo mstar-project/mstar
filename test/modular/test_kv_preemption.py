@@ -55,15 +55,16 @@ def _pool():
 
 def _request(
     kv, rid: str, pages: int, arrival: int | None, keyed: list[int] | None = None, guaranteed=False, rebuildable=True,
+    decodes: int = 4 * PAGE_SIZE,
 ) -> None:
-    """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
+    """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration, up to ``decodes`` tokens."""
     tokens = pages * PAGE_SIZE
     layout = StreamLayout(
         spans=(PrefixSpan(tokens, tokens, WALK),), growth=(("decode", 1),), keyed_spans=int(bool(keyed)),
     )
     _runner(kv).ingest_request(rid, {"kv": KVReqConfig(
         prefix_keys={"main": _keys(keyed)} if keyed else None, kv_layout={"main": layout},
-        loop_caps={"decode": 4 * PAGE_SIZE}, unpausable=guaranteed, rebuildable=rebuildable,
+        loop_caps={"decode": decodes}, unpausable=guaranteed, rebuildable=rebuildable,
     )}, arrival)
 
 
@@ -733,6 +734,71 @@ def test_the_pages_kept_for_a_waiting_request_stop_at_what_it_asks_for():
 
     assert not _ready(kv, "b") and _ready(kv, "p"), "p was refused with the pages h didn't take kept from it"
     assert kv._kept == 0
+
+
+def test_a_passer_back_from_a_drop_takes_none_of_the_pages_kept_for_the_head():
+    """h, the first request, doesn't fit, and p passed it. Dropped for x, older, p left the pages it freed past x's
+    shortage kept for h, then returned into them once x finished."""
+    kv = _pool()
+    _running(kv, "x", 5, arrival=0)
+    _request(kv, "h", 8, arrival=1)
+    assert not _admitted(kv, "h")
+    _request(kv, "p", 4, arrival=2, decodes=1)
+    assert _ready(kv, "p") and _step(kv, "p", 4 * PAGE_SIZE).ok
+    assert _preempt(kv, "x", _short(kv, "x"), droppable=lambda rid: True).to_drop == ["p"]
+    _drop(kv, "p")
+    kept = kv._kept
+    _remove(kv, "x")
+
+    _runner(kv).admit_waiting(lambda rid, node: None)
+
+    assert kept == 4 and kv._kept == kept, "p returned into the pages kept for h"
+
+
+def test_a_waiting_request_that_leaves_before_its_moves_land_leaves_nothing_kept():
+    """h's first move freed 4 pages into `_kept`, and h left before the second move landed. The 4 pages stayed kept
+    from passers with no request to take them."""
+    kv = _manager(max_num_pages=21)
+    kv.local_loops = {"decode"}
+    _running(kv, "x", 12, arrival=0)
+    _running(kv, "v1", 4, arrival=5)
+    _running(kv, "v2", 4, arrival=6)
+    for rid in ("v1", "v2"):
+        assert _preempt(kv, rid, _short(kv, rid), droppable=lambda rid: False).waits
+        _runner(kv).readmit(rid, NODE)
+    _request(kv, "h", 8, arrival=2)
+    assert not _admitted(kv, "h")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["v2", "v1"]
+    _drop(kv, "v2")
+    assert kv._kept == 4
+
+    _remove(kv, "h")
+
+    assert kv._kept == 0, "the pages kept for h stayed kept after h left"
+
+
+def test_moves_chosen_again_for_a_waiting_request_keep_no_more_than_it_asks_for():
+    """h's first move kept 4 of the 8 pages it asks for. The moves chosen for it again counted from none kept, so v1's
+    move kept all 6 pages it freed, and h left 2 kept with no request to take them."""
+    kv = _manager(max_num_pages=21)
+    kv.local_loops = {"decode"}
+    _running(kv, "x", 10, arrival=0)
+    _running(kv, "v1", 6, arrival=5)
+    _running(kv, "v2", 4, arrival=6)
+    for rid in ("v1", "v2"):
+        assert _preempt(kv, rid, _short(kv, rid), droppable=lambda rid: False).waits
+        _runner(kv).readmit(rid, NODE)
+    _request(kv, "h", 8, arrival=2)
+    assert not _admitted(kv, "h")
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["v2", "v1"]
+    _drop(kv, "v2")
+    assert kv._kept == 4
+    # before v1's move, the walk chooses it for h again
+    assert _make_room(kv, droppable=lambda rid: True).to_drop == ["v1"]
+
+    _drop(kv, "v1")
+
+    assert "h" in kv._allotments and kv._kept == 0, "h left pages kept with no request to take them"
 
 
 def test_a_request_no_move_covers_waits_until_its_whole_shortage_fits():
