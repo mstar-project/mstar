@@ -441,6 +441,7 @@ def test_a_throwaway_capture_frees_its_memory_pass_or_fail(forward, monkeypatch)
 
 
 @requires_cuda
+@pytest.mark.gpu_exclusive
 def test_graphs_take_no_more_executable_memory_than_sizing_counts():
     """A graph's executable memory is outside the allocator, so no pool shows
     it. On Qwen3-Omni, 162 graphs held 724 MiB beyond their pools, and capture
