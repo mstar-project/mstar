@@ -164,7 +164,6 @@ class TestHandoff(unittest.TestCase):
                     f"@@ -1,2 +0,0 @@\n{b.replace('11', '1')}-a\n{b.replace('11', '2')}-b\n")
 
         raw = diff(*[""] * 6)
-        plain = "R{} |", "L11 |", "R21 |", "R22 |", "R51 |"
         marked = diff("R1 |", "R20 |", "L11 |", "R21 |", "R22 |", "R51 |").replace("R1 |+two", "R2 |+two")
         self.assertEqual(numbered(raw), marked, "a comment would land on the wrong line")
         self.assertEqual(diff_paths(numbered(raw)), ["new.py", "moved.py"],
@@ -174,6 +173,10 @@ class TestHandoff(unittest.TestCase):
         broken = "@@ -1,2 +1,2 @@\n a\nnot a hunk line\n b\n"
         self.assertEqual(numbered(broken), "@@ -1,2 +1,2 @@\nR1 | a\nnot a hunk line\n b\n",
                          "text after a hunk that doesn't match its counts would be numbered")
+        # What git prints for a one-line file that gains its final newline: omitted counts, and a marker mid-hunk.
+        self.assertEqual(numbered("@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n"),
+                         "@@ -1 +1 @@\nL1 |-a\n\\ No newline at end of file\nR1 |+b\n",
+                         "a line after the marker, or in a hunk with omitted counts, would have no number")
 
 
 if __name__ == "__main__":

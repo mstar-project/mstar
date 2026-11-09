@@ -259,8 +259,9 @@ class TestCollect(unittest.TestCase):
         self.assertEqual(json.loads(files["last-review.json"])["head"], LAST)
         _, files = collect(**self.CONVERSATION, **{f"GET repos/o/r/compare/{LAST}...{HEAD}":
                                                    compare("ahead", pr_diff("x = 1", "z"))})
-        self.assertIn(" |-    y = 2\nR11 |+    y = 3", files["since.diff"],
-                      "a deleted line's number here is from the last review, and GitHub would refuse or misplace it")
+        self.assertIn(" |-    y = 2\nR11 |+    y = 3", files["since.diff"])
+        self.assertNotIn("L11 |", files["since.diff"],
+                         "a deleted line's number here is from the last review, and GitHub would refuse or misplace it")
 
     def test_with_the_review_app_only_its_login_is_the_bot(self):
         forged = {**summary(LAST), "user": {"login": "github-actions[bot]"}}
