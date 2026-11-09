@@ -20,6 +20,7 @@ from mstar.api_server.request_types import (
     RequestFailed,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.lora_ops import LoraAdapterOps
 from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
     CurrentForwardConductorMetadata,
@@ -779,6 +780,31 @@ class Conductor:
         if targets is not None:
             logger.info("LoRA: serving only the targets the adapters touch: %s", targets)
             block["targets"] = targets
+
+    def _lora_ops(self) -> LoraAdapterOps:
+        """Runtime LoRA loads and unloads, against the specs requests are validated with
+        and the workers hosting their nodes. Built on first use.
+
+        Each worker's ``_resource_specs`` holds its own copy of a spec, with its own
+        adapter-info cache, so a load or unload updates the copies as well."""
+        ops = getattr(self, "_lora_ops_cache", None)
+        if ops is None:
+            specs = [s for s in self._node_resources() if isinstance(s, LoraSpec)]
+            copies = [
+                s for per_worker in self._resource_specs() for s in per_worker.values()
+                if isinstance(s, LoraSpec)
+            ]
+            nodes = set().union(*(s.nodes for s in specs))
+            workers = [
+                worker_id for worker_id in self.worker_ids
+                if any(nodes & set(wg.section.get_nodes())
+                       for wg in self._per_worker_graphs[worker_id])
+            ]
+            ops = self._lora_ops_cache = LoraAdapterOps(
+                specs[0] if specs else None, workers, self.communicator.send,
+                others=[*specs[1:], *copies],
+            )
+        return ops
 
     def _derive_worker_info(self):
         """Derive per-rank worker info from the worker graphs."""
@@ -1701,6 +1727,10 @@ class Conductor:
                 logger.debug(
                     "Dropping stale early READS_DONE for request %s", request_id
                 )
+        # runtime LoRA loads and unloads a worker never answered
+        lora_ops = getattr(self, "_lora_ops_cache", None)
+        if lora_ops is not None:
+            lora_ops.expire()
 
     def _fail_requests(self, body: FailRequests):
         """Tear down requests a worker reported as unservable. Routes through the
@@ -2226,6 +2256,12 @@ class Conductor:
                 self.communicator.send(worker_id, WorkerMessage(
                     message_type=WorkerMessageType.ENABLE_METRICS, body=message.body,
                 ))
+        elif message.message_type == ConductorMessageType.LOAD_LORA_ADAPTER:
+            self._lora_ops().load(message.body)
+        elif message.message_type == ConductorMessageType.UNLOAD_LORA_ADAPTER:
+            self._lora_ops().unload(message.body)
+        elif message.message_type == ConductorMessageType.LORA_ADAPTER_ACK:
+            self._lora_ops().ack(message.body)
         elif message.message_type == ConductorMessageType.WORKER_GRAPHS_DONE:
             rid = message.body.request_id
             # Draining requests linger in self.requests (concurrency
@@ -2333,6 +2369,10 @@ class Conductor:
         ):
             if deadlines:
                 due = min(due, deadlines[0][0])
+        lora_ops = getattr(self, "_lora_ops_cache", None)
+        lora_due = None if lora_ops is None else lora_ops.next_deadline()
+        if lora_due is not None:
+            due = min(due, lora_due)
         return max(1, math.ceil((due - time.perf_counter()) * 1000))
 
     def run(self):

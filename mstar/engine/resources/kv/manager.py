@@ -2185,7 +2185,7 @@ class KVManager(AttentionResource):
         self._drop_resident_stage()
         with self._lock:
             # No owner check: every rollback finishes before `commit_done` is
-            # released, and the only pre-admit (`Worker._preplan_spec`) waits on
+            # released, and the only pre-admit (`StepExecutor._preplan_spec`) waits on
             # it, so no other uncommitted step can hold marks on these streams.
             # `.get` as in `admit`: a refusal can come before a stream exists
             for segment in step.segments:

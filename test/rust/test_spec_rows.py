@@ -1,7 +1,7 @@
 """The columnar speculation (``prep_spec_rows`` + ``SpeculationBuilder.assemble_rows``)
 must build exactly the speculative step the per-row path builds.
 
-A real worker (``make_worker`` plus the collaborators these methods read) over
+A real worker (``make_worker``) over
 the real graph runtime is driven through a decode loop. Each
 step the next one is speculated twice from the same state, once per path --
 prepping is side-effect free when nothing streams -- and everything the engine,
@@ -32,13 +32,15 @@ from mstar.streaming.topology import Connection
 from mstar.testing_utils.worker import make_worker
 from mstar.utils.containers import ParallelList
 from mstar.worker.batch_builder import StepPick
+from mstar.worker.executing_batch import build_executing_batch
 from mstar.worker.micro_scheduler import ChainPick, ScheduledBatch
 from mstar.worker.node_manager_utils import RequestStateManager
 from mstar.worker.rebuild import Rebuilds
 from mstar.worker.spec_rows import DeferredRowInputs
 from mstar.worker.speculation import SpeculationPreparer
+from mstar.worker.step_executor import PendingBatch
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import PendingBatch, Worker
+from mstar.worker.worker import Worker
 
 WG, WALK, NODE, LOOP, SIG, PART, ME = 0, "decode", "LLM", "decode_loop", "text_inputs", "default", "w0"
 # the second node of a two-node loop (``pair=True``): NODE -> NODE_B -> NODE
@@ -163,16 +165,14 @@ def _worker(
         release_cached_prefix=lambda batch: None,
     )
     w = make_worker(
-        _graph_runtime=rt,
+        graph_runtime=rt,
+        worker_id=ME,
         tensor_manager=tm,
         request_state=request_state,
         scheduler=_Scheduler(),
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
         streams=StreamBufferManager(request_state, tm, list(connections), walks),
     )
-    w.parallel_nodes = set()
-    w.worker_id = ME
-    w._rid_str = rt.get_rid_string
     return w
 
 
@@ -213,9 +213,9 @@ def _pop(w: Worker, rids: list[int], walk: str = WALK) -> ScheduledBatch:
 
 def _first_step(w: Worker, rids: list[int]) -> PendingBatch:
     batch = _pop(w, rids)
-    w._set_in_flight_flag(batch, True)
+    w.executor._set_in_flight(batch, True)
     return PendingBatch(
-        batch=batch, node_batch=w._build_executing_batch(batch), node_name=NODE,
+        batch=batch, node_batch=build_executing_batch(w.speculator._services, batch), node_name=NODE,
         partition=PART, graph_walk=WALK, future=None,
     )
 
@@ -235,9 +235,9 @@ def _mixed_first_step(w: Worker, decode: list[int], prefill: list[int]) -> Pendi
     pre.walk_output_signals = {PRE: list(pre.output_signals)}
     pre.graph_walk = MIXED
     batch.merge(pre)
-    w._set_in_flight_flag(batch, True)
+    w.executor._set_in_flight(batch, True)
     return PendingBatch(
-        batch=batch, node_batch=w._build_executing_batch(batch), node_name=NODE,
+        batch=batch, node_batch=build_executing_batch(w.speculator._services, batch), node_name=NODE,
         partition=PART, graph_walk=MIXED, future=None,
     )
 
@@ -249,10 +249,10 @@ def _speculate(w: Worker, pending: PendingBatch, rows: bool, monkeypatch):
     # the columnar path where the worker would take it, else the per-row one
     eligible = _ROWS_ELIGIBLE if rows else (lambda *a, **k: False)
     monkeypatch.setattr(SpeculationPreparer, "rows_eligible", eligible)
-    target = w._choose_spec_target(pending.batch)
+    target = w.speculator._choose_spec_target(pending.batch)
     if target is None:
         return None
-    return w._try_speculate_next(pending, target)
+    return w.speculator._try_speculate_next(pending, target)
 
 
 def _view(spec, read_inputs: bool = True):
@@ -324,8 +324,8 @@ def _route(w: Worker, pending: PendingBatch) -> None:
 
 def _advance(w: Worker, pending: PendingBatch, spec) -> PendingBatch:
     """Await N, thread, settle, postprocess N: the run loop's order."""
-    w._clear_in_flight_flag(pending.batch)
-    w._settle_speculation(spec, success=True, dropped_rids=spec.dropped)
+    w.executor.clear_in_flight(pending.batch)
+    w.speculator.settle(spec, success=True, dropped_rids=spec.dropped)
     _route(w, pending)
     return PendingBatch(
         batch=spec.scheduled_batch, node_batch=spec.node_batch,
@@ -350,8 +350,8 @@ def _step_both(w, pending, monkeypatch, outputs=None, check_unread=True):
         general, read_inputs=not check_unread,
     )
     outputs = outputs if outputs is not None else _rows_only(pending)
-    w._thread_outputs_to_speculative(general, outputs)
-    w._thread_outputs_to_speculative(rows, outputs)
+    w.speculator.thread_outputs(general, outputs)
+    w.speculator.thread_outputs(rows, outputs)
     assert _view(rows) == _view(general)
     return rows
 

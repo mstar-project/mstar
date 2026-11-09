@@ -31,7 +31,20 @@ TIMED_CHECKS = {
     "drain": lambda c, at: c._draining_deadlines.append((at, "r")),
     "early_reads_done": lambda c, at: c._early_reads_done_deadlines.append((at, "r")),
     "early_abort": lambda c, at: c._early_abort_deadlines.append((at, "r")),
+    "lora_op": lambda c, at: setattr(c, "_lora_ops_cache", _lora_op_due(at)),
 }
+
+
+def _lora_op_due(at):
+    """A runtime LoRA unload no worker has answered, given up on at ``at``."""
+    from types import SimpleNamespace
+
+    from mstar.conductor.lora_ops import LoraAdapterOps, _PendingOp
+    from mstar.utils.ipc_format import UnloadLoraAdapter
+
+    ops = LoraAdapterOps(SimpleNamespace(runtime_update_timeout_s=FAR_S, adapters={}), ["w"], lambda *_: None)
+    ops._pending["op"] = _PendingOp(UnloadLoraAdapter(op_id="op", lora_name="a"), waiting={"w"}, deadline=at)
+    return ops
 
 
 class _StopLoop(BaseException):

@@ -2,6 +2,7 @@
 worker's own batches and its speculative ones."""
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from mstar.communication.tensors import NameToTensorList
@@ -11,10 +12,14 @@ from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.model.submodule_base import InputMetadata
 from mstar.worker.node_manager_utils import RequestStateManager
+from mstar.worker.scheduled_batch import ScheduledBatch
+from mstar.worker.services import WorkerServices
 from mstar.worker.stream_buffers import StreamBufferManager
 
 if TYPE_CHECKING:
     from mstar.worker.rebuild import Rebuilds
+
+logger = logging.getLogger(__name__)
 
 
 def input_metadata_and_fwd_info(
@@ -99,3 +104,71 @@ def make_executing_batch(
             rebuild_rids=rebuild_rids,
         ),
     )
+
+
+def build_executing_batch(services: WorkerServices, batch: ScheduledBatch) -> ExecutingBatch:
+    """Gather input tensors from tensor_manager for all requests in the batch."""
+    batch_partition = services.request_state.get_partition_for_node(batch.node_name)
+
+    # One walk of the columns for both: each rid's inputs as tensors, and
+    # per rid, the edges that carried a stream's final chunk. Only this side can
+    # turn a uuid back into a tensor, which is why the runtime reports uuids
+    # and the resolution happens here.
+    #
+    # Seeded with the batch's rids rather than just the ones that have
+    # edges: a rid with nothing ready still needs an entry, because
+    # per_request_info is keyed off these and the engine indexes it by rid.
+    # skip_missing: a backstop, not a fix. A live rid holding a freed uuid
+    # is a bug (an abandoned speculation handing back a still-ingested
+    # chunk is one), but resolving the batch in one call means one such rid
+    # would otherwise fail every other request in the step -- 64 duplex
+    # sessions for one bad chunk. Take out just that rid and report it, so
+    # the failure is attributed and loud.
+    per_request_inputs, final_edges, unresolved = (
+        services.streams.input_tensors(
+            batch.input_edges, batch.node_name, batch.request_to_worker_graph,
+            skip_missing=True,
+        )
+    )
+    for rid in unresolved:
+        # Before the get_fwd_info loop below, so a rid that is going to be
+        # failed anyway is not asked for forward-pass state as well.
+        per_request_inputs.pop(rid, None)
+        final_edges.pop(rid, None)
+    per_request_input_metadata, per_request_info = input_metadata_and_fwd_info(
+        services.request_state, services.streams,
+        node_name=batch.node_name, batch_partition=batch_partition,
+        per_request_inputs=per_request_inputs,
+    )
+
+    node_batch = make_executing_batch(
+        services.streams,
+        node_name=batch.node_name,
+        graph_walk=batch.graph_walk,
+        request_ids=[
+            rid for rid in batch.request_to_worker_graph
+            if rid not in unresolved
+        ],
+        per_request_input_tensors=per_request_inputs,
+        per_request_info=per_request_info,
+        final_edges=final_edges,
+        per_request_input_metadata=per_request_input_metadata,
+        request_walks=batch.request_walks,
+        chunk_ranges=batch.chunk_ranges,
+        engine=services.engine_manager.get_engine(batch.node_name) if batch.request_walks else None,
+        rebuild_rids=batch.rebuild_rids, rebuilds=services.rebuilds,
+    )
+    node_batch.read_check_rids = batch.read_check_rids
+    for rid in unresolved:
+        # Reported the way a per-rid stage reports: left in
+        # ``failed_requests`` for the run loop to drop and fail, so the
+        # client gets an error instead of a session that silently stops.
+        logger.error(
+            "Worker %s: request %s has an input tensor the store no longer "
+            "holds; failing it and running %s without it",
+            services.worker_id, rid, batch.node_name,
+        )
+        node_batch.register_failure(
+            rid, KeyError(f"input tensor missing for {batch.node_name}"),
+        )
+    return node_batch

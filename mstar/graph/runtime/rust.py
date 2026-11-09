@@ -703,7 +703,9 @@ class RustGraphRuntime(GraphRuntime):
     def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
         cap = (1 << 32) - 1  # also "no limit": a loop count never reaches it
         for (node, walk), policies in self._stop_policies.items():
-            if not policies:
+            # a node's limits come from its own partition's info: another partition's
+            # carries that partition's settings, which are not the node's
+            if not policies or self._node_to_partition.get(node, info.partition_name) != info.partition_name:
                 continue
             limits = [p.limits(info) for p in policies.values()]
             self._rust.set_stop_limits(
