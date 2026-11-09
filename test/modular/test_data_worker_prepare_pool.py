@@ -6,10 +6,13 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import wave
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
+from test_parakeet_model import _snapshot
 
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, ResultQueue
 from mstar.api_server.request_types import PreprocessInput
@@ -58,10 +61,12 @@ class _Serial(_Model):
 class _Tensors:
     def __init__(self):
         self.stored: list[tuple[str, str]] = []
+        self.tensors: dict[str, dict] = {}
         self.dropped: list[str] = []
 
     def store_and_return_tensor_info(self, request_id, tensors):
         self.stored.append((request_id, threading.current_thread().name))
+        self.tensors.setdefault(request_id, {}).update(tensors)
         return {}
 
     def register_for_send(self, request_id, tensor_infos):
@@ -353,6 +358,69 @@ def test_a_bad_preprocess_workers_fails_startup(workers, tmp_path):
 
     with pytest.raises(DeploymentError, match=r"preprocess_workers must be a positive integer"):
         validate_deployment(_Model(), {"max_seq_len": 64, "preprocess_workers": workers}, str(tmp_path / "cfg.yaml"))
+
+
+def _speech_model(kind, path):
+    if kind == "omnilingual":
+        from mstar.model.omnilingual_asr.omnilingual_asr_model import OmnilingualASRModel
+
+        # the upload's decode and normalize read nothing the constructor sets
+        return OmnilingualASRModel.__new__(OmnilingualASRModel)
+    from mstar.model.parakeet.parakeet_model import ParakeetModel
+
+    return ParakeetModel(str(_snapshot(path, nemotron=kind == "nemotron")))
+
+
+@pytest.mark.parametrize("kind", ["parakeet", "nemotron", "omnilingual"])
+def test_a_speech_model_prepares_each_upload_on_the_pool(kind, tmp_path, monkeypatch):
+    """Uploads that overlap each get their own samples and metadata, the same as
+    one at a time, and reach the conductor in arrival order. The first four hold
+    each other inside ``load_audio``, so a pool that stops overlapping fails."""
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    model = _speech_model(kind, tmp_path)
+    wt = _thread(model)
+    assert wt._prepare_workers == 4
+    ids, inputs, expected = [str(i) for i in range(24)], [], {}
+    for i, rid in enumerate(ids):
+        path = tmp_path / f"{rid}.wav"
+        samples = 0.5 * np.sin(2 * np.pi * (200 + 40 * i) * np.arange(8000 + 700 * i) / 16_000)
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1), wf.setsampwidth(2), wf.setframerate(16_000)
+            wf.writeframes((samples * 32767).astype("<i2").tobytes())
+        kwargs = {"language": "de" if i % 2 else "en"} if kind == "nemotron" else {}
+        expected[rid] = model.process_prompt(
+            None, ["audio"], ["text"],
+            tensors={"audio_inputs": [model.load_audio(str(path), "cpu").data]}, **kwargs,
+        )
+        inputs.append(PreprocessInput(rid, None, {"audio": [str(path)]}, ["audio"], ["text"], kwargs))
+        wt.in_queue.put(inputs[-1])
+
+    overlap, load = threading.Barrier(wt._prepare_workers), model.load_audio
+    starts = iter(range(wt._prepare_workers))
+
+    def held_load(path, device):
+        if next(starts, None) is not None:
+            overlap.wait(timeout=10)
+        return load(path, device)
+
+    monkeypatch.setattr(model, "load_audio", held_load)
+    give_up = time.monotonic() + 30
+    while len(_sent(wt)) < len(ids):
+        assert time.monotonic() < give_up, _sent(wt)
+        for item in wt._next_inputs():
+            wt._process_waiting_input(item)
+        wt._release_prepared()
+    wt._prepare_pool.shutdown(wait=True)
+    wt._encode_pool.shutdown(wait=True)
+
+    assert _sent(wt) == ids
+    for rid, want in expected.items():
+        out = want if isinstance(want, ProcessPromptOutput) else ProcessPromptOutput(want, {})
+        tensors, metadata = out.new_input_tensors, out.metadata
+        for name, values in tensors.items():
+            assert torch.equal(wt.tensor_manager.tensors[rid][name][0], values[0]), (rid, name)
+        for key, value in metadata.items():
+            assert wt.request_model_kwargs[rid][key] == value, (rid, key)
 
 
 def test_the_prepare_pool_is_sized_with_the_first_request(monkeypatch):
